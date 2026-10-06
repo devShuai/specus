@@ -43,6 +43,7 @@ type clientEnvironmentInfo struct {
 	ClientMessageCapabilities     clientMessageCapabilities     `json:"clientMessageCapabilities"`
 	ClientPeerServiceCapabilities clientPeerServiceCapabilities `json:"clientPeerServiceCapabilities"`
 	ClientEgressCapabilities      clientEgressCapabilities      `json:"clientEgressCapabilities"`
+	ClientHTTPRouteCapabilities   clientHTTPRouteCapabilities   `json:"clientHttpRouteCapabilities"`
 	LocalAddresses                []string                      `json:"localAddresses"`
 	StartedAt                     string                        `json:"startedAt"`
 }
@@ -74,6 +75,17 @@ type clientEgressCapabilities struct {
 	// coexist. A domain-capable egress honours name-bind (protocol/spec/peer-egress-dns.md).
 	DomainTargetCapable bool `json:"domainTargetCapable"`
 	IPv6TargetCapable   bool `json:"ipv6TargetCapable"`
+}
+
+// clientHTTPRouteCapabilities is what this build does for HTTP route streams.
+//
+// From version 1 an HTTP stream that fails before its response OPEN carries metadata.failure on
+// its RST, classified where the client can tell (http_route_failure.go), and the client never makes
+// up a response head. A server trusts failure only from a session that announced version 1, so the
+// connectivity check can tell a refused target from a route the device has not loaded
+// (protocol/spec/service-connectivity-check.md section 6). Older servers ignore the object.
+type clientHTTPRouteCapabilities struct {
+	Version int `json:"version"`
 }
 
 // egressProtocolVersion is the split-routing version this client speaks.
@@ -217,8 +229,11 @@ func collectEnvironment() clientEnvironmentInfo {
 			Applications: []string{"http", "https", "ssh", "tcp", "udp"},
 		},
 		ClientEgressCapabilities: currentEgressCapabilities(),
-		LocalAddresses:           localAddresses(),
-		StartedAt:                time.Now().UTC().Format(time.RFC3339Nano),
+		ClientHTTPRouteCapabilities: clientHTTPRouteCapabilities{
+			Version: httpRouteCapabilityVersion,
+		},
+		LocalAddresses: localAddresses(),
+		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 }
 

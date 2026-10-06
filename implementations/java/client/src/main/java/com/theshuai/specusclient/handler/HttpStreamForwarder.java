@@ -1,10 +1,12 @@
 package com.theshuai.specusclient.handler;
 
+import com.theshuai.common.protocol.HttpRouteFailure;
 import com.theshuai.common.service.ExecuteService;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
@@ -29,6 +31,8 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import com.theshuai.specusclient.client.UpstreamTlsPolicyHolder;
 import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.Future;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -64,18 +68,26 @@ final class HttpStreamForwarder implements Runnable {
     private final Map<String, Object> metadata;
     private final Map<String, HttpSpecusConfig> routes;
     private final EventLoopGroup workerGroup;
+    private final HttpUpstreamDial dial;
     private final StreamingBodyInput requestBody;
     private final AtomicBoolean remoteReset = new AtomicBoolean();
     private volatile Channel upstreamChannel;
 
     HttpStreamForwarder(NatClientHandler owner, int streamId, Map<String, Object> metadata,
                         Map<String, HttpSpecusConfig> routes, EventLoopGroup workerGroup) {
+        this(owner, streamId, metadata, routes, workerGroup, HttpUpstreamDial.DEFAULT);
+    }
+
+    HttpStreamForwarder(NatClientHandler owner, int streamId, Map<String, Object> metadata,
+                        Map<String, HttpSpecusConfig> routes, EventLoopGroup workerGroup,
+                        HttpUpstreamDial dial) {
         this.owner = owner;
         this.streamId = streamId;
         this.metadata = metadata == null || metadata.isEmpty()
                 ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(metadata));
         this.routes = routes;
         this.workerGroup = workerGroup;
+        this.dial = dial;
         this.requestBody = new StreamingBodyInput(bytes -> owner.sendHttpWindowUpdate(streamId, bytes));
     }
 
@@ -103,14 +115,16 @@ final class HttpStreamForwarder implements Runnable {
     @Override
     public void run() {
         UpstreamExchange exchange = null;
+        // Once the response OPEN is on its way the stream has answered, and a later failure is no
+        // longer the target's failure to answer: it is reset without a classification.
+        boolean responseOpened = false;
         try {
             String method = requiredText("method");
             String route = requiredText("route");
             String relativePath = text(metadata.get("relativePath"));
             String rawQuery = text(metadata.get("rawQuery"));
             HttpSpecusConfig routeConfig = routes.get(route);
-            URI target = HttpRouteTargetResolver.buildTarget(
-                    routeConfig == null ? null : routeConfig.getTargetBaseUrl(), relativePath, rawQuery);
+            URI target = routeTarget(routeConfig, relativePath, rawQuery);
             long contentLength = number(metadata.get("contentLength"), -1L);
             if (contentLength > MAX_REQUEST_BYTES) {
                 throw new IOException("HTTP 请求体超过限制");
@@ -128,6 +142,7 @@ final class HttpStreamForwarder implements Runnable {
             if (!(event instanceof ResponseHead head)) {
                 throw eventError(event, "upstream closed before HTTP response head");
             }
+            responseOpened = true;
             owner.sendHttpResponseHead(streamId, head.statusCode(), head.headers(), head.trailerNames())
                     .get(WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             long total = 0;
@@ -157,7 +172,8 @@ final class HttpStreamForwarder implements Runnable {
                     cause = cause.getCause();
                 }
                 owner.failHttpStream(streamId,
-                        cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage());
+                        cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage(),
+                        responseOpened ? null : HttpRouteFailureClassifier.carried(cause));
             }
         } finally {
             if (exchange != null) {
@@ -177,21 +193,49 @@ final class HttpStreamForwarder implements Runnable {
         return value;
     }
 
+    /**
+     * The target for this request. A route the snapshot does not hold, or holds without a target,
+     * is one the device has not loaded; a target the route's base cannot be turned into is invalid.
+     */
+    private static URI routeTarget(HttpSpecusConfig routeConfig, String relativePath, String rawQuery)
+            throws HttpRouteFailureException {
+        if (routeConfig == null || routeConfig.getTargetBaseUrl() == null
+                || routeConfig.getTargetBaseUrl().isBlank()) {
+            throw new HttpRouteFailureException(HttpRouteFailure.ROUTE_NOT_LOADED, "未配置 HTTP route", null);
+        }
+        try {
+            return HttpRouteTargetResolver.buildTarget(routeConfig.getTargetBaseUrl(), relativePath, rawQuery);
+        } catch (IllegalArgumentException invalid) {
+            throw new HttpRouteFailureException(HttpRouteFailure.TARGET_INVALID,
+                    invalid.getMessage() == null ? invalid.getClass().getSimpleName() : invalid.getMessage(),
+                    invalid);
+        }
+    }
+
+    /**
+     * Reaches the target: the name lookup, the TCP connect and, for https, the TLS handshake, all
+     * within the dial's connect timeout. Waiting for the handshake here, before any of the request
+     * is written, is what keeps a TLS failure apart from a target that breaks the exchange later.
+     * Each failure carries its classification; see {@link HttpRouteFailureClassifier}.
+     */
     private UpstreamExchange connect(URI target, boolean insecureSkipVerify) throws Exception {
         UpstreamExchange exchange = new UpstreamExchange();
-        int port = target.getPort() >= 0 ? target.getPort()
-                : "https".equalsIgnoreCase(target.getScheme()) ? 443 : 80;
+        boolean https = "https".equalsIgnoreCase(target.getScheme());
+        int port = target.getPort() >= 0 ? target.getPort() : https ? 443 : 80;
+        long connectTimeoutMillis = dial.connectTimeoutMillis();
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(connectTimeoutMillis);
         Bootstrap bootstrap = new Bootstrap()
                 .group(workerGroup)
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+                .resolver(dial.resolver())
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) connectTimeoutMillis)
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.AUTO_READ, false)
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel channel) {
-                        if ("https".equalsIgnoreCase(target.getScheme())) {
+                        if (https) {
                             SslContext sslContext = insecureSkipVerify
                                     ? INSECURE_LOCAL_HTTP_SSL_CONTEXT : LOCAL_HTTP_SSL_CONTEXT;
                             io.netty.handler.ssl.SslHandler sslHandler = sslContext
@@ -207,10 +251,49 @@ final class HttpStreamForwarder implements Runnable {
                         channel.pipeline().addLast(new UpstreamResponseHandler(exchange));
                     }
                 });
-        Channel channel = bootstrap.connect(target.getHost(), port).sync().channel();
+        ChannelFuture connect = bootstrap.connect(target.getHost(), port);
+        Channel channel = connect.channel();
+        // Published at once, so an RST from the server abandons a connect still under way.
+        upstreamChannel = channel;
+        if (!connect.await(remainingNanos(deadline), TimeUnit.NANOSECONDS)) {
+            channel.close();
+            throw connectTimedOut(connectTimeoutMillis);
+        }
+        if (!connect.isSuccess()) {
+            channel.close();
+            throw classified(HttpRouteFailureClassifier.connectFailure(connect.cause()), connect.cause());
+        }
         exchange.bind(channel);
+        // Reads are manual; this one also carries the TLS handshake, which reads on from there.
         channel.read();
+        if (https) {
+            Future<Channel> handshake = channel.pipeline().get(SslHandler.class).handshakeFuture();
+            if (!handshake.await(remainingNanos(deadline), TimeUnit.NANOSECONDS)) {
+                channel.close();
+                throw connectTimedOut(connectTimeoutMillis);
+            }
+            if (!handshake.isSuccess()) {
+                channel.close();
+                throw classified(HttpRouteFailureClassifier.handshakeFailure(handshake.cause()), handshake.cause());
+            }
+        }
         return exchange;
+    }
+
+    private static long remainingNanos(long deadline) {
+        return Math.max(0, deadline - System.nanoTime());
+    }
+
+    private static HttpRouteFailureException connectTimedOut(long connectTimeoutMillis) {
+        return new HttpRouteFailureException(HttpRouteFailure.CONNECT_TIMEOUT,
+                "upstream connect timed out after " + connectTimeoutMillis + " ms", null);
+    }
+
+    private static HttpRouteFailureException classified(HttpRouteFailure failure, Throwable cause) {
+        String message = cause == null ? null : cause.getMessage();
+        return new HttpRouteFailureException(failure,
+                message != null ? message : cause == null ? "upstream connect failed" : cause.getClass().getSimpleName(),
+                cause);
     }
 
     private void pumpRequest(UpstreamExchange exchange, URI target, String method,
@@ -243,7 +326,7 @@ final class HttpStreamForwarder implements Runnable {
             } else {
                 HttpUtil.setTransferEncodingChunked(request, true);
             }
-            channel.writeAndFlush(request).sync();
+            writeUpstream(channel, request);
 
             long forwarded = 0;
             for (int read; (read = requestBody.read(buffer)) >= 0; ) {
@@ -252,18 +335,39 @@ final class HttpStreamForwarder implements Runnable {
                 if (contentLength >= 0 && forwarded > contentLength) {
                     throw new IOException("HTTP request DATA exceeds declared contentLength");
                 }
-                channel.writeAndFlush(new DefaultHttpContent(
-                        Unpooled.wrappedBuffer(Arrays.copyOf(buffer, read)))).sync();
+                writeUpstream(channel, new DefaultHttpContent(
+                        Unpooled.wrappedBuffer(Arrays.copyOf(buffer, read))));
             }
             if (contentLength >= 0 && forwarded != contentLength) {
                 throw new IOException("HTTP request body does not match declared contentLength");
             }
             DefaultLastHttpContent last = new DefaultLastHttpContent(Unpooled.EMPTY_BUFFER);
             appendTrailers(last.trailingHeaders(), requestBody.trailers(), trailerNames);
-            channel.writeAndFlush(last).sync();
-        } catch (Exception error) {
-            exchange.fail(error);
+            writeUpstream(channel, last);
+        } catch (UpstreamWriteException error) {
+            // The target went away under the request, the same break the response side sees.
+            exchange.fail(error.getCause(), HttpRouteFailureClassifier.exchangeFailure(error.getCause()));
             channel.close();
+        } catch (Exception error) {
+            // The request itself: malformed, larger than declared, or cancelled. Not the target's doing.
+            exchange.fail(error, null);
+            channel.close();
+        }
+    }
+
+    private static void writeUpstream(Channel channel, HttpObject message)
+            throws UpstreamWriteException, InterruptedException {
+        ChannelFuture write = channel.writeAndFlush(message).await();
+        if (!write.isSuccess()) {
+            throw new UpstreamWriteException(write.cause() != null
+                    ? write.cause() : new IOException("upstream HTTP write was cancelled"));
+        }
+    }
+
+    /** Writing the request to the target failed; the cause is the transport's. */
+    private static final class UpstreamWriteException extends Exception {
+        private UpstreamWriteException(Throwable cause) {
+            super(cause);
         }
     }
 
@@ -415,9 +519,11 @@ final class HttpStreamForwarder implements Runnable {
         return defaultPort ? host : host + ":" + port;
     }
 
+    /** The error for an exchange that ended without what was expected, with any classification it carried. */
     private static IOException eventError(UpstreamEvent event, String fallback) {
         return event instanceof ResponseError error
-                ? new IOException(error.cause().getMessage() == null ? fallback : error.cause().getMessage(), error.cause())
+                ? new HttpRouteFailureException(error.failure(),
+                        error.cause().getMessage() == null ? fallback : error.cause().getMessage(), error.cause())
                 : new IOException(fallback);
     }
 
@@ -448,7 +554,8 @@ final class HttpStreamForwarder implements Runnable {
                                 List<String> trailerNames) implements UpstreamEvent { }
     private record ResponseData(byte[] bytes) implements UpstreamEvent { }
     private record ResponseEnd(List<String> trailers) implements UpstreamEvent { }
-    private record ResponseError(Throwable cause) implements UpstreamEvent { }
+    /** {@code failure} classifies the error should it end the exchange before the response head. */
+    private record ResponseError(Throwable cause, HttpRouteFailure failure) implements UpstreamEvent { }
 
     private static final class UpstreamExchange {
         private final LinkedBlockingQueue<UpstreamEvent> events = new LinkedBlockingQueue<>();
@@ -475,9 +582,9 @@ final class HttpStreamForwarder implements Runnable {
             }
         }
 
-        private void fail(Throwable cause) {
+        private void fail(Throwable cause, HttpRouteFailure failure) {
             if (terminal.compareAndSet(false, true)) {
-                events.offer(new ResponseError(cause));
+                events.offer(new ResponseError(cause, failure));
             }
         }
 
@@ -508,11 +615,19 @@ final class HttpStreamForwarder implements Runnable {
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, HttpObject message) {
             if (message instanceof HttpResponse response) {
+                if (response.decoderResult().isFailure()) {
+                    // The decoder stands in a placeholder head (status 999) for bytes that were no
+                    // HTTP response head. It is never forwarded: the client makes up no head.
+                    exchange.fail(new IOException("invalid upstream HTTP response head",
+                            response.decoderResult().cause()), HttpRouteFailure.PROTOCOL_ERROR);
+                    ctx.close();
+                    return;
+                }
                 HttpResponseStatus status = response.status();
                 informational = status.code() >= 100 && status.code() < 200 && status.code() != 101;
                 if (!informational) {
                     if (responseStarted) {
-                        exchange.fail(new IOException("duplicate upstream HTTP response head"));
+                        exchange.fail(new IOException("duplicate upstream HTTP response head"), null);
                         ctx.close();
                         return;
                     }
@@ -528,7 +643,8 @@ final class HttpStreamForwarder implements Runnable {
                     return;
                 }
                 if (!responseStarted) {
-                    exchange.fail(new IOException("upstream HTTP content arrived before response head"));
+                    exchange.fail(new IOException("upstream HTTP content arrived before response head"),
+                            HttpRouteFailure.PROTOCOL_ERROR);
                     ctx.close();
                     return;
                 }
@@ -543,14 +659,19 @@ final class HttpStreamForwarder implements Runnable {
             }
         }
 
+        /**
+         * Before the response head, a close is the target ending the exchange without an answer.
+         * The classification only counts while no head has been forwarded; after that the stream
+         * is reset without one.
+         */
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            exchange.fail(new IOException("upstream HTTP connection closed"));
+            exchange.fail(new IOException("upstream HTTP connection closed"), HttpRouteFailure.PROTOCOL_ERROR);
         }
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            exchange.fail(cause);
+            exchange.fail(cause, HttpRouteFailureClassifier.exchangeFailure(cause));
             ctx.close();
         }
     }

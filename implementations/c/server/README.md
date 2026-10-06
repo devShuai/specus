@@ -37,6 +37,17 @@ Java's ID-token validation or local sign-in (see below). With `SPECUS_DATABASE_P
 machine/user-bound client identity, write a `HTTP_AUTHENTICATED` row to `specus_client_session`,
 and issue a runtime `cs_` token that the control-channel login later promotes to `NETTY_ONLINE`.
 The environment-token mode is a local smoke-test fixture, not an alternate wire protocol.
+In both modes a login whose signature verifies consumes its `(apiKey, nonce)` pair, as
+`protocol/spec/client-auth.md` requires: the same pair again within 120 s gets Java's
+`400 {"error":"客户端签名 nonce 已使用"}` and no token; a request whose signature fails consumes nothing.
+The digests live in process memory (Java and Go keep them in the database): at most 65536 at a time,
+expiring by the same wall clock as the +-60 s timestamp window, and a full store answers
+`503` with `Retry-After` rather than evicting a pair that could still be replayed. Being per process,
+they are not shared between C server instances and do not survive a restart; the timestamp window
+limits a replay after a restart to requests signed in the preceding 60 s.
+The login response carries `nettyTls`, derived as Java and Go derive it: `true` when
+`SPECUS_TLS_MODE` is `file` or `self-signed`, or `SPECUS_TLS_TERMINATED_UPSTREAM=true`. Clients
+whose `controlTls.enabled` is unset follow it.
 
 ## Build
 
@@ -194,6 +205,10 @@ stored only as SHA-256 digests; management responses expose `authPasswordConfigu
 password or digest. Authentication runs before HTTP request bodies and WebSocket upgrades, and a
 successful protected request has its outer `Authorization` header removed before tunnel forwarding
 and traffic-detail capture. Environment-only routes remain public for compatibility.
+The ingress fails closed before any of that: a request enters the tunnel only for a route the
+server defines, an enabled SQLite row of an enabled client or a `SPECUS_HTTP_ROUTES` entry (with a
+database, of an enabled client). Anything else, a deleted route the client may still forward
+included, is a `404` and never reaches the data connection.
 SQLite-backed routes also persist the Java-compatible `insecureSkipVerify` flag. It is returned by
 the management API and included in both `/api/client/auth/login.httpSpecusConfigList` and
 `NAT_CONTROL.httpSpecusConfigList`; omitted values and environment-only routes default to `false`.
@@ -310,7 +325,14 @@ the same right-to-left trusted-proxy resolver.
 The login and refresh responses use the Java-shaped `accessToken/tokenType/expiresIn` fields. The
 token is a local HS256 JWT with `iss=specus`, `sub`, `tenant_id`, `role`, `iat`, and `exp`;
 real HTTP requests to `/api/admin/**` and `/auth/refresh` must include it as
-`Authorization: Bearer <token>`. The C unit-test convenience wrappers still allow an implicit
+`Authorization: Bearer <token>`. As in Java's `ManagementContextResolver`, the token only names
+the account: every authenticated request and every refresh re-reads it (one read-only SQLite
+query, not cached). The built-in admin must still be allowed to sign in with its password; a stored
+user must exist, be enabled and still belong to the token's tenant; tenant, role and admin rights
+come from the record as it is now. Otherwise requests get `403 {"error":"账号未绑定、已禁用或权限已撤销"}`
+and refresh gets `401 {"error":"账号已禁用、不存在或不再允许本地登录"}`; an unreadable user store
+answers `500`. Refresh issues the new token from the current record, so a demoted admin is
+refreshed as `USER`. The C unit-test convenience wrappers still allow an implicit
 built-in admin context so existing smoke tests can exercise endpoint bodies without hand-building
 headers.
 Client, startup credential, TCP mapping, HTTP route, connection record, archived connection-stat,
@@ -420,6 +442,17 @@ state machine aligned with the Java/Go/.NET servers:
   RST closes the browser with `1011`; a CLOSE that cannot get NAT credit within 5 seconds resets the
   stream. `tests/direct_websocket_tests.c` drives all of this through a real listener.
 
+Every NAT stream on the data connection follows the stream lifecycle rules of
+`protocol/spec/control-protocol.md`, aligned with Java `NatServerHandler` and Go: a frame one stream
+cannot take resets only that stream (`RST` 8 for an invalid HTTP response frame, 4 for an HTTP
+response over 64 MiB, 7 for TCP DATA after FIN, a second FIN or DATA/FIN for an unknown stream, 6
+when the 4 MiB client-to-public queue overflows), and `DATA|END_STREAM` is DATA followed by FIN. Each
+data connection remembers its 1024 most recently closed stream ids so a late `RST` is ignored; an
+`RST` for a stream that was never opened, a `WINDOW_UPDATE` beyond the 16 MiB window and a NAT type a
+client never sends close the data connection. A data connection holds at most 1024 pending HTTP
+streams (the next request gets `502`), and request bodies over 16 MiB get `413`.
+`tests/nat_stream_tests.c` checks each rule against a real server process.
+
 The C
 implementation currently provides the basic data bridge, summary traffic accounting,
 SQLite-backed detail capture/query path, Java-shaped DB credential startup login, and
@@ -472,9 +505,18 @@ Security skeleton endpoints:
 The control/data listener supports disabled, PKCS#12/PEM file, and ephemeral self-signed TLS modes.
 TLS 1.2 is the minimum. Production rejects self-signed TLS and plaintext public binds; plaintext
 behind a trusted L4 TLS terminator is accepted only when the process binds loopback/private space and
-`SPECUS_TLS_TERMINATED_UPSTREAM=true` is explicit. `tls_transport_tests` covers that deployment gate,
-the environment parsing, a TLS 1.2+ self-signed handshake over a socket pair and loading a PKCS#12
-bundle. Loading a PEM certificate/key and a client connecting to the TLS listener have no test yet.
+`SPECUS_TLS_TERMINATED_UPSTREAM=true` is explicit. Production here means `SPECUS_ENV=prod`, an unset
+or unrecognised `SPECUS_ENV`, or `SPECUS_TLS_REQUIRE_ENCRYPTION=true`; a rejected configuration
+exits with status 1 and `TLS configuration rejected: ...` before any listener opens.
+
+What is tested: `tls_transport_tests` loads PKCS#12, and PEM as separate certificate/key, a chain
+file, one combined PEM keystore and an encrypted key, and runs handshakes where an OpenSSL client
+verifies the CA-signed chain and the host name, and refuses another CA or another name.
+`tls_deployment_e2e.sh` (CTest and `make test`) starts the real binary with each refused
+combination and checks the exit status and message, starts it with PEM file TLS, and verifies that
+listener with `openssl s_client`. `tls_client_e2e.sh` (below) runs the Java, Go and .NET clients
+against it. Not tested: PKCS#12 or self-signed listeners with a real client, production certificates
+from a public CA, and TLS terminated by an actual L4 proxy.
 
 ## End-to-End Smoke Tests
 
@@ -514,6 +556,21 @@ the app, a 6 MiB download, a streamed response, POST, a 2 MiB upload and a chunk
 byte-for-byte; a small RFC 6455 client checks the app's greeting, UTF-8 text, binary, a 1.5 MiB
 binary frame, a fragmented message with a ping between its fragments, and a close handshake started
 from each side.
+
+Control/data TLS with a real client:
+
+```bash
+bash implementations/c/server/scripts/tls_client_e2e.sh
+```
+
+The script makes a throwaway CA and a certificate for `specus-c.test` with the openssl CLI and runs
+the server with PEM file TLS and `SPECUS_TLS_REQUIRE_ENCRYPTION=true`. The host name never resolves:
+clients dial the advertised `nettyHost` 127.0.0.1 and check the certificate against
+`controlTls.serverName`. The signed login must return `"nettyTls":true` and refuse its own replay.
+A client with no `controlTls` settings must follow `nettyTls` into TLS and fail verification, as
+must one trusting another CA and one expecting `wrong.specus-c.test`, without any login reaching the
+server; with the test CA and `serverName` the control and data connections log in over TLS and
+256 KiB make a round trip through a TCP mapping.
 
 Every script takes `SPECUS_CLIENT_COMMAND` (another client binary, for example the Go client or
 `dotnet specus-client.dll`), `SPECUS_CLIENT_LABEL`, and `SPECUS_SMOKE_REUSE_BUILD=1` to reuse a server

@@ -1,6 +1,11 @@
 package com.theshuai.specusserver.http;
 
+import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.service.ClientAccountService;
+import com.theshuai.specusserver.management.service.HttpRouteService;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 
@@ -33,6 +38,22 @@ class HttpWebSocketRoutingTests {
 
     @Value("${local.server.port}")
     private int port;
+
+    @Autowired private ClientAccountService clientAccountService;
+    @Autowired private ClientAccountRepository clientAccountRepository;
+    @Autowired private HttpRouteService httpRouteService;
+
+    /** The public entry only admits routes the server has a record of, so the tests' route exists. */
+    @BeforeEach
+    void ensureOfflineClientRoute() {
+        if (clientAccountRepository.findByClientName("offline-client").isPresent()) {
+            return;
+        }
+        clientAccountService.createClient(new ClientAccountService.ClientMutation("offline-client", true, 0));
+        long clientId = clientAccountRepository.findByClientName("offline-client").orElseThrow().getId();
+        httpRouteService.createRoute(clientId,
+                new HttpRouteService.RouteMutation("route", "http://127.0.0.1:8080", true));
+    }
 
     @Test
     void websocketUpgradeUsesTunnelHandlerInsteadOfHttpController() throws Exception {

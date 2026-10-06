@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "admin_http.h"
+#include "client_auth_nonce.h"
 #include "client_package.h"
 #include "crypto.h"
 #include "json.h"
@@ -60,6 +61,213 @@ static void sign_client_auth(const char *api_key,
 static int contains(const char *haystack, const char *needle)
 {
     return strstr(haystack, needle) != NULL;
+}
+
+/* Logs a stored management user in and returns "Bearer <token>" in authorization. */
+static int management_login(const char *username, const char *password, char *authorization, size_t len)
+{
+    static char response[65536];
+    char body[256];
+    snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
+    int written = st_admin_build_response_with_body("POST", "/auth/login", body, response, sizeof(response));
+    char *token = written > 0 && contains(response, "200 OK") ? st_json_get_string(response, "accessToken") : NULL;
+    if (token == NULL) {
+        fprintf(stderr, "management login for %s failed: %s\n", username, response);
+        return -1;
+    }
+    snprintf(authorization, len, "Bearer %s", token);
+    free(token);
+    return 0;
+}
+
+static int expect_with_token(const char *what, const char *method, const char *path,
+                             const char *authorization, const char *status, const char *needle)
+{
+    static char response[65536];
+    int len = st_admin_build_response_with_auth(method, path, authorization, NULL, response, sizeof(response));
+    if (len <= 0 || !contains(response, status) || (needle != NULL && !contains(response, needle))) {
+        fprintf(stderr, "%s: expected %s%s%s, got: %.300s\n", what, status,
+                needle == NULL ? "" : " with ", needle == NULL ? "" : needle, response);
+        return 1;
+    }
+    return 0;
+}
+
+static int update_management_user(const char *username, const char *body)
+{
+    static char response[65536];
+    char path[128];
+    snprintf(path, sizeof(path), "/api/admin/users/%s", username);
+    int len = body == NULL
+        ? st_admin_build_response("DELETE", path, response, sizeof(response))
+        : st_admin_build_response_with_body("PUT", path, body, response, sizeof(response));
+    if (len <= 0 || (!contains(response, "200 OK") && !contains(response, "204 No Content"))) {
+        fprintf(stderr, "management user change for %s failed: %s\n", username, response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * A management token names an account; it does not freeze the account's rights. Like Java's
+ * ManagementContextResolver every request and every refresh re-reads the user: a disabled or
+ * deleted user is refused at once (403 on requests, 401 on refresh, with Java's bodies), and a
+ * demoted admin loses the admin endpoints on its next request and is refreshed as USER.
+ * Expects SPECUS_DATABASE_PATH to be set.
+ */
+static int test_management_token_follows_user_record(void)
+{
+    static char response[65536];
+    const char *gone = "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}";
+    const char *refresh_gone = "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}";
+    if (st_admin_build_response_with_body("POST", "/api/admin/users",
+            "{\"username\":\"dora\",\"password\":\"dora-secret\",\"role\":\"ADMIN\",\"enabled\":true}",
+            response, sizeof(response)) <= 0 || !contains(response, "201 Created")
+        || st_admin_build_response_with_body("POST", "/api/admin/users",
+            "{\"username\":\"evan\",\"password\":\"evan-secret\",\"role\":\"USER\",\"enabled\":true}",
+            response, sizeof(response)) <= 0 || !contains(response, "201 Created")) {
+        fprintf(stderr, "management token test users could not be created: %s\n", response);
+        return 1;
+    }
+    char dora[2300];
+    char evan[2300];
+    if (management_login("dora", "dora-secret", dora, sizeof(dora)) != 0
+        || management_login("evan", "evan-secret", evan, sizeof(evan)) != 0
+        || expect_with_token("admin before demotion", "GET", "/api/admin/users", dora, "200 OK", NULL)
+        || expect_with_token("user before disable", "GET", "/api/admin/me", evan, "200 OK", "\"admin\":false")) {
+        return 1;
+    }
+
+    /* Demoted: the old ADMIN token loses the admin endpoints, and refresh issues a USER token. */
+    if (update_management_user("dora", "{\"role\":\"USER\"}")
+        || expect_with_token("demoted admin, admin endpoint", "GET", "/api/admin/users", dora,
+                             "403 Forbidden", "需要 admin 权限")
+        || expect_with_token("demoted admin, me", "GET", "/api/admin/me", dora, "200 OK", "\"admin\":false")) {
+        return 1;
+    }
+    int len = st_admin_build_response_with_auth("POST", "/auth/refresh", dora, NULL, response, sizeof(response));
+    char *refreshed = len > 0 && contains(response, "200 OK") ? st_json_get_string(response, "accessToken") : NULL;
+    st_security_token_claims claims;
+    int refreshed_as_user = refreshed != NULL
+        && st_security_validate_local_token(refreshed, getenv("SPECUS_AUTH_JWT_SECRET"),
+                                            "default", "admin-user", &claims) == 0
+        && strcmp(claims.role, "USER") == 0;
+    free(refreshed);
+    if (!refreshed_as_user) {
+        fprintf(stderr, "demoted admin was not refreshed as USER: %.300s\n", response);
+        return 1;
+    }
+
+    /* Disabled: every request is refused, and so is refresh. */
+    if (update_management_user("evan", "{\"enabled\":false}")
+        || expect_with_token("disabled user, me", "GET", "/api/admin/me", evan, "403 Forbidden", gone)
+        || expect_with_token("disabled user, clients", "GET", "/api/admin/clients", evan, "403 Forbidden", gone)
+        || expect_with_token("disabled user, refresh", "POST", "/auth/refresh", evan, "401 Unauthorized",
+                             refresh_gone)) {
+        return 1;
+    }
+    /* Re-enabled, the same token works again: nothing about the account was frozen into it. */
+    if (update_management_user("evan", "{\"enabled\":true}")
+        || expect_with_token("re-enabled user", "GET", "/api/admin/me", evan, "200 OK", "\"username\":\"evan\"")) {
+        return 1;
+    }
+
+    /* Deleted: refused, refresh included. */
+    if (update_management_user("dora", NULL)
+        || update_management_user("evan", NULL)
+        || expect_with_token("deleted user, me", "GET", "/api/admin/me", dora, "403 Forbidden", gone)
+        || expect_with_token("deleted user, refresh", "POST", "/auth/refresh", dora, "401 Unauthorized",
+                             refresh_gone)
+        || expect_with_token("deleted user, me", "GET", "/api/admin/me", evan, "403 Forbidden", gone)) {
+        return 1;
+    }
+
+    /* A token that names a user the server never had, signed with the server's key. */
+    char token[2048];
+    char ghost[2300];
+    if (st_security_issue_local_token("ghost", "tenant-admin", "ADMIN", getenv("SPECUS_AUTH_JWT_SECRET"),
+                                      600, token, sizeof(token)) != 0) {
+        return 1;
+    }
+    snprintf(ghost, sizeof(ghost), "Bearer %s", token);
+    if (expect_with_token("unknown user with an ADMIN claim", "GET", "/api/admin/users", ghost,
+                          "403 Forbidden", gone)) {
+        return 1;
+    }
+
+    /* The built-in admin keeps its rights only while it may still sign in with its password. */
+    char builtin[2300];
+    if (st_security_issue_local_token("admin-user", "tenant-admin", "ADMIN", getenv("SPECUS_AUTH_JWT_SECRET"),
+                                      600, token, sizeof(token)) != 0) {
+        return 1;
+    }
+    snprintf(builtin, sizeof(builtin), "Bearer %s", token);
+    char *saved_password = getenv("SPECUS_AUTH_PASSWORD") == NULL ? NULL : strdup(getenv("SPECUS_AUTH_PASSWORD"));
+    setenv("SPECUS_AUTH_PASSWORD", "builtin-admin-password", 1);
+    int failed = expect_with_token("built-in admin", "GET", "/api/admin/users", builtin, "200 OK", NULL);
+    setenv("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", "false", 1);
+    failed = failed
+        || expect_with_token("built-in admin, password login off", "GET", "/api/admin/users", builtin,
+                             "403 Forbidden", gone)
+        || expect_with_token("built-in admin, password login off, refresh", "POST", "/auth/refresh", builtin,
+                             "401 Unauthorized", refresh_gone);
+    unsetenv("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED");
+    if (saved_password == NULL) {
+        unsetenv("SPECUS_AUTH_PASSWORD");
+    } else {
+        setenv("SPECUS_AUTH_PASSWORD", saved_password, 1);
+        free(saved_password);
+    }
+    return failed;
+}
+
+/*
+ * nettyTls in the login response follows the control listener's TLS settings the way Java and Go
+ * derive it (protocol/spec/client-auth.md): any TLS mode, or TLS terminated by a trusted upstream.
+ * Without it clients with controlTls.enabled unset connect in plaintext to a TLS listener.
+ */
+static int test_client_auth_netty_tls(void)
+{
+    static const struct {
+        const char *mode;
+        const char *terminated_upstream;
+        const char *expected;
+    } cases[] = {
+        {NULL, NULL, "\"nettyTls\":false"},
+        {"disabled", "false", "\"nettyTls\":false"},
+        {"file", NULL, "\"nettyTls\":true"},
+        {"self-signed", NULL, "\"nettyTls\":true"},
+        {" SELF_SIGNED ", NULL, "\"nettyTls\":true"},
+        {NULL, "true", "\"nettyTls\":true"},
+    };
+    static char response[65536];
+    setenv("SPECUS_CLIENT_ACCESS_TOKEN", "tls-runtime-token", 1);
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]) && !failed; ++i) {
+        if (cases[i].mode == NULL) {
+            unsetenv("SPECUS_TLS_MODE");
+        } else {
+            setenv("SPECUS_TLS_MODE", cases[i].mode, 1);
+        }
+        if (cases[i].terminated_upstream == NULL) {
+            unsetenv("SPECUS_TLS_TERMINATED_UPSTREAM");
+        } else {
+            setenv("SPECUS_TLS_TERMINATED_UPSTREAM", cases[i].terminated_upstream, 1);
+        }
+        int len = st_admin_build_response("POST", "/api/client/auth/login", response, sizeof(response));
+        if (len <= 0 || !contains(response, "200 OK") || !contains(response, cases[i].expected)
+            || !contains(response, "\"nettyPort\":7010,\"nettyTls\":")) {
+            fprintf(stderr, "client auth nettyTls mismatch for mode=%s terminatedUpstream=%s: %s\n",
+                    cases[i].mode == NULL ? "(unset)" : cases[i].mode,
+                    cases[i].terminated_upstream == NULL ? "(unset)" : cases[i].terminated_upstream,
+                    response);
+            failed = 1;
+        }
+    }
+    unsetenv("SPECUS_TLS_MODE");
+    unsetenv("SPECUS_TLS_TERMINATED_UPSTREAM");
+    unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    return failed;
 }
 
 static long long nat_control_expected_client_id = 0;
@@ -2133,8 +2341,36 @@ static int connection_events_silent(int fd, const char *label)
     return -1;
 }
 
+/*
+ * Management tokens are re-resolved against the user table on every request, so the users these
+ * sessions sign as have to exist, enabled, in the tenant their token names.
+ */
+static int connection_events_ensure_user(const char *username, const char *tenant, const char *role)
+{
+    const char *db_path = getenv("SPECUS_DATABASE_PATH");
+    st_storage_management_user user;
+    if (db_path == NULL || db_path[0] == '\0') {
+        fprintf(stderr, "connection events need SPECUS_DATABASE_PATH\n");
+        return -1;
+    }
+    if (st_storage_get_management_user(db_path, username, &user) == 0) {
+        return 0;
+    }
+    if (st_storage_create_management_user(db_path, username, tenant, "unused-password-hash", role, 1, &user) != 0) {
+        fprintf(stderr, "connection events user %s/%s setup failed\n", tenant, username);
+        return -1;
+    }
+    return 0;
+}
+
 static int test_connection_events_websocket(long long owned_client_id)
 {
+    if (connection_events_ensure_user("owner-db", "tenant-db", "USER") != 0
+        || connection_events_ensure_user("someone-else", "tenant-db", "USER") != 0
+        || connection_events_ensure_user("events-admin-other", "tenant-other", "ADMIN") != 0) {
+        return 1;
+    }
+
     st_admin_server server;
     memset(&server, 0, sizeof(server));
     server.fd = -1;
@@ -2183,7 +2419,7 @@ static int test_connection_events_websocket(long long owned_client_id)
     }
     owner = connection_events_open(port, "owner-db", "tenant-db", "USER");
     stranger = connection_events_open(port, "someone-else", "tenant-db", "USER");
-    other_tenant = connection_events_open(port, "admin", "tenant-other", "ADMIN");
+    other_tenant = connection_events_open(port, "events-admin-other", "tenant-other", "ADMIN");
     if (owner < 0 || stranger < 0 || other_tenant < 0) goto cleanup;
 
     /* Another tenant's event, then a created/updated pair of the owner's client, then a
@@ -2366,7 +2602,12 @@ static int test_admin_endpoint_contracts(void)
         || st_storage_upsert_client(db_path, 0, "tenant-a", "endpoint-bravo", "bob", 1, 60, &bravo) != 0
         || st_storage_upsert_client(db_path, 0, "tenant-b", "endpoint-charlie", "alice", 1, 60, &charlie) != 0
         || st_storage_create_mapping_for_client(db_path, alpha.id, 18080, "127.0.0.1", 8080, 1, 0, &mapping) != 0
-        || st_storage_create_mapping_for_client(db_path, alpha.id, 18081, "127.0.0.1", 8081, 0, 0, &mapping) != 0;
+        || st_storage_create_mapping_for_client(db_path, alpha.id, 18081, "127.0.0.1", 8081, 0, 0, &mapping) != 0
+        /* Tokens are re-resolved against the user table, so the callers below have to exist. */
+        || connection_events_ensure_user("alice", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("bob", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
     if (failed) fprintf(stderr, "admin endpoint fixture setup failed\n");
     int len = 0;
 
@@ -2402,7 +2643,7 @@ static int test_admin_endpoint_contracts(void)
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh of another owner's client") != 0;
     }
     if (!failed) {
-        len = endpoint_call("POST", path, "root", "tenant-b", "ADMIN", response, sizeof(response));
+        len = endpoint_call("POST", path, "root-b", "tenant-b", "ADMIN", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh from another tenant") != 0
             || endpoint_push_calls != 2;
     }
@@ -2472,7 +2713,7 @@ static int test_admin_endpoint_contracts(void)
                                  "exchange detail for another owner") != 0;
     }
     if (!failed) {
-        len = endpoint_call("GET", path, "root", "tenant-b", "ADMIN", response, sizeof(response));
+        len = endpoint_call("GET", path, "root-b", "tenant-b", "ADMIN", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "exchange detail from another tenant") != 0;
     }
     if (!failed) {
@@ -2511,7 +2752,7 @@ static int test_admin_endpoint_contracts(void)
         failed = endpoint_body_equals(len, response, expected, "egress activity of the tenant") != 0;
     }
     if (!failed) {
-        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "root", "tenant-b", "ADMIN",
+        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "root-b", "tenant-b", "ADMIN",
                             response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"egressClientName\":\"endpoint-charlie\"",
                                  "egress activity of another tenant") != 0
@@ -2572,6 +2813,120 @@ static int test_log_safe_reason(void)
         || st_admin_log_safe_reason(NULL, tiny, sizeof(tiny)) != 0U || tiny[0] != '\0') {
         fprintf(stderr, "log-safe reason bounds mismatch: %s\n", tiny);
         return 1;
+    }
+    return 0;
+}
+
+/* Sends one request and checks its status and how many HTTP/WS dispatches it caused. */
+static int route_auth_expect(int port,
+                             route_auth_test_context *context,
+                             const char *label,
+                             const char *request,
+                             const char *status,
+                             int http_calls,
+                             int ws_calls,
+                             int authorization_headers)
+{
+    char response[8192];
+    route_auth_test_context_reset(context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, status)
+        || !route_auth_test_context_matches(context, http_calls, ws_calls, authorization_headers)) {
+        fprintf(stderr, "%s: want %s and %d/%d dispatches, got %.160s\n",
+                label, status, http_calls, ws_calls, response);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * The fake dispatcher forwards every route it is handed, the way a client still holding a stale
+ * route list would, so only the server's own records may decide what gets through. Leaves
+ * SPECUS_HTTP_ROUTES set and may leave SPECUS_DATABASE_PATH unset; the caller restores both.
+ */
+static int test_direct_http_route_fails_closed(const char *database_path,
+                                               int port,
+                                               route_auth_test_context *context,
+                                               const st_storage_http_route *protected_route)
+{
+    static const char doomed_get[] =
+        "GET /http/C%20managed%202/doomed/secret HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    static const char doomed_ws[] =
+        "GET /http/C%20managed%202/doomed/socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    static const char never_created[] =
+        "GET /http/C%20managed%202/never-created/ HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    static const char protected_with_credentials[] =
+        "GET /http/C%20managed%202/api/items HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n";
+
+    st_storage_client managed;
+    st_storage_client changed;
+    st_storage_http_route doomed;
+    if (st_storage_get_client_by_name(database_path, "C managed 2", &managed) != 0
+        || st_storage_create_http_route_for_client(database_path, managed.id, "doomed",
+                                                   "http://127.0.0.1:8080", 1, 0, 0, 0, 0, 1,
+                                                   protected_route->auth_username,
+                                                   protected_route->auth_password_hash,
+                                                   &doomed) != 0) {
+        fprintf(stderr, "fail-closed route fixture failed\n");
+        return -1;
+    }
+    /* A protected route deleted while the client still forwards it is refused, never anonymous. */
+    if (route_auth_expect(port, context, "protected route before delete", doomed_get,
+                          "401 Unauthorized", 0, 0, 0) != 0
+        || st_storage_delete_http_route_by_id(database_path, doomed.id) != 0
+        || route_auth_expect(port, context, "deleted protected route", doomed_get,
+                             "404 Not Found", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "deleted protected websocket route", doomed_ws,
+                             "404 Not Found", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "route never created", never_created,
+                             "404 Not Found", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "path without a route",
+                             "GET /http/C%20managed%202 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                             "404 Not Found", 0, 0, 0) != 0) {
+        return -1;
+    }
+
+    /* Every route of a disabled client is refused, valid credentials or not. */
+    int disabled = st_storage_upsert_client(database_path, managed.id, managed.tenant_id, managed.client_name,
+                                            managed.owner_username, 0, managed.connection_rate_limit_per_minute,
+                                            &changed) == 0
+        && route_auth_expect(port, context, "protected route of a disabled client", protected_with_credentials,
+                             "404 Not Found", 0, 0, 0) == 0;
+    int restored = st_storage_upsert_client(database_path, managed.id, managed.tenant_id, managed.client_name,
+                                            managed.owner_username, 1, managed.connection_rate_limit_per_minute,
+                                            &changed) == 0;
+    if (!disabled || !restored
+        || route_auth_expect(port, context, "protected route of a re-enabled client", protected_with_credentials,
+                             "200 OK", 1, 0, 0) != 0) {
+        return -1;
+    }
+
+    /* SPECUS_HTTP_ROUTES entries are server-defined and public, for an enabled account with a
+     * database and for anyone without one; any other route stays refused. */
+    setenv("SPECUS_HTTP_ROUTES", "envapi=http://127.0.0.1:8080", 1);
+    static const char env_route[] =
+        "GET /http/C%20managed%202/envapi/items HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n";
+    static const char env_route_unknown_client[] =
+        "GET /http/Env/envapi/items HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n";
+    static const char not_env_route[] =
+        "GET /http/Env/api/items HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    if (route_auth_expect(port, context, "environment route with a database", env_route,
+                          "200 OK", 1, 0, 1) != 0
+        || route_auth_expect(port, context, "environment route of a client without an account",
+                             env_route_unknown_client, "404 Not Found", 0, 0, 0) != 0) {
+        return -1;
+    }
+    unsetenv("SPECUS_DATABASE_PATH");
+    if (route_auth_expect(port, context, "database-free environment route", env_route_unknown_client,
+                          "200 OK", 1, 0, 1) != 0
+        || route_auth_expect(port, context, "database-free route outside the environment list", not_env_route,
+                             "404 Not Found", 0, 0, 0) != 0) {
+        return -1;
     }
     return 0;
 }
@@ -2874,39 +3229,12 @@ static int test_direct_http_route_authentication(const char *database_path)
     }
 
     setenv("SPECUS_DATABASE_PATH", database_path, 1);
-    setenv("SPECUS_HTTP_ROUTES", "api=http://127.0.0.1:8080", 1);
-    snprintf(request,
-             sizeof(request),
-             "GET /http/Env/api/items HTTP/1.1\r\nHost: localhost\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n");
-    route_auth_test_context_reset(&context);
-    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
-        || !contains(response, "200 OK")
-        || !route_auth_test_context_matches(&context, 1, 0, 1)) {
-        fprintf(stderr, "database-unmanaged environment route compatibility mismatch\n");
-        unsetenv("SPECUS_HTTP_ROUTES");
-        route_auth_stop_server(&server);
-        pthread_mutex_destroy(&context.lock);
-        return 1;
-    }
-
-    unsetenv("SPECUS_DATABASE_PATH");
-    route_auth_test_context_reset(&context);
-    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
-        || !contains(response, "200 OK")
-        || !route_auth_test_context_matches(&context, 1, 0, 1)) {
-        fprintf(stderr, "database-free environment route compatibility mismatch\n");
-        setenv("SPECUS_DATABASE_PATH", database_path, 1);
-        unsetenv("SPECUS_HTTP_ROUTES");
-        route_auth_stop_server(&server);
-        pthread_mutex_destroy(&context.lock);
-        return 1;
-    }
-    setenv("SPECUS_DATABASE_PATH", database_path, 1);
+    int closed_ok = test_direct_http_route_fails_closed(database_path, port, &context, &route);
     unsetenv("SPECUS_HTTP_ROUTES");
+    setenv("SPECUS_DATABASE_PATH", database_path, 1);
     route_auth_stop_server(&server);
     pthread_mutex_destroy(&context.lock);
-    return 0;
+    return closed_ok == 0 ? 0 : 1;
 }
 
 typedef struct {
@@ -3492,6 +3820,9 @@ int main(void)
     unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
     unsetenv("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS");
     unsetenv("SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES");
+    if (test_client_auth_netty_tls() != 0) {
+        return 1;
+    }
 
     setenv("SPECUS_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
     setenv("SPECUS_CLIENT_API_KEY", "demo-api", 1);
@@ -3510,6 +3841,39 @@ int main(void)
     len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"accessToken\":\"dev-runtime-token\"")) {
         fprintf(stderr, "client auth signed login response mismatch\n");
+        return 1;
+    }
+    /* The same signed request again is a replay: refused as Java refuses it, with no token. */
+    len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "{\"error\":\"客户端签名 nonce 已使用\"}")
+        || contains(response, "accessToken")) {
+        fprintf(stderr, "client auth replayed environment login was not rejected: %s\n", response);
+        return 1;
+    }
+    /* A request whose signature fails consumes nothing: its nonce still works once signed. */
+    snprintf(timestamp, sizeof(timestamp), "%lld", test_now_millis());
+    snprintf(body,
+             sizeof(body),
+             "{\"apiKey\":\"demo-api\",\"timestamp\":\"%s\",\"nonce\":\"nonce-2\","
+             "\"signature\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+             "\"environment\":{\"machineFingerprint\":\"m_test\",\"osUser\":\"tester\"}}",
+             timestamp);
+    len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "401 Unauthorized")) {
+        fprintf(stderr, "client auth bad signature with a fresh nonce was not rejected\n");
+        return 1;
+    }
+    sign_client_auth("demo-api", timestamp, "nonce-2", "m_test", "tester", "test1234", signature);
+    snprintf(body,
+             sizeof(body),
+             "{\"apiKey\":\"demo-api\",\"timestamp\":\"%s\",\"nonce\":\"nonce-2\",\"signature\":\"%s\","
+             "\"environment\":{\"machineFingerprint\":\"m_test\",\"osUser\":\"tester\"}}",
+             timestamp,
+             signature);
+    len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "client auth nonce was consumed by a request whose signature failed\n");
         return 1;
     }
     len = st_admin_build_response_with_body("POST",
@@ -3568,14 +3932,30 @@ int main(void)
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
              signature);
+    /* The control listener runs TLS here, which the database login advertises too. */
+    setenv("SPECUS_TLS_MODE", "file", 1);
     len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    unsetenv("SPECUS_TLS_MODE");
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"tenantId\":\"tenant-db\"")
         || !contains(response, "\"accessToken\":\"cs_")
+        || !contains(response, "\"nettyTls\":true")
         || !contains(response, "\"maxOnlineInstances\":4")
         || !contains(response, "db-host-db-user-")) {
         fprintf(stderr, "client auth database login response mismatch\n");
         return 1;
+    }
+    {
+        /* Replaying the database login must not mint a second session. */
+        static char replay[65536];
+        int replay_len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body,
+                                                           replay, sizeof(replay));
+        if (replay_len <= 0 || !contains(replay, "400 Bad Request")
+            || !contains(replay, "{\"error\":\"客户端签名 nonce 已使用\"}")
+            || contains(replay, "accessToken")) {
+            fprintf(stderr, "client auth replayed database login was not rejected: %s\n", replay);
+            return 1;
+        }
     }
     int runtime_client_id = 0;
     int runtime_client_session_id = 0;
@@ -4369,6 +4749,9 @@ int main(void)
         return 1;
     }
     free(alice_token);
+    if (test_management_token_follows_user_record() != 0) {
+        return 1;
+    }
     len = st_admin_build_response_with_body("PUT",
                                             "/api/admin/users/alice",
                                             "{\"role\":\"ADMIN\",\"enabled\":false}",

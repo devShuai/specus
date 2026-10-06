@@ -831,9 +831,15 @@ func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base Ru
 		mesh.mergeRoster(message.Peers)
 		mesh.announceCandidates()
 	case peerControlTypeSessionGrant:
+		if !mesh.acceptsSessionSignal(message) {
+			return
+		}
 		mesh.mergeSession(message)
 		mesh.announceCandidates()
 	case peerControlTypeCandidates:
+		if !mesh.acceptsSessionSignal(message) {
+			return
+		}
 		mesh.mergePeerFromSignal(message)
 		mesh.mergeSession(message)
 		mesh.sendConnectivityChecks(message)
@@ -849,6 +855,33 @@ func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base Ru
 	default:
 		mesh.logger.Printf("ignored peer-control message type=%q", message.Type)
 	}
+}
+
+// acceptsSessionSignal says whether a session-grant or candidates message can be taken now: only
+// while the mesh runs. Before the peer-config that enables the device has been applied, or after
+// one that disabled it, there is no socket to probe from and no session table to keep the session
+// in, and the next full start clears that table anyway. The server pushes the peer-config from one
+// thread and the session signals from another, so a signal can overtake the config that enables
+// its device. It is dropped, as the Java client does, and nothing is lost by that: once the mesh
+// runs it announces its candidates to the peers its roster lists, which has the server grant the
+// session again and the peer answer with its own candidates.
+//
+// close is not held back here: it also revokes the peer's egress flows, and the egress plane can
+// be running before the mesh is.
+func (mesh *peerMeshClient) acceptsSessionSignal(message peerControlMessage) bool {
+	mesh.mu.Lock()
+	running := mesh.isStartedLocked()
+	mesh.mu.Unlock()
+	if running {
+		return true
+	}
+	sessionID := int64(0)
+	if message.SessionID != nil {
+		sessionID = *message.SessionID
+	}
+	mesh.logger.Printf("Peer Mesh %s ignored, mesh not running: session=%d source=%d target=%d",
+		message.Type, sessionID, message.SourceClientID, message.TargetClientID)
+	return false
 }
 
 func (mesh *peerMeshClient) udpLoop(conn *net.UDPConn, stopCh <-chan struct{}) {
@@ -2352,6 +2385,12 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 	}
 	mesh.mu.Lock()
 	defer mesh.mu.Unlock()
+	// No table means the mesh is not running: start makes it under the same lock that opens the
+	// socket, and stop drops it. acceptsSessionSignal turns such a signal away first, but the mesh
+	// can be stopped between that check and this one by a restart on another goroutine.
+	if mesh.sessions == nil {
+		return
+	}
 	peerID := message.TargetClientID
 	peerName := message.TargetClientName
 	peerVirtualIP := message.TargetVirtualIP
@@ -2702,6 +2741,10 @@ func (mesh *peerMeshClient) reciprocateCandidates(peerID int64) {
 		mesh.mu.Unlock()
 		return
 	}
+	// Made by the first start, so nil on a mesh that has never run.
+	if mesh.candidateReciprocateAt == nil {
+		mesh.candidateReciprocateAt = make(map[int64]time.Time)
+	}
 	mesh.candidateReciprocateAt[peerID] = now
 	mesh.mu.Unlock()
 	mesh.announceCandidatesToPeer(peerID)
@@ -2902,6 +2945,12 @@ func (mesh *peerMeshClient) sendProbe(session *peerMeshSession, candidate peerCa
 	}
 	remoteText := net.JoinHostPort(candidate.Address, fmt.Sprintf("%d", candidate.Port))
 	mesh.mu.Lock()
+	// The mesh stopped after udp was taken above: there is no table to match the answer against,
+	// and nothing to probe for.
+	if mesh.pending == nil {
+		mesh.mu.Unlock()
+		return
+	}
 	mesh.pending[nonce] = pendingPeerProbe{SessionID: session.ID, PeerID: session.PeerID, SentAt: time.Now(), Remote: remoteText, Relay: relay, RelayID: candidate.RelayID}
 	mesh.mu.Unlock()
 	if relay {
@@ -2946,6 +2995,11 @@ func (mesh *peerMeshClient) sendDirectKeepalive(session *peerMeshSession, endpoi
 	}
 	body, _ := json.Marshal(probe)
 	mesh.mu.Lock()
+	// The mesh stopped after udp was taken above, as in sendProbe.
+	if mesh.pending == nil {
+		mesh.mu.Unlock()
+		return false
+	}
 	mesh.pending[nonce] = pendingPeerProbe{SessionID: session.ID, PeerID: session.PeerID, SentAt: time.Now(), Remote: endpoint.String()}
 	mesh.mu.Unlock()
 	if _, err := udp.WriteToUDP(body, endpoint); err != nil {
