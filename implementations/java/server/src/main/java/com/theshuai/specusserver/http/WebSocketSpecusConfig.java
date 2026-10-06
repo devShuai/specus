@@ -30,17 +30,24 @@ import org.springframework.web.socket.server.support.WebSocketHandlerMapping;
 public class WebSocketSpecusConfig implements WebSocketConfigurer {
     private final WebSocketSpecusHandler webSocketSpecusHandler;
     private final WebSocketSpecusHandshakeInterceptor handshakeInterceptor;
+    private final HttpShareWebSocketHandshakeInterceptor shareHandshakeInterceptor;
 
     public WebSocketSpecusConfig(WebSocketSpecusHandler webSocketSpecusHandler,
-                                 WebSocketSpecusHandshakeInterceptor handshakeInterceptor) {
+                                 WebSocketSpecusHandshakeInterceptor handshakeInterceptor,
+                                 HttpShareWebSocketHandshakeInterceptor shareHandshakeInterceptor) {
         this.webSocketSpecusHandler = webSocketSpecusHandler;
         this.handshakeInterceptor = handshakeInterceptor;
+        this.shareHandshakeInterceptor = shareHandshakeInterceptor;
     }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(webSocketSpecusHandler, "/http/**")
                 .addInterceptors(handshakeInterceptor)
+                .setAllowedOriginPatterns("*");
+        // Temporary shares reuse the same tunnel handler behind the share decision.
+        registry.addHandler(webSocketSpecusHandler, "/http-share/**")
+                .addInterceptors(shareHandshakeInterceptor)
                 .setAllowedOriginPatterns("*");
     }
 

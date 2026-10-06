@@ -9,6 +9,7 @@ import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -32,11 +33,21 @@ import java.util.UUID;
 public class ManagementUserService {
     private final ManagementUserRepository repository;
     private final AuthProperties authProperties;
+    /** Ends the shares a user can no longer back; absent only in isolated unit tests. */
+    private final HttpShareService httpShareService;
 
     public ManagementUserService(ManagementUserRepository repository,
                                  AuthProperties authProperties) {
+        this(repository, authProperties, null);
+    }
+
+    @Autowired
+    public ManagementUserService(ManagementUserRepository repository,
+                                 AuthProperties authProperties,
+                                 HttpShareService httpShareService) {
         this.repository = repository;
         this.authProperties = authProperties;
+        this.httpShareService = httpShareService;
     }
 
     @Transactional(readOnly = true)
@@ -402,7 +413,11 @@ public class ManagementUserService {
             user.setEnabled(request.enabled());
         }
         user.setUpdatedAt(Instant.now().toString());
-        return toView(repository.save(user));
+        ManagementUserView view = toView(repository.save(user));
+        if (request.role() != null || request.enabled() != null) {
+            endSharesWithoutCreatorAccess(context, user);
+        }
+        return view;
     }
 
     @Transactional
@@ -412,7 +427,21 @@ public class ManagementUserService {
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户不能删除");
         }
-        repository.delete(requireMutableUserInTenant(context, normalized, "delete"));
+        ManagementUser user = requireMutableUserInTenant(context, normalized, "delete");
+        repository.delete(user);
+        endSharesWithoutCreatorAccess(context, user);
+    }
+
+    /**
+     * Same transaction as the user change: the user's own active HTTP shares end when the user can
+     * no longer manage their route. Shares are recorded by login name, and a later user with the
+     * same name must not inherit them.
+     */
+    private void endSharesWithoutCreatorAccess(ManagementContext context, ManagementUser user) {
+        if (httpShareService != null) {
+            httpShareService.onUserChanged(context.username(), TenantContext.normalize(user.getTenantId()),
+                    loginName(user));
+        }
     }
 
     /**

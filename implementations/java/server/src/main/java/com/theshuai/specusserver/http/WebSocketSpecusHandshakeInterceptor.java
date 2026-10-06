@@ -173,7 +173,7 @@ public class WebSocketSpecusHandshakeInterceptor implements HandshakeInterceptor
         }
     }
 
-    private static List<String> collectHeaders(HttpServletRequest request, boolean stripAuthorization) {
+    static List<String> collectHeaders(HttpServletRequest request, boolean stripAuthorization) {
         List<String> headers = new ArrayList<>();
         Enumeration<String> names = request.getHeaderNames();
         while (names != null && names.hasMoreElements()) {
