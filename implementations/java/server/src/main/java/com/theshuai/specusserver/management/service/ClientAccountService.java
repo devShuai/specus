@@ -5,9 +5,11 @@ import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.ClientAccountView;
 import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.DisconnectReason;
+import com.theshuai.specusserver.management.model.HttpRouteMapping;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientNameReferenceRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
+import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.specusserver.management.repository.TrafficTotal;
 import com.theshuai.specusserver.management.repository.TrafficUsageRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
@@ -48,17 +50,23 @@ public class ClientAccountService {
     private final TrafficUsageRepository trafficUsageRepository;
     private final ClientSessionRepository clientSessionRepository;
     private final ClientNameReferenceRepository clientNameReferenceRepository;
+    private final HttpRouteMappingRepository httpRouteMappingRepository;
+    private final HttpShareService httpShareService;
     private final WorkbenchReferences workbenchReferences;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
                                 ClientSessionRepository clientSessionRepository,
                                 ClientNameReferenceRepository clientNameReferenceRepository,
+                                HttpRouteMappingRepository httpRouteMappingRepository,
+                                HttpShareService httpShareService,
                                 WorkbenchReferences workbenchReferences) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
         this.clientNameReferenceRepository = clientNameReferenceRepository;
+        this.httpRouteMappingRepository = httpRouteMappingRepository;
+        this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
     }
 
@@ -146,13 +154,13 @@ public class ClientAccountService {
     @Transactional
     public ClientResult updateClient(TenantContext tenant, long id, ClientMutation request) {
         ClientAccount account = findClientById(tenant, id);
-        return updateClient(tenant, account, request);
+        return updateClient(tenant, account, request, null);
     }
 
     @Transactional
     public ClientResult updateClient(ManagementContext context, long id, ClientMutation request) {
         ClientAccount account = findClientById(context, id);
-        return updateClient(context.tenant(), account, request);
+        return updateClient(context.tenant(), account, request, context.username());
     }
 
     @Transactional(readOnly = true)
@@ -167,8 +175,10 @@ public class ClientAccountService {
         return new ClientNameAvailability(clientName, available);
     }
 
-    private ClientResult updateClient(TenantContext tenant, ClientAccount account, ClientMutation request) {
+    private ClientResult updateClient(TenantContext tenant, ClientAccount account, ClientMutation request,
+                                      String actor) {
         String originalClientName = account.getClientName();
+        boolean wasEnabled = account.isEnabled();
         String newClientName = StringUtils.hasText(request.clientName())
                 ? requireClientName(request.clientName())
                 : originalClientName;
@@ -192,6 +202,10 @@ public class ClientAccountService {
             invalidateNameCache(newClientName);
         }
         clientAccountRepository.saveAndFlush(account);
+        if (wasEnabled && !account.isEnabled()) {
+            // Same transaction: every active share of the client's routes ends (client-disabled).
+            httpShareService.onClientDisabled(actor, account);
+        }
         if (!newClientName.equals(originalClientName)) {
             clientNameReferenceRepository.rename(account.getId(), newClientName, updatedAt);
         }
@@ -216,20 +230,29 @@ public class ClientAccountService {
     @Transactional
     public void deleteClient(TenantContext tenant, long id) {
         ClientAccount account = findClientById(tenant, id);
-        closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
-        invalidateNameCache(account.getClientName());
-        workbenchReferences.forgetClientServices(account.getId());
-        clientAccountRepository.delete(account);
+        deleteClient(account, null);
     }
 
     @Transactional
     public void deleteClient(ManagementContext context, long id) {
         ClientAccount account = findClientById(context, id);
+        deleteClient(account, context.username());
+    }
+
+    /**
+     * Deletes the account together with its HTTP routes, so no orphaned route row can be served or
+     * shared later. Each route is audited as deleted and its shares end, all in this transaction.
+     */
+    private void deleteClient(ClientAccount account, String actor) {
+        // Every identity's workbench reference to the client's services goes in this transaction,
+        // looked up by client id while the route rows still exist.
+        workbenchReferences.forgetClientServices(account.getId());
+        List<HttpRouteMapping> routes = httpRouteMappingRepository.findByClientIdOrderByIdDesc(account.getId());
+        httpShareService.onClientDeleted(actor, routes);
+        httpRouteMappingRepository.deleteAll(routes);
+        httpRouteMappingRepository.flush();
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
         invalidateNameCache(account.getClientName());
-        // The client's routes, mappings and Peer services stay behind as rows, but they are gone
-        // for the workbench: every identity's reference to them goes in this transaction.
-        workbenchReferences.forgetClientServices(account.getId());
         clientAccountRepository.delete(account);
     }
 

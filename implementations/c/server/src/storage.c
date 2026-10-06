@@ -2,11 +2,14 @@
 
 #include "crypto.h"
 #include "elasticsearch_traffic.h"
+#include "http_share.h"
+#include "json.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <limits.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -859,6 +862,45 @@ int st_storage_init(const char *path, int seed_demo_client)
             ");"
             "CREATE INDEX IF NOT EXISTS idx_mwi_object ON management_workbench_item(tenant_id, kind, object_id);"
             "CREATE INDEX IF NOT EXISTS idx_mwi_list_at ON management_workbench_item(list, at_ms);");
+    }
+    if (rc == 0) {
+        /*
+         * Temporary HTTP shares and the audit of who changed access to a route
+         * (protocol/spec/temporary-http-share.md). The names and columns are shared by every
+         * server; times are integer epoch seconds and only the token's SHA-256 is stored.
+         */
+        rc = exec_sql(db,
+            "CREATE TABLE IF NOT EXISTS http_share ("
+            "share_id VARCHAR(16) PRIMARY KEY,"
+            "tenant_id VARCHAR(80) NOT NULL,"
+            "route_id BIGINT NOT NULL,"
+            "token_sha256 VARCHAR(64) NOT NULL,"
+            "access VARCHAR(8) NOT NULL,"
+            "path_prefix VARCHAR(256) NOT NULL,"
+            "label VARCHAR(255),"
+            "created_by VARCHAR(120) NOT NULL,"
+            "created_at BIGINT NOT NULL,"
+            "expires_at BIGINT NOT NULL,"
+            "revoked_at BIGINT,"
+            "revoked_by VARCHAR(120),"
+            "revoke_reason VARCHAR(40),"
+            "expiry_recorded INTEGER NOT NULL DEFAULT 0"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_http_share_route ON http_share(route_id);"
+            "CREATE INDEX IF NOT EXISTS idx_http_share_creator ON http_share(tenant_id, created_by);"
+            "CREATE INDEX IF NOT EXISTS idx_http_share_expires ON http_share(expires_at);"
+            "CREATE TABLE IF NOT EXISTS http_access_audit ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "tenant_id VARCHAR(80) NOT NULL,"
+            "occurred_at BIGINT NOT NULL,"
+            "actor VARCHAR(120),"
+            "action VARCHAR(40) NOT NULL,"
+            "route_id BIGINT NOT NULL,"
+            "share_id VARCHAR(16),"
+            "detail_json VARCHAR(512) NOT NULL"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_http_access_audit_at ON http_access_audit(occurred_at);"
+            "CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit(tenant_id, route_id, id);");
     }
     if (rc == 0 && seed_demo_client) {
         sqlite3_stmt *stmt = NULL;
@@ -1739,18 +1781,13 @@ int st_storage_create_management_user(const char *path,
     return out_user == NULL ? 0 : st_storage_get_management_user(path, username, out_user);
 }
 
-int st_storage_update_management_user(const char *path,
-                                      const char *tenant_id,
-                                      const char *username,
-                                      const char *password_hash,
-                                      const char *role,
-                                      int enabled,
-                                      st_storage_management_user *out_user)
+static int update_management_user_on_db(sqlite3 *db,
+                                        const char *tenant_id,
+                                        const char *username,
+                                        const char *password_hash,
+                                        const char *role,
+                                        int enabled)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE specus_management_user SET "
@@ -1780,6 +1817,22 @@ int st_storage_update_management_user(const char *path,
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    return rc;
+}
+
+int st_storage_update_management_user(const char *path,
+                                      const char *tenant_id,
+                                      const char *username,
+                                      const char *password_hash,
+                                      const char *role,
+                                      int enabled,
+                                      st_storage_management_user *out_user)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    int rc = update_management_user_on_db(db, tenant_id, username, password_hash, role, enabled);
     sqlite3_close(db);
     if (rc != 0) {
         return -1;
@@ -1787,18 +1840,10 @@ int st_storage_update_management_user(const char *path,
     return out_user == NULL ? 0 : st_storage_get_management_user_in_tenant(path, tenant_id, username, out_user);
 }
 
-int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username)
+static int delete_management_user_on_db(sqlite3 *db, const char *tenant_id, const char *username)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
-    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
-        sqlite3_close(db);
-        return -1;
-    }
     /*
-     * The account's workbench rows go in the same transaction: favourites and recent opens are
+     * The account's workbench rows go in the caller's transaction: favourites and recent opens are
      * personal history, and an account created later under the same name must start empty.
      */
     sqlite3_stmt *stmt = NULL;
@@ -1833,6 +1878,20 @@ int st_storage_delete_management_user(const char *path, const char *tenant_id, c
         }
         sqlite3_finalize(stmt);
     }
+    return rc;
+}
+
+int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    int rc = delete_management_user_on_db(db, tenant_id, username);
     if (rc == 0) {
         rc = exec_sql(db, "COMMIT");
     } else {
@@ -3442,6 +3501,69 @@ int st_storage_close_client_sessions_by_status(const char *path,
     return rc == 0 ? 0 : -1;
 }
 
+/* Updates client rowid id; previous_name (NULL when unknown) moves its mappings and routes along. */
+static int update_client_on_db(sqlite3 *db,
+                               long long id,
+                               const char *previous_name,
+                               const char *tenant_id,
+                               const char *client_name,
+                               const char *owner_username,
+                               int enabled,
+                               int connection_rate_limit_per_minute)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE client_account SET tenant_id = ?, client_name = ?, owner_username = ?, "
+        "enabled = ?, connection_limit_per_minute = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE rowid = ?",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, owner_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 4, enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 5, connection_rate_limit_per_minute);
+        sqlite3_bind_int64(stmt, 6, id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0 && previous_name != NULL && strcmp(previous_name, client_name) != 0) {
+        rc = sqlite3_prepare_v2(db,
+            "UPDATE specus_mapping SET client_name = ?, updated_at = CURRENT_TIMESTAMP WHERE client_name = ?",
+            -1,
+            &stmt,
+            NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, previous_name, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0 && previous_name != NULL && strcmp(previous_name, client_name) != 0) {
+        rc = sqlite3_prepare_v2(db,
+            "UPDATE http_route_mapping SET client_name = ?, updated_at = CURRENT_TIMESTAMP WHERE client_name = ?",
+            -1,
+            &stmt,
+            NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, previous_name, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return rc;
+}
+
 int st_storage_upsert_client(const char *path,
                              long long id,
                              const char *tenant_id,
@@ -3466,59 +3588,12 @@ int st_storage_upsert_client(const char *path,
     if (connection_rate_limit_per_minute <= 0) {
         connection_rate_limit_per_minute = 30;
     }
-    sqlite3_stmt *stmt = NULL;
     int rc;
     if (id > 0) {
-        rc = sqlite3_prepare_v2(db,
-            "UPDATE client_account SET tenant_id = ?, client_name = ?, owner_username = ?, "
-            "enabled = ?, connection_limit_per_minute = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE rowid = ?",
-            -1,
-            &stmt,
-            NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2, client_name, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 3, owner_username, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(stmt, 4, enabled ? 1 : 0);
-            sqlite3_bind_int(stmt, 5, connection_rate_limit_per_minute);
-            sqlite3_bind_int64(stmt, 6, id);
-            rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
-        } else {
-            rc = -1;
-        }
-        sqlite3_finalize(stmt);
-        if (rc == 0 && has_existing && strcmp(existing.client_name, client_name) != 0) {
-            rc = sqlite3_prepare_v2(db,
-                "UPDATE specus_mapping SET client_name = ?, updated_at = CURRENT_TIMESTAMP WHERE client_name = ?",
-                -1,
-                &stmt,
-                NULL);
-            if (rc == SQLITE_OK) {
-                sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, existing.client_name, -1, SQLITE_TRANSIENT);
-                rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-            } else {
-                rc = -1;
-            }
-            sqlite3_finalize(stmt);
-        }
-        if (rc == 0 && has_existing && strcmp(existing.client_name, client_name) != 0) {
-            rc = sqlite3_prepare_v2(db,
-                "UPDATE http_route_mapping SET client_name = ?, updated_at = CURRENT_TIMESTAMP WHERE client_name = ?",
-                -1,
-                &stmt,
-                NULL);
-            if (rc == SQLITE_OK) {
-                sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, existing.client_name, -1, SQLITE_TRANSIENT);
-                rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-            } else {
-                rc = -1;
-            }
-            sqlite3_finalize(stmt);
-        }
+        rc = update_client_on_db(db, id, has_existing ? existing.client_name : NULL, tenant_id, client_name,
+                                 owner_username, enabled, connection_rate_limit_per_minute);
     } else {
+        sqlite3_stmt *stmt = NULL;
         rc = sqlite3_prepare_v2(db,
             "INSERT INTO client_account(tenant_id, client_name, owner_username, enabled, connection_limit_per_minute) "
             "VALUES(?,?,?,?,?)",
@@ -3545,22 +3620,11 @@ int st_storage_upsert_client(const char *path,
     return out_client == NULL ? 0 : st_storage_get_client(path, id, out_client);
 }
 
-int st_storage_delete_client(const char *path, long long id)
+/* Deletes the client with its mappings and HTTP routes. */
+static int delete_client_on_db(sqlite3 *db, long long id, const char *client_name)
 {
-    st_storage_client client;
-    if (st_storage_get_client(path, id, &client) != 0) {
-        return -1;
-    }
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
-    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
-        sqlite3_close(db);
-        return -1;
-    }
     /*
-     * Workbench references to everything the client carries go first, in the same transaction:
+     * Workbench references to everything the client carries go first, in the caller's transaction:
      * its routes and mappings below, and its Peer services, whose rows this deletion leaves in
      * place but which no longer resolve to a client.
      */
@@ -3579,7 +3643,7 @@ int st_storage_delete_client(const char *path, long long id)
             rc = -1;
         } else {
             if (i < 2U) {
-                sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
             } else {
                 sqlite3_bind_int64(stmt, 1, id);
             }
@@ -3591,7 +3655,7 @@ int st_storage_delete_client(const char *path, long long id)
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE client_name = ?", -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
             rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
         } else {
             rc = -1;
@@ -3601,7 +3665,7 @@ int st_storage_delete_client(const char *path, long long id)
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db, "DELETE FROM http_route_mapping WHERE client_name = ?", -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
             rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
         } else {
             rc = -1;
@@ -3618,6 +3682,24 @@ int st_storage_delete_client(const char *path, long long id)
         }
         sqlite3_finalize(stmt);
     }
+    return rc;
+}
+
+int st_storage_delete_client(const char *path, long long id)
+{
+    st_storage_client client;
+    if (st_storage_get_client(path, id, &client) != 0) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    int rc = delete_client_on_db(db, id, client.client_name);
     if (rc == 0) {
         rc = exec_sql(db, "COMMIT");
     } else {
@@ -4145,6 +4227,59 @@ int st_storage_get_http_route_by_client_route(const char *path,
         : -1;
 }
 
+/* Creates the route, or updates it when the client already has a route of that name. */
+static int upsert_http_route_on_db(sqlite3 *db,
+                                   const char *client_name,
+                                   const char *route,
+                                   const char *target_base_url,
+                                   int enabled,
+                                   int detail_capture_enabled,
+                                   int media_capture_enabled,
+                                   int path_rewrite_enabled,
+                                   int insecure_skip_verify,
+                                   int auth_enabled,
+                                   const char *auth_username,
+                                   const char *auth_password_hash)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO http_route_mapping(client_name, route, target_base_url, enabled, detail_capture_enabled, media_capture_enabled, "
+        "path_rewrite_enabled, insecure_skip_verify, auth_enabled, auth_username, auth_password_hash) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(client_name, route) DO UPDATE SET "
+        "target_base_url = excluded.target_base_url,"
+        "enabled = excluded.enabled,"
+        "detail_capture_enabled = excluded.detail_capture_enabled,"
+        "media_capture_enabled = excluded.media_capture_enabled,"
+        "path_rewrite_enabled = excluded.path_rewrite_enabled,"
+        "insecure_skip_verify = excluded.insecure_skip_verify,"
+        "auth_enabled = excluded.auth_enabled,"
+        "auth_username = excluded.auth_username,"
+        "auth_password_hash = excluded.auth_password_hash,"
+        "updated_at = CURRENT_TIMESTAMP",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, route, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, target_base_url, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 4, enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 5, detail_capture_enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 6, media_capture_enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 7, path_rewrite_enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 8, insecure_skip_verify ? 1 : 0);
+        sqlite3_bind_int(stmt, 9, auth_enabled ? 1 : 0);
+        sqlite3_bind_text(stmt, 10, auth_username == NULL ? "" : auth_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 11, auth_password_hash == NULL ? "" : auth_password_hash, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 int st_storage_create_http_route_for_client(const char *path,
                                             long long client_id,
                                             const char *route,
@@ -4167,42 +4302,9 @@ int st_storage_create_http_route_for_client(const char *path,
     if (open_db(path, &db) != 0) {
         return -1;
     }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO http_route_mapping(client_name, route, target_base_url, enabled, detail_capture_enabled, media_capture_enabled, "
-        "path_rewrite_enabled, insecure_skip_verify, auth_enabled, auth_username, auth_password_hash) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(client_name, route) DO UPDATE SET "
-        "target_base_url = excluded.target_base_url,"
-        "enabled = excluded.enabled,"
-        "detail_capture_enabled = excluded.detail_capture_enabled,"
-        "media_capture_enabled = excluded.media_capture_enabled,"
-        "path_rewrite_enabled = excluded.path_rewrite_enabled,"
-        "insecure_skip_verify = excluded.insecure_skip_verify,"
-        "auth_enabled = excluded.auth_enabled,"
-        "auth_username = excluded.auth_username,"
-        "auth_password_hash = excluded.auth_password_hash,"
-        "updated_at = CURRENT_TIMESTAMP",
-        -1,
-        &stmt,
-        NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, route, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, target_base_url, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 4, enabled ? 1 : 0);
-        sqlite3_bind_int(stmt, 5, detail_capture_enabled ? 1 : 0);
-        sqlite3_bind_int(stmt, 6, media_capture_enabled ? 1 : 0);
-        sqlite3_bind_int(stmt, 7, path_rewrite_enabled ? 1 : 0);
-        sqlite3_bind_int(stmt, 8, insecure_skip_verify ? 1 : 0);
-        sqlite3_bind_int(stmt, 9, auth_enabled ? 1 : 0);
-        sqlite3_bind_text(stmt, 10, auth_username == NULL ? "" : auth_username, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 11, auth_password_hash == NULL ? "" : auth_password_hash, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-    } else {
-        rc = -1;
-    }
-    sqlite3_finalize(stmt);
+    int rc = upsert_http_route_on_db(db, client.client_name, route, target_base_url, enabled,
+                                     detail_capture_enabled, media_capture_enabled, path_rewrite_enabled,
+                                     insecure_skip_verify, auth_enabled, auth_username, auth_password_hash);
     sqlite3_close(db);
     if (rc != 0) {
         return -1;
@@ -4212,24 +4314,19 @@ int st_storage_create_http_route_for_client(const char *path,
         : st_storage_get_http_route_by_client_route(path, client.client_name, route, out_route);
 }
 
-int st_storage_update_http_route_by_id(const char *path,
-                                       long long id,
-                                       const char *route,
-                                       const char *target_base_url,
-                                       int enabled,
-                                       int detail_capture_enabled,
-                                       int media_capture_enabled,
-                                       int path_rewrite_enabled,
-                                       int insecure_skip_verify,
-                                       int auth_enabled,
-                                       const char *auth_username,
-                                       const char *auth_password_hash,
-                                       st_storage_http_route *out_route)
+static int update_http_route_on_db(sqlite3 *db,
+                                   long long id,
+                                   const char *route,
+                                   const char *target_base_url,
+                                   int enabled,
+                                   int detail_capture_enabled,
+                                   int media_capture_enabled,
+                                   int path_rewrite_enabled,
+                                   int insecure_skip_verify,
+                                   int auth_enabled,
+                                   const char *auth_username,
+                                   const char *auth_password_hash)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE http_route_mapping SET route = ?, target_base_url = ?, enabled = ?, "
@@ -4255,6 +4352,30 @@ int st_storage_update_http_route_by_id(const char *path,
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    return rc;
+}
+
+int st_storage_update_http_route_by_id(const char *path,
+                                       long long id,
+                                       const char *route,
+                                       const char *target_base_url,
+                                       int enabled,
+                                       int detail_capture_enabled,
+                                       int media_capture_enabled,
+                                       int path_rewrite_enabled,
+                                       int insecure_skip_verify,
+                                       int auth_enabled,
+                                       const char *auth_username,
+                                       const char *auth_password_hash,
+                                       st_storage_http_route *out_route)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    int rc = update_http_route_on_db(db, id, route, target_base_url, enabled, detail_capture_enabled,
+                                     media_capture_enabled, path_rewrite_enabled, insecure_skip_verify,
+                                     auth_enabled, auth_username, auth_password_hash);
     sqlite3_close(db);
     if (rc != 0) {
         return -1;
@@ -4262,12 +4383,42 @@ int st_storage_update_http_route_by_id(const char *path,
     return out_route == NULL ? 0 : load_http_route_by_id(path, id, out_route);
 }
 
+static int delete_http_route_on_db(sqlite3 *db, long long id)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "DELETE FROM http_route_mapping WHERE id = ?", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    /* Every workbench reference to the route goes with it, in the caller's transaction. */
+    if (rc == 0) {
+        rc = workbench_delete_object_refs(db, "http-route", id);
+    }
+    return rc;
+}
+
 int st_storage_delete_http_route_by_id(const char *path, long long id)
 {
-    return delete_object_by_id_with_workbench_refs(path,
-                                                   "DELETE FROM http_route_mapping WHERE id = ?",
-                                                   "http-route",
-                                                   id);
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    int rc = delete_http_route_on_db(db, id);
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    } else {
+        (void)exec_sql(db, "ROLLBACK");
+    }
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
 }
 
 int st_storage_record_connection(const char *path,
@@ -8303,4 +8454,1541 @@ int st_storage_workbench_sweep(const char *path, long long now_ms)
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return rc;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Temporary HTTP shares (protocol/spec/temporary-http-share.md): share rows and the access audit.
+ * "now" arrives in epoch milliseconds so expiry (now >= expires_at) is exact at full precision;
+ * rows keep whole seconds. Every decision reads the share, route, client and creator afresh.
+ */
+
+#define ST_SHARE_COLUMNS \
+    "share_id, tenant_id, route_id, token_sha256, access, path_prefix, label, created_by, " \
+    "created_at, expires_at, revoked_at, revoked_by, revoke_reason, expiry_recorded"
+
+static atomic_int share_store_failing;
+
+void st_storage_http_share_fail_for_testing(int failing)
+{
+    atomic_store(&share_store_failing, failing ? 1 : 0);
+}
+
+static int share_open_db(const char *path, sqlite3 **db)
+{
+    *db = NULL;
+    if (path == NULL || atomic_load(&share_store_failing)) {
+        return -1;
+    }
+    return open_db(path, db);
+}
+
+static int share_begin(sqlite3 *db)
+{
+    return exec_sql(db, "BEGIN IMMEDIATE");
+}
+
+/* Commits when rc is 0 and rolls back otherwise; a failed commit turns into -1. */
+static int share_end(sqlite3 *db, int rc)
+{
+    if (rc == 0) {
+        if (exec_sql(db, "COMMIT") == 0) {
+            return 0;
+        }
+        rc = -1;
+    }
+    (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    return rc;
+}
+
+int st_storage_share_ids_add(st_storage_share_ids *ids, const char *share_id)
+{
+    if (ids == NULL) {
+        return 0;
+    }
+    if (ids->len == ids->cap) {
+        size_t next = ids->cap == 0U ? 8U : ids->cap * 2U;
+        char (*grown)[17] = realloc(ids->ids, next * sizeof(*grown));
+        if (grown == NULL) {
+            return -1;
+        }
+        ids->ids = grown;
+        ids->cap = next;
+    }
+    snprintf(ids->ids[ids->len], sizeof(ids->ids[ids->len]), "%s", share_id);
+    ++ids->len;
+    return 0;
+}
+
+void st_storage_share_ids_free(st_storage_share_ids *ids)
+{
+    if (ids == NULL) {
+        return;
+    }
+    free(ids->ids);
+    ids->ids = NULL;
+    ids->len = 0U;
+    ids->cap = 0U;
+}
+
+static const char *share_exposure(int enabled, int auth_enabled)
+{
+    return !enabled ? "disabled" : (auth_enabled ? "protected" : "public");
+}
+
+/* One audit row (spec 8); it never carries a token, hash, label, credential or visitor data. */
+static int share_audit(sqlite3 *db,
+                       const char *tenant_id,
+                       long long at,
+                       const char *actor,
+                       const char *action,
+                       long long route_id,
+                       const char *share_id,
+                       const char *detail_json)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO http_access_audit(tenant_id, occurred_at, actor, action, route_id, share_id, detail_json) "
+        "VALUES(?,?,?,?,?,?,?)",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, tenant_id == NULL ? "" : tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, at);
+        bind_nullable_text(stmt, 3, actor);
+        sqlite3_bind_text(stmt, 4, action, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 5, route_id);
+        bind_nullable_text(stmt, 6, share_id);
+        sqlite3_bind_text(stmt, 7, detail_json, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int share_scan(sqlite3_stmt *stmt, st_storage_http_share *share)
+{
+    memset(share, 0, sizeof(*share));
+    if (copy_text_column(stmt, 0, share->share_id, sizeof(share->share_id)) != 0
+        || copy_text_column(stmt, 1, share->tenant_id, sizeof(share->tenant_id)) != 0
+        || copy_text_column(stmt, 3, share->token_sha256, sizeof(share->token_sha256)) != 0
+        || copy_text_column(stmt, 4, share->access, sizeof(share->access)) != 0
+        || copy_text_column(stmt, 5, share->path_prefix, sizeof(share->path_prefix)) != 0
+        || copy_text_column(stmt, 7, share->created_by, sizeof(share->created_by)) != 0) {
+        return -1;
+    }
+    share->route_id = sqlite3_column_int64(stmt, 2);
+    if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+        if (copy_text_column(stmt, 6, share->label, sizeof(share->label)) != 0) {
+            return -1;
+        }
+        share->has_label = share->label[0] != '\0';
+    }
+    share->created_at = sqlite3_column_int64(stmt, 8);
+    share->expires_at = sqlite3_column_int64(stmt, 9);
+    if (sqlite3_column_type(stmt, 10) != SQLITE_NULL) {
+        share->revoked = 1;
+        share->revoked_at = sqlite3_column_int64(stmt, 10);
+    }
+    if (sqlite3_column_type(stmt, 11) != SQLITE_NULL) {
+        if (copy_text_column(stmt, 11, share->revoked_by, sizeof(share->revoked_by)) != 0) {
+            return -1;
+        }
+        share->has_revoked_by = 1;
+    }
+    if (sqlite3_column_type(stmt, 12) != SQLITE_NULL
+        && copy_text_column(stmt, 12, share->revoke_reason, sizeof(share->revoke_reason)) != 0) {
+        return -1;
+    }
+    share->expiry_recorded = sqlite3_column_int(stmt, 13) != 0;
+    return 0;
+}
+
+/* Steps a prepared share query into a malloc'd array and finalizes it. */
+static int share_collect(sqlite3_stmt *stmt, st_storage_http_share **shares, size_t *count)
+{
+    *shares = NULL;
+    *count = 0U;
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (*count == capacity) {
+            size_t next = capacity == 0U ? 8U : capacity * 2U;
+            st_storage_http_share *grown = realloc(*shares, next * sizeof(*grown));
+            if (grown == NULL) {
+                rc = SQLITE_NOMEM;
+                break;
+            }
+            *shares = grown;
+            capacity = next;
+        }
+        if (share_scan(stmt, &(*shares)[*count]) != 0) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        ++*count;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        free(*shares);
+        *shares = NULL;
+        *count = 0U;
+        return -1;
+    }
+    return 0;
+}
+
+/* 0 found, 1 missing, -1 on error. */
+static int share_load(sqlite3 *db, const char *share_id, st_storage_http_share *share)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE share_id = ?",
+                           -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, share_id, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_ROW ? (share_scan(stmt, share) == 0 ? 0 : -1) : (rc == SQLITE_DONE ? 1 : -1);
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+static int share_is_active(const st_storage_http_share *share, long long now_ms)
+{
+    return !share->revoked && share->expires_at * 1000LL > now_ms;
+}
+
+/* Active shares selected by one bound value (route id or client name), oldest first. */
+static int share_select_active(sqlite3 *db,
+                               const char *sql,
+                               long long route_id,
+                               const char *text,
+                               const char *text2,
+                               long long now_ms,
+                               st_storage_http_share **shares,
+                               size_t *count)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int index = 1;
+    if (text != NULL) {
+        sqlite3_bind_text(stmt, index++, text, -1, SQLITE_TRANSIENT);
+    }
+    if (text2 != NULL) {
+        sqlite3_bind_text(stmt, index++, text2, -1, SQLITE_TRANSIENT);
+    }
+    if (route_id > 0) {
+        sqlite3_bind_int64(stmt, index++, route_id);
+    }
+    sqlite3_bind_int64(stmt, index, now_ms);
+    return share_collect(stmt, shares, count);
+}
+
+static int share_active_of_route(sqlite3 *db, long long route_id, long long now_ms,
+                                 st_storage_http_share **shares, size_t *count)
+{
+    return share_select_active(db,
+        "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE route_id = ? "
+        "AND revoked_at IS NULL AND expires_at * 1000 > ? ORDER BY created_at, share_id",
+        route_id, NULL, NULL, now_ms, shares, count);
+}
+
+static int share_active_of_client(sqlite3 *db, const char *client_name, long long now_ms,
+                                  st_storage_http_share **shares, size_t *count)
+{
+    return share_select_active(db,
+        "SELECT " ST_SHARE_COLUMNS " FROM http_share "
+        "WHERE route_id IN (SELECT id FROM http_route_mapping WHERE client_name = ?) "
+        "AND revoked_at IS NULL AND expires_at * 1000 > ? ORDER BY created_at, share_id",
+        0, client_name, NULL, now_ms, shares, count);
+}
+
+typedef struct {
+    int route_found;
+    int client_found;
+    long long route_id;
+    char route_name[128];
+    char client_name[256];
+    int route_enabled;
+    int auth_enabled;
+    int path_rewrite_enabled;
+    long long client_id;
+    char tenant_id[128];
+    char owner_username[128];
+    int client_enabled;
+} share_target;
+
+/* The route by id with its client, which a route reaches by name and may have lost. */
+static int share_load_target(sqlite3 *db, long long route_id, share_target *target)
+{
+    memset(target, 0, sizeof(*target));
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT r.id, r.route, r.client_name, r.enabled, r.auth_enabled, r.path_rewrite_enabled, "
+            "c.rowid, c.tenant_id, c.owner_username, c.enabled "
+            "FROM http_route_mapping r LEFT JOIN client_account c ON c.client_name = r.client_name "
+            "WHERE r.id = ?",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, route_id);
+    int rc = sqlite3_step(stmt);
+    int result = 0;
+    if (rc == SQLITE_ROW) {
+        target->route_found = 1;
+        target->route_id = sqlite3_column_int64(stmt, 0);
+        if (copy_text_column(stmt, 1, target->route_name, sizeof(target->route_name)) != 0
+            || copy_text_column(stmt, 2, target->client_name, sizeof(target->client_name)) != 0) {
+            result = -1;
+        }
+        target->route_enabled = sqlite3_column_int(stmt, 3) != 0;
+        target->auth_enabled = sqlite3_column_int(stmt, 4) != 0;
+        target->path_rewrite_enabled = sqlite3_column_int(stmt, 5) != 0;
+        if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+            target->client_found = 1;
+            target->client_id = sqlite3_column_int64(stmt, 6);
+            if (copy_text_column(stmt, 7, target->tenant_id, sizeof(target->tenant_id)) != 0
+                || copy_text_column(stmt, 8, target->owner_username, sizeof(target->owner_username)) != 0) {
+                result = -1;
+            }
+            target->client_enabled = sqlite3_column_int(stmt, 9) != 0;
+        }
+    } else if (rc != SQLITE_DONE) {
+        result = -1;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+typedef struct {
+    int exists;
+    int enabled;
+    int admin;
+    char username[128];
+    char tenant_id[128];
+} share_principal;
+
+static int share_ascii_casecmp(const char *left, const char *right)
+{
+    while (*left != '\0' && *right != '\0') {
+        int a = tolower((unsigned char)*left++);
+        int b = tolower((unsigned char)*right++);
+        if (a != b) {
+            return a - b;
+        }
+    }
+    return tolower((unsigned char)*left) - tolower((unsigned char)*right);
+}
+
+static int share_role_is_admin(const char *role)
+{
+    while (*role == ' ' || *role == '\t') {
+        ++role;
+    }
+    size_t len = strlen(role);
+    while (len > 0U && (role[len - 1U] == ' ' || role[len - 1U] == '\t')) {
+        --len;
+    }
+    char trimmed[16];
+    if (len >= sizeof(trimmed)) {
+        return 0;
+    }
+    memcpy(trimmed, role, len);
+    trimmed[len] = '\0';
+    return share_ascii_casecmp(trimmed, "ADMIN") == 0;
+}
+
+/*
+ * A user as the management API sees it now. The built-in admin has no row: under its configured
+ * tenant it is an ADMIN that is enabled while it may sign in, as admin_resolve_token_user treats it.
+ */
+static int share_load_principal(sqlite3 *db,
+                                const st_storage_share_builtin_admin *builtin,
+                                const char *username,
+                                const char *tenant_hint,
+                                share_principal *principal)
+{
+    memset(principal, 0, sizeof(*principal));
+    if (username == NULL || *username == '\0') {
+        return 0;
+    }
+    if (builtin != NULL && builtin->username != NULL && builtin->username[0] != '\0'
+        && builtin->tenant_id != NULL && share_ascii_casecmp(username, builtin->username) == 0
+        && (tenant_hint == NULL || tenant_hint[0] == '\0'
+            || share_ascii_casecmp(tenant_hint, builtin->tenant_id) == 0)) {
+        principal->exists = 1;
+        principal->enabled = builtin->accepted != 0;
+        principal->admin = 1;
+        snprintf(principal->username, sizeof(principal->username), "%s", builtin->username);
+        snprintf(principal->tenant_id, sizeof(principal->tenant_id), "%s", builtin->tenant_id);
+        return 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT username, tenant_id, role, enabled FROM specus_management_user "
+            "WHERE lower(username) = lower(?)",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    int result = 0;
+    if (rc == SQLITE_ROW) {
+        char role[32];
+        if (copy_text_column(stmt, 0, principal->username, sizeof(principal->username)) != 0
+            || copy_text_column(stmt, 1, principal->tenant_id, sizeof(principal->tenant_id)) != 0
+            || copy_text_column(stmt, 2, role, sizeof(role)) != 0) {
+            result = -1;
+        } else {
+            principal->exists = 1;
+            principal->admin = share_role_is_admin(role);
+            principal->enabled = sqlite3_column_int(stmt, 3) != 0;
+        }
+    } else if (rc != SQLITE_DONE) {
+        result = -1;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* The route management rule, evaluated now: same tenant, and an admin or the client's owner. */
+static int share_can_manage(const share_principal *principal, const share_target *target)
+{
+    return principal->exists && principal->enabled && target->route_found && target->client_found
+        && strcmp(principal->tenant_id, target->tenant_id) == 0
+        && (principal->admin || strcmp(target->owner_username, principal->username) == 0);
+}
+
+/* Spec 7.2: why an active share can no longer be honoured, first match wins; NULL when it can. */
+static int share_lapse_reason(sqlite3 *db,
+                              const st_storage_share_builtin_admin *builtin,
+                              const st_storage_http_share *share,
+                              const share_target *target,
+                              const char **reason)
+{
+    *reason = NULL;
+    if (!target->route_found || (target->client_found && strcmp(target->tenant_id, share->tenant_id) != 0)) {
+        *reason = "route-deleted";
+    } else if (!target->client_found) {
+        *reason = "client-deleted";
+    } else if (!target->client_enabled) {
+        *reason = "client-disabled";
+    } else if (!target->route_enabled) {
+        *reason = "route-disabled";
+    } else if (!target->auth_enabled) {
+        *reason = "route-made-public";
+    } else {
+        share_principal creator;
+        if (share_load_principal(db, builtin, share->created_by, share->tenant_id, &creator) != 0) {
+            return -1;
+        }
+        if (!share_can_manage(&creator, target)) {
+            *reason = "creator-lost-access";
+        }
+    }
+    return 0;
+}
+
+/*
+ * The conditional revoke of spec 7.4: only a share that is neither revoked nor expired changes,
+ * so concurrent instances write one audit row. 1 when this call ended it, 0 when it had already
+ * ended, -1 on error. Runs inside the caller's transaction.
+ */
+static int share_revoke_row(sqlite3 *db,
+                            const st_storage_http_share *share,
+                            const char *actor,
+                            const char *reason,
+                            long long now_ms)
+{
+    long long now_s = now_ms / 1000LL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE http_share SET revoked_at = ?, revoked_by = ?, revoke_reason = ? "
+        "WHERE share_id = ? AND revoked_at IS NULL AND expires_at * 1000 > ?",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, now_s);
+    bind_nullable_text(stmt, 2, actor);
+    sqlite3_bind_text(stmt, 3, reason, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, share->share_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, now_ms);
+    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    int changed = rc == 0 && sqlite3_changes(db) == 1;
+    sqlite3_finalize(stmt);
+    if (rc != 0) {
+        return -1;
+    }
+    if (!changed) {
+        return 0;
+    }
+    char detail[96];
+    snprintf(detail, sizeof(detail), "{\"reason\":\"%s\"}", reason);
+    return share_audit(db, share->tenant_id, now_s, actor, "share.revoked", share->route_id,
+                       share->share_id, detail) == 0 ? 1 : -1;
+}
+
+static int share_revoke_each(sqlite3 *db,
+                             const st_storage_http_share *shares,
+                             size_t count,
+                             const char *actor,
+                             const char *reason,
+                             long long now_ms,
+                             st_storage_share_ids *revoked)
+{
+    for (size_t i = 0U; i < count; ++i) {
+        int changed = share_revoke_row(db, &shares[i], actor, reason, now_ms);
+        if (changed < 0 || (changed == 1 && st_storage_share_ids_add(revoked, shares[i].share_id) != 0)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Revokes in place, each in its own transaction, the given active shares that have lapsed. */
+static int share_revoke_lapsed_list(sqlite3 *db,
+                                    const st_storage_share_builtin_admin *builtin,
+                                    const st_storage_http_share *shares,
+                                    size_t count,
+                                    long long now_ms,
+                                    st_storage_share_ids *revoked)
+{
+    for (size_t i = 0U; i < count; ++i) {
+        share_target target;
+        const char *reason = NULL;
+        if (share_load_target(db, shares[i].route_id, &target) != 0
+            || share_lapse_reason(db, builtin, &shares[i], &target, &reason) != 0) {
+            return -1;
+        }
+        if (reason == NULL) {
+            continue;
+        }
+        int rc = share_begin(db);
+        int changed = rc == 0 ? share_revoke_row(db, &shares[i], NULL, reason, now_ms) : -1;
+        if (share_end(db, changed < 0 ? -1 : 0) != 0) {
+            return -1;
+        }
+        if (changed == 1 && st_storage_share_ids_add(revoked, shares[i].share_id) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int st_storage_http_share_caller_can_manage(const char *path,
+                                            const st_storage_share_builtin_admin *builtin,
+                                            const char *caller,
+                                            const char *caller_tenant,
+                                            long long route_id,
+                                            int *allowed)
+{
+    *allowed = 0;
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_target target;
+    share_principal principal;
+    int rc = share_load_target(db, route_id, &target);
+    if (rc == 0) {
+        rc = share_load_principal(db, builtin, caller, caller_tenant, &principal);
+    }
+    if (rc == 0) {
+        *allowed = share_can_manage(&principal, &target);
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_http_share_caller_is_admin(const char *path,
+                                          const st_storage_share_builtin_admin *builtin,
+                                          const char *caller,
+                                          const char *caller_tenant,
+                                          int *admin,
+                                          char tenant_id[128])
+{
+    *admin = 0;
+    tenant_id[0] = '\0';
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_principal principal;
+    int rc = share_load_principal(db, builtin, caller, caller_tenant, &principal);
+    if (rc == 0 && principal.exists && principal.enabled) {
+        *admin = principal.admin;
+        snprintf(tenant_id, 128U, "%s", principal.tenant_id);
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_http_share_create(const char *path,
+                                 const st_storage_share_builtin_admin *builtin,
+                                 const char *caller,
+                                 const char *caller_tenant,
+                                 long long route_id,
+                                 const st_storage_http_share *draft,
+                                 int max_active,
+                                 long long now_ms,
+                                 st_storage_http_share *out)
+{
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_target target;
+    share_principal principal;
+    st_storage_http_share row = *draft;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_target(db, route_id, &target);
+    }
+    if (rc == 0) {
+        rc = share_load_principal(db, builtin, caller, caller_tenant, &principal);
+    }
+    if (rc == 0) {
+        if (!share_can_manage(&principal, &target)) {
+            rc = ST_STORAGE_SHARE_ROUTE_NOT_FOUND;
+        } else if (!target.route_enabled) {
+            rc = ST_STORAGE_SHARE_ROUTE_DISABLED;
+        } else if (!target.client_enabled) {
+            rc = ST_STORAGE_SHARE_CLIENT_DISABLED;
+        } else if (!target.auth_enabled) {
+            rc = ST_STORAGE_SHARE_ROUTE_PUBLIC;
+        }
+    }
+    if (rc == 0) {
+        /* Only active shares count; the count and the insert share one transaction. */
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM http_share WHERE route_id = ? AND revoked_at IS NULL AND expires_at * 1000 > ?",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, target.route_id);
+            sqlite3_bind_int64(stmt, 2, now_ms);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                rc = sqlite3_column_int64(stmt, 0) >= max_active ? ST_STORAGE_SHARE_LIMIT_REACHED : 0;
+            } else {
+                rc = -1;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
+        snprintf(row.tenant_id, sizeof(row.tenant_id), "%s", target.tenant_id);
+        snprintf(row.created_by, sizeof(row.created_by), "%s", principal.username);
+        row.route_id = target.route_id;
+        row.revoked = 0;
+        row.has_revoked_by = 0;
+        row.revoke_reason[0] = '\0';
+        row.expiry_recorded = 0;
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "INSERT INTO http_share(share_id, tenant_id, route_id, token_sha256, access, path_prefix, label, "
+            "created_by, created_at, expires_at, expiry_recorded) VALUES(?,?,?,?,?,?,?,?,?,?,0)",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, row.share_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, row.tenant_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 3, row.route_id);
+            sqlite3_bind_text(stmt, 4, row.token_sha256, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 5, row.access, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 6, row.path_prefix, -1, SQLITE_TRANSIENT);
+            bind_nullable_text(stmt, 7, row.has_label ? row.label : NULL);
+            sqlite3_bind_text(stmt, 8, row.created_by, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 9, row.created_at);
+            sqlite3_bind_int64(stmt, 10, row.expires_at);
+            int step = sqlite3_step(stmt);
+            rc = step == SQLITE_DONE ? 0 : (step == SQLITE_CONSTRAINT ? ST_STORAGE_SHARE_ID_TAKEN : -1);
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
+        char expires[32];
+        st_http_share_format_time(row.expires_at, expires);
+        char *prefix = st_json_escape(row.path_prefix);
+        char detail[512];
+        int written = prefix == NULL ? -1 : snprintf(detail, sizeof(detail),
+                                                     "{\"access\":\"%s\",\"pathPrefix\":\"%s\",\"expiresAt\":\"%s\"}",
+                                                     row.access, prefix, expires);
+        free(prefix);
+        rc = written > 0 && (size_t)written < sizeof(detail)
+            ? share_audit(db, row.tenant_id, now_ms / 1000LL, row.created_by, "share.created",
+                          row.route_id, row.share_id, detail)
+            : -1;
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc == 0 && out != NULL) {
+        *out = row;
+    }
+    return rc;
+}
+
+int st_storage_http_share_list(const char *path,
+                               const st_storage_share_builtin_admin *builtin,
+                               long long route_id,
+                               const char *share_id,
+                               long long now_ms,
+                               st_storage_http_share **shares,
+                               size_t *count,
+                               st_storage_share_ids *revoked)
+{
+    *shares = NULL;
+    *count = 0U;
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    /* Read-time revoke first, so a share that cannot be used is never listed as active. */
+    st_storage_http_share *active = NULL;
+    size_t active_count = 0U;
+    int rc = share_id == NULL
+        ? share_active_of_route(db, route_id, now_ms, &active, &active_count)
+        : share_select_active(db,
+                              "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE share_id = ? AND route_id = ? "
+                              "AND revoked_at IS NULL AND expires_at * 1000 > ? ORDER BY created_at, share_id",
+                              route_id, share_id, NULL, now_ms, &active, &active_count);
+    if (rc == 0) {
+        rc = share_revoke_lapsed_list(db, builtin, active, active_count, now_ms, revoked);
+    }
+    free(active);
+    if (rc == 0) {
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            share_id == NULL
+                ? "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE route_id = ? ORDER BY created_at DESC, share_id DESC"
+                : "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE route_id = ? AND share_id = ?",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, route_id);
+            if (share_id != NULL) {
+                sqlite3_bind_text(stmt, 2, share_id, -1, SQLITE_TRANSIENT);
+            }
+            rc = share_collect(stmt, shares, count);
+        } else {
+            sqlite3_finalize(stmt);
+        }
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_http_share_revoke(const char *path,
+                                 const st_storage_share_builtin_admin *builtin,
+                                 const char *caller,
+                                 const char *caller_tenant,
+                                 long long route_id,
+                                 const char *share_id,
+                                 long long now_ms,
+                                 st_storage_http_share *out,
+                                 int *changed)
+{
+    *changed = 0;
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_target target;
+    share_principal principal;
+    st_storage_http_share share;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_target(db, route_id, &target);
+    }
+    if (rc == 0) {
+        rc = share_load_principal(db, builtin, caller, caller_tenant, &principal);
+    }
+    if (rc == 0 && !share_can_manage(&principal, &target)) {
+        rc = ST_STORAGE_SHARE_ROUTE_NOT_FOUND;
+    }
+    if (rc == 0) {
+        int loaded = share_load(db, share_id, &share);
+        rc = loaded < 0 ? -1 : (loaded == 1 || share.route_id != route_id ? ST_STORAGE_SHARE_NOT_FOUND : 0);
+    }
+    /* Idempotent: an ended share is answered as it is, nothing is written. */
+    if (rc == 0 && share_is_active(&share, now_ms)) {
+        int revoked = share_revoke_row(db, &share, principal.username, "revoked-by-user", now_ms);
+        rc = revoked < 0 ? -1 : 0;
+        *changed = revoked == 1;
+        if (rc == 0 && revoked == 1) {
+            rc = share_load(db, share_id, &share) == 0 ? 0 : -1;
+        }
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc != 0) {
+        *changed = 0;
+    } else if (out != NULL) {
+        *out = share;
+    }
+    return rc;
+}
+
+int st_storage_http_share_resolve(const char *path,
+                                  const st_storage_share_builtin_admin *builtin,
+                                  const char *share_id,
+                                  long long now_ms,
+                                  st_storage_http_share_resolution *out)
+{
+    memset(out, 0, sizeof(*out));
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    int loaded = share_load(db, share_id, &out->share);
+    int rc = loaded < 0 ? -1 : 0;
+    if (loaded == 0) {
+        out->found = 1;
+        share_target target;
+        rc = share_load_target(db, out->share.route_id, &target);
+        if (rc == 0) {
+            out->route_found = target.route_found;
+            out->client_found = target.client_found;
+            out->client_id = target.client_id;
+            out->path_rewrite_enabled = target.path_rewrite_enabled;
+            snprintf(out->client_name, sizeof(out->client_name), "%s", target.client_name);
+            snprintf(out->route_name, sizeof(out->route_name), "%s", target.route_name);
+            if (share_is_active(&out->share, now_ms)) {
+                rc = share_lapse_reason(db, builtin, &out->share, &target, &out->lapse_reason);
+            }
+        }
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_http_share_revoke_lapsed(const char *path,
+                                        const char *share_id,
+                                        const char *reason,
+                                        long long now_ms,
+                                        int *changed)
+{
+    *changed = 0;
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    st_storage_http_share share;
+    int rc = share_begin(db);
+    int loaded = rc == 0 ? share_load(db, share_id, &share) : -1;
+    int revoked = 0;
+    if (loaded < 0) {
+        rc = -1;
+    } else if (loaded == 0) {
+        revoked = share_revoke_row(db, &share, NULL, reason, now_ms);
+        rc = revoked < 0 ? -1 : 0;
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    *changed = rc == 0 && revoked == 1;
+    return rc;
+}
+
+int st_storage_http_share_sweep(const char *path,
+                                const st_storage_share_builtin_admin *builtin,
+                                long long now_ms,
+                                st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    /* 1. Each expiry is recorded once, stamped with expiresAt, in expiry order. */
+    st_storage_http_share *expired = NULL;
+    size_t expired_count = 0U;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE revoked_at IS NULL AND expiry_recorded = 0 "
+        "AND expires_at * 1000 <= ? ORDER BY expires_at, share_id",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_int64(stmt, 1, now_ms);
+        rc = share_collect(stmt, &expired, &expired_count);
+    } else {
+        sqlite3_finalize(stmt);
+    }
+    for (size_t i = 0U; rc == 0 && i < expired_count; ++i) {
+        rc = share_begin(db);
+        int changed = 0;
+        if (rc == 0) {
+            stmt = NULL;
+            rc = sqlite3_prepare_v2(db,
+                "UPDATE http_share SET expiry_recorded = 1 "
+                "WHERE share_id = ? AND revoked_at IS NULL AND expiry_recorded = 0",
+                -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+            if (rc == 0) {
+                sqlite3_bind_text(stmt, 1, expired[i].share_id, -1, SQLITE_TRANSIENT);
+                rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+                changed = rc == 0 && sqlite3_changes(db) == 1;
+            }
+            sqlite3_finalize(stmt);
+        }
+        if (rc == 0 && changed) {
+            rc = share_audit(db, expired[i].tenant_id, expired[i].expires_at, NULL, "share.expired",
+                             expired[i].route_id, expired[i].share_id, "{}");
+        }
+        rc = share_end(db, rc);
+    }
+    free(expired);
+    /* 2. The safety net: active shares whose route, client or creator no longer allows them. */
+    if (rc == 0) {
+        st_storage_http_share *active = NULL;
+        size_t active_count = 0U;
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE revoked_at IS NULL AND expires_at * 1000 > ? "
+            "ORDER BY created_at, share_id",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, now_ms);
+            rc = share_collect(stmt, &active, &active_count);
+        } else {
+            sqlite3_finalize(stmt);
+        }
+        if (rc == 0) {
+            rc = share_revoke_lapsed_list(db, builtin, active, active_count, now_ms, revoked);
+        }
+        free(active);
+    }
+    /* 3. Retention: ended shares for 30 days, audit for 180 days. */
+    if (rc == 0) {
+        long long now_s = now_ms / 1000LL;
+        long long share_horizon = now_s - ST_HTTP_SHARE_RETENTION_DAYS * 86400LL;
+        long long audit_horizon = now_s - ST_HTTP_SHARE_AUDIT_RETENTION_DAYS * 86400LL;
+        stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "DELETE FROM http_share WHERE (revoked_at IS NOT NULL AND revoked_at < ?1) "
+            "OR (revoked_at IS NULL AND expires_at < ?1)",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, share_horizon);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+        if (rc == 0) {
+            stmt = NULL;
+            rc = sqlite3_prepare_v2(db, "DELETE FROM http_access_audit WHERE occurred_at < ?",
+                                    -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+            if (rc == 0) {
+                sqlite3_bind_int64(stmt, 1, audit_horizon);
+                rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_http_access_audit_list(const char *path,
+                                      const char *tenant_id,
+                                      long long route_id,
+                                      long long before,
+                                      int limit,
+                                      st_storage_http_access_audit **entries,
+                                      size_t *count,
+                                      int *more)
+{
+    *entries = NULL;
+    *count = 0U;
+    *more = 0;
+    if (limit <= 0) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (share_open_db(path, &db) != 0) {
+        return -1;
+    }
+    char sql[384];
+    snprintf(sql, sizeof(sql),
+             "SELECT id, occurred_at, actor, action, route_id, share_id, detail_json FROM http_access_audit "
+             "WHERE tenant_id = ?%s%s ORDER BY id DESC LIMIT ?",
+             route_id > 0 ? " AND route_id = ?" : "",
+             before > 0 ? " AND id < ?" : "");
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    int index = 1;
+    sqlite3_bind_text(stmt, index++, tenant_id, -1, SQLITE_TRANSIENT);
+    if (route_id > 0) {
+        sqlite3_bind_int64(stmt, index++, route_id);
+    }
+    if (before > 0) {
+        sqlite3_bind_int64(stmt, index++, before);
+    }
+    sqlite3_bind_int(stmt, index, limit + 1);
+    st_storage_http_access_audit *items = calloc((size_t)limit, sizeof(*items));
+    int rc = items == NULL ? SQLITE_NOMEM : SQLITE_OK;
+    size_t got = 0U;
+    while (items != NULL && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (got == (size_t)limit) {
+            *more = 1;
+            continue;
+        }
+        st_storage_http_access_audit *item = &items[got];
+        item->id = sqlite3_column_int64(stmt, 0);
+        item->occurred_at = sqlite3_column_int64(stmt, 1);
+        if (sqlite3_column_type(stmt, 2) != SQLITE_NULL) {
+            item->has_actor = copy_text_column(stmt, 2, item->actor, sizeof(item->actor)) == 0;
+        }
+        item->route_id = sqlite3_column_int64(stmt, 4);
+        if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
+            item->has_share_id = copy_text_column(stmt, 5, item->share_id, sizeof(item->share_id)) == 0;
+        }
+        if (copy_text_column(stmt, 3, item->action, sizeof(item->action)) != 0
+            || copy_text_column(stmt, 6, item->detail_json, sizeof(item->detail_json)) != 0) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        ++got;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (rc != SQLITE_DONE) {
+        free(items);
+        *more = 0;
+        return -1;
+    }
+    *entries = items;
+    *count = got;
+    return 0;
+}
+
+/* Spec 7.3 and 8 after a route change: exposure and credentials audit, then the share hooks. */
+static int share_route_changed(sqlite3 *db,
+                               const char *tenant_id,
+                               long long route_id,
+                               const char *before,
+                               const char *after,
+                               int credentials_changed,
+                               const char *actor,
+                               long long now_ms,
+                               st_storage_share_ids *revoked)
+{
+    long long at = now_ms / 1000LL;
+    int rc = 0;
+    if (strcmp(before, after) != 0) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "{\"from\":\"%s\",\"to\":\"%s\"}", before, after);
+        rc = share_audit(db, tenant_id, at, actor, "route.exposure-changed", route_id, NULL, detail);
+    }
+    if (rc == 0 && credentials_changed) {
+        rc = share_audit(db, tenant_id, at, actor, "route.credentials-changed", route_id, NULL, "{}");
+    }
+    if (rc == 0 && strcmp(after, "protected") != 0) {
+        st_storage_http_share *shares = NULL;
+        size_t count = 0U;
+        rc = share_active_of_route(db, route_id, now_ms, &shares, &count);
+        if (rc == 0) {
+            rc = share_revoke_each(db, shares, count, actor,
+                                   strcmp(after, "disabled") == 0 ? "route-disabled" : "route-made-public",
+                                   now_ms, revoked);
+        }
+        free(shares);
+    }
+    return rc;
+}
+
+typedef struct {
+    int found;
+    long long id;
+    int enabled;
+    int auth_enabled;
+    char auth_username[121];
+    char tenant_id[128];
+} share_route_state;
+
+static int share_load_route_state(sqlite3 *db, const char *sql, long long id, const char *client_name,
+                                  const char *route, share_route_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    if (id > 0) {
+        sqlite3_bind_int64(stmt, 1, id);
+    } else {
+        sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, route, -1, SQLITE_TRANSIENT);
+    }
+    int rc = sqlite3_step(stmt);
+    int result = 0;
+    if (rc == SQLITE_ROW) {
+        state->found = 1;
+        state->id = sqlite3_column_int64(stmt, 0);
+        state->enabled = sqlite3_column_int(stmt, 1) != 0;
+        state->auth_enabled = sqlite3_column_int(stmt, 2) != 0;
+        if (copy_text_column(stmt, 3, state->auth_username, sizeof(state->auth_username)) != 0
+            || copy_text_column(stmt, 4, state->tenant_id, sizeof(state->tenant_id)) != 0) {
+            result = -1;
+        }
+    } else if (rc != SQLITE_DONE) {
+        result = -1;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+#define ST_SHARE_ROUTE_STATE_COLUMNS \
+    "SELECT r.id, r.enabled, r.auth_enabled, r.auth_username, COALESCE(c.tenant_id, '') " \
+    "FROM http_route_mapping r LEFT JOIN client_account c ON c.client_name = r.client_name "
+
+int st_storage_create_http_route_audited(const char *path,
+                                         long long client_id,
+                                         const char *route,
+                                         const char *target_base_url,
+                                         int enabled,
+                                         int detail_capture_enabled,
+                                         int media_capture_enabled,
+                                         int path_rewrite_enabled,
+                                         int insecure_skip_verify,
+                                         int auth_enabled,
+                                         const char *auth_username,
+                                         const char *auth_password_hash,
+                                         int password_set,
+                                         const char *actor,
+                                         long long now_ms,
+                                         st_storage_http_route *out_route,
+                                         st_storage_share_ids *revoked)
+{
+    st_storage_client client;
+    if (st_storage_get_client(path, client_id, &client) != 0) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_route_state existing;
+    share_route_state created;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_route_state(db, ST_SHARE_ROUTE_STATE_COLUMNS "WHERE r.client_name = ? AND r.route = ?",
+                                    0, client.client_name, route, &existing);
+    }
+    if (rc == 0) {
+        rc = upsert_http_route_on_db(db, client.client_name, route, target_base_url, enabled,
+                                     detail_capture_enabled, media_capture_enabled, path_rewrite_enabled,
+                                     insecure_skip_verify, auth_enabled, auth_username, auth_password_hash);
+    }
+    if (rc == 0) {
+        rc = share_load_route_state(db, ST_SHARE_ROUTE_STATE_COLUMNS "WHERE r.client_name = ? AND r.route = ?",
+                                    0, client.client_name, route, &created);
+        if (rc == 0 && !created.found) {
+            rc = -1;
+        }
+    }
+    const char *after = share_exposure(enabled, auth_enabled);
+    if (rc == 0 && !existing.found) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "{\"exposure\":\"%s\"}", after);
+        rc = share_audit(db, client.tenant_id, now_ms / 1000LL, actor, "route.created", created.id, NULL, detail);
+    } else if (rc == 0) {
+        /* Creating a route that already exists updates it, with the update's audit and hooks. */
+        const char *username = auth_username == NULL ? "" : auth_username;
+        int credentials_changed = auth_enabled && (strcmp(username, existing.auth_username) != 0 || password_set);
+        rc = share_route_changed(db, client.tenant_id, existing.id,
+                                 share_exposure(existing.enabled, existing.auth_enabled), after,
+                                 credentials_changed, actor, now_ms, revoked);
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc != 0) {
+        return -1;
+    }
+    return out_route == NULL
+        ? 0
+        : st_storage_get_http_route_by_client_route(path, client.client_name, route, out_route);
+}
+
+int st_storage_update_http_route_audited(const char *path,
+                                         long long id,
+                                         const char *route,
+                                         const char *target_base_url,
+                                         int enabled,
+                                         int detail_capture_enabled,
+                                         int media_capture_enabled,
+                                         int path_rewrite_enabled,
+                                         int insecure_skip_verify,
+                                         int auth_enabled,
+                                         const char *auth_username,
+                                         const char *auth_password_hash,
+                                         int password_set,
+                                         const char *actor,
+                                         long long now_ms,
+                                         st_storage_http_route *out_route,
+                                         st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_route_state before;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_route_state(db, ST_SHARE_ROUTE_STATE_COLUMNS "WHERE r.id = ?", id, NULL, NULL, &before);
+        if (rc == 0 && !before.found) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        rc = update_http_route_on_db(db, id, route, target_base_url, enabled, detail_capture_enabled,
+                                     media_capture_enabled, path_rewrite_enabled, insecure_skip_verify,
+                                     auth_enabled, auth_username, auth_password_hash);
+    }
+    if (rc == 0) {
+        /* A new Basic username, or a new password, while the route asks for Basic. */
+        const char *username = auth_username == NULL ? "" : auth_username;
+        int credentials_changed = auth_enabled && (strcmp(username, before.auth_username) != 0 || password_set);
+        rc = share_route_changed(db, before.tenant_id, id, share_exposure(before.enabled, before.auth_enabled),
+                                 share_exposure(enabled, auth_enabled), credentials_changed, actor, now_ms,
+                                 revoked);
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc != 0) {
+        return -1;
+    }
+    return out_route == NULL ? 0 : load_http_route_by_id(path, id, out_route);
+}
+
+int st_storage_delete_http_route_audited(const char *path,
+                                         long long id,
+                                         const char *actor,
+                                         long long now_ms,
+                                         st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_route_state before;
+    st_storage_http_share *shares = NULL;
+    size_t count = 0U;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_route_state(db, ST_SHARE_ROUTE_STATE_COLUMNS "WHERE r.id = ?", id, NULL, NULL, &before);
+        if (rc == 0 && !before.found) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        rc = share_active_of_route(db, id, now_ms, &shares, &count);
+    }
+    if (rc == 0) {
+        rc = delete_http_route_on_db(db, id);
+    }
+    if (rc == 0) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "{\"exposure\":\"%s\"}", share_exposure(before.enabled, before.auth_enabled));
+        rc = share_audit(db, before.tenant_id, now_ms / 1000LL, actor, "route.deleted", id, NULL, detail);
+    }
+    if (rc == 0) {
+        rc = share_revoke_each(db, shares, count, actor, "route-deleted", now_ms, revoked);
+    }
+    free(shares);
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+typedef struct {
+    char tenant_id[128];
+    char client_name[256];
+    char owner_username[128];
+    int enabled;
+} share_client_state;
+
+static int share_load_client_state(sqlite3 *db, long long id, share_client_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT tenant_id, client_name, owner_username, enabled FROM client_account WHERE rowid = ?",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, id);
+    int result = sqlite3_step(stmt) == SQLITE_ROW
+        && copy_text_column(stmt, 0, state->tenant_id, sizeof(state->tenant_id)) == 0
+        && copy_text_column(stmt, 1, state->client_name, sizeof(state->client_name)) == 0
+        && copy_text_column(stmt, 2, state->owner_username, sizeof(state->owner_username)) == 0
+        ? 0 : -1;
+    if (result == 0) {
+        state->enabled = sqlite3_column_int(stmt, 3) != 0;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+int st_storage_update_client_audited(const char *path,
+                                     long long id,
+                                     const char *client_name,
+                                     int enabled,
+                                     int connection_rate_limit_per_minute,
+                                     const char *actor,
+                                     long long now_ms,
+                                     st_storage_client *out_client,
+                                     st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    if (connection_rate_limit_per_minute <= 0) {
+        connection_rate_limit_per_minute = 30;
+    }
+    share_client_state before;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_client_state(db, id, &before);
+    }
+    if (rc == 0) {
+        rc = update_client_on_db(db, id, before.client_name, before.tenant_id, client_name,
+                                 before.owner_username, enabled, connection_rate_limit_per_minute);
+    }
+    if (rc == 0 && before.enabled && !enabled) {
+        st_storage_http_share *shares = NULL;
+        size_t count = 0U;
+        rc = share_active_of_client(db, client_name, now_ms, &shares, &count);
+        if (rc == 0) {
+            rc = share_revoke_each(db, shares, count, actor, "client-disabled", now_ms, revoked);
+        }
+        free(shares);
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc != 0) {
+        return -1;
+    }
+    return out_client == NULL ? 0 : st_storage_get_client(path, id, out_client);
+}
+
+int st_storage_delete_client_audited(const char *path,
+                                     long long id,
+                                     const char *actor,
+                                     long long now_ms,
+                                     st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_client_state client;
+    long long *route_ids = NULL;
+    char (*exposures)[16] = NULL;
+    size_t route_count = 0U;
+    st_storage_http_share *shares = NULL;
+    size_t share_count = 0U;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_client_state(db, id, &client);
+    }
+    if (rc == 0) {
+        /* Its routes go with it; each gets route.deleted, in ascending id, before the shares end. */
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "SELECT id, enabled, auth_enabled FROM http_route_mapping WHERE client_name = ? ORDER BY id",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
+            size_t capacity = 0U;
+            int step;
+            while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+                if (route_count == capacity) {
+                    size_t next = capacity == 0U ? 8U : capacity * 2U;
+                    long long *grown_ids = realloc(route_ids, next * sizeof(*grown_ids));
+                    if (grown_ids == NULL) {
+                        step = SQLITE_NOMEM;
+                        break;
+                    }
+                    route_ids = grown_ids;
+                    char (*grown_exposures)[16] = realloc(exposures, next * sizeof(*grown_exposures));
+                    if (grown_exposures == NULL) {
+                        step = SQLITE_NOMEM;
+                        break;
+                    }
+                    exposures = grown_exposures;
+                    capacity = next;
+                }
+                route_ids[route_count] = sqlite3_column_int64(stmt, 0);
+                snprintf(exposures[route_count], sizeof(exposures[route_count]), "%s",
+                         share_exposure(sqlite3_column_int(stmt, 1) != 0, sqlite3_column_int(stmt, 2) != 0));
+                ++route_count;
+            }
+            rc = step == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
+        rc = share_active_of_client(db, client.client_name, now_ms, &shares, &share_count);
+    }
+    if (rc == 0) {
+        rc = delete_client_on_db(db, id, client.client_name);
+    }
+    for (size_t i = 0U; rc == 0 && i < route_count; ++i) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "{\"exposure\":\"%s\"}", exposures[i]);
+        rc = share_audit(db, client.tenant_id, now_ms / 1000LL, actor, "route.deleted", route_ids[i], NULL, detail);
+    }
+    if (rc == 0) {
+        rc = share_revoke_each(db, shares, share_count, actor, "client-deleted", now_ms, revoked);
+    }
+    free(route_ids);
+    free(exposures);
+    free(shares);
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+typedef struct {
+    char username[128];
+    char tenant_id[128];
+    char role[32];
+    int enabled;
+} share_user_state;
+
+/* 0 found, 1 missing, -1 on error. */
+static int share_load_user_state(sqlite3 *db, const char *username, share_user_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT username, tenant_id, role, enabled FROM specus_management_user WHERE lower(username) = lower(?)",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_DONE ? 1 : -1;
+    if (rc == SQLITE_ROW) {
+        result = copy_text_column(stmt, 0, state->username, sizeof(state->username)) == 0
+            && copy_text_column(stmt, 1, state->tenant_id, sizeof(state->tenant_id)) == 0
+            && copy_text_column(stmt, 2, state->role, sizeof(state->role)) == 0
+            ? 0 : -1;
+        state->enabled = sqlite3_column_int(stmt, 3) != 0;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* The user's own active shares whose creator may no longer manage their route (spec 7.3). */
+static int share_revoke_lost_creator(sqlite3 *db,
+                                     const st_storage_share_builtin_admin *builtin,
+                                     const char *tenant_id,
+                                     const char *username,
+                                     const char *actor,
+                                     long long now_ms,
+                                     st_storage_share_ids *revoked)
+{
+    st_storage_http_share *shares = NULL;
+    size_t count = 0U;
+    int rc = share_select_active(db,
+                                 "SELECT " ST_SHARE_COLUMNS " FROM http_share WHERE tenant_id = ? "
+                                 "AND lower(created_by) = lower(?) AND revoked_at IS NULL AND expires_at * 1000 > ? "
+                                 "ORDER BY created_at, share_id",
+                                 0, tenant_id, username, now_ms, &shares, &count);
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        share_target target;
+        const char *reason = NULL;
+        rc = share_load_target(db, shares[i].route_id, &target);
+        if (rc == 0) {
+            rc = share_lapse_reason(db, builtin, &shares[i], &target, &reason);
+        }
+        if (rc == 0 && reason != NULL && strcmp(reason, "creator-lost-access") == 0) {
+            rc = share_revoke_each(db, &shares[i], 1U, actor, reason, now_ms, revoked);
+        }
+    }
+    free(shares);
+    return rc;
+}
+
+int st_storage_update_management_user_audited(const char *path,
+                                              const st_storage_share_builtin_admin *builtin,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              const char *password_hash,
+                                              const char *role,
+                                              int enabled,
+                                              const char *actor,
+                                              long long now_ms,
+                                              st_storage_management_user *out_user,
+                                              st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_user_state before;
+    share_user_state after;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_user_state(db, username, &before) == 0 ? 0 : -1;
+    }
+    if (rc == 0) {
+        rc = update_management_user_on_db(db, tenant_id, username, password_hash, role, enabled);
+    }
+    if (rc == 0) {
+        rc = share_load_user_state(db, username, &after) == 0 ? 0 : -1;
+    }
+    /* Disabling a user or changing its role may end the shares it created. */
+    if (rc == 0 && (before.enabled != after.enabled || strcmp(before.role, after.role) != 0)) {
+        rc = share_revoke_lost_creator(db, builtin, before.tenant_id, before.username, actor, now_ms, revoked);
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc != 0) {
+        return -1;
+    }
+    return out_user == NULL ? 0 : st_storage_get_management_user_in_tenant(path, tenant_id, username, out_user);
+}
+
+int st_storage_delete_management_user_audited(const char *path,
+                                              const st_storage_share_builtin_admin *builtin,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              const char *actor,
+                                              long long now_ms,
+                                              st_storage_share_ids *revoked)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    share_user_state before;
+    int rc = share_begin(db);
+    if (rc == 0) {
+        rc = share_load_user_state(db, username, &before) == 0 ? 0 : -1;
+    }
+    if (rc == 0) {
+        rc = delete_management_user_on_db(db, tenant_id, username);
+    }
+    if (rc == 0) {
+        rc = share_revoke_lost_creator(db, builtin, before.tenant_id, before.username, actor, now_ms, revoked);
+    }
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
 }

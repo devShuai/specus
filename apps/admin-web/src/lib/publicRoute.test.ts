@@ -30,6 +30,12 @@ describe("readPublicRoute", () => {
     },
   );
 
+  it("recognizes the share landing page from the fragment that carries the token", () => {
+    expect(readPublicRoute(location({ hash: "#/http-share/hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo" })))
+      .toBe("http-share");
+    expect(readPublicRoute(location({ hash: "#/http-shares/x" }))).toBeNull();
+  });
+
   it.each([
     { pathname: "/downloads" },
     { hash: "#/downloads" },

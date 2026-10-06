@@ -17,6 +17,7 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/httpshare"
 	"github.com/devShuai/specus/implementations/go/server/internal/connectivity"
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
@@ -53,6 +54,7 @@ type API struct {
 	packageDirectory string
 	downloadLimiter  *publicDownloadRateLimiter
 	workbench        *workbench
+	shares           *httpshare.Service
 	connectivity     *connectivity.Checker
 	logger           *slog.Logger
 }
@@ -82,7 +84,7 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 	turnstile := security.NewTurnstileVerifier(authConfig.Turnstile)
 	registration := newRegistrationService(db, tokens, turnstile, authConfig,
 		newSMTPRegistrationMailer(authConfig.EmailVerification))
-	return &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
+	api := &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
 		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile,
@@ -91,6 +93,11 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 		workbench:       newWorkbench(),
 		addressResolver: addressResolver,
 		registration:    registration, logger: logger}
+	api.shares = httpshare.NewService(db, httpshare.BuiltInAdmin{Username: api.adminUsername(),
+		TenantID: api.defaultTenant(), Enabled: func() bool {
+			return tokens == nil || tokens.PasswordLoginEnabled()
+		}}, logger)
+	return api
 }
 
 // Register attaches all auth and admin routes to mux.
@@ -171,6 +178,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/clients/{id}/http-routes", a.requireAuth(a.handleCreateHTTPRoute))
 	mux.HandleFunc("PUT /api/admin/http-routes/{routeId}", a.requireAuth(a.handleUpdateHTTPRoute))
 	mux.HandleFunc("DELETE /api/admin/http-routes/{routeId}", a.requireAuth(a.handleDeleteHTTPRoute))
+	a.registerHTTPShares(mux)
 	mux.HandleFunc("POST /api/admin/http-routes/{routeId}/connectivity-check",
 		noStore(a.requireAuth(a.handleHTTPRouteConnectivityCheck)))
 
@@ -654,10 +662,15 @@ func (a *API) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		user.Enabled = *req.Enabled
 	}
 	user.UpdatedAt = time.Now()
-	if err := a.db.UpdateManagementUser(r.Context(), *user); err != nil {
+	// Disabling the user or changing its role ends the shares it may no longer manage, in the same
+	// transaction.
+	revoked, err := a.db.UpdateManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
+		a.shares.LapseReason)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
+	a.shares.CutStreams(revoked)
 	writeJSON(w, http.StatusOK, managementUserView(*user))
 }
 
@@ -689,10 +702,13 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, store.ErrNotFound)
 		return
 	}
-	if err := a.db.DeleteManagementUser(r.Context(), username); err != nil {
+	revoked, err := a.db.DeleteManagementUserAudited(r.Context(), username, principal.Username, a.shareNow(),
+		a.shares.LapseReason)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
+	a.shares.CutStreams(revoked)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1000,10 +1016,13 @@ func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 		account.ConnectionRateLimitPerMinute = rateLimit
 	}
 	account.UpdatedAt = time.Now()
-	if err := a.db.UpdateClientAndRenameReferences(r.Context(), *account, oldName); err != nil {
+	revoked, err := a.db.UpdateClientAudited(r.Context(), *account, oldName, wasEnabled, principal.Username,
+		a.shareNow())
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
+	a.shares.CutStreams(revoked)
 
 	// Kick the live session if the account was renamed or disabled.
 	if !account.Enabled && (wasEnabled || oldName != account.ClientName) {
@@ -1035,10 +1054,12 @@ func (a *API) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, forbidden("无权访问客户端"))
 		return
 	}
-	if err := a.db.DeleteClient(r.Context(), id); err != nil {
+	revoked, err := a.db.DeleteClientAudited(r.Context(), id, principal.Username, a.shareNow(), routeExposure)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
+	a.shares.CutStreams(revoked)
 	a.kick(account.ClientName, store.ReasonAdminDeleted)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1640,7 +1661,8 @@ func (a *API) handleCreateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.InsertHTTPRoute(r.Context(), mapping); err != nil {
+	if err := a.db.InsertHTTPRouteAudited(r.Context(), mapping, principal.Username, a.shareNow(),
+		routeExposure(mapping)); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1685,6 +1707,7 @@ func (a *API) handleUpdateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, conflict("路由已存在"))
 		return
 	}
+	before := *mapping
 	mapping.Route = route
 	mapping.TargetBaseURL = strings.TrimSpace(req.TargetBaseURL)
 	mapping.Enabled = boolOr(req.Enabled, mapping.Enabled)
@@ -1696,10 +1719,15 @@ func (a *API) handleUpdateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mapping.UpdatedAt = time.Now()
-	if err := a.db.UpdateHTTPRoute(r.Context(), *mapping); err != nil {
+	// A route that stops being protected ends its shares in the same transaction; exposure and
+	// credential changes are audited with it.
+	revoked, err := a.db.UpdateHTTPRouteAudited(r.Context(), *mapping, routeChange(before, *mapping, req),
+		principal.Username, a.shareNow())
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
+	a.shares.CutStreams(revoked)
 	a.pushNatControl(r.Context(), mapping.ClientID, mapping.ClientName)
 	writeJSON(w, http.StatusOK, httpRouteView(*mapping))
 }
@@ -1724,10 +1752,13 @@ func (a *API) handleDeleteHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.DeleteHTTPRoute(r.Context(), id); err != nil {
+	revoked, err := a.db.DeleteHTTPRouteAudited(r.Context(), *mapping, routeExposure(*mapping), principal.Username,
+		a.shareNow())
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
+	a.shares.CutStreams(revoked)
 	a.pushNatControl(r.Context(), mapping.ClientID, mapping.ClientName)
 	w.WriteHeader(http.StatusNoContent)
 }

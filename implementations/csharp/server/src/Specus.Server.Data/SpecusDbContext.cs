@@ -31,6 +31,8 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<HttpRouteMapping> HttpRouteMappings => Set<HttpRouteMapping>();
     public DbSet<HttpMediaCapture> HttpMediaCaptures => Set<HttpMediaCapture>();
     public DbSet<HttpMediaReference> HttpMediaReferences => Set<HttpMediaReference>();
+    public DbSet<HttpShare> HttpShares => Set<HttpShare>();
+    public DbSet<HttpAccessAudit> HttpAccessAudits => Set<HttpAccessAudit>();
     public DbSet<TrafficUsage> TrafficUsages => Set<TrafficUsage>();
     public DbSet<ResourceTrafficUsage> ResourceTrafficUsages => Set<ResourceTrafficUsage>();
     public DbSet<HttpTrafficExchange> HttpTrafficExchanges => Set<HttpTrafficExchange>();
@@ -799,6 +801,49 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.UpdatedBy).HasColumnName("updated_by").HasMaxLength(80);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
+        });
+
+        // Temporary HTTP shares (temporary-http-share.md). Column names and types are shared with
+        // the Go, Java and C servers, which may open the same database: instants are integer epoch
+        // seconds, and expiry_recorded is a 0/1 integer rather than a boolean.
+        modelBuilder.Entity<HttpShare>(b =>
+        {
+            b.ToTable("http_share");
+            b.HasKey(x => x.ShareId);
+            b.Property(x => x.ShareId).HasColumnName("share_id").HasMaxLength(16).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.RouteId).HasColumnName("route_id").IsRequired();
+            b.Property(x => x.TokenSha256).HasColumnName("token_sha256").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Access).HasColumnName("access").HasMaxLength(8).IsRequired();
+            b.Property(x => x.PathPrefix).HasColumnName("path_prefix").HasMaxLength(256).IsRequired();
+            b.Property(x => x.Label).HasColumnName("label").HasMaxLength(255);
+            b.Property(x => x.CreatedBy).HasColumnName("created_by").HasMaxLength(120).IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").IsRequired();
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").IsRequired();
+            b.Property(x => x.RevokedAt).HasColumnName("revoked_at");
+            b.Property(x => x.RevokedBy).HasColumnName("revoked_by").HasMaxLength(120);
+            b.Property(x => x.RevokeReason).HasColumnName("revoke_reason").HasMaxLength(40);
+            b.Property(x => x.ExpiryRecorded).HasColumnName("expiry_recorded").IsRequired()
+                .HasDefaultValue((sbyte)0);
+            b.HasIndex(x => x.RouteId).HasDatabaseName("idx_http_share_route");
+            b.HasIndex(x => new { x.TenantId, x.CreatedBy }).HasDatabaseName("idx_http_share_creator");
+            b.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_http_share_expires");
+        });
+
+        modelBuilder.Entity<HttpAccessAudit>(b =>
+        {
+            b.ToTable("http_access_audit");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").IsRequired();
+            b.Property(x => x.Actor).HasColumnName("actor").HasMaxLength(120);
+            b.Property(x => x.Action).HasColumnName("action").HasMaxLength(40).IsRequired();
+            b.Property(x => x.RouteId).HasColumnName("route_id").IsRequired();
+            b.Property(x => x.ShareId).HasColumnName("share_id").HasMaxLength(16);
+            b.Property(x => x.DetailJson).HasColumnName("detail_json").HasMaxLength(512).IsRequired();
+            b.HasIndex(x => x.OccurredAt).HasDatabaseName("idx_http_access_audit_at");
+            b.HasIndex(x => new { x.TenantId, x.RouteId, x.Id }).HasDatabaseName("idx_http_access_audit_route");
         });
 
         modelBuilder.Entity<ConnectionStat>(b =>

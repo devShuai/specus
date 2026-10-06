@@ -65,6 +65,13 @@ STAP2/STWR2/STCLIP2 向量；Java 独立 STUN 服务直接读取 STFWD2 向量�
 Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`，验证 STCE 编解码和 groupId；该内部帧
 不是浏览器协议，不得暴露 roomKey 或 Redis key。
 
+## 临时 HTTP 分享（草案）
+
+- `temporary-http-share-v1.json`：临时 HTTP 分享的参考判定。包括令牌格式与哈希、路径前缀规范化、创建与兑换接口、
+  `/http-share/{shareId}/**` 上每个请求的判定与转发内容、请求 Cookie 剥离与响应头改写、管理事件之后的级联失效与审计
+  序列，以及两个 GCRA 限流器的事件序列。由 `tools/protocol/generate_temporary_share_vectors.py` 生成，语义见
+  [`protocol/spec/temporary-http-share.md`](../spec/temporary-http-share.md)。Java、Go、.NET 与 C 服务端的测试逐节重放它。
+
 ## 服务连通性检查（草案）
 
 - `service-connectivity-check-v1.json`：`POST /api/admin/http-routes/{id}/connectivity-check` 的参考状态机。输入是

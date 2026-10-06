@@ -69,6 +69,8 @@ public class SecurityConfig {
                         // 可以申请 OSS 上传/下载；房间发现、ICE 和实时 Direct/TURN 仍免登录。
                         .requestMatchers(HttpMethod.GET, "/api/public/transfer/downloads/**").permitAll()
                         .requestMatchers("/api/public/transfer/attachments/**").authenticated()
+                        // 临时 HTTP 分享的兑换接口匿名可用：凭据是请求体里的分享令牌。
+                        .requestMatchers(HttpMethod.POST, "/api/public/http-shares/exchange").permitAll()
                         // 其余公开 API 无需 JWT，登录页和未登录用户也能读取。
                         .requestMatchers("/api/public/**").permitAll()
                         .requestMatchers("/api/admin/**", "/auth/refresh").authenticated()
@@ -122,9 +124,11 @@ public class SecurityConfig {
                 + "form-action 'self'; "
                 + "frame-ancestors 'none'; "
                 + "base-uri 'self'";
+        // /http-share/** relays the same target applications for temporary-share visitors.
         RequestMatcher httpSpecus = request -> {
             String path = request.getRequestURI().substring(request.getContextPath().length());
-            return "/http".equals(path) || path.startsWith("/http/");
+            return "/http".equals(path) || path.startsWith("/http/")
+                    || "/http-share".equals(path) || path.startsWith("/http-share/");
         };
         return new DelegatingRequestMatcherHeaderWriter(
                 new NegatedRequestMatcher(httpSpecus),

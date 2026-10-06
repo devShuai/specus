@@ -18,7 +18,16 @@ func (a *App) observeManagementHTTP(next http.Handler) http.Handler {
 		response := &observedResponseWriter{ResponseWriter: w}
 		panicked := false
 		defer func() {
-			if recovered := recover(); recovered != nil {
+			recovered := recover()
+			if recovered == http.ErrAbortHandler {
+				// A deliberate abort (e.g. a share that ended mid-response): net/http must see it
+				// to drop the connection instead of finishing the response as if it were complete.
+				a.logger.Info("management HTTP response aborted", "method", r.Method,
+					"pattern", safeRequestPattern(r), "bytes", response.bytesWritten,
+					"durationMs", time.Since(startedAt).Milliseconds())
+				panic(recovered)
+			}
+			if recovered != nil {
 				panicked = true
 				if !response.wroteHeader && !response.hijacked {
 					http.Error(response, "internal server error", http.StatusInternalServerError)

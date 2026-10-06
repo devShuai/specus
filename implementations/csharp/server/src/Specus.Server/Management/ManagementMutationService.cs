@@ -15,14 +15,16 @@ public sealed class ManagementMutationService
     private readonly SessionRegistry _sessions;
     private readonly NatControlService _natControl;
     private readonly ClientAuthOptions _clientAuth;
+    private readonly HttpShareService _shares;
 
     public ManagementMutationService(SpecusDbContext db, SessionRegistry sessions,
-        NatControlService natControl, IOptions<ClientAuthOptions> clientAuth)
+        NatControlService natControl, IOptions<ClientAuthOptions> clientAuth, HttpShareService shares)
     {
         _db = db;
         _sessions = sessions;
         _natControl = natControl;
         _clientAuth = clientAuth.Value;
+        _shares = shares;
     }
 
     public async Task<ClientResult> CreateClientAsync(ManagementContext context, ClientMutation request,
@@ -53,6 +55,7 @@ public sealed class ManagementMutationService
     {
         var account = await FindClientAsync(context, id, cancellationToken).ConfigureAwait(false);
         var oldName = account.ClientName;
+        var wasEnabled = account.Enabled;
 
         if (!string.IsNullOrWhiteSpace(request.ClientName))
         {
@@ -66,7 +69,20 @@ public sealed class ManagementMutationService
             request.ConnectionRateLimitPerMinute, account.ConnectionRateLimitPerMinute);
         account.UpdatedAt = DateTimeOffset.UtcNow;
 
-        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        // Disabling a client ends the shares of all its routes in the same transaction.
+        List<string> revokedShares = [];
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+            if (wasEnabled && !account.Enabled)
+            {
+                revokedShares = await _shares.OnClientDisabledAsync(context.Username, account.Id,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        _shares.CutStreams(revokedShares);
         if (!account.Enabled || !string.Equals(oldName, account.ClientName, StringComparison.Ordinal))
         {
             CloseOnlineChannel(oldName, account.Enabled ? DisconnectReason.AdminRenamed : DisconnectReason.AdminDisabled);
@@ -80,15 +96,20 @@ public sealed class ManagementMutationService
     {
         var account = await FindClientAsync(context, id, cancellationToken).ConfigureAwait(false);
         CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
+        // The client's route rows go with it (no orphans), each audited as route.deleted, and the
+        // shares of those routes end, all in one transaction.
         await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        // The client's route, mapping and Peer service rows outlive it here, but no workbench
-        // reference to them may: they go with the client, for every identity.
+        // Its mapping and Peer service rows outlive it here, but no workbench reference to any of
+        // its objects may: they go with the client, for every identity.
         await WorkbenchService.DeleteClientReferencesAsync(_db, account.Id, cancellationToken)
+            .ConfigureAwait(false);
+        var revokedShares = await _shares.OnClientDeletedAsync(context.Username, account.Id, cancellationToken)
             .ConfigureAwait(false);
         _db.ClientAccounts.Remove(account);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        _shares.CutStreams(revokedShares);
     }
 
     public async Task<ClientNameAvailability> ClientNameAvailabilityAsync(ManagementContext context,
@@ -373,7 +394,13 @@ public sealed class ManagementMutationService
             UpdatedAt = now,
         };
         _db.HttpRouteMappings.Add(row);
-        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+            await _shares.OnRouteCreatedAsync(context.Username, row, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
         await _natControl.PushSnapshotIfOnlineAsync(account.Id, cancellationToken).ConfigureAwait(false);
         return ToHttpRouteView(row);
     }
@@ -390,6 +417,8 @@ public sealed class ManagementMutationService
         {
             await EnsureRouteAvailableAsync(row.ClientId, route, row.Id, cancellationToken).ConfigureAwait(false);
         }
+        var exposureBefore = HttpShareService.Exposure(row);
+        var authUsernameBefore = row.AuthUsername;
 
         row.Route = route;
         row.TargetBaseUrl = RequireTargetBaseUrl(request.TargetBaseUrl);
@@ -409,7 +438,21 @@ public sealed class ManagementMutationService
         }
         ValidateAuthConfiguration(row.AuthEnabled, row.AuthUsername, row.AuthPasswordHash);
         row.UpdatedAt = DateTimeOffset.UtcNow;
-        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        // Audited when the Basic username changed or a new password was set while auth is on;
+        // the shares never used those credentials, so they stay.
+        var credentialsChanged = row.AuthEnabled
+                                 && (authPasswordHash is not null
+                                     || !string.Equals(authUsernameBefore, row.AuthUsername, StringComparison.Ordinal));
+        List<string> revokedShares;
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+            revokedShares = await _shares.OnRouteUpdatedAsync(context.Username, row, exposureBefore,
+                credentialsChanged, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        _shares.CutStreams(revokedShares);
         await _natControl.PushSnapshotIfOnlineAsync(row.ClientId, cancellationToken).ConfigureAwait(false);
         return ToHttpRouteView(row);
     }
@@ -420,6 +463,8 @@ public sealed class ManagementMutationService
             .ConfigureAwait(false) ?? throw new ArgumentException($"http route not found: {id}");
         await EnsureClientAccessAsync(context, row.ClientId, cancellationToken).ConfigureAwait(false);
         var clientId = row.ClientId;
+        var exposureBefore = HttpShareService.Exposure(row);
+        List<string> revokedShares;
         await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
                          .ConfigureAwait(false))
         {
@@ -427,8 +472,11 @@ public sealed class ManagementMutationService
                 cancellationToken).ConfigureAwait(false);
             _db.HttpRouteMappings.Remove(row);
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            revokedShares = await _shares.OnRouteDeletedAsync(context.Username, row, exposureBefore,
+                cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
+        _shares.CutStreams(revokedShares);
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
