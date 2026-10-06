@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Specus.Client.PeerMesh;
+using Specus.Protocol.HttpRoute;
 using Specus.Protocol.Security;
 
 namespace Specus.Client.Configuration;
@@ -262,6 +263,16 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("clientEgressCapabilities")]
     public ClientEgressCapabilities ClientEgressCapabilities { get; set; } = new();
 
+    /// <summary>What this build does for HTTP route streams.</summary>
+    /// <remarks>
+    /// A server trusts <c>metadata.failure</c> on an HTTP stream's RST only from a session that
+    /// announced version 1, which lets the connectivity check tell a refused target from a route
+    /// the device has not loaded (protocol/spec/service-connectivity-check.md section 6). Older
+    /// servers ignore the object.
+    /// </remarks>
+    [JsonPropertyName("clientHttpRouteCapabilities")]
+    public ClientHttpRouteCapabilities ClientHttpRouteCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -290,6 +301,10 @@ public sealed class ClientEnvironmentInfo
                 Applications = [.. PeerServiceDiscovery.Applications],
             },
             ClientEgressCapabilities = ClientEgressCapabilities.Current(),
+            ClientHttpRouteCapabilities = new ClientHttpRouteCapabilities
+            {
+                Version = HttpRouteFailure.CapabilityVersion,
+            },
             StartedAt = DateTimeOffset.UtcNow.ToString("O"),
         };
         try
@@ -447,6 +462,17 @@ public sealed class ClientEgressCapabilities
         // socket binding that keeps forwarded traffic out of this device's own tunnel is IPv4 only.
         DomainTargetCapable = true,
     };
+}
+
+/// <summary>
+/// From version 1 an HTTP stream that fails before its response OPEN carries the classified
+/// <c>failure</c> on its RST where the client can tell, and the client never makes up a response
+/// head.
+/// </summary>
+public sealed class ClientHttpRouteCapabilities
+{
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
 }
 
 public sealed class ClientPeerServiceCapabilities
