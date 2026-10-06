@@ -4217,9 +4217,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "alice",
-            "revokeReason": "revoked-by-user"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           }
         ],
         "events": [
@@ -4309,9 +4309,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "alice",
-            "revokeReason": "route-disabled"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AC",
@@ -4324,9 +4324,9 @@
             "createdBy": "admin",
             "createdAt": "2026-10-06T07:30:00Z",
             "expiresAt": "2026-10-07T07:30:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "alice",
-            "revokeReason": "route-disabled"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AD",
@@ -4441,9 +4441,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "alice",
-            "revokeReason": "route-made-public"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           }
         ],
         "events": [
@@ -4555,9 +4555,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "admin",
-            "revokeReason": "route-deleted"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AC",
@@ -4636,9 +4636,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "admin",
-            "revokeReason": "client-disabled"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AC",
@@ -4708,9 +4708,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "admin",
-            "revokeReason": "client-deleted"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           }
         ],
         "events": [
@@ -4790,9 +4790,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "admin",
-            "revokeReason": "creator-lost-access"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AC",
@@ -4863,9 +4863,9 @@
             "createdBy": "admin",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "carol",
-            "revokeReason": "creator-lost-access"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AC",
@@ -4878,9 +4878,9 @@
             "createdBy": "admin",
             "createdAt": "2026-10-06T07:30:00Z",
             "expiresAt": "2026-10-07T07:30:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "carol",
-            "revokeReason": "creator-lost-access"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           }
         ],
         "events": [
@@ -4994,9 +4994,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:00Z",
-            "revokedBy": "admin",
-            "revokeReason": "creator-lost-access"
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
           }
         ],
         "events": [
@@ -5112,8 +5112,7 @@
             "expiresAt": "2026-10-06T07:50:00Z",
             "revokedAt": null,
             "revokedBy": null,
-            "revokeReason": null,
-            "expiryRecorded": true
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AC",
@@ -5128,8 +5127,7 @@
             "expiresAt": "2026-10-06T07:30:00Z",
             "revokedAt": null,
             "revokedBy": null,
-            "revokeReason": null,
-            "expiryRecorded": true
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AD",
@@ -5144,8 +5142,7 @@
             "expiresAt": "2026-10-06T09:00:00Z",
             "revokedAt": null,
             "revokedBy": null,
-            "revokeReason": null,
-            "expiryRecorded": true
+            "revokeReason": null
           },
           {
             "shareId": "AAAAAAAAAAAAq8AE",
@@ -5302,9 +5299,9 @@
             "createdBy": "alice",
             "createdAt": "2026-10-06T07:00:00Z",
             "expiresAt": "2026-10-07T07:00:00Z",
-            "revokedAt": "2026-10-06T08:00:30Z",
+            "revokedAt": null,
             "revokedBy": null,
-            "revokeReason": "route-made-public"
+            "revokeReason": null
           }
         ],
         "events": [

@@ -17,6 +17,7 @@ Every expectation is produced by the reference and checked against a hand-writte
 file is written, so the vector cannot ship contradicting itself.
 """
 import base64
+import copy
 import hashlib
 import json
 import re
@@ -1402,7 +1403,8 @@ def build():
 
     lifecycle_cases = []
     for name, shares, events, note in LIFECYCLE_CASES:
-        audit, final, responses = apply_events(shares, events)
+        # The replay mutates share rows; the emitted input must stay the state before the events.
+        audit, final, responses = apply_events(copy.deepcopy(shares), events)
         ids = {S(n): n for n in range(1, 10)}
         expected_audit, expected_final, expected_responses = LIFECYCLE_EXPECTED[name]
         assert summarize_audit(audit, ids) == expected_audit, (name, summarize_audit(audit, ids))
