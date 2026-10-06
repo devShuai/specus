@@ -319,16 +319,73 @@ public class PeerEgressConsumerTests
     }
 
     /// <summary>
-    /// A rejection removes the matching flow rather than leaving it to expire.
+    /// A connection still opening has nothing the consumer could reset it with, so the egress's own
+    /// RST is what ends the application's connect.
     /// </summary>
+    /// <remarks>
+    /// The egress sends its flow-reject first; forgetting the flow on it dropped the RST behind it as
+    /// return-no-flow, and the application retransmitted its SYN into the same refusal until it timed
+    /// out (the peer egress lab, #42).
+    /// </remarks>
     [Fact]
-    public void DropsAFlowTheEgressRejected()
+    public void KeepsAnOpeningFlowTheEgressRejectedForItsReset()
     {
         var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool> { [2] = true });
-        consumer.HandleOutbound(PacketTo("203.0.113.10", 443), Epoch);
+        var syn = PacketTo("203.0.113.10", 443);
+        consumer.HandleOutbound(syn, Epoch);
+
+        var reject = PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false,
+            PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
+                "tcp", VirtualIp, 40000, "203.0.113.10", 443, PeerEgressCodes.LimitExceeded)));
+        consumer.HandleInbound(reject, 2, Epoch);
+        Assert.True(consumer.FlowCount == 1, "the opening flow was forgotten on the reject");
+        Assert.True(_toTun.Count == 0, "a reset was made up for a flow the application acknowledged nothing on");
+
+        // The egress's reset, exactly as it answers a refused SYN, reaches the application.
+        var reset = PeerEgressSegment.BuildReset(PeerEgressSegment.Parse(syn)!);
+        consumer.HandleInbound(PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, reset), 2, Epoch);
+        Assert.Single(_toTun);
+        var delivered = PeerEgressSegment.Parse(_toTun[0]);
+        Assert.NotNull(delivered);
+        Assert.True(delivered.Has(PeerEgressSegment.FlagRst));
+        Assert.Equal(1001u, delivered.Ack);
+
+        // A repeated reject, as for a retransmitted SYN, is neither counted again nor acted on.
+        consumer.HandleInbound(reject, 2, Epoch);
+        Assert.Equal(1, consumer.BlockedCounts()["rejected-egress_limit_exceeded"]);
+        Assert.False(consumer.BlockedCounts().ContainsKey("return-no-flow"));
+        Assert.Single(_toTun);
+    }
+
+    /// <summary>The order can also be the other way round: the reset first, then the reject.</summary>
+    [Fact]
+    public void TakesTheEgressResetBeforeItsReject()
+    {
+        var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool> { [2] = true });
+        var syn = PacketTo("203.0.113.10", 443);
+        consumer.HandleOutbound(syn, Epoch);
+        consumer.HandleInbound(PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false,
+            PeerEgressSegment.BuildReset(PeerEgressSegment.Parse(syn)!)), 2, Epoch);
+        consumer.HandleInbound(PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false,
+            PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
+                "tcp", VirtualIp, 40000, "203.0.113.10", 443, PeerEgressCodes.PortDenied))), 2, Epoch);
+        Assert.Single(_toTun);
+        Assert.Equal(1, consumer.BlockedCounts()["rejected-egress_port_denied"]);
+    }
+
+    /// <summary>
+    /// A rejected datagram flow is forgotten: UDP has no reset to wait for, and the next datagram is
+    /// judged afresh.
+    /// </summary>
+    [Fact]
+    public void ForgetsADatagramFlowTheEgressRejected()
+    {
+        var consumer = NewConsumer(ConsumerRules(), new Dictionary<long, bool> { [2] = true });
+        consumer.HandleOutbound(PeerEgressDatagram.Build(new PeerEgressDatagram.Datagram(
+            Address(VirtualIp), Address("203.0.113.10"), 40000, 53, "query"u8.ToArray())), Epoch);
 
         var body = PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.FlowReject(
-            "tcp", VirtualIp, 40000, "203.0.113.10", 443, PeerEgressCodes.PortDenied));
+            "udp", VirtualIp, 40000, "203.0.113.10", 53, PeerEgressCodes.PortDenied));
         consumer.HandleInbound(PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false, body), 2, Epoch);
 
         Assert.True(consumer.FlowCount == 0, "a flow survived a flow-reject");

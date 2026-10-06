@@ -122,6 +122,13 @@ internal sealed class PeerEgressConsumer(
         /// </summary>
         public bool Replied { get; set; }
 
+        /// <summary>
+        /// Set by a flow-reject for a TCP flow the application has acknowledged nothing on yet: one
+        /// still opening. Such a flow is kept rather than forgotten (see HandleFlowReject), and the
+        /// mark keeps a repeated rejection from being counted again.
+        /// </summary>
+        public bool Rejected { get; set; }
+
         public bool IsTcp => Key.Protocol == PeerEgressSegment.Ipv4ProtocolTcp;
 
         private bool _finOut;
@@ -959,7 +966,8 @@ internal sealed class PeerEgressConsumer(
 
     /// <summary>
     /// A rejection can overtake (or survive loss of) the remote RST. Reset locally before forgetting
-    /// the flow, and only accept its actual egress as the sender.
+    /// the flow, and only accept its actual egress as the sender. A TCP flow still opening cannot be
+    /// reset locally and is kept for the egress's RST instead.
     /// </summary>
     private void HandleFlowReject(PeerEgressFrame.Control control, long fromEgress, long nowMs)
     {
@@ -975,6 +983,24 @@ internal sealed class PeerEgressConsumer(
             return;
         }
         var reset = FlowResetPacket(key, flow);
+        if (reset is null && flow.IsTcp)
+        {
+            // Still opening: the application has acknowledged nothing, so there is no reset to make
+            // here, and the egress's own RST is what ends its connect. That RST may arrive behind
+            // this message and reaches the application only past the return check, which needs the
+            // flow. Forgetting the flow here dropped it as return-no-flow, and the application
+            // retransmitted its SYN into the same refusal until its own timeout. The RST closes the
+            // flow like any other; if it is lost, the retransmitted SYN draws another.
+            if (flow.Rejected)
+            {
+                return;
+            }
+            flow.Rejected = true;
+            RecordBlocked("rejected-" + control.Code.ToLowerInvariant());
+            logger?.LogInformation("[peer-egress-consumer] egress={Egress} refused flow code={Code}",
+                fromEgress, control.Code);
+            return;
+        }
         Forget(flow);
         RecordBlocked("rejected-" + control.Code.ToLowerInvariant());
         logger?.LogInformation("[peer-egress-consumer] egress={Egress} refused flow code={Code}",
