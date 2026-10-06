@@ -19,6 +19,7 @@ public class ClientEnvironmentInfo {
     private ClientMessageCapabilities clientMessageCapabilities = new ClientMessageCapabilities();
     private ClientPeerServiceCapabilities clientPeerServiceCapabilities = new ClientPeerServiceCapabilities();
     private ClientEgressCapabilities clientEgressCapabilities = new ClientEgressCapabilities();
+    private ClientHttpRouteCapabilities clientHttpRouteCapabilities = new ClientHttpRouteCapabilities();
     private List<String> localAddresses = new ArrayList<>();
     private String startedAt;
 
@@ -52,5 +53,17 @@ public class ClientEnvironmentInfo {
         private boolean egressCapable;
         private boolean domainTargetCapable;
         private boolean ipv6TargetCapable;
+    }
+
+    /**
+     * What the client does for HTTP route streams. From version 1 a stream that fails before its
+     * response OPEN carries {@code metadata.failure} on its RST where the client can tell why, and
+     * the client never makes up a response head; a server trusts {@code failure} only from a session
+     * that announced version 1 (protocol/spec/service-connectivity-check.md section 6). Version 0 or
+     * absent is an older client.
+     */
+    @Data
+    public static class ClientHttpRouteCapabilities {
+        private int version;
     }
 }

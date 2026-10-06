@@ -3,6 +3,7 @@ package com.theshuai.specusclient.handler;
 import com.theshuai.common.handler.RecentStreamTombstones;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.handler.NatCommonHandler;
+import com.theshuai.common.protocol.HttpRouteFailure;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
@@ -68,6 +69,8 @@ public class NatClientHandler extends NatCommonHandler {
      * {@code ws://} 或 HTTP 目标。volatile 整体替换，供强制 NAT stream v2 转发使用。
      */
     private volatile Map<String, HttpSpecusConfig> httpRoutes = Map.of();
+    /** How HTTP route streams reach their targets; tests swap in a resolver or a shorter timeout. */
+    private volatile HttpUpstreamDial httpUpstreamDial = HttpUpstreamDial.DEFAULT;
 
     private final ConcurrentHashMap<Integer, LocalSpecusHandler> channelHandlerMap = new ConcurrentHashMap<>();
     /** WS 隧道流的本地 Channel，key = 服务端分配的 streamId。 */
@@ -130,6 +133,10 @@ public class NatClientHandler extends NatCommonHandler {
         Map<String, String> targets = new HashMap<>();
         httpRoutes.forEach((route, config) -> targets.put(route, config.getTargetBaseUrl()));
         return Map.copyOf(targets);
+    }
+
+    void useHttpUpstreamDial(HttpUpstreamDial dial) {
+        this.httpUpstreamDial = dial;
     }
 
     boolean isCurrentHttpRouteInsecureSkipVerify(String route) {
@@ -686,7 +693,7 @@ public class NatClientHandler extends NatCommonHandler {
         }
         int streamId = packet.getStreamId();
         HttpStreamForwarder forwarder = new HttpStreamForwarder(
-                this, streamId, packet.getMetaData(), httpRoutes, ensureWsWorkerGroup());
+                this, streamId, packet.getMetaData(), httpRoutes, ensureWsWorkerGroup(), httpUpstreamDial);
         if (httpStreams.putIfAbsent(streamId, forwarder) != null) {
             sendReset(streamId, 7, "duplicate HTTP stream");
             return;
@@ -742,11 +749,28 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     void failHttpStream(int streamId, String reason) {
+        failHttpStream(streamId, reason, null);
+    }
+
+    /**
+     * Resets an HTTP stream. {@code failure} classifies a failure before the response OPEN and
+     * travels next to the reason (protocol/spec/service-connectivity-check.md section 6.2); null
+     * leaves the RST as it always was.
+     */
+    void failHttpStream(int streamId, String reason, HttpRouteFailure failure) {
         HttpStreamForwarder stream = httpStreams.remove(streamId);
         if (stream != null) {
             stream.cancel(reason);
         }
-        sendReset(streamId, 8, reason);
+        markStreamClosed(streamId);
+        Map<String, Object> metadata = new HashMap<>();
+        if (reason != null && !reason.isBlank()) {
+            metadata.put("reason", reason);
+        }
+        if (failure != null) {
+            metadata.put(HttpRouteFailure.METADATA_KEY, failure.wireName());
+        }
+        StreamFlowController.get(ctx.channel()).reset(streamId, 8, metadata);
     }
 
     void httpForwarderDone(int streamId, HttpStreamForwarder forwarder) {
