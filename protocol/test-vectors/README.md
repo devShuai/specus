@@ -61,6 +61,13 @@ STAP2/STWR2/STCLIP2 向量；Java 独立 STUN 服务直接读取 STFWD2 向量�
 Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`，验证 STCE 编解码和 groupId；该内部帧
 不是浏览器协议，不得暴露 roomKey 或 Redis key。
 
+## 服务连通性检查（草案）
+
+- `service-connectivity-check-v1.json`：`POST /api/admin/http-routes/{id}/connectivity-check` 的参考状态机。输入是
+  route 与设备状态、客户端能力和设备对探测的回应，期望是接口状态码，以及按固定顺序排列的四个阶段的结果、结果码和
+  判定时刻；另有 GCRA 限流事件序列。由 `tools/protocol/generate_service_connectivity_vectors.py` 生成，语义见
+  [`protocol/spec/service-connectivity-check.md`](../spec/service-connectivity-check.md)。尚无实现读取它。
+
 ## 拒绝规则
 
 每种实现至少覆盖：错误版本、错误 magic/type、截断、尾随字节、越界长度、错误 GCM tag/HMAC、重复

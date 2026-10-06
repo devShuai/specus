@@ -3,6 +3,7 @@ package com.theshuai.specusclient.handler;
 import com.theshuai.common.handler.RecentStreamTombstones;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.handler.NatCommonHandler;
+import com.theshuai.common.protocol.HttpRouteFailure;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
@@ -68,6 +69,8 @@ public class NatClientHandler extends NatCommonHandler {
      * {@code ws://} 或 HTTP 目标。volatile 整体替换，供强制 NAT stream v2 转发使用。
      */
     private volatile Map<String, HttpSpecusConfig> httpRoutes = Map.of();
+    /** How HTTP route streams reach their targets; tests swap in a resolver or a shorter timeout. */
+    private volatile HttpUpstreamDial httpUpstreamDial = HttpUpstreamDial.DEFAULT;
 
     private final ConcurrentHashMap<Integer, LocalSpecusHandler> channelHandlerMap = new ConcurrentHashMap<>();
     /** WS 隧道流的本地 Channel，key = 服务端分配的 streamId。 */
@@ -130,6 +133,10 @@ public class NatClientHandler extends NatCommonHandler {
         Map<String, String> targets = new HashMap<>();
         httpRoutes.forEach((route, config) -> targets.put(route, config.getTargetBaseUrl()));
         return Map.copyOf(targets);
+    }
+
+    void useHttpUpstreamDial(HttpUpstreamDial dial) {
+        this.httpUpstreamDial = dial;
     }
 
     boolean isCurrentHttpRouteInsecureSkipVerify(String route) {
@@ -387,38 +394,69 @@ public class NatClientHandler extends NatCommonHandler {
         // Created up front so a failed connect removes only this stream's handler, never one that
         // an earlier stream with the same id still owns.
         LocalSpecusHandler localSpecusHandler = new LocalSpecusHandler(this, streamId);
+        if (channelHandlerMap.putIfAbsent(streamId, localSpecusHandler) != null) {
+            sendReset(streamId, 7, "duplicate TCP stream");
+            return;
+        }
+        // The stream is published while its connect is still under way, the way the Go and .NET
+        // clients keep it, so this loop goes straight back to the other streams on the data
+        // connection. DATA and FIN that arrive in the meantime wait in the handler, within the
+        // stream's receive window, and an RST closes the channel, which abandons the connect.
+        String address = specusConfig.getSpecusAddress();
+        int targetPort = specusConfig.getSpecusPort();
+        ChannelFuture connectFuture;
         try {
-            localConnection.connect(specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), new ChannelInitializer<SocketChannel>() {
+            connectFuture = localConnection.connect(address, targetPort, new ChannelInitializer<SocketChannel>() {
                 @Override
-                protected void initChannel(SocketChannel channel) throws Exception {
-                    if (!removePendingStream(streamId)) {
+                protected void initChannel(SocketChannel channel) {
+                    if (channelHandlerMap.get(streamId) != localSpecusHandler) {
+                        // Reset before the channel even registered.
                         channel.close();
                         return;
                     }
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), localSpecusHandler);
-                    LocalSpecusHandler existing = channelHandlerMap.putIfAbsent(streamId, localSpecusHandler);
-                    if (existing != null) {
-                        sendReset(streamId, 7, "duplicate TCP stream");
-                        channel.close();
-                        return;
-                    }
                     channelGroup.add(channel);
-                    channel.closeFuture().addListener(future -> {
-                        removeLocalHandler(streamId, localSpecusHandler);
-                    });
                 }
             });
-        } catch (Exception e) {
-            // An unreachable target fails this stream only. Letting the exception reach the
-            // pipeline would close the data connection and every other stream on it.
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            log.warn("Local connect for stream {} to {}:{} failed: {}", Integer.toUnsignedString(streamId),
-                    specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), e.toString());
-            channelHandlerMap.remove(streamId, localSpecusHandler);
-            sendReset(streamId, 1, "local connect failed");
+        } catch (RuntimeException e) {
+            // A connect that cannot even start fails this stream only. Letting the exception reach
+            // the pipeline would close the data connection and every other stream on it.
+            localTcpConnectFailed(streamId, localSpecusHandler, address, targetPort, e);
+            return;
         }
+        Channel localChannel = connectFuture.channel();
+        localSpecusHandler.connecting(localChannel);
+        localChannel.closeFuture().addListener(future -> removeLocalHandler(streamId, localSpecusHandler));
+        connectFuture.addListener((ChannelFuture future) ->
+                localSpecusHandler.connectFinished(future, address, targetPort));
+    }
+
+    /**
+     * Called on the local channel's loop once its connect succeeded. Returns false when the stream
+     * no longer belongs to this handler or the data connection is gone, and the caller closes it.
+     */
+    boolean localTcpConnected(int streamId, LocalSpecusHandler handler) {
+        removePendingStream(streamId);
+        return channelHandlerMap.get(streamId) == handler && ctx != null && ctx.channel().isActive();
+    }
+
+    /**
+     * Fails one stream whose local connect did not succeed. An unreachable target is that stream's
+     * failure alone: it gets a reset with the reason it always had, and the data connection and
+     * every other stream on it keep going.
+     */
+    void localTcpConnectFailed(int streamId, LocalSpecusHandler handler, String address, int port,
+                               Throwable cause) {
+        log.warn("Local connect for stream {} to {}:{} failed: {}", Integer.toUnsignedString(streamId),
+                address, port, cause == null ? "unknown" : cause.toString());
+        channelHandlerMap.remove(streamId, handler);
+        removePendingStream(streamId);
+        resetTcpStream(streamId, 1, "local connect failed");
+    }
+
+    /** The handler of a TCP stream, connected or still connecting; for tests. */
+    LocalSpecusHandler localTcpStream(int streamId) {
+        return channelHandlerMap.get(streamId);
     }
 
     /**
@@ -655,7 +693,7 @@ public class NatClientHandler extends NatCommonHandler {
         }
         int streamId = packet.getStreamId();
         HttpStreamForwarder forwarder = new HttpStreamForwarder(
-                this, streamId, packet.getMetaData(), httpRoutes, ensureWsWorkerGroup());
+                this, streamId, packet.getMetaData(), httpRoutes, ensureWsWorkerGroup(), httpUpstreamDial);
         if (httpStreams.putIfAbsent(streamId, forwarder) != null) {
             sendReset(streamId, 7, "duplicate HTTP stream");
             return;
@@ -711,11 +749,28 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     void failHttpStream(int streamId, String reason) {
+        failHttpStream(streamId, reason, null);
+    }
+
+    /**
+     * Resets an HTTP stream. {@code failure} classifies a failure before the response OPEN and
+     * travels next to the reason (protocol/spec/service-connectivity-check.md section 6.2); null
+     * leaves the RST as it always was.
+     */
+    void failHttpStream(int streamId, String reason, HttpRouteFailure failure) {
         HttpStreamForwarder stream = httpStreams.remove(streamId);
         if (stream != null) {
             stream.cancel(reason);
         }
-        sendReset(streamId, 8, reason);
+        markStreamClosed(streamId);
+        Map<String, Object> metadata = new HashMap<>();
+        if (reason != null && !reason.isBlank()) {
+            metadata.put("reason", reason);
+        }
+        if (failure != null) {
+            metadata.put(HttpRouteFailure.METADATA_KEY, failure.wireName());
+        }
+        StreamFlowController.get(ctx.channel()).reset(streamId, 8, metadata);
     }
 
     void httpForwarderDone(int streamId, HttpStreamForwarder forwarder) {

@@ -121,6 +121,15 @@ public final class StreamFlowController {
     }
 
     public void reset(int streamId, long errorCode, String reason) {
+        reset(streamId, errorCode, reason == null || reason.isBlank() ? null : Map.of("reason", reason));
+    }
+
+    /**
+     * Resets a stream with the given RST metadata: the reason, and whatever travels next to it, such
+     * as an HTTP route failure classification. Null or empty metadata sends the RST without any.
+     */
+    public void reset(int streamId, long errorCode, Map<String, Object> metadata) {
+        Map<String, Object> resetMetadata = metadata == null || metadata.isEmpty() ? null : Map.copyOf(metadata);
         execute(() -> {
             StreamState state = streams.remove(streamId);
             if (state != null) {
@@ -131,8 +140,8 @@ public final class StreamFlowController {
             reset.setNatMessageType(NatMessageType.RST);
             reset.setStreamId(streamId);
             reset.setValue(errorCode);
-            if (reason != null && !reason.isBlank()) {
-                reset.setMetaData(Map.of("reason", reason));
+            if (resetMetadata != null) {
+                reset.setMetaData(resetMetadata);
             }
             controlChannel.writeAndFlush(reset);
         });

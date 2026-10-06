@@ -340,6 +340,12 @@ public class SpecusClientApplication {
         egress.setDomainTargetCapable(true);
         egress.setIpv6TargetCapable(false);
         info.setClientEgressCapabilities(egress);
+        // HTTP route streams that fail before their response head say why on the RST, so the
+        // connectivity check can tell a refused target from a route this device has not loaded.
+        ClientEnvironmentInfo.ClientHttpRouteCapabilities httpRoutes =
+                new ClientEnvironmentInfo.ClientHttpRouteCapabilities();
+        httpRoutes.setVersion(com.theshuai.common.protocol.HttpRouteFailure.CAPABILITY_VERSION);
+        info.setClientHttpRouteCapabilities(httpRoutes);
         return info;
     }
 
