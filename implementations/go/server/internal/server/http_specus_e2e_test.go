@@ -189,7 +189,8 @@ func loginHTTPTestChannels(
 	port int,
 ) (net.Conn, net.Conn, *bufio.Reader) {
 	t.Helper()
-	return loginHTTPTestChannelsWithCapability(t, app, port, 0)
+	controlConn, _, dataConn, dataReader := loginHTTPTestChannelsWithControlReader(t, app, port)
+	return controlConn, dataConn, dataReader
 }
 
 // loginHTTPTestChannelsWithCapability logs the demo client in as a session that announced
@@ -200,6 +201,28 @@ func loginHTTPTestChannelsWithCapability(
 	port int,
 	httpRouteCapability int,
 ) (net.Conn, net.Conn, *bufio.Reader) {
+	t.Helper()
+	controlConn, _, dataConn, dataReader := loginHTTPTestChannelsAs(t, app, port, httpRouteCapability)
+	return controlConn, dataConn, dataReader
+}
+
+// loginHTTPTestChannelsWithControlReader also returns the reader that consumed the control login
+// response, so a test can keep reading NAT_CONTROL pushes without losing buffered bytes.
+func loginHTTPTestChannelsWithControlReader(
+	t *testing.T,
+	app *App,
+	port int,
+) (net.Conn, *bufio.Reader, net.Conn, *bufio.Reader) {
+	t.Helper()
+	return loginHTTPTestChannelsAs(t, app, port, 0)
+}
+
+func loginHTTPTestChannelsAs(
+	t *testing.T,
+	app *App,
+	port int,
+	httpRouteCapability int,
+) (net.Conn, *bufio.Reader, net.Conn, *bufio.Reader) {
 	t.Helper()
 	session := issueClientSession(t, app, DemoClientName)
 	app.clientAuth.SetHTTPRouteCapability(session.ID, httpRouteCapability)
@@ -253,7 +276,7 @@ func loginHTTPTestChannelsWithCapability(
 		dataConn.Close()
 		t.Fatalf("data login rejected: %#v", dataResponse)
 	}
-	return controlConn, dataConn, dataReader
+	return controlConn, controlReader, dataConn, dataReader
 }
 
 func readProtocolPacket(reader *bufio.Reader) (protocol.Packet, error) {

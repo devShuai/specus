@@ -152,7 +152,6 @@ class HttpRouteServiceTests {
         httpRouteService.deleteRoute(created.id());
 
         assertThat(httpRouteMappingRepository.findById(created.id())).isEmpty();
-        // existsByClientId 仍然 false，等于"未接管态"重新激活
         assertThat(httpRouteMappingRepository.existsByClientId(clientIdA)).isFalse();
     }
 

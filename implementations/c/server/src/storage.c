@@ -1576,6 +1576,37 @@ int st_storage_get_management_user(const char *path,
     return ok ? 0 : -1;
 }
 
+int st_storage_find_management_user(const char *path,
+                                    const char *username,
+                                    st_storage_management_user *user)
+{
+    /* Read-only: a lookup on every authenticated request must never create or migrate the file. */
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
+        "FROM specus_management_user WHERE lower(username) = lower(?)",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_ROW ? (scan_management_user(stmt, user) == 0 ? 0 : -1)
+        : rc == SQLITE_DONE ? 1 : -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
 int st_storage_create_management_user(const char *path,
                                       const char *username,
                                       const char *tenant_id,

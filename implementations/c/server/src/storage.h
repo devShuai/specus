@@ -535,6 +535,10 @@ int st_storage_list_management_users(const char *path,
 int st_storage_get_management_user(const char *path,
                                    const char *username,
                                    st_storage_management_user *user);
+/* Read-only lookup: 0 when found, 1 when there is no such user, -1 when the store cannot be read. */
+int st_storage_find_management_user(const char *path,
+                                    const char *username,
+                                    st_storage_management_user *user);
 int st_storage_create_management_user(const char *path,
                                       const char *username,
                                       const char *tenant_id,
