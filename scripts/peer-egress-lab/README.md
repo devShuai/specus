@@ -37,8 +37,9 @@ that did not happen reaches the target and is logged, instead of failing for wan
 - Fault injection, each with a leak check on the target's log: ACL revoked (the catalogue stops offering the
   egress and the consumer blocks it as `not-offered`, or the egress refuses a flow that beat the
   catalogue), tenant switch off (an established flow is cut, a new one refused), egress process
-  stopped and restarted, rule changed to `block` across a consumer restart, consumer `kill -9`
-  with a user route of its own in the table.
+  stopped and restarted, server restarted (routes held while the control connection is down, and a
+  policy change the restarted server pushes is applied by the egress), rule changed to `block`
+  across a consumer restart, consumer `kill -9` with a user route of its own in the table.
 - The consumer's routing table after a normal exit, after `kill -9`, after the restart, and at the
   end.
 - Refusals at the egress (#42): a restricted target under a `0.0.0.0/0` grant, a consumer taken off
@@ -62,14 +63,30 @@ these checks takes as its evidence the egress's own cumulative refusal count und
 push it depends on has been logged by the egress and published in its status. The consumer's view,
 the `refused flow code=` line and its `rejected-<code>` count, is added to the evidence but not
 required: the `flow-reject` is a datagram, and losing it is allowed. The target's log is read for
-anything that got through, from any address.
+anything that got through, from any address. A refused connect must also end as one, curl's exit 7
+rather than a timeout: the egress answers a refused SYN with a reset, and an application left to
+retransmit into the refusal until its own timeout is what the explicit-failure rule forbids.
+
+That last requirement found a bug in all three consumers. The egress sends its `flow-reject` before
+the reset, and the consumers forgot a flow on the `flow-reject` even when it was still opening,
+which has no acknowledgement to make a reset from; the egress's reset arriving next was dropped as
+`return-no-flow`, and every refused connect hung for curl's whole 8 s while the egress refused its
+retransmitted SYNs. A consumer now keeps an opening TCP flow on a `flow-reject`, counts the rejection
+once, and lets the egress's reset through.
+
+The policy changes these checks make found a second one, in the Java egress: it kept the last
+control session's `egress-config` revision across a reconnect, and a restarted server numbers from 1
+again, so after the server-restart fault it ignored every policy change and went on enforcing the
+policy from before (here, a flow cap of 128 when 4 was pushed). Go and .NET build a new plane for
+each session; Java now resets the revision when a control session starts, and the server-restart
+fault checks that the egress applies a change the restarted server pushes.
 
 | Check | How | Expected code |
 | --- | --- | --- |
 | Restricted target | The consumer gets a second rule, `169.254.169.254/32` to the egress, and the policy grants `0.0.0.0/0` next to the lab's prefix. The egress's own network reaches the target on that address (checked first), so only the forced-deny list stands in the way | `EGRESS_FORBIDDEN_DESTINATION`; nothing reaches `169.254.169.254` |
 | Unauthorized device | The consumer is taken off the allow list while a blackhole route in the server's namespace holds back everything the server sends the consumer, so its catalogue still offers the egress (the check reads `standing`) and it sends the flow on. The peer path is direct and never passes the server; the server is not changed. Afterwards the consumer is allowed again and flows recover once the held-back messages arrive | `EGRESS_CONSUMER_DENIED` |
 | Flow cap | `maxFlowsPerConsumer` 4: four connections held open through the egress, the fifth refused; once they are reset a new flow goes through under the same cap | `EGRESS_LIMIT_EXCEEDED` |
-| New-flow bucket | Both flow caps raised out of reach, then 384 short flows at once (three buckets of 128, refilled at 64 a second). At least 128 must connect and some be refused; a flow established before the burst runs to its end; two seconds later 16 new flows at once go through | `EGRESS_LIMIT_EXCEEDED` |
+| New-flow bucket | Both flow caps raised out of reach and the idle timeout cut to 3 s, then one datagram from each of 384 sockets at once: 384 new flows (three buckets of 128, refilled at 64 a second). A datagram flow needs no handshake with the target, so the burst meets the bucket as fast as the egress reads it rather than as fast as it dials. Of what reached the egress (refused plus its `totalFlows` delta), at most 128 + 64/s over the time until the last answer, plus a slack of 32, may be admitted, and the rest must be refused; at least 64 must be answered. A TCP flow established before the burst runs to its end, and two seconds later 16 new flows at once go through | `EGRESS_LIMIT_EXCEEDED` |
 | DNS rebinding (phase two) | The policy's `domainRules` grant `*.lab.test`, shown to be in force by `granted.lab.test`, a public address no destination rule covers, going through. `metadata.lab.test` and `private.lab.test` resolve, in the egress's hosts file, to `169.254.169.254` and `10.90.9.10`; the consumer resolves each to a fake IP | `EGRESS_FORBIDDEN_DESTINATION` and `EGRESS_SCOPE_DENIED`; nothing reaches either address |
 
 `EGRESS_CONSUMER_DENIED` does not happen end to end while the two messages a policy change sends

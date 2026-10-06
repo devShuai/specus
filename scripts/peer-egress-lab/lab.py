@@ -82,9 +82,16 @@ CODE_FORBIDDEN = "EGRESS_FORBIDDEN_DESTINATION"
 CODE_SCOPE = "EGRESS_SCOPE_DENIED"
 CODE_LIMIT = "EGRESS_LIMIT_EXCEEDED"
 # The egress's new-flow bucket per consumer: 128 at once, refilled at 64 a second. The burst is three
-# buckets, so it still overflows when the egress takes up to three seconds to see all of it.
+# buckets, and below the 500 packets a TUN device queues, so none is lost on the consumer's side
+# before the egress can judge it. Of what reaches the egress, the egress may admit no more than
+# RATE_BUCKET + RATE_REFILL_PER_SECOND x (how long it took over the burst) + RATE_SLACK and must
+# refuse the rest; the slack covers the last answer coming a little before the egress finished.
 RATE_BUCKET, RATE_REFILL_PER_SECOND = 128, 64
 RATE_BURST_FLOWS = 3 * RATE_BUCKET
+RATE_SLACK = 32
+# The admitted datagram flows stay live until they are idle this long. Short, so that they are gone
+# before the flow caps come back down, rather than holding 200 slots for a minute.
+RATE_IDLE_SECONDS = 3
 CONCURRENCY_CAP = 4
 
 # Phase two (protocol/spec/peer-egress-dns.md). The name exists only in the egress's /etc/hosts: the
@@ -121,39 +128,44 @@ GATE_FIRST_BYTE_SAMPLES = 20
 GATE_FIRST_BYTE_P95_MS = 50.0
 GATE_MEMORY_GROWTH_MIB = 200.0
 
-# Run in the consumer's namespace as `python3 -c BURST_SCRIPT HOST PORT COUNT SECONDS`: COUNT
-# non-blocking connects started back to back, each closed with a reset the moment it connects, so
-# the flows are short and the egress's concurrency limits never come into it. Prints how each one
-# ended, by errno name; "pending" is a connect still unanswered after SECONDS.
+# Run in the consumer's namespace as `python3 -c BURST_SCRIPT HOST PORT COUNT QUIET`: one datagram
+# from each of COUNT sockets, so COUNT new flows, sent back to back. A datagram flow costs the
+# egress no handshake with the target, so how fast the burst meets the bucket does not depend on
+# how fast the egress can dial. Listens for the answers until QUIET seconds pass without one, and
+# prints how many came and when the last did: the egress admits flows for about that long, and the
+# bucket refills for as long as it does.
 BURST_SCRIPT = """\
-import errno, json, selectors, socket, struct, sys, time
-host, port, count, wait = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
-abort = struct.pack('ii', 1, 0)
+import json, selectors, socket, sys, time
+host, port, count, quiet = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
 selector = selectors.DefaultSelector()
-started = time.monotonic()
+sockets = []
 for _ in range(count):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(False)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, abort)
-    s.connect_ex((host, port))
-    selector.register(s, selectors.EVENT_WRITE)
-opened = time.monotonic() - started
-outcomes, pending = {}, count
-deadline = time.monotonic() + wait
-while pending and time.monotonic() < deadline:
-    for key, _ in selector.select(max(0.0, deadline - time.monotonic())):
-        s = key.fileobj
-        selector.unregister(s)
-        pending -= 1
-        error = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-        name = 'connected' if error == 0 else errno.errorcode.get(error, str(error))
-        outcomes[name] = outcomes.get(name, 0) + 1
-        s.close()
-settled = time.monotonic() - started
-for key in list(selector.get_map().values()):
-    key.fileobj.close()
-outcomes['pending'] = pending
-print(json.dumps({'outcomes': outcomes, 'opened': round(opened, 3), 'settled': round(settled, 3)}))
+    sockets.append(s)
+started = time.monotonic()
+for s in sockets:
+    s.sendto(b'burst', (host, port))
+    selector.register(s, selectors.EVENT_READ)
+sent = time.monotonic() - started
+answered, last = 0, 0.0
+deadline = time.monotonic() + quiet
+while answered < count and selector.get_map():
+    events = selector.select(max(0.0, deadline - time.monotonic()))
+    if not events:
+        break
+    for key, _ in events:
+        selector.unregister(key.fileobj)
+        try:
+            key.fileobj.recv(512)
+        except OSError:
+            continue
+        answered += 1
+        last = time.monotonic() - started
+        deadline = time.monotonic() + quiet
+for s in sockets:
+    s.close()
+print(json.dumps({'sent': count, 'answered': answered, 'sendSeconds': round(sent, 3), 'lastAnswer': round(last, 3)}))
 """
 
 # Run as `python3 -c HOLD_SCRIPT HOST PORT ATTEMPTS`: connects one at a time and keeps each
@@ -323,6 +335,7 @@ class Lab:
         self.secrets = {"egress": secrets.token_hex(16), "consumer": secrets.token_hex(16)}
         self.started = time.time()
         self.netem = None
+        self.last_refused = None
 
     # -- plumbing ---------------------------------------------------------------------------------
 
@@ -587,14 +600,16 @@ class Lab:
     def devices(self):
         return self.admin.call("GET", "/api/admin/peer-mesh/devices") or []
 
-    def policy(self, allowed, destinations=(RULE_GRANT,), domains=(), max_flows=256, per_consumer=128):
+    def policy(self, allowed, destinations=(RULE_GRANT,), domains=(), max_flows=256, per_consumer=128,
+               idle_seconds=60):
         # Every field is sent every time. The server keeps whatever a request leaves out, so a grant
         # or a limit set for one check would otherwise outlive it into the next.
         return self.admin.call("POST", "/api/admin/peer-mesh/egress/policies", {
             "egressClientId": self.egress_id, "enabled": True, "scope": "PUBLIC",
             "allowedConsumerClientIds": allowed,
             "destinationRules": list(destinations), "domainRules": list(domains),
-            "maxConcurrentFlows": max_flows, "maxFlowsPerConsumer": per_consumer, "idleTimeoutSeconds": 60,
+            "maxConcurrentFlows": max_flows, "maxFlowsPerConsumer": per_consumer,
+            "idleTimeoutSeconds": idle_seconds,
         })
 
     def set_policy(self, allowed, **fields):
@@ -698,11 +713,18 @@ class Lab:
                 return section
         return None
 
-    def egress_refused(self):
+    def egress_counts(self):
+        """The egress's refusals by code and the number of flows it has ever admitted, from its
+        status; None for what cannot be read."""
         section = self.egress_section()
         if section is None:
-            return None
-        return {code: count for code, count in (section.get("refused") or {}).items() if isinstance(count, int)}
+            return None, None
+        refused = {code: count for code, count in (section.get("refused") or {}).items() if isinstance(count, int)}
+        total = section.get("totalFlows")
+        return refused, total if isinstance(total, int) else None
+
+    def egress_refused(self):
+        return self.egress_counts()[0]
 
     def refusal_baseline(self):
         """The egress's refusal counts with the last policy push fully accounted for. A push revokes
@@ -712,18 +734,26 @@ class Lab:
         time.sleep(2.5)
         return self.egress_refused() or {}
 
-    def refused_at_egress(self, code, before, timeout=15):
-        """The egress's counts once it has counted `code` more often than in `before`, else None. The
-        egress counts a refusal when it makes it, whether or not its reset and flow-reject reach the
-        consumer: this is the evidence that the egress is where the flow stopped."""
+    def refused_at_egress(self, code, before, timeout=15, at_least=1):
+        """The egress's counts once it has counted `code` at least `at_least` more times than in
+        `before`, else None. The egress counts a refusal when it makes it, whether or not its reset
+        and flow-reject reach the consumer: this is the evidence that the egress is where the flow
+        stopped."""
+        last = {}
+
         def gained():
             counts = self.egress_refused()
-            return counts if counts is not None and counts.get(code, 0) > before.get(code, 0) else None
-        counts, _ = self.wait_for(f"the egress to count {code}", gained, timeout, 1.0)
+            if counts is not None:
+                last["counts"] = counts
+            return counts if counts is not None and counts.get(code, 0) - before.get(code, 0) >= at_least else None
+        counts, _ = self.wait_for(f"the egress to count {code} {at_least} more time(s)", gained, timeout, 1.0)
+        self.last_refused = last.get("counts")
         return counts
 
     def refusal_evidence(self, code, before, counts):
-        after = counts.get(code, 0) if counts else before.get(code, 0)
+        # When the count never got there, what it last read is the evidence.
+        seen = counts if counts is not None else getattr(self, "last_refused", None)
+        after = (seen or {}).get(code, before.get(code, 0))
         return f"egress refused[{code}] {before.get(code, 0)} -> {after}"
 
     def consumer_view(self, code, offset):
@@ -1408,6 +1438,11 @@ class Lab:
         back = consumer.wait_log(r"control connection established|Connected to .*\(awaiting login response\)", 90, offset)
         self.check("server back: the consumer reconnects", bool(back))
         self.check("server back: flows go through the egress again", bool(self.wait_ready()))
+        # The restarted server numbers its pushes from 1 again. An egress that kept the last session's
+        # revision ignored each of them as older and went on enforcing the policy from before.
+        applied = self.set_policy([self.consumer_id])
+        self.check("server back: the egress applies a policy change the restarted server pushes", applied,
+                   "the egress logged it" if applied else "no 'policy applied' in the egress's log within 15 s")
         # Whatever the reconnect did to the table, what it ends with is what matters.
         table = self.consumer_table()
         self.snapshots["after the control connection came back"] = table
@@ -1477,9 +1512,12 @@ class Lab:
         """Issue #42's last acceptance item, end to end: an unauthorized device, a restricted target
         and resource exhaustion are refused by the egress. A request failing proves nothing about
         where it was stopped, so every check takes the egress's own refusal count under the expected
-        code as the evidence, and reads the target's log for anything that got through. DNS rebinding
-        needs the DNS takeover and is checked in phase two; the README says why cross-tenant access is
-        left to the servers' unit tests."""
+        code as the evidence, and reads the target's log for anything that got through. A refused
+        connect must also end as one, curl's exit 7, not as a timeout: the egress answers the SYN with
+        a reset, and an application left to retransmit into the refusal until its own timeout is the
+        failure the explicit-failure rule exists to prevent. DNS rebinding needs the DNS takeover and
+        is checked in phase two; the README says why cross-tenant access is left to the servers' unit
+        tests."""
         self.say("refusals at the egress")
         consumer = self.procs.get("consumer")
         if consumer is not None and consumer.alive:
@@ -1517,7 +1555,7 @@ class Lab:
         got = self.whoami(f"http://{METADATA_IP}")
         counts = self.refused_at_egress(CODE_FORBIDDEN, before)
         self.check(f"restricted target: {METADATA_IP} under a 0.0.0.0/0 grant is refused by the egress ({CODE_FORBIDDEN})",
-                   applied and got["code"] != CURL_OK and counts is not None,
+                   applied and got["code"] == CURL_CONNECT_FAILED and counts is not None,
                    f"0.0.0.0/0 {'applied' if applied else 'not confirmed applied'}; {self.describe(got)}; "
                    f"{self.refusal_evidence(CODE_FORBIDDEN, before, counts)}; {self.consumer_view(CODE_FORBIDDEN, offset)}")
         self.nothing_reached("restricted target: nothing reached the metadata address", mark, METADATA_IP)
@@ -1564,11 +1602,18 @@ class Lab:
         return through if through == count else None
 
     def refusal_rate_limit(self):
-        """The new-flow bucket: RATE_BURST_FLOWS short flows at once, while one established flow runs
-        through it, with both concurrency limits raised out of reach so that the bucket is the only
-        limit the burst can meet."""
+        """The new-flow bucket: RATE_BURST_FLOWS new datagram flows at once while one established TCP
+        flow runs through it, with both flow caps raised out of reach so that the bucket is the only
+        limit the burst can meet.
+
+        A burst of TCP connects could not show it: an admitted connect waits for the egress to dial
+        the target, so a slow dial paces the burst to the refill rate, and a refused one was not told
+        (fixed alongside this, see TestConsumerKeepsAnOpeningFlowTheEgressRejectedForItsReset) and
+        retried until it got in. A datagram flow is admitted without a handshake, so the burst meets
+        the bucket as fast as the egress can read it."""
         roomy = 4 * RATE_BURST_FLOWS
-        applied = self.set_policy([self.consumer_id], max_flows=roomy, per_consumer=roomy)
+        applied = self.set_policy([self.consumer_id], max_flows=roomy, per_consumer=roomy,
+                                  idle_seconds=RATE_IDLE_SECONDS)
         mark = self.target_mark()
         seconds, interval = 15, 0.25
         expected = max(1, int(seconds / interval)) * len(SLOW_TICK)
@@ -1579,40 +1624,57 @@ class Lab:
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         streaming, _ = self.wait_for("the established stream to start",
                                      lambda: stream.exists() and stream.stat().st_size > 0, 15)
-        # The baseline's pause also refills what the stream and the checks before took from the bucket.
-        before = self.refusal_baseline()
+        # The pause also refills what the stream and the checks before took from the bucket, and lets
+        # the status catch up with the policy push (see refusal_baseline).
+        time.sleep(2.5)
+        before, admitted_before = self.egress_counts()
+        before = before or {}
         offset = self.procs["consumer"].log_offset()
-        burst = self.sh(ns("con", sys.executable, "-c", BURST_SCRIPT, TARGET_IP, "80", str(RATE_BURST_FLOWS), "8"),
-                        check=False, timeout=90)
+        burst = self.sh(ns("con", sys.executable, "-c", BURST_SCRIPT, TARGET_IP, str(UDP_PORT),
+                           str(RATE_BURST_FLOWS), "1"), check=False, timeout=90)
         ended = time.monotonic()
         try:
             result = json.loads(burst.stdout.strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError):
             result = {}
+        # Once the egress has counted a refusal, a moment more for its status to take in the rest.
+        self.refused_at_egress(CODE_LIMIT, before, timeout=10)
+        time.sleep(1.2)
+        after, admitted_after = self.egress_counts()
+        refused = after.get(CODE_LIMIT, 0) - before.get(CODE_LIMIT, 0) if after is not None else None
+        admitted = (admitted_after - admitted_before
+                    if admitted_before is not None and admitted_after is not None else None)
+        # The egress admitted flows for about as long as answers kept coming, and the bucket refilled
+        # for that long; of what reached it, everything beyond that it must have refused. Judged on
+        # what reached the egress rather than on what was sent, so a datagram lost on the way does
+        # not count against it.
+        window = max(float(result.get("sendSeconds") or 0.0), float(result.get("lastAnswer") or 0.0))
+        allowed = RATE_BUCKET + RATE_REFILL_PER_SECOND * window
+        answered = int(result.get("answered") or 0)
+        judged = refused is not None and admitted is not None
+        reached = refused + admitted if judged else None
+        floor = max(1, math.ceil(reached - allowed - RATE_SLACK)) if judged else None
+        self.check(f"resource exhaustion: a burst of {RATE_BURST_FLOWS} new flows meets the egress's new-flow bucket, "
+                   f"which refuses what its {RATE_BUCKET} and {RATE_REFILL_PER_SECOND}/s do not cover ({CODE_LIMIT})",
+                   applied and judged and refused >= floor and answered >= RATE_BUCKET // 2,
+                   (f"{reached} of {RATE_BURST_FLOWS} reached the egress: {admitted} admitted, which the bucket allows "
+                    f"{allowed:.0f} of in the {window:.2f}s until the last answer, and {refused} refused where at "
+                    f"least {floor} must be; {answered} answered" if judged and result
+                    else f"burst {json.dumps(result) if result else (burst.stdout + burst.stderr).strip()[-300:]}; "
+                         f"egress refused/admitted before {before} {admitted_before}, after {after} {admitted_after}")
+                   + f"; {self.consumer_view(CODE_LIMIT, offset)}")
+        if judged:
+            self.measure("new-flow burst: flows the egress admitted out of the burst", admitted)
+            self.measure("new-flow burst: how long the egress took over it", round(window, 3), "s")
         # Two seconds refill the whole bucket, so a batch of new flows at once then has to find room.
         time.sleep(max(0.0, 2.0 - (time.monotonic() - ended)))
         batch, waited = self.wait_for("16 new flows at once through the egress",
                                       lambda: self.batch_through_egress(16), 10, 1.0)
-        counts = self.refused_at_egress(CODE_LIMIT, before)
-
-        outcomes = result.get("outcomes") or {}
-        connected, refused = outcomes.get("connected", 0), outcomes.get("ECONNREFUSED", 0)
-        others = {name: count for name, count in outcomes.items() if count and name not in ("connected", "ECONNREFUSED")}
-        settled = result.get("settled") or 0.0
-        self.check(f"resource exhaustion: a burst of {RATE_BURST_FLOWS} new flows is cut by the egress's new-flow "
-                   f"bucket ({CODE_LIMIT}) after at least the {RATE_BUCKET} it holds",
-                   applied and connected >= RATE_BUCKET and refused >= 1 and counts is not None,
-                   (f"{connected} connected, {refused} refused, other {json.dumps(others)}; opened in "
-                    f"{result.get('opened')}s, settled in {settled}s, in which the bucket admits about "
-                    f"{RATE_BUCKET + RATE_REFILL_PER_SECOND * settled:.0f}" if result
-                    else f"the burst printed nothing usable: {(burst.stdout + burst.stderr).strip()[-300:]}")
-                   + f"; {self.refusal_evidence(CODE_LIMIT, before, counts)}; {self.consumer_view(CODE_LIMIT, offset)}")
-        if result:
-            self.measure("new-flow burst: flows the egress took out of the burst", connected)
+        since = time.monotonic() - ended
         self.check("resource exhaustion: two seconds after the burst the bucket is full again, 16 new flows at once "
                    "go through the egress", bool(batch),
-                   f"all 16 through the egress {2.0 + waited:.1f}s after the burst ended" if batch
-                   else "not every flow of a batch went through within 12 s of the burst")
+                   f"all 16 through the egress {since:.1f}s after the burst ended" if batch
+                   else f"not every flow of a batch went through within {since:.0f} s of the burst")
         try:
             _, stderr = slow.communicate(timeout=seconds + 40)
             size = stream.stat().st_size if stream.exists() else 0
@@ -1625,6 +1687,10 @@ class Lab:
                        f"the {seconds}s stream was still running {seconds + 40}s later")
         self.leak_check("resource exhaustion, new-flow burst: nothing leaked to the target from the consumer's address",
                         mark)
+        # The admitted datagram flows end on the short idle timeout. Gone before the caps come back
+        # down, they cannot hold slots against the checks that follow.
+        self.wait_for("the burst's flows to go idle", lambda: (self.egress_section() or {}).get("flows") == 0,
+                      10 + 2 * RATE_IDLE_SECONDS, 1.0)
         self.set_policy([self.consumer_id])
 
     def refusal_consumer_denied(self):
@@ -1664,7 +1730,8 @@ class Lab:
         counts = self.refused_at_egress(CODE_CONSUMER_DENIED, before)
         # Offered or still unknown both mean the consumer sent the flow on; not-offered would mean it
         # blocked the flow itself and the egress was never asked.
-        self.check(title, applied and standing in ("offered", "unknown") and got["code"] != CURL_OK and counts is not None,
+        self.check(title, applied and standing in ("offered", "unknown") and got["code"] == CURL_CONNECT_FAILED
+                   and counts is not None,
                    f"the consumer's catalogue still said {standing}; {self.describe(got)}; "
                    f"{self.refusal_evidence(CODE_CONSUMER_DENIED, before, counts)}; "
                    f"{self.consumer_view(CODE_CONSUMER_DENIED, offset)}")
@@ -1912,7 +1979,7 @@ class Lab:
             counts = self.refused_at_egress(code, before)
             self.check(f"DNS rebinding: {host}, granted by name but resolved by the egress to {address}, is refused by "
                        f"the egress ({code})",
-                       applied and self.in_fake_pool(fake) and got["code"] != CURL_OK and counts is not None,
+                       applied and self.in_fake_pool(fake) and got["code"] == CURL_CONNECT_FAILED and counts is not None,
                        f"the consumer resolved it to {fake or '-'}; curl exit {got['code']}"
                        + (f" ({got['stderr'][:80]})" if got["stderr"] else "")
                        + f"; {self.refusal_evidence(code, before, counts)}; {self.consumer_view(code, offset)}")

@@ -3,6 +3,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 import unittest
 from unittest.mock import Mock
@@ -121,14 +122,16 @@ class RefusalEvidenceTests(unittest.TestCase):
         # otherwise outlive it into every check after.
         instance = self.lab()
         instance.admin = Mock()
-        instance.policy([1], domains=({"match": "*.lab.test"},), per_consumer=4)
+        instance.policy([1], domains=({"match": "*.lab.test"},), per_consumer=4, idle_seconds=3)
         instance.policy([1])
         granted, plain = (call.args[2] for call in instance.admin.call.call_args_list)
         self.assertEqual([{"match": "*.lab.test"}], granted["domainRules"])
         self.assertEqual(4, granted["maxFlowsPerConsumer"])
+        self.assertEqual(3, granted["idleTimeoutSeconds"])
         self.assertEqual([], plain["domainRules"])
         self.assertEqual([RULE_GRANT], plain["destinationRules"])
         self.assertEqual(128, plain["maxFlowsPerConsumer"])
+        self.assertEqual(60, plain["idleTimeoutSeconds"])
 
     def test_set_policy_waits_for_the_push_with_its_rule_count(self):
         instance = self.lab()
@@ -162,10 +165,26 @@ class RefusalEvidenceTests(unittest.TestCase):
         self.assertIsNone(instance.refused_at_egress(CODE_LIMIT, {CODE_LIMIT: 3, "EGRESS_DEST_DENIED": 1}))
         self.assertIsNotNone(instance.refused_at_egress(CODE_LIMIT, {CODE_LIMIT: 2}))
         self.assertIsNotNone(instance.refused_at_egress(CODE_LIMIT, {}))
+        # A threshold: three more are not five more, and the evidence says where the count got to.
+        self.assertIsNone(instance.refused_at_egress(CODE_LIMIT, {}, at_least=5))
+        self.assertEqual(f"egress refused[{CODE_LIMIT}] 0 -> 3", instance.refusal_evidence(CODE_LIMIT, {}, None))
+        self.assertIsNotNone(instance.refused_at_egress(CODE_LIMIT, {}, at_least=3))
         self.assertEqual(f"egress refused[{CODE_LIMIT}] 2 -> 3",
                          instance.refusal_evidence(CODE_LIMIT, {CODE_LIMIT: 2}, {CODE_LIMIT: 3}))
+        instance.last_refused = None
         self.assertEqual(f"egress refused[{CODE_LIMIT}] 2 -> 2",
                          instance.refusal_evidence(CODE_LIMIT, {CODE_LIMIT: 2}, None))
+
+    def test_egress_counts_reads_refusals_and_admitted_flows(self):
+        instance = self.lab()
+        instance.client_status = Mock(return_value={"data": {"instances": [{"egress": {
+            "egress": {"refused": {CODE_LIMIT: 7}, "totalFlows": 140}}}]}})
+        self.assertEqual(({CODE_LIMIT: 7}, 140), instance.egress_counts())
+        instance.client_status = Mock(return_value={"data": {"instances": [{"egress": {
+            "egress": {"refused": {}, "totalFlows": "many"}}}]}})
+        self.assertEqual(({}, None), instance.egress_counts())
+        instance.client_status = Mock(return_value=None)
+        self.assertEqual((None, None), instance.egress_counts())
 
     def test_nothing_reached_fails_for_any_source(self):
         instance = self.lab()
@@ -202,14 +221,35 @@ class ProbeScriptTests(unittest.TestCase):
         probe.close()
         return port
 
-    def test_burst_reports_every_connect(self):
-        result = self.run_script(BURST_SCRIPT, "127.0.0.1", self.listener(), 8, 10)
-        self.assertEqual({"connected": 8, "pending": 0}, result["outcomes"])
+    def udp_echo(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(("127.0.0.1", 0))
+        self.addCleanup(server.close)
 
-    def test_burst_names_a_refusal_by_errno(self):
-        result = self.run_script(BURST_SCRIPT, "127.0.0.1", self.closed_port(), 3, 10)
-        refused = {name: count for name, count in result["outcomes"].items() if "CONNREFUSED" in name}
-        self.assertEqual(3, sum(refused.values()), result)
+        def serve():
+            while True:
+                try:
+                    data, peer = server.recvfrom(512)
+                    server.sendto(data, peer)
+                except OSError:
+                    return
+        threading.Thread(target=serve, daemon=True).start()
+        return server.getsockname()[1]
+
+    def test_burst_sends_one_datagram_per_flow_and_counts_the_answers(self):
+        result = self.run_script(BURST_SCRIPT, "127.0.0.1", self.udp_echo(), 8, 1)
+        self.assertEqual(8, result["sent"])
+        self.assertEqual(8, result["answered"])
+        self.assertGreaterEqual(result["lastAnswer"], 0)
+
+    def test_burst_with_nobody_answering_ends_after_the_quiet_period(self):
+        closed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        result = self.run_script(BURST_SCRIPT, "127.0.0.1", port, 3, 0.5)
+        self.assertEqual(0, result["answered"])
+        self.assertEqual(0, result["lastAnswer"])
 
     def test_hold_keeps_what_connects_and_stops_at_the_first_refusal(self):
         self.assertEqual({"held": 3, "next": "never refused"},
