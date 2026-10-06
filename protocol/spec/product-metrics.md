@@ -4,7 +4,7 @@
 
 关联 [issue #38](https://github.com/devShuai/specus/issues/38) 的待办「产品指标」，见 [docs/issues/product-followups.md](../../docs/issues/product-followups.md)。
 
-**状态：契约已定（第 13 节各项采用推荐默认值），尚未实现。** 共享向量 `protocol/test-vectors/product-metrics-v1.json` 由 `tools/protocol/generate_product_metrics_vectors.py` 生成。
+**状态：契约已定（第 13 节各项采用推荐默认值），已实现。** Java、Go、.NET 与 C 四个服务端实现第 6 节的四张表与第 7 节的接口，并经各自真实的 HTTP 处理代码逐节回放共享向量；管理前端提供开关与说明、汇总视图、成员常驻说明和互传结果上报。四端共同遵守的实现约定见第 14 节。共享向量 `protocol/test-vectors/product-metrics-v1.json` 由 `tools/protocol/generate_product_metrics_vectors.py` 生成。
 
 ## 1. 现状
 
@@ -337,3 +337,20 @@ GET /api/admin/product-metrics/summary?from=2026-09-01&to=2026-09-21
 | 计数保存期 | 180 天，不提供租户自定义；允许缩短作为后续选项 |
 | Peer 服务发布是否算 `service_published` | 不算：它由客户端配置上报，不是管理端的发布动作 |
 | 上报与开关接口放在 `/api/admin` 下 | 是。互传页已登录时使用同一 Bearer；不新开公开端点 |
+
+## 14. 实现约定
+
+四个服务端在契约之外统一采用以下做法，彼此保持一致：
+
+- **表**：表名与列名即第 6 节的建议名。时间列（`updated_at`、`purged_at`、`started_at`、`*_at`）是 epoch 毫秒（BIGINT），
+  日期列（`cohort_day`、`day`）是 UTC `YYYY-MM-DD` 文本，因此区间筛选与保存期截止都是字符串比较。没有外键和代理主键。
+- **开关读取**：每次上报、里程碑与读取都直接读库，不做实例内缓存（第 10 节允许最多 30 秒，这里取 0）。
+- **部署级开关**（第 13 节）：Go/C `SPECUS_PRODUCT_METRICS_ALLOWED`，Java `specus.product-metrics.allowed`，
+  .NET `Specus:ProductMetrics:Allowed`。为 `false` 时开启返回 `409 {"code": "PRODUCT_METRICS_NOT_ALLOWED"}`，关闭仍可执行。
+- **存储故障**：任何读写失败返回 `503 {"code": "PRODUCT_METRICS_UNAVAILABLE"}`，不把读不到当作零。
+- **封闭 schema**：除第 4.2、7.2 节外，重复的键、`1.0`/`1e0` 形式的版本号、JSON 之后的多余内容和非法 UTF-8 也使整个请求无效。
+- **时刻输出**：`updatedAt`、`generatedAt` 截断到秒，形如 `2026-09-01T00:00:00Z`；`from`/`to` 只接受 `YYYY-MM-DD`，格式不符同样返回
+  `400 PRODUCT_METRICS_RANGE`。
+- **里程碑钩子**：在写路径提交之后调用，失败只记日志（租户、步骤、错误类别），从不影响写路径本身；`signed_in` 覆盖密码登录、
+  注册验证后的签发和本地签发会话的 OIDC 登录。OIDC 首次登录自动建号不算 `account_created`（第 4.1 节未列出这一写路径）。
+- **日志**：指标相关日志只含租户、操作与错误类别，不含用户名、请求体或任何第 4.3 节列出的内容。

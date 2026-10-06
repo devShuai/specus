@@ -19,7 +19,7 @@ python tools/protocol/verify_peer_egress_vectors.py
 | `generate_peer_egress_socket_binding_vectors.py` | `protocol/test-vectors/peer-egress-socket-binding-v1.json`（出口 socket 的接口选择；读取 macOS 路由向量里的真机样本） |
 | `verify_peer_egress_vectors.py` | 无产物；校验失败时退出码非零 |
 | `generate_service_connectivity_vectors.py` | `protocol/test-vectors/service-connectivity-check-v1.json`（服务连通性检查草案的四阶段状态机与限流；见 [`service-connectivity-check.md`](../../protocol/spec/service-connectivity-check.md)） |
-| `generate_product_metrics_vectors.py` | `protocol/test-vectors/product-metrics-v1.json`（产品指标草案的上报校验、分桶、接入队列、计数、限流、保存期与汇总；见 [`product-metrics.md`](../../protocol/spec/product-metrics.md)） |
+| `generate_product_metrics_vectors.py` | `protocol/test-vectors/product-metrics-v1.json`（产品指标的上报校验、分桶、接入队列、计数、限流、保存期与汇总；见 [`product-metrics.md`](../../protocol/spec/product-metrics.md)） |
 
 两个生成器各自带一份参考实现（规则匹配器、授权判定器），写文件前会用它断言每条期望，
 因此向量不会带着自相矛盾的用例发布。
