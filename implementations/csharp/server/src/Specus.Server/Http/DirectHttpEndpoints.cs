@@ -948,7 +948,7 @@ public static class DirectHttpEndpoints
         await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static int? AsInt(Dictionary<string, object?>? metadata, string key)
+    internal static int? AsInt(Dictionary<string, object?>? metadata, string key)
     {
         if (metadata is null || !metadata.TryGetValue(key, out var value) || value is null)
         {

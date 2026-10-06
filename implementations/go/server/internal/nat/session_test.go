@@ -79,15 +79,20 @@ func TestHTTPClientRSTKeepsReasonOutOfTheErrorText(t *testing.T) {
 
 	if err := session.handle(protocol.NatMessage{
 		Type: protocol.NatRST, StreamID: 46, Value: 3,
-		Metadata: map[string]any{"reason": reason},
+		Metadata: map[string]any{"reason": reason, "failure": "connect-refused"},
 	}); err != nil {
 		t.Fatalf("client RST closed the data connection: %v", err)
 	}
 
+	// The classification travels with the reset for the connectivity check; the session that owns
+	// the stream decides whether it is trusted.
 	_, err := stream.WaitResponseHead(context.Background())
 	var reset *directhttp.StreamResetError
-	if !errors.As(err, &reset) || reset.Code != 3 || reset.Reason != reason {
-		t.Fatalf("WaitResponseHead error = %#v, want StreamResetError{3, reason}", err)
+	if !errors.As(err, &reset) || reset.Code != 3 || reset.Reason != reason || reset.Failure != "connect-refused" {
+		t.Fatalf("WaitResponseHead error = %#v, want StreamResetError{3, reason, connect-refused}", err)
+	}
+	if stream.HTTPRouteCapability() != 0 {
+		t.Fatal("a stream without a login session claims an HTTP route capability")
 	}
 	if bytes.Contains([]byte(err.Error()), []byte("10.20.30.40")) {
 		t.Fatalf("reset error text leaks the client reason: %q", err.Error())

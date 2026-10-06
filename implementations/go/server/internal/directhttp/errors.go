@@ -23,9 +23,14 @@ const maxLoggedReasonRunes = 256
 // StreamResetError is the terminal error of an HTTP stream the client reset. Reason is the
 // client's free-text RST metadata and may carry the target URL, internal hosts or the raw
 // query, so Error() deliberately omits it: only logSafeReason(Reason) may reach a log.
+//
+// Failure is the client's metadata.failure classification (service-connectivity-check.md
+// section 6.2). Only the connectivity check reads it, and only from a session that announced
+// clientHttpRouteCapabilities.version >= 1; the public path ignores it like the value.
 type StreamResetError struct {
-	Code   uint32
-	Reason string
+	Code    uint32
+	Reason  string
+	Failure string
 }
 
 func (e *StreamResetError) Error() string { return "HTTP stream reset by client" }

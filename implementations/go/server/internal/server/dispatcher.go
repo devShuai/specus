@@ -338,6 +338,7 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		}
 		conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID,
 			time.Now().UnixMilli(), request.ConnectionRole)
+		conn.SetHTTPRouteCapability(result.Session.HTTPRouteCapability)
 		if dataConnection {
 			displaced = d.sessions.ReplaceData(conn)
 		} else {
