@@ -1,10 +1,10 @@
-# 产品指标（v1，草案）
+# 产品指标（v1）
 
 租户管理员**显式开启**后，服务端只保存回答四个问题所需的按日计数：首次接入完成耗时、接入步骤流失、按文件大小区间与传输方式拆分的互传成功率、失败后重试的成功率。默认关闭；不采集凭证、文件名、文本内容、内网地址、IP、User-Agent 或跨租户可关联的访客标识；有固定的保存期限和一键清除。
 
 关联 [issue #38](https://github.com/devShuai/specus/issues/38) 的待办「产品指标」，见 [docs/issues/product-followups.md](../../docs/issues/product-followups.md)。
 
-**状态：契约草案，尚未实现。** 共享向量 `protocol/test-vectors/product-metrics-v1.json` 由 `tools/protocol/generate_product_metrics_vectors.py` 生成。
+**状态：契约已定（第 13 节各项采用推荐默认值），尚未实现。** 共享向量 `protocol/test-vectors/product-metrics-v1.json` 由 `tools/protocol/generate_product_metrics_vectors.py` 生成。
 
 ## 1. 现状
 
@@ -321,7 +321,9 @@ GET /api/admin/product-metrics/summary?from=2026-09-01&to=2026-09-21
 
 各端按场景顺序回放：把时钟固定在每个 op 的 `at`，比较带 `status` 的响应，并在每个 `checkpoint` 比较四张表的内容（时间按时刻比较）。`milestone` 是服务端内部写路径的钩子，由测试直接触发；其 `effect` 只供排错，不要求可观察。`limits` 是该场景的限流配置，实现需要能在测试里设置。
 
-## 13. 未决问题（附推荐默认值）
+## 13. 已定事项（采用推荐默认值）
+
+以下各项在草案阶段列为未决，按维护者对同类问题的一贯做法，采用各条的推荐默认值。
 
 | 问题 | 推荐默认 |
 | --- | --- |
