@@ -2341,8 +2341,36 @@ static int connection_events_silent(int fd, const char *label)
     return -1;
 }
 
+/*
+ * Management tokens are re-resolved against the user table on every request, so the users these
+ * sessions sign as have to exist, enabled, in the tenant their token names.
+ */
+static int connection_events_ensure_user(const char *username, const char *tenant, const char *role)
+{
+    const char *db_path = getenv("SPECUS_DATABASE_PATH");
+    st_storage_management_user user;
+    if (db_path == NULL || db_path[0] == '\0') {
+        fprintf(stderr, "connection events need SPECUS_DATABASE_PATH\n");
+        return -1;
+    }
+    if (st_storage_get_management_user(db_path, username, &user) == 0) {
+        return 0;
+    }
+    if (st_storage_create_management_user(db_path, username, tenant, "unused-password-hash", role, 1, &user) != 0) {
+        fprintf(stderr, "connection events user %s/%s setup failed\n", tenant, username);
+        return -1;
+    }
+    return 0;
+}
+
 static int test_connection_events_websocket(long long owned_client_id)
 {
+    if (connection_events_ensure_user("owner-db", "tenant-db", "USER") != 0
+        || connection_events_ensure_user("someone-else", "tenant-db", "USER") != 0
+        || connection_events_ensure_user("events-admin-other", "tenant-other", "ADMIN") != 0) {
+        return 1;
+    }
+
     st_admin_server server;
     memset(&server, 0, sizeof(server));
     server.fd = -1;
@@ -2391,7 +2419,7 @@ static int test_connection_events_websocket(long long owned_client_id)
     }
     owner = connection_events_open(port, "owner-db", "tenant-db", "USER");
     stranger = connection_events_open(port, "someone-else", "tenant-db", "USER");
-    other_tenant = connection_events_open(port, "admin", "tenant-other", "ADMIN");
+    other_tenant = connection_events_open(port, "events-admin-other", "tenant-other", "ADMIN");
     if (owner < 0 || stranger < 0 || other_tenant < 0) goto cleanup;
 
     /* Another tenant's event, then a created/updated pair of the owner's client, then a
