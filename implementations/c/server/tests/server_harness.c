@@ -526,10 +526,9 @@ static void random_hex(char *out, size_t bytes)
     st_hex_encode(buffer, bytes, out);
 }
 
-int http_client_login(const test_server *server, const char *api_key, const char *secret,
-                      const char *fingerprint, const char *os_user, runtime_session *out)
+void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
+                       const char *os_user, char *body, size_t body_len)
 {
-    memset(out, 0, sizeof(*out));
     char timestamp[32];
     char nonce[33];
     snprintf(timestamp, sizeof(timestamp), "%lld", wall_clock_ms());
@@ -542,13 +541,20 @@ int http_client_login(const test_server *server, const char *api_key, const char
     st_hmac_sha256(key, sizeof(key), (const uint8_t *)canonical, strlen(canonical), mac);
     char signature[ST_SHA256_HEX_LEN + 1];
     st_hex_encode(mac, sizeof(mac), signature);
-    char body[2048];
-    snprintf(body, sizeof(body),
+    snprintf(body, body_len,
              "{\"apiKey\":\"%s\",\"timestamp\":\"%s\",\"nonce\":\"%s\",\"signature\":\"%s\","
              "\"environment\":{\"machineFingerprint\":\"%s\",\"hostname\":\"lifecycle-host\","
              "\"osUser\":\"%s\",\"osName\":\"Linux\",\"osVersion\":\"test\",\"osArch\":\"amd64\","
              "\"clientVersion\":\"session-lifecycle-test\"}}",
              api_key, timestamp, nonce, signature, fingerprint, os_user);
+}
+
+int http_client_login(const test_server *server, const char *api_key, const char *secret,
+                      const char *fingerprint, const char *os_user, runtime_session *out)
+{
+    memset(out, 0, sizeof(*out));
+    char body[2048];
+    signed_login_body(api_key, secret, fingerprint, os_user, body, sizeof(body));
     int status = 0;
     char *response = NULL;
     if (http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) != 0) {

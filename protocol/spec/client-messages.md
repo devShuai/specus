@@ -178,8 +178,15 @@ C server 已实现 endpoint 绑定的一次性 ticket、`/ws/client-messages` he
 客户端间 control fallback。WebSocket 输入会验证完整 JSON、UTF-8、分片顺序、控制帧和 65,536 UTF-16 code unit
 上限；能力检查遍历全部 `NETTY_ONLINE` session。
 
-C server 仍不实现 STMSG2 附件对象存储、附件 REST 的可用数据面或离线 outbox；6 个附件路径继续明确返回
-`409 OBJECT_STORAGE_DISABLED`。当前 C 运行时每个 clientName 只允许一个活动 control，因此目标写入只选择该连接。
+`admin_http_tests` 的 `test_client_messages_websocket` 经真实 socket 覆盖 ticket/Upgrade/hello、管理端到客户端与客户端到
+管理端的投递、异步写入回执，以及 65,536 / 65,537 UTF-16 code unit 边界（后者以 `1009` 关闭）。没有任何客户端进程
+× C server 的消息端到端证据。
+
+管理端附件 REST（`/api/admin/client-messages/attachments/presign-upload`、`/{attachmentId}/complete`、
+`/{attachmentId}/presign-download`）与公开互传附件共用 `src/object_storage.c` 的数据面，只支持 `aliyun-oss` provider。
+未配置时 6 个附件路径明确返回 `409 OBJECT_STORAGE_DISABLED`，`admin_http_tests` 断言了管理端 presign-upload 的这一分支；
+配置后的管理端附件路径没有测试，公开互传路径的 fake OSS 端到端证据见 [public-transfer.md](public-transfer.md) 第 6 节。
+C server 不实现离线 outbox。当前 C 运行时每个 clientName 只允许一个活动 control，因此目标写入只选择该连接。
 
 ## 10. 参考入口
 

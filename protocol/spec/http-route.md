@@ -24,6 +24,13 @@ ANY /http/{clientName}/{route}/**
 连接时返回 `502/503`（以实现的离线语义为准）；route 不存在由客户端拒绝。请求超时返回 `504`，请求体超过
 配置上限返回 `413`。
 
+客户端在发出响应 `OPEN` 之前对该 stream 发送 `RST`（upstream 不可达、拒绝连接、TLS 失败等）时，只要公网响应头
+尚未提交（包括路径改写缓冲阶段），服务端就返回 `502`，响应体是固定的通用文本 `HTTP 转发请求失败`（C server
+沿用其 `{"error":"..."}` 错误信封承载同一文本），且必须与“客户端不在线”的错误文本不同。`RST.metadata.reason`
+是客户端提供的自由文本，可能包含目标 URL、内网主机/IP 与原始 query，任何实现都不得把它回显到公网响应的状态行、
+header 或 body 中；它只用于服务端诊断：写入日志（以及实现提供的管理端流量明细失败原因）前必须截断（最多保留前
+256 个字符，超出部分以截断标记代替），并把 CR/LF 等控制字符转义为可见形式。公网响应已提交后收到的 RST 只能中断该响应。
+
 ## 2. route 配置
 
 每条 route 至少包含：
@@ -83,7 +90,8 @@ Java、Go、.NET 与 Android client 都必须按上述规范流式转发 request
 Netty HTTP/1.1 transport 满足该契约。
 
 客户端必须在读取 request DATA 后按实际消费字节发送 `WINDOW_UPDATE`。如果 upstream 无法建立、请求格式无效、
-本地队列超限或服务端取消，任一端发送 `RST(value=errorCode, metadata.reason)` 并释放 stream。
+本地队列超限或服务端取消，任一端发送 `RST(value=errorCode, metadata.reason)` 并释放 stream。`reason` 仅供
+诊断，服务端对公网调用方的处理见第 1 节。
 
 ## 4. 响应流
 
@@ -181,7 +189,8 @@ data frame 可在 16 MiB 上限内规范化为一组 SWS2：首段保留 opcode/
 每个请求记录 route/client、method、relativePath、rawQuery、status、耗时、请求/响应字节和失败原因。正文预览按
 配置截断，采集队列有界，不能反向阻塞数据面。流量计数按实际 DATA 字节累计，不包含控制 framing。
 
-日志和指标不得把 streamId、完整 URL、token、Basic Authorization 或正文作为常驻标签。
+日志和指标不得把 streamId、完整 URL、token、Basic Authorization 或正文作为常驻标签。客户端 RST 的
+`reason` 只作为单条日志/明细中的诊断字段出现，按第 1 节截断并转义，不进入公网响应。
 
 ## 10. 实现入口
 

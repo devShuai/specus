@@ -164,8 +164,11 @@ typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
     int response_started;
-    /* The server reset the stream; frames the client sent before it saw the RST are dropped. */
+    /* Either side reset the stream; frames the client sent before it saw an RST are dropped. */
     int reset;
+    /* Set when error holds the client's RST reason rather than a server-side failure. */
+    int client_reset;
+    uint32_t reset_code;
     char *error;
     direct_http_event *events_head;
     direct_http_event *events_tail;
@@ -1355,10 +1358,13 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     const char *reset_reason = NULL;
     const char *metadata = message->meta_json == NULL ? "{}" : message->meta_json;
     if (message->type == ST_NAT_RST) {
+        /* A client RST after the server's own reset keeps the server's failure. */
         if (!pending->reset) {
             char *reason = st_json_get_string(metadata, "reason");
             free(pending->error);
             pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
+            pending->client_reset = 1;
+            pending->reset_code = message->value;
         }
         pending->done = 1;
         pending->reset = 1;
@@ -1563,6 +1569,17 @@ static void active_session_close_data_locked(specus_session *control)
     }
 }
 
+/* Hands a client RST reason to the sink for server-side logging; it never reaches the caller. */
+static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
+                                      uint32_t code,
+                                      const char *reason)
+{
+    if (sink->on_reset != NULL) {
+        sink->on_reset(sink->ctx, code, reason);
+    }
+    return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
+}
+
 /* Whether a bound control connection still carries this runtime session. */
 static int control_session_live_locked(long long client_session_id)
 {
@@ -1755,8 +1772,9 @@ static int optional_string_array(const char *json, const char *key, char ***out,
 }
 
 /*
- * Retires a finished Direct HTTP stream. It is tombstoned before it leaves the pending list, so a
- * late client RST always finds one of the two and is never mistaken for a never-opened stream.
+ * Takes a finished Direct HTTP stream off the pending list; its error and condition stay for the
+ * caller. It is tombstoned before it leaves the list, so a late client RST always finds one of
+ * the two and is never mistaken for a never-opened stream.
  */
 static void direct_pending_retire(specus_session *session, direct_http_pending *pending)
 {
@@ -1767,9 +1785,6 @@ static void direct_pending_retire(specus_session *session, direct_http_pending *
     direct_pending_remove(session, pending);
     direct_pending_free_events(pending);
     pthread_mutex_unlock(&session->direct_lock);
-    free(pending->error);
-    pending->error = NULL;
-    pthread_cond_destroy(&pending->cond);
 }
 
 static int direct_http_forward(void *ctx,
@@ -1889,6 +1904,8 @@ static int direct_http_forward(void *ctx,
         direct_http_event *event = result == 0 ? direct_pending_pop(&pending) : NULL;
         char *pending_error = event == NULL && pending.error != NULL
             ? dup_string(pending.error) : NULL;
+        int client_reset = pending.client_reset;
+        uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
         if (result != 0) {
@@ -1896,8 +1913,9 @@ static int direct_http_forward(void *ctx,
             break;
         }
         if (pending_error != NULL) {
+            result = client_reset
+                ? direct_report_client_reset(sink, reset_code, pending_error) : -1;
             free(pending_error);
-            result = -1;
             break;
         }
         if (event == NULL) {
@@ -1966,13 +1984,20 @@ static int direct_http_forward(void *ctx,
     }
 
     direct_pending_retire(session, &pending);
+    free(pending.error);
+    pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
     return result;
 
 failed:
     direct_pending_retire(session, &pending);
+    /* A client RST while the request body was still uploading is reported like one after it. */
+    int failed_result = pending.client_reset && pending.error != NULL
+        ? direct_report_client_reset(sink, pending.reset_code, pending.error) : -1;
+    free(pending.error);
+    pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
-    return -1;
+    return failed_result;
 }
 
 static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)

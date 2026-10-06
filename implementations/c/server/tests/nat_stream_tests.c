@@ -9,9 +9,10 @@
  *   - DATA and FIN for unknown streams are answered with RST 7, a late RST for a recently closed
  *     stream is ignored, and an RST for a never-opened stream or a WINDOW_UPDATE that overflows the
  *     send window closes the data connection;
- *   - DATA|END_STREAM is DATA followed by FIN, a response head may leave out trailerNames,
- *     HEARTBEAT_RESPONSE is accepted on both roles, request bodies over 16 MiB get 413 and the
- *     1025th pending HTTP stream gets 502.
+ *   - DATA|END_STREAM is DATA followed by FIN, a response head may leave out trailerNames, a TCP
+ *     stream half-closes in either order, a port that cannot be bound is answered with
+ *     success=false, HEARTBEAT_RESPONSE and KEEPALIVE are accepted, request bodies over 16 MiB get
+ *     413 and the 1025th pending HTTP stream gets 502.
  *
  * The test plays the client on real control/data sockets and the browser and the public peer on
  * real HTTP and TCP sockets. Every check runs on its own server, so each one shows on its own
@@ -23,6 +24,7 @@
 
 #include "server_harness.h"
 
+#include "json.h"
 #include "protocol.h"
 #include "storage.h"
 #include "stream_tombstones.h"
@@ -627,6 +629,87 @@ static int check_tcp_client_open(test_server *server, client_pair *pair)
 }
 
 /*
+ * The public peer half-closes first: its bytes and then a FIN reach the client, the client can
+ * still answer, and its answer and FIN reach the public peer before EOF (Java
+ * TcpServerHalfCloseTests). A stream both sides finished is released without an RST.
+ */
+static int check_tcp_public_half_close(test_server *server, client_pair *pair)
+{
+    int public_fd = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
+    CHECK(send_all(public_fd, (const uint8_t *)"public-request", 14U) == 0 && shutdown(public_fd, SHUT_WR) == 0,
+          "request, then half-close");
+    char received[64];
+    size_t received_len = 0U;
+    int fin = 0;
+    int reset = 0;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    while (!fin && !reset) {
+        st_nat_message message;
+        CHECK(next_nat_frame(pair->data, deadline, &message) == 1, "no FIN after the public half-close");
+        if (message.stream_id == stream_id && message.type == ST_NAT_DATA
+            && message.data_len < sizeof(received) - received_len) {
+            memcpy(received + received_len, message.data, message.data_len);
+            received_len += message.data_len;
+        }
+        fin = message.stream_id == stream_id && message.type == ST_NAT_FIN;
+        reset = message.stream_id == stream_id && message.type == ST_NAT_RST;
+        st_nat_message_free(&message);
+    }
+    CHECK(fin && received_len == 14U && memcmp(received, "public-request", 14U) == 0,
+          "the public bytes and then a FIN must reach the client");
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "reply-after-eof", 15U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0,
+          "answer and FIN");
+    CHECK(expect_public_bytes(public_fd, "reply-after-eof") == 0, "the answer after the public EOF must arrive");
+    CHECK(expect_socket_eof(public_fd, IO_TIMEOUT_MS) == 0, "the client FIN must end the public peer");
+    close_fd(&public_fd);
+    CHECK(expect_alive_without_rst(pair->data, stream_id) == 0, "a stream both sides finished must not be reset");
+    return expect_data_connection_served(server, pair);
+}
+
+/* A public port that cannot be bound is answered with success=false; the data connection stays. */
+static int check_register_bind_failure(test_server *server, client_pair *pair)
+{
+    int busy_port = pick_free_port();
+    CHECK(create_mapping(server->db_path, pair->runtime.client_id, busy_port) == 0, "second mapping");
+    /* A data connection reads the client's mappings when it logs in. */
+    close_fd(&pair->data);
+    CHECK(login_data(server, pair) == 0, "data re-login");
+
+    int holder = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons((uint16_t)busy_port);
+    int bound = holder >= 0 && bind(holder, (struct sockaddr *)&address, sizeof(address)) == 0
+        && listen(holder, 1) == 0;
+    if (!bound) {
+        close_fd(&holder);
+    }
+    CHECK(bound, "occupy the public port");
+
+    char meta[512];
+    snprintf(meta, sizeof(meta),
+             "{\"port\":%d,\"specusAddress\":\"127.0.0.1\",\"specusPort\":9,\"clientName\":\"%s\"}",
+             busy_port, pair->runtime.client_name);
+    st_nat_message result;
+    int sent = send_nat(pair->data, ST_NAT_REGISTER, 0U, 0U, 0U, meta, NULL, 0U) == 0
+        && expect_nat_frame(pair->data, ST_NAT_REGISTER_RESULT, &result) == 0;
+    close_fd(&holder);
+    CHECK(sent, "no REGISTER_RESULT");
+    int success = 1;
+    int port = 0;
+    int refused = st_json_get_bool(result.meta_json, "success", &success) == 0 && !success
+        && st_json_get_int(result.meta_json, "port", &port) == 0 && port == busy_port;
+    st_nat_message_free(&result);
+    CHECK(refused, "a port that cannot be bound must be answered with success=false for that port");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
  * DATA and FIN for streams that do not exist get RST 7 and the id is tombstoned, so the client's
  * crossing RST is ignored; credit for an unknown stream is ignored as well.
  */
@@ -681,13 +764,17 @@ static int check_window_overflow(test_server *server, client_pair *pair)
     return expect_data_connection_served(server, pair);
 }
 
-/* HEARTBEAT_RESPONSE is a heartbeat and allowed on both roles; it needs no answer. */
+/*
+ * HEARTBEAT_RESPONSE is a heartbeat and allowed on both roles; it needs no answer. A NAT KEEPALIVE
+ * on the data connection is accepted as well.
+ */
 static int check_heartbeat_response(test_server *server, client_pair *pair)
 {
     st_buffer response = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_RESPONSE);
     CHECK(send_buffer(pair->control, &response) == 0, "control HEARTBEAT_RESPONSE");
     response = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_RESPONSE);
     CHECK(send_buffer(pair->data, &response) == 0, "data HEARTBEAT_RESPONSE");
+    CHECK(send_nat(pair->data, ST_NAT_KEEPALIVE, 0U, 0U, 0U, NULL, NULL, 0U) == 0, "data KEEPALIVE");
     CHECK(expect_channel_alive(pair->control) == 0, "HEARTBEAT_RESPONSE closed the control connection");
     CHECK(expect_channel_alive(pair->data) == 0, "HEARTBEAT_RESPONSE closed the data connection");
     return expect_data_connection_served(server, pair);
@@ -947,6 +1034,8 @@ int main(int argc, char **argv)
     failures += run_check("TCP empty DATA|END_STREAM is a FIN; a second FIN gets RST 7",
                           check_tcp_end_stream_and_duplicate_fin);
     failures += run_check("TCP client OPEN gets RST 8", check_tcp_client_open);
+    failures += run_check("TCP public half-close, then the client answers", check_tcp_public_half_close);
+    failures += run_check("REGISTER of a port that cannot be bound", check_register_bind_failure);
     failures += run_check("unknown streams get RST 7 and are tombstoned", check_unknown_streams);
     failures += run_check("RST for a never-opened stream closes the data connection",
                           check_rst_for_never_opened_stream);

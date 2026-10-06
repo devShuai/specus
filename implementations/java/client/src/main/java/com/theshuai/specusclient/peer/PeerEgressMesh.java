@@ -572,6 +572,12 @@ final class PeerEgressMesh implements AutoCloseable {
      */
     void newControlSession() {
         catalog.newSession(catalogClock.getAsLong());
+        // egress-config revisions count within a session too: a restarted server starts again from
+        // 1, and a node that kept the last session's revision ignored its pushes as older.
+        PeerEgressRuntime plane = runtime;
+        if (plane != null) {
+            plane.newControlSession();
+        }
         // The server behind the new session may have restarted, so the next report check sends
         // whatever it finds.
         reporter.newSession();

@@ -36,20 +36,40 @@ typedef struct {
                       size_t trailer_names_len);
     int (*on_data)(void *ctx, const uint8_t *data, size_t data_len);
     int (*on_end)(void *ctx, char *const *trailers, size_t trailers_len);
+    /* Optional: reports the client's free-text RST reason for server-side logging only. */
+    void (*on_reset)(void *ctx, uint32_t code, const char *reason);
 } st_admin_direct_http_sink;
 
 /*
+ * Forwarder result when the client reset the stream (http-route.md §1). The public caller gets
+ * a 502 with ST_ADMIN_DIRECT_HTTP_RESET_BODY; the RST reason only reaches sink->on_reset.
+ */
+#define ST_ADMIN_DIRECT_HTTP_STREAM_RESET (-5)
+#define ST_ADMIN_DIRECT_HTTP_RESET_BODY "HTTP 转发请求失败"
+/*
+ * Forwarder result when the client's data connection already holds its maximum of pending HTTP
+ * streams; the public caller gets 502 "HTTP 流创建失败", as Java HttpSpecusController answers.
+ */
+#define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-6)
+#define ST_ADMIN_LOG_REASON_MAX_CODE_POINTS 256U
+
+/*
+ * Copies at most 256 code points of a peer-supplied reason into out, escaping control and
+ * line-separator characters and invalid UTF-8 so the text cannot forge log lines. Always
+ * NUL-terminates when out_len > 0; returns the length written.
+ */
+size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len);
+
+/*
  * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head
- * timed out, -3 when the route is not configured for the client, ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT
- * when the client's data connection already holds its maximum of pending HTTP streams, and any
- * other negative value when the client is offline or the stream failed.
+ * timed out, -3 when the route is not configured for the client, ST_ADMIN_DIRECT_HTTP_STREAM_RESET
+ * or ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT as above, and any other negative value when the client is
+ * offline or the stream failed.
  */
 typedef int (*st_admin_direct_http_forwarder)(void *ctx,
                                               const char *client_name,
                                               const st_direct_http_request *request,
                                               const st_admin_direct_http_sink *sink);
-
-#define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-5)
 
 typedef struct st_admin_direct_ws_stream st_admin_direct_ws_stream;
 

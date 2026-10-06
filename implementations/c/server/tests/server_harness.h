@@ -89,7 +89,10 @@ int expect_socket_eof(int fd, int timeout_ms);
 /* HTTP */
 int http_request(int port, const char *method, const char *path, const char *body,
                  const char *bearer, int *status, char **response_body);
-/* The real POST /api/client/auth/login, signed exactly as protocol/spec/client-auth.md describes. */
+/* A POST /api/client/auth/login body, signed exactly as protocol/spec/client-auth.md describes. */
+void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
+                       const char *os_user, char *body, size_t body_len);
+/* The real POST /api/client/auth/login with a freshly signed body. */
 int http_client_login(const test_server *server, const char *api_key, const char *secret,
                       const char *fingerprint, const char *os_user, runtime_session *out);
 

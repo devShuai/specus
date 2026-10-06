@@ -346,7 +346,7 @@ public class NatClientHandler extends NatCommonHandler {
         sendReset(streamId, 7, "FIN for unknown TCP stream");
     }
 
-    private void processOpen(NatMessagePacket natMessagePacket) throws Exception {
+    private void processOpen(NatMessagePacket natMessagePacket) {
         String source = asString(natMessagePacket.getMetaData(), "source");
         if ("http".equals(source)) {
             markStreamOpened(natMessagePacket.getStreamId());
@@ -364,36 +364,37 @@ public class NatClientHandler extends NatCommonHandler {
         }
     }
 
-    private void processTcpConnected(NatMessagePacket natMessagePacket) throws Exception {
+    private void processTcpConnected(NatMessagePacket natMessagePacket) {
+        int streamId = natMessagePacket.getStreamId();
+        Integer port = asInt(natMessagePacket.getMetaData(), "port");
+        if (port == null) {
+            log.warn("CONNECTED frame missing port from {}", clientName);
+            sendReset(streamId, 2, "TCP OPEN missing port");
+            return;
+        }
+        String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+        if (channelId == null) {
+            log.warn("CONNECTED frame missing channelId from {}", clientName);
+            sendReset(streamId, 2, "TCP OPEN missing channelId");
+            return;
+        }
+        SpecusConfig specusConfig = specusConfigMap.get(port);
+        if (specusConfig == null) {
+            log.warn("CONNECTED for unknown port {} from {}", port, clientName);
+            sendReset(streamId, 3, "TCP OPEN for unknown port");
+            return;
+        }
+        // Created up front so a failed connect removes only this stream's handler, never one that
+        // an earlier stream with the same id still owns.
+        LocalSpecusHandler localSpecusHandler = new LocalSpecusHandler(this, streamId);
         try {
-            NatClientHandler thisHandler = this;
-            Integer port = asInt(natMessagePacket.getMetaData(), "port");
-            if (port == null) {
-                log.warn("CONNECTED frame missing port from {}", clientName);
-                sendReset(natMessagePacket.getStreamId(), 2, "TCP OPEN missing port");
-                return;
-            }
-            String channelId = asString(natMessagePacket.getMetaData(), "channelId");
-            if (channelId == null) {
-                log.warn("CONNECTED frame missing channelId from {}", clientName);
-                sendReset(natMessagePacket.getStreamId(), 2, "TCP OPEN missing channelId");
-                return;
-            }
-            SpecusConfig specusConfig = specusConfigMap.get(port);
-            if (specusConfig == null) {
-                log.warn("CONNECTED for unknown port {} from {}", port, clientName);
-                sendReset(natMessagePacket.getStreamId(), 3, "TCP OPEN for unknown port");
-                return;
-            }
             localConnection.connect(specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel channel) throws Exception {
-                    int streamId = natMessagePacket.getStreamId();
                     if (!removePendingStream(streamId)) {
                         channel.close();
                         return;
                     }
-                    LocalSpecusHandler localSpecusHandler = new LocalSpecusHandler(thisHandler, streamId);
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), localSpecusHandler);
                     LocalSpecusHandler existing = channelHandlerMap.putIfAbsent(streamId, localSpecusHandler);
                     if (existing != null) {
@@ -408,9 +409,15 @@ public class NatClientHandler extends NatCommonHandler {
                 }
             });
         } catch (Exception e) {
-            sendReset(natMessagePacket.getStreamId(), 1, "local connect failed");
-            channelHandlerMap.remove(natMessagePacket.getStreamId());
-            throw e;
+            // An unreachable target fails this stream only. Letting the exception reach the
+            // pipeline would close the data connection and every other stream on it.
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.warn("Local connect for stream {} to {}:{} failed: {}", Integer.toUnsignedString(streamId),
+                    specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), e.toString());
+            channelHandlerMap.remove(streamId, localSpecusHandler);
+            sendReset(streamId, 1, "local connect failed");
         }
     }
 

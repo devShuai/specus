@@ -16,17 +16,20 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Binds each egress socket to the interface {@link PeerEgressSocketBinding#select} chooses:
  * {@code IP_UNICAST_IF} on Windows, {@code IP_BOUND_IF} on macOS.
  *
- * <p>On Linux nothing is bound. The Go and .NET egresses mark their sockets there for a policy
- * routing rule to steer; that needs a handle this class could now supply, but it is a separate
- * change.
+ * <p>On Linux nothing is bound. The socket is marked with {@code SO_MARK 0x5350} instead, the mark
+ * the Go and .NET egresses set, for a policy routing rule to steer to the physical interface
+ * regardless of what the tunnel did to the main table. That one is best-effort; see {@link Linux}.
  */
+@Slf4j
 class PeerEgressSocketBinder {
 
     /** Reads the candidate routes. */
@@ -39,35 +42,60 @@ class PeerEgressSocketBinder {
         void apply(int handle, String iface) throws IOException;
     }
 
+    /** Marks a socket before it connects. Best-effort: it never fails the dial. */
+    interface Marker {
+        void mark(NetworkChannel channel);
+    }
+
     private final Supplier<String> tunnel;
     private final Function<String, String> tunnelKey;
     private final Applier applier;
+    private final Marker marker;
     /** Replaceable so the real-socket tests can hand the stack a route it has to refuse. */
     RouteSource routes;
 
     PeerEgressSocketBinder(Supplier<String> tunnel, RouteSource routes, Function<String, String> tunnelKey,
-            Applier applier) {
+            Applier applier, Marker marker) {
         this.tunnel = tunnel;
         this.routes = routes;
         this.tunnelKey = tunnelKey;
         this.applier = applier;
+        this.marker = marker;
     }
 
-    /** A binder that binds nothing. */
+    /** A binder that binds and marks nothing. */
     static PeerEgressSocketBinder none() {
-        return new PeerEgressSocketBinder(() -> "", null, name -> "", null);
+        return new PeerEgressSocketBinder(() -> "", null, name -> "", null, null);
     }
 
     static PeerEgressSocketBinder forPlatform(Supplier<String> tunnel) {
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        return forPlatform(System.getProperty("os.name", ""), tunnel);
+    }
+
+    /** The binder for the operating system named as {@code os.name} names it. */
+    static PeerEgressSocketBinder forPlatform(String operatingSystem, Supplier<String> tunnel) {
+        String os = operatingSystem.toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
-            return new PeerEgressSocketBinder(tunnel, Windows::routes, Windows::interfaceKey, Windows::apply);
+            return new PeerEgressSocketBinder(tunnel, Windows::routes, Windows::interfaceKey, Windows::apply, null);
         }
         if (os.contains("mac") || os.contains("darwin")) {
             Macos table = new Macos();
-            return new PeerEgressSocketBinder(tunnel, table::routes, name -> name, Macos::apply);
+            return new PeerEgressSocketBinder(tunnel, table::routes, name -> name, Macos::apply, null);
+        }
+        if (os.contains("linux")) {
+            return new PeerEgressSocketBinder(tunnel, null, name -> "", null, Linux::mark);
         }
         return none();
+    }
+
+    /** Whether sockets are bound to an interface: Windows and macOS. */
+    boolean binds() {
+        return applier != null;
+    }
+
+    /** Whether sockets are marked: Linux. */
+    boolean marks() {
+        return marker != null;
     }
 
     /** Turns a tunnel name into what the table's interface column holds, or "" when there is none. */
@@ -75,8 +103,14 @@ class PeerEgressSocketBinder {
         return name == null || name.isEmpty() ? "" : tunnelKey.apply(name);
     }
 
-    /** Binds channel, before it connects, to the interface for target. */
+    /**
+     * Readies channel, before it connects, for target: marks it on Linux, binds it to the interface
+     * for target on Windows and macOS.
+     */
     void bind(NetworkChannel channel, InetSocketAddress target) throws IOException {
+        if (marker != null) {
+            marker.mark(channel);
+        }
         if (applier == null) {
             return;
         }
@@ -264,6 +298,60 @@ class PeerEgressSocketBinder {
                         PeerEgressSocketBinding.MACOS_IP_BOUND_IF, option, option.length);
             } catch (LastErrorException failed) {
                 throw new IOException("bind egress socket to " + iface + ": errno " + failed.getErrorCode(), failed);
+            }
+        }
+    }
+
+    /**
+     * Linux: the socket is marked, not bound, and the mark is set best-effort.
+     *
+     * <p>A node without the matching rule, or without permission to set a mark -- it takes
+     * CAP_NET_ADMIN -- still works whenever the tunnel did not claim the default route, so failing
+     * the connect here would break the common case in order to protect the uncommon one. The Go and
+     * .NET egresses ignore a refused mark without a word, and so does this one.
+     *
+     * <p>A handle this JVM cannot reach is no reason to refuse either: Linux egress never needed one
+     * before the mark, and refusing would turn a missing JVM option into an egress that carries
+     * nothing. The socket goes out unmarked instead. That failure is Java's own and an operator can
+     * fix it, so it is logged, once, naming the option.
+     */
+    static final class Linux {
+
+        interface LibC extends Library {
+            int setsockopt(int fd, int level, int name, byte[] value, int length) throws LastErrorException;
+        }
+
+        private static final class Libraries {
+            static final LibC LIBC = Native.load("c", LibC.class);
+        }
+
+        private static final AtomicBoolean HANDLE_UNREACHABLE_LOGGED = new AtomicBoolean();
+
+        private Linux() {
+        }
+
+        static void mark(NetworkChannel channel) {
+            int handle;
+            try {
+                handle = PeerEgressSocketHandles.of(channel);
+            } catch (IOException unreachable) {
+                if (HANDLE_UNREACHABLE_LOGGED.compareAndSet(false, true)) {
+                    // The handle's own message names the missing JVM option when that is the cause.
+                    log.warn("[peer-egress] egress sockets go out without SO_MARK 0x5350, so a policy routing "
+                            + "rule on that mark will not steer them: the socket handle is out of reach ({})",
+                            unreachable.getMessage());
+                }
+                return;
+            }
+            byte[] option = PeerEgressSocketBinding.linuxSocketMarkOption(
+                    PeerEgressSocketBinding.LINUX_EGRESS_SOCKET_MARK);
+            try {
+                Libraries.LIBC.setsockopt(handle, PeerEgressSocketBinding.LINUX_SOL_SOCKET,
+                        PeerEgressSocketBinding.LINUX_SO_MARK, option, option.length);
+            } catch (LastErrorException refused) {
+                // Best effort; see the class comment. EPERM without the capability is the usual one.
+            } catch (LinkageError unavailable) {
+                // Same: no libc to call leaves the socket unmarked, not the dial refused.
             }
         }
     }

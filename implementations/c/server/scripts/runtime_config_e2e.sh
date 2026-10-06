@@ -60,6 +60,13 @@ cleanup() {
   for pid in "${CLIENT_PID:-}" "${SERVER_PID:-}" "${ECHO_PID:-}" "${HTTP_PID:-}"; do
     if [[ -n "$pid" ]]; then stop_process "$pid"; fi
   done
+  # SPECUS_E2E_LOG_DIR keeps this run's logs (C server, client, upstreams) once the temporary
+  # directory is gone, whether the run passed or failed; CI uploads that directory as an artifact.
+  if [[ -n "${SPECUS_E2E_LOG_DIR:-}" ]]; then
+    local label="${CLIENT_LABEL:-client}"
+    local log_dir="$SPECUS_E2E_LOG_DIR/runtime_config_e2e-${label//[^A-Za-z0-9._-]/_}"
+    mkdir -p "$log_dir" && cp "$TMP_DIR"/*.log "$log_dir"/ 2>/dev/null
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT

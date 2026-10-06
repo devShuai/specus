@@ -3,6 +3,9 @@
 Experimental C port of `specus-server`.
 
 Full migration plan: [docs/cross-language/specus-server-c-port-plan.md](../../../docs/cross-language/specus-server-c-port-plan.md).
+The list below describes what the source implements. Which of it has a unit test, an integration test or an
+end-to-end run, and which Java server tests have no C counterpart, is recorded per area in
+[c-server-test-map.md](../../../docs/cross-language/alignment/c-server-test-map.md).
 
 This version implements the v2 core server path:
 
@@ -14,24 +17,37 @@ This version implements the v2 core server path:
 - `/api/client/auth/login`: SQLite credential login writes `specus_client_session` and returns a runtime `cs_` access token; an explicitly configured environment-token path is available only for local smoke tests
 - Java-shaped management/auth APIs, including password and email-verification registration, OIDC configuration/token exchange, tenant/owner-filtered users, clients, mappings, routes, connection records, traffic, packages, object storage, media capture, and Peer Mesh resources
 - client package metadata plus hosted multipart upload/download, shared public rate limiting, full SemVer selection, and a validated/cached official GitHub latest-release fallback
-- Java-shaped public ICE discovery and an in-process RFC 5389/5780 STUN plus RFC 5766 TURN UDP service with long-term credentials, allocations, permissions, ChannelData/indications, relay quotas, alternate-address NAT probing, and expiry cleanup
+- Java-shaped public ICE discovery and an in-process RFC 5389/5780 STUN plus RFC 5766 TURN UDP service with long-term credentials, allocations, permissions, ChannelData/indications, relay quotas, alternate-address NAT probing, and expiry cleanup (`stun_turn_tests` covers Binding, RFC 5780 probes, the 401 challenge, Allocate, CreatePermission, relay through Send/Data indications and the allocation quota; Refresh, ChannelBind/ChannelData and expiry cleanup have no test)
 - public-transfer discovery at `POST /api/public/transfer/ws-tickets`, `GET /api/public/transfer/clients/name-availability`, and `/ws/public-transfer/discovery`, including source-bound one-time tickets, token/same-address merged visibility, hello/roster, signalling, ping, rate/size gates, STWR2 relay, and optional Redis multi-instance coordination
 - an HTTP stream bridge for `/http/{clientName}/{route}/...` using NAT `OPEN/DATA/FIN/RST/WINDOW_UPDATE`; WebSocket frames use the mandatory `SWS2` envelope
 - `NAT_CONTROL` push after login, after SQLite mapping/route mutations, and through the manual admin endpoint
 - `/ws/client-messages` with endpoint-bound one-time tickets, admin/client fan-out, online capability checks, and ACL-gated client fallback over the control channel
 - Peer Mesh login configuration, roster, service catalog, offer/answer/candidate/close signalling, persisted session/path/traffic state, management service sharing/import/audit/stats, and immediate roster/catalog refresh after mutations
-- Java-compatible attachment presign/complete/download flows for S3-compatible or Aliyun OSS storage, plus route-level HTTP media capture, sparse Range stitching/backfill, ticketed playback, and scheduled expiry cleanup
+- Java-compatible attachment presign/complete/download flows for Aliyun OSS storage (OSS V4 signing; `aliyun-oss` is the only attachment provider), plus route-level HTTP media capture on an S3-compatible store, sparse Range stitching/backfill, ticketed playback, and scheduled expiry cleanup
 - optional Elasticsearch HTTP/TCP detail persistence/query/retention, with SQLite as the default detail backend
 - TCP specus `REGISTER`, `REGISTER_RESULT`, `OPEN`, `DATA`, `FIN`, `RST`, `WINDOW_UPDATE`, and `UNREGISTER` flow
 - heartbeat responses after successful login
 
 It intentionally does not build the SPA or provide a C client/virtual network device; it serves an existing SPA
 from `SPECUS_STATIC_ROOT`. Server-side Peer Mesh signalling and STUN/TURN relay are implemented, while virtual IP
-traffic is terminated by Java/Go/.NET/Android clients. Control/data TLS and verified HTTPS OIDC exchange are implemented. With `SPECUS_DATABASE_PATH` configured,
+traffic is terminated by Java/Go/.NET/Android clients; no client has been run against the C Peer Mesh or TURN paths end to end.
+Control/data TLS is implemented; `/oidc/token` proxies the code exchange over verified HTTPS but does not implement
+Java's ID-token validation or local sign-in (see below). With `SPECUS_DATABASE_PATH` configured,
 `/api/client/auth/login` can authenticate rows in `specus_client_credential`, create or reuse a
 machine/user-bound client identity, write a `HTTP_AUTHENTICATED` row to `specus_client_session`,
 and issue a runtime `cs_` token that the control-channel login later promotes to `NETTY_ONLINE`.
 The environment-token mode is a local smoke-test fixture, not an alternate wire protocol.
+In both modes a login whose signature verifies consumes its `(apiKey, nonce)` pair, as
+`protocol/spec/client-auth.md` requires: the same pair again within 120 s gets Java's
+`400 {"error":"客户端签名 nonce 已使用"}` and no token; a request whose signature fails consumes nothing.
+The digests live in process memory (Java and Go keep them in the database): at most 65536 at a time,
+expiring by the same wall clock as the +-60 s timestamp window, and a full store answers
+`503` with `Retry-After` rather than evicting a pair that could still be replayed. Being per process,
+they are not shared between C server instances and do not survive a restart; the timestamp window
+limits a replay after a restart to requests signed in the preceding 60 s.
+The login response carries `nettyTls`, derived as Java and Go derive it: `true` when
+`SPECUS_TLS_MODE` is `file` or `self-signed`, or `SPECUS_TLS_TERMINATED_UPSTREAM=true`. Clients
+whose `controlTls.enabled` is unset follow it.
 
 ## Build
 
@@ -108,12 +124,12 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_BIND_ADDRESS` | `0.0.0.0` | Bind address for the built-in STUN/TURN UDP listener. |
 | `SPECUS_PEER_MESH_STUN_TURN_PORT` | `3478` | Built-in STUN/TURN UDP listen port and published URL port. |
 | `SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS` | unset | Optional comma-separated public STUN URLs appended to the discovery response; missing ports default to `3478` and duplicates are removed. |
-| `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | Authentication flag returned by the public ICE response. |
-| `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | unset | Shared secret used for temporary TURN HMAC-SHA1 credentials. When auth is required, C omits the TURN URL until this is explicitly set so it cannot advertise unusable credentials. |
+| `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | Whether the built-in TURN listener requires long-term credentials; also returned as `turnAuthRequired` by the public ICE response. |
+| `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | unset | Shared secret used for temporary TURN HMAC-SHA1 credentials. When unset the process generates a random secret at startup, as Java does, so credentials issued before a restart stop working. |
 | `SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | Temporary public-transfer TURN credential lifetime, clamped to at least 60 seconds. |
 | `SPECUS_PEER_MESH_CIDR` | `100.96.0.0/11` | Virtual address pool advertised to Peer Mesh clients. |
-| `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | `120` | Peer session negotiation/idle expiry used by the signalling state machine. |
-| `SPECUS_PEER_MESH_CATALOG_TTL_SECONDS` | `90` | Live service-catalog lease before stale withdrawal. |
+| `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | Peer session authorization lifetime: the expiry stored for a new peer session and the `sessionTtlSeconds` sent in the login configuration. Non-positive values fall back to `3600`. |
+| `SPECUS_PEER_MESH_CATALOG_TTL_SECONDS` | `300` | Live service-catalog lease before stale withdrawal. Values outside `1..86400` fall back to `300`. |
 | `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | Maximum discoverable peers in one token/public room. |
 | `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message limits. Redis failure closes discovery sockets; there is no process-local fallback. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | unset | Required in cluster mode. Supports `redis://[user[:password]@]host[:port][/0..15]`; TLS `rediss://` is intentionally rejected until a verified TLS transport is added. |
@@ -127,7 +143,7 @@ Additional runtime knobs:
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS` | `300` | Pairing-code lifetime, clamped to `60..900` seconds. |
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP` | `10` | Pairing-code redemption attempts per resolved source address in one fixed window. |
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS` | `300` | Pairing-code redemption fixed-window duration. |
-| `SPECUS_OBJECT_STORAGE_PROVIDER` | unset | Attachment provider (`s3-compatible` or `aliyun-oss`); unset keeps attachment APIs fail-closed. |
+| `SPECUS_OBJECT_STORAGE_PROVIDER` | `disabled` | Attachment provider: `aliyun-oss` is the only supported value. Unset or `disabled` keeps attachment APIs fail-closed; any other value, or `aliyun-oss` without endpoint, bucket, access keys and an inferable or explicit region, is rejected at startup. |
 | `SPECUS_OBJECT_STORAGE_ENDPOINT` / `REGION` / `BUCKET` | unset | Object-storage endpoint, region and bucket. |
 | `SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID` / `ACCESS_KEY_SECRET` | unset | Object-storage credentials; keep them outside checked-in configuration. |
 | `SPECUS_MEDIA_CAPTURE_ENABLED` | `false` | Enables route-level media capture after its S3-compatible endpoint/bucket/credentials validate. |
@@ -278,8 +294,9 @@ upload/download totals. The same capability projection gates live peer roster an
 The exact Java attachment paths—public/admin `presign-upload`, `/{attachmentId}/complete`, and
 `/{attachmentId}/presign-download` under `/api/public/transfer/attachments` or
 `/api/admin/client-messages/attachments`—return `409 OBJECT_STORAGE_DISABLED` only when no provider is
-configured. Configured S3-compatible and Aliyun OSS providers return signed URLs and enforce ownership,
-room role, size, quota, state, and expiry semantics. `GET /api/public/transfer/attachments/capabilities`
+configured. A configured Aliyun OSS provider returns signed URLs and enforces ownership,
+room role, size, quota, state, and expiry semantics. `object_storage_e2e` runs the public-transfer paths
+against a local fake OSS endpoint; the configured admin client-message paths share that code but have no test. `GET /api/public/transfer/attachments/capabilities`
 implements `protocol/spec/transfer-capabilities.md` v1: an authenticated, `private, no-store` snapshot of
 the caller's own storage and monthly download quota, read over a read-only SQLite connection from the same
 tables. It answers `200` with `storageEnabled:false` while storage is disabled, never signs or contacts
@@ -304,7 +321,14 @@ the same right-to-left trusted-proxy resolver.
 The login and refresh responses use the Java-shaped `accessToken/tokenType/expiresIn` fields. The
 token is a local HS256 JWT with `iss=specus`, `sub`, `tenant_id`, `role`, `iat`, and `exp`;
 real HTTP requests to `/api/admin/**` and `/auth/refresh` must include it as
-`Authorization: Bearer <token>`. The C unit-test convenience wrappers still allow an implicit
+`Authorization: Bearer <token>`. As in Java's `ManagementContextResolver`, the token only names
+the account: every authenticated request and every refresh re-reads it (one read-only SQLite
+query, not cached). The built-in admin must still be allowed to sign in with its password; a stored
+user must exist, be enabled and still belong to the token's tenant; tenant, role and admin rights
+come from the record as it is now. Otherwise requests get `403 {"error":"账号未绑定、已禁用或权限已撤销"}`
+and refresh gets `401 {"error":"账号已禁用、不存在或不再允许本地登录"}`; an unreadable user store
+answers `500`. Refresh issues the new token from the current record, so a demoted admin is
+refreshed as `USER`. The C unit-test convenience wrappers still allow an implicit
 built-in admin context so existing smoke tests can exercise endpoint bodies without hand-building
 headers.
 Client, startup credential, TCP mapping, HTTP route, connection record, archived connection-stat,
@@ -457,7 +481,7 @@ per management socket and a 1,024-pending process limit, so a slow client does n
 management WebSocket from consuming later commands. Client `MESSAGE_REQUEST` packets addressed to
 `admin:<username>` fan out to matching management subscriptions; other client targets use the
 Peer device/ACL permission check before control-channel fallback. Offline outbox is not part of this live
-fallback. Attachments use the configured S3-compatible/Aliyun OSS provider and return the documented
+fallback. Attachments use the configured Aliyun OSS provider and return the documented
 `OBJECT_STORAGE_DISABLED` contract only while no provider is configured.
 
 Security skeleton endpoints:
@@ -465,17 +489,30 @@ Security skeleton endpoints:
 - `GET /oidc-config` returns the Java-shaped browser login config:
   `configured`, `authorizationEndpoint`, `endSessionEndpoint`, `clientId`, `redirectUri`,
   `scope`, and `passwordLoginEnabled`.
-- `POST /oidc/token` mirrors Java's Authorization Code + PKCE proxy contract. It validates
-  `code` and `codeVerifier`, posts `grant_type=authorization_code`, `redirect_uri`, and
-  `code_verifier` to `SPECUS_OIDC_TOKEN_ENDPOINT`, and returns Java-shaped
-  `accessToken`, `idToken`, `tokenType`, and `expiresIn`. Both HTTP and HTTPS are supported;
-  HTTPS validates the certificate chain and hostname, with an optional private CA from
-  `SPECUS_OIDC_CA_CERTIFICATE_PATH`.
+- `POST /oidc/token` requires `code` and `codeVerifier`, posts `grant_type=authorization_code`,
+  `redirect_uri`, and `code_verifier` to `SPECUS_OIDC_TOKEN_ENDPOINT`, and returns the identity
+  provider's `access_token`/`id_token` as `accessToken`, `idToken`, `tokenType`, and `expiresIn`.
+  Both HTTP and HTTPS are supported; HTTPS validates the certificate chain and hostname, with an
+  optional private CA from `SPECUS_OIDC_CA_CERTIFICATE_PATH`. This is not Java's contract: Java
+  validates the ID token (issuer, audience, nonce), resolves or provisions the local management
+  user and returns a local Specus token. C does none of that, and its management API accepts only
+  its local HS256 JWT, so an OIDC sign-in cannot authenticate against the C management API.
 
 The control/data listener supports disabled, PKCS#12/PEM file, and ephemeral self-signed TLS modes.
 TLS 1.2 is the minimum. Production rejects self-signed TLS and plaintext public binds; plaintext
 behind a trusted L4 TLS terminator is accepted only when the process binds loopback/private space and
-`SPECUS_TLS_TERMINATED_UPSTREAM=true` is explicit.
+`SPECUS_TLS_TERMINATED_UPSTREAM=true` is explicit. Production here means `SPECUS_ENV=prod`, an unset
+or unrecognised `SPECUS_ENV`, or `SPECUS_TLS_REQUIRE_ENCRYPTION=true`; a rejected configuration
+exits with status 1 and `TLS configuration rejected: ...` before any listener opens.
+
+What is tested: `tls_transport_tests` loads PKCS#12, and PEM as separate certificate/key, a chain
+file, one combined PEM keystore and an encrypted key, and runs handshakes where an OpenSSL client
+verifies the CA-signed chain and the host name, and refuses another CA or another name.
+`tls_deployment_e2e.sh` (CTest and `make test`) starts the real binary with each refused
+combination and checks the exit status and message, starts it with PEM file TLS, and verifies that
+listener with `openssl s_client`. `tls_client_e2e.sh` (below) runs the Java, Go and .NET clients
+against it. Not tested: PKCS#12 or self-signed listeners with a real client, production certificates
+from a public CA, and TLS terminated by an actual L4 proxy.
 
 ## End-to-End Smoke Tests
 
@@ -516,9 +553,26 @@ byte-for-byte; a small RFC 6455 client checks the app's greeting, UTF-8 text, bi
 binary frame, a fragmented message with a ping between its fragments, and a close handshake started
 from each side.
 
+Control/data TLS with a real client:
+
+```bash
+bash implementations/c/server/scripts/tls_client_e2e.sh
+```
+
+The script makes a throwaway CA and a certificate for `specus-c.test` with the openssl CLI and runs
+the server with PEM file TLS and `SPECUS_TLS_REQUIRE_ENCRYPTION=true`. The host name never resolves:
+clients dial the advertised `nettyHost` 127.0.0.1 and check the certificate against
+`controlTls.serverName`. The signed login must return `"nettyTls":true` and refuse its own replay.
+A client with no `controlTls` settings must follow `nettyTls` into TLS and fail verification, as
+must one trusting another CA and one expecting `wrong.specus-c.test`, without any login reaching the
+server; with the test CA and `serverName` the control and data connections log in over TLS and
+256 KiB make a round trip through a TCP mapping.
+
 Every script takes `SPECUS_CLIENT_COMMAND` (another client binary, for example the Go client or
 `dotnet specus-client.dll`), `SPECUS_CLIENT_LABEL`, and `SPECUS_SMOKE_REUSE_BUILD=1` to reuse a server
-an earlier run built and unit-tested. When WSL runs the C server but `java.exe` runs the client in the
+an earlier run built and unit-tested. With `SPECUS_E2E_LOG_DIR` set, each script copies its C server,
+client and upstream logs to `$SPECUS_E2E_LOG_DIR/<script>-<client label>/` when it exits, passed or
+failed; the `protocol-v2` CI job uploads that directory as the `c-server-e2e-logs` artifact. When WSL runs the C server but `java.exe` runs the client in the
 Windows network namespace, the scripts automatically advertise the WSL interface address for upstream
 targets instead of assuming that Windows `127.0.0.1` reaches a WSL listener.
 

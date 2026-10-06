@@ -23,6 +23,9 @@ import java.util.Map;
  * per destination: binding everything to the default route's interface would break every target
  * reached through a second NIC or another VPN.
  *
+ * <p>On Linux nothing is bound: the socket is marked with {@code SO_MARK} for a policy routing rule
+ * to steer, as the Go and .NET egresses mark theirs. Only the option's encoding lives here.
+ *
  * <p>Everything here is pure and pinned by {@code protocol/test-vectors/peer-egress-socket-binding-v1.json};
  * the calls that fetch the tables and set the options are in {@link PeerEgressSocketBinder}.
  */
@@ -33,6 +36,15 @@ public final class PeerEgressSocketBinding {
     /** {@code IP_BOUND_IF}, at level {@code IPPROTO_IP}. */
     public static final int MACOS_IP_BOUND_IF = 25;
     public static final int IPPROTO_IP = 0;
+    /** {@code SOL_SOCKET} on Linux. */
+    public static final int LINUX_SOL_SOCKET = 1;
+    /** {@code SO_MARK} on Linux, at level {@code SOL_SOCKET}. */
+    public static final int LINUX_SO_MARK = 36;
+    /**
+     * The mark a Linux policy routing rule matches on. The same value the Go and .NET egresses set,
+     * so one deployment's rule serves every implementation.
+     */
+    public static final int LINUX_EGRESS_SOCKET_MARK = 0x5350;
 
     /**
      * The layouts of MIB_IPFORWARD_ROW2 and MIB_IPINTERFACE_ROW on 64-bit Windows, measured against
@@ -405,5 +417,10 @@ public final class PeerEgressSocketBinding {
     /** The {@code IP_BOUND_IF} value: the index as a host-order int. */
     public static byte[] macosBoundInterfaceOption(long index) {
         return ByteBuffer.allocate(4).order(ByteOrder.nativeOrder()).putInt((int) index).array();
+    }
+
+    /** The {@code SO_MARK} value: the mark as a host-order int, as the kernel reads it. */
+    public static byte[] linuxSocketMarkOption(int mark) {
+        return ByteBuffer.allocate(4).order(ByteOrder.nativeOrder()).putInt(mark).array();
     }
 }
