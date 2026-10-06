@@ -4,7 +4,7 @@ route 的所有者或租户管理员，可以为**一条已有、受保护的 HT
 
 关联 [issue #38](https://github.com/devShuai/specus/issues/38) 的待办「临时 HTTP 分享：有效期、撤销、访问范围与权限变更审计；各 server 实现保持一致，禁止把长期公开路由当作临时邀请」，见 [docs/issues/product-followups.md](../../docs/issues/product-followups.md)。
 
-**状态：契约已定（第 15 节各项采用建议默认值），尚无实现。** 共享向量 `protocol/test-vectors/temporary-http-share-v1.json` 由 `tools/protocol/generate_temporary_share_vectors.py` 生成。
+**状态：契约已定（第 15 节各项采用建议默认值）；Java、Go、.NET、C 四个服务端与管理前端已实现，尚未部署。** 共享向量 `protocol/test-vectors/temporary-http-share-v1.json` 由 `tools/protocol/generate_temporary_share_vectors.py` 生成。
 
 ## 1. 现状
 

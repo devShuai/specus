@@ -66,7 +66,7 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
 - `temporary-http-share-v1.json`：临时 HTTP 分享的参考判定。包括令牌格式与哈希、路径前缀规范化、创建与兑换接口、
   `/http-share/{shareId}/**` 上每个请求的判定与转发内容、请求 Cookie 剥离与响应头改写、管理事件之后的级联失效与审计
   序列，以及两个 GCRA 限流器的事件序列。由 `tools/protocol/generate_temporary_share_vectors.py` 生成，语义见
-  [`protocol/spec/temporary-http-share.md`](../spec/temporary-http-share.md)。尚无实现读取它。
+  [`protocol/spec/temporary-http-share.md`](../spec/temporary-http-share.md)。Java、Go、.NET 与 C 服务端的测试逐节重放它。
 
 ## 服务连通性检查（草案）
 
