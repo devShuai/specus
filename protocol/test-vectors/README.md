@@ -61,6 +61,14 @@ STAP2/STWR2/STCLIP2 向量；Java 独立 STUN 服务直接读取 STFWD2 向量�
 Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`，验证 STCE 编解码和 groupId；该内部帧
 不是浏览器协议，不得暴露 roomKey 或 Redis key。
 
+## 服务工作台（草案）
+
+- `service-workbench-v1.json`：`/api/admin/workbench` 收藏与最近打开的参考实现。每个场景给出账号、对象和预置行，按时间重放
+  接口调用与外部事件（删除对象、删除账号、存储故障、保留期清理），期望是每一步的完整响应和场景结束后存储里剩下的行；
+  覆盖上限、保留期、排序、去重、身份隔离、级联删除与限流。`problems` 一节只由管理前端读取。由
+  `tools/protocol/generate_service_workbench_vectors.py` 生成，语义见
+  [`protocol/spec/service-workbench.md`](../spec/service-workbench.md)。尚无实现读取它。
+
 ## 拒绝规则
 
 每种实现至少覆盖：错误版本、错误 magic/type、截断、尾随字节、越界长度、错误 GCM tag/HMAC、重复
