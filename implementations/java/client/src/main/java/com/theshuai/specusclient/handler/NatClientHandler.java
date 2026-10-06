@@ -286,6 +286,9 @@ public class NatClientHandler extends NatCommonHandler {
                 return;
             }
             handler.writeFrame(wsCtx, data);
+            if ((natMessagePacket.getFlags() & NatMessagePacket.FLAG_END_STREAM) != 0) {
+                finishWsStream(streamId, false);
+            }
             return;
         }
         LocalSpecusHandler handler = channelHandlerMap.get(streamId);
@@ -311,11 +314,7 @@ public class NatClientHandler extends NatCommonHandler {
             }
             return;
         }
-        ChannelHandlerContext wsCtx = wsLocalChannels.remove(streamId);
-        if (wsCtx != null) {
-            markStreamClosed(streamId);
-            StreamFlowController.get(ctx.channel()).remove(streamId);
-            wsCtx.close();
+        if (finishWsStream(streamId, natMessagePacket.getNatMessageType() == NatMessageType.RST)) {
             return;
         }
         LocalSpecusHandler handler = channelHandlerMap.get(streamId);
@@ -534,6 +533,27 @@ public class NatClientHandler extends NatCommonHandler {
         if (removePendingStream(streamId)) {
             sendReset(streamId, 5, reason);
         }
+    }
+
+    /**
+     * Ends a WebSocket stream on the server's FIN (or DATA|END_STREAM) or RST. FIN closes the local
+     * socket only after the frames already relayed to it are written, so the CLOSE that precedes it
+     * reaches the app; RST aborts at once. Returns false when no WebSocket stream has this id.
+     */
+    private boolean finishWsStream(int streamId, boolean reset) {
+        ChannelHandlerContext wsCtx = wsLocalChannels.remove(streamId);
+        if (wsCtx == null) {
+            return false;
+        }
+        markStreamClosed(streamId);
+        StreamFlowController.get(ctx.channel()).remove(streamId);
+        WsLocalSpecusHandler handler = wsCtx.pipeline().get(WsLocalSpecusHandler.class);
+        if (reset || handler == null) {
+            wsCtx.close();
+        } else {
+            handler.closeAfterPendingWrites(wsCtx);
+        }
+        return true;
     }
 
     void removeWsLocalHandler(int streamId, WsLocalSpecusHandler handler) {

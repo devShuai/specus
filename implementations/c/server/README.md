@@ -76,7 +76,7 @@ Additional runtime knobs:
 | `SPECUS_CLIENT_ACCESS_TOKEN_HASH` | unset | SHA-256 hex hash of the environment runtime access token when the plaintext token should not be kept in env. |
 | `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` | Runtime token TTL returned by the auth-login response. Legacy alias: `SPECUS_CLIENT_TOKEN_TTL_SECONDS`. |
 | `SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | Default max online instances returned by auth login and used when creating credentials without an explicit value. Legacy alias: `SPECUS_CLIENT_MAX_ONLINE_INSTANCES`. |
-| `SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | Same-machine/user online-instance limit. The current C stage still enforces one instance in the control-channel path. |
+| `SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | Same credential + machine fingerprint + OS user online-instance limit enforced by the control-channel login. The logging-in session itself is not counted, so a re-login of the same session replaces its previous connections. |
 | `SPECUS_CLIENT_POLICY_ENABLED` | `true` | Client policy enabled flag returned by auth login. |
 | `SPECUS_CLIENT_BILLING_STATUS` | `ACTIVE` | Client billing status returned by auth login. |
 | `SPECUS_CLIENT_RETRY_AFTER_SECONDS` | `0` | Retry-after hint returned by auth login. |
@@ -362,8 +362,22 @@ documented in `protocol/spec/client-auth.md`, creates or reuses the machine/user
 identity, writes `specus_client_session` as `HTTP_AUTHENTICATED`, and returns a freshly generated
   `cs_` runtime token. The following v2 control/data login verifies
 `clientSessionId + accessToken`, checks expiry, enabled client/credential state, same-machine
-single-instance state, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`; disconnects
-  mark it `DISCONNECTED`. When no matching SQLite credential exists, the explicitly configured environment-token
+user instance limit, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`; disconnects
+  mark it `DISCONNECTED`. The token stays reusable for ordinary reconnects until it expires, but a
+  session that a later HTTP login of the same machine user superseded is refused as
+  `客户端访问令牌无效`, so the client refreshes instead of reviving an old session. Before counting
+  online instances the login closes `NETTY_ONLINE` rows of the credential that no bound control
+  connection carries. A newer control or data login of the same client replaces the older
+  connection instead of being refused (`REPLACED_BY_NEW_LOGIN`): a control login also closes the
+  previous data connection, its NAT streams, pending Direct HTTP requests and public listeners, and
+  the previous session can no longer attach a data connection. A control connection that goes
+  away closes the data connection of the same session; a data connection that goes away leaves its
+  control alone, as in Java and Go. A dead peer is closed by
+  `SPECUS_CONTROL_READ_IDLE_SECONDS` and stops counting as online. On `SIGTERM`/`SIGINT` the server
+  stops accepting, closes every control/data connection, waits up to 10 s for each to mark its session
+  `DISCONNECTED` and stamp its connection record `SERVER_SHUTDOWN`, sweeps whatever is still open, and
+  only then stops its background workers; a restart closes rows a killed process left online or open
+  (`SERVER_RESTARTED`). When no matching SQLite credential exists, the explicitly configured environment-token
   smoke-test path is available. Partial environment client-auth configuration is treated as a
 server misconfiguration and returns `503` instead of silently falling back. The same listener also
 serves the SPA and `/specus-http-route-runtime.js` from `SPECUS_STATIC_ROOT`.
@@ -462,7 +476,11 @@ bash implementations/c/server/scripts/nat_e2e_smoke.sh
 
 The script starts local TCP/HTTP/WebSocket upstreams, this C server, and the existing Java client.
 It verifies TCP small payloads, 1 MiB transfer and reconnect, Direct HTTP POST/path/query, plus
-WebSocket/SWS2 text, continuation, ping/pong and close handling.
+WebSocket/SWS2 text, continuation, ping/pong and close handling. It then runs the server with a
+10 s `SPECUS_CONTROL_READ_IDLE_SECONDS` (`CONTROL_READ_IDLE_SECONDS` overrides it), leaves the
+session idle for 22 s, and requires the server's `first heartbeat answered` log line for both the
+control and the data connection, no read-idle close and no second login, and working TCP and Direct
+HTTP afterwards.
 
 To validate database-backed Java startup login and live configuration changes without reconnecting:
 
@@ -474,9 +492,24 @@ This second script creates a SQLite credential, starts the Java client, waits fo
 online/version projection, then creates, deletes, and recreates a TCP mapping and a Direct HTTP
 route while the client remains connected.
 
-When WSL runs the C server but `java.exe` runs the client in the Windows network namespace, both
-scripts automatically advertise the WSL interface address for upstream targets instead of assuming
-that Windows `127.0.0.1` reaches a WSL listener.
+Direct HTTP and Direct WebSocket get their own end-to-end run:
+
+```bash
+bash implementations/c/server/scripts/direct_route_e2e.sh
+```
+
+The client publishes one local app (HTTP and a WebSocket endpoint on the same port) as the route
+`app`. curl checks GET with request/response headers, a percent-encoded path and query, a 404 from
+the app, a 6 MiB download, a streamed response, POST, a 2 MiB upload and a chunked upload, each
+byte-for-byte; a small RFC 6455 client checks the app's greeting, UTF-8 text, binary, a 1.5 MiB
+binary frame, a fragmented message with a ping between its fragments, and a close handshake started
+from each side.
+
+Every script takes `SPECUS_CLIENT_COMMAND` (another client binary, for example the Go client or
+`dotnet specus-client.dll`), `SPECUS_CLIENT_LABEL`, and `SPECUS_SMOKE_REUSE_BUILD=1` to reuse a server
+an earlier run built and unit-tested. When WSL runs the C server but `java.exe` runs the client in the
+Windows network namespace, the scripts automatically advertise the WSL interface address for upstream
+targets instead of assuming that Windows `127.0.0.1` reaches a WSL listener.
 
 ## Release Build
 
