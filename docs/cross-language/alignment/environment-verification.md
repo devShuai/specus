@@ -51,6 +51,7 @@
   - 回归：同一构建上 Go client 的 `runtime_config_e2e.sh`、`direct_route_e2e.sh`、`nat_e2e_smoke.sh`（含心跳）均返回 0。
   - 管理 JWT：每个鉴权请求与 `/auth/refresh` 改为按 Java `ManagementContextResolver` 重新读取管理用户（只读 SQLite 查询、无缓存）；`admin_http_tests` 覆盖降级 admin 失去 admin 端点且续期为 USER、禁用用户请求 403 / 续期 401 且重新启用后恢复、删除用户与不存在用户（即使 claim 为 ADMIN）被拒、内置 admin 在密码登录关闭后被拒。修复前的 `admin_http.c` 上首条断言失败（降级后仍 200）。
   - CI：「C server (Linux)」任务的 CTest 步骤自动包含新单测与 `tls_deployment_e2e`；Java、Go、.NET 各新增一步 `tls_client_e2e.sh`（Java 不带额外参数，Go/.NET 与既有步骤同样以 `SPECUS_CLIENT_COMMAND` + `SPECUS_SMOKE_REUSE_BUILD=1` 运行）。记录时尚未有包含这些改动的 CI 运行。
+- C server NAT stream 语义（2026-10-06，分支 `fix/c-server-stream-semantics`）：`Ubuntu-24.04` WSL 中以 `git archive` 导出的全新目录做 Release CMake 构建 0 warning，新增的 `nat_stream_tests` 用同一测试二进制对修复前（`5394a3b`）的 server 运行时，除 413 与 4 MiB 队列两项（行为未变、仅补覆盖）外 13 项检查逐条失败，对修复后的 server 全部通过（1024 个 pending HTTP 流的检查约 30 s）。合并 `main`（含 #130 的客户端 RST 统一 502、#133 的登录 nonce 与 TLS）后补了公网侧半关闭、REGISTER 绑定失败与 KEEPALIVE 三项检查，重新导出验证：CTest `28/28` 通过（`nat_stream_tests` 在 `-j 4` 下约 128 s，其中 1024 个 pending 流约 48 s），`session_lifecycle_tests` 经共享 harness 跑 main 新增的登录重放检查通过，`make test` 0 warning 全部通过，Go client（`GOOS=linux` 构建）下 `nat_e2e_smoke.sh` 与 `direct_route_e2e.sh` 均通过。WSL 无 JDK，Java client 路径以 CI 为准。
 - 仍需环境验收：真实 MySQL/PostgreSQL、真实私有 OSS/ES、Windows/Linux/macOS/Android 双机、跨 NAT direct/relay fallback、长时间压力与真实 TLS/OIDC。源码自动化通过不能替代这些外部系统与硬件验证。
 
 ## 当前仍存在的不一致与环境门禁

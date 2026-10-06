@@ -47,6 +47,11 @@ typedef struct {
  */
 #define ST_ADMIN_DIRECT_HTTP_STREAM_RESET (-5)
 #define ST_ADMIN_DIRECT_HTTP_RESET_BODY "HTTP 转发请求失败"
+/*
+ * Forwarder result when the client's data connection already holds its maximum of pending HTTP
+ * streams; the public caller gets 502 "HTTP 流创建失败", as Java HttpSpecusController answers.
+ */
+#define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-6)
 #define ST_ADMIN_LOG_REASON_MAX_CODE_POINTS 256U
 
 /*
@@ -56,6 +61,12 @@ typedef struct {
  */
 size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len);
 
+/*
+ * Forwards one Direct HTTP request: 0 once the response was relayed, -2 when the response head
+ * timed out, -3 when the route is not configured for the client, ST_ADMIN_DIRECT_HTTP_STREAM_RESET
+ * or ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT as above, and any other negative value when the client is
+ * offline or the stream failed.
+ */
 typedef int (*st_admin_direct_http_forwarder)(void *ctx,
                                               const char *client_name,
                                               const st_direct_http_request *request,

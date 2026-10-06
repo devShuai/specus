@@ -40,6 +40,7 @@ add_library(specus_c_core
     src/security.c
     src/security_baseline.c
     src/storage.c
+    src/stream_tombstones.c
     src/stun_turn.c
     src/tls_transport.c
     src/turn_auth.c
@@ -185,12 +186,19 @@ target_link_libraries(specus_c_security_baseline_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_security_baseline_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME security_baseline_tests COMMAND specus_c_security_baseline_tests)
 
-add_executable(specus_c_session_lifecycle_tests tests/session_lifecycle_tests.c)
+add_executable(specus_c_session_lifecycle_tests tests/session_lifecycle_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_session_lifecycle_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_session_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME session_lifecycle_tests
     COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_nat_stream_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME nat_stream_tests
+    COMMAND specus_c_nat_stream_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(nat_stream_tests PROPERTIES TIMEOUT 420)
 
 add_executable(specus_c_storage_tests tests/storage_tests.c)
 target_link_libraries(specus_c_storage_tests PRIVATE specus_c_core)

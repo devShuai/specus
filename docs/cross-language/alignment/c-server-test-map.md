@@ -20,23 +20,23 @@
 
 ## 汇总
 
-79 个 Java 测试类中，**覆盖 15 个，部分 46 个，无 18 个**（2026-10-06 随 C 认证修复与 #132 更新）。
+79 个 Java 测试类中，**覆盖 17 个，部分 47 个，无 15 个**（2026-10-06 随 C 认证修复、#132 与 NAT stream 语义修正更新）。
 
 审计点名的类目前的状态如下：
 
 | Java 测试类 | 状态 | 一句话 |
 | --- | --- | --- |
-| `NatServerHandlerTests` | 无 | 6 项断言没有一项有 C 测试；其中两项 C 的行为与 Java 不同：未知流的 DATA/FIN/RST 被静默丢弃，HTTP 流的 `DATA\|END_STREAM` 也被忽略（见文末“对照中发现的 C 行为差异”） |
-| `TcpServerHalfCloseTests` | 无 | 半关闭逻辑在 `src/main.c` 里，但没有任何测试或脚本对公网 socket 做 `shutdown(SHUT_WR)` |
-| `HttpStreamExchangeTests` | 部分 | 只覆盖 trailer 字段的编解码和 E2E 正常路径；trailer 过滤、窗口上限、帧顺序都没有测试 |
-| `HttpSpecusBodyLimitFilterTests` | 无 | C 对超过 16 MiB 的请求返回同样文案的 `413`，但不记录被拒请求，也没有测试 |
+| `NatServerHandlerTests` | 覆盖 | 6 项断言均由 `nat_stream_tests` 对真实进程验证；原先未知流静默丢弃、HTTP `DATA\|END_STREAM` 被忽略两处差异已修正 |
+| `TcpServerHalfCloseTests` | 覆盖 | `nat_stream_tests` 让公网侧先 `shutdown(SHUT_WR)`，客户端在其 EOF 之后仍能回写并收尾 |
+| `HttpStreamExchangeTests` | 部分 | 帧顺序（响应头唯一且在 body 之前、FIN 之后无帧）与 `DATA\|END_STREAM` 已有测试；trailer 过滤 C 未实现，窗口上限没有确定性测试 |
+| `HttpSpecusBodyLimitFilterTests` | 部分 | `413 HTTP 请求体超过限制`（Content-Length 与 chunked）和恰好 16 MiB 放行已有测试；C 不记录被拒请求，且对整个管理监听生效 |
 | `OidcControllerTests` | 无 | C 的 `/oidc/token` 只代理 code 交换：不校验 ID Token，不绑定本地用户，也不签发本地 token |
 | `SecurityConfigOidcTests` | 无 | C 不接受外部 issuer 签发的 JWT，所以 issuer 校验在 C 不存在 |
 | `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests` | 覆盖 / 部分 / 无 | C 已原子消费 nonce（`client_auth_nonce_tests`），但存储在进程内存，多实例不共享；仓库方言测试不适用 |
 | `TrafficInspectionServiceTests` | 无 | C 只测了直接写入的明细能否查询；采集逻辑（默认关闭、gzip 解码、预览截断）没有测试 |
 | `ConnectionEventsWebSocketHandlerTests` | 部分 | #132 补了真实 socket 的 created/updated 事件、租户与归属过滤、ticket 规则；C 没有集群扇出 |
 
-全部 18 个“无”：`SpecusServerApplicationTests`、`SecurityConfigOidcTests`、`OidcControllerTests`、`GlobalExceptionHandlerTests`、`TurnstileVerifierTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ManagementUserSchemaMigratorTests`、`ClientAuthNonceRepositoryCustomImplTests`、`NatServerHandlerTests`、`TcpServerHalfCloseTests`、`HttpSpecusBodyLimitFilterTests`、`UpstreamBrowserHeadersTests`、`SemanticVersionTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`、`StunTurnServerMetricsTests`。
+全部 15 个“无”：`SpecusServerApplicationTests`、`SecurityConfigOidcTests`、`OidcControllerTests`、`GlobalExceptionHandlerTests`、`TurnstileVerifierTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ManagementUserSchemaMigratorTests`、`ClientAuthNonceRepositoryCustomImplTests`、`UpstreamBrowserHeadersTests`、`SemanticVersionTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`、`StunTurnServerMetricsTests`。
 
 ## 1. 启动、认证与安全规则
 
@@ -69,9 +69,9 @@
 
 | Java 测试类 | @Test | 状态 | C 证据 | 说明 |
 | --- | ---: | --- | --- | --- |
-| `handler/ConnectionRoleHandlerTests` | 2 | 部分 | `session_lifecycle_tests.c`：`expect_channel_alive`（control 与 data 的 HEARTBEAT 都有应答）、`test_second_login_on_one_connection_closes_it` | 以下角色错配逻辑写在 `src/main.c` 但没有测试：control 上收到 NAT 帧、data 上收到 MESSAGE_REQUEST、收到服务端响应包。 |
-| `handler/NatServerHandlerTests` | 6 | 无 | — | Java 断言 6 项：KEEPALIVE 保持连接；未知流的 DATA/FIN 回 RST；从未打开的流收到 RST 时按协议违规断开；已关闭流迟到的 RST 被忽略；REGISTER 绑定失败时回 `success=false`；HTTP `DATA\|END_STREAM`。C 没有任何测试发送这些帧。其中两项与 Java 行为不同，见文末。 |
-| `server/TcpServerHalfCloseTests` | 1 | 无 | — | 能力在源码里但没有测试：`external_conn_thread` 在公网 EOF 后发 FIN，待客户端 FIN 写完再 `shutdown(SHUT_WR)`。没有测试或脚本做公网侧半关闭。 |
+| `handler/ConnectionRoleHandlerTests` | 2 | 部分 | `session_lifecycle_tests.c`：`expect_channel_alive`（control 与 data 的 HEARTBEAT 都有应答）、`test_second_login_on_one_connection_closes_it`；`nat_stream_tests.c:check_heartbeat_response`（control 与 data 上的 `HEARTBEAT_RESPONSE` 被接受） | 以下角色错配逻辑写在 `src/main.c` 但没有测试：control 上收到 NAT 帧、data 上收到 MESSAGE_REQUEST。 |
+| `handler/NatServerHandlerTests` | 6 | 覆盖 | `nat_stream_tests.c`：`check_heartbeat_response`（KEEPALIVE）、`check_unknown_streams`（未知流的 DATA/FIN 回 `RST 7`，连接保留）、`check_rst_for_never_opened_stream`、`check_tcp_data_after_fin` 与 `check_http_data_before_head`（迟到的 RST 被忽略）、`check_register_bind_failure`、`check_http_end_stream` | 均对真实进程与 socket。C 另把每条流违规只复位该流（`RST 7/8/4/6`）的规则逐条测到，见 [运行时语义](runtime-semantics.md)。 |
+| `server/TcpServerHalfCloseTests` | 1 | 覆盖 | `nat_stream_tests.c:check_tcp_public_half_close`（公网侧先半关闭，客户端在 EOF 后回写并 FIN）、`check_tcp_data_after_fin`（客户端先 FIN，公网侧收到 EOF） | — |
 | `integration/EndToEndSpecusIT` | 1 | 覆盖 | `scripts/runtime_config_e2e.sh`（API key 登录、在线投影、建 mapping 后经公网端口走 TCP、建/改 route 后经 NAT_CONTROL 热推并跑 Direct HTTP）、`scripts/nat_e2e_smoke.sh`、`scripts/direct_route_e2e.sh` | 由 CI 对 Java/Go/.NET 三个客户端各跑一次。 |
 
 ## 4. Direct HTTP / WebSocket
@@ -81,9 +81,9 @@
 | `http/DecompressionLimitsTests` | 4 | 覆盖 | `tests/decompression_limits_tests.c`：`main`、`expect_round_trip`、`expect_bomb_rejected`、`expect_exact_allowance` | `limitFor(-1)` 在 C 不适用（参数是 `size_t`）。 |
 | `http/HttpQueryStringCodecTests` | 2 | 部分 | "direct HTTP raw path or query brace encoding mismatch"；`nat_e2e_smoke.sh`、`runtime_config_e2e.sh` 的 `%7Bok%7D` | 未测：query 中的 `/`、`?` 原样保留，null 与空 query 的区分。 |
 | `http/HttpRouteAuthenticationServiceTests` | 4 | 覆盖 | `admin_http_tests.c:test_direct_http_route_authentication`："protected route missing basic credentials mismatch"、"protected route invalid basic credentials mismatch"、"malformed protected route policy should fail closed"、"route auth database failure should fail closed"、"database-unmanaged environment route compatibility mismatch" | 未测的小分支：`Bearer` scheme、口令中含 `:`。 |
-| `http/HttpSpecusBodyLimitFilterTests` | 3 | 无 | — | 能力部分在源码里：`src/admin_http.c` 对超过 16 MiB 的请求体返回 `413 HTTP 请求体超过限制`。但不写 HTTP 明细，且对整个管理监听生效、不限于 `/http/**`。没有测试发送超限请求体。 |
+| `http/HttpSpecusBodyLimitFilterTests` | 3 | 部分 | `nat_stream_tests.c:test_request_body_limit`（Content-Length 与 chunked 超过 16 MiB 得 `413 HTTP 请求体超过限制`，恰好 16 MiB 照常转发） | 未测也未实现：被拒请求不写 HTTP 明细；限制对整个管理监听生效、不限于 `/http/**`。 |
 | `http/HttpSpecusControllerAuthenticationTests` | 8 | 部分 | `test_direct_http_route_authentication`："protected route successful auth or authorization stripping mismatch"、`route_auth_detail_is_sanitized` | 4 个 trailer 用例没有 C 测试。C 丢弃全部请求 trailers；响应 trailers 只检查 CR/LF，不按声明名和禁用字段过滤。 |
-| `http/HttpStreamExchangeTests` | 5 | 部分 | `protocol_fixture_tests.c:test_nat_decode`（trailerNames、FIN trailers 编解码）；`direct_route_e2e.sh` 的 "GET (6 MiB)"、"GET (streamed)" | 以下检查写在 `process_direct_http_message` 但没有测试：先 OPEN 后 DATA 的顺序、窗口上限、FIN/RST 之后的帧。trailer 过滤 C 未实现。 |
+| `http/HttpStreamExchangeTests` | 5 | 部分 | `protocol_fixture_tests.c:test_nat_decode`（trailerNames、FIN trailers 编解码）；`direct_route_e2e.sh` 的 "GET (6 MiB)"、"GET (streamed)"；`nat_stream_tests.c`：`check_http_data_before_head`、`check_http_second_head`、`check_http_end_stream`（响应头唯一且先于 body、FIN 之后的帧复位该流）、`check_http_response_limit`（按窗口收发 64 MiB） | 窗口上限的拒绝写在 `process_direct_http_message` 但没有确定性测试（服务端在交付后即回补 credit）。trailer 过滤 C 未实现。 |
 | `http/HttpWebSocketRoutingTests` | 5 | 部分 | 路由认证测试的 `ws_calls`/`http_calls` 计数；`nat_e2e_smoke.sh` 的 WS `101`；"route runtime static asset path mismatch" | 未测：客户端离线时 `502 客户端不在线`、polyfill 正文内容。query 中裸 `\|` 返回 `400` 是 Tomcat 特有行为，C 不适用。 |
 | `http/ResponseRewriterTests` | 2 | 部分 | "direct http html rewrite response mismatch"、"bounded gzip response rewrite mismatch"、"gzip decompression bomb was not safely passed through without rewrite" | 未测：协议相对 URL 和绝对 URL 保持不变。Java 在 Node 下运行 polyfill 的用例在 C 没有对应，C 只负责提供同一个静态文件。 |
 | `http/UpstreamBrowserHeadersTests` | 3 | 无 | — | C 不存在这项能力：不改写 `Origin`、`Referer`、`Sec-Fetch-Site`。 |
@@ -168,10 +168,7 @@
 
 ## 对照中发现的 C 行为差异
 
-以下差异都在源码中逐处核实过，没有在本分支修改代码。它们也是上表中若干“无”或“部分”的原因。
+以下差异都在源码中逐处核实过，没有在本分支修改代码。它们也是上表中若干“无”或“部分”的原因。原第 4–6 项（HTTP 流忽略 `DATA|END_STREAM`、未知流上的 DATA/FIN/RST 被静默丢弃、入站 `HEARTBEAT_RESPONSE` 被当作协议违规）已由 `fix/c-server-stream-semantics` 修正，并由 `nat_stream_tests` 覆盖。
 
 3. **OIDC 只代理 code 交换**：见第 1 节。C 管理 API 只接受本地 HS256 JWT，所以通过 OIDC 登录拿不到 C 管理 API 的访问权限。
-4. **HTTP 流的 `DATA|END_STREAM` 被忽略**：`src/main.c:process_direct_http_message` 不读 `ST_NAT_FLAG_END_STREAM`（TCP 和 WebSocket 路径会读），空的 `DATA|END_STREAM` 还会被判为非法。这与 [control-protocol.md](../../../protocol/spec/control-protocol.md) 中“`DATA|END_STREAM` 等同于 DATA 后再发 FIN”不一致。
-5. **未知流上的 DATA/FIN/RST 被静默丢弃**：Java 对 DATA/FIN 回 RST，对从未打开过的流上的 RST 按协议违规断开。
-6. **入站 `HEARTBEAT_RESPONSE` 按协议违规断开**：Java 在两种角色上都接受它。正常客户端不发送这个包。
 7. **TURN 私网 peer 策略放行全部 IPv6**，而且测试从未在策略开启时运行。
