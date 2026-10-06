@@ -107,8 +107,7 @@ class NatTcpActivationLoopbackTests {
         }
 
         @Override
-        public ChannelFuture connect(String host, int port, ChannelInitializer<SocketChannel> initializer)
-                throws InterruptedException {
+        public ChannelFuture connect(String host, int port, ChannelInitializer<SocketChannel> initializer) {
             return super.connect(host, port, new ChannelInitializer<>() {
                 @Override
                 protected void initChannel(SocketChannel channel) {
