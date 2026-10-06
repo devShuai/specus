@@ -8,7 +8,7 @@
 
 本文的「工作台」指管理前端（`apps/admin-web`）的页面，与三端 CLI 的「本机连接工作台」（[cli-usage.md](../../docs/cli-usage.md)）无关，两者不共享任何数据。
 
-**状态：契约已定（第 16 节各项采用推荐默认），尚未实现。** 共享向量 `protocol/test-vectors/service-workbench-v1.json` 由 `tools/protocol/generate_service_workbench_vectors.py` 生成。
+**状态：契约已定（第 16 节各项采用推荐默认），四个服务端与管理前端已实现（第 18 节）。** 共享向量 `protocol/test-vectors/service-workbench-v1.json` 由 `tools/protocol/generate_service_workbench_vectors.py` 生成。
 
 ## 1. 现状
 

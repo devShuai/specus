@@ -13,7 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from "@heroui/react";
-import { adminApi } from "../../api/client";
+import { adminApi, recordWorkbenchOpenAsCaller } from "../../api/client";
 import type {
   PeerMeshDevice,
   PeerMeshServiceAuditEvent,
@@ -26,6 +26,7 @@ import { EmptyState } from "../../components/EmptyState";
 import { notify, notifyError } from "../../components/toast";
 import { copyTextWithFeedback } from "../../lib/clipboard";
 import { formatDateTime } from "../../lib/format";
+import { copyThenRecord } from "../../lib/workbenchRecording";
 import {
   groupPeerMeshServices,
   PeerMeshOperationLocks,
@@ -374,7 +375,9 @@ export function PeerMeshServicesTab({
       notifyError(new Error(row.availability.reason), "复制地址失败");
       return;
     }
-    await copyTextWithFeedback(row.service.publishedAddress, "已复制虚拟地址");
+    // Copying the address is how a Peer service is opened: it counts for 「最近打开」 once copied.
+    await copyThenRecord(() => copyTextWithFeedback(row.service.publishedAddress!, "已复制虚拟地址"),
+      () => recordWorkbenchOpenAsCaller("peer-service.copy-address", { kind: "peer-service", id: row.service.id }));
   };
 
   const checkDirectoryStatus = async (row: PeerMeshServiceInstanceRow) => {

@@ -68,13 +68,14 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
   判定时刻；另有 GCRA 限流事件序列。由 `tools/protocol/generate_service_connectivity_vectors.py` 生成，语义见
   [`protocol/spec/service-connectivity-check.md`](../spec/service-connectivity-check.md)。尚无实现读取它。
 
-## 服务工作台（草案）
+## 服务工作台
 
 - `service-workbench-v1.json`：`/api/admin/workbench` 收藏与最近打开的参考实现。每个场景给出账号、对象和预置行，按时间重放
   接口调用与外部事件（删除对象、删除账号、存储故障、保留期清理），期望是每一步的完整响应和场景结束后存储里剩下的行；
   覆盖上限、保留期、排序、去重、身份隔离、级联删除与限流。`problems` 一节只由管理前端读取。由
   `tools/protocol/generate_service_workbench_vectors.py` 生成，语义见
-  [`protocol/spec/service-workbench.md`](../spec/service-workbench.md)。尚无实现读取它。
+  [`protocol/spec/service-workbench.md`](../spec/service-workbench.md)。Java、Go、.NET 与 C 服务端经真实 HTTP
+  处理代码重放全部 `scenarios`，管理前端的推导测试读取 `problems.cases`。
 
 ## 拒绝规则
 

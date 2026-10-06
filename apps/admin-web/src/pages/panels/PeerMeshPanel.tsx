@@ -79,7 +79,9 @@ export function PeerMeshPanel() {
   const [targetClientId, setTargetClientId] = useState("");
   const [natFilter, setNatFilter] = useState<PeerNatFilterKey>("all");
   const [natKeyword, setNatKeyword] = useState("");
-  const [peerView, setPeerView] = useState<PeerMeshViewKey>("devices");
+  // #/peer-mesh/services opens the services tab directly (the workbench's publish entry links there).
+  const [peerView, setPeerView] = useState<PeerMeshViewKey>(() =>
+    /^#\/?peer-mesh\/services(?:[/?#]|$)/.test(window.location.hash) ? "services" : "devices");
   const [sessionPage, setSessionPage] = useState(0);
   const [sessionTotal, setSessionTotal] = useState(0);
   const [sessionTotalPages, setSessionTotalPages] = useState(1);
