@@ -915,6 +915,15 @@ static int send_direct_post(const test_server *server, const char *headers, size
  */
 static int test_request_body_limit(test_server *server)
 {
+    /* The public entry fails closed on a route with no server record, so the offline client the
+     * oversized bodies are aimed at needs one: the limit must be what refuses them, not the route. */
+    st_storage_client offline;
+    st_storage_http_route offline_route;
+    CHECK(st_storage_upsert_client(server->db_path, 0, "default", "offline-client", ADMIN_USERNAME, 1, 60,
+                                   &offline) == 0
+              && st_storage_create_http_route_for_client(server->db_path, offline.id, ROUTE, "http://127.0.0.1:9", 1,
+                                                         0, 0, 0, 0, 0, NULL, NULL, &offline_route) == 0,
+          "offline client with a configured route");
     char headers[128];
     snprintf(headers, sizeof(headers), "Content-Length: %u\r\n", REQUEST_BODY_LIMIT + 1U);
     int fd = send_direct_post(server, headers, 0U, 0, 1);
