@@ -1,0 +1,5453 @@
+{
+  "name": "temporary-http-share-v1",
+  "version": 1,
+  "description": "Temporary HTTP shares: a revocable, expiring grant for one protected HTTP route, reached under /http-share/{shareId}/ with an HttpOnly cookie that holds the share token. Covers creation, the fragment-to-cookie exchange, the decision for every request under the share path, revocation, the lifecycle events that end shares, the expiry sweep, audit entries, header rewriting and rate limits. See protocol/spec/temporary-http-share.md.",
+  "notes": [
+    "now 未给出时为 2026-10-06T08:00:00Z；所有时刻精确到秒，expiresAt 严格：now >= expiresAt 即已过期。",
+    "共享的初始世界见 world：租户 t1 有管理员 admin 与 carol、普通用户 alice 与 bob；alice 拥有客户端 7（路由 42 名为 api 且受保护、43 公开、44 停用），bob 拥有客户端 8（路由 50 受保护）；租户 t2 有管理员 eve。input.worldChanges 是用例在此基础上的改动（deleted 表示该行被删除）。",
+    "input.shares 是存储中的分享行；tokenSha256 是完整 token 字符串 UTF-8 的 SHA-256 小写十六进制，明文 token 不入库。",
+    "create 用例中新分享的 shareId 与 token 由测试注入的随机源决定，取 newShare 中的固定值；实现应注入同样的字节。",
+    "access 用例的 expect.httpStatus 为 forwarded 时表示请求按 route 语义转发给设备，forward 给出 NAT OPEN 中的 route（route 当前的名字）、method、relativePath、rawQuery 与转发的 Cookie 头（null 表示不带 Cookie 头）。其余请求头按 http-route.md 处理，Authorization 原样转发。",
+    "headers.response 是分享响应在 route 自身响应规则之后追加的改写：relayed 为发给访客的头，顺序有意义；Cache-Control 追加在末尾。",
+    "expect.revoke 表示该请求把分享就地撤销（revokedBy 为 null）并写入 expect.audit；之后同一分享的任何请求都是 410。",
+    "expect.setCookie 为结构化 cookie：属性顺序不限，不得带 Domain；maxAge 为 0 表示清除。",
+    "lifecycle 用例按顺序重放 events；expect.audit 逐条比较 action、at、actor、routeId、shareId 与 detail；auditId 由实现分配，不在向量里。",
+    "rate 的每个事件是同一时刻、同一键上连续的 requests 个请求；admitted 是其中放行的个数，retryAfterSeconds 是第一个被拒请求的 Retry-After。被拒请求不消耗额度。"
+  ],
+  "constants": {
+    "tokenVersion": "hs1",
+    "shareIdBytes": 12,
+    "secretBytes": 32,
+    "tokenPattern": "hs1\\.([A-Za-z0-9_-]{16})\\.([A-Za-z0-9_-]{43})",
+    "cookieName": "__Secure-specus_http_share",
+    "maxCookieCandidates": 4,
+    "sharePathRoot": "/http-share/",
+    "linkRoot": "/#/http-share/",
+    "minExpiresInSeconds": 300,
+    "maxExpiresInSeconds": 604800,
+    "maxActiveSharesPerRoute": 20,
+    "labelMaxCodePoints": 60,
+    "pathPrefixMaxBytes": 256,
+    "readMethods": [
+      "GET",
+      "HEAD"
+    ],
+    "maxConcurrentPerShare": 64,
+    "sweepIntervalMaxSeconds": 60,
+    "streamRecheckMaxSeconds": 5,
+    "shareRetentionDays": 30,
+    "auditRetentionDays": 180,
+    "revokeReasons": [
+      "revoked-by-user",
+      "route-disabled",
+      "route-made-public",
+      "route-deleted",
+      "client-disabled",
+      "client-deleted",
+      "creator-lost-access"
+    ],
+    "auditActions": [
+      "share.created",
+      "share.revoked",
+      "share.expired",
+      "route.created",
+      "route.exposure-changed",
+      "route.credentials-changed",
+      "route.deleted"
+    ]
+  },
+  "codes": {
+    "create": [
+      "SHARE_REQUEST_INVALID",
+      "SHARE_UNAVAILABLE",
+      "SHARE_ROUTE_NOT_FOUND",
+      "SHARE_ROUTE_DISABLED",
+      "SHARE_CLIENT_DISABLED",
+      "SHARE_ROUTE_PUBLIC",
+      "SHARE_LIMIT_REACHED"
+    ],
+    "exchange": [
+      "SHARE_REQUEST_INVALID",
+      "SHARE_RATE_LIMITED",
+      "SHARE_NOT_FOUND",
+      "SHARE_UNAVAILABLE",
+      "SHARE_REVOKED",
+      "SHARE_EXPIRED"
+    ],
+    "access": [
+      "SHARE_NOT_FOUND",
+      "SHARE_UNAVAILABLE",
+      "SHARE_REVOKED",
+      "SHARE_EXPIRED",
+      "SHARE_METHOD_NOT_ALLOWED",
+      "SHARE_SCOPE_DENIED",
+      "SHARE_BUSY",
+      "SHARE_RATE_LIMITED"
+    ]
+  },
+  "world": {
+    "users": {
+      "admin": {
+        "username": "admin",
+        "tenantId": "t1",
+        "role": "ADMIN",
+        "enabled": true
+      },
+      "carol": {
+        "username": "carol",
+        "tenantId": "t1",
+        "role": "ADMIN",
+        "enabled": true
+      },
+      "alice": {
+        "username": "alice",
+        "tenantId": "t1",
+        "role": "USER",
+        "enabled": true
+      },
+      "bob": {
+        "username": "bob",
+        "tenantId": "t1",
+        "role": "USER",
+        "enabled": true
+      },
+      "eve": {
+        "username": "eve",
+        "tenantId": "t2",
+        "role": "ADMIN",
+        "enabled": true
+      }
+    },
+    "clients": {
+      "7": {
+        "clientId": 7,
+        "tenantId": "t1",
+        "owner": "alice",
+        "enabled": true
+      },
+      "8": {
+        "clientId": 8,
+        "tenantId": "t1",
+        "owner": "bob",
+        "enabled": true
+      }
+    },
+    "routes": {
+      "42": {
+        "routeId": 42,
+        "tenantId": "t1",
+        "clientId": 7,
+        "name": "api",
+        "enabled": true,
+        "authEnabled": true
+      },
+      "43": {
+        "routeId": 43,
+        "tenantId": "t1",
+        "clientId": 7,
+        "name": "blog",
+        "enabled": true,
+        "authEnabled": false
+      },
+      "44": {
+        "routeId": 44,
+        "tenantId": "t1",
+        "clientId": 7,
+        "name": "old",
+        "enabled": false,
+        "authEnabled": true
+      },
+      "50": {
+        "routeId": 50,
+        "tenantId": "t1",
+        "clientId": 8,
+        "name": "nas",
+        "enabled": true,
+        "authEnabled": true
+      }
+    },
+    "shares": {}
+  },
+  "newShare": {
+    "shareIdBytesHex": "5a5a5a5a5a5a5a5a5a5a5a5a",
+    "secretBytesHex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "shareId": "WlpaWlpaWlpaWlpa",
+    "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+  },
+  "token": {
+    "examples": [
+      {
+        "shareIdBytesHex": "1f8b3c5d7e9a0b2c4d6e8f10",
+        "secretBytesHex": "a3c5e7f90b1d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+        "sharePath": "/http-share/H4s8XX6aCyxNbo8Q/",
+        "linkPath": "/#/http-share/hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+      },
+      {
+        "shareIdBytesHex": "00ff00ff00ff00ff00ff00ff",
+        "secretBytesHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "shareId": "AP8A_wD_AP8A_wD_",
+        "token": "hs1.AP8A_wD_AP8A_wD_.__________________________________________8",
+        "tokenSha256": "2e90901e9be949c93d0f85340e0cc93ddc79b00d8942309388b89ad007611714",
+        "sharePath": "/http-share/AP8A_wD_AP8A_wD_/",
+        "linkPath": "/#/http-share/hs1.AP8A_wD_AP8A_wD_.__________________________________________8"
+      },
+      {
+        "shareIdBytesHex": "fbefbefbefbefbefbefbefbe",
+        "secretBytesHex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "shareId": "----------------",
+        "token": "hs1.----------------.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "tokenSha256": "b7a15030f334d15c68f53c7a9c5463478d856099b295597ab848c32222849d6d",
+        "sharePath": "/http-share/----------------/",
+        "linkPath": "/#/http-share/hs1.----------------.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    ],
+    "parse": [
+      {
+        "input": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": "H4s8XX6aCyxNbo8Q"
+      },
+      {
+        "input": "hs1.AP8A_wD_AP8A_wD_.__________________________________________8",
+        "shareId": "AP8A_wD_AP8A_wD_"
+      },
+      {
+        "input": "hs1.----------------.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "shareId": "----------------"
+      },
+      {
+        "input": "HS1.H4S8XX6ACYXNBO8Q.O8XN-QSDL0PSJGSTT2QMDITNB4OMLKTTJWOSTMUNDYO",
+        "shareId": null
+      },
+      {
+        "input": "HS1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": null
+      },
+      {
+        "input": "hs2.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": null
+      },
+      {
+        "input": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo=",
+        "shareId": null
+      },
+      {
+        "input": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDy",
+        "shareId": null
+      },
+      {
+        "input": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyoA",
+        "shareId": null
+      },
+      {
+        "input": " hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": null
+      },
+      {
+        "input": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo\n",
+        "shareId": null
+      },
+      {
+        "input": "hs1_H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": null
+      },
+      {
+        "input": "hs1.H4s8XX6aCyxNbo8Q",
+        "shareId": null
+      },
+      {
+        "input": "hs1..o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": null
+      },
+      {
+        "input": "hs1.H+s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+        "shareId": null
+      },
+      {
+        "input": "",
+        "shareId": null
+      },
+      {
+        "input": null,
+        "shareId": null
+      }
+    ]
+  },
+  "pathPrefix": [
+    {
+      "input": "/",
+      "canonical": "/"
+    },
+    {
+      "input": "/docs",
+      "canonical": "/docs/"
+    },
+    {
+      "input": "/docs/",
+      "canonical": "/docs/"
+    },
+    {
+      "input": "/a/b/c",
+      "canonical": "/a/b/c/"
+    },
+    {
+      "input": "/%e6%96%87%e6%a1%a3",
+      "canonical": "/%E6%96%87%E6%A1%A3/"
+    },
+    {
+      "input": "/%7Euser/",
+      "canonical": "/~user/"
+    },
+    {
+      "input": "/v1:beta@x/",
+      "canonical": "/v1:beta@x/"
+    },
+    {
+      "input": "",
+      "canonical": null
+    },
+    {
+      "input": "docs/",
+      "canonical": null
+    },
+    {
+      "input": "//docs/",
+      "canonical": null
+    },
+    {
+      "input": "/a//b/",
+      "canonical": null
+    },
+    {
+      "input": "/./",
+      "canonical": null
+    },
+    {
+      "input": "/a/../b",
+      "canonical": null
+    },
+    {
+      "input": "/a/%2E%2e/b/",
+      "canonical": null
+    },
+    {
+      "input": "/a%2Fb/",
+      "canonical": null
+    },
+    {
+      "input": "/a%5cb/",
+      "canonical": null
+    },
+    {
+      "input": "/a\\b/",
+      "canonical": null
+    },
+    {
+      "input": "/a;b/",
+      "canonical": null
+    },
+    {
+      "input": "/a?b",
+      "canonical": null
+    },
+    {
+      "input": "/a#b",
+      "canonical": null
+    },
+    {
+      "input": "/a b/",
+      "canonical": null
+    },
+    {
+      "input": "/%zz/",
+      "canonical": null
+    },
+    {
+      "input": "/%4/",
+      "canonical": null
+    },
+    {
+      "input": "/%00/",
+      "canonical": null
+    },
+    {
+      "input": "/文档/",
+      "canonical": null
+    },
+    {
+      "input": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "canonical": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+    },
+    {
+      "input": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "canonical": null
+    },
+    {
+      "input": 7,
+      "canonical": null
+    }
+  ],
+  "create": [
+    {
+      "name": "owner-creates-read-share",
+      "note": "Defaults: read-only, the whole route, no label.",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 201,
+        "body": {
+          "share": {
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "routeId": 42,
+            "label": null,
+            "access": "read",
+            "pathPrefix": "/",
+            "sharePath": "/http-share/WlpaWlpaWlpaWlpa/",
+            "createdAt": "2026-10-06T08:00:00Z",
+            "createdBy": "alice",
+            "expiresAt": "2026-10-07T08:00:00Z",
+            "status": "active",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8",
+          "linkPath": "/#/http-share/hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+        },
+        "audit": [
+          {
+            "action": "share.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "detail": {
+              "access": "read",
+              "pathPrefix": "/",
+              "expiresAt": "2026-10-07T08:00:00Z"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "admin-creates-full-share-with-prefix",
+      "note": "A tenant admin may share any route of the tenant. The prefix gets its trailing slash; the label is trimmed of spaces.",
+      "input": {
+        "caller": "admin",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600,
+          "access": "full",
+          "pathPrefix": "/docs",
+          "label": "  周报评审  "
+        }
+      },
+      "expect": {
+        "httpStatus": 201,
+        "body": {
+          "share": {
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "routeId": 42,
+            "label": "周报评审",
+            "access": "full",
+            "pathPrefix": "/docs/",
+            "sharePath": "/http-share/WlpaWlpaWlpaWlpa/",
+            "createdAt": "2026-10-06T08:00:00Z",
+            "createdBy": "admin",
+            "expiresAt": "2026-10-06T09:00:00Z",
+            "status": "active",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8",
+          "linkPath": "/#/http-share/hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+        },
+        "audit": [
+          {
+            "action": "share.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "detail": {
+              "access": "full",
+              "pathPrefix": "/docs/",
+              "expiresAt": "2026-10-06T09:00:00Z"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "minimum-expiry",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 300
+        }
+      },
+      "expect": {
+        "httpStatus": 201,
+        "body": {
+          "share": {
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "routeId": 42,
+            "label": null,
+            "access": "read",
+            "pathPrefix": "/",
+            "sharePath": "/http-share/WlpaWlpaWlpaWlpa/",
+            "createdAt": "2026-10-06T08:00:00Z",
+            "createdBy": "alice",
+            "expiresAt": "2026-10-06T08:05:00Z",
+            "status": "active",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8",
+          "linkPath": "/#/http-share/hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+        },
+        "audit": [
+          {
+            "action": "share.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "detail": {
+              "access": "read",
+              "pathPrefix": "/",
+              "expiresAt": "2026-10-06T08:05:00Z"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "maximum-expiry",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 604800
+        }
+      },
+      "expect": {
+        "httpStatus": 201,
+        "body": {
+          "share": {
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "routeId": 42,
+            "label": null,
+            "access": "read",
+            "pathPrefix": "/",
+            "sharePath": "/http-share/WlpaWlpaWlpaWlpa/",
+            "createdAt": "2026-10-06T08:00:00Z",
+            "createdBy": "alice",
+            "expiresAt": "2026-10-13T08:00:00Z",
+            "status": "active",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8",
+          "linkPath": "/#/http-share/hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+        },
+        "audit": [
+          {
+            "action": "share.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "detail": {
+              "access": "read",
+              "pathPrefix": "/",
+              "expiresAt": "2026-10-13T08:00:00Z"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "expiry-below-minimum",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 299
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "expiry-above-maximum",
+      "note": "There is no unbounded share: a long-lived grant is what a protected route with its own password is for.",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 604801
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "expiry-missing",
+      "note": "The expiry is mandatory; there is no default.",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {}
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "expiry-not-integer",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": "3600"
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "expiry-fractional",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600.5
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "expiry-boolean",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": true
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "unknown-access",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600,
+          "access": "write"
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "unknown-field",
+      "note": "Unknown fields are rejected, so a client cannot believe a limit is enforced when it is not.",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600,
+          "maxUses": 1
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "bad-prefix",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600,
+          "pathPrefix": "/a/../b"
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "label-too-long",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600,
+          "label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "label-control-character",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 3600,
+          "label": "a\nb"
+        }
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "body-not-object",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": [
+          3600
+        ]
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "unauthenticated",
+      "input": {
+        "authenticated": false,
+        "caller": null,
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 401
+      }
+    },
+    {
+      "name": "store-unreadable",
+      "note": "A read failure is not reported as a missing route.",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        },
+        "readable": false
+      },
+      "expect": {
+        "httpStatus": 503,
+        "code": "SHARE_UNAVAILABLE"
+      }
+    },
+    {
+      "name": "other-owner",
+      "note": "Not the owner and not an admin: indistinguishable from a route that does not exist.",
+      "input": {
+        "caller": "bob",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_ROUTE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "other-tenant-admin",
+      "input": {
+        "caller": "eve",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_ROUTE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "route-absent",
+      "input": {
+        "caller": "admin",
+        "routeId": 99,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_ROUTE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "route-disabled",
+      "input": {
+        "caller": "alice",
+        "routeId": 44,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 409,
+        "code": "SHARE_ROUTE_DISABLED"
+      }
+    },
+    {
+      "name": "route-public",
+      "note": "A public route is reachable by anyone already; a share on it would suggest that revoking the share stops access. Protect the route first.",
+      "input": {
+        "caller": "alice",
+        "routeId": 43,
+        "body": {
+          "expiresInSeconds": 86400
+        }
+      },
+      "expect": {
+        "httpStatus": 409,
+        "code": "SHARE_ROUTE_PUBLIC"
+      }
+    },
+    {
+      "name": "client-disabled",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        },
+        "worldChanges": [
+          {
+            "table": "clients",
+            "key": 7,
+            "set": {
+              "enabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 409,
+        "code": "SHARE_CLIENT_DISABLED"
+      }
+    },
+    {
+      "name": "limit-reached",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        },
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAAAAB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "5aceca469638fe2ea0a20c0fa4dcb62ab509d810479c8212a7a253132c25bcac",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAC",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "9ea7f73aa0a3dbd9e56f6842d05724b2188b3a68a0a316dac98fd7bf2eb96abc",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAD",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "847e41b48ccf625b8fcc75827e5cbad0726a8412076c29f36ec7f577ef922ba2",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAE",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "43088e484caa25ab0e0a759b2de25239b23d12b8a954c99457ef06e9dedc1d9b",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAF",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "165f1e5d78d0326eca22db453be1ea8395c36b97ed117d53b85018082e90b3d7",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAG",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "c1bf01fe6a5e768cbf45f3c33f96bb4477447f99a6afc300284c3507175d7d80",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAH",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "667bb20688b7d741eb2dc82909e1430b3b562e39c01c0cd69274f94b5f5a4c92",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAI",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "cfcc2dd60412075df4dc814e0d1676b7e9d5b2db0e56b26bf48995e50a0d1a46",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAJ",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "d73d2232d063cb5d3abdcb8bd66938b8b5185e3d2763b3ce6e33ab05ddfa3c76",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAK",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7e8677c23f6ca4f0a9ce4ad03e98f2d2a1a8e49af13b327ae26ea51d4eae3c5d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAL",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "49f19597f72a6f6245e38f69b20983decfe892dd1a97bcc8fd92d89b5f77f38d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAM",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "3fefc402ff7165ff6ef8092674f25937372a3749e60b397f96ede707e7ae8ae1",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAN",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "9dbd495f9c1e504b5535f111fbc3f3d1b005757db1bdc68277e371616b9a460f",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAO",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "918c747ed5d03934d738ae17bb2a8b9a9af7011b0eae730ec9b69f97d2b48731",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAP",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "328f9b51c2119694e39451056daec4dc8fbe48063950253862300b53c848489a",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAQ",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "73d55de5fb27b3e82ab275686f4fc0c6d259cda20da9b81051b6a9275f355dd9",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAR",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "8e4b47e69a752783dff61d02552d8e5405c931afd36397da1e4e491a724211a8",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAS",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "b18c982b1f8e07fa604fe9578fa0b6f1590d071bc5624802fa775fe280976ae7",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAT",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "30e83c0b6bb1d1a61770396ac836b16aea3dd89154e33dee630c6c011fa81f3f",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAU",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "66da5155c3368b3e25067b39ebeb96840cb82bf0c25eb26c2b7e38a18d049fd4",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 409,
+        "code": "SHARE_LIMIT_REACHED"
+      }
+    },
+    {
+      "name": "ended-shares-do-not-count",
+      "note": "Expired and revoked shares do not count against the limit of active shares per route.",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        },
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAAAAB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "5aceca469638fe2ea0a20c0fa4dcb62ab509d810479c8212a7a253132c25bcac",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAC",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "9ea7f73aa0a3dbd9e56f6842d05724b2188b3a68a0a316dac98fd7bf2eb96abc",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAD",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "847e41b48ccf625b8fcc75827e5cbad0726a8412076c29f36ec7f577ef922ba2",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAE",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "43088e484caa25ab0e0a759b2de25239b23d12b8a954c99457ef06e9dedc1d9b",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAF",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "165f1e5d78d0326eca22db453be1ea8395c36b97ed117d53b85018082e90b3d7",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAG",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "c1bf01fe6a5e768cbf45f3c33f96bb4477447f99a6afc300284c3507175d7d80",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAH",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "667bb20688b7d741eb2dc82909e1430b3b562e39c01c0cd69274f94b5f5a4c92",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAI",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "cfcc2dd60412075df4dc814e0d1676b7e9d5b2db0e56b26bf48995e50a0d1a46",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAJ",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "d73d2232d063cb5d3abdcb8bd66938b8b5185e3d2763b3ce6e33ab05ddfa3c76",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAK",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7e8677c23f6ca4f0a9ce4ad03e98f2d2a1a8e49af13b327ae26ea51d4eae3c5d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAL",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "49f19597f72a6f6245e38f69b20983decfe892dd1a97bcc8fd92d89b5f77f38d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAM",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "3fefc402ff7165ff6ef8092674f25937372a3749e60b397f96ede707e7ae8ae1",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAN",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "9dbd495f9c1e504b5535f111fbc3f3d1b005757db1bdc68277e371616b9a460f",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAO",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "918c747ed5d03934d738ae17bb2a8b9a9af7011b0eae730ec9b69f97d2b48731",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAP",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "328f9b51c2119694e39451056daec4dc8fbe48063950253862300b53c848489a",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAQ",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "73d55de5fb27b3e82ab275686f4fc0c6d259cda20da9b81051b6a9275f355dd9",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAR",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "8e4b47e69a752783dff61d02552d8e5405c931afd36397da1e4e491a724211a8",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAS",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "b18c982b1f8e07fa604fe9578fa0b6f1590d071bc5624802fa775fe280976ae7",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAT",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "30e83c0b6bb1d1a61770396ac836b16aea3dd89154e33dee630c6c011fa81f3f",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AP8A_wD_AP8A_wD_",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "2e90901e9be949c93d0f85340e0cc93ddc79b00d8942309388b89ad007611714",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-05T07:00:00Z",
+            "expiresAt": "2026-10-05T08:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "----------------",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "b7a15030f334d15c68f53c7a9c5463478d856099b295597ab848c32222849d6d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T07:59:00Z",
+            "revokedBy": "alice",
+            "revokeReason": "revoked-by-user"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 201,
+        "body": {
+          "share": {
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "routeId": 42,
+            "label": null,
+            "access": "read",
+            "pathPrefix": "/",
+            "sharePath": "/http-share/WlpaWlpaWlpaWlpa/",
+            "createdAt": "2026-10-06T08:00:00Z",
+            "createdBy": "alice",
+            "expiresAt": "2026-10-07T08:00:00Z",
+            "status": "active",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8",
+          "linkPath": "/#/http-share/hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+        },
+        "audit": [
+          {
+            "action": "share.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "detail": {
+              "access": "read",
+              "pathPrefix": "/",
+              "expiresAt": "2026-10-07T08:00:00Z"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "other-route-shares-do-not-count",
+      "input": {
+        "caller": "alice",
+        "routeId": 42,
+        "body": {
+          "expiresInSeconds": 86400
+        },
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAAAAB",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "5aceca469638fe2ea0a20c0fa4dcb62ab509d810479c8212a7a253132c25bcac",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAC",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "9ea7f73aa0a3dbd9e56f6842d05724b2188b3a68a0a316dac98fd7bf2eb96abc",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAD",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "847e41b48ccf625b8fcc75827e5cbad0726a8412076c29f36ec7f577ef922ba2",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAE",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "43088e484caa25ab0e0a759b2de25239b23d12b8a954c99457ef06e9dedc1d9b",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAF",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "165f1e5d78d0326eca22db453be1ea8395c36b97ed117d53b85018082e90b3d7",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAG",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "c1bf01fe6a5e768cbf45f3c33f96bb4477447f99a6afc300284c3507175d7d80",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAH",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "667bb20688b7d741eb2dc82909e1430b3b562e39c01c0cd69274f94b5f5a4c92",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAI",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "cfcc2dd60412075df4dc814e0d1676b7e9d5b2db0e56b26bf48995e50a0d1a46",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAJ",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "d73d2232d063cb5d3abdcb8bd66938b8b5185e3d2763b3ce6e33ab05ddfa3c76",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAK",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "7e8677c23f6ca4f0a9ce4ad03e98f2d2a1a8e49af13b327ae26ea51d4eae3c5d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAL",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "49f19597f72a6f6245e38f69b20983decfe892dd1a97bcc8fd92d89b5f77f38d",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAM",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "3fefc402ff7165ff6ef8092674f25937372a3749e60b397f96ede707e7ae8ae1",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAN",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "9dbd495f9c1e504b5535f111fbc3f3d1b005757db1bdc68277e371616b9a460f",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAO",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "918c747ed5d03934d738ae17bb2a8b9a9af7011b0eae730ec9b69f97d2b48731",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAP",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "328f9b51c2119694e39451056daec4dc8fbe48063950253862300b53c848489a",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAQ",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "73d55de5fb27b3e82ab275686f4fc0c6d259cda20da9b81051b6a9275f355dd9",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAR",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "8e4b47e69a752783dff61d02552d8e5405c931afd36397da1e4e491a724211a8",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAS",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "b18c982b1f8e07fa604fe9578fa0b6f1590d071bc5624802fa775fe280976ae7",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAT",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "30e83c0b6bb1d1a61770396ac836b16aea3dd89154e33dee630c6c011fa81f3f",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AAAAAAAAAAAAAAAU",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "66da5155c3368b3e25067b39ebeb96840cb82bf0c25eb26c2b7e38a18d049fd4",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 201,
+        "body": {
+          "share": {
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "routeId": 42,
+            "label": null,
+            "access": "read",
+            "pathPrefix": "/",
+            "sharePath": "/http-share/WlpaWlpaWlpaWlpa/",
+            "createdAt": "2026-10-06T08:00:00Z",
+            "createdBy": "alice",
+            "expiresAt": "2026-10-07T08:00:00Z",
+            "status": "active",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          "token": "hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8",
+          "linkPath": "/#/http-share/hs1.WlpaWlpaWlpaWlpa.ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8"
+        },
+        "audit": [
+          {
+            "action": "share.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "WlpaWlpaWlpaWlpa",
+            "detail": {
+              "access": "read",
+              "pathPrefix": "/",
+              "expiresAt": "2026-10-07T08:00:00Z"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "exchange": [
+    {
+      "name": "valid",
+      "note": "The cookie is scoped to the share path and lives exactly as long as the share; the landing page then replaces itself with location.",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "shareId": "H4s8XX6aCyxNbo8Q",
+          "location": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "expiresAt": "2026-10-07T07:00:00Z",
+          "access": "read",
+          "pathPrefix": "/docs/"
+        },
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 82800,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "valid-with-charset",
+      "input": {
+        "contentType": "application/json; charset=utf-8",
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "shareId": "H4s8XX6aCyxNbo8Q",
+          "location": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "expiresAt": "2026-10-07T07:00:00Z",
+          "access": "read",
+          "pathPrefix": "/docs/"
+        },
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 82800,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "last-second",
+      "note": "One second before expiry: Max-Age is the one second left.",
+      "input": {
+        "now": "2026-10-07T06:59:59Z",
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 200,
+        "body": {
+          "shareId": "H4s8XX6aCyxNbo8Q",
+          "location": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "expiresAt": "2026-10-07T07:00:00Z",
+          "access": "read",
+          "pathPrefix": "/docs/"
+        },
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 1,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "at-expiry",
+      "note": "Expiry is strict: at expiresAt the share has ended.",
+      "input": {
+        "now": "2026-10-07T07:00:00Z",
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_EXPIRED"
+      }
+    },
+    {
+      "name": "form-post",
+      "note": "Only JSON: another site cannot submit the exchange with a plain form.",
+      "input": {
+        "contentType": "application/x-www-form-urlencoded",
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 415,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "extra-field",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+          "remember": true
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "token-not-string",
+      "input": {
+        "body": {
+          "token": 7
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 400,
+        "code": "SHARE_REQUEST_INVALID"
+      }
+    },
+    {
+      "name": "malformed-token",
+      "note": "Charged to the source address like any attempt, answered like an unknown token.",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "wrong-secret",
+      "note": "Same share id, different secret: indistinguishable from a share that does not exist.",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyA"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "unknown-share",
+      "input": {
+        "body": {
+          "token": "hs1.AP8A_wD_AP8A_wD_.__________________________________________8"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "revoked",
+      "note": "Only someone holding the token learns that the share ended.",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T07:59:50Z",
+            "revokedBy": "alice",
+            "revokeReason": "revoked-by-user"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED"
+      }
+    },
+    {
+      "name": "lapsed-route-public",
+      "note": "The route was made public by a path that did not revoke its shares; the share is revoked now.",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "authEnabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "route-made-public",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "route-made-public"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "rate-limited",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "rateLimitedMs": 4500
+      },
+      "expect": {
+        "httpStatus": 429,
+        "code": "SHARE_RATE_LIMITED",
+        "retryAfterSeconds": 5
+      }
+    },
+    {
+      "name": "store-unreadable",
+      "input": {
+        "body": {
+          "token": "hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "readable": false
+      },
+      "expect": {
+        "httpStatus": 503,
+        "code": "SHARE_UNAVAILABLE"
+      }
+    }
+  ],
+  "access": [
+    {
+      "name": "in-scope-get",
+      "note": "The share cookie is removed from the Cookie header; every other cookie and the raw query go to the device unchanged.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/guide.html",
+          "cookies": [
+            "theme=dark; __Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo; sid=abc"
+          ],
+          "rawQuery": "v=%2F2"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/docs/guide.html",
+          "rawQuery": "v=%2F2",
+          "cookie": "theme=dark; sid=abc"
+        }
+      }
+    },
+    {
+      "name": "prefix-itself",
+      "note": "The prefix without its trailing slash is in scope; the target may redirect to the slash form.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/docs",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "only-share-cookie",
+      "note": "No other cookies: the device receives no Cookie header at all.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/docs/",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "missing-trailing-slash",
+      "note": "Decided before any lookup, the same for every well-formed id.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q",
+          "cookies": [],
+          "rawQuery": "a=1"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 308,
+        "location": "/http-share/H4s8XX6aCyxNbo8Q/?a=1"
+      }
+    },
+    {
+      "name": "malformed-share-id",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/short/x",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "no-cookie",
+      "note": "No credential: the same answer as a share that does not exist.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": []
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "unknown-share",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/AP8A_wD_AP8A_wD_/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.AP8A_wD_AP8A_wD_.__________________________________________8"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "cookie-of-another-share",
+      "note": "A valid token of share B never opens share A.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.AP8A_wD_AP8A_wD_.__________________________________________8"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          },
+          {
+            "shareId": "AP8A_wD_AP8A_wD_",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "2e90901e9be949c93d0f85340e0cc93ddc79b00d8942309388b89ad007611714",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "planted-cookie-first",
+      "note": "A same-origin page planted a cookie of the same name with a longer Path, so the browser sends it first. The server tries up to four values that name this share.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; __Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/docs/",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "token-in-authorization-header",
+      "note": "The token is accepted only from the cookie; Authorization belongs to the target and is relayed unchanged.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [],
+          "authorization": "Bearer hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 404,
+        "code": "SHARE_NOT_FOUND"
+      }
+    },
+    {
+      "name": "revoked",
+      "note": "The cookie is cleared so the browser stops presenting it.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T07:59:50Z",
+            "revokedBy": "alice",
+            "revokeReason": "revoked-by-user"
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "expired",
+      "input": {
+        "now": "2026-10-07T07:00:00Z",
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_EXPIRED",
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "expired-and-lapsed",
+      "note": "An expired share is not revoked afterwards: expiry wins and nothing is written.",
+      "input": {
+        "now": "2026-10-07T07:00:00Z",
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "enabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_EXPIRED",
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-route-disabled",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "enabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "route-disabled",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "route-disabled"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-route-deleted",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "routes",
+            "key": 42,
+            "deleted": true
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "route-deleted",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "route-deleted"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-client-disabled",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "clients",
+            "key": 7,
+            "set": {
+              "enabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "client-disabled",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "client-disabled"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-client-deleted",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "clients",
+            "key": 7,
+            "deleted": true
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "client-deleted",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "client-deleted"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-creator-disabled",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "users",
+            "key": "alice",
+            "set": {
+              "enabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "creator-lost-access",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-creator-deleted",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "users",
+            "key": "alice",
+            "deleted": true
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "creator-lost-access",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "admin-share-survives-owner-disabled",
+      "note": "The share belongs to whoever created it: an admin's share does not depend on the owner's account.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "admin",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "users",
+            "key": "alice",
+            "set": {
+              "enabled": false
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/docs/",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "lapsed-admin-demoted",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "admin",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "worldChanges": [
+          {
+            "table": "users",
+            "key": "admin",
+            "set": {
+              "role": "USER"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 410,
+        "code": "SHARE_REVOKED",
+        "revoke": {
+          "reason": "creator-lost-access",
+          "revokedBy": null
+        },
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          }
+        ],
+        "setCookie": {
+          "name": "__Secure-specus_http_share",
+          "value": "",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/",
+          "maxAge": 0,
+          "httpOnly": true,
+          "secure": true,
+          "sameSite": "Strict",
+          "domain": null
+        }
+      }
+    },
+    {
+      "name": "read-share-refuses-post",
+      "input": {
+        "request": {
+          "method": "POST",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/form",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 405,
+        "code": "SHARE_METHOD_NOT_ALLOWED",
+        "allow": "GET, HEAD"
+      }
+    },
+    {
+      "name": "read-share-refuses-options",
+      "input": {
+        "request": {
+          "method": "OPTIONS",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 405,
+        "code": "SHARE_METHOD_NOT_ALLOWED",
+        "allow": "GET, HEAD"
+      }
+    },
+    {
+      "name": "read-share-allows-head",
+      "input": {
+        "request": {
+          "method": "HEAD",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/a.pdf",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "HEAD",
+          "relativePath": "/docs/a.pdf",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "read-share-refuses-websocket",
+      "note": "A WebSocket is a GET that can carry data to the target: not read-only.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/live",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ],
+          "upgrade": true
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "full-share-allows-post",
+      "input": {
+        "request": {
+          "method": "POST",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/api/items",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "full",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "POST",
+          "relativePath": "/api/items",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "full-share-allows-websocket",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/live",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ],
+          "upgrade": true
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "full",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/live",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "outside-prefix",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/admin/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "prefix-is-a-segment",
+      "note": "The prefix /docs/ does not cover /docsecret.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docsecret/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "dot-dot-escape",
+      "note": "Encoded dot segments are dot segments.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/%2e%2E/admin/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "literal-dot-dot",
+      "note": "Browsers remove dot segments before sending; a client that does not is refused.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/../admin/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "encoded-slash",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/..%2Fadmin",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "semicolon",
+      "note": "Servlet containers strip ;parameters and then normalise: refused under a prefix.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/..;/admin",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": 403,
+        "code": "SHARE_SCOPE_DENIED"
+      }
+    },
+    {
+      "name": "encoded-unreserved-in-scope",
+      "note": "Escapes of unreserved characters are decoded before matching, as the target will decode them; the raw path is forwarded unchanged.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/%64ocs/guide.html",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/%64ocs/guide.html",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "whole-route-share-has-no-path-rules",
+      "note": "With the prefix / the share covers exactly what the route covers, so the route's own path rules apply and nothing more.",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/a/..%2Fb;c",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "full",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ]
+      },
+      "expect": {
+        "httpStatus": "forwarded",
+        "forward": {
+          "route": "api",
+          "method": "GET",
+          "relativePath": "/a/..%2Fb;c",
+          "rawQuery": "",
+          "cookie": null
+        }
+      }
+    },
+    {
+      "name": "share-busy",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "admission": "share-busy"
+      },
+      "expect": {
+        "httpStatus": 429,
+        "code": "SHARE_BUSY",
+        "retryAfterSeconds": 1
+      }
+    },
+    {
+      "name": "rate-limited",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "admission": "rate-limited"
+      },
+      "expect": {
+        "httpStatus": 429,
+        "code": "SHARE_RATE_LIMITED",
+        "retryAfterSeconds": 1
+      }
+    },
+    {
+      "name": "store-unreadable",
+      "input": {
+        "request": {
+          "method": "GET",
+          "path": "/http-share/H4s8XX6aCyxNbo8Q/docs/",
+          "cookies": [
+            "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+          ]
+        },
+        "shares": [
+          {
+            "shareId": "H4s8XX6aCyxNbo8Q",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "81fe34d9cab948b6ef2387f9e69fe97eafc1057e7bf4aec8f77280294c5ecfa3",
+            "access": "read",
+            "pathPrefix": "/docs/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "readable": false
+      },
+      "expect": {
+        "httpStatus": 503,
+        "code": "SHARE_UNAVAILABLE"
+      }
+    }
+  ],
+  "headers": {
+    "requestCookie": [
+      {
+        "cookieHeaders": [
+          "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        ],
+        "forwardedCookie": null
+      },
+      {
+        "cookieHeaders": [
+          "a=1; __Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo; b=2"
+        ],
+        "forwardedCookie": "a=1; b=2"
+      },
+      {
+        "cookieHeaders": [
+          "a=1",
+          "__Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo",
+          "b=2"
+        ],
+        "forwardedCookie": "a=1; b=2"
+      },
+      {
+        "cookieHeaders": [
+          "__Secure-specus_http_share=junk; __Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        ],
+        "forwardedCookie": null
+      },
+      {
+        "cookieHeaders": [
+          "__secure-specus_http_share=x; __Secure-specus_http_share=hs1.H4s8XX6aCyxNbo8Q.o8Xn-QsdL0psjgstT2qMDitNb4oMLkttjwosTmuNDyo"
+        ],
+        "forwardedCookie": "__secure-specus_http_share=x"
+      },
+      {
+        "cookieHeaders": [
+          "a=1;;b=2"
+        ],
+        "forwardedCookie": "a=1; b=2"
+      },
+      {
+        "cookieHeaders": [],
+        "forwardedCookie": null
+      }
+    ],
+    "response": [
+      {
+        "name": "plain",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 200,
+        "upstream": [
+          "Content-Type:text/html",
+          "Cache-Control:public, max-age=3600",
+          "ETag:\"x\""
+        ],
+        "relayed": [
+          "Content-Type:text/html",
+          "ETag:\"x\"",
+          "Cache-Control:private, no-cache"
+        ]
+      },
+      {
+        "name": "no-store-kept",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 200,
+        "upstream": [
+          "Cache-Control:no-store, max-age=0",
+          "Pragma:no-cache"
+        ],
+        "relayed": [
+          "Cache-Control:private, no-store"
+        ]
+      },
+      {
+        "name": "cdn-headers-removed",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 200,
+        "upstream": [
+          "CDN-Cache-Control:max-age=600",
+          "Surrogate-Control:max-age=600",
+          "Expires:Wed, 21 Oct 2026 07:28:00 GMT"
+        ],
+        "relayed": [
+          "Cache-Control:private, no-cache"
+        ]
+      },
+      {
+        "name": "not-modified",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 304,
+        "upstream": [
+          "ETag:\"x\"",
+          "Cache-Control:max-age=60"
+        ],
+        "relayed": [
+          "ETag:\"x\"",
+          "Cache-Control:private, no-cache"
+        ]
+      },
+      {
+        "name": "cookies-scoped",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 200,
+        "upstream": [
+          "Set-Cookie:__Secure-specus_http_share=evil; Path=/",
+          "Set-Cookie:sid=abc; path=/; Domain=example.com; HttpOnly",
+          "Set-Cookie:pref=1; Path=/app/; Max-Age=60",
+          "Set-Cookie:rel=1; Path=app",
+          "Set-Cookie:bare=1",
+          "Set-Cookie:__Host-csrf=x; Path=/; Secure",
+          "Set-Cookie:__Secure-t=y; Path=/; Secure; SameSite=Lax"
+        ],
+        "relayed": [
+          "Set-Cookie:sid=abc; Path=/http-share/H4s8XX6aCyxNbo8Q/; HttpOnly",
+          "Set-Cookie:pref=1; Path=/http-share/H4s8XX6aCyxNbo8Q/app/; Max-Age=60",
+          "Set-Cookie:rel=1; Path=app",
+          "Set-Cookie:bare=1",
+          "Set-Cookie:__Secure-t=y; Path=/http-share/H4s8XX6aCyxNbo8Q/; Secure; SameSite=Lax",
+          "Cache-Control:private, no-cache"
+        ]
+      },
+      {
+        "name": "clear-site-data-dropped",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 200,
+        "upstream": [
+          "Clear-Site-Data:\"cookies\", \"storage\"",
+          "Content-Type:text/plain"
+        ],
+        "relayed": [
+          "Content-Type:text/plain",
+          "Cache-Control:private, no-cache"
+        ]
+      },
+      {
+        "name": "upgrade",
+        "shareId": "H4s8XX6aCyxNbo8Q",
+        "status": 101,
+        "upstream": [
+          "Set-Cookie:__Secure-specus_http_share=evil",
+          "Set-Cookie:ws=1; Path=/",
+          "Sec-WebSocket-Protocol:chat",
+          "Cache-Control:no-cache"
+        ],
+        "relayed": [
+          "Set-Cookie:ws=1; Path=/http-share/H4s8XX6aCyxNbo8Q/",
+          "Sec-WebSocket-Protocol:chat",
+          "Cache-Control:no-cache"
+        ]
+      }
+    ]
+  },
+  "lifecycle": [
+    {
+      "name": "owner-revokes-then-revokes-again",
+      "note": "Revocation is idempotent: the second call answers 200 and writes nothing. Someone who cannot manage the route gets 404, and a share id under a route it does not belong to is not found.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "alice",
+            "revokeReason": "revoked-by-user"
+          }
+        ],
+        "events": [
+          {
+            "kind": "revoke",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB"
+          },
+          {
+            "kind": "revoke",
+            "at": "2026-10-06T08:00:05Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB"
+          },
+          {
+            "kind": "revoke",
+            "at": "2026-10-06T08:00:06Z",
+            "actor": "bob",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB"
+          },
+          {
+            "kind": "revoke",
+            "at": "2026-10-06T08:00:07Z",
+            "actor": "admin",
+            "routeId": 50,
+            "shareId": "AAAAAAAAAAAAq8AB"
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "revoked-by-user"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "revoked-by-user",
+            "revokedBy": "alice"
+          }
+        },
+        "responses": [
+          {
+            "httpStatus": 200,
+            "status": "revoked"
+          },
+          {
+            "httpStatus": 200,
+            "status": "revoked"
+          },
+          {
+            "httpStatus": 404,
+            "code": "SHARE_ROUTE_NOT_FOUND"
+          },
+          {
+            "httpStatus": 404,
+            "code": "SHARE_NOT_FOUND"
+          }
+        ]
+      }
+    },
+    {
+      "name": "route-disabled-ends-every-active-share",
+      "note": "Disabling revokes; enabling again does not bring the shares back. The already-expired share is not touched.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "alice",
+            "revokeReason": "route-disabled"
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "31aa9a1e548b98e2599147dd7f8eb22be1c85e9d5e0003eea3fea3c511ca03aa",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "admin",
+            "createdAt": "2026-10-06T07:30:00Z",
+            "expiresAt": "2026-10-07T07:30:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "alice",
+            "revokeReason": "route-disabled"
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AD",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "0861b692452937c7ff36eb537e7557208f0d805c1d35fc8266dcf1134a15b41b",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-05T07:00:00Z",
+            "expiresAt": "2026-10-05T08:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "route-updated",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "enabled": false
+          },
+          {
+            "kind": "route-updated",
+            "at": "2026-10-06T08:01:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "enabled": true
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "route.exposure-changed",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": null,
+            "detail": {
+              "from": "protected",
+              "to": "disabled"
+            }
+          },
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "route-disabled"
+            }
+          },
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "detail": {
+              "reason": "route-disabled"
+            }
+          },
+          {
+            "action": "route.exposure-changed",
+            "at": "2026-10-06T08:01:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": null,
+            "detail": {
+              "from": "disabled",
+              "to": "protected"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "route-disabled",
+            "revokedBy": "alice"
+          },
+          "AAAAAAAAAAAAq8AC": {
+            "status": "revoked",
+            "revokeReason": "route-disabled",
+            "revokedBy": "alice"
+          },
+          "AAAAAAAAAAAAq8AD": {
+            "status": "expired",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "route-made-public",
+      "note": "A public route needs no share; keeping one would mislead the owner into thinking revoking it stops access.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "alice",
+            "revokeReason": "route-made-public"
+          }
+        ],
+        "events": [
+          {
+            "kind": "route-updated",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "authEnabled": false
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "route.exposure-changed",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": null,
+            "detail": {
+              "from": "protected",
+              "to": "public"
+            }
+          },
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "route-made-public"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "route-made-public",
+            "revokedBy": "alice"
+          }
+        }
+      }
+    },
+    {
+      "name": "credentials-changed-keeps-shares",
+      "note": "Changing the Basic password is audited but does not touch shares: they never used it.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "route-updated",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "credentialsChanged": true
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "route.credentials-changed",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 42,
+            "shareId": null,
+            "detail": {}
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "active",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "route-deleted",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "admin",
+            "revokeReason": "route-deleted"
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "31aa9a1e548b98e2599147dd7f8eb22be1c85e9d5e0003eea3fea3c511ca03aa",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "bob",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "route-deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "route.deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": null,
+            "detail": {
+              "exposure": "protected"
+            }
+          },
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "route-deleted"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "route-deleted",
+            "revokedBy": "admin"
+          },
+          "AAAAAAAAAAAAq8AC": {
+            "status": "active",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "client-disabled",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "admin",
+            "revokeReason": "client-disabled"
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "31aa9a1e548b98e2599147dd7f8eb22be1c85e9d5e0003eea3fea3c511ca03aa",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "bob",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "client-disabled",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "clientId": 7
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "client-disabled"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "client-disabled",
+            "revokedBy": "admin"
+          },
+          "AAAAAAAAAAAAq8AC": {
+            "status": "active",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "client-deleted",
+      "note": "Deleting a client deletes its routes: each gets a route.deleted entry, then the shares end.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "admin",
+            "revokeReason": "client-deleted"
+          }
+        ],
+        "events": [
+          {
+            "kind": "client-deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "clientId": 7
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "route.deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": null,
+            "detail": {
+              "exposure": "protected"
+            }
+          },
+          {
+            "action": "route.deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 43,
+            "shareId": null,
+            "detail": {
+              "exposure": "public"
+            }
+          },
+          {
+            "action": "route.deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 44,
+            "shareId": null,
+            "detail": {
+              "exposure": "disabled"
+            }
+          },
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "client-deleted"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "client-deleted",
+            "revokedBy": "admin"
+          }
+        }
+      }
+    },
+    {
+      "name": "creator-disabled",
+      "note": "Only the disabled user's own shares end; the admin's share of the same route stays.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "admin",
+            "revokeReason": "creator-lost-access"
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "31aa9a1e548b98e2599147dd7f8eb22be1c85e9d5e0003eea3fea3c511ca03aa",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "admin",
+            "createdAt": "2026-10-06T07:30:00Z",
+            "expiresAt": "2026-10-07T07:30:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "user-updated",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "username": "alice",
+            "enabled": false
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "creator-lost-access",
+            "revokedBy": "admin"
+          },
+          "AAAAAAAAAAAAq8AC": {
+            "status": "active",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "admin-demoted",
+      "note": "An admin who is demoted and owns neither client loses every share it created.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "admin",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "carol",
+            "revokeReason": "creator-lost-access"
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "tenantId": "t1",
+            "routeId": 50,
+            "tokenSha256": "31aa9a1e548b98e2599147dd7f8eb22be1c85e9d5e0003eea3fea3c511ca03aa",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "admin",
+            "createdAt": "2026-10-06T07:30:00Z",
+            "expiresAt": "2026-10-07T07:30:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "carol",
+            "revokeReason": "creator-lost-access"
+          }
+        ],
+        "events": [
+          {
+            "kind": "user-updated",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "carol",
+            "username": "admin",
+            "role": "USER"
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "carol",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          },
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "carol",
+            "routeId": 50,
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "creator-lost-access",
+            "revokedBy": "carol"
+          },
+          "AAAAAAAAAAAAq8AC": {
+            "status": "revoked",
+            "revokeReason": "creator-lost-access",
+            "revokedBy": "carol"
+          }
+        }
+      }
+    },
+    {
+      "name": "owner-promoted-then-demoted-keeps-own-route",
+      "note": "Still the owner of the client after the demotion: nothing to end.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "user-updated",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "username": "alice",
+            "role": "ADMIN"
+          },
+          {
+            "kind": "user-updated",
+            "at": "2026-10-06T08:00:05Z",
+            "actor": "admin",
+            "username": "alice",
+            "role": "USER"
+          }
+        ]
+      },
+      "expect": {
+        "audit": [],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "active",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "creator-deleted",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:00Z",
+            "revokedBy": "admin",
+            "revokeReason": "creator-lost-access"
+          }
+        ],
+        "events": [
+          {
+            "kind": "user-deleted",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "username": "alice"
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "admin",
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "creator-lost-access"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "creator-lost-access",
+            "revokedBy": "admin"
+          }
+        }
+      }
+    },
+    {
+      "name": "route-created",
+      "note": "Creating a route is an exposure change too. Turning on Basic for the first time records both the exposure change and the new credentials.",
+      "input": {
+        "shares": [],
+        "events": [
+          {
+            "kind": "route-created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "route": {
+              "routeId": 60,
+              "tenantId": "t1",
+              "clientId": 7,
+              "name": "wiki",
+              "enabled": true,
+              "authEnabled": false
+            }
+          },
+          {
+            "kind": "route-updated",
+            "at": "2026-10-06T08:00:30Z",
+            "actor": "alice",
+            "routeId": 60,
+            "authEnabled": true,
+            "credentialsChanged": true
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "route.created",
+            "at": "2026-10-06T08:00:00Z",
+            "actor": "alice",
+            "routeId": 60,
+            "shareId": null,
+            "detail": {
+              "exposure": "public"
+            }
+          },
+          {
+            "action": "route.exposure-changed",
+            "at": "2026-10-06T08:00:30Z",
+            "actor": "alice",
+            "routeId": 60,
+            "shareId": null,
+            "detail": {
+              "from": "public",
+              "to": "protected"
+            }
+          },
+          {
+            "action": "route.credentials-changed",
+            "at": "2026-10-06T08:00:30Z",
+            "actor": "alice",
+            "routeId": 60,
+            "shareId": null,
+            "detail": {}
+          }
+        ],
+        "shares": {}
+      }
+    },
+    {
+      "name": "sweep-records-expiry-once",
+      "note": "Each expiry is written once, stamped with expiresAt rather than the sweep time, in expiry order. A share revoked before it expired gets no expiry entry.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-06T07:50:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null,
+            "expiryRecorded": true
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "31aa9a1e548b98e2599147dd7f8eb22be1c85e9d5e0003eea3fea3c511ca03aa",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-06T07:30:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null,
+            "expiryRecorded": true
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AD",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "0861b692452937c7ff36eb537e7557208f0d805c1d35fc8266dcf1134a15b41b",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-06T09:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null,
+            "expiryRecorded": true
+          },
+          {
+            "shareId": "AAAAAAAAAAAAq8AE",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "330c1d0aa0e556f8ecb9fe7e2acca71212326eead7dce408a945e936f8a5cb7c",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-06T07:10:00Z",
+            "revokedAt": "2026-10-06T07:01:40Z",
+            "revokedBy": "alice",
+            "revokeReason": "revoked-by-user"
+          }
+        ],
+        "events": [
+          {
+            "kind": "sweep",
+            "at": "2026-10-06T08:00:00Z"
+          },
+          {
+            "kind": "sweep",
+            "at": "2026-10-06T08:01:00Z"
+          },
+          {
+            "kind": "sweep",
+            "at": "2026-10-06T09:00:00Z"
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.expired",
+            "at": "2026-10-06T07:30:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AC",
+            "detail": {}
+          },
+          {
+            "action": "share.expired",
+            "at": "2026-10-06T07:50:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {}
+          },
+          {
+            "action": "share.expired",
+            "at": "2026-10-06T09:00:00Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AD",
+            "detail": {}
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "expired",
+            "revokeReason": null,
+            "revokedBy": null
+          },
+          "AAAAAAAAAAAAq8AC": {
+            "status": "expired",
+            "revokeReason": null,
+            "revokedBy": null
+          },
+          "AAAAAAAAAAAAq8AD": {
+            "status": "expired",
+            "revokeReason": null,
+            "revokedBy": null
+          },
+          "AAAAAAAAAAAAq8AE": {
+            "status": "revoked",
+            "revokeReason": "revoked-by-user",
+            "revokedBy": "alice"
+          }
+        }
+      }
+    },
+    {
+      "name": "missed-hook-undone-before-sweep",
+      "note": "If a change bypassed the hooks and was undone before any request or sweep saw it, the share survives -- the window is one sweep interval. Here the sweep runs after the undo: nothing to do.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": null,
+            "revokedBy": null,
+            "revokeReason": null
+          }
+        ],
+        "events": [
+          {
+            "kind": "silent-change",
+            "at": "2026-10-06T08:00:00Z",
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "enabled": false
+            }
+          },
+          {
+            "kind": "silent-change",
+            "at": "2026-10-06T08:00:10Z",
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "enabled": true
+            }
+          },
+          {
+            "kind": "sweep",
+            "at": "2026-10-06T08:00:20Z"
+          }
+        ]
+      },
+      "expect": {
+        "audit": [],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "active",
+            "revokeReason": null,
+            "revokedBy": null
+          }
+        }
+      }
+    },
+    {
+      "name": "sweep-revokes-a-lapsed-share",
+      "note": "The sweep revokes with no actor; protecting the route again does not revive the share.",
+      "input": {
+        "shares": [
+          {
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "tenantId": "t1",
+            "routeId": 42,
+            "tokenSha256": "7bab7c14896a28d65b23950faf3511e76a3ffde0c89f10555d67b2493eed9c35",
+            "access": "read",
+            "pathPrefix": "/",
+            "label": null,
+            "createdBy": "alice",
+            "createdAt": "2026-10-06T07:00:00Z",
+            "expiresAt": "2026-10-07T07:00:00Z",
+            "revokedAt": "2026-10-06T08:00:30Z",
+            "revokedBy": null,
+            "revokeReason": "route-made-public"
+          }
+        ],
+        "events": [
+          {
+            "kind": "silent-change",
+            "at": "2026-10-06T08:00:00Z",
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "authEnabled": false
+            }
+          },
+          {
+            "kind": "sweep",
+            "at": "2026-10-06T08:00:30Z"
+          },
+          {
+            "kind": "silent-change",
+            "at": "2026-10-06T08:00:40Z",
+            "table": "routes",
+            "key": 42,
+            "set": {
+              "authEnabled": true
+            }
+          }
+        ]
+      },
+      "expect": {
+        "audit": [
+          {
+            "action": "share.revoked",
+            "at": "2026-10-06T08:00:30Z",
+            "actor": null,
+            "routeId": 42,
+            "shareId": "AAAAAAAAAAAAq8AB",
+            "detail": {
+              "reason": "route-made-public"
+            }
+          }
+        ],
+        "shares": {
+          "AAAAAAAAAAAAq8AB": {
+            "status": "revoked",
+            "revokeReason": "route-made-public",
+            "revokedBy": null
+          }
+        }
+      }
+    }
+  ],
+  "rate": {
+    "algorithm": "gcra",
+    "exchange": {
+      "key": "sourceAddress",
+      "intervalMs": 6000,
+      "burst": 10,
+      "events": [
+        {
+          "atMs": 0,
+          "key": "203.0.113.7",
+          "requests": 10,
+          "admitted": 10
+        },
+        {
+          "atMs": 0,
+          "key": "203.0.113.7",
+          "requests": 1,
+          "admitted": 0,
+          "retryAfterSeconds": 6
+        },
+        {
+          "atMs": 5999,
+          "key": "203.0.113.7",
+          "requests": 1,
+          "admitted": 0,
+          "retryAfterSeconds": 1
+        },
+        {
+          "atMs": 6000,
+          "key": "203.0.113.7",
+          "requests": 1,
+          "admitted": 1
+        },
+        {
+          "atMs": 6000,
+          "key": "198.51.100.2",
+          "requests": 1,
+          "admitted": 1
+        },
+        {
+          "atMs": 60000,
+          "key": "203.0.113.7",
+          "requests": 12,
+          "admitted": 9,
+          "retryAfterSeconds": 6
+        }
+      ]
+    },
+    "share": {
+      "key": "shareId",
+      "intervalMs": 50,
+      "burst": 200,
+      "events": [
+        {
+          "atMs": 0,
+          "key": "H4s8XX6aCyxNbo8Q",
+          "requests": 200,
+          "admitted": 200
+        },
+        {
+          "atMs": 0,
+          "key": "H4s8XX6aCyxNbo8Q",
+          "requests": 1,
+          "admitted": 0,
+          "retryAfterSeconds": 1
+        },
+        {
+          "atMs": 49,
+          "key": "H4s8XX6aCyxNbo8Q",
+          "requests": 1,
+          "admitted": 0,
+          "retryAfterSeconds": 1
+        },
+        {
+          "atMs": 50,
+          "key": "H4s8XX6aCyxNbo8Q",
+          "requests": 1,
+          "admitted": 1
+        },
+        {
+          "atMs": 50,
+          "key": "AP8A_wD_AP8A_wD_",
+          "requests": 1,
+          "admitted": 1
+        },
+        {
+          "atMs": 1050,
+          "key": "H4s8XX6aCyxNbo8Q",
+          "requests": 25,
+          "admitted": 20,
+          "retryAfterSeconds": 1
+        }
+      ]
+    }
+  }
+}
