@@ -125,6 +125,7 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_STUN_TURN_PORT` | `3478` | Built-in STUN/TURN UDP listen port and published URL port. |
 | `SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS` | unset | Optional comma-separated public STUN URLs appended to the discovery response; missing ports default to `3478` and duplicates are removed. |
 | `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | Whether the built-in TURN listener requires long-term credentials; also returned as `turnAuthRequired` by the public ICE response. |
+| `SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS` | `false` | C-only. By default general (public-transfer) TURN allocations may only reach public unicast peers, as Java/Go/.NET enforce: CreatePermission and ChannelBind to loopback, unspecified, link-local, private/site-local, multicast or IPv6 ULA addresses (IPv4-mapped forms included) or to port 0 get `403` and a `[peer-mesh][audit]` line on stderr. `true` lifts that policy for loopback or single-host test setups; never enable it on a public listener. Peer Mesh allocations are not subject to it. |
 | `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | unset | Shared secret used for temporary TURN HMAC-SHA1 credentials. When unset the process generates a random secret at startup, as Java does, so credentials issued before a restart stop working. |
 | `SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | Temporary public-transfer TURN credential lifetime, clamped to at least 60 seconds. |
 | `SPECUS_PEER_MESH_CIDR` | `100.96.0.0/11` | Virtual address pool advertised to Peer Mesh clients. |
