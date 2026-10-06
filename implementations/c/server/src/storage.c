@@ -1522,20 +1522,18 @@ int st_storage_list_management_users(const char *path,
     if (open_db(path, &db) != 0) {
         return -1;
     }
-    const char *sql = tenant_id != NULL && *tenant_id != '\0'
-        ? "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-          "FROM specus_management_user WHERE tenant_id = ? ORDER BY lower(username)"
-        : "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-          "FROM specus_management_user ORDER BY tenant_id, lower(username)";
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
+        "FROM specus_management_user WHERE tenant_id = ? ORDER BY lower(username)",
+        -1,
+        &stmt,
+        NULL);
     if (rc != SQLITE_OK) {
         sqlite3_close(db);
         return -1;
     }
-    if (tenant_id != NULL && *tenant_id != '\0') {
-        sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT);
-    }
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (*user_count >= max_users || scan_management_user(stmt, &users[*user_count]) != 0) {
             sqlite3_finalize(stmt);
@@ -1569,6 +1567,35 @@ int st_storage_get_management_user(const char *path,
         return -1;
     }
     sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return ok ? 0 : -1;
+}
+
+int st_storage_get_management_user_in_tenant(const char *path,
+                                             const char *tenant_id,
+                                             const char *username,
+                                             st_storage_management_user *user)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
+        "FROM specus_management_user WHERE tenant_id = ? AND lower(username) = lower(?)",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
     int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0;
     sqlite3_finalize(stmt);
@@ -1651,6 +1678,7 @@ int st_storage_create_management_user(const char *path,
 }
 
 int st_storage_update_management_user(const char *path,
+                                      const char *tenant_id,
                                       const char *username,
                                       const char *password_hash,
                                       const char *role,
@@ -1667,7 +1695,7 @@ int st_storage_update_management_user(const char *path,
         "password_hash = COALESCE(?, password_hash), "
         "role = COALESCE(?, role), "
         "enabled = ?, updated_at = CURRENT_TIMESTAMP "
-        "WHERE lower(username) = lower(?)",
+        "WHERE tenant_id = ? AND lower(username) = lower(?)",
         -1,
         &stmt,
         NULL);
@@ -1683,7 +1711,8 @@ int st_storage_update_management_user(const char *path,
             sqlite3_bind_text(stmt, 2, role, -1, SQLITE_TRANSIENT);
         }
         sqlite3_bind_int(stmt, 3, enabled ? 1 : 0);
-        sqlite3_bind_text(stmt, 4, username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, username, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;
@@ -1693,10 +1722,10 @@ int st_storage_update_management_user(const char *path,
     if (rc != 0) {
         return -1;
     }
-    return out_user == NULL ? 0 : st_storage_get_management_user(path, username, out_user);
+    return out_user == NULL ? 0 : st_storage_get_management_user_in_tenant(path, tenant_id, username, out_user);
 }
 
-int st_storage_delete_management_user(const char *path, const char *username)
+int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -1704,12 +1733,13 @@ int st_storage_delete_management_user(const char *path, const char *username)
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "DELETE FROM specus_management_user WHERE lower(username) = lower(?)",
+        "DELETE FROM specus_management_user WHERE tenant_id = ? AND lower(username) = lower(?)",
         -1,
         &stmt,
         NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;
