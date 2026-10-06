@@ -4,9 +4,9 @@ set -euo pipefail
 # Peer Mesh through the C server with two real clients (issue #35, P3): roster, session grant,
 # candidate exchange and path reports over PEER_CONTROL, then the standard TURN relay.
 #
-# Phase one runs both clients next to the server. Their only candidates are the server-reflexive
-# addresses the C STUN service reports, on the loopback interface, so they must settle on a DIRECT
-# path. Phase two restarts the same two clients each in a network namespace of its own that reaches
+# Phase one runs both clients next to the server, in a namespace whose only interface is loopback.
+# Their candidates are the server-reflexive addresses the C STUN service reports (and, for a client
+# that offers them, 127.0.0.1 host candidates), so they must settle on a DIRECT path over loopback. Phase two restarts the same two clients each in a network namespace of its own that reaches
 # the server and nothing else: the namespaces are joined to the server's by veth pairs and the
 # server's namespace does not forward, so no datagram can pass between the clients except through
 # the C server's TURN allocations, and the path must become RELAY. Each phase ends with one client
@@ -428,8 +428,10 @@ DIRECT_SESSION="$(check session "$ADMIN_PORT" "$ADMIN_TOKEN" "$CLIENT_A" "$CLIEN
   || fail "no DIRECT session between A and B"
 echo "direct session: $DIRECT_SESSION"
 DIRECT_REMOTE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["remoteEndpoint"])' "$DIRECT_SESSION")"
-[[ "$DIRECT_REMOTE" == "$SERVER_IP:"* ]] \
-  || fail "the direct path should run between server-reflexive loopback addresses, not $DIRECT_REMOTE"
+# Over the loopback interface either way: the server-reflexive address the C STUN service reports
+# (Go, .NET), or a 127.0.0.1 host candidate (Java offers loopback host candidates).
+[[ "$DIRECT_REMOTE" == "$SERVER_IP:"* || "$DIRECT_REMOTE" == 127.* ]] \
+  || fail "the direct path should run over the loopback interface, not $DIRECT_REMOTE"
 
 server_log_since 0 | grep -q "signal accepted source=$CLIENT_A target=$CLIENT_B" \
   || fail "the server never accepted a signal from A to B"
