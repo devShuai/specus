@@ -729,14 +729,17 @@ static int session_status(const char *db_path, long long session_id, char *out, 
 
 static int wait_session_status(const char *db_path, long long session_id, const char *expected, int timeout_ms)
 {
-    long long deadline = monotonic_ms() + timeout_ms;
+    long long started = monotonic_ms();
+    long long deadline = started + timeout_ms;
     char status[64] = "";
     for (;;) {
-        if (session_status(db_path, session_id, status, sizeof(status)) == 0 && strcmp(status, expected) == 0) {
+        int rc = session_status(db_path, session_id, status, sizeof(status));
+        if (rc == 0 && strcmp(status, expected) == 0) {
             return 0;
         }
         if (monotonic_ms() >= deadline) {
-            fprintf(stderr, "session %lld status %s, expected %s\n", session_id, status, expected);
+            fprintf(stderr, "session %lld is %s after %lld ms, expected %s\n", session_id,
+                    rc == 0 ? status : (rc == 1 ? "missing" : "unreadable"), monotonic_ms() - started, expected);
             return -1;
         }
         sleep_ms(50);
@@ -758,7 +761,15 @@ static int wait_connection_reason(const char *db_path, const char *client_name, 
             return 0;
         }
         if (monotonic_ms() >= deadline) {
-            fprintf(stderr, "no %s connection record for %s\n", reason, client_name);
+            char records[2048] = "";
+            db_scalar(db_path,
+                      "SELECT COALESCE(group_concat(id || '|' || success || '|' || COALESCE(disconnect_reason, 'NULL')"
+                      " || '|' || COALESCE(disconnected_at, 'NULL'), ', '), 'none') FROM connection_record"
+                      " WHERE client_name = ?",
+                      client_name, 0, records, sizeof(records));
+            fprintf(stderr, "no closed %s connection record for %s within %d ms; its records "
+                    "(id|success|disconnect reason|disconnected at): %s\n",
+                    reason, client_name, timeout_ms, records);
             return -1;
         }
         sleep_ms(50);
@@ -911,6 +922,74 @@ static void server_cleanup(test_server *server, int failed)
 /* Scenarios                                                                                     */
 
 /*
+ * The scenarios report errno and one of them forks a server of its own (sigterm_at_first_accept),
+ * so they include what that needs themselves instead of relying on the process helpers above.
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+/*
+ * The server gives its channels up to 10 s (ST_SHUTDOWN_DRAIN_SECONDS) to finish at shutdown. The
+ * shutdown checks wait for the event itself (an EOF, the exit) and give up only well past that, so
+ * a slow, loaded runner is not mistaken for a server that never closed or never exited.
+ */
+#define SHUTDOWN_TIMEOUT_MS 30000
+#define SERVER_START_TIMEOUT_MS 30000
+
+/*
+ * TIMED(call) runs a helper that only answers pass or fail and keeps how long it took, so a failed
+ * check can say whether its wait ran out or the helper failed early (see timed_outcome).
+ */
+static long long timed_started_ms;
+static long long timed_ms;
+static int timed_rc;
+#define TIMED(call) \
+    (timed_started_ms = monotonic_ms(), timed_rc = (call), timed_ms = monotonic_ms() - timed_started_ms, timed_rc)
+
+/* Why the last TIMED call, bounded by bound_ms, failed. */
+static const char *timed_outcome(int bound_ms)
+{
+    static char text[200];
+    if (timed_ms >= bound_ms) {
+        snprintf(text, sizeof(text), "nothing happened before the %d ms wait ran out", bound_ms);
+    } else {
+        snprintf(text, sizeof(text), "it failed after %lld ms of its %d ms bound (the socket closed or errored, "
+                 "or the server answered something else)", timed_ms, bound_ms);
+    }
+    return text;
+}
+
+/* admin_client_online's answer, for a check message. */
+static const char *online_text(int online)
+{
+    return online == 1 ? "true" : (online == 0 ? "false" : "unknown (the admin API request failed)");
+}
+
+/* How the last TIMED channel_login ended, for a check that expected a refusal. */
+static const char *login_outcome(void)
+{
+    return timed_rc == 1 ? "an accepted login" : (timed_rc == 0 ? "a refusal" : "no login answer");
+}
+
+/* What server_stop's result says about how the server ended. */
+static const char *describe_server_exit(int exit_status, char *out, size_t out_len)
+{
+    if (exit_status == -1) {
+        snprintf(out, out_len, "still running when the wait ran out, so it was killed");
+    } else if (exit_status > 1000) {
+        snprintf(out, out_len, "killed by signal %d (%s)", exit_status - 1000, strsignal(exit_status - 1000));
+    } else if (exit_status == 128 + SIGTERM) {
+        snprintf(out, out_len, "exit status %d: SIGTERM took the \"outside the serving loop\" exit, "
+                 "not the graceful shutdown", exit_status);
+    } else {
+        snprintf(out, out_len, "exit status %d", exit_status);
+    }
+    return out;
+}
+
+/*
  * The same runtime session logging in again while its previous pair is still bound (a client whose
  * old sockets died without a FIN looks exactly like this to the server) replaces that pair: the old
  * control and data connections and the NAT stream on the old data connection are closed, the
@@ -922,40 +1001,53 @@ static int test_same_session_relogin_replaces_old_pair(test_server *server)
     runtime_session runtime;
     int control1 = -1, data1 = -1, control2 = -1, data2 = -1, public_fd = -1;
     int public_port = pick_free_port();
-    CHECK(create_credential(server->db_path, "ck_relogin", "relogin-secret", 2) == 0, "credential");
+    CHECK(public_port > 0, "no free port for the public mapping");
+    CHECK(create_credential(server->db_path, "ck_relogin", "relogin-secret", 2) == 0,
+          "credential ck_relogin not stored");
     CHECK(http_client_login(server, "ck_relogin", "relogin-secret", "machine-relogin", "alice", &runtime) == 0,
-          "http login");
-    CHECK(create_mapping(server->db_path, runtime.client_id, public_port) == 0, "mapping");
+          "http login (status and body above)");
+    CHECK(create_mapping(server->db_path, runtime.client_id, public_port) == 0,
+          "mapping of port %d not stored", public_port);
 
     CHECK(channel_login(server->control_port, &runtime, "control", &control1, reason, sizeof(reason)) == 1,
           "first control login: %s", reason);
     CHECK(channel_login(server->control_port, &runtime, "data", &data1, reason, sizeof(reason)) == 1,
           "first data login: %s", reason);
-    CHECK(nat_register(data1, runtime.client_name, public_port, 9) == 0, "first REGISTER");
-    CHECK(open_public_stream(data1, public_port, &public_fd) == 0, "public stream OPEN on first data");
-    CHECK(admin_client_online(server, runtime.client_name) == 1, "client online before re-login");
+    CHECK(TIMED(nat_register(data1, runtime.client_name, public_port, 9)) == 0,
+          "first REGISTER of port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(open_public_stream(data1, public_port, &public_fd)) == 0,
+          "no OPEN on the first data for a connection to port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    int online = admin_client_online(server, runtime.client_name);
+    CHECK(online == 1, "client not online before re-login: management view online=%s", online_text(online));
 
     CHECK(channel_login(server->control_port, &runtime, "control", &control2, reason, sizeof(reason)) == 1,
           "re-login of the same session must replace the old control: %s", reason);
-    CHECK(expect_channel_closed(control1, IO_TIMEOUT_MS) == 0, "old control was not closed");
-    CHECK(expect_channel_closed(data1, IO_TIMEOUT_MS) == 0, "old data was not closed");
-    CHECK(expect_socket_eof(public_fd, IO_TIMEOUT_MS) == 0, "NAT stream of the old data was not closed");
+    CHECK(TIMED(expect_channel_closed(control1, IO_TIMEOUT_MS)) == 0,
+          "old control was not closed: %s", timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_closed(data1, IO_TIMEOUT_MS)) == 0,
+          "old data was not closed: %s", timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_socket_eof(public_fd, IO_TIMEOUT_MS)) == 0,
+          "NAT stream of the old data was not closed: %s", timed_outcome(IO_TIMEOUT_MS));
 
     CHECK(channel_login(server->control_port, &runtime, "data", &data2, reason, sizeof(reason)) == 1,
           "data login for the replacing control: %s", reason);
-    CHECK(nat_register(data2, runtime.client_name, public_port, 9) == 0,
-          "the old data connection still holds the public port");
-    CHECK(expect_channel_alive(control2) == 0 && expect_channel_alive(data2) == 0, "new pair not served");
+    CHECK(TIMED(nat_register(data2, runtime.client_name, public_port, 9)) == 0,
+          "the old data connection still holds the public port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_alive(control2)) == 0, "new control not served: %s", timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_alive(data2)) == 0, "new data not served: %s", timed_outcome(IO_TIMEOUT_MS));
     CHECK(wait_connection_reason(server->db_path, runtime.client_name, "REPLACED_BY_NEW_LOGIN", IO_TIMEOUT_MS) == 0,
           "old control record not stamped REPLACED_BY_NEW_LOGIN");
     char status[64];
     CHECK(session_status(server->db_path, runtime.session_id, status, sizeof(status)) == 0
               && strcmp(status, "NETTY_ONLINE") == 0,
-          "the departing old control took the live session offline: %s", status);
-    CHECK(admin_client_online(server, runtime.client_name) == 1, "client not online after re-login");
+          "the departing old control took the live session offline: session %lld is '%s', expected NETTY_ONLINE",
+          runtime.session_id, status);
+    online = admin_client_online(server, runtime.client_name);
+    CHECK(online == 1, "client not online after re-login: management view online=%s", online_text(online));
 
     close_fd(&control2);
-    CHECK(expect_channel_closed(data2, IO_TIMEOUT_MS) == 0, "closing the control did not close its data");
+    CHECK(TIMED(expect_channel_closed(data2, IO_TIMEOUT_MS)) == 0,
+          "closing the control did not close its data: %s", timed_outcome(IO_TIMEOUT_MS));
     CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
           "session not DISCONNECTED after the client left");
     close_fd(&control1);
@@ -975,8 +1067,9 @@ static int test_session_reuse_and_supersession(test_server *server)
     char reason[256];
     runtime_session first, second, third, fourth;
     int control = -1, data = -1, refused = -1;
-    CHECK(create_credential(server->db_path, "ck_reuse", "reuse-secret", 2) == 0, "credential");
-    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &first) == 0, "login 1");
+    CHECK(create_credential(server->db_path, "ck_reuse", "reuse-secret", 2) == 0, "credential ck_reuse not stored");
+    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &first) == 0,
+          "login 1 (status and body above)");
 
     for (int round = 0; round < 2; ++round) {
         CHECK(channel_login(server->control_port, &first, "control", &control, reason, sizeof(reason)) == 1,
@@ -985,34 +1078,43 @@ static int test_session_reuse_and_supersession(test_server *server)
               "data login round %d: %s", round, reason);
         close_fd(&data);
         /* As in Java and Go, a data connection going away leaves its control connection alone. */
-        CHECK(expect_channel_alive(control) == 0, "round %d: closing the data closed the control", round);
+        CHECK(TIMED(expect_channel_alive(control)) == 0, "round %d: closing the data closed the control: %s",
+              round, timed_outcome(IO_TIMEOUT_MS));
         close_fd(&control);
         CHECK(wait_session_status(server->db_path, first.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
               "round %d: session not DISCONNECTED", round);
     }
 
-    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &second) == 0, "login 2");
-    CHECK(channel_login(server->control_port, &first, "control", &refused, reason, sizeof(reason)) == 0
+    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &second) == 0,
+          "login 2 (status and body above)");
+    CHECK(TIMED(channel_login(server->control_port, &first, "control", &refused, reason, sizeof(reason))) == 0
               && strstr(reason, "访问令牌无效") != NULL,
-          "superseded session must not open a control channel, got: %s", reason);
+          "superseded session must not open a control channel; expected a 访问令牌无效 refusal, got %s: %s",
+          login_outcome(), reason);
     CHECK(channel_login(server->control_port, &second, "control", &control, reason, sizeof(reason)) == 1,
           "control login with the newer session: %s", reason);
-    CHECK(channel_login(server->control_port, &first, "data", &refused, reason, sizeof(reason)) == 0
+    CHECK(TIMED(channel_login(server->control_port, &first, "data", &refused, reason, sizeof(reason))) == 0
               && strstr(reason, "数据连接") != NULL,
-          "old session must not attach a data channel, got: %s", reason);
+          "old session must not attach a data channel; expected a 数据连接 refusal, got %s: %s",
+          login_outcome(), reason);
     CHECK(channel_login(server->control_port, &second, "data", &data, reason, sizeof(reason)) == 1,
           "data login with the newer session: %s", reason);
 
-    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &third) == 0, "login 3");
-    CHECK(channel_login(server->control_port, &third, "control", &refused, reason, sizeof(reason)) == 0
+    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &third) == 0,
+          "login 3 (status and body above)");
+    CHECK(TIMED(channel_login(server->control_port, &third, "control", &refused, reason, sizeof(reason))) == 0
               && strstr(reason, "同一台机器和用户已经有在线实例") != NULL,
-          "a second live instance of the machine user must be refused, got: %s", reason);
-    CHECK(expect_channel_alive(control) == 0, "the refused login disturbed the live control");
+          "a second live instance of the machine user must be refused; expected a 同一台机器和用户已经有在线实例 "
+          "refusal, got %s: %s", login_outcome(), reason);
+    CHECK(TIMED(expect_channel_alive(control)) == 0, "the refused login disturbed the live control: %s",
+          timed_outcome(IO_TIMEOUT_MS));
 
-    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &fourth) == 0, "login 4");
-    CHECK(channel_login(server->control_port, &third, "control", &refused, reason, sizeof(reason)) == 0
+    CHECK(http_client_login(server, "ck_reuse", "reuse-secret", "machine-reuse", "bob", &fourth) == 0,
+          "login 4 (status and body above)");
+    CHECK(TIMED(channel_login(server->control_port, &third, "control", &refused, reason, sizeof(reason))) == 0
               && strstr(reason, "访问令牌无效") != NULL,
-          "a session retired before it ever connected must stay unusable, got: %s", reason);
+          "a session retired before it ever connected must stay unusable; expected a 访问令牌无效 refusal, got %s: %s",
+          login_outcome(), reason);
 
     close_fd(&data);
     close_fd(&control);
@@ -1027,12 +1129,14 @@ static int test_second_login_on_one_connection_closes_it(test_server *server)
     char reason[256];
     runtime_session runtime;
     int control = -1;
-    CHECK(create_credential(server->db_path, "ck_twice", "twice-secret", 2) == 0, "credential");
-    CHECK(http_client_login(server, "ck_twice", "twice-secret", "machine-twice", "hank", &runtime) == 0, "login");
+    CHECK(create_credential(server->db_path, "ck_twice", "twice-secret", 2) == 0, "credential ck_twice not stored");
+    CHECK(http_client_login(server, "ck_twice", "twice-secret", "machine-twice", "hank", &runtime) == 0,
+          "login (status and body above)");
     CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
           "control: %s", reason);
-    CHECK(send_login_request(control, &runtime, "control") == 0, "second LOGIN_REQUEST");
-    CHECK(expect_channel_closed(control, IO_TIMEOUT_MS) == 0, "a second login on one connection was tolerated");
+    CHECK(send_login_request(control, &runtime, "control") == 0, "second LOGIN_REQUEST not sent: %s", strerror(errno));
+    CHECK(TIMED(expect_channel_closed(control, IO_TIMEOUT_MS)) == 0,
+          "a second login on one connection was tolerated: %s", timed_outcome(IO_TIMEOUT_MS));
     CHECK(wait_connection_reason(server->db_path, runtime.client_name, "PROTOCOL_VIOLATION", IO_TIMEOUT_MS) == 0,
           "violation not recorded");
     CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
@@ -1046,14 +1150,17 @@ static int test_credential_online_limit(test_server *server)
     char reason[256];
     runtime_session machine_a, machine_b;
     int control_a = -1, control_b = -1;
-    CHECK(create_credential(server->db_path, "ck_limit", "limit-secret", 1) == 0, "credential");
-    CHECK(http_client_login(server, "ck_limit", "limit-secret", "machine-limit-a", "carol", &machine_a) == 0, "login a");
-    CHECK(http_client_login(server, "ck_limit", "limit-secret", "machine-limit-b", "carol", &machine_b) == 0, "login b");
+    CHECK(create_credential(server->db_path, "ck_limit", "limit-secret", 1) == 0, "credential ck_limit not stored");
+    CHECK(http_client_login(server, "ck_limit", "limit-secret", "machine-limit-a", "carol", &machine_a) == 0,
+          "login a (status and body above)");
+    CHECK(http_client_login(server, "ck_limit", "limit-secret", "machine-limit-b", "carol", &machine_b) == 0,
+          "login b (status and body above)");
     CHECK(channel_login(server->control_port, &machine_a, "control", &control_a, reason, sizeof(reason)) == 1,
           "machine a: %s", reason);
-    CHECK(channel_login(server->control_port, &machine_b, "control", &control_b, reason, sizeof(reason)) == 0
+    CHECK(TIMED(channel_login(server->control_port, &machine_b, "control", &control_b, reason, sizeof(reason))) == 0
               && strstr(reason, "在线实例数已达上限") != NULL,
-          "maxOnlineInstances=1 must refuse a second machine, got: %s", reason);
+          "maxOnlineInstances=1 must refuse a second machine; expected a 在线实例数已达上限 refusal, got %s: %s",
+          login_outcome(), reason);
     close_fd(&control_a);
     CHECK(wait_session_status(server->db_path, machine_a.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
           "machine a not DISCONNECTED");
@@ -1072,14 +1179,15 @@ static int test_stale_online_row_is_closed(test_server *server)
     char reason[256];
     runtime_session stale, fresh;
     int control = -1;
-    CHECK(create_credential(server->db_path, "ck_stale_row", "stale-row-secret", 2) == 0, "credential");
+    CHECK(create_credential(server->db_path, "ck_stale_row", "stale-row-secret", 2) == 0,
+          "credential ck_stale_row not stored");
     CHECK(http_client_login(server, "ck_stale_row", "stale-row-secret", "machine-stale", "dave", &stale) == 0,
-          "login 1");
+          "login 1 (status and body above)");
     CHECK(st_storage_mark_client_session_online(server->db_path, stale.session_id, "lost-channel",
                                                 "127.0.0.1:1", "2026-01-01T00:00:00Z") == 0,
-          "mark stale row online");
+          "could not mark session %lld online", stale.session_id);
     CHECK(http_client_login(server, "ck_stale_row", "stale-row-secret", "machine-stale", "dave", &fresh) == 0,
-          "login 2");
+          "login 2 (status and body above)");
     CHECK(channel_login(server->control_port, &fresh, "control", &control, reason, sizeof(reason)) == 1,
           "a stale online row blocked the machine user: %s", reason);
     CHECK(wait_session_status(server->db_path, stale.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
@@ -1099,46 +1207,58 @@ static int test_new_session_replaces_previous_session(test_server *server)
     runtime_session old_session, new_session;
     int control1 = -1, data1 = -1, control2 = -1, data2 = -1, refused = -1, public_fd = -1;
     int public_port = pick_free_port();
-    CHECK(create_credential(server->db_path, "ck_replace", "replace-secret", 3) == 0, "credential");
+    CHECK(public_port > 0, "no free port for the public mapping");
+    CHECK(create_credential(server->db_path, "ck_replace", "replace-secret", 3) == 0,
+          "credential ck_replace not stored");
     CHECK(http_client_login(server, "ck_replace", "replace-secret", "machine-replace", "erin", &old_session) == 0,
-          "login 1");
-    CHECK(create_mapping(server->db_path, old_session.client_id, public_port) == 0, "mapping");
+          "login 1 (status and body above)");
+    CHECK(create_mapping(server->db_path, old_session.client_id, public_port) == 0,
+          "mapping of port %d not stored", public_port);
     CHECK(channel_login(server->control_port, &old_session, "control", &control1, reason, sizeof(reason)) == 1,
           "old control: %s", reason);
     CHECK(channel_login(server->control_port, &old_session, "data", &data1, reason, sizeof(reason)) == 1,
           "old data: %s", reason);
-    CHECK(nat_register(data1, old_session.client_name, public_port, 9) == 0, "old REGISTER");
-    CHECK(open_public_stream(data1, public_port, &public_fd) == 0, "public stream OPEN");
+    CHECK(TIMED(nat_register(data1, old_session.client_name, public_port, 9)) == 0,
+          "old REGISTER of port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(open_public_stream(data1, public_port, &public_fd)) == 0,
+          "no OPEN for a connection to port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
 
     CHECK(http_client_login(server, "ck_replace", "replace-secret", "machine-replace", "erin", &new_session) == 0,
-          "login 2");
-    CHECK(strcmp(new_session.client_name, old_session.client_name) == 0, "same machine user, same client");
+          "login 2 (status and body above)");
+    CHECK(strcmp(new_session.client_name, old_session.client_name) == 0,
+          "same machine user, same client: got %s after %s", new_session.client_name, old_session.client_name);
     CHECK(channel_login(server->control_port, &new_session, "control", &control2, reason, sizeof(reason)) == 1,
           "new session control: %s", reason);
-    CHECK(expect_channel_closed(control1, IO_TIMEOUT_MS) == 0, "old control was not closed");
-    CHECK(expect_channel_closed(data1, IO_TIMEOUT_MS) == 0, "old data was not closed");
-    CHECK(expect_socket_eof(public_fd, IO_TIMEOUT_MS) == 0, "old NAT stream was not closed");
+    CHECK(TIMED(expect_channel_closed(control1, IO_TIMEOUT_MS)) == 0,
+          "old control was not closed: %s", timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_closed(data1, IO_TIMEOUT_MS)) == 0,
+          "old data was not closed: %s", timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_socket_eof(public_fd, IO_TIMEOUT_MS)) == 0,
+          "old NAT stream was not closed: %s", timed_outcome(IO_TIMEOUT_MS));
 
-    CHECK(channel_login(server->control_port, &old_session, "data", &refused, reason, sizeof(reason)) == 0
+    CHECK(TIMED(channel_login(server->control_port, &old_session, "data", &refused, reason, sizeof(reason))) == 0
               && strstr(reason, "数据连接") != NULL,
-          "old session attached a data connection, got: %s", reason);
-    CHECK(channel_login(server->control_port, &old_session, "control", &refused, reason, sizeof(reason)) == 0
+          "old session attached a data connection; expected a 数据连接 refusal, got %s: %s", login_outcome(), reason);
+    CHECK(TIMED(channel_login(server->control_port, &old_session, "control", &refused, reason, sizeof(reason))) == 0
               && strstr(reason, "访问令牌无效") != NULL,
-          "old session reopened a control channel, got: %s", reason);
+          "old session reopened a control channel; expected a 访问令牌无效 refusal, got %s: %s",
+          login_outcome(), reason);
     CHECK(wait_session_status(server->db_path, old_session.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
           "old session not DISCONNECTED");
     char status[64];
     CHECK(session_status(server->db_path, new_session.session_id, status, sizeof(status)) == 0
               && strcmp(status, "NETTY_ONLINE") == 0,
-          "new session status %s", status);
+          "new session %lld is '%s', expected NETTY_ONLINE", new_session.session_id, status);
     CHECK(wait_connection_reason(server->db_path, old_session.client_name, "REPLACED_BY_NEW_LOGIN",
                                  IO_TIMEOUT_MS) == 0,
           "replaced control not recorded");
 
     CHECK(channel_login(server->control_port, &new_session, "data", &data2, reason, sizeof(reason)) == 1,
           "new session data: %s", reason);
-    CHECK(nat_register(data2, new_session.client_name, public_port, 9) == 0, "public port not released");
-    CHECK(expect_channel_alive(control2) == 0 && expect_channel_alive(data2) == 0, "new pair not served");
+    CHECK(TIMED(nat_register(data2, new_session.client_name, public_port, 9)) == 0,
+          "public port %d not released: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_alive(control2)) == 0, "new control not served: %s", timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_alive(data2)) == 0, "new data not served: %s", timed_outcome(IO_TIMEOUT_MS));
     close_fd(&control2);
     close_fd(&data2);
     close_fd(&control1);
@@ -1157,30 +1277,53 @@ static int test_dead_channel_is_cleaned_up(test_server *server)
     char reason[256];
     runtime_session dead, fresh;
     int control = -1, data = -1;
-    CHECK(create_credential(server->db_path, "ck_idle", "idle-secret", 2) == 0, "credential");
-    CHECK(http_client_login(server, "ck_idle", "idle-secret", "machine-idle", "frank", &dead) == 0, "login 1");
+    CHECK(create_credential(server->db_path, "ck_idle", "idle-secret", 2) == 0, "credential ck_idle not stored");
+    CHECK(http_client_login(server, "ck_idle", "idle-secret", "machine-idle", "frank", &dead) == 0,
+          "login 1 (status and body above)");
     CHECK(channel_login(server->control_port, &dead, "control", &control, reason, sizeof(reason)) == 1,
           "control: %s", reason);
     CHECK(channel_login(server->control_port, &dead, "data", &data, reason, sizeof(reason)) == 1,
           "data: %s", reason);
-    CHECK(admin_client_online(server, dead.client_name) == 1, "client not online while connected");
+    int online = admin_client_online(server, dead.client_name);
+    CHECK(online == 1, "client not online while connected: management view online=%s", online_text(online));
 
     /* From here on the client sends nothing, exactly like a peer that vanished. */
-    CHECK(expect_channel_closed(control, 15000) == 0, "silent control was not closed by the idle timeout");
-    CHECK(expect_channel_closed(data, 15000) == 0, "silent data was not closed");
+    CHECK(TIMED(expect_channel_closed(control, 15000)) == 0,
+          "silent control was not closed by the 5 s idle timeout: %s", timed_outcome(15000));
+    CHECK(TIMED(expect_channel_closed(data, 15000)) == 0, "silent data was not closed: %s", timed_outcome(15000));
     CHECK(wait_session_status(server->db_path, dead.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
           "dead session still online");
     CHECK(wait_connection_reason(server->db_path, dead.client_name, "IDLE_TIMEOUT", IO_TIMEOUT_MS) == 0,
           "idle timeout not recorded");
-    CHECK(admin_client_online(server, dead.client_name) == 0, "dead channel keeps the client online");
+    online = admin_client_online(server, dead.client_name);
+    CHECK(online == 0, "dead channel keeps the client online: management view online=%s", online_text(online));
 
     close_fd(&control);
     close_fd(&data);
-    CHECK(http_client_login(server, "ck_idle", "idle-secret", "machine-idle", "frank", &fresh) == 0, "login 2");
+    CHECK(http_client_login(server, "ck_idle", "idle-secret", "machine-idle", "frank", &fresh) == 0,
+          "login 2 (status and body above)");
     CHECK(channel_login(server->control_port, &fresh, "control", &control, reason, sizeof(reason)) == 1,
           "the dead channel still blocks the machine user: %s", reason);
     close_fd(&control);
     return 0;
+}
+
+/* The last "[server] stopped: ..." line of the server log, or a note that there is none. */
+static void server_stopped_line(const test_server *server, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "no \"[server] stopped:\" line in %s", server->log_path);
+    FILE *log = fopen(server->log_path, "r");
+    if (log == NULL) {
+        return;
+    }
+    char line[1024];
+    while (fgets(line, sizeof(line), log) != NULL) {
+        if (strncmp(line, "[server] stopped:", strlen("[server] stopped:")) == 0) {
+            line[strcspn(line, "\n")] = '\0';
+            snprintf(out, out_len, "%s", line);
+        }
+    }
+    fclose(log);
 }
 
 /*
@@ -1193,56 +1336,163 @@ static int test_sigterm_closes_channels_before_exit(test_server *server, runtime
     char reason[256];
     int control = -1, data = -1, public_fd = -1, pre_auth = -1;
     int public_port = pick_free_port();
-    CHECK(create_credential(server->db_path, "ck_shutdown", "shutdown-secret", 2) == 0, "credential");
+    CHECK(public_port > 0, "no free port for the public mapping");
+    CHECK(create_credential(server->db_path, "ck_shutdown", "shutdown-secret", 2) == 0,
+          "credential ck_shutdown not stored");
     CHECK(http_client_login(server, "ck_shutdown", "shutdown-secret", "machine-shutdown", "gina", runtime) == 0,
-          "http login");
-    CHECK(create_mapping(server->db_path, runtime->client_id, public_port) == 0, "mapping");
+          "http login (status and body above)");
+    CHECK(create_mapping(server->db_path, runtime->client_id, public_port) == 0,
+          "mapping of port %d not stored", public_port);
     CHECK(channel_login(server->control_port, runtime, "control", &control, reason, sizeof(reason)) == 1,
           "control: %s", reason);
     CHECK(channel_login(server->control_port, runtime, "data", &data, reason, sizeof(reason)) == 1,
           "data: %s", reason);
-    CHECK(nat_register(data, runtime->client_name, public_port, 9) == 0, "REGISTER");
-    CHECK(open_public_stream(data, public_port, &public_fd) == 0, "public stream OPEN");
-    CHECK(expect_channel_alive(control) == 0, "control idle in its read loop");
+    CHECK(TIMED(nat_register(data, runtime->client_name, public_port, 9)) == 0,
+          "REGISTER of port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(open_public_stream(data, public_port, &public_fd)) == 0,
+          "no OPEN for a connection to port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    CHECK(TIMED(expect_channel_alive(control)) == 0, "control not idle in its read loop: %s",
+          timed_outcome(IO_TIMEOUT_MS));
     pre_auth = connect_local(server->control_port);
-    CHECK(pre_auth >= 0, "pre-auth connection");
+    CHECK(pre_auth >= 0, "pre-auth connection to control port %d: %s", server->control_port, strerror(errno));
 
-    CHECK(kill(server->pid, SIGTERM) == 0, "SIGTERM");
-    CHECK(expect_channel_closed(control, 10000) == 0, "control not closed at shutdown");
-    CHECK(expect_channel_closed(data, 10000) == 0, "data not closed at shutdown");
-    CHECK(expect_socket_eof(public_fd, 10000) == 0, "NAT stream not closed at shutdown");
-    CHECK(expect_socket_eof(pre_auth, 10000) == 0, "pre-auth connection not closed at shutdown");
-    int exit_status = server_stop(server, 20000);
-    CHECK(exit_status == 0, "server exit status %d", exit_status);
+    /* Each wait below ends as soon as its event happens; only the bound is generous. */
+    long long sigterm_at = monotonic_ms();
+    CHECK(kill(server->pid, SIGTERM) == 0, "SIGTERM to pid %d: %s", (int)server->pid, strerror(errno));
+    CHECK(TIMED(expect_channel_closed(control, SHUTDOWN_TIMEOUT_MS)) == 0,
+          "control not closed at shutdown: %s (%lld ms after SIGTERM)", timed_outcome(SHUTDOWN_TIMEOUT_MS),
+          monotonic_ms() - sigterm_at);
+    CHECK(TIMED(expect_channel_closed(data, SHUTDOWN_TIMEOUT_MS)) == 0,
+          "data not closed at shutdown: %s (%lld ms after SIGTERM)", timed_outcome(SHUTDOWN_TIMEOUT_MS),
+          monotonic_ms() - sigterm_at);
+    CHECK(TIMED(expect_socket_eof(public_fd, SHUTDOWN_TIMEOUT_MS)) == 0,
+          "NAT stream not closed at shutdown: %s (%lld ms after SIGTERM)", timed_outcome(SHUTDOWN_TIMEOUT_MS),
+          monotonic_ms() - sigterm_at);
+    CHECK(TIMED(expect_socket_eof(pre_auth, SHUTDOWN_TIMEOUT_MS)) == 0,
+          "pre-auth connection not closed at shutdown: %s (%lld ms after SIGTERM)",
+          timed_outcome(SHUTDOWN_TIMEOUT_MS), monotonic_ms() - sigterm_at);
+    /* Waits for the exit; the SIGTERM server_stop sends again stays blocked, the server takes one. */
+    int exit_status = server_stop(server, SHUTDOWN_TIMEOUT_MS);
+    char exit_text[160];
+    CHECK(exit_status == 0, "server did not shut down cleanly: %s, %lld ms after SIGTERM",
+          describe_server_exit(exit_status, exit_text, sizeof(exit_text)), monotonic_ms() - sigterm_at);
 
-    char status[64];
-    CHECK(session_status(server->db_path, runtime->session_id, status, sizeof(status)) == 0
-              && strcmp(status, "DISCONNECTED") == 0,
-          "session left %s by the shutdown", status);
+    /* The process is gone, so everything it was going to write is in the database. */
+    char status[64] = "";
+    int status_rc = session_status(server->db_path, runtime->session_id, status, sizeof(status));
+    CHECK(status_rc == 0 && strcmp(status, "DISCONNECTED") == 0,
+          "session %lld is %s after the shutdown, expected DISCONNECTED", runtime->session_id,
+          status_rc == 0 ? status : (status_rc == 1 ? "missing" : "unreadable"));
     CHECK(wait_connection_reason(server->db_path, runtime->client_name, "SERVER_SHUTDOWN", 0) == 0,
-          "control record not stamped SERVER_SHUTDOWN");
-    char open_records[32];
+          "control record not stamped SERVER_SHUTDOWN (the client's records are listed above)");
+    char open_records[512] = "";
     CHECK(db_scalar(server->db_path,
-                    "SELECT COUNT(*) FROM connection_record WHERE disconnected_at IS NULL OR disconnected_at = ''",
+                    "SELECT COUNT(*) || ' (' || COALESCE(group_concat(id || ':' || client_name, ', '), 'none') || ')'"
+                    " FROM connection_record WHERE disconnected_at IS NULL OR disconnected_at = ''",
                     NULL, 0, open_records, sizeof(open_records)) == 0
-              && strcmp(open_records, "0") == 0,
-          "%s connection record(s) left open", open_records);
-    FILE *log = fopen(server->log_path, "r");
-    int drained = 0;
-    if (log != NULL) {
-        char line[1024];
-        while (fgets(line, sizeof(line), log) != NULL) {
-            if (strstr(line, "[server] stopped: 0 connection(s) unfinished") != NULL) {
-                drained = 1;
-            }
-        }
-        fclose(log);
-    }
-    CHECK(drained, "channels did not all finish their own bookkeeping before the process exited");
+              && strcmp(open_records, "0 (none)") == 0,
+          "connection records left open after the shutdown: %s, expected none", open_records);
+    char stopped[1100];
+    server_stopped_line(server, stopped, sizeof(stopped));
+    CHECK(strncmp(stopped, "[server] stopped: 0 connection(s) unfinished",
+                  strlen("[server] stopped: 0 connection(s) unfinished")) == 0,
+          "channels did not all finish their own bookkeeping before the process exited: %s", stopped);
     close_fd(&control);
     close_fd(&data);
     close_fd(&public_fd);
     close_fd(&pre_auth);
+    return 0;
+}
+
+/*
+ * Starts the server as server_start does, but sends SIGTERM the instant its admin port accepts a
+ * connection. The admin port opens after the control listener, so that is the earliest moment a
+ * readiness probe can call the server up, and server_start's 50 ms probe can land there too on a
+ * busy runner. Returns server_stop's result for the exit.
+ */
+static int sigterm_at_first_accept(test_server *server, long long *accepted_after_ms)
+{
+    *accepted_after_ms = -1;
+    server->control_port = pick_free_port();
+    server->admin_port = pick_free_port();
+    if (server->control_port <= 0 || server->admin_port <= 0 || server->control_port == server->admin_port) {
+        fprintf(stderr, "no two distinct free ports (control %d, admin %d)\n", server->control_port,
+                server->admin_port);
+        return -2;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork: %s\n", strerror(errno));
+        return -2;
+    }
+    if (pid == 0) {
+        char control_port[16];
+        char admin_port[16];
+        snprintf(control_port, sizeof(control_port), "%d", server->control_port);
+        snprintf(admin_port, sizeof(admin_port), "%d", server->admin_port);
+        setenv("SPECUS_ENV", "dev", 1);
+        setenv("SPECUS_DATABASE_PATH", server->db_path, 1);
+        setenv("SPECUS_DB_SEED_DEMO_CLIENT", "1", 1);
+        setenv("SPECUS_NETTY_PORT", control_port, 1);
+        setenv("SPECUS_NETTY_BIND_ADDRESS", "127.0.0.1", 1);
+        setenv("SPECUS_ADMIN_PORT", admin_port, 1);
+        setenv("SPECUS_AUTH_USERNAME", ADMIN_USERNAME, 1);
+        setenv("SPECUS_AUTH_PASSWORD", ADMIN_PASSWORD, 1);
+        setenv("SPECUS_AUTH_JWT_SECRET", ADMIN_JWT_SECRET, 1);
+        int log = open(server->log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (log >= 0) {
+            dup2(log, STDOUT_FILENO);
+            dup2(log, STDERR_FILENO);
+            close(log);
+        }
+        execl(server_binary, server_binary, (char *)NULL);
+        _exit(127);
+    }
+    server->pid = pid;
+    long long started = monotonic_ms();
+    /* No sleep between attempts: the point is to probe as early as anything could. */
+    for (;;) {
+        int wait_status = 0;
+        if (waitpid(pid, &wait_status, WNOHANG) == pid) {
+            server->pid = -1;
+            fprintf(stderr, "server exited during startup (wait status %d) before its admin port accepted\n",
+                    wait_status);
+            return -2;
+        }
+        if (monotonic_ms() - started >= SERVER_START_TIMEOUT_MS) {
+            fprintf(stderr, "admin port %d did not accept a connection within %d ms\n", server->admin_port,
+                    SERVER_START_TIMEOUT_MS);
+            return -2;
+        }
+        int admin = connect_local(server->admin_port);
+        if (admin >= 0) {
+            kill(pid, SIGTERM);
+            *accepted_after_ms = monotonic_ms() - started;
+            close_fd(&admin);
+            return server_stop(server, SHUTDOWN_TIMEOUT_MS);
+        }
+    }
+}
+
+/*
+ * A SIGTERM that arrives once the ports accept connections but before the accept loop runs still
+ * takes the graceful shutdown and exit status 0, not the 128+15 exit meant for a signal that lands
+ * before anything listens. Before the shutdown pipe was opened ahead of the listeners, this was the
+ * window that made the restarted server's SIGTERM exit 143 now and then.
+ */
+static int test_sigterm_at_first_accept_is_graceful(test_server *server)
+{
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        long long accepted_after_ms = -1;
+        int exit_status = sigterm_at_first_accept(server, &accepted_after_ms);
+        char exit_text[160];
+        CHECK(exit_status != -2, "attempt %d: the server never accepted a connection (see above)", attempt);
+        CHECK(exit_status == 0, "attempt %d: SIGTERM sent as the admin port first accepted (%lld ms after start) "
+              "did not shut the server down cleanly: %s", attempt, accepted_after_ms,
+              describe_server_exit(exit_status, exit_text, sizeof(exit_text)));
+    }
     return 0;
 }
 
@@ -1252,23 +1502,29 @@ static int test_restart_closes_leftover_state(test_server *server, const runtime
     long long record_id = 0;
     CHECK(st_storage_mark_client_session_online(server->db_path, runtime->session_id, "killed-channel",
                                                 "127.0.0.1:1", "2026-01-01T00:00:00Z") == 0,
-          "leftover online session");
+          "could not mark session %lld online as a leftover", runtime->session_id);
     CHECK(st_storage_record_connection_detail_with_tenant_and_id(server->db_path, "default", runtime->client_id,
                                                                  runtime->client_name, NULL, "127.0.0.1:1", 1,
                                                                  NULL, NULL, "2026-01-01T00:00:00Z", NULL,
                                                                  &record_id) == 0,
-          "leftover open connection record");
-    CHECK(server_start(server) == 0, "restart");
-    char status[64];
-    CHECK(session_status(server->db_path, runtime->session_id, status, sizeof(status)) == 0
-              && strcmp(status, "DISCONNECTED") == 0,
-          "leftover session still %s after restart", status);
-    char reason[64];
+          "could not store a leftover open connection record");
+    CHECK(server_start(server) == 0, "restart: the server did not come up (its startup error, if any, is above)");
+    /* Startup closes leftovers before it opens a port, so they are closed once server_start returns. */
+    char status[64] = "";
+    int status_rc = session_status(server->db_path, runtime->session_id, status, sizeof(status));
+    CHECK(status_rc == 0 && strcmp(status, "DISCONNECTED") == 0,
+          "leftover session %lld is %s after the restart, expected DISCONNECTED", runtime->session_id,
+          status_rc == 0 ? status : (status_rc == 1 ? "missing" : "unreadable"));
+    char reason[64] = "";
     CHECK(db_scalar(server->db_path, "SELECT COALESCE(disconnect_reason, '') FROM connection_record WHERE id = ?",
                     NULL, record_id, reason, sizeof(reason)) == 0
               && strcmp(reason, "SERVER_RESTARTED") == 0,
-          "leftover record reason '%s'", reason);
-    CHECK(server_stop(server, 20000) == 0, "second shutdown");
+          "leftover connection record %lld has disconnect reason '%s' after the restart, expected SERVER_RESTARTED",
+          record_id, reason);
+    int exit_status = server_stop(server, SHUTDOWN_TIMEOUT_MS);
+    char exit_text[160];
+    CHECK(exit_status == 0, "SIGTERM to the restarted server: %s",
+          describe_server_exit(exit_status, exit_text, sizeof(exit_text)));
     return 0;
 }
 
@@ -1306,14 +1562,15 @@ static int run_on_fresh_server(const char *name, server_scenario scenario, const
  */
 static int test_replayed_login_is_rejected(test_server *server)
 {
-    CHECK(create_credential(server->db_path, "ck_replay", "replay-secret", 2) == 0, "credential");
+    CHECK(create_credential(server->db_path, "ck_replay", "replay-secret", 2) == 0, "credential ck_replay not stored");
     char body[2048];
     signed_login_body("ck_replay", "replay-secret", "machine-replay", "mallory", body, sizeof(body));
     int status = 0;
     char *response = NULL;
     CHECK(http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) == 0
           && status == 200 && strstr(response, "\"accessToken\":\"cs_") != NULL,
-          "first login: status %d", status);
+          "first login answered %d, expected 200 with a cs_ access token: %s", status,
+          response == NULL ? "(no response)" : response);
     free(response);
     response = NULL;
     int replay_ok = http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL,
@@ -1325,16 +1582,16 @@ static int test_replayed_login_is_rejected(test_server *server)
         fprintf(stderr, "replayed login answered %d: %s\n", status, response == NULL ? "" : response);
     }
     free(response);
-    CHECK(replay_ok, "replayed login was not rejected");
+    CHECK(replay_ok, "replayed login was not rejected with 400 客户端签名 nonce 已使用 (its answer is above)");
     char sessions[32] = "";
     CHECK(db_scalar(server->db_path,
                     "SELECT COUNT(*) FROM specus_client_session WHERE machine_fingerprint = ?",
                     "machine-replay", 0, sessions, sizeof(sessions)) == 0
           && strcmp(sessions, "1") == 0,
-          "replay minted a session: %s session(s)", sessions);
+          "replay minted a session: %s session(s), expected 1", sessions);
     runtime_session fresh;
     CHECK(http_client_login(server, "ck_replay", "replay-secret", "machine-replay", "mallory", &fresh) == 0,
-          "a freshly signed login after the replay");
+          "a freshly signed login after the replay (status and body above)");
     return 0;
 }
 
@@ -1352,7 +1609,8 @@ static int scenario_shutdown_and_restart(test_server *server)
 {
     runtime_session runtime;
     return test_sigterm_closes_channels_before_exit(server, &runtime)
-        || test_restart_closes_leftover_state(server, &runtime);
+        || test_restart_closes_leftover_state(server, &runtime)
+        || test_sigterm_at_first_accept_is_graceful(server);
 }
 
 int main(int argc, char **argv)
@@ -1362,6 +1620,8 @@ int main(int argc, char **argv)
         return 2;
     }
     server_binary = argv[1];
+    /* Line by line, so in a CI log each scenario's verdict follows its own failure details. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
     srand((unsigned int)wall_clock_ms());
 
