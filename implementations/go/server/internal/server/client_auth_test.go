@@ -84,6 +84,35 @@ func TestClientAuthLoginStoresTheEgressDomainTargetDeclaration(t *testing.T) {
 	}
 }
 
+// The connectivity check trusts RST metadata.failure only from a session that announced
+// clientHttpRouteCapabilities.version >= 1; the login keeps the announced version with the session.
+func TestClientAuthLoginKeepsTheHTTPRouteCapability(t *testing.T) {
+	app, ts := newAPIServer(t)
+	const (
+		apiKey = "ck_http_route_capability"
+		secret = "tenant-secret"
+	)
+	insertCredentialForTest(t, app, "tenant-a", "alice", apiKey, secret, 8)
+	cases := []struct {
+		name        string
+		environment map[string]any
+		want        int
+	}{
+		{"declared", map[string]any{"clientHttpRouteCapabilities": map[string]any{"version": 1}}, 1},
+		{"zero", map[string]any{"clientHttpRouteCapabilities": map[string]any{"version": 0}}, 0},
+		{"negative", map[string]any{"clientHttpRouteCapabilities": map[string]any{"version": -3}}, 0},
+		{"absent", map[string]any{}, 0},
+	}
+	for i, tc := range cases {
+		machine := "machine-http-route-" + strconv.Itoa(i)
+		decoded := clientAuthLoginWithEnvironmentForTest(t, ts.URL, apiKey, secret, machine, "alice", tc.environment)
+		session, ok := app.clientAuth.Find(decoded.ClientSessionID, decoded.AccessToken)
+		if !ok || session.HTTPRouteCapability != tc.want {
+			t.Errorf("%s: session %v capability %d, want %d", tc.name, ok, session.HTTPRouteCapability, tc.want)
+		}
+	}
+}
+
 func TestClientAuthAdvertisesTLSWhenTerminatedUpstream(t *testing.T) {
 	cfg := config.Default()
 	cfg.TLS.Mode = "disabled"

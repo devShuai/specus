@@ -730,7 +730,7 @@ public sealed class ManagementMutationService
         return normalized;
     }
 
-    private static string RequireTargetBaseUrl(string? targetBaseUrl)
+    internal static string RequireTargetBaseUrl(string? targetBaseUrl)
     {
         if (string.IsNullOrWhiteSpace(targetBaseUrl))
         {

@@ -205,6 +205,33 @@ func (s *HTTPStream) Reset(code uint32, reason string) {
 	s.Close()
 }
 
+// Abandon ends an exchange whose response body nobody will read -- the connectivity check once the
+// response head is in. The stream is reset unless both directions already ended (request FIN sent,
+// response FIN or RST received); either way it is released without granting further receive credit,
+// so DATA still in flight is dropped and never answered with WINDOW_UPDATE.
+func (s *HTTPStream) Abandon(code uint32, reason string) {
+	s.windowMu.Lock()
+	finished := s.requestEnded && s.terminalQueued
+	s.windowMu.Unlock()
+	if finished {
+		s.Close()
+		return
+	}
+	s.Reset(code, reason)
+}
+
+// ResponseStatus reads statusCode from a response head returned by WaitResponseHead.
+func ResponseStatus(head map[string]any) (int, bool) { return asInt(head, "statusCode") }
+
+// HTTPRouteCapability is environment.clientHttpRouteCapabilities.version of the login session that
+// owns the connection this stream runs on. RST metadata.failure is trusted only from version >= 1.
+func (s *HTTPStream) HTTPRouteCapability() int {
+	if s.conn == nil {
+		return 0
+	}
+	return s.conn.HTTPRouteCapability()
+}
+
 // Close releases the stream without emitting another wire frame.
 func (s *HTTPStream) Close() {
 	s.once.Do(func() {

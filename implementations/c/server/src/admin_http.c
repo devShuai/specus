@@ -251,6 +251,29 @@ void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler h
     pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
 }
 
+static pthread_mutex_t admin_connectivity_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_connectivity_checker *admin_connectivity_checker;
+
+void st_admin_set_connectivity_device(const st_connectivity_device *device)
+{
+    st_connectivity_checker *checker = device == NULL ? NULL : st_connectivity_checker_new(device);
+    pthread_mutex_lock(&admin_connectivity_lock);
+    /*
+     * A replaced checker is deliberately not freed: a check may still run on it. The server sets
+     * its device once at startup; only tests replace it.
+     */
+    admin_connectivity_checker = checker;
+    pthread_mutex_unlock(&admin_connectivity_lock);
+}
+
+static st_connectivity_checker *admin_current_connectivity_checker(void)
+{
+    pthread_mutex_lock(&admin_connectivity_lock);
+    st_connectivity_checker *checker = admin_connectivity_checker;
+    pthread_mutex_unlock(&admin_connectivity_lock);
+    return checker;
+}
+
 static void admin_notify_peer_mesh_refresh(const char *tenant_id)
 {
     pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
@@ -2226,6 +2249,20 @@ static int build_database_client_auth_login_response(const char *database_path,
     /* Stored with the session so the egress-catalog can tell consumers which egress resolves names. */
     int client_egress_domain_targets = st_egress_declares_domain_targets(egress_caps_raw,
                                                                          client_egress_version);
+    /*
+     * From version 1 the client classifies an HTTP stream RST in metadata.failure; the
+     * connectivity check trusts that only from such a session (service-connectivity-check.md 6).
+     */
+    int client_http_route_version = 0;
+    char *http_route_caps_raw = environment_raw == NULL
+        ? NULL : st_json_get_top_level_raw(environment_raw, "clientHttpRouteCapabilities");
+    if (http_route_caps_raw != NULL) {
+        (void)st_json_get_int(http_route_caps_raw, "version", &client_http_route_version);
+        free(http_route_caps_raw);
+    }
+    if (client_http_route_version < 0) {
+        client_http_route_version = 0;
+    }
     (void)st_json_get_int(peer_caps, "version", &peer_service_discovery_version);
     if (peer_service_discovery_version < 1) peer_service_discovery_version = 0;
     else if (peer_service_discovery_version > 2) peer_service_discovery_version = 2;
@@ -2447,6 +2484,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     session.peer_service_discovery_version = peer_service_discovery_version;
     session.client_egress_version = client_egress_version;
     session.client_egress_domain_targets = client_egress_domain_targets;
+    session.client_http_route_version = client_http_route_version;
     snprintf(session.peer_service_applications, sizeof(session.peer_service_applications),
              "%s", peer_service_applications);
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", now_text);
@@ -6789,6 +6827,140 @@ static int handle_http_route_update(const st_admin_context *context, long long i
     return build_http_route_response(&route, 200, "OK", out, out_len);
 }
 
+#define ADMIN_CONNECTIVITY_PREFIX "/api/admin/http-routes/"
+#define ADMIN_CONNECTIVITY_SUFFIX "/connectivity-check"
+
+/*
+ * Whether path is /api/admin/http-routes/{routeId}/connectivity-check, copying the {routeId}
+ * segment as received: a malformed id is still this endpoint and answers 404 after the body check.
+ */
+static int admin_connectivity_check_path(const char *path, char *route_id, size_t route_id_len)
+{
+    size_t prefix_len = strlen(ADMIN_CONNECTIVITY_PREFIX);
+    size_t suffix_len = strlen(ADMIN_CONNECTIVITY_SUFFIX);
+    if (path == NULL || strncmp(path, ADMIN_CONNECTIVITY_PREFIX, prefix_len) != 0) {
+        return 0;
+    }
+    size_t path_len = strcspn(path, "?");
+    if (path_len < prefix_len + suffix_len + 1U
+        || strncmp(path + path_len - suffix_len, ADMIN_CONNECTIVITY_SUFFIX, suffix_len) != 0) {
+        return 0;
+    }
+    size_t segment_len = path_len - prefix_len - suffix_len;
+    if (memchr(path + prefix_len, '/', segment_len) != NULL) {
+        return 0;
+    }
+    if (route_id != NULL && route_id_len > 0U) {
+        snprintf(route_id, route_id_len, "%.*s", (int)(segment_len < route_id_len ? segment_len : route_id_len - 1U),
+                 path + prefix_len);
+    }
+    return 1;
+}
+
+static int write_connectivity_response(char *out, size_t out_len, int status, int retry_after_seconds, const char *body)
+{
+    const char *reason = status == 200 ? "OK"
+        : status == 400 ? "Bad Request"
+        : status == 401 ? "Unauthorized"
+        : status == 404 ? "Not Found"
+        : status == 429 ? "Too Many Requests"
+        : status == 503 ? "Service Unavailable"
+        : "Internal Server Error";
+    char retry_after[48] = "";
+    if (retry_after_seconds > 0) {
+        snprintf(retry_after, sizeof(retry_after), "Retry-After: %d\r\n", retry_after_seconds);
+    }
+    if (body == NULL) {
+        body = "";
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: private, no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "%s"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           status,
+                           reason,
+                           retry_after,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/* The route as the caller may see it: absent, foreign and not-owned routes are all absent. */
+static int admin_connectivity_load_route(void *ctx, long long route_id, st_connectivity_route *out)
+{
+    const st_admin_context *context = (const st_admin_context *)ctx;
+    const char *database_path = admin_database_path();
+    if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        return ST_CONNECTIVITY_ROUTE_UNREADABLE;
+    }
+    st_storage_http_route route;
+    int found = 0;
+    if (st_storage_find_http_route_by_id(database_path, route_id, &route, &found) != 0) {
+        return ST_CONNECTIVITY_ROUTE_UNREADABLE;
+    }
+    if (!found) {
+        return ST_CONNECTIVITY_ROUTE_ABSENT;
+    }
+    st_storage_client client;
+    if (st_storage_get_client(database_path, route.client_id, &client) != 0) {
+        /* The route row joins its client, so a client that cannot be loaded is a read failure. */
+        return ST_CONNECTIVITY_ROUTE_UNREADABLE;
+    }
+    if (!admin_can_access_client(context, &client)) {
+        return ST_CONNECTIVITY_ROUTE_ABSENT;
+    }
+    out->id = route.id;
+    snprintf(out->tenant_id, sizeof(out->tenant_id), "%s", client.tenant_id);
+    snprintf(out->client_name, sizeof(out->client_name), "%s", client.client_name);
+    snprintf(out->route, sizeof(out->route), "%s", route.route);
+    snprintf(out->target_base_url, sizeof(out->target_base_url), "%s", route.target_base_url);
+    out->route_enabled = route.enabled;
+    out->client_enabled = client.enabled;
+    return ST_CONNECTIVITY_ROUTE_FOUND;
+}
+
+/*
+ * POST /api/admin/http-routes/{routeId}/connectivity-check (protocol/spec/service-connectivity-
+ * check.md). Visibility is that of PUT /api/admin/http-routes/{id}; every answer is private and
+ * uncacheable, and never names the target, the path, a status code or a client's reset reason.
+ */
+static int handle_http_route_connectivity_check(const st_admin_context *context,
+                                                const char *route_id,
+                                                const char *body,
+                                                size_t body_len,
+                                                char *out,
+                                                size_t out_len)
+{
+    st_connectivity_checker *checker = admin_current_connectivity_checker();
+    if (checker == NULL) {
+        return write_connectivity_response(out, out_len, 503, 1, "{\"code\":\"CHECK_UNAVAILABLE\"}");
+    }
+    st_connectivity_request request = {
+        .authenticated = context->authenticated,
+        .tenant_id = context->tenant_id,
+        .username = context->username,
+        .route_id = route_id,
+        .body = body,
+        .body_len = body == NULL ? 0U : body_len,
+    };
+    st_connectivity_response response;
+    if (st_connectivity_handle(checker, &request, admin_connectivity_load_route, (void *)context, &response) != 0) {
+        st_connectivity_response_free(&response);
+        return write_connectivity_response(out, out_len, 503, 1, "{\"code\":\"CHECK_UNAVAILABLE\"}");
+    }
+    int written = response.status == 401
+        ? write_connectivity_response(out, out_len, 401, 0, "{\"error\":\"missing or invalid bearer token\"}")
+        : write_connectivity_response(out, out_len, response.status, response.retry_after_seconds, response.body);
+    st_connectivity_response_free(&response);
+    return written;
+}
+
 static int handle_http_route_delete(const st_admin_context *context, long long id, char *out, size_t out_len)
 {
     const char *database_path = NULL;
@@ -8808,6 +8980,7 @@ static int st_admin_build_response_internal(const char *method,
     if (admin_path_requires_auth(method, path)) {
         /* Workbench answers are private, the shared layer's refusals included. */
         int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
+        int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
             /* Java's answers: refresh says 401 so the SPA signs in again, any other request 403. */
@@ -8824,11 +8997,15 @@ static int st_admin_build_response_internal(const char *method,
                 return write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
                                           "{\"error\":\"management user store unavailable\"}");
             }
-            if (auth_rc != 0) {
-                return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
-                                          ST_ADMIN_UNAUTHORIZED_BODY);
+            unauthorized = auth_rc != 0;
+        } else {
+            unauthorized = !allow_default_admin;
+        }
+        if (unauthorized) {
+            /* Every answer of the connectivity check is private, the 401 included. */
+            if (admin_connectivity_check_path(path, NULL, 0U)) {
+                return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
             }
-        } else if (!allow_default_admin) {
             return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
@@ -9026,6 +9203,11 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0
         && admin_parse_nested_path_id(path, "/api/admin/clients/", "/http-routes", &path_id) == 0) {
         return handle_http_route_create(&context, path_id, body, out, out_len);
+    }
+    char connectivity_route_id[32];
+    if (strcmp(method, "POST") == 0
+        && admin_connectivity_check_path(path, connectivity_route_id, sizeof(connectivity_route_id))) {
+        return handle_http_route_connectivity_check(&context, connectivity_route_id, body, body_len, out, out_len);
     }
     if (admin_parse_path_id(path, "/api/admin/http-routes/", &path_id) == 0) {
         if (strcmp(method, "PUT") == 0) {

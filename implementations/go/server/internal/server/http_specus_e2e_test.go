@@ -193,6 +193,19 @@ func loginHTTPTestChannels(
 	return controlConn, dataConn, dataReader
 }
 
+// loginHTTPTestChannelsWithCapability logs the demo client in as a session that announced
+// clientHttpRouteCapabilities.version = httpRouteCapability.
+func loginHTTPTestChannelsWithCapability(
+	t *testing.T,
+	app *App,
+	port int,
+	httpRouteCapability int,
+) (net.Conn, net.Conn, *bufio.Reader) {
+	t.Helper()
+	controlConn, _, dataConn, dataReader := loginHTTPTestChannelsAs(t, app, port, httpRouteCapability)
+	return controlConn, dataConn, dataReader
+}
+
 // loginHTTPTestChannelsWithControlReader also returns the reader that consumed the control login
 // response, so a test can keep reading NAT_CONTROL pushes without losing buffered bytes.
 func loginHTTPTestChannelsWithControlReader(
@@ -201,7 +214,18 @@ func loginHTTPTestChannelsWithControlReader(
 	port int,
 ) (net.Conn, *bufio.Reader, net.Conn, *bufio.Reader) {
 	t.Helper()
+	return loginHTTPTestChannelsAs(t, app, port, 0)
+}
+
+func loginHTTPTestChannelsAs(
+	t *testing.T,
+	app *App,
+	port int,
+	httpRouteCapability int,
+) (net.Conn, *bufio.Reader, net.Conn, *bufio.Reader) {
+	t.Helper()
 	session := issueClientSession(t, app, DemoClientName)
+	app.clientAuth.SetHTTPRouteCapability(session.ID, httpRouteCapability)
 	login := protocol.LoginRequest{
 		ClientName:      DemoClientName,
 		ClientSessionID: session.ID,

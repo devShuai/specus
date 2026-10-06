@@ -147,6 +147,7 @@ describe("problem wording", () => {
   it("says no known problem is not reachability", () => {
     expect(NO_KNOWN_PROBLEM).toBe("未发现已知问题");
     expect(NO_KNOWN_PROBLEM_CAVEAT).toContain("这不代表服务可以访问");
+    expect(NO_KNOWN_PROBLEM_CAVEAT).toContain("连接检查");
   });
 
   it("counts the services in the titles that carry a number", () => {

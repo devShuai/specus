@@ -84,6 +84,11 @@ import {
   hasCompleteGithubClientDownloadSet,
   mergePreferredClientDownloads,
 } from "../lib/githubReleaseDownloads";
+import {
+  parseRetryAfter,
+  type ConnectivityCheckAnswer,
+  type ConnectivityCheckResult,
+} from "../lib/connectivityCheck";
 
 const ADMIN_PREFIX = "/api/admin";
 
@@ -186,6 +191,48 @@ export function recordWorkbenchOpenAsCaller(
   ref: WorkbenchRef,
 ): Promise<WorkbenchDocument | null> {
   return recordWorkbenchOpen(action, ref, { token: tokenStore.get() });
+}
+
+// checkHttpRouteConnectivity runs one connectivity check of a route. It is a POST with a JSON body so
+// that nothing but an explicit user action can start one (service-connectivity-check.md section 10).
+// Answers other than 200 come back as a refusal carrying the status, code and Retry-After, because the
+// page must tell "the server refused or is too old" apart from "the route has a problem".
+async function checkHttpRouteConnectivity(routeId: number, path?: string): Promise<ConnectivityCheckAnswer> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  const token = tokenStore.get();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const response = await fetch(`${ADMIN_PREFIX}/http-routes/${routeId}/connectivity-check`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(path && path !== "/" ? { path } : {}),
+    cache: "no-store",
+  });
+  if (response.status === 401) {
+    if (!unauthorizedHandled) {
+      unauthorizedHandled = true;
+      unauthorizedHandler?.();
+    }
+    throw new ApiError("登录已过期");
+  }
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+  if (response.status === 200 && body && typeof body === "object" && (body as { schemaVersion?: unknown }).schemaVersion === 1) {
+    return { kind: "result", result: body as ConnectivityCheckResult };
+  }
+  const code = body && typeof body === "object" && typeof (body as { code?: unknown }).code === "string"
+    ? (body as { code: string }).code
+    : null;
+  return {
+    kind: "refused",
+    refusal: { status: response.status, code, retryAfterSeconds: parseRetryAfter(response.headers.get("Retry-After")) },
+  };
 }
 
 // ---- auth endpoints (outside /api/admin) ----------------------------------------------
@@ -391,6 +438,7 @@ export const adminApi = {
   updateHttpRoute: (id: number, body: HttpRouteMutation) =>
     request<HttpRoute>(`/http-routes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteHttpRoute: (id: number) => request<null>(`/http-routes/${id}`, { method: "DELETE" }),
+  checkHttpRouteConnectivity: (id: number, path?: string) => checkHttpRouteConnectivity(id, path),
 
   listConnections: (query: ConnectionQuery) => {
     const params = new URLSearchParams();

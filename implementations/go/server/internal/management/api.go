@@ -17,6 +17,7 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/connectivity"
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
@@ -52,6 +53,7 @@ type API struct {
 	packageDirectory string
 	downloadLimiter  *publicDownloadRateLimiter
 	workbench        *workbench
+	connectivity     *connectivity.Checker
 	logger           *slog.Logger
 }
 
@@ -169,6 +171,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/clients/{id}/http-routes", a.requireAuth(a.handleCreateHTTPRoute))
 	mux.HandleFunc("PUT /api/admin/http-routes/{routeId}", a.requireAuth(a.handleUpdateHTTPRoute))
 	mux.HandleFunc("DELETE /api/admin/http-routes/{routeId}", a.requireAuth(a.handleDeleteHTTPRoute))
+	mux.HandleFunc("POST /api/admin/http-routes/{routeId}/connectivity-check",
+		noStore(a.requireAuth(a.handleHTTPRouteConnectivityCheck)))
 
 	mux.HandleFunc("GET /api/admin/connections", a.requireAuth(a.handleListConnections))
 	mux.HandleFunc("GET /api/admin/traffic", a.requireAuth(a.handleListTraffic))

@@ -246,7 +246,7 @@ export const SOURCE_LABELS: Record<ProblemSource, string> = {
 };
 
 export const NO_KNOWN_PROBLEM = "未发现已知问题";
-export const NO_KNOWN_PROBLEM_CAVEAT = "这不代表服务可以访问；需要确认时，请手动打开访问链接验证";
+export const NO_KNOWN_PROBLEM_CAVEAT = "这不代表服务可以访问；需要确认时，请对单个 HTTP 服务做连接检查";
 export const MULTI_INSTANCE_OFFLINE_CAVEAT =
   "多实例部署时，请求可能落到不持有该设备连接的实例，设备也会显示离线。";
 export const ATTENTION_NOTE = "原因未定：目录里没有这项服务，但从现有状态无法判断原因，不代表目标服务出错。";

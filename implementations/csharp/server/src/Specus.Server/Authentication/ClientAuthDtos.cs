@@ -59,6 +59,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("clientEgressCapabilities")]
     public ClientEgressCapabilities ClientEgressCapabilities { get; set; } = new();
 
+    [JsonPropertyName("clientHttpRouteCapabilities")]
+    public ClientHttpRouteCapabilities ClientHttpRouteCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -118,6 +121,21 @@ public sealed class ClientEgressCapabilities
 
     [JsonPropertyName("ipv6TargetCapable")]
     public bool Ipv6TargetCapable { get; set; }
+}
+
+/// <summary>
+/// HTTP route failure classification (protocol/spec/service-connectivity-check.md section 6.1).
+/// </summary>
+/// <remarks>
+/// Version 0 or absent is an older client: its HTTP stream resets carry free text only. From
+/// <see cref="Specus.Protocol.HttpRoute.HttpRouteFailure.CapabilityVersion"/> on, the client puts
+/// <c>failure</c> into the RST metadata of a stream it could not answer and never makes up a
+/// response head. The value is kept with the in-memory session, not persisted.
+/// </remarks>
+public sealed class ClientHttpRouteCapabilities
+{
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
 }
 
 
