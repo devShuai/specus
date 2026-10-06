@@ -3514,8 +3514,9 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
 
 static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
 {
+    /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
-                              "{\"id\":%lld,\"clientId\":%lld,\"clientName\":",
+                              "{\"id\":\"%lld\",\"clientId\":%lld,\"clientName\":",
                               item->id,
                               item->client_id);
     if (rc == 0) rc = admin_sb_append_json_string(builder, item->client_name);
