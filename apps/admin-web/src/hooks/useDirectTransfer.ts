@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PublicTransferIceConfig, TransferAttachment } from "../api/types";
 import {
   buildPeerRtcConfiguration,
@@ -15,6 +15,42 @@ import {
   encodeAppMessage,
   type AppPeerMessage,
 } from "../lib/appMessageProtocol";
+import { ChunkBitmap } from "../lib/chunkedResume/bitmap";
+import { fromHex, randomHex128, sha256 as sha256Digest, toHex } from "../lib/chunkedResume/bytes";
+import { isRecord, RECEIVER_BOUND_KINDS, SENDER_BOUND_KINDS, sendJson } from "../lib/chunkedResume/channel";
+import { hashChunks } from "../lib/chunkedResume/chunkHashes";
+import {
+  CHUNK_SIZE_DEFAULT,
+  MAX_RESUMABLE_BYTES,
+  MEMORY_LIMIT_BYTES,
+} from "../lib/chunkedResume/constants";
+import { maxFrameBytes } from "../lib/chunkedResume/frames";
+import { estimateStorage, openIndexedDbResumeStore } from "../lib/chunkedResume/indexedDbStore";
+import {
+  chunkLengthOf,
+  manifestFromHashes,
+  normalizeOfferedMimeType,
+  normalizeOfferedName,
+} from "../lib/chunkedResume/manifest";
+import {
+  isResumableFileMeta,
+  ReceiverController,
+  type ReceiverSnapshot,
+} from "../lib/chunkedResume/receiverController";
+import { sendResumable, type OpenedChannel } from "../lib/chunkedResume/resumableSend";
+import {
+  SenderError,
+  SenderRouter,
+  type OutgoingTransfer,
+} from "../lib/chunkedResume/senderController";
+import { SourceSizeMismatchError } from "../lib/chunkedResume/senderPlan";
+import {
+  copyBuffer,
+  MemoryResumeStore,
+  type ResumeStore,
+  type SendRecord,
+  type StorageMode,
+} from "../lib/chunkedResume/store";
 
 export interface DirectTransferSignalPayload {
   signalType?: "offer" | "answer" | "ice";
@@ -39,6 +75,8 @@ export interface DirectReceivingTransfer {
   mimeType: string;
   sizeBytes: number;
   receivedBytes: number;
+  /** Resumable transfers only: where verified chunks are kept. */
+  storage?: StorageMode;
 }
 
 export interface DirectPendingTransfer {
@@ -47,6 +85,40 @@ export interface DirectPendingTransfer {
   fileName: string;
   mimeType: string;
   sizeBytes: number;
+  /** Resumable offers: "persistent" writes to this browser's storage after the click. */
+  storage?: StorageMode;
+  /** Why a resumable offer can only be received in memory. */
+  memoryReason?: string;
+}
+
+/** An interrupted resumable receive kept in IndexedDB (or memory) and not active right now. */
+export interface DirectStoredReceive {
+  transferId: string;
+  sourcePeerId: string;
+  sourceName: string;
+  fileName: string;
+  sizeBytes: number;
+  receivedBytes: number;
+  expiresAt: number;
+  storage: StorageMode;
+}
+
+/** A resumable send this page knows about: running, paused, or restored after a reload. */
+export interface DirectOutgoingResume {
+  transferId: string;
+  fileName: string;
+  sizeBytes: number;
+  lastModified: number;
+  targetPeerId: string;
+  targetName: string;
+  ackedBytes: number;
+  expiresAt: number | null;
+  /** False after a reload: the user has to select the same file again. */
+  hasSource: boolean;
+  running: boolean;
+  /** Running outside the page's send queue (a resume the receiver asked for, or from the list). */
+  background: boolean;
+  persistent: boolean;
 }
 
 export interface DirectIncomingAttachment {
@@ -58,6 +130,10 @@ export interface DirectIncomingAttachment {
   direct: true;
   previewUrl: string;
   blob: Blob;
+  /** Resumable receives: the transfer id to mark saved once a download starts. */
+  resumeTransferId?: string;
+  /** Restored from this browser's storage after a reload. */
+  restored?: boolean;
 }
 
 export interface DirectTransferResult {
@@ -135,9 +211,52 @@ interface UseDirectTransferOptions {
   onStateChange: (state: DirectTransferPhase) => void;
   onProgress: (value: number) => void;
   onError: (message: string) => void;
+  /** Informational messages, e.g. a background resume that finished. */
+  onNotice?: (message: string) => void;
 }
 
-export const DEFAULT_DIRECT_MEMORY_LIMIT_BYTES = 128 * 1024 * 1024;
+export const DEFAULT_DIRECT_MEMORY_LIMIT_BYTES = MEMORY_LIMIT_BYTES;
+/** Device transfers up to this size are resumable; larger receives need persistent storage. */
+export const DIRECT_RESUMABLE_LIMIT_BYTES = MAX_RESUMABLE_BYTES;
+/**
+ * Pass as the abort reason when the user cancels a send: the transfer is abandoned, not paused.
+ * An AbortError, so fetch-based fallbacks sharing the signal still see a regular abort.
+ */
+export const DIRECT_SEND_USER_CANCEL: Error = new DOMException("文件发送已取消", "AbortError");
+
+/** Chunked resume needs WebCrypto and a secure context (§3); otherwise the legacy flow is used. */
+export function directResumeSupported(): boolean {
+  return typeof isSecureContext !== "undefined" && isSecureContext
+    && typeof crypto !== "undefined" && typeof crypto.subtle?.digest === "function";
+}
+
+/** Largest file this browser can offer for device transfer. */
+export function directSendLimitBytes(): number {
+  return directResumeSupported() ? DIRECT_RESUMABLE_LIMIT_BYTES : DEFAULT_DIRECT_MEMORY_LIMIT_BYTES;
+}
+
+const CAPACITY_REJECT_CODES = new Set([
+  "TOO_LARGE",
+  "PERSISTENCE_UNAVAILABLE",
+  "TOO_MANY_PARTIALS",
+  "PARTIAL_BYTES_LIMIT",
+  "INSUFFICIENT_STORAGE",
+  "LEGACY_TOO_LARGE",
+]);
+
+/**
+ * How the page should continue after sendDirect failed:
+ * next-transport (try relay), cloud (the receiver cannot hold the file; a link may work) or
+ * final (the user or the receiver decided, or the transfer is paused for a later resume).
+ */
+export function directSendFailureKind(error: unknown): "next-transport" | "cloud" | "final" {
+  if (error instanceof SenderError) {
+    if (error.failure === "retry" || error.failure === "restart") return "next-transport";
+    return error.code && CAPACITY_REJECT_CODES.has(error.code) ? "cloud" : "final";
+  }
+  if (error instanceof SourceSizeMismatchError) return "final";
+  return "next-transport";
+}
 const DEFAULT_RECEIVING_TRANSFER_LIMIT = 10;
 const MAX_PENDING_ICE_CANDIDATES = 256;
 const DIRECT_FILE_CHANNEL_OPEN_TIMEOUT_MS = 10_000;
@@ -173,11 +292,120 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const [pendingTransfers, setPendingTransfers] = useState<DirectPendingTransfer[]>([]);
   const [receivingTransfers, setReceivingTransfers] = useState<DirectReceivingTransfer[]>([]);
   const [peerTransportPaths, setPeerTransportPaths] = useState<Record<string, PeerTransportPath>>({});
+  // Chunked resume (protocol/spec/chunked-resume.md): receiver controller, sender sessions and
+  // the outgoing transfers this page can resume.
+  const [resumeSnapshot, setResumeSnapshot] = useState<ReceiverSnapshot>({ pending: [], entries: [] });
+  const [outgoingResumes, setOutgoingResumes] = useState<DirectOutgoingResume[]>([]);
+  const resumeStoreRef = useRef<Promise<ResumeStore | null> | null>(null);
+  const memoryResumeStoreRef = useRef<ResumeStore>(new MemoryResumeStore());
+  const receiverRef = useRef<ReceiverController | null>(null);
+  const senderRouterRef = useRef(new SenderRouter());
+  const outgoingRef = useRef<Map<string, OutgoingTransfer>>(new Map());
+  const outgoingByFileRef = useRef<WeakMap<Blob, string>>(new WeakMap());
+  const runningOutgoingRef = useRef<Map<string, { wake: () => void; background: boolean }>>(new Map());
+  const resumeRequestNoticesRef = useRef<Set<string>>(new Set());
+  const snapshotTimerRef = useRef<number | null>(null);
+  const outgoingViewTimerRef = useRef<number | null>(null);
+  const resumeRequestHandlerRef = useRef<(peerId: string, transferId: string) => void>(() => undefined);
+  const outgoingCancelHandlerRef = useRef<(transfer: OutgoingTransfer) => void>(() => undefined);
 
   optionsRef.current = options;
   iceConfigRef.current = options.iceConfig;
   activePeerIdsRef.current = new Set(options.peers.map((peer) => peer.peerId));
   connectionScopeRef.current = options.connectionScopeKey ?? "default";
+
+  const openResumeStore = useCallback((): Promise<ResumeStore | null> => {
+    if (!resumeStoreRef.current) {
+      resumeStoreRef.current = directResumeSupported() ? openIndexedDbResumeStore() : Promise.resolve(null);
+    }
+    return resumeStoreRef.current;
+  }, []);
+
+  const scheduleResumeSnapshot = useCallback(() => {
+    if (snapshotTimerRef.current !== null) return;
+    snapshotTimerRef.current = window.setTimeout(() => {
+      snapshotTimerRef.current = null;
+      if (receiverRef.current) setResumeSnapshot(receiverRef.current.snapshot());
+    }, 150);
+  }, []);
+
+  const refreshOutgoingView = useCallback((immediate = false) => {
+    const update = () => {
+      outgoingViewTimerRef.current = null;
+      setOutgoingResumes([...outgoingRef.current.values()]
+        .filter((transfer) => transfer.resumeToken !== null)
+        .map((transfer) => {
+          const running = runningOutgoingRef.current.get(transfer.transferId);
+          return {
+            transferId: transfer.transferId,
+            fileName: transfer.manifest.fileName,
+            sizeBytes: transfer.manifest.sizeBytes,
+            lastModified: transfer.lastModified,
+            targetPeerId: transfer.targetPeerId,
+            targetName: transfer.targetName,
+            ackedBytes: ackedBytesOf(transfer),
+            expiresAt: transfer.expiresAt,
+            hasSource: transfer.source !== null,
+            running: running !== undefined,
+            background: running?.background ?? false,
+            persistent: transfer.storage === "persistent",
+          };
+        }));
+    };
+    if (immediate) {
+      if (outgoingViewTimerRef.current !== null) window.clearTimeout(outgoingViewTimerRef.current);
+      update();
+    } else if (outgoingViewTimerRef.current === null) {
+      outgoingViewTimerRef.current = window.setTimeout(update, 250);
+    }
+  }, []);
+
+  const getReceiver = useCallback((): ReceiverController => {
+    if (!receiverRef.current) {
+      receiverRef.current = new ReceiverController({
+        openPersistentStore: openResumeStore,
+        memoryStore: memoryResumeStoreRef.current,
+        estimate: estimateStorage,
+        now: () => Date.now(),
+        digest: sha256Digest,
+        randomToken: randomHex128,
+        // Auto-accept is memory mode only; anything persistent waits for a click (§6).
+        autoAccept: () => !optionsRef.current.receiveConfirmationRequired,
+        senderAllowed: (peerId) => activePeerIdsRef.current.has(peerId)
+          && optionsRef.current.canReceiveFromPeer?.(peerId, "file") !== false,
+        peerName: (peerId) => optionsRef.current.peers.find((peer) => peer.peerId === peerId)?.displayName ?? "",
+        setTimer: (callback, ms) => window.setTimeout(callback, ms),
+        clearTimer: (handle) => {
+          if (typeof handle === "number") window.clearTimeout(handle);
+        },
+        onChange: scheduleResumeSnapshot,
+        onComplete: (file) => {
+          const mimeType = effectiveMimeType(file.fileName, file.mimeType);
+          const blob = file.blob.type === mimeType ? file.blob : new Blob([file.blob], { type: mimeType });
+          const previewUrl = URL.createObjectURL(blob);
+          optionsRef.current.onPreviewUrl(previewUrl);
+          const attachment = directAttachment(file.transferId, file.fileName, mimeType, file.sizeBytes, null);
+          optionsRef.current.onIncoming({
+            sourcePeerId: file.sourcePeerId,
+            attachment,
+            objectId: attachment.objectId,
+            downloadUrl: previewUrl,
+            downloadExpiresAt: null,
+            direct: true,
+            previewUrl,
+            blob,
+            resumeTransferId: file.storage === "persistent" ? file.transferId : undefined,
+            restored: file.restored,
+          });
+          if (file.restored) {
+            optionsRef.current.onNotice?.(`已从本机存储恢复未保存的文件：${file.fileName}`);
+          }
+        },
+        onError: (message) => optionsRef.current.onError(message),
+      });
+    }
+    return receiverRef.current;
+  }, [openResumeStore, scheduleResumeSnapshot]);
 
   const isCurrentDataChannel = useCallback((peerId: string, channel: RTCDataChannel, scopeKey: string) => {
     const metadata = dataChannelMetadataRef.current.get(channel);
@@ -290,6 +518,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     dataChannelMetadataRef.current = new WeakMap();
     directAppReassemblersRef.current = new WeakMap();
     for (const channel of channels) {
+      // Resumable state survives: sessions end, records stay for a later resume.
+      receiverRef.current?.channelClosed(channel);
+      senderRouterRef.current.channelClosed(channel);
       channel.onmessage = null;
       channel.onclose = null;
       channel.close();
@@ -398,6 +629,8 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     dataChannelMetadataRef.current.delete(channel);
     rejectDirectAckWaiters((waiter) => waiter.channel === channel, reason);
     rejectAppAckWaiters((waiter) => waiter.channel === channel, reason);
+    receiverRef.current?.channelClosed(channel);
+    senderRouterRef.current.channelClosed(channel);
 
     const activeTransferKey = directChannelTransfersRef.current.get(channel);
     directChannelTransfersRef.current.delete(channel);
@@ -505,6 +738,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
     const request = pendingDirectRequestsRef.current.get(transferKey);
     if (!request) {
+      if (receiverRef.current?.snapshot().pending.some((item) => item.transferId === transferId)) {
+        void receiverRef.current.accept(transferId);
+      }
       return;
     }
     startIncomingTransfer(request, transferKey);
@@ -514,6 +750,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
     const request = pendingDirectRequestsRef.current.get(transferKey);
     if (!request) {
+      receiverRef.current?.reject(transferId);
       return;
     }
     sendDirectReject(request.channel, transferId, "对方已拒绝接收");
@@ -521,6 +758,11 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   }, [removePendingTransfer, sendDirectReject]);
 
   const cancelIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
+    if (receiverRef.current?.snapshot().entries.some((item) => item.transferId === transferId)) {
+      // Abandoning a resumable receive deletes its local data and tells the sender.
+      void receiverRef.current.abandon(transferId);
+      return;
+    }
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
     let channel: RTCDataChannel | null = null;
     for (const [candidate, key] of directChannelTransfersRef.current) {
@@ -642,7 +884,16 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     if (!isCurrentDataChannel(sourcePeerId, channel, scopeKey)) {
       return;
     }
-    let message: {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (!isRecord(parsed)) {
+      return;
+    }
+    const message = parsed as {
       kind?: string;
       transferId?: string;
       fileName?: string;
@@ -651,9 +902,53 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       sha256?: string | null;
       reason?: string;
     };
-    try {
-      message = JSON.parse(data);
-    } catch {
+    const legacyChannelBusy = () => {
+      const activeTransferKey = directChannelTransfersRef.current.get(channel);
+      const pendingTransferKey = pendingChannelTransfersRef.current.get(channel);
+      return Boolean((activeTransferKey && directIncomingRef.current.has(activeTransferKey))
+        || (pendingTransferKey && pendingDirectRequestsRef.current.has(pendingTransferKey)));
+    };
+    // Chunked resume: a file-meta with `resume`, the handshake and the per-chunk messages.
+    if (message.kind === "file-meta" && typeof message.transferId === "string"
+      && isResumableFileMeta(parsed) && directResumeSupported()) {
+      if (legacyChannelBusy()) {
+        sendJson(channel, { kind: "file-reject", transferId: message.transferId, code: "BUSY", reason: "当前还有文件正在接收" });
+        return;
+      }
+      void getReceiver().handleFileMeta(sourcePeerId, channel, parsed);
+      return;
+    }
+    if (message.kind === "resume-offer") {
+      if (directResumeSupported()) {
+        void getReceiver().handleResumeOffer(sourcePeerId, channel, parsed);
+      }
+      return;
+    }
+    if (typeof message.kind === "string" && SENDER_BOUND_KINDS.has(message.kind)
+      && senderRouterRef.current.dispatch(channel, parsed)) {
+      return;
+    }
+    if (message.kind === "resume-request" && typeof message.transferId === "string") {
+      resumeRequestHandlerRef.current(sourcePeerId, message.transferId);
+      return;
+    }
+    if (message.kind === "file-cancel" && typeof message.transferId === "string") {
+      // Outside a session only the resume token proves the receiver abandoned our transfer.
+      const outgoing = outgoingRef.current.get(message.transferId);
+      if (outgoing?.resumeToken && parsed.resumeToken === outgoing.resumeToken
+        && !runningOutgoingRef.current.has(outgoing.transferId)) {
+        outgoingCancelHandlerRef.current(outgoing);
+        return;
+      }
+    }
+    if (typeof message.kind === "string" && RECEIVER_BOUND_KINDS.has(message.kind) && receiverRef.current) {
+      void receiverRef.current.handleSenderMessage(sourcePeerId, channel, parsed);
+      if (message.kind === "transfer-error") {
+        return;
+      }
+    }
+    if (message.kind === "file-meta" && message.transferId && receiverRef.current?.isChannelBusy(channel)) {
+      sendDirectReject(channel, message.transferId, "当前还有文件正在接收");
       return;
     }
     if (message.kind === "file-meta" && message.transferId) {
@@ -767,7 +1062,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         waiter.reject(new Error(message.reason || "对方拒绝接收"));
       }
     }
-  }, [completeDirectIncoming, isCurrentDataChannel, removePendingTransfer, sendDirectReject, startIncomingTransfer]);
+  }, [completeDirectIncoming, getReceiver, isCurrentDataChannel, removePendingTransfer, sendDirectReject, startIncomingTransfer]);
 
   const handleDataChannelMessage = useCallback((sourcePeerId: string, channel: RTCDataChannel, data: unknown, scopeKey: string) => {
     if (!isCurrentDataChannel(sourcePeerId, channel, scopeKey)) {
@@ -804,6 +1099,10 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       return;
     }
     if (data instanceof ArrayBuffer) {
+      if (receiverRef.current?.hasSession(channel)) {
+        receiverRef.current.handleFrame(channel, data);
+        return;
+      }
       const activeTransferKey = directChannelTransfersRef.current.get(channel);
       const current = activeTransferKey ? directIncomingRef.current.get(activeTransferKey) : null;
       if (current && current.scopeKey === scopeKey && current.sourcePeerId === sourcePeerId) {
@@ -1321,7 +1620,8 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   ) => handleAppBinaryMessage(sourcePeerId, frame, connectionScopeRef.current,
     (reply) => sendReply(sourcePeerId, reply)), [handleAppBinaryMessage]);
 
-  const sendDirect = useCallback(async (
+  /** The pre-resume flow: whole-file SHA-256, raw 64 KiB buffers, receiver memory only. */
+  const sendDirectLegacy = useCallback(async (
     targetPeerId: string,
     file: File,
     mode: PeerTransportMode = "auto",
@@ -1398,9 +1698,469 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   }, [closeDataChannel, isCurrentDataChannel, openDirectChannel,
     recordTransportPath, waitForDirectAck]);
 
+  const dropOutgoing = useCallback((transfer: OutgoingTransfer) => {
+    if (outgoingRef.current.get(transfer.transferId) === transfer) {
+      outgoingRef.current.delete(transfer.transferId);
+    }
+    void openResumeStore().then((store) => store?.deleteSend(transfer.transferId)).catch(() => undefined);
+    refreshOutgoingView(true);
+  }, [openResumeStore, refreshOutgoingView]);
+
+  outgoingCancelHandlerRef.current = (transfer) => {
+    dropOutgoing(transfer);
+    optionsRef.current.onNotice?.(`对方已放弃接收 ${transfer.manifest.fileName}，未完成的发送已删除`);
+  };
+
+  /** Runs sendResumable for one transfer over `mode`, with in-session reconnects (§9). */
+  const runResumable = useCallback(async (params: {
+    targetPeerId: string;
+    source: Blob;
+    lastModified: number;
+    fileName: string;
+    fileType: string;
+    existing: OutgoingTransfer | null;
+    mode: PeerTransportMode;
+    signal?: AbortSignal;
+    background: boolean;
+    onTransfer?: (transfer: OutgoingTransfer) => void;
+    onPhase: (phase: "waiting" | "sending") => void;
+    onProgress: (transfer: OutgoingTransfer) => void;
+  }) => {
+    const scopeKey = connectionScopeRef.current;
+    const { targetPeerId, signal } = params;
+    const targetName = optionsRef.current.peers.find((peer) => peer.peerId === targetPeerId)?.displayName ?? "";
+    let wake: (() => void) | null = null;
+    let registeredId = "";
+    const register = (transfer: OutgoingTransfer) => {
+      if (registeredId) runningOutgoingRef.current.delete(registeredId);
+      registeredId = transfer.transferId;
+      runningOutgoingRef.current.set(transfer.transferId, { wake: () => wake?.(), background: params.background });
+      outgoingRef.current.set(transfer.transferId, transfer);
+      outgoingByFileRef.current.set(params.source, transfer.transferId);
+      params.onTransfer?.(transfer);
+      refreshOutgoingView(true);
+    };
+    if (params.existing) register(params.existing);
+    try {
+      return await sendResumable({
+        source: params.source,
+        lastModified: params.lastModified,
+        targetPeerId,
+        targetName,
+        existing: params.existing,
+        router: senderRouterRef.current,
+        digest: sha256Digest,
+        signal,
+        now: () => Date.now(),
+        openChannel: async (): Promise<OpenedChannel> => {
+          if (connectionScopeRef.current !== scopeKey) {
+            throw new Error("发送过程中房间或对方设备已变化");
+          }
+          const channel = await openDirectChannel(targetPeerId, fileChannelOpenTimeoutMs(params.mode), params.mode, "bulk");
+          const connection = peerConnectionsRef.current.get(peerTransportKey(targetPeerId, params.mode));
+          if (connection) {
+            recordTransportPath(targetPeerId, connection, scopeKey);
+          }
+          return {
+            channel,
+            peerId: targetPeerId,
+            frameBytes: maxFrameBytes(connection?.sctp?.maxMessageSize),
+            ensureCurrent: () => {
+              if (signal?.aborted) {
+                throw signal.reason instanceof Error ? signal.reason : new Error("文件发送已取消");
+              }
+              if (connectionScopeRef.current !== scopeKey || !activePeerIdsRef.current.has(targetPeerId)) {
+                throw new Error("发送过程中房间或对方设备已变化");
+              }
+              if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
+                throw new SenderError("DataChannel 已关闭", "retry");
+              }
+            },
+          };
+        },
+        buildManifest: async () => {
+          const fileName = normalizeOfferedName(params.fileName || "attachment");
+          const mimeType = normalizeOfferedMimeType(effectiveMimeType(fileName, params.fileType));
+          const hashes = await hashChunks(params.source, CHUNK_SIZE_DEFAULT, signal);
+          return manifestFromHashes({ sizeBytes: params.source.size, chunkSize: CHUNK_SIZE_DEFAULT, fileName, mimeType, hashes });
+        },
+        // Direct mode hands over to relay quickly; relay and auto keep reconnecting.
+        retryOpenFailures: params.mode !== "direct",
+        sleep: (ms) => new Promise<void>((resolve) => {
+          const done = () => {
+            window.clearTimeout(timer);
+            signal?.removeEventListener("abort", done);
+            wake = null;
+            resolve();
+          };
+          const timer = window.setTimeout(done, ms);
+          wake = done;
+          signal?.addEventListener("abort", done, { once: true });
+        }),
+        onTransfer: register,
+        onPhase: params.onPhase,
+        onProgress: (transfer) => {
+          params.onProgress(transfer);
+          refreshOutgoingView();
+        },
+        onAccepted: async (transfer) => {
+          if (transfer.storage !== "persistent" || transfer.expiresAt === null || !transfer.resumeToken) {
+            return;
+          }
+          // Only the manifest, hashes and token survive a reload; the file itself never does.
+          const store = await openResumeStore();
+          await store?.putSend(sendRecordOf(transfer)).catch(() => undefined);
+        },
+        onFinished: (transfer) => dropOutgoing(transfer),
+      });
+    } finally {
+      if (registeredId) runningOutgoingRef.current.delete(registeredId);
+      const current = registeredId ? outgoingRef.current.get(registeredId) : undefined;
+      if (current?.storage === "persistent") {
+        void openResumeStore()
+          .then((store) => store?.patchSend(current.transferId, { acked: copyBuffer(current.acked.bytes) }))
+          .catch(() => undefined);
+      }
+      refreshOutgoingView(true);
+    }
+  }, [dropOutgoing, isCurrentDataChannel, openDirectChannel, openResumeStore, recordTransportPath, refreshOutgoingView]);
+
+  /** Abandons an outgoing transfer: file-cancel (with the token when off-session) and local deletion. */
+  const abandonOutgoingTransfer = useCallback((transfer: OutgoingTransfer) => {
+    for (const channel of dataChannelsRef.current.values()) {
+      const metadata = dataChannelMetadataRef.current.get(channel);
+      if (metadata?.peerId === transfer.targetPeerId && metadata.purpose === "bulk") {
+        sendJson(channel, { kind: "file-cancel", transferId: transfer.transferId, resumeToken: transfer.resumeToken });
+      }
+    }
+    dropOutgoing(transfer);
+  }, [dropOutgoing]);
+
+  /** Matches a file the user selected to a transfer this page started or restored. */
+  const findOutgoing = useCallback((file: File, targetPeerId: string): OutgoingTransfer | null => {
+    const now = Date.now();
+    const known = outgoingByFileRef.current.get(file);
+    const byFile = known ? outgoingRef.current.get(known) : undefined;
+    if (byFile && (byFile.expiresAt === null || now < byFile.expiresAt) && !runningOutgoingRef.current.has(byFile.transferId)) {
+      return byFile;
+    }
+    const targetName = optionsRef.current.peers.find((peer) => peer.peerId === targetPeerId)?.displayName ?? "";
+    const fileName = normalizeOfferedName(file.name || "attachment");
+    for (const transfer of outgoingRef.current.values()) {
+      // A reselected file after a reload: same name and size, sent to the same device.
+      if (transfer.source === null && transfer.resumeToken !== null
+        && transfer.manifest.fileName === fileName && transfer.manifest.sizeBytes === file.size
+        && (transfer.targetPeerId === targetPeerId || (targetName !== "" && transfer.targetName === targetName))
+        && (transfer.expiresAt === null || now < transfer.expiresAt)
+        && !runningOutgoingRef.current.has(transfer.transferId)) {
+        return transfer;
+      }
+    }
+    return null;
+  }, []);
+
+  const sendDirect = useCallback(async (
+    targetPeerId: string,
+    file: File,
+    mode: PeerTransportMode = "auto",
+    signal?: AbortSignal,
+  ): Promise<DirectTransferResult> => {
+    if (!directResumeSupported()) {
+      return sendDirectLegacy(targetPeerId, file, mode, signal);
+    }
+    if (typeof RTCPeerConnection === "undefined") {
+      throw new Error("当前浏览器不支持直连");
+    }
+    if (file.size > DIRECT_RESUMABLE_LIMIT_BYTES) {
+      throw new Error(`文件超过直连上限 ${formatTransferBytes(DIRECT_RESUMABLE_LIMIT_BYTES)}`);
+    }
+    optionsRef.current.onStateChange("connecting");
+    optionsRef.current.onProgress(0);
+    const scopeKey = connectionScopeRef.current;
+    const reportProgress = createProgressReporter(optionsRef.current.onProgress);
+    let active: OutgoingTransfer | null = findOutgoing(file, targetPeerId);
+    try {
+      const result = await runResumable({
+        targetPeerId,
+        source: file,
+        lastModified: file.lastModified,
+        fileName: file.name,
+        fileType: file.type,
+        existing: active,
+        mode,
+        signal,
+        background: false,
+        onTransfer: (transfer) => {
+          active = transfer;
+        },
+        onPhase: (phase) => optionsRef.current.onStateChange(phase === "waiting" ? "waiting" : "direct"),
+        onProgress: (transfer) => {
+          active = transfer;
+          const total = transfer.manifest.sizeBytes;
+          reportProgress(total > 0 ? (ackedBytesOf(transfer) / total) * 100 : 100, ackedBytesOf(transfer) >= total);
+        },
+      });
+      active = result.transfer;
+      const { manifest } = result.transfer;
+      if (result.kind === "legacy") {
+        // An old page answered file-ready: it ignores `resume` and receives the raw stream into
+        // memory, so only files within its memory limit can go this way (§12).
+        const { channel, ensureCurrent } = result.channel;
+        if (file.size > MEMORY_LIMIT_BYTES) {
+          sendJson(channel, { kind: "file-cancel", transferId: result.transfer.transferId });
+          throw new SenderError("对方页面版本较旧，不支持 128 MiB 以上的设备传输，请让对方刷新页面后重试", "drop", "LEGACY_TOO_LARGE");
+        }
+        const rtcChannel = channel as RTCDataChannel;
+        const legacyTransferId = result.transfer.transferId;
+        try {
+          optionsRef.current.onStateChange("direct");
+          await sendFileChunks(rtcChannel, file, optionsRef.current.onProgress, ensureCurrent, signal);
+          ensureCurrent();
+          // Without a whole-file digest the old page acknowledges right away: listen before
+          // file-complete leaves so the acknowledgement cannot arrive before the waiter.
+          const acknowledged = waitForDirectAck(targetPeerId, rtcChannel, scopeKey, legacyTransferId, 120_000, "对方未确认完成");
+          acknowledged.catch(() => undefined);
+          rtcChannel.send(JSON.stringify({ kind: "file-complete", transferId: legacyTransferId }));
+          await waitForDataChannelDrain(rtcChannel, 60_000, signal);
+          ensureCurrent();
+          await acknowledged;
+        } catch (error) {
+          sendJson(rtcChannel, { kind: "file-cancel", transferId: legacyTransferId });
+          closeDataChannel(targetPeerId, rtcChannel, `${mode} file transfer failed`, true);
+          throw error;
+        }
+      }
+      reportProgress(100, true);
+      return {
+        attachment: directAttachment(result.transfer.transferId, manifest.fileName, manifest.mimeType, manifest.sizeBytes, null),
+        previewUrl: URL.createObjectURL(file),
+      };
+    } catch (error) {
+      if (signal?.aborted) {
+        // The user's cancel abandons the transfer; a room change or page teardown only pauses it.
+        if (signal.reason === DIRECT_SEND_USER_CANCEL && active) {
+          abandonOutgoingTransfer(active);
+        }
+        throw new Error("文件发送已取消");
+      }
+      if (error instanceof SenderError && error.code === "LEGACY_REJECT" && file.size > MEMORY_LIMIT_BYTES) {
+        throw new SenderError("对方页面不支持 128 MiB 以上的设备传输，请让对方刷新页面后重试", "drop", "LEGACY_TOO_LARGE");
+      }
+      throw error;
+    }
+  }, [abandonOutgoingTransfer, closeDataChannel, findOutgoing, runResumable, sendDirectLegacy, waitForDirectAck]);
+
+  /** Resumes a paused transfer outside the page's send queue (from the list or a resume-request). */
+  const runBackgroundResume = useCallback(async (transfer: OutgoingTransfer, targetPeerId: string) => {
+    if (!transfer.source || runningOutgoingRef.current.has(transfer.transferId)) return;
+    const fileName = transfer.manifest.fileName;
+    try {
+      await runResumable({
+        targetPeerId,
+        source: transfer.source,
+        lastModified: transfer.lastModified,
+        fileName,
+        fileType: transfer.manifest.mimeType,
+        existing: transfer,
+        mode: "auto",
+        background: true,
+        onPhase: () => undefined,
+        onProgress: () => undefined,
+      });
+      optionsRef.current.onNotice?.(`${fileName} 已续传完成，对方已收到`);
+    } catch (error) {
+      optionsRef.current.onError(`${fileName} 续传未完成：${error instanceof Error ? error.message : "未知错误"}`);
+    }
+  }, [runResumable]);
+
+  resumeRequestHandlerRef.current = (peerId: string, transferId: string) => {
+    const transfer = outgoingRef.current.get(transferId);
+    if (!transfer?.resumeToken) return;
+    const running = runningOutgoingRef.current.get(transferId);
+    if (running) {
+      running.wake(); // skip the remaining backoff: the receiver is back
+      return;
+    }
+    if (!transfer.source) {
+      if (!resumeRequestNoticesRef.current.has(transferId)) {
+        resumeRequestNoticesRef.current.add(transferId);
+        optionsRef.current.onNotice?.(`对方请求继续接收 ${transfer.manifest.fileName}，请在“未完成的发送”中重新选择该文件`);
+      }
+      return;
+    }
+    void runBackgroundResume(transfer, peerId);
+  };
+
+  const resumeOutgoing = useCallback(async (transferId: string, file?: File) => {
+    const transfer = outgoingRef.current.get(transferId);
+    if (!transfer) return;
+    if (file) {
+      // §7: a reselected file of another size is refused before any handshake.
+      if (file.size !== transfer.manifest.sizeBytes) {
+        throw new SourceSizeMismatchError();
+      }
+      transfer.source = file;
+      outgoingByFileRef.current.set(file, transferId);
+    }
+    if (!transfer.source) {
+      throw new Error("请重新选择原文件后继续发送");
+    }
+    const peers = optionsRef.current.peers;
+    const target = peers.find((peer) => peer.peerId === transfer.targetPeerId)
+      ?? peers.find((peer) => transfer.targetName !== "" && peer.displayName === transfer.targetName);
+    if (!target) {
+      throw new Error(`接收设备 ${transfer.targetName || ""} 不在线，请等对方打开页面后再继续`);
+    }
+    await runBackgroundResume(transfer, target.peerId);
+  }, [runBackgroundResume]);
+
+  const abandonOutgoing = useCallback((transferId: string) => {
+    const transfer = outgoingRef.current.get(transferId);
+    if (transfer && !runningOutgoingRef.current.has(transferId)) {
+      abandonOutgoingTransfer(transfer);
+    }
+  }, [abandonOutgoingTransfer]);
+
+  const bulkChannelsTo = useCallback((peerId: string): RTCDataChannel[] => [...dataChannelsRef.current.values()]
+    .filter((channel) => {
+      const metadata = dataChannelMetadataRef.current.get(channel);
+      return metadata?.peerId === peerId && metadata.purpose === "bulk" && channel.readyState === "open";
+    }), []);
+
+  const abandonStoredReceive = useCallback((transferId: string) => {
+    const receiver = receiverRef.current;
+    const entry = receiver?.snapshot().entries.find((item) => item.transferId === transferId);
+    void receiver?.abandon(transferId, entry ? bulkChannelsTo(entry.sourcePeerId) : []);
+  }, [bulkChannelsTo]);
+
+  const markDirectSaved = useCallback((transferId: string) => {
+    void receiverRef.current?.markSaved(transferId);
+  }, []);
+
+  /** "清除互传本地数据": every receive record and chunk plus every paused send record. */
+  const clearResumeData = useCallback(async () => {
+    await getReceiver().clearAll();
+    for (const transfer of [...outgoingRef.current.values()]) {
+      if (!runningOutgoingRef.current.has(transfer.transferId)) {
+        outgoingRef.current.delete(transfer.transferId);
+      }
+    }
+    const store = await openResumeStore();
+    await store?.clear().catch(() => undefined);
+    refreshOutgoingView(true);
+  }, [getReceiver, openResumeStore, refreshOutgoingView]);
+
+  const cleanupOutgoing = useCallback(async () => {
+    const now = Date.now();
+    const store = await openResumeStore();
+    for (const transfer of [...outgoingRef.current.values()]) {
+      if (transfer.expiresAt !== null && now >= transfer.expiresAt && !runningOutgoingRef.current.has(transfer.transferId)) {
+        outgoingRef.current.delete(transfer.transferId);
+        await store?.deleteSend(transfer.transferId).catch(() => undefined);
+      }
+    }
+    for (const record of await store?.listSends().catch(() => [] as SendRecord[]) ?? []) {
+      if (now >= record.expiresAt) {
+        await store?.deleteSend(record.transferId).catch(() => undefined);
+      }
+    }
+    refreshOutgoingView(true);
+  }, [openResumeStore, refreshOutgoingView]);
+
+  // Page load: clean up, restore interrupted receives, completed-unsaved files and paused sends.
+  // Cleanup also runs whenever the page returns to the foreground; nothing can run while closed.
+  useEffect(() => {
+    if (!directResumeSupported()) {
+      return undefined;
+    }
+    let cancelled = false;
+    void (async () => {
+      await getReceiver().restore();
+      const store = await openResumeStore();
+      if (!store || cancelled) return;
+      const now = Date.now();
+      for (const record of await store.listSends().catch(() => [] as SendRecord[])) {
+        if (now >= record.expiresAt) {
+          await store.deleteSend(record.transferId).catch(() => undefined);
+        } else if (!outgoingRef.current.has(record.transferId)) {
+          outgoingRef.current.set(record.transferId, outgoingFromRecord(record));
+        }
+      }
+      if (!cancelled) refreshOutgoingView(true);
+    })();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void getReceiver().cleanup();
+        void cleanupOutgoing();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [cleanupOutgoing, getReceiver, openResumeStore, refreshOutgoingView]);
+
+  // After a reload the receiver asks the original sender (if online) to resume (§9).
+  useEffect(() => {
+    const receiver = receiverRef.current;
+    if (!receiver || connectionScopeRef.current.startsWith("invalidated:")) return;
+    for (const target of receiver.resumeRequestTargets()) {
+      if (!options.peers.some((peer) => peer.peerId === target.sourcePeerId)) continue;
+      void openDirectChannel(target.sourcePeerId, AUTO_FILE_CHANNEL_OPEN_TIMEOUT_MS, "auto", "bulk")
+        .then((channel) => receiver.sendResumeRequest(channel, target.transferId))
+        .catch(() => undefined);
+    }
+  }, [openDirectChannel, options.peers, resumeSnapshot]);
+
+  const resumePending = resumeSnapshot.pending;
+  const resumeEntries = resumeSnapshot.entries;
+  const allPendingTransfers = useMemo<DirectPendingTransfer[]>(() => (resumePending.length === 0
+    ? pendingTransfers
+    : [...pendingTransfers, ...resumePending.map((item) => ({
+      transferId: item.transferId,
+      sourcePeerId: item.sourcePeerId,
+      fileName: item.fileName,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+      storage: item.storage,
+      memoryReason: item.memoryReason,
+    }))]), [pendingTransfers, resumePending]);
+  const allReceivingTransfers = useMemo<DirectReceivingTransfer[]>(() => {
+    const active = resumeEntries.filter((item) => item.active && item.state !== "COMPLETE");
+    return active.length === 0 ? receivingTransfers : [...active.map((item) => ({
+      transferId: item.transferId,
+      sourcePeerId: item.sourcePeerId,
+      fileName: item.fileName,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+      receivedBytes: item.receivedBytes,
+      storage: item.storage,
+    })), ...receivingTransfers];
+  }, [receivingTransfers, resumeEntries]);
+  const storedReceives = useMemo<DirectStoredReceive[]>(() => resumeEntries
+    .filter((item) => !item.active && item.state === "INTERRUPTED")
+    .map((item) => ({
+      transferId: item.transferId,
+      sourcePeerId: item.sourcePeerId,
+      sourceName: item.sourceName,
+      fileName: item.fileName,
+      sizeBytes: item.sizeBytes,
+      receivedBytes: item.receivedBytes,
+      expiresAt: item.expiresAt,
+      storage: item.storage,
+    })), [resumeEntries]);
+
   return {
-    pendingTransfers,
-    receivingTransfers,
+    pendingTransfers: allPendingTransfers,
+    receivingTransfers: allReceivingTransfers,
+    storedReceives,
+    outgoingResumes,
+    resumeOutgoing,
+    abandonOutgoing,
+    abandonStoredReceive,
+    markDirectSaved,
+    clearResumeData,
     peerTransportPaths,
     sendDirect,
     sendPeerMessage,
@@ -1417,6 +2177,63 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
 
 export function receivingTransferKey(item: Pick<DirectReceivingTransfer, "sourcePeerId" | "transferId">) {
   return `${item.sourcePeerId}:${item.transferId}`;
+}
+
+function ackedBytesOf(transfer: OutgoingTransfer): number {
+  const { sizeBytes, chunkSize } = transfer.manifest;
+  let total = 0;
+  for (const index of transfer.acked.indexes()) {
+    total += chunkLengthOf(sizeBytes, chunkSize, index);
+  }
+  return total;
+}
+
+function sendRecordOf(transfer: OutgoingTransfer): SendRecord {
+  const { manifest } = transfer;
+  return {
+    transferId: transfer.transferId,
+    manifestDigest: toHex(manifest.manifestDigest),
+    resumeToken: transfer.resumeToken ?? "",
+    expiresAt: transfer.expiresAt ?? 0,
+    targetPeerId: transfer.targetPeerId,
+    targetName: transfer.targetName,
+    fileName: manifest.fileName,
+    mimeType: manifest.mimeType,
+    sizeBytes: manifest.sizeBytes,
+    lastModified: transfer.lastModified,
+    chunkSize: manifest.chunkSize,
+    chunkCount: manifest.chunkCount,
+    rootSha256: toHex(manifest.rootSha256),
+    hashes: copyBuffer(manifest.hashes),
+    acked: copyBuffer(transfer.acked.bytes),
+  };
+}
+
+/** A send restored after a reload: everything but the file, which the user must select again. */
+function outgoingFromRecord(record: SendRecord): OutgoingTransfer {
+  return {
+    transferId: record.transferId,
+    manifest: {
+      sizeBytes: record.sizeBytes,
+      chunkSize: record.chunkSize,
+      chunkCount: record.chunkCount,
+      fileName: record.fileName,
+      mimeType: record.mimeType,
+      hashes: new Uint8Array(record.hashes),
+      rootSha256: fromHex(record.rootSha256),
+      manifestDigest: fromHex(record.manifestDigest),
+    },
+    source: null,
+    lastModified: record.lastModified,
+    targetPeerId: record.targetPeerId,
+    targetName: record.targetName,
+    resumeToken: record.resumeToken,
+    storage: "persistent",
+    expiresAt: record.expiresAt,
+    acked: new ChunkBitmap(record.chunkCount, record.acked ? new Uint8Array(record.acked) : undefined),
+    confirmedPeers: new Set(),
+    offered: true,
+  };
 }
 
 function peerTransportKey(peerId: string, mode: PeerTransportMode) {

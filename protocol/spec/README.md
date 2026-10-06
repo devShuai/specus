@@ -15,6 +15,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | [peer-mesh.md](peer-mesh.md) | Peer Mesh 私有组网、虚拟 IP、信令、标准 STUN/TURN 子集、加密数据帧和管理面 |
 | [peer-egress.md](peer-egress.md) | Peer 出口分流的规则语义、出口授权模型、`SPEG1` 数据面帧与出口信令 |
 | [public-transfer.md](public-transfer.md) | 免登录公共互传的 ICE 配置、发现信令、附件 REST、对象存储和滥用防护 |
+| [chunked-resume.md](chunked-resume.md) | 浏览器直连文件的分块续传（清单与 STFR1 帧、续传握手、接收方同意、存储与清理），尚未实现 |
 | [public-transfer-cluster.md](public-transfer-cluster.md) | 公共互传多实例 Redis presence、修订、共享限流、管理事件恢复与 STCE v2 内部 Pub/Sub 帧 |
 | [client-messages.md](client-messages.md) | 管理端与客户端消息 WebSocket、一次性 ticket、能力判断和服务端备用投递 |
 | [service-connectivity-check.md](service-connectivity-check.md) | 对单条 HTTP route 的有界端到端检查，四阶段结果码、客户端 RST 分类与限流；实现进行中 |

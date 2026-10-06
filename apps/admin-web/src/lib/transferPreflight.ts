@@ -37,7 +37,7 @@ export function checkFilePreflight(input: FilePreflightInput) {
     if (!input.recipientOnline) errors.push("原接收设备已离线或未选择；不会自动换成其他设备，请取消后重新选择。");
     if (!input.discoveryOnline) errors.push("房间连接尚未恢复，请等待连接恢复后再确认。");
     if (!input.rtcSupported) errors.push("当前浏览器不支持设备文件传输，请使用支持 WebRTC 的浏览器，或明确改为生成文件链接。");
-    if (oversized.length > 0) errors.push(`${oversized.length} 个文件超过设备传输的单文件内存上限，请移除，或明确改为生成文件链接。`);
+    if (oversized.length > 0) errors.push(`${oversized.length} 个文件超过设备传输的单文件上限，请移除，或明确改为生成文件链接。`);
   } else if (!input.signedIn) {
     errors.push("生成文件链接需要登录；登录后仍需重新确认上传。");
   }
