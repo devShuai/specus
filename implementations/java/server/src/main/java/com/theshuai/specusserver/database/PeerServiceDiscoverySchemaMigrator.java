@@ -47,6 +47,12 @@ public class PeerServiceDiscoverySchemaMigrator {
         ensureColumn("specus_client_session", "client_egress_domain_targets", dialect.boolNotNullFalse());
         ensureColumn("peer_mesh_shared_service", "allowed_client_ids", dialect.varchar(512));
         ensureColumn("peer_mesh_service_sharing", "mdns_import_enabled", dialect.boolNotNullFalse());
+        // Domain rules of an egress policy, default empty so a policy saved before them grants no
+        // name. The table itself is Hibernate's: a database without it gets it, column included,
+        // from the schema update, so there is nothing to add here.
+        if (tableExists("peer_mesh_egress_policy")) {
+            ensureColumn("peer_mesh_egress_policy", "domain_rules", dialect.jsonArrayNotNullEmpty(4096));
+        }
         int sharingForcedOff = 0;
         try {
             sharingForcedOff = jdbcTemplate.update(
@@ -75,6 +81,15 @@ public class PeerServiceDiscoverySchemaMigrator {
         } catch (DataAccessException missing) {
             jdbcTemplate.execute("alter table " + table + " add column " + column + " " + definition);
             log.info("[peer-service] added {}.{}", table, column);
+        }
+    }
+
+    private boolean tableExists(String table) {
+        try {
+            jdbcTemplate.query("select 1 from " + table + " where 1 = 0", rs -> null);
+            return true;
+        } catch (DataAccessException missing) {
+            return false;
         }
     }
 
@@ -173,6 +188,10 @@ public class PeerServiceDiscoverySchemaMigrator {
                 case MYSQL -> "int not null default 0";
                 case SQLITE -> "INTEGER not null default 0";
             };
+        }
+
+        private String jsonArrayNotNullEmpty(int length) {
+            return varchar(length) + " not null default '[]'";
         }
 
         private String falseLiteral() {

@@ -489,7 +489,7 @@ class PeerEgressRuntimeTests {
 
         assertTrue(harness.sawReset(), "an unreachable target left the consumer without a reset");
         assertTrue(harness.rejectCodes().isEmpty(), "a network failure was reported as a refusal");
-        assertTrue(harness.runtime.rejections().drainCounts().isEmpty(),
+        assertTrue(harness.runtime.rejections().cumulativeCounts().isEmpty(),
                 "a network failure entered the refusal aggregate");
         // The reservation must come back, or a flapping destination would exhaust the quota.
         assertEquals(0, harness.runtime.flowCount(), "flows left after a failed connect");
@@ -721,7 +721,7 @@ class PeerEgressRuntimeTests {
         assertEquals(0, harness.runtime.flowCount(), "the session outlived its idle timeout");
         assertTrue(harness.socket(0).isClosed(), "an expired session left its socket open");
         // An expiring session is the normal end of life, not something to report as blocked traffic.
-        assertTrue(harness.runtime.rejections().drainCounts().isEmpty(),
+        assertTrue(harness.runtime.rejections().cumulativeCounts().isEmpty(),
                 "idle expiry entered the refusal aggregate");
     }
 
@@ -1013,6 +1013,94 @@ class PeerEgressRuntimeTests {
                 assertTrue(harness.rejectCodes().isEmpty(), where + ": a name-bind closure told the consumer to drop its side");
             }
         }
+    }
+
+    /** policy(destinations) with one domain rule allowing tcp/443 to what match covers. */
+    private static PeerEgressPolicy withDomainRule(String match, String... destinations) {
+        PeerEgressPolicy built = policy(destinations);
+        PeerEgressPolicy.PeerEgressDomainRule rule = new PeerEgressPolicy.PeerEgressDomainRule();
+        rule.setMatch(match);
+        rule.setProtocols(List.of("tcp"));
+        rule.setPortRanges(List.of(List.of(443, 443)));
+        built.setDomainRules(List.of(rule));
+        return built;
+    }
+
+    /**
+     * A domain rule admits a flow the consumer opened under a name even though the address the name
+     * resolves to is outside every destination rule. Without the rule the same flow is refused at
+     * the destination step, and a flow straight to that address is refused even with it: a domain
+     * rule grants names, not the addresses they happen to resolve to.
+     */
+    @Test
+    void aDomainRuleAdmitsANamedFlowOutsideTheDestinationRules() {
+        Harness granted = new Harness();
+        granted.runtime.applyPolicy(withDomainRule("*.example.com", "203.0.113.0/24"),
+                PeerEgressAuthorization.Context.defaults(), EPOCH);
+        granted.runtime.resolve = resolvingTo("192.0.2.10");
+        bindName(granted, 7, "198.18.0.5", "www.example.com");
+        granted.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(List.of("192.0.2.10:443"), granted.dialed());
+        assertTrue(granted.rejectCodes().isEmpty(), "the named flow was refused: " + granted.rejectCodes());
+        assertEquals("www.example.com", granted.runtime.flowName(new PeerEgressFlowTable.Key(
+                PeerEgressSegment.IPV4_PROTOCOL_TCP, address("100.96.0.1"), 40000, address("198.18.0.5"), 443)));
+
+        granted.clearFrames();
+        granted.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40001, "192.0.2.10", 443))), EPOCH);
+        assertEquals(1, granted.dialCount(), "a flow to the address alone was admitted by a domain rule");
+        assertEquals(List.of(PeerEgressCodes.DEST_DENIED), granted.rejectCodes());
+
+        Harness refused = new Harness("203.0.113.0/24");
+        refused.runtime.resolve = resolvingTo("192.0.2.10");
+        bindName(refused, 7, "198.18.0.5", "www.example.com");
+        refused.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(0, refused.dialCount(), "a named flow outside the destination rules was dialled");
+        assertTrue(refused.sawReset(), "the refused flow was not reset");
+        assertEquals(List.of(PeerEgressCodes.DEST_DENIED), refused.rejectCodes());
+    }
+
+    /**
+     * A policy refresh judges a named flow as its opening did: the address it was dialled to, with
+     * its name. Kept while the domain rule that admitted it stays, even with this node's own pool
+     * (which the consumer's fake address is in) forced-denied as it is when the egress runs phase two
+     * itself; revoked like any other revocation once the rule is gone. A named flow a destination
+     * rule admits is untouched by both.
+     */
+    @Test
+    void aPolicyRefreshWithoutTheDomainRuleRevokesTheNamedFlow() {
+        PeerEgressAuthorization.Context ownPoolDenied = new PeerEgressAuthorization.Context(
+                "100.96.0.0/11", List.of("198.18.0.0/15"));
+        Harness harness = new Harness();
+        harness.runtime.applyPolicy(withDomainRule("example.com", "203.0.113.0/24"), ownPoolDenied, EPOCH);
+        harness.runtime.resolve = name -> List.of(address(
+                name.equals("example.com") ? "192.0.2.10" : "203.0.113.10"));
+        bindName(harness, 7, "198.18.0.5", "example.com");
+        bindName(harness, 7, "198.18.0.6", "other.example");
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40001, "198.18.0.6", 443))), EPOCH);
+        assertEquals(List.of("192.0.2.10:443", "203.0.113.10:443"), harness.dialed());
+        assertEquals(2, harness.runtime.flowCount());
+        harness.clearFrames();
+
+        harness.runtime.applyPolicy(withDomainRule("example.com", "203.0.113.0/24"), ownPoolDenied, EPOCH);
+        assertEquals(2, harness.runtime.flowCount(), "a refresh that kept every grant revoked a named flow");
+        assertTrue(harness.rejectCodes().isEmpty(), "a refresh that kept every grant refused: " + harness.rejectCodes());
+
+        harness.runtime.applyPolicy(policy("203.0.113.0/24"), ownPoolDenied, EPOCH);
+        assertEquals(1, harness.runtime.flowCount(), "the flow its domain rule admitted survived the rule");
+        assertTrue(harness.socket(0).isClosed(), "the revoked named flow's socket stayed open");
+        assertFalse(harness.socket(1).isClosed(), "the flow a destination rule admits was closed");
+        assertTrue(harness.runtime.hasFlow(new PeerEgressFlowTable.Key(PeerEgressSegment.IPV4_PROTOCOL_TCP,
+                address("100.96.0.1"), 40001, address("198.18.0.6"), 443)));
+        assertEquals(List.of(PeerEgressCodes.DEST_DENIED), harness.rejectCodes());
+        assertTrue(harness.sawReset(), "the revoked named flow got no reset");
     }
 
     /**

@@ -114,7 +114,7 @@ func TestEgressRuntimeRateLimitsNewFlowsPerConsumer(t *testing.T) {
 	if !harness.sawReset() {
 		t.Error("the refused SYN got no reset, so its application waits on a flow that will never open")
 	}
-	if counts := harness.runtime.rejections.drainCounts(); counts[egressCodeLimitExceeded] != 2 {
+	if counts := harness.runtime.rejections.cumulativeCounts(); counts[egressCodeLimitExceeded] != 2 {
 		t.Errorf("refusal aggregate = %v, want two %s", counts, egressCodeLimitExceeded)
 	}
 

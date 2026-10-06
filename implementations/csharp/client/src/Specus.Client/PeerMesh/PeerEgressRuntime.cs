@@ -44,9 +44,6 @@ internal interface IPeerEgressDialer
     IPeerEgressSocket Dial(string protocol, string host, int port, long timeoutMs);
 }
 
-/// <summary>What the periodic egress-report carries, alongside the per-code refusal counts.</summary>
-internal readonly record struct PeerEgressStats(long TotalFlows, long BytesIn, long BytesOut);
-
 /// <summary>
 /// The egress data plane: the only place authorization turns into a connect.
 /// </summary>
@@ -145,6 +142,13 @@ internal sealed class PeerEgressRuntime
     private long _bytesIn;
     private long _bytesOut;
     private bool _closed;
+    private long _ticks;
+
+    /// <summary>
+    /// Visible for tests: how many ticks have reached this plane, a shut-down one included, so a test
+    /// can tell a plane nobody ticks from one whose ticks find nothing to do.
+    /// </summary>
+    internal long Ticks => Interlocked.Read(ref _ticks);
 
     public PeerEgressRuntime(
         Action<long, byte[]>? send,
@@ -171,21 +175,10 @@ internal sealed class PeerEgressRuntime
 
     public PeerEgressRejectionLog Rejections { get; } = new();
 
-    public PeerEgressStats Stats
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return new PeerEgressStats(_totalFlows, _bytesIn, _bytesOut);
-            }
-        }
-    }
-
     /// <summary>What an operator can read about this node serving as an egress.</summary>
     /// <remarks>
-    /// The refusal counts come from the cumulative tally rather than the one the periodic report
-    /// drains, so the numbers do not start shrinking on their own the day that report is wired up.
+    /// Read by the local status and by the periodic <c>egress-report</c> alike, so the admin page and
+    /// <c>status</c> show the same running totals. Nothing here is reset by being read.
     /// </remarks>
     public PeerEgressRuntimeStatus StatusSnapshot()
     {
@@ -849,6 +842,7 @@ internal sealed class PeerEgressRuntime
     /// </summary>
     public void OnTick(long nowMs)
     {
+        Interlocked.Increment(ref _ticks);
         lock (_lock)
         {
             if (_closed)
@@ -933,7 +927,7 @@ internal sealed class PeerEgressRuntime
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) ReserveTo(
         long consumer, PeerEgressFlowTable.Key key, uint destination, long nowMs, string? name = null)
     {
-        if (AuthorizeTo(consumer, key, destination) is { } code)
+        if (AuthorizeTo(consumer, key, destination, name) is { } code)
         {
             return (null, code, false);
         }
@@ -947,15 +941,24 @@ internal sealed class PeerEgressRuntime
         if (opened is not null)
         {
             // Remembered so a later name-bind can tell a flow opened for its name from one that
-            // was not.
+            // was not, and so a policy refresh judges the flow on what admitted it: the name and
+            // the address actually dialled.
             opened.Name = name;
+            opened.Dialed = destination;
             return (opened, null, true);
         }
         return (_flows.Lookup(key), null, false);
     }
 
-    /// <summary>The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held.</summary>
-    private string? AuthorizeTo(long consumer, PeerEgressFlowTable.Key key, uint destination)
+    /// <summary>
+    /// The judgment layer for a flow dialled to destination; null when allowed. Called with the lock held.
+    /// </summary>
+    /// <remarks>
+    /// The name is the one the consumer bound to the key's address, null for a flow that arrived by
+    /// address. With it the policy's domain rules covering the name take part alongside the
+    /// destination rules; the forced-deny list and the scope still judge the address alone.
+    /// </remarks>
+    private string? AuthorizeTo(long consumer, PeerEgressFlowTable.Key key, uint destination, string? name)
     {
         if (_closed || !_enabled)
         {
@@ -970,6 +973,7 @@ internal sealed class PeerEgressRuntime
                 DestinationIp = Ipv4Cidr.FormatAddress(destination),
                 DestinationPort = key.RemotePort,
                 Protocol = key.ProtocolName(),
+                Name = name,
                 ActiveFlowsForConsumer = _flows.CountFor(consumer),
                 ActiveFlowsTotal = _flows.Count,
                 LocalInterfaceCidrs = _localInterfaces,
@@ -1044,7 +1048,7 @@ internal sealed class PeerEgressRuntime
         lock (_lock)
         {
             _resolving.Remove(key);
-            return ChooseAddress(addresses, address => AuthorizeTo(consumer, key, address)) with { Name = name };
+            return ChooseAddress(addresses, address => AuthorizeTo(consumer, key, address, name)) with { Name = name };
         }
     }
 

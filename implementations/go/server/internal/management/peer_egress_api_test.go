@@ -77,4 +77,12 @@ func TestPeerEgressRoutesAnswerRefusalsWithTheirStatus(t *testing.T) {
 	expect("valid policy", http.MethodPost, policies, admin, map[string]any{"egressClientId": egress.ID,
 		"destinationRules": []map[string]any{{"cidr": " 203.0.113.0/24 ", "protocols": []string{"TCP"}, "portRanges": [][]int{{443, 443}}}}},
 		http.StatusOK, `"protocols":["tcp"]`)
+	expect("address as a domain rule", http.MethodPost, policies, admin, map[string]any{"egressClientId": egress.ID,
+		"domainRules": []map[string]any{{"match": "203.0.113.5", "protocols": []string{"tcp"}, "portRanges": [][]int{{443, 443}}}}},
+		http.StatusBadRequest, "domainRules[0].match")
+	expect("valid domain rule", http.MethodPost, policies, admin, map[string]any{"egressClientId": egress.ID,
+		"domainRules": []map[string]any{{"match": " *.CDN.Example. ", "protocols": []string{"UDP"}, "portRanges": [][]int{{443, 443}}}}},
+		http.StatusOK, `"domainRules":[{"match":"*.cdn.example","protocols":["udp"],"portRanges":[[443,443]]}]`)
+	expect("domain rules kept when omitted", http.MethodPost, policies, admin, map[string]any{"egressClientId": egress.ID,
+		"scope": "LAN"}, http.StatusOK, `"domainRules":[{"match":"*.cdn.example"`)
 }

@@ -25,12 +25,15 @@ import {
   checkPolicyDraft,
   consumerNote,
   draftFromPolicy,
+  emptyDomainRuleDraft,
   emptyPolicyDraft,
   emptyRuleDraft,
   formatPorts,
   MAX_DESTINATION_RULES,
+  MAX_DOMAIN_RULES,
   policyState,
   scopeLabel,
+  storedDomainRuleProblem,
   storedRuleProblem,
   switchSummary,
   type EgressPolicyDraft,
@@ -53,7 +56,9 @@ type ConfirmState = {
  *
  * A device forwards for others only when the switch is on, its policy is enabled, the consumer is
  * both listed and allowed by the Peer ACL, and the destination is in a rule the forced-deny list does
- * not cover. Each of those can silently make a policy do nothing, so each is shown where it applies.
+ * not cover: a destination rule containing the address, or, for a flow the consumer sent by name, a
+ * domain rule covering the name. Each of those can silently make a policy do nothing, so each is shown
+ * where it applies.
  */
 export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
   const { profile } = useAuth();
@@ -225,6 +230,10 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
       setPolicies((items) => [saved, ...items.filter((item) => item.id !== saved.id)]);
       setDraft(null);
       notify(editingExisting ? "出口策略已保存" : saved.enabled ? "出口策略已创建并启用" : "出口策略已创建（未启用）");
+      // A server that predates domain rules ignores the field and leaves it out of its answer.
+      if (saved.domainRules === undefined && (check.mutation.domainRules ?? []).length > 0) {
+        notify("服务端未返回域名规则，可能还不支持：域名规则没有保存", "error");
+      }
       await load(true);
     } catch (error) {
       notifyError(error, "保存出口策略失败");
@@ -250,6 +259,12 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
       rules: current.rules.map((rule, position) => (position === index ? { ...rule, ...patch } : rule)),
     });
 
+  const updateDomainRule = (index: number, patch: Partial<EgressPolicyDraft["domainRules"][number]>) =>
+    setDraft((current) => current && {
+      ...current,
+      domainRules: current.domainRules.map((rule, position) => (position === index ? { ...rule, ...patch } : rule)),
+    });
+
   const takenEgresses = new Set(policies.map((policy) => String(policy.egressClientId)));
   const switchSelected = Boolean(egressSwitch?.configuredEnabled);
   const switchDisabled = !isAdmin || loading || updatingSwitch || loadError != null || !egressSwitch?.deploymentEnabled;
@@ -257,7 +272,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
   return (
     <section className="space-y-4" aria-busy={loading || updatingSwitch}>
       <p className="rounded-md border border-default-200 bg-default-50 p-3 text-small text-default-600">
-        出口分流让一台设备作为其他设备访问指定目标的网络出口。只有总开关开启、策略启用、消费设备既被授权又被 Peer ACL 允许，并且目标在目的规则内时才会转发；回环、链路本地、云元数据与组网网段始终被拒绝。消费端需在客户端里写规则并开启系统接管。
+        出口分流让一台设备作为其他设备访问指定目标的网络出口。只有总开关开启、策略启用、消费设备既被授权又被 Peer ACL 允许，并且目标在目的规则内（消费端按域名发出的流，也可以由覆盖该域名的域名规则放行）时才会转发；回环、链路本地、云元数据与组网网段始终被拒绝。消费端需在客户端里写规则并开启系统接管。
       </p>
       {loadError && (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger-200 bg-danger-50 p-3 text-small text-danger-700">
@@ -386,6 +401,52 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
             </Button>
           </div>
 
+          <div className="space-y-2">
+            <p className="text-small font-semibold text-default-700">域名规则</p>
+            <ul className="list-disc space-y-0.5 pl-5 text-tiny text-default-500">
+              <li>只对消费端按域名规则发出的流（二期，开启系统 DNS 接管）起作用；只按地址发出的流不看域名规则，即使地址恰好是某个已授权域名的解析结果。</li>
+              <li><code>example.com</code> 只覆盖这个名字；<code>*.example.com</code> 覆盖它的所有子域，不含 <code>example.com</code> 本身。</li>
+              <li>出口自己解析名字，解析出的地址仍要先过始终拒绝的地址与目标范围：解析到回环、云元数据、组网网段或（范围为公网时）局域网地址的名字照样被拒绝。</li>
+              <li>站点用 CDN、地址不固定时用它，不必为此放行 <code>0.0.0.0/0</code>。按地址授权请写在上面的目的规则里。</li>
+            </ul>
+            {draft.domainRules.map((rule, index) => (
+              <div key={index} className="grid grid-cols-1 items-center gap-2 md:grid-cols-[2fr_auto_auto_2fr_auto]">
+                <Input
+                  size="sm"
+                  aria-label={`域名规则 ${index + 1} 域名`}
+                  placeholder="*.example.com"
+                  value={rule.match}
+                  onValueChange={(match) => updateDomainRule(index, { match })}
+                />
+                <Checkbox size="sm" isSelected={rule.tcp} onValueChange={(tcp) => updateDomainRule(index, { tcp })}>TCP</Checkbox>
+                <Checkbox size="sm" isSelected={rule.udp} onValueChange={(udp) => updateDomainRule(index, { udp })}>UDP</Checkbox>
+                <Input
+                  size="sm"
+                  aria-label={`域名规则 ${index + 1} 端口`}
+                  placeholder="443, 8000-8100 或 全部"
+                  value={rule.ports}
+                  onValueChange={(ports) => updateDomainRule(index, { ports })}
+                />
+                <Button
+                  size="sm"
+                  variant="light"
+                  color="danger"
+                  onPress={() => setDraft((current) => current && { ...current, domainRules: current.domainRules.filter((_, position) => position !== index) })}
+                >
+                  移除
+                </Button>
+              </div>
+            ))}
+            <Button
+              size="sm"
+              variant="flat"
+              isDisabled={draft.domainRules.length >= MAX_DOMAIN_RULES}
+              onPress={() => setDraft((current) => current && { ...current, domainRules: [...current.domainRules, emptyDomainRuleDraft()] })}
+            >
+              添加域名规则
+            </Button>
+          </div>
+
           <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
             <Input
               label="最大并发流"
@@ -449,6 +510,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
               <TableColumn>范围</TableColumn>
               <TableColumn>消费设备</TableColumn>
               <TableColumn>目的规则</TableColumn>
+              <TableColumn>域名规则</TableColumn>
               <TableColumn>限额</TableColumn>
               <TableColumn>操作</TableColumn>
             </TableHeader>
@@ -508,6 +570,23 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
                       )}
                     </TableCell>
                     <TableCell>
+                      {(policy.domainRules ?? []).length === 0 ? (
+                        <span className="text-tiny text-default-400">无</span>
+                      ) : (
+                        <ul className="space-y-0.5 font-mono text-tiny">
+                          {(policy.domainRules ?? []).map((rule, index) => {
+                            const problem = storedDomainRuleProblem(rule);
+                            return (
+                              <li key={`${rule.match}-${index}`} className={problem ? "text-warning-600" : undefined}>
+                                {rule.match} · {(rule.protocols ?? []).join("/") || "无协议"} · {formatPorts(rule.portRanges)}
+                                {problem && <span className="block font-sans">{problem}</span>}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </TableCell>
+                    <TableCell>
                       <span className="text-tiny text-default-500">
                         并发 {policy.maxConcurrentFlows} · 每设备 {policy.maxFlowsPerConsumer} · 空闲 {policy.idleTimeoutSeconds} 秒
                       </span>
@@ -542,7 +621,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
       <div className="rounded-md border border-default-200 p-3">
         <h4 className="mb-2 text-small font-semibold text-default-600">出口活动</h4>
         {activity.length === 0 ? (
-          <p className="text-tiny text-default-500">尚无出口上报的活动。客户端目前不上报出口计数，出口是否在线以组网在线状态为准。</p>
+          <p className="text-tiny text-default-500">尚无出口上报的活动。出口运行后每 60 秒检查一次、有变化才上报；出口是否在线以组网在线状态为准。</p>
         ) : (
           <ul className="space-y-1 text-tiny text-default-600">
             {activity.map((item) => {

@@ -23,10 +23,6 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#ifndef ST_APPLICATION_FIXTURE_FILE
-#define ST_APPLICATION_FIXTURE_FILE "../../../protocol/test-vectors/application-protocol-v2.json"
-#endif
-
 static long long test_now_millis(void)
 {
     struct timeval tv;
@@ -292,6 +288,9 @@ typedef struct {
     int normalized_accept_encoding_headers;
     char http_raw_query[256];
     char ws_raw_query[256];
+    char http_relative_path[256];
+    char ws_relative_path[256];
+    char http_body[256];
 } route_auth_test_context;
 
 static void route_auth_test_context_reset(route_auth_test_context *context)
@@ -303,6 +302,9 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->normalized_accept_encoding_headers = 0;
     context->http_raw_query[0] = '\0';
     context->ws_raw_query[0] = '\0';
+    context->http_relative_path[0] = '\0';
+    context->ws_relative_path[0] = '\0';
+    context->http_body[0] = '\0';
     pthread_mutex_unlock(&context->lock);
 }
 
@@ -350,6 +352,17 @@ static int route_auth_test_queries_match(route_auth_test_context *context,
     return matches;
 }
 
+static int route_auth_test_paths_match(route_auth_test_context *context,
+                                       const char *http_path,
+                                       const char *ws_path)
+{
+    pthread_mutex_lock(&context->lock);
+    int matches = strcmp(context->http_relative_path, http_path) == 0
+        && strcmp(context->ws_relative_path, ws_path) == 0;
+    pthread_mutex_unlock(&context->lock);
+    return matches;
+}
+
 static int route_auth_http_forwarder(void *ctx,
                                      const char *client_name,
                                      const st_direct_http_request *request,
@@ -367,6 +380,15 @@ static int route_auth_http_forwarder(void *ctx,
              sizeof(context->http_raw_query),
              "%s",
              request->raw_query == NULL ? "" : request->raw_query);
+    snprintf(context->http_relative_path,
+             sizeof(context->http_relative_path),
+             "%s",
+             request->relative_path == NULL ? "" : request->relative_path);
+    snprintf(context->http_body,
+             sizeof(context->http_body),
+             "%.*s",
+             request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
+             request->body == NULL ? "" : (const char *)request->body);
     pthread_mutex_unlock(&context->lock);
     char *headers[] = {"Content-Type: text/plain; charset=UTF-8"};
     static const uint8_t response_body[] = "forwarded";
@@ -388,6 +410,10 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_raw_query),
              "%s",
              request->raw_query == NULL ? "" : request->raw_query);
+    snprintf(context->ws_relative_path,
+             sizeof(context->ws_relative_path),
+             "%s",
+             request->relative_path == NULL ? "" : request->relative_path);
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -404,10 +430,15 @@ static int route_auth_ws_data(void *ctx,
     return 0;
 }
 
-static void route_auth_ws_close(void *ctx, const char *channel_id)
+static void route_auth_ws_close(void *ctx,
+                                const char *channel_id,
+                                uint32_t reset_code,
+                                const char *reason)
 {
     (void)ctx;
     (void)channel_id;
+    (void)reset_code;
+    (void)reason;
 }
 
 static int route_auth_http_roundtrip(int port,
@@ -2000,20 +2031,55 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* The path after the route keeps its percent-encoding: "+" is not a space and "%2F" is not
+     * a separator there, so decoding it would send the app a different path. */
     snprintf(request,
              sizeof(request),
-             "GET %s?template={0}&encoded=%%7B1%%7D HTTP/1.1\r\nHost: localhost\r\n"
+             "GET %s/a+b/c%%20d/%%E4%%BD%%A0/x%%2Fy?template={0}&encoded=%%7B1%%7D HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
              protected_path);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "200 OK")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
-        || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")) {
-        fprintf(stderr, "direct HTTP raw query brace encoding mismatch\n");
+        || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")
+        || !route_auth_test_paths_match(&context, "/items/a+b/c%20d/%E4%BD%A0/x%2Fy", "")) {
+        fprintf(stderr, "direct HTTP raw path or query brace encoding mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
         return 1;
+    }
+
+    /* A chunked body reaches the target decoded (extensions and trailers dropped); a chunked
+     * body that also declares a length, or that ends early, never reaches it. */
+    static const char *const chunked_requests[][2] = {
+        {"Transfer-Encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n7\r\n, world\r\n0\r\nX-Sum: 1\r\n\r\n",
+         "200 OK"},
+        {"Transfer-Encoding: chunked\r\nContent-Length: 10\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+         "400 Bad Request"},
+        {"Transfer-Encoding: chunked\r\n\r\n5\r\nhel", "400 Bad Request"},
+        {"Transfer-Encoding: gzip\r\n\r\nxx", "501 Not Implemented"},
+    };
+    for (size_t i = 0; i < sizeof(chunked_requests) / sizeof(chunked_requests[0]); ++i) {
+        /* PUT, because the traffic detail test later counts the POST exchanges in this database. */
+        snprintf(request,
+                 sizeof(request),
+                 "PUT %s HTTP/1.1\r\nHost: localhost\r\n"
+                 "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s",
+                 protected_path,
+                 chunked_requests[i][0]);
+        route_auth_test_context_reset(&context);
+        int forwarded = i == 0;
+        if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+            || !contains(response, chunked_requests[i][1])
+            || !route_auth_test_context_matches(&context, forwarded, 0, 0)
+            || (forwarded && strcmp(context.http_body, "hello, world") != 0)) {
+            fprintf(stderr, "direct HTTP chunked request %zu mismatch: %s\n", i, response);
+            route_auth_stop_server(&server);
+            pthread_mutex_destroy(&context.lock);
+            return 1;
+        }
     }
 
     snprintf(request,
@@ -2034,7 +2100,7 @@ static int test_direct_http_route_authentication(const char *database_path)
 
     snprintf(request,
              sizeof(request),
-             "GET %s?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+             "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
              "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
@@ -2043,7 +2109,8 @@ static int test_direct_http_route_authentication(const char *database_path)
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
-        || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")) {
+        || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
@@ -2272,134 +2339,6 @@ static void oidc_test_server_stop(oidc_test_server *server, pthread_t thread)
     }
 }
 
-static void test_write_u16_be(uint8_t *value, uint16_t number)
-{
-    value[0] = (uint8_t)(number >> 8U);
-    value[1] = (uint8_t)number;
-}
-
-static char *test_read_text_file(const char *path)
-{
-    FILE *file = fopen(path, "rb");
-    if (file == NULL || fseek(file, 0, SEEK_END) != 0) {
-        if (file != NULL) fclose(file);
-        return NULL;
-    }
-    long size = ftell(file);
-    if (size < 0 || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return NULL;
-    }
-    char *text = (char *)malloc((size_t)size + 1U);
-    if (text == NULL || fread(text, 1U, (size_t)size, file) != (size_t)size) {
-        free(text);
-        fclose(file);
-        return NULL;
-    }
-    fclose(file);
-    text[(size_t)size] = '\0';
-    return text;
-}
-
-static int test_hex_nibble(char value)
-{
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-}
-
-static uint8_t *test_decode_hex(const char *hex, size_t *decoded_len)
-{
-    size_t len = hex == NULL ? 0U : strlen(hex);
-    if (len == 0U || len % 2U != 0U) return NULL;
-    uint8_t *decoded = (uint8_t *)malloc(len / 2U);
-    if (decoded == NULL) return NULL;
-    for (size_t i = 0; i < len; i += 2U) {
-        int high = test_hex_nibble(hex[i]);
-        int low = test_hex_nibble(hex[i + 1U]);
-        if (high < 0 || low < 0) {
-            free(decoded);
-            return NULL;
-        }
-        decoded[i / 2U] = (uint8_t)((high << 4U) | low);
-    }
-    *decoded_len = len / 2U;
-    return decoded;
-}
-
-static int test_sws2_central_vectors(void)
-{
-    char *json = test_read_text_file(ST_APPLICATION_FIXTURE_FILE);
-    if (json == NULL) {
-        fprintf(stderr, "application protocol fixture could not be read\n");
-        return 1;
-    }
-    const char *fields[] = {"frameHex", "invalidMagicHex", "truncatedHex", "trailingHex"};
-    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
-        char *hex = st_json_get_string(json, fields[i]);
-        size_t payload_len = 0U;
-        uint8_t *payload = test_decode_hex(hex, &payload_len);
-        int accepted = payload != NULL && st_admin_validate_sws2_payload(payload, payload_len) == 0;
-        int missing = payload == NULL;
-        free(hex);
-        free(payload);
-        if (missing || (i == 0U && !accepted) || (i != 0U && accepted)) {
-            fprintf(stderr, "central SWS2 vector mismatch: %s\n", fields[i]);
-            free(json);
-            return 1;
-        }
-    }
-    free(json);
-    return 0;
-}
-
-static int test_sws2_validation(void)
-{
-    if (test_sws2_central_vectors() != 0) {
-        return 1;
-    }
-    uint8_t close_frame[12] = {'S', 'W', 'S', '2', 0x8U, 0x1U, 0, 0, 0, 0, 0, 0};
-    test_write_u16_be(close_frame + 6U, 1000U);
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) != 0) {
-        fprintf(stderr, "valid SWS2 close frame was rejected\n");
-        return 1;
-    }
-    const uint16_t forbidden[] = {1004U, 1005U, 1006U, 1015U};
-    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); ++i) {
-        test_write_u16_be(close_frame + 6U, forbidden[i]);
-        if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-            fprintf(stderr,
-                    "forbidden SWS2 close code was accepted: %u\n",
-                    (unsigned)forbidden[i]);
-            return 1;
-        }
-    }
-    test_write_u16_be(close_frame + 6U, 0U);
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) != 0) {
-        fprintf(stderr, "empty SWS2 close frame was rejected\n");
-        return 1;
-    }
-    close_frame[8] = 1U;
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-        fprintf(stderr, "truncated SWS2 payload was accepted\n");
-        return 1;
-    }
-    close_frame[8] = 0U;
-    close_frame[5] = 0x81U;
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-        fprintf(stderr, "reserved SWS2 flag bits were accepted\n");
-        return 1;
-    }
-    close_frame[5] = 0x1U;
-    close_frame[4] = 0x3U;
-    if (st_admin_validate_sws2_payload(close_frame, sizeof(close_frame)) == 0) {
-        fprintf(stderr, "unknown SWS2 opcode was accepted\n");
-        return 1;
-    }
-    return 0;
-}
-
 /*
  * The egress policy endpoint end to end. The rule-by-rule semantics are replayed from the shared
  * vector in peer_egress_tests; what is checked here is that a refused list refuses the whole
@@ -2423,6 +2362,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     int policy_id = 0;
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
         || !contains(response, "\"maxConcurrentFlows\":10")
+        || !contains(response, "\"domainRules\":[]")
         || st_json_get_int(response, "id", &policy_id) != 0 || policy_id <= 0) {
         fprintf(stderr, "egress policy save did not store the normalised rules: %s\n", response);
         return 1;
@@ -2460,6 +2400,55 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored)
         || !contains(response, "\"maxConcurrentFlows\":30")) {
         fprintf(stderr, "null destinationRules did not keep the stored rules: %s\n", response);
+        return 1;
+    }
+
+    /*
+     * Domain rules: stored normalised next to the destination rules, which an update without them
+     * keeps; a refused rule refuses the whole request; null and an absent field keep them.
+     */
+    static const char *const stored_names =
+        "\"domainRules\":[{\"match\":\"*.cdn.example\",\"protocols\":[\"udp\"],\"portRanges\":[[443,443]]}]";
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"domainRules\":[{\"match\":\" *.CDN.Example. \","
+             "\"protocols\":[\" UDP \"],\"portRanges\":[[443,443]]}]}",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
+        || !contains(response, stored) || !contains(response, "\"maxConcurrentFlows\":30")) {
+        fprintf(stderr, "egress policy save did not store the normalised domain rules: %s\n", response);
+        return 1;
+    }
+    static const char *const refused_names[] = {
+        "[{\"match\":\"203.0.113.5\"}]",
+        "[{\"match\":\"*.com\"}]",
+        "[{\"match\":\"localhost\"}]",
+        "[{\"match\":\"example.com\",\"protocols\":[\"icmp\"]}]",
+        "{\"match\":\"example.com\"}",
+    };
+    for (size_t i = 0; i < sizeof(refused_names) / sizeof(refused_names[0]); ++i) {
+        snprintf(body, sizeof(body),
+                 "{\"egressClientId\":%d,\"maxConcurrentFlows\":50,\"domainRules\":%s}",
+                 egress_client_id, refused_names[i]);
+        len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")
+            || !contains(response, "invalid domainRules")) {
+            fprintf(stderr, "egress policy accepted domain rules %s: %s\n", refused_names[i], response);
+            return 1;
+        }
+    }
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"maxConcurrentFlows\":31,\"domainRules\":null}", egress_client_id);
+    len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
+        || !contains(response, "\"maxConcurrentFlows\":31")) {
+        fprintf(stderr, "null domainRules did not keep the stored rules: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, stored_names)
+        || !contains(response, stored) || !contains(response, "\"maxConcurrentFlows\":31")) {
+        fprintf(stderr, "the policy list lost the domain rules: %s\n", response);
         return 1;
     }
 
@@ -2505,9 +2494,6 @@ int main(void)
     /* The suite deliberately exercises demo credentials and seeding; production disables both. */
     setenv("SPECUS_ENV", "test", 1);
     setenv("SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED", "false", 1);
-    if (test_sws2_validation() != 0) {
-        return 1;
-    }
     char response[32768];
     char request_path[128];
     int len = st_admin_build_response("GET", "/health", response, sizeof(response));

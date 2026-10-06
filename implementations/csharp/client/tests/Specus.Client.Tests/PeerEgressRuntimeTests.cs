@@ -439,7 +439,7 @@ public class PeerEgressRuntimeTests
 
         Assert.True(harness.SawReset(), "an unreachable target left the consumer without a reset");
         Assert.Empty(harness.RejectCodes());
-        Assert.Empty(harness.Runtime.Rejections.DrainCounts());
+        Assert.Empty(harness.Runtime.Rejections.CumulativeCounts());
         // The reservation must come back, or a flapping destination would exhaust the quota.
         Assert.True(harness.Runtime.FlowCount == 0, "flows left after a failed connect");
     }
@@ -671,7 +671,7 @@ public class PeerEgressRuntimeTests
         Assert.True(harness.Runtime.FlowCount == 0, "the session outlived its idle timeout");
         Assert.True(harness.Socket(0).IsClosed, "an expired session left its socket open");
         // An expiring session is the normal end of life, not something to report as blocked traffic.
-        Assert.Empty(harness.Runtime.Rejections.DrainCounts());
+        Assert.Empty(harness.Runtime.Rejections.CumulativeCounts());
     }
 
     /// <summary>
@@ -879,6 +879,129 @@ public class PeerEgressRuntimeTests
 
         WaitFor("the datagram to reach the socket", () => harness.DialCount == 1 && harness.Socket(0).Written.Count > 0);
         Assert.Equal(["203.0.113.53:53"], harness.Dialed);
+    }
+
+    /// <summary>
+    /// The harness policy with one domain rule, *.cdn.example on TCP 443, when asked for. Its
+    /// destination rule is 203.0.113.0/24, so 192.0.2.10 is reachable only by name.
+    /// </summary>
+    private static PeerEgressPolicy DomainPolicy(bool withDomainRule) => Policy() with
+    {
+        DomainRules = withDomainRule
+            ? [new PeerEgressDomainRule { Match = "*.cdn.example", Protocols = ["tcp"], PortRanges = [[443, 443]] }]
+            : [],
+    };
+
+    /// <summary>
+    /// The egress's own fake-IP pool on its forced-deny list, as the mesh installs it when this node
+    /// runs phase two too. The consumer's fake addresses fall in it, which is why a named flow has to
+    /// be judged on the address it was dialled to and never on the one in its key.
+    /// </summary>
+    private static readonly PeerEgressContext OwnPoolDenied = new() { DeploymentDenyCidrs = ["198.18.0.0/15"] };
+
+    private static byte[] SynTo(string destination, ushort sourcePort = 40000) =>
+        FrameFor(PeerEgressSegment.Build(Syn("100.96.0.1", sourcePort, destination, 443)));
+
+    /// <summary>
+    /// A name the policy grants by a domain rule is dialled although its address is outside every
+    /// destination rule (protocol/spec/peer-egress.md, 按域名授权).
+    /// </summary>
+    [Fact]
+    public void AdmitsANamedFlowByADomainRule()
+    {
+        var harness = new Harness();
+        harness.Runtime.ApplyPolicy(DomainPolicy(true), OwnPoolDenied, Epoch);
+        harness.Runtime.Resolve = ResolvingTo("192.0.2.10");
+        BindName(harness, 7, "198.18.0.5", "v.cdn.example");
+
+        harness.Runtime.HandleFrame(7, SynTo("198.18.0.5"), Epoch);
+
+        Assert.Equal(["192.0.2.10:443"], harness.Dialed);
+        Assert.Empty(harness.RejectCodes());
+        Assert.True(harness.Runtime.FlowCount == 1, "the admitted flow is not in the table");
+    }
+
+    /// <summary>Without the domain rule the same flow is refused at the destination step, before any dial.</summary>
+    [Fact]
+    public void RefusesANamedFlowNoRuleGrants()
+    {
+        var harness = new Harness();
+        harness.Runtime.ApplyPolicy(DomainPolicy(false), OwnPoolDenied, Epoch);
+        harness.Runtime.Resolve = ResolvingTo("192.0.2.10");
+        BindName(harness, 7, "198.18.0.5", "v.cdn.example");
+
+        harness.Runtime.HandleFrame(7, SynTo("198.18.0.5"), Epoch);
+
+        Assert.True(harness.DialCount == 0, "a name no rule grants was dialled");
+        Assert.True(harness.SawReset(), "the refused flow was not reset");
+        Assert.Equal([PeerEgressCodes.DestinationDenied], harness.RejectCodes());
+    }
+
+    /// <summary>
+    /// A flow that arrives by address is never granted by a domain rule, even to an address an allowed
+    /// name resolves to: that would turn a grant of a name into a grant of an address.
+    /// </summary>
+    [Fact]
+    public void ADomainRuleGrantsNothingToAFlowByAddress()
+    {
+        var harness = new Harness();
+        harness.Runtime.ApplyPolicy(DomainPolicy(true), OwnPoolDenied, Epoch);
+
+        harness.Runtime.HandleFrame(7, SynTo("192.0.2.10"), Epoch);
+
+        Assert.True(harness.DialCount == 0, "a flow by address was granted by a domain rule");
+        Assert.Equal([PeerEgressCodes.DestinationDenied], harness.RejectCodes());
+    }
+
+    /// <summary>
+    /// A policy refresh judges a named flow as admission did, with its name and the address it was
+    /// dialled to: one that still grants it leaves it running, one that drops the domain rule revokes
+    /// it like any other revocation, with a reset and the destination step's code.
+    /// </summary>
+    [Fact]
+    public void RevokesANamedFlowWhenItsDomainRuleIsRemoved()
+    {
+        var harness = new Harness();
+        harness.Runtime.ApplyPolicy(DomainPolicy(true), OwnPoolDenied, Epoch);
+        harness.Runtime.Resolve = ResolvingTo("192.0.2.10");
+        BindName(harness, 7, "198.18.0.5", "v.cdn.example");
+        harness.Runtime.HandleFrame(7, SynTo("198.18.0.5"), Epoch);
+        WaitFor("the named flow to open", () => harness.Runtime.FlowCount == 1 && harness.DialCount == 1);
+        harness.ClearFrames();
+
+        harness.Runtime.ApplyPolicy(DomainPolicy(true), OwnPoolDenied, Epoch);
+
+        Assert.True(harness.Runtime.FlowCount == 1, "a refresh that still grants the name closed its flow");
+        Assert.False(harness.Socket(0).IsClosed, "a refresh that still grants the name closed its socket");
+        Assert.Empty(harness.RejectCodes());
+
+        harness.Runtime.ApplyPolicy(DomainPolicy(false), OwnPoolDenied, Epoch);
+
+        Assert.True(harness.Runtime.FlowCount == 0, "the named flow survived losing its domain rule");
+        Assert.True(harness.Socket(0).IsClosed, "the revoked flow's socket stayed open");
+        Assert.Equal([PeerEgressCodes.DestinationDenied], harness.RejectCodes());
+        Assert.True(harness.SawReset(), "the revoked flow got no reset");
+    }
+
+    /// <summary>
+    /// A named flow a destination rule grants survives a refresh. Judged on the fake address in its
+    /// key it would be refused: that address is in the egress's own pool, on the forced-deny list.
+    /// </summary>
+    [Fact]
+    public void KeepsANamedFlowARefreshStillGrantsByAddress()
+    {
+        var harness = new Harness();
+        harness.Runtime.ApplyPolicy(DomainPolicy(false), OwnPoolDenied, Epoch);
+        harness.Runtime.Resolve = ResolvingTo("203.0.113.10");
+        BindName(harness, 7, "198.18.0.5", "example.com");
+        harness.Runtime.HandleFrame(7, SynTo("198.18.0.5"), Epoch);
+        WaitFor("the named flow to open", () => harness.Runtime.FlowCount == 1 && harness.DialCount == 1);
+        harness.ClearFrames();
+
+        harness.Runtime.ApplyPolicy(DomainPolicy(false), OwnPoolDenied, Epoch);
+
+        Assert.True(harness.Runtime.FlowCount == 1, "a refresh judged the named flow on its fake address");
+        Assert.Empty(harness.RejectCodes());
     }
 
     private static byte[] SynFrame(string source, ushort sourcePort) =>

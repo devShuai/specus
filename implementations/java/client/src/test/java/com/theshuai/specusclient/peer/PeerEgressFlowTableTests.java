@@ -187,6 +187,50 @@ class PeerEgressFlowTableTests {
     }
 
     /**
+     * A named flow is re-authorized by the address it was dialled to, with its name, not by the
+     * consumer's fake address its key holds. Judged by the key, the LAN-scoped flow below would be
+     * refused for its scope and the other for its destination on every refresh, though the policy
+     * still allows both; and a domain rule only ever covers the name the flow carries.
+     */
+    @Test
+    void reauthorizesANamedFlowByTheAddressItDialled() {
+        PeerEgressFlowTable table = new PeerEgressFlowTable(60_000);
+        Flow byDestination = table.open(key(TCP, "100.96.0.1", 40000, "198.18.0.5", 443), 7, EPOCH);
+        byDestination.address = address("203.0.113.10");
+        byDestination.name = "other.example";
+        Flow byDomain = table.open(key(TCP, "100.96.0.1", 40001, "198.18.0.6", 443), 7, EPOCH);
+        byDomain.address = address("192.0.2.10");
+        byDomain.name = "example.com";
+
+        PeerEgressPolicy domain = policy("203.0.113.0/24");
+        PeerEgressPolicy.PeerEgressDomainRule rule = new PeerEgressPolicy.PeerEgressDomainRule();
+        rule.setMatch("example.com");
+        rule.setProtocols(List.of("tcp"));
+        rule.setPortRanges(List.of(List.of(443, 443)));
+        domain.setDomainRules(List.of(rule));
+        assertTrue(table.reauthorize(domain, consumer -> true, PeerEgressAuthorization.Context.defaults(), List.of())
+                .isEmpty(), "a refresh that kept every grant revoked a named flow");
+
+        List<Revocation> revoked = table.reauthorize(policy("203.0.113.0/24"), consumer -> true,
+                PeerEgressAuthorization.Context.defaults(), List.of());
+        assertEquals(1, revoked.size());
+        assertEquals(byDomain, revoked.get(0).flow());
+        assertEquals(PeerEgressCodes.DEST_DENIED, revoked.get(0).code());
+        assertNotNull(table.lookup(byDestination.key));
+
+        Flow lan = table.open(key(TCP, "100.96.0.1", 40002, "198.18.0.7", 443), 7, EPOCH);
+        lan.address = address("10.0.0.5");
+        lan.name = "intranet.example";
+        PeerEgressPolicy lanPolicy = policy("10.0.0.0/8", "203.0.113.0/24");
+        lanPolicy.setScope(PeerEgressPolicy.SCOPE_LAN);
+        revoked = table.reauthorize(lanPolicy, consumer -> true, PeerEgressAuthorization.Context.defaults(), List.of());
+        assertEquals(1, revoked.size(), "the LAN flow was judged by its fake address");
+        assertEquals(byDestination, revoked.get(0).flow());
+        assertEquals(PeerEgressCodes.SCOPE_DENIED, revoked.get(0).code());
+        assertNotNull(table.lookup(lan.key));
+    }
+
+    /**
      * Lowering a quota should stop the next flow, not pick live ones to kill. A limit breach is not
      * a permission a running flow lost.
      */

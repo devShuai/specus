@@ -34,6 +34,12 @@ const MaxEgressDestinationRules = 64
 // MaxEgressDestinationRulesBytes matches the column width in every schema dialect.
 const MaxEgressDestinationRulesBytes = 4096
 
+// MaxEgressDomainRules caps a stored list of domain rules; enforced before persisting.
+const MaxEgressDomainRules = 64
+
+// MaxEgressDomainRulesBytes caps the stored domain rules, counted apart from the destination rules.
+const MaxEgressDomainRulesBytes = 4096
+
 // egressRevisions is bumped on every push so a client can ignore a snapshot it has already applied.
 var egressRevisions atomic.Int64
 
@@ -71,6 +77,7 @@ type EgressPolicyMutation struct {
 	Scope                    *string                      `json:"scope"`
 	AllowedConsumerClientIDs []int64                      `json:"allowedConsumerClientIds"`
 	DestinationRules         []peeregress.DestinationRule `json:"destinationRules"`
+	DomainRules              []peeregress.DomainRule      `json:"domainRules"`
 	MaxConcurrentFlows       *int                         `json:"maxConcurrentFlows"`
 	MaxFlowsPerConsumer      *int                         `json:"maxFlowsPerConsumer"`
 	IdleTimeoutSeconds       *int                         `json:"idleTimeoutSeconds"`
@@ -89,6 +96,7 @@ type EgressPolicyView struct {
 	AllowedConsumerClientIDs   []int64                      `json:"allowedConsumerClientIds"`
 	EffectiveConsumerClientIDs []int64                      `json:"effectiveConsumerClientIds"`
 	DestinationRules           []peeregress.DestinationRule `json:"destinationRules"`
+	DomainRules                []peeregress.DomainRule      `json:"domainRules"`
 	MaxConcurrentFlows         int                          `json:"maxConcurrentFlows"`
 	MaxFlowsPerConsumer        int                          `json:"maxFlowsPerConsumer"`
 	IdleTimeoutSeconds         int                          `json:"idleTimeoutSeconds"`
@@ -247,29 +255,133 @@ func NormalizeEgressDestinationRules(rules []peeregress.DestinationRule) ([]peer
 		if _, ok := peeregress.ParseCIDR(cidr); !ok {
 			return nil, egressInvalid("destinationRules[%d].cidr %q is not an IPv4 address or CIDR with zero host bits", index, rule.CIDR)
 		}
-		protocols := []string{}
-		for _, protocol := range rule.Protocols {
-			value := strings.ToLower(strings.TrimSpace(protocol))
-			if value != "tcp" && value != "udp" {
-				return nil, egressInvalid("destinationRules[%d].protocols: %q is not tcp or udp", index, protocol)
-			}
-			if !containsString(protocols, value) {
-				protocols = append(protocols, value)
-			}
-		}
-		if len(rule.PortRanges) > MaxEgressPortRangesPerRule {
-			return nil, egressInvalid("destinationRules[%d].portRanges: at most %d ranges", index, MaxEgressPortRangesPerRule)
-		}
-		ranges := make([][]int, 0, len(rule.PortRanges))
-		for _, pair := range rule.PortRanges {
-			if len(pair) != 2 || pair[0] < 0 || pair[1] > 65535 || pair[0] > pair[1] {
-				return nil, egressInvalid("destinationRules[%d].portRanges: %v is not [low, high] within 0-65535", index, pair)
-			}
-			ranges = append(ranges, []int{pair[0], pair[1]})
+		field := fmt.Sprintf("destinationRules[%d]", index)
+		protocols, ranges, err := normalizeEgressRuleTraffic(field, rule.Protocols, rule.PortRanges)
+		if err != nil {
+			return nil, err
 		}
 		stored = append(stored, peeregress.DestinationRule{CIDR: cidr, Protocols: protocols, PortRanges: ranges})
 	}
 	return stored, nil
+}
+
+// normalizeEgressRuleTraffic checks the protocols and port ranges of one destination or domain rule:
+// protocols are trimmed, lowercased and de-duplicated in order and must be tcp or udp; each range is
+// [low, high] within 0-65535, at most MaxEgressPortRangesPerRule of them. Absent lists come back
+// empty, which still grants nothing.
+func normalizeEgressRuleTraffic(field string, rawProtocols []string, rawRanges [][]int) ([]string, [][]int, error) {
+	protocols := []string{}
+	for _, protocol := range rawProtocols {
+		value := strings.ToLower(strings.TrimSpace(protocol))
+		if value != "tcp" && value != "udp" {
+			return nil, nil, egressInvalid("%s.protocols: %q is not tcp or udp", field, protocol)
+		}
+		if !containsString(protocols, value) {
+			protocols = append(protocols, value)
+		}
+	}
+	if len(rawRanges) > MaxEgressPortRangesPerRule {
+		return nil, nil, egressInvalid("%s.portRanges: at most %d ranges", field, MaxEgressPortRangesPerRule)
+	}
+	ranges := make([][]int, 0, len(rawRanges))
+	for _, pair := range rawRanges {
+		if len(pair) != 2 || pair[0] < 0 || pair[1] > 65535 || pair[0] > pair[1] {
+			return nil, nil, egressInvalid("%s.portRanges: %v is not [low, high] within 0-65535", field, pair)
+		}
+		ranges = append(ranges, []int{pair[0], pair[1]})
+	}
+	return protocols, ranges, nil
+}
+
+// NormalizeEgressDomainRules checks a management request's domain rules and returns what to store
+// (protocol/spec/peer-egress.md, 按域名授权; protocol/test-vectors/peer-egress-domain-policy-v1.json).
+//
+// A match is written the way a consumer writes a domain rule, and stored trimmed, without its
+// trailing dot and in lower case. What would grant more than a name -- an address or CIDR, which
+// belongs in the destination rules, a single label, a bare * or a wildcard over one label -- refuses
+// the whole request, as does anything the egress could not read. Protocols and port ranges follow
+// the destination rules. The stored list is limited on its own, apart from the destination rules.
+func NormalizeEgressDomainRules(rules []peeregress.DomainRule) ([]peeregress.DomainRule, error) {
+	if len(rules) > MaxEgressDomainRules {
+		return nil, egressInvalid("too many domain rules: %d, at most %d", len(rules), MaxEgressDomainRules)
+	}
+	stored := make([]peeregress.DomainRule, 0, len(rules))
+	for index, rule := range rules {
+		match, ok := normalizeEgressDomainMatch(rule.Match)
+		if !ok {
+			return nil, egressInvalid("domainRules[%d].match %q is not a name or *.name with at least two labels", index, rule.Match)
+		}
+		field := fmt.Sprintf("domainRules[%d]", index)
+		protocols, ranges, err := normalizeEgressRuleTraffic(field, rule.Protocols, rule.PortRanges)
+		if err != nil {
+			return nil, err
+		}
+		stored = append(stored, peeregress.DomainRule{Match: match, Protocols: protocols, PortRanges: ranges})
+	}
+	if _, err := EncodeEgressDomainRules(stored); err != nil {
+		return nil, egressInvalid("%s", err.Error())
+	}
+	return stored, nil
+}
+
+// normalizeEgressDomainMatch is the consumer's domain-rule syntax (protocol/spec/peer-egress-dns.md):
+// name or *.name, every label 1-63 of a-z, 0-9 and an inner -, at most 253 bytes after the *. part,
+// at least two labels and not all of them digits, punycode for IDN. Something with neither a leading
+// * nor a letter is an address, not a name. Returns the stored form.
+func normalizeEgressDomainMatch(raw string) (string, bool) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return "", false
+	}
+	hasLetter := false
+	for index := 0; index < len(text); index++ {
+		c := text[index]
+		if c >= 0x80 {
+			// Unicode has to be written as punycode; it is refused rather than read as an address.
+			return "", false
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			hasLetter = true
+		}
+	}
+	if !hasLetter && !strings.HasPrefix(text, "*") {
+		return "", false
+	}
+	name := strings.ToLower(strings.TrimRight(text, "."))
+	host := strings.TrimPrefix(name, "*.")
+	if host == "" || len(host) > 253 || strings.Contains(host, "*") {
+		return "", false
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return "", false
+	}
+	allDigits := true
+	for _, label := range labels {
+		if !validEgressDomainLabel(label) {
+			return "", false
+		}
+		if strings.Trim(label, "0123456789") != "" {
+			allDigits = false
+		}
+	}
+	if allDigits {
+		return "", false
+	}
+	return name, true
+}
+
+func validEgressDomainLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for index := 0; index < len(label); index++ {
+		c := label[index]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func containsString(values []string, value string) bool {
@@ -301,7 +413,7 @@ func (s *Service) UpsertEgressPolicy(ctx context.Context, access AccessContext, 
 	insert := existing == nil
 	policy := store.PeerMeshEgressPolicy{
 		ID: auth.NewClientID(), TenantID: access.TenantID, CreatedAt: now,
-		Scope: peeregress.ScopePublic, DestinationRules: "[]",
+		Scope: peeregress.ScopePublic, DestinationRules: "[]", DomainRules: "[]",
 		MaxConcurrentFlows: 256, MaxFlowsPerConsumer: 64, IdleTimeoutSeconds: 60,
 	}
 	if existing != nil {
@@ -338,6 +450,17 @@ func (s *Service) UpsertEgressPolicy(ctx context.Context, access AccessContext, 
 			return EgressPolicyView{}, egressInvalid("%s", err.Error())
 		}
 		policy.DestinationRules = encoded
+	}
+	if mutation.DomainRules != nil {
+		rules, err := NormalizeEgressDomainRules(mutation.DomainRules)
+		if err != nil {
+			return EgressPolicyView{}, err
+		}
+		encoded, err := EncodeEgressDomainRules(rules)
+		if err != nil {
+			return EgressPolicyView{}, egressInvalid("%s", err.Error())
+		}
+		policy.DomainRules = encoded
 	}
 	if mutation.MaxConcurrentFlows != nil {
 		if *mutation.MaxConcurrentFlows <= 0 {
@@ -421,6 +544,9 @@ func (s *Service) BuildEgressConfig(ctx context.Context, account store.ClientAcc
 	message.Scope = policy.Scope
 	message.AllowedConsumerClientIDs = consumers
 	message.DestinationRules = DecodeEgressDestinationRules(policy.DestinationRules, s.logger)
+	// Always present on an enabled push, [] when the policy has none.
+	domainRules := DecodeEgressDomainRules(policy.DomainRules, s.logger)
+	message.DomainRules = &domainRules
 	message.Limits = &peeregress.Limits{
 		MaxConcurrentFlows:  policy.MaxConcurrentFlows,
 		MaxFlowsPerConsumer: policy.MaxFlowsPerConsumer,
@@ -543,6 +669,7 @@ func (s *Service) egressPolicyView(ctx context.Context, policy store.PeerMeshEgr
 		AllowedConsumerClientIDs:   configured,
 		EffectiveConsumerClientIDs: effective,
 		DestinationRules:           DecodeEgressDestinationRules(policy.DestinationRules, s.logger),
+		DomainRules:                DecodeEgressDomainRules(policy.DomainRules, s.logger),
 		MaxConcurrentFlows:         policy.MaxConcurrentFlows,
 		MaxFlowsPerConsumer:        policy.MaxFlowsPerConsumer,
 		IdleTimeoutSeconds:         policy.IdleTimeoutSeconds,
@@ -585,6 +712,45 @@ func DecodeEgressDestinationRules(raw string, logger interface{ Warn(string, ...
 	}
 	if rules == nil {
 		return []peeregress.DestinationRule{}
+	}
+	return rules
+}
+
+// EncodeEgressDomainRules serialises domain rules for storage.
+func EncodeEgressDomainRules(rules []peeregress.DomainRule) (string, error) {
+	if len(rules) == 0 {
+		return "[]", nil
+	}
+	if len(rules) > MaxEgressDomainRules {
+		return "", fmt.Errorf("too many domain rules: %d", len(rules))
+	}
+	encoded, err := json.Marshal(rules)
+	if err != nil {
+		return "", err
+	}
+	if len(encoded) > MaxEgressDomainRulesBytes {
+		return "", fmt.Errorf("domain rules exceed %d bytes once stored", MaxEgressDomainRulesBytes)
+	}
+	return string(encoded), nil
+}
+
+// DecodeEgressDomainRules reads stored domain rules. A row that cannot be parsed grants no name
+// rather than falling back to something permissive; a domain rule only ever adds to what the
+// destination rules allow, so no rules is the narrow reading.
+func DecodeEgressDomainRules(raw string, logger interface{ Warn(string, ...any) }) []peeregress.DomainRule {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return []peeregress.DomainRule{}
+	}
+	var rules []peeregress.DomainRule
+	if err := json.Unmarshal([]byte(trimmed), &rules); err != nil {
+		if logger != nil {
+			logger.Warn("peer egress domain rules are unreadable; granting no names")
+		}
+		return []peeregress.DomainRule{}
+	}
+	if rules == nil {
+		return []peeregress.DomainRule{}
 	}
 	return rules
 }

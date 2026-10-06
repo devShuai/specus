@@ -8,7 +8,8 @@ import java.util.List;
  *
  * <p>The checks run in a fixed order so that implementations agree on which code a request fails
  * with, not merely on allow versus deny. Shared vectors:
- * {@code protocol/test-vectors/peer-egress-authz-v1.json}.
+ * {@code protocol/test-vectors/peer-egress-authz-v1.json}, and for a flow that carries a name
+ * {@code protocol/test-vectors/peer-egress-domain-policy-v1.json}.
  */
 public final class PeerEgressAuthorization {
     /**
@@ -100,23 +101,27 @@ public final class PeerEgressAuthorization {
             return Decision.deny(PeerEgressCodes.SCOPE_DENIED);
         }
 
-        List<PeerEgressPolicy.PeerEgressDestinationRule> addressMatches = new ArrayList<>();
+        // The destination, protocol and port steps look at the destination rules that contain the
+        // address together with, for a flow that carries a name, the domain rules that cover it.
+        // A domain rule can only add to what the destination rules allow, never narrow it.
+        List<Grant> matches = new ArrayList<>();
         List<PeerEgressPolicy.PeerEgressDestinationRule> rules = policy.getDestinationRules();
         if (rules != null) {
             for (PeerEgressPolicy.PeerEgressDestinationRule rule : rules) {
                 Ipv4Cidr cidr = rule == null ? null : Ipv4Cidr.parse(rule.getCidr());
                 if (cidr != null && cidr.contains(destination)) {
-                    addressMatches.add(rule);
+                    matches.add(new Grant(rule.getProtocols(), rule.getPortRanges()));
                 }
             }
         }
-        if (addressMatches.isEmpty()) {
+        matches.addAll(domainMatches(policy.getDomainRules(), request.getName()));
+        if (matches.isEmpty()) {
             return Decision.deny(PeerEgressCodes.DEST_DENIED);
         }
 
         String protocol = request.getProtocol() == null ? "" : request.getProtocol();
-        List<PeerEgressPolicy.PeerEgressDestinationRule> protocolMatches = addressMatches.stream()
-                .filter(rule -> rule.getProtocols() != null && rule.getProtocols().contains(protocol))
+        List<Grant> protocolMatches = matches.stream()
+                .filter(grant -> grant.protocols() != null && grant.protocols().contains(protocol))
                 .toList();
         if (protocolMatches.isEmpty()) {
             return Decision.deny(PeerEgressCodes.PROTOCOL_DENIED);
@@ -161,9 +166,40 @@ public final class PeerEgressAuthorization {
         return false;
     }
 
-    private static boolean portAllowed(List<PeerEgressPolicy.PeerEgressDestinationRule> rules, int port) {
-        for (PeerEgressPolicy.PeerEgressDestinationRule rule : rules) {
-            List<List<Integer>> ranges = rule.getPortRanges();
+    /**
+     * The domain rules covering a flow's name, or none for a flow without one. A flow that arrived
+     * by address is never admitted by a domain rule, even when its address is what an allowed name
+     * resolves to: that would turn a grant of a name into a grant of an address.
+     *
+     * <p>A match that is not a well-formed name or {@code *.name} grants nothing. The decoder
+     * already drops such entries; checking again keeps a policy assembled some other way from
+     * granting {@code *.com} or {@code *}.
+     */
+    private static List<Grant> domainMatches(List<PeerEgressPolicy.PeerEgressDomainRule> rules, String name) {
+        if (rules == null || rules.isEmpty() || name == null) {
+            return List.of();
+        }
+        String normalized = PeerEgressNames.normalize(name);
+        if (normalized.isEmpty()) {
+            return List.of();
+        }
+        List<Grant> covering = new ArrayList<>();
+        for (PeerEgressPolicy.PeerEgressDomainRule rule : rules) {
+            if (rule != null && PeerEgressNames.validMatch(rule.getMatch())
+                    && PeerEgressNames.coverage(rule.getMatch(), normalized) >= 0) {
+                covering.add(new Grant(rule.getProtocols(), rule.getPortRanges()));
+            }
+        }
+        return covering;
+    }
+
+    /** What a matching destination or domain rule grants: its protocols and its ports. */
+    private record Grant(List<String> protocols, List<List<Integer>> portRanges) {
+    }
+
+    private static boolean portAllowed(List<Grant> grants, int port) {
+        for (Grant grant : grants) {
+            List<List<Integer>> ranges = grant.portRanges();
             if (ranges == null) {
                 continue;
             }
