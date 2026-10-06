@@ -8,6 +8,7 @@
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
+#include "security.h"
 #include "storage.h"
 
 #include <arpa/inet.h>
@@ -1942,6 +1943,246 @@ cleanup:
     return result;
 }
 
+/*
+ * /ws/connections over real sockets, with the semantics of Java ConnectionEventsWebSocketHandler:
+ * a created or updated event reaches every session of its tenant that may see the connection, i.e.
+ * administrators, and other users only for connections of a client they own.
+ */
+static int connection_events_bearer(const char *username, const char *tenant, const char *role,
+                                    char *out, size_t out_len)
+{
+    char token[2048];
+    if (st_security_issue_local_token(username, tenant, role, getenv("SPECUS_AUTH_JWT_SECRET"), 600,
+                                      token, sizeof(token)) != 0) {
+        return -1;
+    }
+    int written = snprintf(out, out_len, "Bearer %s", token);
+    return written < 0 || (size_t)written >= out_len ? -1 : 0;
+}
+
+static char *connection_events_ticket(int port, const char *authorization, const char *endpoint)
+{
+    char body[96];
+    char request[4096];
+    char response[4096] = {0};
+    int body_len = snprintf(body, sizeof(body), "{\"endpoint\":\"%s\"}", endpoint);
+    snprintf(request, sizeof(request),
+             "POST /api/admin/ws-tickets HTTP/1.1\r\nHost: localhost\r\nAuthorization: %s\r\n"
+             "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+             authorization, body_len, body);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")) {
+        fprintf(stderr, "connection events ticket request failed: %s\n", response);
+        return NULL;
+    }
+    return st_json_get_string(response, "ticket");
+}
+
+/* Opens /ws/connections with the ticket; *status gets the handshake status code. */
+static int connection_events_connect(int port, const char *ticket, int *status)
+{
+    *status = -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0
+        || connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    char request[2048];
+    int request_len = snprintf(request, sizeof(request),
+                               "GET /ws/connections%s%s HTTP/1.1\r\nHost: localhost\r\n"
+                               "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+                               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                               ticket == NULL ? "" : "?ticket=", ticket == NULL ? "" : ticket);
+    char response[2048] = {0};
+    size_t received = 0U;
+    if (request_len > 0 && send(fd, request, (size_t)request_len, 0) == request_len) {
+        while (received + 1U < sizeof(response) && recv(fd, response + received, 1U, 0) == 1) {
+            ++received;
+            if (received >= 4U && strcmp(response + received - 4U, "\r\n\r\n") == 0) break;
+        }
+    }
+    if (strncmp(response, "HTTP/1.1 ", 9U) == 0) *status = atoi(response + 9);
+    if (*status != 101) {
+        close(fd);
+        return -1;
+    }
+    /* The server registers the session before it reads frames, so a pong proves registration. */
+    uint8_t opcode = 0U;
+    uint8_t pong[16];
+    size_t pong_len = 0U;
+    if (test_websocket_send_masked_frame(fd, 0x9U, (const uint8_t *)"sync", 4U) != 0
+        || test_websocket_read_frame(fd, &opcode, pong, sizeof(pong), &pong_len) != 0
+        || opcode != 0xAU || pong_len != 4U || memcmp(pong, "sync", 4U) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int connection_events_open(int port, const char *username, const char *tenant, const char *role)
+{
+    char authorization[2300];
+    int status = -1;
+    char *ticket = connection_events_bearer(username, tenant, role, authorization, sizeof(authorization)) == 0
+        ? connection_events_ticket(port, authorization, "connections") : NULL;
+    int fd = ticket == NULL ? -1 : connection_events_connect(port, ticket, &status);
+    if (fd < 0) fprintf(stderr, "connection events socket for %s/%s failed (%d)\n", tenant, username, status);
+    free(ticket);
+    return fd;
+}
+
+static void connection_events_broadcast(const char *tenant, const char *type, long long id, long long client_id,
+                                        const char *disconnected_at)
+{
+    st_storage_connection connection;
+    memset(&connection, 0, sizeof(connection));
+    connection.id = id;
+    connection.client_id = client_id;
+    connection.success = 1;
+    snprintf(connection.tenant_id, sizeof(connection.tenant_id), "%s", tenant);
+    snprintf(connection.client_name, sizeof(connection.client_name), "events-client-%lld", id);
+    snprintf(connection.channel_id, sizeof(connection.channel_id), "channel-%lld", id);
+    snprintf(connection.remote_address, sizeof(connection.remote_address), "203.0.113.10");
+    snprintf(connection.connected_at, sizeof(connection.connected_at), "2026-07-22T00:00:00Z");
+    snprintf(connection.disconnected_at, sizeof(connection.disconnected_at), "%s",
+             disconnected_at == NULL ? "" : disconnected_at);
+    st_admin_broadcast_connection_event(tenant, type, &connection);
+}
+
+/* Reads the next event and checks tenant, type, connection id and the Java DTO field set. */
+static int connection_events_expect(int fd, const char *tenant, const char *type, long long id, const char *label)
+{
+    char payload[4096] = {0};
+    char expected_tenant[96];
+    char expected_type[48];
+    char expected_id[48];
+    snprintf(expected_tenant, sizeof(expected_tenant), "{\"tenantId\":\"%s\",", tenant);
+    snprintf(expected_type, sizeof(expected_type), "\"type\":\"%s\"", type);
+    snprintf(expected_id, sizeof(expected_id), "\"connection\":{\"id\":%lld,", id);
+    static const char *const fields[] = {
+        "\"clientId\":", "\"clientName\":", "\"channelId\":", "\"remoteAddress\":", "\"connectedAt\":",
+        "\"disconnectedAt\":", "\"success\":true", "\"failureReason\":", "\"disconnectReason\":",
+        "\"disconnectReasonText\":"
+    };
+    int ok = test_websocket_read_text(fd, payload, sizeof(payload)) == 0
+        && strncmp(payload, expected_tenant, strlen(expected_tenant)) == 0
+        && contains(payload, expected_type) && contains(payload, expected_id);
+    for (size_t i = 0; ok && i < sizeof(fields) / sizeof(fields[0]); ++i) ok = contains(payload, fields[i]);
+    if (!ok) fprintf(stderr, "%s: expected %s %s #%lld, got %s\n", label, tenant, type, id, payload);
+    return ok ? 0 : -1;
+}
+
+static int connection_events_silent(int fd, const char *label)
+{
+    struct timeval quick = {.tv_sec = 0, .tv_usec = 300000};
+    struct timeval normal = {.tv_sec = 5, .tv_usec = 0};
+    uint8_t byte = 0U;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &quick, sizeof(quick));
+    ssize_t received = recv(fd, &byte, 1U, MSG_PEEK);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &normal, sizeof(normal));
+    if (received < 0) return 0;
+    fprintf(stderr, "%s: an event leaked to this session\n", label);
+    return -1;
+}
+
+static int test_connection_events_websocket(long long owned_client_id)
+{
+    st_admin_server server;
+    memset(&server, 0, sizeof(server));
+    server.fd = -1;
+    if (st_admin_server_start(&server, 0, "") != 0) {
+        fprintf(stderr, "connection events server start failed\n");
+        return 1;
+    }
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    int port = getsockname(server.fd, (struct sockaddr *)&address, &address_len) == 0 ? ntohs(address.sin_port) : -1;
+    int admin = -1, owner = -1, stranger = -1, other_tenant = -1;
+    int result = 1;
+    char response[4096];
+    char authorization[2300];
+    int status = -1;
+    if (port <= 0) goto cleanup;
+
+    /* Plain HTTP is told to upgrade; missing, cross-endpoint and reused tickets are refused. */
+    int len = st_admin_build_response("GET", "/ws/connections", response, sizeof(response));
+    if (len <= 0 || !contains(response, "426 Upgrade Required")) {
+        fprintf(stderr, "plain GET /ws/connections must be 426\n");
+        goto cleanup;
+    }
+    if (connection_events_connect(port, NULL, &status) >= 0 || status != 403) {
+        fprintf(stderr, "/ws/connections without a ticket must be 403, got %d\n", status);
+        goto cleanup;
+    }
+    char *ticket = connection_events_bearer("admin", "tenant-db", "ADMIN", authorization, sizeof(authorization)) == 0
+        ? connection_events_ticket(port, authorization, "client-messages") : NULL;
+    int issued = ticket != NULL;
+    int refused = issued ? connection_events_connect(port, ticket, &status) : -1;
+    free(ticket);
+    if (!issued || refused >= 0 || status != 403) {
+        fprintf(stderr, "a client-messages ticket must not open /ws/connections (%d)\n", status);
+        if (refused >= 0) close(refused);
+        goto cleanup;
+    }
+    ticket = connection_events_ticket(port, authorization, "connections");
+    admin = ticket == NULL ? -1 : connection_events_connect(port, ticket, &status);
+    int reused = ticket == NULL || admin < 0 ? -1 : connection_events_connect(port, ticket, &status);
+    free(ticket);
+    if (admin < 0 || reused >= 0 || status != 403) {
+        fprintf(stderr, "a connections ticket must open exactly one session (%d)\n", status);
+        if (reused >= 0) close(reused);
+        goto cleanup;
+    }
+    owner = connection_events_open(port, "owner-db", "tenant-db", "USER");
+    stranger = connection_events_open(port, "someone-else", "tenant-db", "USER");
+    other_tenant = connection_events_open(port, "admin", "tenant-other", "ADMIN");
+    if (owner < 0 || stranger < 0 || other_tenant < 0) goto cleanup;
+
+    /* Another tenant's event, then a created/updated pair of the owner's client, then a
+     * connection of no owned client. Each session sees exactly its share, in order. */
+    connection_events_broadcast("tenant-other", "created", 501, 0, NULL);
+    connection_events_broadcast("tenant-db", "created", 502, owned_client_id, NULL);
+    connection_events_broadcast("tenant-db", "updated", 502, owned_client_id, "2026-07-22T00:05:00Z");
+    connection_events_broadcast("tenant-db", "created", 503, 0, NULL);
+    connection_events_broadcast("tenant-other", "updated", 504, 0, "2026-07-22T00:06:00Z");
+    if (connection_events_expect(admin, "tenant-db", "created", 502, "administrator, first event") != 0
+        || connection_events_expect(admin, "tenant-db", "updated", 502, "administrator, second event") != 0
+        || connection_events_expect(admin, "tenant-db", "created", 503, "administrator, third event") != 0
+        || connection_events_silent(admin, "administrator after its tenant's events") != 0
+        || connection_events_expect(owner, "tenant-db", "created", 502, "owner, first event") != 0
+        || connection_events_expect(owner, "tenant-db", "updated", 502, "owner, second event") != 0
+        || connection_events_silent(owner, "owner after its client's events") != 0
+        || connection_events_silent(stranger, "user without clients") != 0
+        || connection_events_expect(other_tenant, "tenant-other", "created", 501, "other tenant, first event") != 0
+        || connection_events_expect(other_tenant, "tenant-other", "updated", 504, "other tenant, second event") != 0
+        || connection_events_silent(other_tenant, "other tenant after its events") != 0) {
+        goto cleanup;
+    }
+    /* A closed session is dropped: later events still reach the others. */
+    test_close_websocket(owner);
+    owner = -1;
+    connection_events_broadcast("tenant-db", "updated", 503, 0, "2026-07-22T00:07:00Z");
+    if (connection_events_expect(admin, "tenant-db", "updated", 503, "administrator after a session closed") != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    test_close_websocket(admin);
+    test_close_websocket(owner);
+    test_close_websocket(stranger);
+    test_close_websocket(other_tenant);
+    route_auth_stop_server(&server);
+    return result;
+}
+
 static int route_auth_detail_is_sanitized(const char *database_path)
 {
     sqlite3 *db = NULL;
@@ -3009,6 +3250,9 @@ int main(void)
         return 1;
     }
     if (test_client_messages_websocket() != 0) {
+        return 1;
+    }
+    if (test_connection_events_websocket(runtime_client_id) != 0) {
         return 1;
     }
     if (test_public_room_access_contract() != 0) {
