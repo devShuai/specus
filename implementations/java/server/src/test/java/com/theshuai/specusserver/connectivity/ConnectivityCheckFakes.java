@@ -6,6 +6,7 @@ import com.theshuai.specusserver.management.controller.HttpRouteResource;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.HttpRouteService;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.security.web.method.annotation.AuthenticationPrincipalArgumentResolver;
@@ -49,7 +50,8 @@ final class ConnectivityCheckFakes {
 
     /** The endpoint as the management API serves it, minus Spring Security. */
     static MockMvc endpoint(HttpRouteConnectivityCheckService service, ManagementContextResolver resolver) {
-        return standaloneSetup(new HttpRouteResource(mock(HttpRouteService.class), resolver, service))
+        return standaloneSetup(new HttpRouteResource(mock(HttpRouteService.class), resolver, service,
+                        mock(ProductMetricsService.class)))
                 .setCustomArgumentResolvers(new AuthenticationPrincipalArgumentResolver())
                 .build();
     }

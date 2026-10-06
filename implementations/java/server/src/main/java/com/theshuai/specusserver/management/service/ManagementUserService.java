@@ -405,14 +405,17 @@ public class ManagementUserService {
         return toView(repository.save(user));
     }
 
+    /** Deletes an account of the caller's tenant and returns its login name. */
     @Transactional
-    public void deleteUser(ManagementContext context, String username) {
+    public String deleteUser(ManagementContext context, String username) {
         requireAdmin(context);
         String normalized = normalizeUsername(username);
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户不能删除");
         }
-        repository.delete(requireMutableUserInTenant(context, normalized, "delete"));
+        ManagementUser user = requireMutableUserInTenant(context, normalized, "delete");
+        repository.delete(user);
+        return loginName(user);
     }
 
     /**

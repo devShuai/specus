@@ -5,6 +5,7 @@ import com.theshuai.specusserver.management.model.HttpRouteView;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.HttpRouteService;
 import com.theshuai.specusserver.management.service.HttpRouteService.RouteMutation;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -45,13 +46,16 @@ public class HttpRouteResource {
     private final HttpRouteService httpRouteService;
     private final ManagementContextResolver contextResolver;
     private final HttpRouteConnectivityCheckService connectivityCheckService;
+    private final ProductMetricsService productMetrics;
 
     public HttpRouteResource(HttpRouteService httpRouteService,
                              ManagementContextResolver contextResolver,
-                             HttpRouteConnectivityCheckService connectivityCheckService) {
+                             HttpRouteConnectivityCheckService connectivityCheckService,
+                             ProductMetricsService productMetrics) {
         this.httpRouteService = httpRouteService;
         this.contextResolver = contextResolver;
         this.connectivityCheckService = connectivityCheckService;
+        this.productMetrics = productMetrics;
     }
 
     @GetMapping("/http-routes")
@@ -64,8 +68,9 @@ public class HttpRouteResource {
     public ResponseEntity<HttpRouteView> createHttpRoute(@AuthenticationPrincipal Jwt jwt,
                                                          @PathVariable long id,
                                                          @RequestBody RouteMutation request) {
-        return ResponseEntity.status(HttpStatus.CREATED)
-                .body(httpRouteService.createRoute(contextResolver.resolve(jwt), id, request));
+        HttpRouteView created = httpRouteService.createRoute(contextResolver.resolve(jwt), id, request);
+        productMetrics.servicePublished(id);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
     @PutMapping("/http-routes/{routeId}")
