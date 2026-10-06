@@ -576,11 +576,10 @@ static void random_hex(char *out, size_t bytes)
     st_hex_encode(buffer, bytes, out);
 }
 
-/* The real POST /api/client/auth/login, signed exactly as protocol/spec/client-auth.md describes. */
-static int http_client_login(const test_server *server, const char *api_key, const char *secret,
-                             const char *fingerprint, const char *os_user, runtime_session *out)
+/* A POST /api/client/auth/login body, signed exactly as protocol/spec/client-auth.md describes. */
+static void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
+                              const char *os_user, char *body, size_t body_len)
 {
-    memset(out, 0, sizeof(*out));
     char timestamp[32];
     char nonce[33];
     snprintf(timestamp, sizeof(timestamp), "%lld", wall_clock_ms());
@@ -593,13 +592,21 @@ static int http_client_login(const test_server *server, const char *api_key, con
     st_hmac_sha256(key, sizeof(key), (const uint8_t *)canonical, strlen(canonical), mac);
     char signature[ST_SHA256_HEX_LEN + 1];
     st_hex_encode(mac, sizeof(mac), signature);
-    char body[2048];
-    snprintf(body, sizeof(body),
+    snprintf(body, body_len,
              "{\"apiKey\":\"%s\",\"timestamp\":\"%s\",\"nonce\":\"%s\",\"signature\":\"%s\","
              "\"environment\":{\"machineFingerprint\":\"%s\",\"hostname\":\"lifecycle-host\","
              "\"osUser\":\"%s\",\"osName\":\"Linux\",\"osVersion\":\"test\",\"osArch\":\"amd64\","
              "\"clientVersion\":\"session-lifecycle-test\"}}",
              api_key, timestamp, nonce, signature, fingerprint, os_user);
+}
+
+/* The real POST /api/client/auth/login with a freshly signed body. */
+static int http_client_login(const test_server *server, const char *api_key, const char *secret,
+                             const char *fingerprint, const char *os_user, runtime_session *out)
+{
+    memset(out, 0, sizeof(*out));
+    char body[2048];
+    signed_login_body(api_key, secret, fingerprint, os_user, body, sizeof(body));
     int status = 0;
     char *response = NULL;
     if (http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) != 0) {
@@ -1292,9 +1299,49 @@ static int run_on_fresh_server(const char *name, server_scenario scenario, const
     return failed;
 }
 
+/*
+ * client-auth.md: a verified login consumes its (apiKey, nonce) pair. The identical signed body
+ * sent again, well inside its 60 s timestamp window, is refused with Java's answer and mints no
+ * second session; a freshly signed login for the same machine still succeeds.
+ */
+static int test_replayed_login_is_rejected(test_server *server)
+{
+    CHECK(create_credential(server->db_path, "ck_replay", "replay-secret", 2) == 0, "credential");
+    char body[2048];
+    signed_login_body("ck_replay", "replay-secret", "machine-replay", "mallory", body, sizeof(body));
+    int status = 0;
+    char *response = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) == 0
+          && status == 200 && strstr(response, "\"accessToken\":\"cs_") != NULL,
+          "first login: status %d", status);
+    free(response);
+    response = NULL;
+    int replay_ok = http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL,
+                                 &status, &response) == 0
+        && status == 400
+        && strstr(response, "{\"error\":\"客户端签名 nonce 已使用\"}") != NULL
+        && strstr(response, "accessToken") == NULL;
+    if (!replay_ok) {
+        fprintf(stderr, "replayed login answered %d: %s\n", status, response == NULL ? "" : response);
+    }
+    free(response);
+    CHECK(replay_ok, "replayed login was not rejected");
+    char sessions[32] = "";
+    CHECK(db_scalar(server->db_path,
+                    "SELECT COUNT(*) FROM specus_client_session WHERE machine_fingerprint = ?",
+                    "machine-replay", 0, sessions, sizeof(sessions)) == 0
+          && strcmp(sessions, "1") == 0,
+          "replay minted a session: %s session(s)", sessions);
+    runtime_session fresh;
+    CHECK(http_client_login(server, "ck_replay", "replay-secret", "machine-replay", "mallory", &fresh) == 0,
+          "a freshly signed login after the replay");
+    return 0;
+}
+
 static int scenario_default_limits(test_server *server)
 {
-    return test_same_session_relogin_replaces_old_pair(server)
+    return test_replayed_login_is_rejected(server)
+        || test_same_session_relogin_replaces_old_pair(server)
         || test_session_reuse_and_supersession(server)
         || test_second_login_on_one_connection_closes_it(server)
         || test_credential_online_limit(server)
@@ -1321,7 +1368,7 @@ int main(int argc, char **argv)
     static const char *const two_per_machine[] = {"SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES=2", NULL};
     static const char *const short_idle[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=5", NULL};
     int failures = 0;
-    failures += run_on_fresh_server("relogin, supersession, single login, online limits, stale rows",
+    failures += run_on_fresh_server("login replay, relogin, supersession, single login, online limits, stale rows",
                                     scenario_default_limits, NULL);
     failures += run_on_fresh_server("new session replaces previous session",
                                     test_new_session_replaces_previous_session, two_per_machine);

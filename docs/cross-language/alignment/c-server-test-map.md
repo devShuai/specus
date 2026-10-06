@@ -20,7 +20,7 @@
 
 ## 汇总
 
-79 个 Java 测试类中，**覆盖 14 个，部分 43 个，无 22 个**。
+79 个 Java 测试类中，**覆盖 15 个，部分 46 个，无 18 个**（2026-10-06 随 C 认证修复与 #132 更新）。
 
 审计点名的类目前的状态如下：
 
@@ -32,11 +32,11 @@
 | `HttpSpecusBodyLimitFilterTests` | 无 | C 对超过 16 MiB 的请求返回同样文案的 `413`，但不记录被拒请求，也没有测试 |
 | `OidcControllerTests` | 无 | C 的 `/oidc/token` 只代理 code 交换：不校验 ID Token，不绑定本地用户，也不签发本地 token |
 | `SecurityConfigOidcTests` | 无 | C 不接受外部 issuer 签发的 JWT，所以 issuer 校验在 C 不存在 |
-| `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests` | 无 | C 不记录 nonce，违反 `client-auth.md` 的一次性消费要求 |
+| `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests` | 覆盖 / 部分 / 无 | C 已原子消费 nonce（`client_auth_nonce_tests`），但存储在进程内存，多实例不共享；仓库方言测试不适用 |
 | `TrafficInspectionServiceTests` | 无 | C 只测了直接写入的明细能否查询；采集逻辑（默认关闭、gzip 解码、预览截断）没有测试 |
-| `ConnectionEventsWebSocketHandlerTests` | 无 | C 没有集群扇出；本地推送只测了 ticket 签发和 `426` |
+| `ConnectionEventsWebSocketHandlerTests` | 部分 | #132 补了真实 socket 的 created/updated 事件、租户与归属过滤、ticket 规则；C 没有集群扇出 |
 
-全部 22 个“无”：`SpecusServerApplicationTests`、`SecurityConfigOidcTests`、`OidcControllerTests`、`ManagementContextResolverTests`、`GlobalExceptionHandlerTests`、`TurnstileVerifierTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ManagementUserSchemaMigratorTests`、`ClientAuthNonceRepositoryCustomImplTests`、`NatServerHandlerTests`、`TcpServerHalfCloseTests`、`HttpSpecusBodyLimitFilterTests`、`UpstreamBrowserHeadersTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceServiceTests`、`SemanticVersionTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`、`StunTurnServerMetricsTests`、`ConnectionEventsWebSocketHandlerTests`。
+全部 18 个“无”：`SpecusServerApplicationTests`、`SecurityConfigOidcTests`、`OidcControllerTests`、`GlobalExceptionHandlerTests`、`TurnstileVerifierTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ManagementUserSchemaMigratorTests`、`ClientAuthNonceRepositoryCustomImplTests`、`NatServerHandlerTests`、`TcpServerHalfCloseTests`、`HttpSpecusBodyLimitFilterTests`、`UpstreamBrowserHeadersTests`、`SemanticVersionTests`、`TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`、`StunTurnServerMetricsTests`。
 
 ## 1. 启动、认证与安全规则
 
@@ -47,7 +47,7 @@
 | `config/SecurityConfigOidcTests` | 2 | 无 | — | C 不存在这项能力。`src/security.c:st_security_validate_local_token` 只接受 `alg=HS256`、`iss=specus` 的本地 token，没有外部 issuer、JWKS 或 RS256 验签。 |
 | `management/controller/OidcControllerTests` | 4 | 无 | 只有代理部分有测试：`security_tests.c` "OIDC configured response mismatch"；"oidc http token exchange response mismatch"（明文 HTTP mock endpoint） | C 不存在这项能力。`/oidc/token` 原样返回 IdP 的 token，不校验 ID Token 的 nonce 和 audience，不解析或开通本地用户，也不签发 Specus token。见 [安全差异](security-differences.md)。 |
 | `management/controller/AuthControllerRefreshTests` | 3 | 部分 | "refresh response mismatch"；`security_tests.c` "local token accepted wrong secret" | 刷新的正常路径有测试，C 也只接受本地 token。但 C 刷新时直接复制旧 token 里的 tenant/role（`handle_management_auth_refresh`），不回查数据库：已禁用、删除、降权的 SQLite 用户仍能刷新。 |
-| `management/security/ManagementContextResolverTests` | 3 | 无 | — | C 没有外部身份绑定，而且每次请求都直接信任 token 里的 tenant/role（`admin_context_from_authorization`），所以“吊销后的角色不能被旧 token 保留”这一点在 C 不成立。 |
+| `management/security/ManagementContextResolverTests` | 3 | 部分 | `admin_http_tests.c`：降级 admin 失去 admin 端点且续期为 USER、禁用用户请求 403/续期 401 且重新启用后恢复、删除与不存在的用户被拒、关闭密码登录后内置 admin 被拒 | 每个鉴权请求与 `/auth/refresh` 都按当前 SQLite 记录重新读取管理用户（只读、无缓存）。C 没有外部身份绑定，这部分不适用。 |
 | `management/controller/GlobalExceptionHandlerTests` | 1 | 无 | — | 这是 Spring 的统一异常映射层，C 没有对应结构；C 各 handler 直接写错误 JSON。 |
 | `security/ClientAddressResolverTests` | 11 | 覆盖 | `tests/client_address_tests.c:main`（逐用例 `expect_address`）：直连伪造、不可信 peer、可信代理、多跳、伪造前导跳、畸形跳、`X-Real-IP` 回退、IPv6、无效 CIDR 等 | — |
 | `security/LoginRateLimiterTests` | 5 | 覆盖 | `tests/login_rate_limiter_tests.c:main`；"per-IP login rate limit response mismatch"、"per-account login rate limit response mismatch"、"successful login did not clear account rate-limit budget" | 未断言关闭限流后跳过计数。 |
@@ -63,7 +63,7 @@
 | `database/LegacyDemoCredentialSanitizerIntegrationTests` | 4 | 无 | 相关但不等价：`security_baseline_tests` 断言未设置环境时禁止演示数据 | C 不存在这项能力，也不需要：C 从不写入公开的演示凭据，只在 dev/test 下创建一个没有 api key 的 `Demo client`。 |
 | `database/ManagementUserSchemaMigratorTests` | 3 | 无 | — | C 不存在这项能力：`specus_management_user` 以全局 `username` 为主键，没有 login_name 列和租户内唯一索引。另外 C 只用 SQLite，MySQL/PostgreSQL 迁移不适用。 |
 | `database/PeerServiceDiscoverySchemaMigratorTests` | 2 | 部分 | `storage_tests.c:test_peer_mesh_egress_domain_rules_migration`、`storage_tests.c:test_client_session_domain_targets_migration` | 未测：sharing/shared_service 表的默认值，以及给旧 session 表补 `peer_service_discovery_version`、`client_egress_version` 两列。 |
-| `management/repository/ClientAuthNonceRepositoryCustomImplTests` | 3 | 无 | — | C 不存在这项能力（没有 nonce 表）；MySQL/PostgreSQL 方言也不适用于只用 SQLite 的 C。 |
+| `management/repository/ClientAuthNonceRepositoryCustomImplTests` | 3 | 无 | — | 平台差异：C 的 nonce 存储在进程内存（`client_auth_nonce.c`），没有 nonce 表，MySQL/PostgreSQL 方言不适用。 |
 
 ## 3. 控制连接、NAT 与端到端
 
@@ -95,8 +95,8 @@
 | Java 测试类 | @Test | 状态 | C 证据 | 说明 |
 | --- | ---: | --- | --- | --- |
 | `management/service/ClientAccountServiceTests` | 2 | 部分 | "client update response mismatch"（改名） | `/api/admin/clients/name-availability` 在源码里但没有测试；改名后运行期引用同步更新也没有断言。 |
-| `management/service/ClientAuthNonceServiceTests` | 1 | 无 | — | C 不存在这项能力：`/api/client/auth/login` 只校验 ±60 s 时间戳和 HMAC，不记录 nonce，窗口内可重放同一请求。 |
-| `management/service/ClientAuthNonceServiceIntegrationTests` | 1 | 无 | — | 同上。 |
+| `management/service/ClientAuthNonceServiceTests` | 1 | 覆盖 | ctest `client_auth_nonce_tests`；`admin_http_tests.c` 两条登录路径的重放；`session_lifecycle_tests` 对真实进程重放 | 摘要与 Java 同算法、保留 120 s；另覆盖到期边界、32 线程竞争恰一胜出、容量满 503、时钟回拨。 |
+| `management/service/ClientAuthNonceServiceIntegrationTests` | 1 | 部分 | 同上 | C 的存储在进程内，多实例不共享、重启后清空（重启后可重放的只限前 60 s 内签名的请求），Java 存数据库。 |
 | `management/service/ClientAuthServiceEgressLoginTests` | 4 | 覆盖 | "client egress capability negotiation mismatch"；`peer_egress_tests.c:run_domain_target_declaration`；`storage_tests.c:test_client_session_domain_targets_migration` | — |
 | `management/controller/ClientDownloadLinkResourceTests` | 1 | 部分 | "hosted client package download mismatch"（`200`、类型、`X-Checksum-SHA256`、正文）、"hosted client package catalogue/file mismatch"（`Specus Android.apk`） | 未测：`no-store`、`Content-Disposition`、`ETag`、`nosniff`、`HEAD`、`Range`。 |
 | `management/service/ClientDownloadLinkServiceTests` | 15 | 部分 | "client download disabled create response mismatch"、"unpublished client download leaked into public list"、"client download latest response mismatch"、"client version check response mismatch"、"client download admin list order mismatch"；`github_release_tests.c:main` | 未测：旧版 target 兼容、Android `any`、已配置 target 时屏蔽 GitHub fallback、外链 latest 必须有已验证的 HTTPS 元数据、标记 latest 必须是合法 SemVer。 |
@@ -118,7 +118,7 @@
 | `management/service/TrafficInspectionServiceTests` | 6 | 无 | 只有查询侧：明细先用 `st_storage_record_http_exchange`/`st_storage_record_tcp_frame` 直接写入，再由 "http exchange page response mismatch"、"tcp frame detail response mismatch" 查询；ES 侧见 `elasticsearch_traffic_tests` | Java 断言的是采集逻辑：通道默认不采集、gzip 先解码再存、二进制 body 不生成文本预览、外置媒体不重复存 body、TCP 全量保存但预览截短。C 的采集路径没有任何测试。 |
 | `management/storage/HttpTrafficExchangeStoreTests` | 3 | 无 | 相关：上行的摘要查询 | 摘要查询不读取、不编码大字段和二进制 body，这一约束没有断言。 |
 | `management/storage/JpaHttpTrafficExchangeStoreIntegrationTests` | 1 | 无 | — | JPA 专属；同一约束在 C 也没有断言。 |
-| `websocket/ConnectionEventsWebSocketHandlerTests` | 2 | 无 | 只有前置部分："websocket ticket response mismatch"、"websocket ticket endpoint allowed anonymous access"、"websocket skeleton response mismatch"（`426`） | C 不存在 Redis 集群扇出及其失败回退。本地推送（`st_admin_broadcast_connection_event`）以及按租户/owner 过滤写在源码里，但没有测试用 ticket Upgrade 后收到事件。 |
+| `websocket/ConnectionEventsWebSocketHandlerTests` | 2 | 部分 | `admin_http_tests.c`（#132）：管理员收到本租户全部事件、普通用户只收到自己客户端的、其他租户收不到，普通 HTTP 426，缺/重用/错用 ticket 403 | C 不存在 Redis 集群扇出，跨实例部分不适用。 |
 
 ## 7. HTTP 媒体采集
 
@@ -170,8 +170,6 @@
 
 以下差异都在源码中逐处核实过，没有在本分支修改代码。它们也是上表中若干“无”或“部分”的原因。
 
-1. **客户端启动鉴权不消费 nonce**：`/api/client/auth/login` 只校验 ±60 s 时间戳和签名，违反 [client-auth.md](../../../protocol/spec/client-auth.md) 中“`(apiKey, nonce)` 原子消费、保留 120 s、重复提交拒绝”的要求。
-2. **管理 JWT 不回查数据库**：每个请求直接采用 token 中的 tenant/role，`/auth/refresh` 也照旧复制。SQLite 管理用户被禁用、删除、降权或迁租后，已签发的 token 仍保留原权限，而且可以不断刷新。Java/Go/.NET 都在每次请求时重新解析。
 3. **OIDC 只代理 code 交换**：见第 1 节。C 管理 API 只接受本地 HS256 JWT，所以通过 OIDC 登录拿不到 C 管理 API 的访问权限。
 4. **HTTP 流的 `DATA|END_STREAM` 被忽略**：`src/main.c:process_direct_http_message` 不读 `ST_NAT_FLAG_END_STREAM`（TCP 和 WebSocket 路径会读），空的 `DATA|END_STREAM` 还会被判为非法。这与 [control-protocol.md](../../../protocol/spec/control-protocol.md) 中“`DATA|END_STREAM` 等同于 DATA 后再发 FIN”不一致。
 5. **未知流上的 DATA/FIN/RST 被静默丢弃**：Java 对 DATA/FIN 回 RST，对从未打开过的流上的 RST 按协议违规断开。

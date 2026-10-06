@@ -175,6 +175,10 @@ jobs:
       - name: Java client Direct HTTP and WebSocket E2E
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
         run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
+      # PEM control/data TLS under a test CA: nettyTls is followed, a wrong CA or host name is
+      # refused, and the right ones carry control, data and a TCP round trip.
+      - name: Java client control TLS E2E
+        run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/tls_client_e2e.sh
       # The same E2E scripts with the Go and .NET clients, against the server the Java run above
       # already built and unit-tested. They run even when a Java step failed, so each client leaves
       # its own evidence; only a failed C build skips them.
@@ -200,6 +204,10 @@ jobs:
         run: |
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
+      - name: Go client control TLS E2E
+        run: |
+          SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/tls_client_e2e.sh
       - name: Set up .NET 10 for the .NET client
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         uses: actions/setup-dotnet@v4
@@ -224,6 +232,11 @@ jobs:
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
+      - name: .NET client control TLS E2E
+        run: |
+          dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
+          SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/tls_client_e2e.sh
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh

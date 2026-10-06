@@ -64,8 +64,8 @@ C server 下列安全门禁与 Java 同口径，并有对应的 C 测试（括�
 以下几处 C 与 Java 不同或缺少证据，不能算作同语义：
 
 - OIDC：C 的 `/oidc/token` 只代理 code 交换并原样返回 IdP token，不校验 ID Token 的 issuer/audience/nonce，不解析或绑定本地用户，也不签发本地 token；C 管理 API 只接受本地 HS256 JWT。Java `OidcControllerTests`、`SecurityConfigOidcTests` 在 C 没有对应实现或测试。
-- 客户端启动鉴权 nonce：[client-auth.md](../../../protocol/spec/client-auth.md) 要求 `(apiKey, nonce)` 签名通过后原子消费并保留 120 s、重复提交拒绝；C 只校验 ±60 s 时间戳和签名，不记录 nonce，窗口内重放同一请求会再次成功。Java `ClientAuthNonce*` 三个测试类在 C 没有对应。
-- 管理 JWT 的权限来源：Java/Go/.NET 每次管理请求和刷新都按数据库当前状态重新解析账号；C 直接采用 token 中的 tenant/role，`/auth/refresh` 也照旧复制，因此被禁用、删除、降权或迁租的 SQLite 管理用户在 token 过期前保留原权限，并能持续刷新。Java `ManagementContextResolverTests` 与 `AuthControllerRefreshTests` 的吊销语义在 C 没有对应。
+- 客户端启动鉴权 nonce：C 在签名通过后原子消费 `(apiKey, nonce)`、保留 120 s、重复提交返回 400（`client_auth_nonce_tests`、`admin_http_tests`、`session_lifecycle_tests`）；与 Java 的差别是存储在进程内存，多实例不共享、重启后清空。
+- 管理 JWT 的权限来源：C 与 Java/Go/.NET 一样，每个管理请求与每次刷新都按数据库当前状态重新读取账号（`admin_http_tests` 覆盖降级、禁用、删除与关闭密码登录）。
 - control/data TLS：`tls_transport_tests` 覆盖部署门禁、自签 TLS 1.2+ 握手（socketpair）与 PKCS#12 加载；PEM 加载和真实客户端连 C TLS listener 没有测试。
 - 管理连接事件 `/ws/connections`：只测了 ticket 签发与非 Upgrade 的 `426`，Upgrade 后事件推送的租户/owner 过滤没有测试。
 
