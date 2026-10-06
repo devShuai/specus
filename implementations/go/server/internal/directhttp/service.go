@@ -157,12 +157,15 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeTextError(w, http.StatusServiceUnavailable, "HTTP 路由认证暂时不可用")
 		return
 	}
-	if policy != nil && !policy.Enabled {
+	// Fail closed: only a route the server has a record of, enabled and owned by an enabled
+	// client, enters the tunnel. A client can keep forwarding a route it was told about earlier
+	// (a deleted route, a stale list), so the client's route table never authorizes access.
+	if policy == nil || !policy.Enabled || !policy.ClientEnabled {
 		w.Header().Set("Cache-Control", "no-store")
-		writeTextError(w, http.StatusNotFound, "HTTP 路由未启用")
+		writeTextError(w, http.StatusNotFound, "HTTP 路由不存在或未启用")
 		return
 	}
-	protected := policy != nil && policy.AuthEnabled
+	protected := policy.AuthEnabled
 	if protected && !validProtectedRoutePolicy(policy) {
 		w.Header().Set("Cache-Control", "no-store")
 		writeTextError(w, http.StatusServiceUnavailable, "HTTP 路由认证暂时不可用")

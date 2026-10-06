@@ -20,9 +20,10 @@ import java.util.Optional;
 
 /**
  * Resolves and verifies route-scoped HTTP Basic credentials for both HTTP and WebSocket ingress.
- * Routes that are not managed in the database remain public for compatibility with legacy
- * client-local route configuration. Database failures and malformed managed configuration fail
- * closed instead of silently turning a protected route public.
+ * Only a route the database has a record of, enabled and owned by an enabled client, is reachable:
+ * a client can keep forwarding a route it was told about earlier (a deleted route, a stale list),
+ * so a missing record is refused rather than treated as public. Database failures and malformed
+ * managed configuration fail closed instead of silently turning a protected route public.
  */
 @Service
 @Slf4j
@@ -41,13 +42,13 @@ public class HttpRouteAuthenticationService {
     public Decision authorize(String clientName, String route, String authorization) {
         try {
             Optional<ClientAccount> account = clientAccountService.findClientByName(clientName);
-            if (account.isEmpty()) {
-                return Decision.publicRoute();
+            if (account.isEmpty() || !account.get().isEnabled()) {
+                return Decision.notFound();
             }
             Optional<HttpRouteMapping> mapping = routeRepository.findByTenantIdAndClientIdAndRoute(
                     account.get().getTenantId(), account.get().getId(), route);
             if (mapping.isEmpty()) {
-                return Decision.publicRoute();
+                return Decision.notFound();
             }
             HttpRouteMapping managedRoute = mapping.get();
             if (!managedRoute.isEnabled()) {
