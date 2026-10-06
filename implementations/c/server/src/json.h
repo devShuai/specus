@@ -15,6 +15,12 @@ char *st_json_get_top_level_raw(const char *json, const char *key);
  * can refuse an escaped NUL, which would otherwise cut the C string short without notice.
  */
 char *st_json_decode_string(const char *raw, size_t *out_len);
+/*
+ * 1 when json is a valid object whose top-level member names are pairwise distinct (compared after
+ * unescaping), 0 otherwise. The top-level getters keep the last duplicate; a signed token whose
+ * claims repeat a name is ambiguous, so a verifier refuses it instead of picking one.
+ */
+int st_json_object_keys_unique(const char *json);
 int st_json_get_i64(const char *json, const char *key, long long *out);
 int st_json_get_int(const char *json, const char *key, int *out);
 int st_json_get_bool(const char *json, const char *key, int *out);

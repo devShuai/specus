@@ -14,6 +14,7 @@
 #include "login_rate_limiter.h"
 #include "media_capture.h"
 #include "object_storage.h"
+#include "oidc.h"
 #include "password_hash.h"
 #include "peer_mesh.h"
 #include "public_discovery.h"
@@ -79,6 +80,7 @@
 
 static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len);
 static const char *admin_reason_phrase(int status);
+static int normalize_username_in_place(char *username);
 static int write_registration_error_response(int status,
                                              const char *error,
                                              char *out,
@@ -113,6 +115,8 @@ typedef struct {
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
     int admin;
     int authenticated;
+    /* The bearer was a valid token of the identity provider, whether or not it resolved. */
+    int oidc_bearer;
 } st_admin_context;
 
 typedef struct st_admin_ws_client {
@@ -810,6 +814,46 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
     return 0;
 }
 
+/*
+ * A token of the identity provider itself, sent straight to the management API (Java's
+ * oidcAccessTokenDecoder, then ManagementContextResolver.resolveBoundOidcUser). A valid token is
+ * not by itself an account: only an issuer/subject pair already bound to an enabled local user gets
+ * in, and tenant and role come from that user, never from the token's claims, the configured
+ * SPECUS_OIDC_TENANT_CLAIM included. Returns like admin_context_from_authorization.
+ */
+static int admin_context_from_oidc_bearer(const char *token, st_admin_context *context)
+{
+    st_oidc_identity identity;
+    if (st_oidc_validate_bearer_token(token, &identity) != ST_OIDC_OK) {
+        return -1;
+    }
+    context->oidc_bearer = 1;
+    int result = -2;
+    char *issuer = admin_trim(identity.issuer);
+    char *subject = admin_trim(identity.subject);
+    char identity_key[65];
+    const char *database_path = admin_database_path();
+    if (database_path != NULL && *issuer != '\0' && *subject != '\0'
+        && strlen(issuer) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && strlen(subject) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && st_oidc_identity_key(issuer, subject, identity_key) == 0) {
+        st_storage_management_user user;
+        int found = st_storage_find_oidc_user(database_path, identity_key, &user);
+        if (found < 0) {
+            result = -3;
+        } else if (found == 0) {
+            snprintf(context->username, sizeof(context->username), "%s", user.username);
+            snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
+            snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+            context->admin = strcmp(context->role, "ADMIN") == 0;
+            context->authenticated = 1;
+            result = 0;
+        }
+    }
+    st_oidc_identity_free(&identity);
+    return result;
+}
+
 /* 0 when the bearer token is valid and its account still resolves, -1 for an invalid token, -2 for
  * a valid token whose account is gone, disabled, moved to another tenant or no longer allowed, and
  * -3 when the account cannot be checked because the user store is unreadable. */
@@ -836,7 +880,8 @@ static int admin_context_from_authorization(const char *authorization, st_admin_
                                          env_text("SPECUS_AUTH_TENANT_ID", "default"),
                                          env_text("SPECUS_AUTH_USERNAME", "admin"),
                                          &claims) != 0) {
-        return -1;
+        /* Java routes by the JOSE alg: HS* only to the local decoder, anything else to OIDC. */
+        return st_oidc_token_is_hmac(token) ? -1 : admin_context_from_oidc_bearer(token, context);
     }
     int resolved = admin_resolve_token_user(&claims, context);
     return resolved == 0 ? 0 : (resolved == -2 ? -3 : -2);
@@ -3552,48 +3597,131 @@ static int admin_form_append_pair(st_admin_string_builder *builder, const char *
     return 0;
 }
 
-static int build_oidc_token_proxy_response(const char *body, char *out, size_t out_len)
+static int write_oidc_error(char *out, size_t out_len, int status, const char *error)
 {
-    if (body == NULL) {
-        body = "{}";
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"error\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, error);
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC response build failed\"}");
     }
-    const char *client_id = getenv("SPECUS_OIDC_CLIENT_ID");
-    const char *token_endpoint = getenv("SPECUS_OIDC_TOKEN_ENDPOINT");
-    const char *redirect_uri = getenv("SPECUS_OIDC_REDIRECT_URI");
-    const char *client_secret = getenv("SPECUS_OIDC_CLIENT_SECRET");
-    if (client_id == NULL || *client_id == '\0' || token_endpoint == NULL || *token_endpoint == '\0') {
-        return write_response(out,
-                              out_len,
-                              503,
-                              "Service Unavailable",
-                              "{\"error\":\"OIDC is not configured: client-id or token-endpoint is missing\"}");
+    int response_len = write_response(out, out_len, status, admin_reason_phrase(status), builder.data);
+    free(builder.data);
+    return response_len;
+}
+
+/*
+ * Java ManagementUserService.resolveOrProvisionOidcUser. issuer/subject is the immutable identity;
+ * preferred_username is mutable profile data that only names the account on its first login and
+ * can never claim the built-in administrator, which has no binding row. New accounts are USER in
+ * the default tenant, with a hash of a random password nobody holds. Returns 0 with *user filled,
+ * 1 when the identity is refused and -1 when the user store fails.
+ */
+static int admin_resolve_oidc_login_user(const char *database_path,
+                                         const st_oidc_identity *identity,
+                                         st_storage_management_user *user)
+{
+    char *issuer_copy = strdup(identity->issuer);
+    char *subject_copy = strdup(identity->subject);
+    char *username = strdup(identity->preferred_username);
+    if (issuer_copy == NULL || subject_copy == NULL || username == NULL) {
+        free(issuer_copy);
+        free(subject_copy);
+        free(username);
+        return -1;
     }
-    char *code = st_json_get_string(body, "code");
-    char *code_verifier = st_json_get_string(body, "codeVerifier");
-    if (code_verifier == NULL) {
-        code_verifier = st_json_get_string(body, "code_verifier");
+    const char *issuer = admin_trim(issuer_copy);
+    const char *subject = admin_trim(subject_copy);
+    char identity_key[65];
+    int result = 1;
+    if (*issuer != '\0' && *subject != '\0'
+        && strlen(issuer) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && strlen(subject) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && normalize_username_in_place(username) == 0
+        && admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) != 0) {
+        const char *tenant_id = env_text("SPECUS_AUTH_TENANT_ID", "default");
+        result = st_oidc_identity_key(issuer, subject, identity_key) == 0
+            ? st_storage_resolve_oidc_user(database_path, issuer, subject, identity_key, username,
+                                           tenant_id, NULL, user)
+            : -1;
+        if (result == 2) {
+            char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+            result = st_oidc_unusable_password_hash(password_hash) == 0
+                ? st_storage_resolve_oidc_user(database_path, issuer, subject, identity_key, username,
+                                               tenant_id, password_hash, user)
+                : -1;
+        }
     }
-    if (code == NULL || *code == '\0' || code_verifier == NULL || *code_verifier == '\0') {
+    free(issuer_copy);
+    free(subject_copy);
+    free(username);
+    return result == 0 ? 0 : (result < 0 ? -1 : 1);
+}
+
+/*
+ * POST /oidc/token, Java's OidcController.exchange. The browser runs Authorization Code + PKCE:
+ * it creates state, nonce and the code verifier, keeps them in its sessionStorage, checks state on
+ * the callback and sends only code, codeVerifier and nonce here. This endpoint redeems the code at
+ * the token endpoint, verifies the ID token (JWKS signature, issuer, client-id audience, azp,
+ * expiry) and the browser's nonce, binds the issuer/subject pair to a local management user, and
+ * answers with the same local HS256 token the password login issues. The identity provider's
+ * access token never reaches the browser; the ID token is returned, as Java does, only to serve as
+ * id_token_hint for RP-initiated logout.
+ */
+static int build_oidc_token_exchange_response(const char *body, char *out, size_t out_len)
+{
+    const char *client_id = st_oidc_setting("SPECUS_OIDC_CLIENT_ID", "");
+    if (!st_oidc_has_text(client_id)) {
+        return write_oidc_error(out, out_len, 503, "OIDC 未配置（缺少 client-id）");
+    }
+    char *code = st_oidc_json_text(body, "code");
+    char *code_verifier = st_oidc_json_text(body, "codeVerifier");
+    char *nonce = st_oidc_json_text(body, "nonce");
+    if (!st_oidc_has_text(code) || !st_oidc_has_text(code_verifier) || !st_oidc_has_text(nonce)) {
         free(code);
         free(code_verifier);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"code or code_verifier is required\"}");
+        free(nonce);
+        return write_oidc_error(out, out_len, 400, "缺少 code、code_verifier 或 nonce");
     }
+    /* Java always has its database. C needs one to bind the identity, so it says so before the
+     * one-time code is spent. */
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        free(code);
+        free(code_verifier);
+        free(nonce);
+        return write_oidc_error(out, out_len, 503, "OIDC 登录需要配置 SPECUS_DATABASE_PATH");
+    }
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        free(code);
+        free(code_verifier);
+        free(nonce);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"database init failed\"}");
+    }
+    const char *token_endpoint = st_oidc_setting("SPECUS_OIDC_TOKEN_ENDPOINT", ST_OIDC_DEFAULT_TOKEN_ENDPOINT);
+    const char *redirect_uri = st_oidc_setting("SPECUS_OIDC_REDIRECT_URI", ST_OIDC_DEFAULT_REDIRECT_URI);
+    const char *client_secret = st_oidc_setting("SPECUS_OIDC_CLIENT_SECRET", "");
+    int confidential = st_oidc_has_text(client_secret);
     st_admin_string_builder form = {0};
     int rc = admin_form_append_pair(&form, "grant_type", "authorization_code");
     if (rc == 0) rc = admin_form_append_pair(&form, "code", code);
-    if (rc == 0) rc = admin_form_append_pair(&form, "redirect_uri", redirect_uri == NULL ? "" : redirect_uri);
+    if (rc == 0) rc = admin_form_append_pair(&form, "redirect_uri", redirect_uri);
     if (rc == 0) rc = admin_form_append_pair(&form, "code_verifier", code_verifier);
-    if (rc == 0 && (client_secret == NULL || *client_secret == '\0')) {
+    /* A public PKCE client names itself in the form; a confidential one uses HTTP Basic below. */
+    if (rc == 0 && !confidential) {
         rc = admin_form_append_pair(&form, "client_id", client_id);
     }
     free(code);
     free(code_verifier);
     if (rc != 0 || form.data == NULL) {
         free(form.data);
+        free(nonce);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC token request build failed\"}");
     }
     char *authorization = NULL;
-    if (client_secret != NULL && *client_secret != '\0') {
+    if (confidential) {
         st_admin_string_builder basic = {0};
         if (admin_sb_appendf(&basic, "%s:%s", client_id, client_secret) == 0 && basic.data != NULL) {
             authorization = admin_base64_encode((const uint8_t *)basic.data, basic.len);
@@ -3601,41 +3729,42 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
         free(basic.data);
         if (authorization == NULL) {
             free(form.data);
+            free(nonce);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC authorization build failed\"}");
         }
     }
     long status_code = 0L;
     char *token_body = NULL;
-    const char *ca_certificate_path = getenv("SPECUS_OIDC_CA_CERTIFICATE_PATH");
     st_http_client_options http_options = {
         .timeout_ms = 15000L,
         .max_response_bytes = 65536U,
-        .ca_certificate_path = ca_certificate_path
+        .ca_certificate_path = getenv("SPECUS_OIDC_CA_CERTIFICATE_PATH")
     };
-    if (st_http_post_form(token_endpoint,
-                          authorization,
-                          form.data,
-                          &http_options,
-                          &status_code,
-                          &token_body) != 0) {
-        free(authorization);
-        free(form.data);
-        return write_response(out, out_len, 502, "Bad Gateway", "{\"error\":\"cannot connect to OIDC token endpoint\"}");
-    }
+    rc = st_http_post_form(token_endpoint, authorization, form.data, &http_options, &status_code, &token_body);
     free(authorization);
     free(form.data);
+    if (rc != 0) {
+        free(nonce);
+        return write_oidc_error(out, out_len, 502, "无法连接 OIDC 令牌端点");
+    }
+    if (!st_json_is_valid(token_body)) {
+        free(token_body);
+        free(nonce);
+        return write_oidc_error(out, out_len, 502, "OIDC 令牌响应无法解析");
+    }
     if (status_code / 100 != 2) {
-        char *error = st_json_get_string(token_body, "error");
-        char *description = st_json_get_string(token_body, "error_description");
+        char *error = st_oidc_json_text(token_body, "error");
+        char *description = st_oidc_json_text(token_body, "error_description");
         st_admin_string_builder builder = {0};
         rc = admin_sb_append(&builder, "{\"error\":");
-        if (rc == 0) rc = admin_sb_append_json_string(&builder, error == NULL || *error == '\0' ? "token_exchange_failed" : error);
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, error == NULL ? "token_exchange_failed" : error);
         if (rc == 0) rc = admin_sb_append(&builder, ",\"error_description\":");
         if (rc == 0) rc = admin_sb_append_json_string(&builder, description == NULL ? "" : description);
         if (rc == 0) rc = admin_sb_append(&builder, "}");
         free(error);
         free(description);
         free(token_body);
+        free(nonce);
         if (rc != 0 || builder.data == NULL) {
             free(builder.data);
             return write_response(out, out_len, 502, "Bad Gateway", "{\"error\":\"token_exchange_failed\",\"error_description\":\"\"}");
@@ -3644,21 +3773,62 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
         free(builder.data);
         return response_len;
     }
-    char *access_token = st_json_get_string(token_body, "access_token");
-    char *id_token = st_json_get_string(token_body, "id_token");
-    char *token_type = st_json_get_string(token_body, "token_type");
-    int expires_in = 0;
-    (void)st_json_get_int(token_body, "expires_in", &expires_in);
+    char *id_token = st_oidc_json_text(token_body, "id_token");
+    char *token_type = st_oidc_json_text(token_body, "token_type");
     free(token_body);
+    if (!st_oidc_has_text(id_token)) {
+        free(id_token);
+        free(token_type);
+        free(nonce);
+        return write_oidc_error(out, out_len, 502, "OIDC 响应缺少 ID Token");
+    }
+    st_oidc_identity identity;
+    int validation = st_oidc_validate_id_token(id_token, nonce, &identity);
+    free(nonce);
+    if (validation != ST_OIDC_OK) {
+        free(id_token);
+        free(token_type);
+        if (validation == ST_OIDC_UNAVAILABLE) {
+            return write_oidc_error(out, out_len, 503, "OIDC 校验服务不可用");
+        }
+        return write_oidc_error(out,
+                                out_len,
+                                502,
+                                validation == ST_OIDC_IDENTITY_REJECTED
+                                    ? "OIDC ID Token 身份或 nonce 校验失败"
+                                    : "OIDC ID Token 校验失败");
+    }
+    st_storage_management_user user;
+    int resolved = admin_resolve_oidc_login_user(database_path, &identity, &user);
+    st_oidc_identity_free(&identity);
+    if (resolved != 0) {
+        free(id_token);
+        free(token_type);
+        return resolved > 0
+            ? write_oidc_error(out, out_len, 403, "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突")
+            : write_oidc_error(out, out_len, 502, "OIDC 账号绑定失败");
+    }
+    long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
+    char access_token[2048];
+    if (st_security_issue_local_token(user.username,
+                                      user.tenant_id,
+                                      normalize_management_role(user.role),
+                                      getenv("SPECUS_AUTH_JWT_SECRET"),
+                                      ttl,
+                                      access_token,
+                                      sizeof(access_token)) != 0) {
+        free(id_token);
+        free(token_type);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
+    }
     st_admin_string_builder builder = {0};
     rc = admin_sb_append(&builder, "{\"accessToken\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(&builder, access_token);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, access_token);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"idToken\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(&builder, id_token);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, id_token);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"tokenType\":");
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, token_type == NULL || *token_type == '\0' ? "Bearer" : token_type);
-    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"expiresIn\":%d}", expires_in);
-    free(access_token);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, token_type == NULL ? "Bearer" : token_type);
+    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"expiresIn\":%lld}", ttl);
     free(id_token);
     free(token_type);
     if (rc != 0 || builder.data == NULL) {
@@ -8823,6 +8993,13 @@ static int st_admin_build_response_internal(const char *method,
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
+            /* Java's AuthController renews only local tokens; it tells an identity provider's
+             * token so whether or not that token resolves to an account. */
+            if (context.oidc_bearer && (auth_rc == 0 || auth_rc == -2)
+                && admin_path_equals(path, "/auth/refresh")) {
+                return write_response(out, out_len, 400, "Bad Request",
+                                      "{\"error\":\"OIDC 令牌不能通过该端点续期\"}");
+            }
             /* Java's answers: refresh says 401 so the SPA signs in again, any other request 403. */
             if (auth_rc == -2 && admin_path_equals(path, "/auth/refresh")) {
                 return write_response(out, out_len, 401, "Unauthorized",
@@ -9263,7 +9440,7 @@ static int st_admin_build_response_internal(const char *method,
         return write_response(out, out_len, 200, "OK", body);
     }
     if (strcmp(method, "POST") == 0 && strcmp(path, "/oidc/token") == 0) {
-        return build_oidc_token_proxy_response(body, out, out_len);
+        return build_oidc_token_exchange_response(body, out, out_len);
     }
     return write_response(out, out_len, 404, "Not Found", "{\"error\":\"not found\"}");
 }
