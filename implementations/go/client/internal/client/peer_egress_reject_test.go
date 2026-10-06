@@ -18,7 +18,7 @@ func TestRejectionLogCountsEveryRefusalRegardlessOfLimiting(t *testing.T) {
 	if emitted != egressRejectionsPerWindow {
 		t.Errorf("emitted %d lines, want the window limit of %d", emitted, egressRejectionsPerWindow)
 	}
-	counts := log.drainCounts()
+	counts := log.cumulativeCounts()
 	if counts[egressCodeDestinationDenied] != int64(egressRejectionsPerWindow*3) {
 		t.Errorf("aggregate = %d, want every refusal counted",
 			counts[egressCodeDestinationDenied])
@@ -84,7 +84,7 @@ func TestRejectionLogBoundsItsSubjectTable(t *testing.T) {
 		t.Error("hitting the cap was not recorded")
 	}
 	// Reaching the cap costs diagnostic lines, never accuracy.
-	counts := log.drainCounts()
+	counts := log.cumulativeCounts()
 	if counts[egressCodeConsumerDenied] != int64(egressRejectionMaxSubjects+500) {
 		t.Errorf("aggregate = %d, want every refusal counted even at the cap",
 			counts[egressCodeConsumerDenied])
@@ -104,24 +104,25 @@ func TestRejectionLogRecoversAfterTheWindowElapses(t *testing.T) {
 	}
 }
 
-// Consecutive reports have to describe consecutive intervals. A running total would leave the
-// server differencing values it was never told were cumulative.
-func TestRejectionLogDrainResetsTheInterval(t *testing.T) {
+// The report and the status read the same tally, and the server keeps only the latest report, so
+// the tally is a running total: reading it resets nothing, and a caller changing the copy it got
+// changes nothing either.
+func TestRejectionLogKeepsARunningTotal(t *testing.T) {
 	log := newEgressRejectionLog()
 	log.record(7, egressCodeDestinationDenied, flowEpoch)
 	log.record(7, egressCodePortDenied, flowEpoch)
 
-	first := log.drainCounts()
+	first := log.cumulativeCounts()
 	if first[egressCodeDestinationDenied] != 1 || first[egressCodePortDenied] != 1 {
-		t.Fatalf("first interval = %v", first)
+		t.Fatalf("first reading = %v", first)
 	}
-	if second := log.drainCounts(); second != nil {
-		t.Errorf("an interval with no refusals returned %v, want nothing to send", second)
+	first[egressCodeDestinationDenied] = 100
+	if second := log.cumulativeCounts(); second[egressCodeDestinationDenied] != 1 || second[egressCodePortDenied] != 1 {
+		t.Errorf("second reading = %v, want the first one's counts unchanged", second)
 	}
 
 	log.record(7, egressCodeDestinationDenied, flowEpoch)
-	third := log.drainCounts()
-	if third[egressCodeDestinationDenied] != 1 {
-		t.Errorf("third interval = %v, want only the refusal from that interval", third)
+	if third := log.cumulativeCounts(); third[egressCodeDestinationDenied] != 2 || third[egressCodePortDenied] != 1 {
+		t.Errorf("third reading = %v, want every refusal since the start", third)
 	}
 }
