@@ -59,7 +59,17 @@ Unix mode 位在 Windows 上没有意义，而把 ACL 读到足以判断"过宽"
 
 ### C server 安全门禁
 
-C server 已完成本地可构造的 Java 同语义安全门禁：管理用户 PBKDF2/旧哈希迁移、无默认口令、IP/账号登录限流、可信代理 CIDR、解压绝对/膨胀比上限、control/data TLS、严格 HTTPS OIDC/GitHub/S3 请求、邮件注册/Turnstile、client-message ticket/权限/帧校验、公共 discovery 隔离/容量/限流/Redis 故障关闭、持久房间角色/邀请/配对码、流程图 3 MiB/50 版、对象存储 tenant/owner/room-role/配额/一次性授权、媒体 ticket/Range/过期清理，以及 Peer Mesh tenant/ACL/session/service/STUN/TURN long-term credential、nonce、permission、allocation/relay quota。`SPECUS_ENV` 未设置或未知按 prod，弱口令/JWT 占位值与不安全 TLS 部署拒绝启动，prod 禁止演示数据。严格 Release 与 ASan/UBSan CTest 均为 22/22；真实私有 OSS/ES、生产证书/OIDC、跨 NAT/真机和长时间压力仍是环境验收，不能由源码门禁替代。
+C server 下列安全门禁与 Java 同口径，并有对应的 C 测试（括号内为 ctest 名；逐项对照见 [C server 测试对照](c-server-test-map.md)）：管理用户 PBKDF2/旧哈希迁移（`password_hash_tests`、`admin_http_tests`）、无默认口令与 prod 弱口令/JWT 占位值拒绝和演示数据禁用（`security_baseline_tests`）、IP/账号登录限流（`login_rate_limiter_tests`、`admin_http_tests`）、可信代理 CIDR（`client_address_tests`）、解压绝对/膨胀比上限（`decompression_limits_tests`）、出站 HTTPS 证书链/主机名/私有 CA（`http_client_tests`；OIDC、GitHub release 与对象存储请求共用该客户端，OIDC 代理交换本身只在 `admin_http_tests` 中对明文 HTTP mock endpoint 测试）、邮件注册/Turnstile（`admin_http_tests`）、client-message ticket/帧大小校验（`admin_http_tests`）、公共 discovery 隔离/容量/限流（`admin_http_tests`）与 Redis 故障关闭（`public_discovery_cluster_e2e`）、持久房间角色/邀请/配对码与流程图 3 MiB/50 版（`admin_http_tests`）、对象存储公开互传路径的配额/限流/一次性授权（`object_storage_e2e`）、媒体 ticket/Range/过期清理（`media_capture_tests`）、Peer Mesh tenant/ACL/session/service（`peer_mesh_tests`）与 TURN long-term credential/401 challenge/permission/allocation 配额（`stun_turn_tests`）。`SPECUS_ENV` 未设置或未知按 prod，弱口令/JWT 占位值与不安全 TLS 部署拒绝启动，prod 禁止演示数据。
+
+以下几处 C 与 Java 不同或缺少证据，不能算作同语义：
+
+- OIDC：C 的 `/oidc/token` 只代理 code 交换并原样返回 IdP token，不校验 ID Token 的 issuer/audience/nonce，不解析或绑定本地用户，也不签发本地 token；C 管理 API 只接受本地 HS256 JWT。Java `OidcControllerTests`、`SecurityConfigOidcTests` 在 C 没有对应实现或测试。
+- 客户端启动鉴权 nonce：[client-auth.md](../../../protocol/spec/client-auth.md) 要求 `(apiKey, nonce)` 签名通过后原子消费并保留 120 s、重复提交拒绝；C 只校验 ±60 s 时间戳和签名，不记录 nonce，窗口内重放同一请求会再次成功。Java `ClientAuthNonce*` 三个测试类在 C 没有对应。
+- 管理 JWT 的权限来源：Java/Go/.NET 每次管理请求和刷新都按数据库当前状态重新解析账号；C 直接采用 token 中的 tenant/role，`/auth/refresh` 也照旧复制，因此被禁用、删除、降权或迁租的 SQLite 管理用户在 token 过期前保留原权限，并能持续刷新。Java `ManagementContextResolverTests` 与 `AuthControllerRefreshTests` 的吊销语义在 C 没有对应。
+- control/data TLS：`tls_transport_tests` 覆盖部署门禁、自签 TLS 1.2+ 握手（socketpair）与 PKCS#12 加载；PEM 加载和真实客户端连 C TLS listener 没有测试。
+- 管理连接事件 `/ws/connections`：只测了 ticket 签发与非 Upgrade 的 `426`，Upgrade 后事件推送的租户/owner 过滤没有测试。
+
+CI 的 C server 任务每次运行 Release CTest（当前 25 项）；ASan/UBSan 只在本地跑过一次（当时 22 项，见[环境验证](environment-verification.md)），CI 没有 sanitizer 任务。真实私有 OSS/ES、生产证书/OIDC、跨 NAT/真机和长时间压力仍是环境验收，不能由源码门禁替代。
 
 ## 拒绝而不是告警
 
