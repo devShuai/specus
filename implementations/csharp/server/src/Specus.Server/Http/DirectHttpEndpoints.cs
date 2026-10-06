@@ -62,7 +62,7 @@ public static class DirectHttpEndpoints
         var startedAt = DateTimeOffset.UtcNow;
         var logger = loggerFactory.CreateLogger(LoggerCategory);
         var relativePath = RelativePath(context, rest);
-        HttpRouteAccessPolicy accessPolicy;
+        HttpRouteAccessPolicy? accessPolicy;
         try
         {
             accessPolicy = await LoadRouteAccessPolicyAsync(db, clientName, route, context.RequestAborted)
@@ -76,7 +76,10 @@ public static class DirectHttpEndpoints
             return;
         }
 
-        if (accessPolicy.Managed && !accessPolicy.Enabled)
+        // Fail closed: only a route the server has a record of, enabled and owned by an enabled
+        // client, enters the tunnel. A client can keep forwarding a route it was told about
+        // earlier (a deleted route, a stale list), so the client's route table never authorizes access.
+        if (accessPolicy is null || !accessPolicy.Enabled)
         {
             context.Response.Headers.CacheControl = "no-store";
             await WriteTextErrorAsync(context.Response, StatusCodes.Status404NotFound,
@@ -854,23 +857,27 @@ public static class DirectHttpEndpoints
         }
     }
 
-    private static async Task<HttpRouteAccessPolicy> LoadRouteAccessPolicyAsync(SpecusDbContext db,
+    /// <summary>
+    /// The server's record of a client route, or null when there is none to admit a request:
+    /// the client is unknown or disabled, or the route does not exist (or was deleted).
+    /// </summary>
+    private static async Task<HttpRouteAccessPolicy?> LoadRouteAccessPolicyAsync(SpecusDbContext db,
         string clientName, string route,
         CancellationToken cancellationToken)
     {
         var account = await db.ClientAccounts.AsNoTracking()
             .FirstOrDefaultAsync(c => c.ClientName == clientName, cancellationToken)
             .ConfigureAwait(false);
-        if (account is null)
+        if (account is null || !account.Enabled)
         {
-            return HttpRouteAccessPolicy.Public;
+            return null;
         }
         return await db.HttpRouteMappings.AsNoTracking()
             .Where(r => r.ClientId == account.Id && r.Route == route)
-            .Select(r => new HttpRouteAccessPolicy(true, r.Enabled, r.PathRewriteEnabled, r.AuthEnabled,
+            .Select(r => new HttpRouteAccessPolicy(r.Enabled, r.PathRewriteEnabled, r.AuthEnabled,
                 r.AuthUsername, r.AuthPasswordHash))
             .FirstOrDefaultAsync(cancellationToken)
-            .ConfigureAwait(false) ?? HttpRouteAccessPolicy.Public;
+            .ConfigureAwait(false);
     }
 
     private static List<string>? StripRewriteHeaders(List<string>? source)
@@ -1149,9 +1156,6 @@ public static class DirectHttpEndpoints
         await response.WriteAsync(message, Encoding.UTF8).ConfigureAwait(false);
     }
 
-    private sealed record HttpRouteAccessPolicy(bool Managed, bool Enabled, bool PathRewriteEnabled, bool AuthEnabled,
-        string? AuthUsername, string? AuthPasswordHash)
-    {
-        public static readonly HttpRouteAccessPolicy Public = new(false, true, false, false, null, null);
-    }
+    private sealed record HttpRouteAccessPolicy(bool Enabled, bool PathRewriteEnabled, bool AuthEnabled,
+        string? AuthUsername, string? AuthPasswordHash);
 }

@@ -205,6 +205,10 @@ stored only as SHA-256 digests; management responses expose `authPasswordConfigu
 password or digest. Authentication runs before HTTP request bodies and WebSocket upgrades, and a
 successful protected request has its outer `Authorization` header removed before tunnel forwarding
 and traffic-detail capture. Environment-only routes remain public for compatibility.
+The ingress fails closed before any of that: a request enters the tunnel only for a route the
+server defines, an enabled SQLite row of an enabled client or a `SPECUS_HTTP_ROUTES` entry (with a
+database, of an enabled client). Anything else, a deleted route the client may still forward
+included, is a `404` and never reaches the data connection.
 SQLite-backed routes also persist the Java-compatible `insecureSkipVerify` flag. It is returned by
 the management API and included in both `/api/client/auth/login.httpSpecusConfigList` and
 `NAT_CONTROL.httpSpecusConfigList`; omitted values and environment-only routes default to `false`.
@@ -437,6 +441,17 @@ state machine aligned with the Java/Go/.NET servers:
   browser is not read after its CLOSE, and a client frame after its CLOSE resets the stream. A client
   RST closes the browser with `1011`; a CLOSE that cannot get NAT credit within 5 seconds resets the
   stream. `tests/direct_websocket_tests.c` drives all of this through a real listener.
+
+Every NAT stream on the data connection follows the stream lifecycle rules of
+`protocol/spec/control-protocol.md`, aligned with Java `NatServerHandler` and Go: a frame one stream
+cannot take resets only that stream (`RST` 8 for an invalid HTTP response frame, 4 for an HTTP
+response over 64 MiB, 7 for TCP DATA after FIN, a second FIN or DATA/FIN for an unknown stream, 6
+when the 4 MiB client-to-public queue overflows), and `DATA|END_STREAM` is DATA followed by FIN. Each
+data connection remembers its 1024 most recently closed stream ids so a late `RST` is ignored; an
+`RST` for a stream that was never opened, a `WINDOW_UPDATE` beyond the 16 MiB window and a NAT type a
+client never sends close the data connection. A data connection holds at most 1024 pending HTTP
+streams (the next request gets `502`), and request bodies over 16 MiB get `413`.
+`tests/nat_stream_tests.c` checks each rule against a real server process.
 
 The C
 implementation currently provides the basic data bridge, summary traffic accounting,

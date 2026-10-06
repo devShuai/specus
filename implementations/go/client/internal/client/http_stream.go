@@ -8,8 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
@@ -22,6 +24,49 @@ const (
 	httpRequestQueueChunks  = 32
 )
 
+// upstreamConnectTimeout bounds reaching the forwarding target: the name lookup, the TCP connect
+// and, for https, the TLS handshake together.
+const upstreamConnectTimeout = 5 * time.Second
+
+// forwardingDial is how the forwarding client reaches its target. Production uses the system
+// resolver and upstreamConnectTimeout; tests swap in a resolver, a shorter timeout or a hook that
+// holds the connect, so the failures they classify are real ones produced without the network.
+type forwardingDial struct {
+	connectTimeout time.Duration
+	resolver       *net.Resolver
+	control        func(ctx context.Context, network, address string, conn syscall.RawConn) error
+}
+
+func (dial forwardingDial) netDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout: dial.connectTimeout, KeepAlive: 30 * time.Second,
+		Resolver: dial.resolver, ControlContext: dial.control,
+	}
+}
+
+// dialTLS connects and completes the TLS handshake as tls.Dialer did, with the connect timeout
+// spanning both, but returns a handshake failure as an upstreamTLSError. Past this point an EOF
+// from a handshake and an EOF from a response look the same, and only the first is a TLS failure.
+func (dial forwardingDial) dialTLS(ctx context.Context, network, address string,
+	config *tls.Config) (net.Conn, error) {
+	dialer := dial.netDialer()
+	if dialer.Timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dialer.Timeout)
+		defer cancel()
+	}
+	raw, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	conn := tls.Client(raw, config)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, &upstreamTLSError{err: err}
+	}
+	return conn, nil
+}
+
 // newForwardingHTTPClient builds the client used to reach the forwarding target.
 //
 // Upstream certificates are verified. This used to be a package-level client with verification
@@ -30,9 +75,15 @@ const (
 // through the upstreamTls section: a private CA, a certificate pin, or an explicit opt-out.
 func newForwardingHTTPClient(tlsFactory *upstreamTLSFactory,
 	routeInsecureSkipVerify bool) *http.Client {
+	return newForwardingHTTPClientWithDial(tlsFactory, routeInsecureSkipVerify,
+		forwardingDial{connectTimeout: upstreamConnectTimeout})
+}
+
+func newForwardingHTTPClientWithDial(tlsFactory *upstreamTLSFactory,
+	routeInsecureSkipVerify bool, dial forwardingDial) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           dial.netDialer().DialContext,
 		DisableCompression:    true,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 20 * time.Second,
@@ -46,11 +97,7 @@ func newForwardingHTTPClient(tlsFactory *upstreamTLSFactory,
 		if err != nil {
 			return nil, err
 		}
-		dialer := &tls.Dialer{
-			NetDialer: &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second},
-			Config:    tlsConfig,
-		}
-		return dialer.DialContext(ctx, network, address)
+		return dial.dialTLS(ctx, network, address, tlsConfig)
 	}
 	return &http.Client{
 		Transport:     transport,
@@ -165,13 +212,13 @@ func (stream *httpRequestStream) forward() {
 	relativePath, _ := metadataStringOptional(stream.metadata, "relativePath")
 	rawQuery, _ := metadataStringOptional(stream.metadata, "rawQuery")
 	routeConfig, found := stream.client.routeConfig(route)
-	if !found {
-		stream.fail(24, "未配置 HTTP route")
+	if !found || strings.TrimSpace(routeConfig.TargetBaseURL) == "" {
+		stream.failWith(24, "未配置 HTTP route", httpRouteFailureRouteNotLoaded)
 		return
 	}
 	target, err := buildTarget(routeConfig.TargetBaseURL, relativePath, rawQuery)
 	if err != nil {
-		stream.fail(24, err.Error())
+		stream.failWith(24, err.Error(), httpRouteFailureTargetInvalid)
 		return
 	}
 
@@ -180,7 +227,9 @@ func (stream *httpRequestStream) forward() {
 	if hasLength && contentLength == 0 {
 		body = http.NoBody
 	}
-	request, err := http.NewRequestWithContext(stream.ctx, method, target.String(), body)
+	progress := &upstreamProgress{}
+	request, err := http.NewRequestWithContext(httptrace.WithClientTrace(stream.ctx, progress.trace()),
+		method, target.String(), body)
 	if err != nil {
 		stream.fail(25, err.Error())
 		return
@@ -207,7 +256,7 @@ func (stream *httpRequestStream) forward() {
 		routeConfig.InsecureSkipVerify).Do(request)
 	if err != nil {
 		if stream.ctx.Err() == nil {
-			stream.fail(26, err.Error())
+			stream.failWith(26, err.Error(), classifyUpstreamFailure(err, progress))
 		}
 		return
 	}
@@ -272,7 +321,13 @@ func (stream *httpRequestStream) send(message protocol.NatMessage) error {
 }
 
 func (stream *httpRequestStream) fail(code uint32, reason string) {
-	stream.client.sendNatReset(stream.connection, stream.streamID, code, reason)
+	stream.failWith(code, reason, "")
+}
+
+// failWith resets the stream, classifying the failure when it happened before the response OPEN
+// and the client can tell why; an empty failure leaves the RST as it always was.
+func (stream *httpRequestStream) failWith(code uint32, reason string, failure httpRouteFailure) {
+	stream.client.sendNatResetWithFailure(stream.connection, stream.streamID, code, reason, failure)
 	stream.abort(reason)
 }
 

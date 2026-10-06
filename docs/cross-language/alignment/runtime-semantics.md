@@ -74,8 +74,10 @@
 - Go server、.NET server 与 C server 已接入 HTTP 响应路径改写行为：当 `pathRewriteEnabled=true` 时，服务端会在回写浏览器前尝试改写 `text/html` / `text/css` 中的绝对路径，并在 HTML 中注入 Java 对齐、同源外链的 `/specus-http-route-runtime.js?v=4`，避免上游 CSP 阻止 inline script；runtime 覆盖 `fetch`、`XMLHttpRequest`、`history.pushState/replaceState`、动态 DOM/CSS、`EventSource` 和 `WebSocket`，并处理同源双斜线与 query 裸大括号。改写后返回给浏览器的响应会剥离失效的 `Content-Encoding` / `Content-Length`，但 HTTP 明细采集仍保留客户端原始响应头，便于排查上游真实行为；C server 当前支持 `gzip`、zlib `deflate` 与 raw `deflate` 解码后改写。
 - Java、Go、.NET 与 C server 的持久化 HTTP route 已对齐可选 Basic 入口认证：管理 API 使用
   `authEnabled/authUsername/authPassword` 写入，只返回 `authPasswordConfigured`；密码只保存哈希。HTTP 与支持
-  WebSocket 的实现均在打开隧道/Upgrade 前校验，受保护 route 的入口 Authorization 不透传 upstream 或写入明细，
-  未持久化的 legacy 客户端本地 route 仍保持公开兼容。
+  WebSocket 的实现均在打开隧道/Upgrade 前校验，受保护 route 的入口 Authorization 不透传 upstream 或写入明细。
+  四个 server 的入口都 fail closed：没有服务端记录的 route（含已删除但客户端仍在转发的 route）、未启用的 route
+  与已停用客户端的 route 一律 `404`，不再按"未持久化即公开"放行；C server 的 `SPECUS_HTTP_ROUTES` 作为服务端
+  配置的公开 route 保留。`NAT_CONTROL` 始终携带完整 `httpSpecusConfigList`，删除最后一条 route 时下发空数组。
 - Go server 与 .NET server 已补齐数据库版 HTTP/TCP 明细采集链路：
   - 新增 `specus_resource_traffic_usage`，并按 TCP 映射 / HTTP route 聚合资源级每日流量。
   - 资源级流量和每日总流量均带 `tenant_id`，管理查询按当前租户和可见客户端收敛。
@@ -95,6 +97,13 @@
 - Go server 与 .NET server 的媒体管理/公开端点已按 Java 对齐：管理列表、播放、manifest、asset 和播放票据先做 tenant/owner 可见性过滤；公开 `play/manifest/asset` 只接受内存短期票据并支持 GET/HEAD，Range 空洞返回 `416`，无效或过期票据返回 `404`。
 - C server 的 Direct HTTP/WS v2 bridge：`OPEN/DATA/FIN/WINDOW_UPDATE` 流转、query 大括号编码、百分号编码路径、chunked 请求体、6 MiB 下载/2 MiB 上传和 WebSocket/SWS2 由 `nat_e2e_smoke.sh`、`direct_route_e2e.sh` 对真实客户端进程验证；route Basic 鉴权（`test_direct_http_route_authentication`）、HTML/CSS 改写与有界 gzip/deflate（`admin_http_tests`、`decompression_limits_tests`）、`RST` 与 SWS2 违规（`direct_websocket_tests`）只有单测，不在 E2E 内。Java、Go、.NET client 的三条脚本均在 CI 中通过（PR #127 的 run 37387624598，见[环境验证](environment-verification.md)）。mapping/route mutation 会热推权威全集（`runtime_config_e2e.sh`），手工 push 在线 `200`（`runtime_config_e2e.sh`）、离线 `409`（`admin_http_tests`）。
 - C server 的 WebSocket/SWS2 已补齐与 Java/Go/.NET 对齐的严格状态机，由 `direct_websocket_tests.c` 经真实监听端口驱动：中央 SWS2 向量的 canonical 与全部 malformed 样例既做编解码重放、也作为客户端 DATA 送入 stream；浏览器侧校验 mask、RSV（未协商扩展必须为 0）、opcode、最短长度编码、控制帧、continuation/FIN 序列、UTF-8 与 close code/reason，单个原始 data frame 在 16 MiB 内规范化为 SWS2（首段保留 opcode、其余为 continuation、仅末段继承 FIN），违规以 `1002`/`1007`/`1009` 关闭浏览器并把同一 close code 作为终止 SWS2 CLOSE 发给客户端；客户端侧按 Go/Java 重组时的消息规则（孤立 continuation、未完消息中的新消息、16 MiB、RSV、UTF-8）逐帧校验，与 .NET 一样保留分片边界写给浏览器，违规回 `RST 30`（FIN 后 DATA 为 `RST 7`）并以 `1002` 关闭浏览器。close 握手两向闭环：浏览器 CLOSE 立即回显并转为 SWS2 CLOSE + FIN；客户端 CLOSE 或无 CLOSE 的 FIN（浏览器收到 `1001`）最多等待 5 秒浏览器回复再回送 SWS2 CLOSE + FIN；CLOSE 之后同方向不再收发任何帧，客户端 CLOSE 后的帧回 `RST`，客户端 RST 以 `1011` 关闭浏览器，CLOSE 拿不到 NAT credit 时 5 秒后改发 `RST 31`。各语言在违规时的具体 close/RST 码并不完全相同（例如 Go 对浏览器协议错误向客户端回 `1011`），C 采用 RFC 6455 码并向客户端镜像同一码。
+- C server 的 NAT data 连接流语义已按 `control-protocol.md` 与 Java `NatServerHandler` / `HttpStreamExchange` / `RemoteSpecusHandler`、Go `clientSession` 对齐，由 `nat_stream_tests.c` 以真实 server 进程和 socket 逐条覆盖（每条检查各用独立 server，修复前逐条失败）。此前任何单流违规、64 MiB 响应超限或 WINDOW_UPDATE 溢出都只把整条 data 连接置为 `active=0`：连接并不关闭，TCP 照旧，HTTP/WS 新请求却一律答 502 离线。现在：
+  - 单流违规只复位该流，同一 data 连接上的其它流不受影响：HTTP 流的重复响应头、响应头前或结束后的 DATA、超出接收窗口的 DATA、重复 FIN 回 `RST 8`；响应体超过 64 MiB 回 `RST 4`（同 Go；Java server 不设此上限），浏览器拿到已转发部分后连接截断。TCP 流 FIN 后的 DATA 与重复 FIN 回 `RST 7`（此前前者回 `RST 6`、后者静默关闭），4 MiB client→public 队列溢出仍回 `RST 6`；客户端对非 HTTP stream 发 OPEN 回 `RST 8`，并关闭同 id 的 TCP/WebSocket 流。
+  - 未知 stream 的 DATA/FIN 回 `RST 7`（此前静默忽略）。每条 data 连接保留 1024 个最近关闭 stream 的 tombstone（含服务端为未知 stream 发出 RST 的 id），迟到 RST 幂等忽略；只有从未打开过的 stream 的 RST 才是 data 连接协议违规，此时真正关闭 data 连接、保留控制连接。WINDOW_UPDATE 使单流发送窗口超过 16 MiB 时与 Java `StreamFlowController.onWindowUpdate`、Go `handleWindowUpdate` 一样关闭 data 连接，未知 stream 的 WINDOW_UPDATE 忽略。
+  - `DATA|END_STREAM` 在 HTTP 流上等价于 DATA 后再收到 FIN（此前浏览器一直等不到响应结束），TCP 流上空 payload 的 `DATA|END_STREAM` 即 FIN；HTTP 响应头的 `trailerNames` 按 spec 可省略（此前缺省即被当成非法响应头，浏览器得到 502）。
+  - 已认证的 control/data 连接上收到 `HEARTBEAT_RESPONSE` 按 Java `ConnectionRoleHandler` 与 Go 静默接受，不再按协议违规断开。
+  - 已被任一侧 RST 的 TCP 流不再补发 FIN；写 public socket 失败按 Java/Go 回 `RST 9`（此前静默关闭）。
+  - 单条 data 连接最多 1024 个 pending Direct HTTP 流，第 1025 个请求按 Java 答 `502 HTTP 流创建失败`（此前被当成响应头超时答 504）；请求体按 Content-Length 或 chunked 超过 16 MiB 答 `413 HTTP 请求体超过限制`，恰好 16 MiB 照常转发。
 - C server 已补可选 Elasticsearch HTTP/TCP 明细写入、查询和容量清理（`elasticsearch_traffic_tests`，对 fake ES）；未配置时继续使用 SQLite。逐 route 媒体采集已支持专用 S3-compatible/RustFS 校验、HLS/DASH/渐进式对象、multipart、Range 去重与跨对象连续区间、incomplete 稀疏回放、可选回源、tenant ticket、manifest/asset 和定时过期清理（`media_capture_tests`，对 fake S3；未接真实 RustFS）。公共 discovery 已通过 C↔C 双实例（`public_discovery_cluster_e2e`）和 C↔Java Redis（CI 中的 `java_c_discovery_interop.sh`）的 roster/名称/双向信令混部门禁；Go/.NET server 与 C 的混部没有证据。
 
 ## 阶段 4：Peer Mesh 控制面与数据面

@@ -101,7 +101,7 @@ Java 参考实现已收拢到 `implementations/java/server`、`implementations/j
 - `RemoteSpecusHandler` 等价物([RemoteSpecusHandler.java](../../implementations/java/server/src/main/java/com/theshuai/specusserver/handler/RemoteSpecusHandler.java)):每个外部 TCP 连接的入站读循环,把字节切片打包 NAT_MESSAGE/DATA → 控制通道
 - 背压:对 Pipelines `PauseWriterThreshold=64KiB / ResumeWriterThreshold=32KiB`,任一方写满时暂停另一方读循环,等价 [ChannelBackpressure.java](../../implementations/java/common/src/main/java/com/theshuai/common/handler/ChannelBackpressure.java)
 - TrafficUsageService:`ConcurrentDictionary<long, (long up, long down)>` in-memory,每 5 s `BackgroundService` flush 进 `specus_traffic_usage`(以 `Task.Delay` 模拟 fixed-delay 语义),参考 [TrafficUsageService.java](../../implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/TrafficUsageService.java)
-- `NatControlService` 登录后下发 MESSAGE_RESPONSE/NAT_CONTROL,让 Java client 在 Phase 3 就挂载 `NatClientHandler` 并发起 REGISTER；JSON 体严格按 [NatControlService.java](../../implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/NatControlService.java) 的字段顺序和"未配 HTTP 路由就省略 `httpSpecusConfigList`"语义。Phase 4 再补 CRUD 后热更新 push
+- `NatControlService` 登录后下发 MESSAGE_RESPONSE/NAT_CONTROL,让 Java client 在 Phase 3 就挂载 `NatClientHandler` 并发起 REGISTER；JSON 体严格按 [NatControlService.java](../../implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/NatControlService.java) 的字段顺序和"始终携带完整 `httpSpecusConfigList`，没有 HTTP 路由时为空数组"语义（早期"未配 HTTP 路由就省略该字段"会让删除最后一条 route 的客户端继续转发，已废弃）。Phase 4 再补 CRUD 后热更新 push
 
 **测试**:
 - E2E:Java client 注册一个隧道,本机起一个 mock TCP echo server 当上游,在测试里发 TCP 流量验证回环

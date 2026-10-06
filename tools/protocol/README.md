@@ -18,6 +18,7 @@ python tools/protocol/verify_peer_egress_vectors.py
 | `generate_peer_egress_policy_vectors.py` | `protocol/test-vectors/peer-egress-rules-v1.json`、`peer-egress-authz-v1.json` |
 | `generate_peer_egress_socket_binding_vectors.py` | `protocol/test-vectors/peer-egress-socket-binding-v1.json`（出口 socket 的接口选择；读取 macOS 路由向量里的真机样本） |
 | `verify_peer_egress_vectors.py` | 无产物；校验失败时退出码非零 |
+| `generate_service_connectivity_vectors.py` | `protocol/test-vectors/service-connectivity-check-v1.json`（服务连通性检查草案的四阶段状态机与限流；见 [`service-connectivity-check.md`](../../protocol/spec/service-connectivity-check.md)） |
 | `generate_service_workbench_vectors.py` | `protocol/test-vectors/service-workbench-v1.json`（服务工作台草案：收藏与最近打开的上限、保留期、排序、隔离与级联；见 [`service-workbench.md`](../../protocol/spec/service-workbench.md)） |
 
 两个生成器各自带一份参考实现（规则匹配器、授权判定器），写文件前会用它断言每条期望，

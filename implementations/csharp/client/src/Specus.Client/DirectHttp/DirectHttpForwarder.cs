@@ -63,6 +63,15 @@ public sealed class DirectHttpForwarder : IDisposable
         return handler;
     }
 
+    /// <summary>
+    /// Whether the client for this route has an overall request timeout. The default clients have
+    /// none, so the only timeout a request meets before its response head is the handler's
+    /// ConnectTimeout; with one, a timeout cannot be attributed to the connect.
+    /// </summary>
+    internal bool HasRequestTimeout(bool routeInsecureSkipVerify) =>
+        (routeInsecureSkipVerify ? _routeInsecureHttpClient.Value : _httpClient).Timeout
+            != Timeout.InfiniteTimeSpan;
+
     internal Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
         bool routeInsecureSkipVerify, CancellationToken cancellationToken) =>
         (routeInsecureSkipVerify ? _routeInsecureHttpClient.Value : _httpClient)

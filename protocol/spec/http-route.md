@@ -19,10 +19,15 @@ ANY /http/{clientName}/{route}/**
 - query 使用原始 query string，不执行 decode/re-encode；
 - 普通请求使用 HTTP stream；支持 HTTP-route WebSocket 的实现使用同一 NAT stream 上的 SWS2。
 
+入口必须 fail closed：是否放行只由服务端自己的 route 记录决定。该 `clientName` + `route` 没有服务端记录（从未
+创建、已删除，或路径缺少 route 段）、route 未启用、客户端账户不存在或已停用时，服务端返回 `404`（`Cache-Control:
+no-store`），且不读取请求体、不创建 NAT stream、不执行 WebSocket Upgrade。客户端可能仍持有旧的 route 列表并继续
+为该 route 名转发（例如删除后尚未收到新列表或尚未重连），因此客户端的 route 表从不构成访问授权，"没有记录"也
+绝不能退化为公开访问。
+
 认证已启用但凭据缺失或错误时返回 `401`，并携带 `WWW-Authenticate: Basic`；认证配置读取失败时返回
 `503`。认证在读取请求体、创建 NAT stream，以及受支持实现执行 WebSocket Upgrade 之前完成。找不到客户端或活动 `data`
-连接时返回 `502/503`（以实现的离线语义为准）；route 不存在由客户端拒绝。请求超时返回 `504`，请求体超过
-配置上限返回 `413`。
+连接时返回 `502/503`（以实现的离线语义为准）。请求超时返回 `504`，请求体超过配置上限返回 `413`。
 
 客户端在发出响应 `OPEN` 之前对该 stream 发送 `RST`（upstream 不可达、拒绝连接、TLS 失败等）时，只要公网响应头
 尚未提交（包括路径改写缓冲阶段），服务端就返回 `502`，响应体是固定的通用文本 `HTTP 转发请求失败`（C server
@@ -51,8 +56,14 @@ header 或 body 中；它只用于服务端诊断：写入日志（以及实现�
 或传全空白字符串表示保留原密码；首次启用认证必须同时具备用户名和密码。关闭认证保留已有凭据，便于之后
 重新启用。
 
-入口认证仅属于 server 公网边界，不进入 `httpSpecusConfigList`，客户端也不持有访问密码。没有服务端持久化
-记录的 legacy 本地 route 继续按公开入口处理，以兼容客户端本地配置。
+入口认证仅属于 server 公网边界，不进入 `httpSpecusConfigList`，客户端也不持有访问密码。客户端不在本地定义
+route，只使用 HTTP 登录快照与 `NAT_CONTROL.httpSpecusConfigList` 下发的列表，所以不存在需要按公开入口兼容的
+"客户端本地 route"。C server 的 `SPECUS_HTTP_ROUTES` 是服务端自身配置、下发给所有客户端的公开 route，属于服务端
+记录：无数据库时只放行这些 route；有数据库时它们同样公开，但客户端账户仍须存在且已启用。
+
+服务端每次下发 `NAT_CONTROL` 都必须携带该客户端当前已启用 route 的完整列表；没有任何 route 时（例如删除了最后一条）
+发送空数组，客户端据此整体替换并停止转发被删除的 route。客户端仍把字段缺省理解为"本次不更新 route"，因此服务端不得
+用缺省表达"没有 route"。客户端在收到新列表之前可能仍转发旧 route，这正是第 1 节要求入口 fail closed 的原因。
 
 目标 URI 由 `targetBaseUrl + relativePath + ?rawQuery` 构造。base URL 不能包含 query/fragment，相对路径不能
 含控制字符。HTTP 客户端不自动跟随 redirect，响应原样返回给公网调用方。

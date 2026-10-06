@@ -2817,6 +2817,120 @@ static int test_log_safe_reason(void)
     return 0;
 }
 
+/* Sends one request and checks its status and how many HTTP/WS dispatches it caused. */
+static int route_auth_expect(int port,
+                             route_auth_test_context *context,
+                             const char *label,
+                             const char *request,
+                             const char *status,
+                             int http_calls,
+                             int ws_calls,
+                             int authorization_headers)
+{
+    char response[8192];
+    route_auth_test_context_reset(context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, status)
+        || !route_auth_test_context_matches(context, http_calls, ws_calls, authorization_headers)) {
+        fprintf(stderr, "%s: want %s and %d/%d dispatches, got %.160s\n",
+                label, status, http_calls, ws_calls, response);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * The fake dispatcher forwards every route it is handed, the way a client still holding a stale
+ * route list would, so only the server's own records may decide what gets through. Leaves
+ * SPECUS_HTTP_ROUTES set and may leave SPECUS_DATABASE_PATH unset; the caller restores both.
+ */
+static int test_direct_http_route_fails_closed(const char *database_path,
+                                               int port,
+                                               route_auth_test_context *context,
+                                               const st_storage_http_route *protected_route)
+{
+    static const char doomed_get[] =
+        "GET /http/C%20managed%202/doomed/secret HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    static const char doomed_ws[] =
+        "GET /http/C%20managed%202/doomed/socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    static const char never_created[] =
+        "GET /http/C%20managed%202/never-created/ HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    static const char protected_with_credentials[] =
+        "GET /http/C%20managed%202/api/items HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n";
+
+    st_storage_client managed;
+    st_storage_client changed;
+    st_storage_http_route doomed;
+    if (st_storage_get_client_by_name(database_path, "C managed 2", &managed) != 0
+        || st_storage_create_http_route_for_client(database_path, managed.id, "doomed",
+                                                   "http://127.0.0.1:8080", 1, 0, 0, 0, 0, 1,
+                                                   protected_route->auth_username,
+                                                   protected_route->auth_password_hash,
+                                                   &doomed) != 0) {
+        fprintf(stderr, "fail-closed route fixture failed\n");
+        return -1;
+    }
+    /* A protected route deleted while the client still forwards it is refused, never anonymous. */
+    if (route_auth_expect(port, context, "protected route before delete", doomed_get,
+                          "401 Unauthorized", 0, 0, 0) != 0
+        || st_storage_delete_http_route_by_id(database_path, doomed.id) != 0
+        || route_auth_expect(port, context, "deleted protected route", doomed_get,
+                             "404 Not Found", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "deleted protected websocket route", doomed_ws,
+                             "404 Not Found", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "route never created", never_created,
+                             "404 Not Found", 0, 0, 0) != 0
+        || route_auth_expect(port, context, "path without a route",
+                             "GET /http/C%20managed%202 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                             "404 Not Found", 0, 0, 0) != 0) {
+        return -1;
+    }
+
+    /* Every route of a disabled client is refused, valid credentials or not. */
+    int disabled = st_storage_upsert_client(database_path, managed.id, managed.tenant_id, managed.client_name,
+                                            managed.owner_username, 0, managed.connection_rate_limit_per_minute,
+                                            &changed) == 0
+        && route_auth_expect(port, context, "protected route of a disabled client", protected_with_credentials,
+                             "404 Not Found", 0, 0, 0) == 0;
+    int restored = st_storage_upsert_client(database_path, managed.id, managed.tenant_id, managed.client_name,
+                                            managed.owner_username, 1, managed.connection_rate_limit_per_minute,
+                                            &changed) == 0;
+    if (!disabled || !restored
+        || route_auth_expect(port, context, "protected route of a re-enabled client", protected_with_credentials,
+                             "200 OK", 1, 0, 0) != 0) {
+        return -1;
+    }
+
+    /* SPECUS_HTTP_ROUTES entries are server-defined and public, for an enabled account with a
+     * database and for anyone without one; any other route stays refused. */
+    setenv("SPECUS_HTTP_ROUTES", "envapi=http://127.0.0.1:8080", 1);
+    static const char env_route[] =
+        "GET /http/C%20managed%202/envapi/items HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n";
+    static const char env_route_unknown_client[] =
+        "GET /http/Env/envapi/items HTTP/1.1\r\nHost: localhost\r\n"
+        "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n";
+    static const char not_env_route[] =
+        "GET /http/Env/api/items HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    if (route_auth_expect(port, context, "environment route with a database", env_route,
+                          "200 OK", 1, 0, 1) != 0
+        || route_auth_expect(port, context, "environment route of a client without an account",
+                             env_route_unknown_client, "404 Not Found", 0, 0, 0) != 0) {
+        return -1;
+    }
+    unsetenv("SPECUS_DATABASE_PATH");
+    if (route_auth_expect(port, context, "database-free environment route", env_route_unknown_client,
+                          "200 OK", 1, 0, 1) != 0
+        || route_auth_expect(port, context, "database-free route outside the environment list", not_env_route,
+                             "404 Not Found", 0, 0, 0) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int test_direct_http_route_authentication(const char *database_path)
 {
     route_auth_test_context context;
@@ -3115,39 +3229,12 @@ static int test_direct_http_route_authentication(const char *database_path)
     }
 
     setenv("SPECUS_DATABASE_PATH", database_path, 1);
-    setenv("SPECUS_HTTP_ROUTES", "api=http://127.0.0.1:8080", 1);
-    snprintf(request,
-             sizeof(request),
-             "GET /http/Env/api/items HTTP/1.1\r\nHost: localhost\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n");
-    route_auth_test_context_reset(&context);
-    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
-        || !contains(response, "200 OK")
-        || !route_auth_test_context_matches(&context, 1, 0, 1)) {
-        fprintf(stderr, "database-unmanaged environment route compatibility mismatch\n");
-        unsetenv("SPECUS_HTTP_ROUTES");
-        route_auth_stop_server(&server);
-        pthread_mutex_destroy(&context.lock);
-        return 1;
-    }
-
-    unsetenv("SPECUS_DATABASE_PATH");
-    route_auth_test_context_reset(&context);
-    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
-        || !contains(response, "200 OK")
-        || !route_auth_test_context_matches(&context, 1, 0, 1)) {
-        fprintf(stderr, "database-free environment route compatibility mismatch\n");
-        setenv("SPECUS_DATABASE_PATH", database_path, 1);
-        unsetenv("SPECUS_HTTP_ROUTES");
-        route_auth_stop_server(&server);
-        pthread_mutex_destroy(&context.lock);
-        return 1;
-    }
-    setenv("SPECUS_DATABASE_PATH", database_path, 1);
+    int closed_ok = test_direct_http_route_fails_closed(database_path, port, &context, &route);
     unsetenv("SPECUS_HTTP_ROUTES");
+    setenv("SPECUS_DATABASE_PATH", database_path, 1);
     route_auth_stop_server(&server);
     pthread_mutex_destroy(&context.lock);
-    return 0;
+    return closed_ok == 0 ? 0 : 1;
 }
 
 typedef struct {

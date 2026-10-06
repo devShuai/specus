@@ -120,7 +120,7 @@ func TestServeWebSocketOpenDataCloseLifecycle(t *testing.T) {
 					return nil
 				}, nil), nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
 		}}, nil, store.TrafficDetailOptions{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -207,7 +207,7 @@ func TestServeWebSocketRejectsMissingBasicAuthBeforeUpgrade(t *testing.T) {
 			opened = true
 			return nil, nil
 		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "ws-user", AuthPasswordHash: auth.HashToken("ws-password"),
 		}}, nil, store.TrafficDetailOptions{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.SetPathValue("clientName", "Demo client")
@@ -231,6 +231,35 @@ func TestServeWebSocketRejectsMissingBasicAuthBeforeUpgrade(t *testing.T) {
 	}
 	if challenge := response.Header.Get("WWW-Authenticate"); !strings.HasPrefix(challenge, "Basic ") {
 		t.Fatalf("WWW-Authenticate = %q", challenge)
+	}
+}
+
+func TestServeWebSocketRejectsRouteWithoutServerRecordBeforeUpgrade(t *testing.T) {
+	opened := false
+	service := NewService(onlineRegistry("Demo client"), nil,
+		func(string, map[string]any, *gorillaws.Conn) (*WebSocketSpecus, error) {
+			opened = true
+			return nil, nil
+		}, time.Second, 1024, 1024, nil, &staticRouteSettings{}, nil, store.TrafficDetailOptions{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.SetPathValue("clientName", "Demo client")
+		r.SetPathValue("route", "deleted")
+		service.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, response, err := websocket.Dial(ctx,
+		"ws"+strings.TrimPrefix(server.URL, "http")+"/http/Demo%20client/deleted/ws", nil)
+	if conn != nil {
+		conn.CloseNow()
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusNotFound || opened {
+		t.Fatalf("err/status/opened = %v/%v/%t, want dial error/404/false", err, responseStatus(response), opened)
 	}
 }
 
@@ -371,7 +400,7 @@ func TestServeWebSocketAutoRepliesToPingAndForwardsBrowserPongPayload(t *testing
 				frames <- frame
 				return nil
 			}, func() error { return nil }, nil), nil
-		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{Enabled: true}},
+		}, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{ClientEnabled: true, Enabled: true}},
 		nil, store.TrafficDetailOptions{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.SetPathValue("clientName", "Demo client")

@@ -1,5 +1,6 @@
 package com.theshuai.specusclient.handler;
 
+import com.theshuai.common.protocol.HttpRouteFailure;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import io.netty.channel.EventLoopGroup;
@@ -198,7 +199,7 @@ class HttpStreamForwarderTrailersTests {
         }
 
         @Override
-        void failHttpStream(int streamId, String reason) {
+        void failHttpStream(int streamId, String reason, HttpRouteFailure classification) {
             failure = reason;
         }
 
