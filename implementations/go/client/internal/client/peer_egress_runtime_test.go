@@ -517,7 +517,7 @@ func TestEgressRuntimeSeparatesAnUnreachableTargetFromARefusal(t *testing.T) {
 	if codes := harness.rejectCodes(); len(codes) != 0 {
 		t.Errorf("a network failure was reported as a refusal: %v", codes)
 	}
-	if counts := harness.runtime.rejections.drainCounts(); len(counts) != 0 {
+	if counts := harness.runtime.rejections.cumulativeCounts(); len(counts) != 0 {
 		t.Errorf("a network failure entered the refusal aggregate: %v", counts)
 	}
 	// The reservation must come back, or a flapping destination would exhaust the quota.
@@ -774,7 +774,7 @@ func TestEgressRuntimeExpiresAnIdleUDPSession(t *testing.T) {
 		t.Error("an expired session left its socket open")
 	}
 	// An expiring session is the normal end of life, not something to report as blocked traffic.
-	if counts := harness.runtime.rejections.drainCounts(); len(counts) != 0 {
+	if counts := harness.runtime.rejections.cumulativeCounts(); len(counts) != 0 {
 		t.Errorf("idle expiry entered the refusal aggregate: %v", counts)
 	}
 }

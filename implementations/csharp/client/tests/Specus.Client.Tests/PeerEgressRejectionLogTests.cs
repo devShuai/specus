@@ -33,7 +33,7 @@ public class PeerEgressRejectionLogTests
         }
         Assert.Equal(PeerEgressRejectionLog.PerWindow, emitted);
 
-        var counts = log.DrainCounts();
+        var counts = log.CumulativeCounts();
         Assert.True(counts[PeerEgressCodes.DestinationDenied] == PeerEgressRejectionLog.PerWindow * 3,
             "the aggregate must count every refusal");
     }
@@ -95,16 +95,21 @@ public class PeerEgressRejectionLogTests
     {
         var log = new PeerEgressRejectionLog();
         const long attempts = PeerEgressRejectionLog.MaxSubjects + 500L;
+        var emitted = 0L;
         for (long consumer = 0; consumer < attempts; consumer++)
         {
-            log.Record(consumer, PeerEgressCodes.ConsumerDenied, Epoch);
+            if (log.Record(consumer, PeerEgressCodes.ConsumerDenied, Epoch).ShouldLog)
+            {
+                emitted++;
+            }
         }
         Assert.True(log.SubjectCount <= PeerEgressRejectionLog.MaxSubjects,
             $"subject table held {log.SubjectCount} entries");
-        Assert.True(log.Limited, "hitting the cap was not recorded");
+        Assert.True(emitted == PeerEgressRejectionLog.MaxSubjects,
+            $"{emitted} lines for {attempts} subjects: the cap did not drop the ones past it");
 
         // Reaching the cap costs diagnostic lines, never accuracy.
-        Assert.True(log.DrainCounts()[PeerEgressCodes.ConsumerDenied] == attempts,
+        Assert.True(log.CumulativeCounts()[PeerEgressCodes.ConsumerDenied] == attempts,
             "the aggregate must count every refusal even at the cap");
     }
 
@@ -126,24 +131,27 @@ public class PeerEgressRejectionLogTests
     }
 
     /// <summary>
-    /// Consecutive reports have to describe consecutive intervals. A running total would leave the
-    /// server differencing values it was never told were cumulative.
+    /// The status and the egress-report read one running tally. Reading it must not reset it: the
+    /// server keeps only the latest report, so a report that started counting from zero again
+    /// would replace the totals on the admin page with "since the last report".
     /// </summary>
     [Fact]
-    public void DrainResetsTheInterval()
+    public void ReadingTheTallyLeavesItRunning()
     {
         var log = new PeerEgressRejectionLog();
         log.Record(7, PeerEgressCodes.DestinationDenied, Epoch);
         log.Record(7, PeerEgressCodes.PortDenied, Epoch);
 
-        var first = log.DrainCounts();
+        var first = log.CumulativeCounts();
         Assert.Equal(1, first[PeerEgressCodes.DestinationDenied]);
         Assert.Equal(1, first[PeerEgressCodes.PortDenied]);
-        Assert.Empty(log.DrainCounts());
+        Assert.Equal(first, log.CumulativeCounts());
 
         log.Record(7, PeerEgressCodes.DestinationDenied, Epoch);
-        var third = log.DrainCounts();
-        Assert.True(third.Count == 1, "the third interval carried more than its own refusal");
-        Assert.Equal(1, third[PeerEgressCodes.DestinationDenied]);
+        var third = log.CumulativeCounts();
+        Assert.Equal(2, third[PeerEgressCodes.DestinationDenied]);
+        Assert.Equal(1, third[PeerEgressCodes.PortDenied]);
+        // A copy: what a reader holds does not move under it.
+        Assert.Equal(1, first[PeerEgressCodes.DestinationDenied]);
     }
 }

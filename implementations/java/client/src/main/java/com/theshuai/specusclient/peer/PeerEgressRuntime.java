@@ -124,7 +124,7 @@ final class PeerEgressRuntime {
     private record UdpFlow(Socket socket) {
     }
 
-    /** What the periodic egress-report carries, alongside the per-code refusal counts. */
+    /** What the status and the periodic egress-report carry, alongside the per-code refusal counts. */
     record Stats(long totalFlows, long bytesIn, long bytesOut) {
     }
 
@@ -208,10 +208,9 @@ final class PeerEgressRuntime {
     }
 
     /**
-     * What an operator can read about this node serving as an egress.
-     *
-     * <p>The refusal counts come from the cumulative tally rather than the one the periodic report
-     * drains, so the numbers do not start shrinking on their own the day that report is wired up.
+     * What an operator can read about this node serving as an egress: the status's egress section,
+     * and the {@code egress-report} built from the same snapshot, so the admin page and this
+     * device say the same thing. Every count runs from the start of this runtime.
      */
     PeerEgressStatus.RuntimeSnapshot statusSnapshot() {
         lock.lock();
@@ -1081,8 +1080,25 @@ final class PeerEgressRuntime {
      * which is what the application waits on anyway.
      */
     private void unreachable(long consumer, PeerEgressFlowTable.Key key, Exception cause) {
-        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}",
-                consumer, key.protocolName(), connectReason(cause));
+        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}{}",
+                consumer, key.protocolName(), connectReason(cause), connectDetail(cause));
+    }
+
+    /**
+     * What follows the reason: the JVM option the egress lacks when that is why the dial failed,
+     * otherwise nothing.
+     *
+     * <p>Without {@value PeerEgressSocketHandles#EXPORT_OPTION} every dial on Windows and macOS is
+     * refused, and {@code reason=error} alone would leave an operator nothing to go on. The reason
+     * stays {@code error}, one of the words every runtime shares; the option is a field after it.
+     */
+    static String connectDetail(Throwable cause) {
+        for (Throwable error = cause; error != null; error = error.getCause()) {
+            if (error instanceof PeerEgressSocketHandles.MissingExportException) {
+                return " missing=\"" + PeerEgressSocketHandles.EXPORT_OPTION + "\"";
+            }
+        }
+        return "";
     }
 
     /**
@@ -1259,6 +1275,21 @@ final class PeerEgressRuntime {
             }
             revision = candidate;
             return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * A new control session. Revisions count within one, and a restarted server numbers its pushes
+     * from 1 again; the last session's revision would hold every push of the new one back until the
+     * count caught up, leaving the policy from before the restart in force. Go and .NET get the same
+     * by building a new plane for each session.
+     */
+    void newControlSession() {
+        lock.lock();
+        try {
+            revision = 0;
         } finally {
             lock.unlock();
         }

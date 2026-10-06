@@ -110,6 +110,8 @@ add_test(NAME login_rate_limiter_tests COMMAND specus_c_login_rate_limiter_tests
 add_executable(specus_c_object_storage_tests tests/object_storage_tests.c)
 target_link_libraries(specus_c_object_storage_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_object_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_object_storage_tests PRIVATE
+    ST_TRANSFER_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME object_storage_tests COMMAND specus_c_object_storage_tests)
 add_test(NAME object_storage_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/object_storage_e2e.sh
@@ -168,6 +170,13 @@ add_executable(specus_c_security_baseline_tests tests/security_baseline_tests.c)
 target_link_libraries(specus_c_security_baseline_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_security_baseline_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME security_baseline_tests COMMAND specus_c_security_baseline_tests)
+
+add_executable(specus_c_session_lifecycle_tests tests/session_lifecycle_tests.c)
+target_link_libraries(specus_c_session_lifecycle_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_session_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME session_lifecycle_tests
+    COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_storage_tests tests/storage_tests.c)
 target_link_libraries(specus_c_storage_tests PRIVATE specus_c_core)

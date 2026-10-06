@@ -43,15 +43,35 @@ else
   CLIENT_LABEL="Java"
 fi
 
+# Stops a background process and waits until it is gone, so a client of this run never logs in to
+# the next run's server (see nat_e2e_smoke.sh).
+stop_process() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   set +e
-  if [[ -n "${CLIENT_PID:-}" ]]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
-  if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; fi
-  if [[ -n "${ECHO_PID:-}" ]]; then kill "$ECHO_PID" 2>/dev/null || true; fi
-  if [[ -n "${HTTP_PID:-}" ]]; then kill "$HTTP_PID" 2>/dev/null || true; fi
+  for pid in "${CLIENT_PID:-}" "${SERVER_PID:-}" "${ECHO_PID:-}" "${HTTP_PID:-}"; do
+    if [[ -n "$pid" ]]; then stop_process "$pid"; fi
+  done
+  # SPECUS_E2E_LOG_DIR keeps this run's logs (C server, client, upstreams) once the temporary
+  # directory is gone, whether the run passed or failed; CI uploads that directory as an artifact.
+  if [[ -n "${SPECUS_E2E_LOG_DIR:-}" ]]; then
+    local label="${CLIENT_LABEL:-client}"
+    local log_dir="$SPECUS_E2E_LOG_DIR/runtime_config_e2e-${label//[^A-Za-z0-9._-]/_}"
+    mkdir -p "$log_dir" && cp "$TMP_DIR"/*.log "$log_dir"/ 2>/dev/null
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 if [[ -z "${SPECUS_CLIENT_COMMAND:-}" && ! -f "$JAVA_CLIENT_JAR" ]]; then
   echo "missing Java client jar: $JAVA_CLIENT_JAR" >&2
@@ -173,7 +193,8 @@ cat >"$TMP_DIR/client.jsonc" <<JSON
 }
 JSON
 
-(cd "$TMP_DIR" && "${CLIENT_COMMAND[@]}" run --config client.jsonc --no-update-check >"$TMP_DIR/client.log" 2>&1) &
+# exec makes CLIENT_PID the client itself, so cleanup stops the client and not just a subshell.
+(cd "$TMP_DIR" && exec "${CLIENT_COMMAND[@]}" run --config client.jsonc --no-update-check >"$TMP_DIR/client.log" 2>&1) &
 CLIENT_PID=$!
 
 if ! python3 - "$ADMIN_PORT" "$PUBLIC_PORT" "$ECHO_PORT" "$HTTP_UPSTREAM_PORT" \

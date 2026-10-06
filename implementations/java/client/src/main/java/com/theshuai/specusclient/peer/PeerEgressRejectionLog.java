@@ -59,27 +59,17 @@ final class PeerEgressRejectionLog {
         }
     }
 
-    private Map<String, Long> counts = new LinkedHashMap<>();
-
     /**
-     * The same tally for the status surface, which nothing resets.
-     *
-     * <p>Separate from {@link #counts} on purpose. That one belongs to the periodic report and is
-     * drained so consecutive reports describe consecutive intervals; a status reading it would
-     * answer "since whenever the last report went out", which is not a question anybody asked and
-     * changes meaning the day the report is wired up. Two counters cost a map.
+     * Refusals per code since this runtime started, which nothing resets. The status shows it as
+     * {@code refused}, and the {@code egress-report} carries the same numbers: the server keeps only
+     * the latest report, so a report of an interval would leave the admin page describing "since
+     * the last report" and stuck there once reports stop.
      */
     private final Map<String, Long> cumulative = new LinkedHashMap<>();
     private final Map<Key, Bucket> recent = new LinkedHashMap<>();
-    private long total;
     private boolean limited;
 
-    /** How many refusals the current interval has seen, across every code. */
-    long total() {
-        return total;
-    }
-
-    /** Whether the subject cap dropped a diagnostic line during this interval. */
+    /** Whether the subject cap has dropped a diagnostic line since this log started. */
     boolean limited() {
         return limited;
     }
@@ -97,9 +87,7 @@ final class PeerEgressRejectionLog {
      * would be worse than no report, since it would look like the refusals stopped.
      */
     Decision record(long consumer, String code, long nowMs) {
-        counts.merge(code, 1L, Long::sum);
         cumulative.merge(code, 1L, Long::sum);
-        total++;
 
         Key key = new Key(consumer, code);
         Bucket bucket = recent.get(key);
@@ -148,24 +136,10 @@ final class PeerEgressRejectionLog {
     }
 
     /**
-     * Returns the per-code totals for one {@code egress-report} and resets them, so consecutive
-     * reports describe consecutive intervals rather than a running sum the server has to
-     * difference.
+     * The per-code totals since this runtime started, for the status and the
+     * {@code egress-report} alike. A copy; this log goes on counting.
      */
-    /** The per-code totals since this runtime started. A copy; this log goes on counting. */
     Map<String, Long> cumulativeCounts() {
         return new LinkedHashMap<>(cumulative);
-    }
-
-    /** Drains the report's tally. The cumulative one above is deliberately left alone. */
-    Map<String, Long> drainCounts() {
-        if (counts.isEmpty()) {
-            return Map.of();
-        }
-        Map<String, Long> drained = counts;
-        counts = new LinkedHashMap<>();
-        total = 0;
-        limited = false;
-        return drained;
     }
 }

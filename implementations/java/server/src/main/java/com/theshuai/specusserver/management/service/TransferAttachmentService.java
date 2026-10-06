@@ -14,6 +14,7 @@ import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.storage.object.ObjectStorageService;
 import com.theshuai.specusserver.management.storage.object.PresignedObjectUrl;
 import com.theshuai.specusserver.management.service.PublicTransferRoomService.RoomAccess;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -25,6 +26,7 @@ import org.springframework.web.server.ResponseStatusException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.YearMonth;
@@ -62,7 +64,10 @@ public class TransferAttachmentService {
     private final PublicTransferRoomService publicTransferRoomService;
     private final Object[] quotaLocks = new Object[64];
     private final SecureRandom secureRandom = new SecureRandom();
+    /** The clock the capability snapshot reads; tests pin it to replay a fixed instant. */
+    private final Clock clock;
 
+    @Autowired
     public TransferAttachmentService(TransferAttachmentRepository repository,
                                      TransferAttachmentDownloadGrantRepository downloadGrantRepository,
                                      TransferAttachmentDownloadUsageRepository downloadUsageRepository,
@@ -71,6 +76,19 @@ public class TransferAttachmentService {
                                      PublicTransferProperties publicTransferProperties,
                                      ClientAccountService clientAccountService,
                                      PublicTransferRoomService publicTransferRoomService) {
+        this(repository, downloadGrantRepository, downloadUsageRepository, objectStorageService, properties,
+                publicTransferProperties, clientAccountService, publicTransferRoomService, Clock.systemUTC());
+    }
+
+    TransferAttachmentService(TransferAttachmentRepository repository,
+                              TransferAttachmentDownloadGrantRepository downloadGrantRepository,
+                              TransferAttachmentDownloadUsageRepository downloadUsageRepository,
+                              ObjectStorageService objectStorageService,
+                              ObjectStorageProperties properties,
+                              PublicTransferProperties publicTransferProperties,
+                              ClientAccountService clientAccountService,
+                              PublicTransferRoomService publicTransferRoomService,
+                              Clock clock) {
         this.repository = repository;
         this.downloadGrantRepository = downloadGrantRepository;
         this.downloadUsageRepository = downloadUsageRepository;
@@ -79,6 +97,7 @@ public class TransferAttachmentService {
         this.publicTransferProperties = publicTransferProperties;
         this.clientAccountService = clientAccountService;
         this.publicTransferRoomService = publicTransferRoomService;
+        this.clock = clock;
         for (int i = 0; i < quotaLocks.length; i++) {
             quotaLocks[i] = new Object();
         }
@@ -89,7 +108,7 @@ public class TransferAttachmentService {
         String tenant = requireAccountText(context.tenant().tenantId(), "tenantId");
         String username = requireAccountText(context.username(), "username");
         synchronized (quotaLock(tenant, username)) {
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             YearMonth month = YearMonth.from(now.atOffset(ZoneOffset.UTC));
             long used = Math.max(0L, repository.sumActiveStorageBytes(tenant, username, Long.MIN_VALUE,
                     STATUS_PENDING, STATUS_UPLOADED, now.toString()));

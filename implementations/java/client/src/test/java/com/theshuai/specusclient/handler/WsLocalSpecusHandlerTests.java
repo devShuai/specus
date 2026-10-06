@@ -13,15 +13,19 @@ import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.WebSocketClientProtocolHandler;
 import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -77,7 +81,61 @@ class WsLocalSpecusHandlerTests {
             assertEquals(WebSocketSpecusFrame.OPCODE_CLOSE,
                     WebSocketSpecusFrame.decode(close.getData()).opcode());
             assertEquals(NatMessageType.FIN, fin.getNatMessageType());
+            assertTrue(fixture.local.isActive(), "the app's close handshake still waits for the peer's reply");
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void relaysThePeersCloseReplyBeforeClosingOnASeparateFin() throws Exception {
+        HeldWrites held = new HeldWrites();
+        Fixture fixture = registeredFixture(5_000, held);
+        try {
+            startAppClose(fixture);
+
+            // The server relays the browser's CLOSE reply, then ends the stream with its own FIN.
+            fixture.control.writeInbound(data(17, appCloseReply(), 0));
+            fixture.control.writeInbound(fin(17));
+            fixture.control.runPendingTasks();
+
+            assertCloseReplyHeldThenClosed(fixture, held);
+        } finally {
+            held.releaseAll();
+            fixture.close();
+        }
+    }
+
+    @Test
+    void relaysThePeersCloseReplyBeforeClosingOnEndStream() throws Exception {
+        HeldWrites held = new HeldWrites();
+        Fixture fixture = registeredFixture(5_000, held);
+        try {
+            startAppClose(fixture);
+
+            // DATA|END_STREAM is the same CLOSE reply followed by FIN.
+            fixture.control.writeInbound(data(17, appCloseReply(), NatMessagePacket.FLAG_END_STREAM));
+            fixture.control.runPendingTasks();
+
+            assertCloseReplyHeldThenClosed(fixture, held);
+        } finally {
+            held.releaseAll();
+            fixture.close();
+        }
+    }
+
+    @Test
+    void stopsWaitingForACloseReplyThatNeverComes() throws Exception {
+        Fixture fixture = registeredFixture(50, null);
+        try {
+            startAppClose(fixture);
+
+            fixture.control.advanceTimeBy(50, TimeUnit.MILLISECONDS);
+            fixture.control.runScheduledPendingTasks();
+            fixture.control.runPendingTasks();
+
             assertFalse(fixture.local.isActive());
+            assertNull(fixture.control.readOutbound(), "our FIN already ended this direction");
         } finally {
             fixture.close();
         }
@@ -164,6 +222,66 @@ class WsLocalSpecusHandlerTests {
 
     private static Fixture fixture(long closeTimeoutMillis) {
         return fixture(closeTimeoutMillis, null);
+    }
+
+    /** A stream past its handshake, so NatClientHandler routes the server's DATA/FIN to it. */
+    @SuppressWarnings("unchecked")
+    private static Fixture registeredFixture(long closeTimeoutMillis, ChannelOutboundHandlerAdapter localSocket)
+            throws Exception {
+        Fixture fixture = fixture(closeTimeoutMillis, localSocket);
+        NatClientHandler nat = fixture.control.pipeline().get(NatClientHandler.class);
+        Field pending = NatClientHandler.class.getDeclaredField("pendingStreamIds");
+        pending.setAccessible(true);
+        ((Set<Integer>) pending.get(nat)).add(17);
+        fixture.local.pipeline().fireUserEventTriggered(
+                WebSocketClientProtocolHandler.ClientHandshakeStateEvent.HANDSHAKE_COMPLETE);
+        return fixture;
+    }
+
+    /** The app sends CLOSE 1001; it goes to the server as SWS2 CLOSE followed by FIN. */
+    private static void startAppClose(Fixture fixture) {
+        fixture.local.writeInbound(new CloseWebSocketFrame(1001, "app going away"));
+        fixture.control.runPendingTasks();
+        NatMessagePacket close = fixture.control.readOutbound();
+        NatMessagePacket fin = fixture.control.readOutbound();
+        assertEquals(NatMessageType.DATA, close.getNatMessageType());
+        assertEquals(WebSocketSpecusFrame.OPCODE_CLOSE, WebSocketSpecusFrame.decode(close.getData()).opcode());
+        assertEquals(NatMessageType.FIN, fin.getNatMessageType());
+        assertTrue(fixture.local.isActive(), "the app's close handshake still waits for the peer's reply");
+    }
+
+    private static byte[] appCloseReply() {
+        return new WebSocketSpecusFrame(WebSocketSpecusFrame.OPCODE_CLOSE, true, 0, 1001,
+                "app going away".getBytes(java.nio.charset.StandardCharsets.UTF_8)).encode();
+    }
+
+    /** The reply sits in the local socket: the channel may close only once it is written. */
+    private static void assertCloseReplyHeldThenClosed(Fixture fixture, HeldWrites held) {
+        assertEquals(1, held.messages.size(), "the peer's CLOSE reply never reached the local socket");
+        CloseWebSocketFrame reply = assertInstanceOf(CloseWebSocketFrame.class, held.messages.get(0));
+        assertEquals(1001, reply.statusCode());
+        assertEquals("app going away", reply.reasonText());
+        assertTrue(fixture.local.isActive(), "closed before the CLOSE reply was written");
+
+        held.completeAll();
+        fixture.local.runPendingTasks();
+        assertFalse(fixture.local.isActive());
+    }
+
+    private static NatMessagePacket data(int streamId, byte[] payload, int flags) {
+        NatMessagePacket packet = new NatMessagePacket();
+        packet.setNatMessageType(NatMessageType.DATA);
+        packet.setStreamId(streamId);
+        packet.setData(payload);
+        packet.setFlags(flags);
+        return packet;
+    }
+
+    private static NatMessagePacket fin(int streamId) {
+        NatMessagePacket packet = new NatMessagePacket();
+        packet.setNatMessageType(NatMessageType.FIN);
+        packet.setStreamId(streamId);
+        return packet;
     }
 
     private static Fixture fixture(long closeTimeoutMillis, ChannelOutboundHandlerAdapter localSocket) {

@@ -449,7 +449,9 @@ func (s *clientSession) handleHTTPEnd(message protocol.NatMessage) bool {
 		return false
 	}
 	if message.Type == protocol.NatRST {
-		stream.onReset(asString(message.Metadata, "reason"))
+		stream.onReset(&directhttp.StreamResetError{
+			Code: message.Value, Reason: asString(message.Metadata, "reason"),
+		})
 		return true
 	}
 	switch stream.onEnd(message.Metadata) {
@@ -783,7 +785,7 @@ func (s *clientSession) dispose() {
 		external.close()
 	}
 	for _, stream := range httpStreams {
-		stream.onReset("control channel closed")
+		stream.onReset(errors.New("control channel closed"))
 	}
 	// 对齐 Java onControlChannelInactive -> WebSocketStreamRegistry.closeAll。
 	for _, specus := range wsStreams {
