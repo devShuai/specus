@@ -110,21 +110,22 @@ func (s *ProductMetricsStore) Switch(ctx context.Context, tenantID string) (*Pro
 	return &value, nil
 }
 
-// SaveSwitch writes the whole switch row, inserting it when absent.
+// SaveSwitch writes the whole switch row, inserting it when absent. One upsert: an UPDATE that
+// changes nothing reports no affected row on MySQL, so "update, else insert" would collide.
 func (s *ProductMetricsStore) SaveSwitch(ctx context.Context, row ProductMetricsSwitch) error {
-	enabled := s.db.clientMessageCapabilityValue(row.Enabled)
-	result, err := s.exec.ExecContext(ctx, s.db.rebind(`UPDATE product_metrics_switch
-		SET enabled = ?, updated_by = ?, updated_at = ?, purged_at = ? WHERE tenant_id = ?`),
-		enabled, productMetricsText(row.UpdatedBy), nullableInt64(row.UpdatedAtMs), nullableInt64(row.PurgedAtMs), row.TenantID)
-	if err != nil {
-		return err
+	var query string
+	switch s.db.dialect {
+	case DialectMySQL:
+		query = `INSERT INTO product_metrics_switch (tenant_id, enabled, updated_by, updated_at, purged_at)
+			VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE enabled = VALUES(enabled),
+			updated_by = VALUES(updated_by), updated_at = VALUES(updated_at), purged_at = VALUES(purged_at)`
+	default:
+		query = `INSERT INTO product_metrics_switch (tenant_id, enabled, updated_by, updated_at, purged_at)
+			VALUES (?, ?, ?, ?, ?) ON CONFLICT (tenant_id) DO UPDATE SET enabled = excluded.enabled,
+			updated_by = excluded.updated_by, updated_at = excluded.updated_at, purged_at = excluded.purged_at`
 	}
-	if updated, err := result.RowsAffected(); err != nil || updated > 0 {
-		return err
-	}
-	_, err = s.exec.ExecContext(ctx, s.db.rebind(`INSERT INTO product_metrics_switch
-		(tenant_id, enabled, updated_by, updated_at, purged_at) VALUES (?, ?, ?, ?, ?)`),
-		row.TenantID, enabled, productMetricsText(row.UpdatedBy), nullableInt64(row.UpdatedAtMs), nullableInt64(row.PurgedAtMs))
+	_, err := s.exec.ExecContext(ctx, s.db.rebind(query), row.TenantID, s.db.clientMessageCapabilityValue(row.Enabled),
+		productMetricsText(row.UpdatedBy), nullableInt64(row.UpdatedAtMs), nullableInt64(row.PurgedAtMs))
 	return err
 }
 
