@@ -152,6 +152,7 @@ jobs:
       - name: Configure
         run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release
       - name: Build
+        id: c-build
         run: cmake --build build/c-server --parallel
       - name: Test
         run: ctest --test-dir build/c-server --output-on-failure
@@ -160,6 +161,7 @@ jobs:
       - name: C and Java Redis discovery interoperability E2E
         run: timeout --preserve-status 120s bash implementations/c/server/scripts/java_c_discovery_interop.sh build/c-server/specus-server-c
       - name: Build Java reference client
+        id: java-client
         run: mvn -pl :specus-client -am package -DskipTests
       # nat_e2e_smoke.sh, runtime_config_e2e.sh and direct_route_e2e.sh copy their server, client and
       # upstream logs here on exit, passed or failed; the last step uploads them for review.
@@ -168,45 +170,56 @@ jobs:
       - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Java client SQLite runtime configuration E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
         run: timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: Java client Direct HTTP and WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
         run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
       # The same E2E scripts with the Go and .NET clients, against the server the Java run above
-      # already built and unit-tested.
+      # already built and unit-tested. They run even when a Java step failed, so each client leaves
+      # its own evidence; only a failed C build skips them.
       - name: Set up Go for the Go client
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         uses: actions/setup-go@v5
         with:
           go-version-file: implementations/go/client/go.mod
           cache-dependency-path: implementations/go/client/go.sum
       - name: Go client NAT, heartbeat and Direct HTTP/WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           (cd implementations/go/client && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-client-go" ./cmd/specus-client)
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Go client SQLite runtime configuration E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: Go client Direct HTTP and WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
       - name: Set up .NET 10 for the .NET client
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
       - name: .NET client NAT, heartbeat and Direct HTTP/WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           dotnet build implementations/csharp/client/src/Specus.Client/Specus.Client.csproj -c Release -v quiet
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: .NET client SQLite runtime configuration E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: .NET client Direct HTTP and WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
