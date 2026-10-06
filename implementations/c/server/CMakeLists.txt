@@ -17,6 +17,7 @@ find_library(UTF8PROC_LIBRARY utf8proc REQUIRED)
 add_library(specus_c_core
     src/admin_http.c
     src/client_address.c
+    src/client_auth_nonce.c
     src/client_package.c
     src/crypto.c
     src/decompression_limits.c
@@ -73,6 +74,11 @@ add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_address_tests COMMAND specus_c_client_address_tests)
+
+add_executable(specus_c_client_auth_nonce_tests tests/client_auth_nonce_tests.c)
+target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_auth_nonce_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_auth_nonce_tests COMMAND specus_c_client_auth_nonce_tests)
 
 add_executable(specus_c_crypto_tests tests/crypto_tests.c)
 target_link_libraries(specus_c_crypto_tests PRIVATE specus_c_core)
