@@ -8,7 +8,7 @@
 
 本文的「工作台」指管理前端（`apps/admin-web`）的页面，与三端 CLI 的「本机连接工作台」（[cli-usage.md](../../docs/cli-usage.md)）无关，两者不共享任何数据。
 
-**状态：草案，未实现，待维护者确认第 16 节的待定问题。** 共享向量 `protocol/test-vectors/service-workbench-v1.json` 由 `tools/protocol/generate_service_workbench_vectors.py` 生成。
+**状态：契约已定（第 16 节各项采用推荐默认），尚未实现。** 共享向量 `protocol/test-vectors/service-workbench-v1.json` 由 `tools/protocol/generate_service_workbench_vectors.py` 生成。
 
 ## 1. 现状
 
@@ -375,7 +375,9 @@ v1 不支持手动调整收藏顺序。
 | 记录打开时在请求体里传 JSON | 路径已经完整表达引用；不读请求体，各端就没有 JSON 解析差异 |
 | 删除返回 `204` | 页面需要服务端整理之后的权威列表 |
 
-## 16. 待定问题与推荐默认
+## 16. 已定事项（采用推荐默认）
+
+以下各项在草案阶段列为待定，按维护者对同类问题的一贯做法，采用各条的推荐默认。
 
 1. **登录后的默认页面是否改为工作台？** 推荐：是，对所有用户；「概览」保留在导航中。工作台回答「我要做什么」，概览回答「整体运行得怎样」。
 2. **上限与保留期是否可配置？** 推荐：不可配置，固定为 50 / 20 / 30 天；向量固定这些值。
