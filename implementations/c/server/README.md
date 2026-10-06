@@ -31,8 +31,9 @@ This version implements the v2 core server path:
 It intentionally does not build the SPA or provide a C client/virtual network device; it serves an existing SPA
 from `SPECUS_STATIC_ROOT`. Server-side Peer Mesh signalling and STUN/TURN relay are implemented, while virtual IP
 traffic is terminated by Java/Go/.NET/Android clients; no client has been run against the C Peer Mesh or TURN paths end to end.
-Control/data TLS is implemented; `/oidc/token` proxies the code exchange over verified HTTPS but does not implement
-Java's ID-token validation or local sign-in (see below). With `SPECUS_DATABASE_PATH` configured,
+Control/data TLS is implemented. `/oidc/token` follows Java: it validates the ID token against the JWKS and the
+browser's nonce, binds the identity to a local management user and returns the same local HS256 token as password
+login (see below). With `SPECUS_DATABASE_PATH` configured,
 `/api/client/auth/login` can authenticate rows in `specus_client_credential`, create or reuse a
 machine/user-bound client identity, write a `HTTP_AUTHENTICATED` row to `specus_client_session`,
 and issue a runtime `cs_` token that the control-channel login later promotes to `NETTY_ONLINE`.
@@ -152,14 +153,19 @@ Additional runtime knobs:
 | `SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY` | `data/client-packages` | Root for hosted client-package artifacts. |
 | `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED` | `true` | Merges validated official GitHub latest-release assets for targets without any configured row. |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `false` | Enables `/auth/register`; optional SMTP verification and Turnstile use the `SPECUS_AUTH_EMAIL_*`, `SPECUS_AUTH_SMTP_*`, and `SPECUS_AUTH_TURNSTILE_*` groups. |
-| `SPECUS_OIDC_CLIENT_ID` | unset | OIDC browser client id returned by `/oidc-config`; a non-empty value marks OIDC as configured. |
-| `SPECUS_OIDC_AUTHORIZATION_ENDPOINT` | unset | OIDC authorization endpoint returned by `/oidc-config`. |
-| `SPECUS_OIDC_TOKEN_ENDPOINT` | unset | HTTP or HTTPS token endpoint used by the C `/oidc/token` proxy. HTTPS verifies the trust chain and endpoint hostname. |
-| `SPECUS_OIDC_CA_CERTIFICATE_PATH` | unset | Optional PEM CA bundle for a private HTTPS OIDC issuer. Verification remains enabled; there is no insecure-skip switch. |
-| `SPECUS_OIDC_END_SESSION_ENDPOINT` | unset | OIDC logout endpoint returned by `/oidc-config`. |
+| `SPECUS_OIDC_CLIENT_ID` | unset | OIDC browser client id. Non-blank marks OIDC as configured in `/oidc-config`; without it `/oidc/token` answers `503`. ID tokens must list it in `aud`, and `azp` must equal it when present or when `aud` has several entries. |
+| `SPECUS_OIDC_ISSUER` | `https://certus.devshuai.com` | Exact `iss` required of ID tokens and of identity-provider bearer tokens. Set but blank refuses every token, as Java does. |
+| `SPECUS_OIDC_JWK_SET_URI` | `https://certus.devshuai.com/oauth2/jwks` | JWK Set used for RS256 verification: fetched on first use, cached for 5 minutes, and fetched again (at most once per 10 s) when no cached key verifies a token, which is how a key rotation shows. Set but blank: `/oidc/token` answers `503` and bearer tokens are refused. |
+| `SPECUS_OIDC_AUTHORIZATION_ENDPOINT` | `https://certus.devshuai.com/oauth2/authorize` | Authorization endpoint returned by `/oidc-config`. |
+| `SPECUS_OIDC_REGISTRATION_ENDPOINT` | `https://certus.devshuai.com/register` | Registration page returned by `/oidc-config`. |
+| `SPECUS_OIDC_TOKEN_ENDPOINT` | `https://certus.devshuai.com/oauth2/token` | Token endpoint `/oidc/token` redeems the code at. HTTPS verifies the trust chain and endpoint hostname. |
+| `SPECUS_OIDC_CA_CERTIFICATE_PATH` | unset | C only: optional PEM CA bundle for a private HTTPS identity provider, used for the token endpoint and the JWK Set. Verification remains enabled; there is no insecure-skip switch. |
+| `SPECUS_OIDC_END_SESSION_ENDPOINT` | `https://certus.devshuai.com/oauth2/logout` | Logout endpoint returned by `/oidc-config`. |
 | `SPECUS_OIDC_CLIENT_SECRET` | unset | Optional confidential-client secret. When set, `/oidc/token` sends HTTP Basic auth and omits `client_id` from the form. |
-| `SPECUS_OIDC_REDIRECT_URI` | unset | Browser redirect URI returned by `/oidc-config`. |
-| `SPECUS_OIDC_SCOPE` | unset | OIDC scope returned by `/oidc-config`. |
+| `SPECUS_OIDC_REDIRECT_URI` | `http://127.0.0.1:8088/` | Browser redirect URI returned by `/oidc-config` and sent as `redirect_uri` with the code. |
+| `SPECUS_OIDC_SCOPE` | `openid profile email` | OIDC scope returned by `/oidc-config`. |
+| `SPECUS_OIDC_AUDIENCE` | unset | Resource audience for identity-provider tokens sent straight to `/api/admin/**`. Unset or blank refuses all such tokens (fail closed); browser login does not need it. |
+| `SPECUS_OIDC_TENANT_CLAIM` | `tenant_id` | Accepted for parity with Java, where it does not select the tenant either: OIDC accounts are created in `SPECUS_AUTH_TENANT_ID`, and tenant and role always come from the bound local account. |
 | `SPECUS_CONTROL_READ_IDLE_SECONDS` | `60` | Control-channel read idle timeout. |
 | `SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS` | `30` | Maximum blocking control/data socket write time before the affected session is closed. |
 | `SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS` | `4096` | Global external TCP connection cap. |
@@ -493,14 +499,35 @@ Security skeleton endpoints:
 - `GET /oidc-config` returns the Java-shaped browser login config:
   `configured`, `authorizationEndpoint`, `endSessionEndpoint`, `clientId`, `redirectUri`,
   `scope`, and `passwordLoginEnabled`.
-- `POST /oidc/token` requires `code` and `codeVerifier`, posts `grant_type=authorization_code`,
-  `redirect_uri`, and `code_verifier` to `SPECUS_OIDC_TOKEN_ENDPOINT`, and returns the identity
-  provider's `access_token`/`id_token` as `accessToken`, `idToken`, `tokenType`, and `expiresIn`.
-  Both HTTP and HTTPS are supported; HTTPS validates the certificate chain and hostname, with an
-  optional private CA from `SPECUS_OIDC_CA_CERTIFICATE_PATH`. This is not Java's contract: Java
-  validates the ID token (issuer, audience, nonce), resolves or provisions the local management
-  user and returns a local Specus token. C does none of that, and its management API accepts only
-  its local HS256 JWT, so an OIDC sign-in cannot authenticate against the C management API.
+- `POST /oidc/token` is Java's `OidcController.exchange`. The SPA runs Authorization Code + PKCE
+  (S256) and keeps `state`, `nonce` and the code verifier in its own `sessionStorage`; it checks
+  `state` on the callback and posts only `code`, `codeVerifier` and `nonce`, all three required
+  (`400` otherwise, before the identity provider is contacted). The server posts
+  `grant_type=authorization_code`, `code`, `redirect_uri` and `code_verifier` (plus `client_id`,
+  or HTTP Basic for a confidential client) to `SPECUS_OIDC_TOKEN_ENDPOINT`, then verifies the
+  `id_token`: RS256 only, signed by a key of the JWK Set (a `kid` must match exactly, a token
+  without `kid` may use any key), `exp`/`nbf` with 60 s of skew, `iss` equal to
+  `SPECUS_OIDC_ISSUER`, `aud` containing the client id, the `azp` rule above, a non-blank `sub`
+  and `nonce` byte-equal to the request's. The immutable `iss`+`sub` pair is bound to a local
+  management user: the user already bound to it; otherwise, on the first login, an enabled and
+  unbound user of the default tenant named `preferred_username`; otherwise a new `USER` in
+  `SPECUS_AUTH_TENANT_ID` with a hash of a random password. `preferred_username` never claims the
+  built-in admin, a disabled account, an account bound to another identity, or (usernames being
+  a global key in C) an account of another tenant: those get `403`. The answer is
+  `{"accessToken","idToken","tokenType","expiresIn"}` where `accessToken` is the local HS256 token
+  password login issues, so it works on `/api/admin/**` and `/auth/refresh`. The identity
+  provider's access and refresh tokens are not passed on; `idToken` is returned, as Java does, as
+  the `id_token_hint` for logout. Failures: `503` without client id, user store or JWK Set URI;
+  `502` when the token endpoint is unreachable, answers non-JSON or an error, omits `id_token`, or
+  the ID token fails verification (`OIDC ID Token 校验失败`) or the subject/nonce check
+  (`OIDC ID Token 身份或 nonce 校验失败`); `403` for a refused account. Unlike Java, C refuses an
+  ID token without `exp`, as the Go and .NET servers do.
+- An identity-provider token sent directly as `Authorization: Bearer` to `/api/admin/**` is
+  accepted only when `SPECUS_OIDC_AUDIENCE` is set: same signature, time and issuer rules, `aud`
+  containing that audience, and its `iss`+`sub` already bound to an enabled local user, whose
+  tenant and role apply (`401` for an invalid token, `403` for an unbound or disabled identity).
+  `/auth/refresh` answers such a token `400`. Tokens whose header names an `HS*` algorithm only
+  ever go to the local HS256 check.
 
 The control/data listener supports disabled, PKCS#12/PEM file, and ephemeral self-signed TLS modes.
 TLS 1.2 is the minimum. Production rejects self-signed TLS and plaintext public binds; plaintext
