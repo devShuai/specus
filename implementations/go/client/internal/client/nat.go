@@ -606,10 +606,22 @@ func (client *Client) sendNatFin(connection net.Conn, streamID uint32) error {
 }
 
 func (client *Client) sendNatReset(connection net.Conn, streamID uint32, code uint32, reason string) {
+	client.sendNatResetWithFailure(connection, streamID, code, reason, "")
+}
+
+// sendNatResetWithFailure resets a stream with metadata.failure next to the reason when the
+// failure is classified (protocol/spec/service-connectivity-check.md section 6.2). Without one the
+// metadata is the reason alone, as it always was.
+func (client *Client) sendNatResetWithFailure(connection net.Conn, streamID uint32, code uint32,
+	reason string, failure httpRouteFailure) {
 	client.closeNatFlow(streamID)
 	client.recentlyClosedStreams.add(streamID)
+	metadata := map[string]any{"reason": reason}
+	if failure != "" {
+		metadata["failure"] = string(failure)
+	}
 	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
-		Type: protocol.NatRST, StreamID: streamID, Value: code, Metadata: map[string]any{"reason": reason},
+		Type: protocol.NatRST, StreamID: streamID, Value: code, Metadata: metadata,
 	})
 	if err == nil {
 		err = client.send(connection, protocol.CommandNatMessage, body)

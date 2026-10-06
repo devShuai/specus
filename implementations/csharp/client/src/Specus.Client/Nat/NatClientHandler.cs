@@ -7,6 +7,7 @@ using Specus.Client.Configuration;
 using Specus.Client.Control;
 using Specus.Client.DirectHttp;
 using Specus.Protocol;
+using Specus.Protocol.HttpRoute;
 using Specus.Protocol.Packets;
 
 namespace Specus.Client.Nat;
@@ -407,7 +408,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
                 packet.StreamId,
                 route,
                 _directHttp.DescribeRoutes());
-            return RejectNewHttpStreamAsync(packet.StreamId, 22, "unknown HTTP route");
+            return RejectNewHttpStreamAsync(packet.StreamId, 22, "unknown HTTP route",
+                HttpRouteFailure.RouteNotLoaded);
         }
         var channel = new HttpStreamChannel(packet.StreamId, packet.MetaData, _directHttp,
             routeConfig.TargetBaseUrl, _writer, _logger, _cancellationToken,
@@ -773,7 +775,8 @@ internal sealed class NatClientHandler : IAsyncDisposable
         await WriteResetPacketAsync(streamId, errorCode, reason).ConfigureAwait(false);
     }
 
-    private async Task WriteResetPacketAsync(uint streamId, uint errorCode, string reason)
+    private async Task WriteResetPacketAsync(uint streamId, uint errorCode, string reason,
+        string? failure = null)
     {
         try
         {
@@ -782,7 +785,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
                 NatMessageType = NatMessageType.Rst,
                 StreamId = streamId,
                 Value = errorCode,
-                MetaData = new Dictionary<string, object?> { ["reason"] = reason },
+                MetaData = HttpRouteFailureClassifier.ResetMetadata(reason, failure),
             }, _cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -905,10 +908,11 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
     }
 
-    private Task RejectNewHttpStreamAsync(uint streamId, uint errorCode, string reason)
+    private Task RejectNewHttpStreamAsync(uint streamId, uint errorCode, string reason,
+        string? failure = null)
     {
         MarkStreamClosed(streamId);
-        return WriteResetPacketAsync(streamId, errorCode, reason);
+        return WriteResetPacketAsync(streamId, errorCode, reason, failure);
     }
 
     private async Task RejectDuplicateOpenAsync(uint streamId, StreamReservationResult result)
