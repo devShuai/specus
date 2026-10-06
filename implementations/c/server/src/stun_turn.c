@@ -635,7 +635,10 @@ static int authorize_relay_payload(const uint8_t *payload,
     long long source_id = allocation_client_id(source);
     long long target_id = allocation_client_id(target);
     if (source_id <= 0 || target_id <= 0) return 0;
-    const char *database_path = getenv("SPECUS_DB_PATH");
+    /* The same database the control channel grants sessions in. Reading any other variable here
+     * leaves Peer Mesh relaying with no session to check against, so every relayed datagram is
+     * dropped while allocations, permissions and channel binds all still succeed. */
+    const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') return 0;
     if (payload_len >= 36U && read_u32(payload) == 0x53504d32U) {
         long long session_id = (long long)read_u64(payload + 4U);

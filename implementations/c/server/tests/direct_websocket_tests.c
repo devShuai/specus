@@ -1566,6 +1566,8 @@ int main(void)
     (void)signal(SIGPIPE, SIG_IGN);
     unsetenv("SPECUS_DATABASE_PATH");
     setenv("SPECUS_ENV", "test", 1);
+    /* Without a database only SPECUS_HTTP_ROUTES routes are admitted at the public entry. */
+    setenv("SPECUS_HTTP_ROUTES", "ws=http://127.0.0.1:8080", 1);
 
     if (test_central_vectors() != 0 || test_codec_rules() != 0) return 1;
 

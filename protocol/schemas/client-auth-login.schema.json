@@ -104,6 +104,19 @@
         }
       }
     },
+    "ClientHttpRouteCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "HTTP route 能力，见 service-connectivity-check.md 第 6 节。服务端只采信声明了 version >= 1 的会话在 RST metadata 里给出的 failure 分类。",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "当前为 1：Direct HTTP 流在响应头之前失败时，RST 的 metadata 带 failure 分类。0 或缺省表示不带。"
+        }
+      }
+    },
     "ClientEgressCapabilities": {
       "type": "object",
       "additionalProperties": false,
@@ -186,6 +199,10 @@
         "clientEgressCapabilities": {
           "$ref": "#/$defs/ClientEgressCapabilities",
           "description": "客户端 Peer 出口分流能力；缺省时按 version=0 处理，服务端不会下发出口策略。"
+        },
+        "clientHttpRouteCapabilities": {
+          "$ref": "#/$defs/ClientHttpRouteCapabilities",
+          "description": "客户端 HTTP route 能力；缺省时按 version=0 处理，服务端把响应头之前的 RST 判为无法分类。"
         },
         "localAddresses": {
           "type": "array",

@@ -241,10 +241,12 @@ class SecurityRulesTests {
     void publicHttpProxyIgnoresForeignBearerToken() throws Exception {
         HttpResponse<String> response = get("/http/missing-client/nacos/", "nacos-owned-token");
 
+        // The proxy itself answers: a route without a server record is refused there, not a 401
+        // from resource-server validation of the foreign token.
         assertThat(response.statusCode())
                 .as("foreign upstream bearer token must reach HTTP proxy instead of resource-server validation")
-                .isEqualTo(502);
-        assertThat(response.body()).contains("客户端不在线");
+                .isEqualTo(404);
+        assertThat(response.body()).contains("HTTP 路由不存在或未启用");
     }
 
     @Test
@@ -254,7 +256,8 @@ class SecurityRulesTests {
                 .hasValueSatisfying(policy -> assertThat(policy).contains("frame-ancestors 'none'"));
 
         HttpResponse<String> specus = get("/http/missing-client/nacos/", null);
-        assertThat(specus.statusCode()).isEqualTo(502);
+        assertThat(specus.statusCode()).isEqualTo(404);
+        assertThat(specus.body()).contains("HTTP 路由不存在或未启用");
         assertThat(specus.headers().firstValue("Content-Security-Policy")).isEmpty();
         assertThat(specus.headers().firstValue("X-Frame-Options")).isEmpty();
         assertThat(specus.headers().firstValue("X-Content-Type-Options")).isEmpty();

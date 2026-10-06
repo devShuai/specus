@@ -1022,11 +1022,31 @@ func TestClientDownloadLinksAdminCrudAndPublicList(t *testing.T) {
 }
 
 func TestDirectHTTPOfflineAndOversize(t *testing.T) {
-	app, ts := newAPIServer(t)
-	_ = app
+	cfg := config.Default()
+	cfg.HTTP.RouteCacheTTLms = 0
+	_, ts := newAPIServerWithConfig(t, cfg)
+
+	// A route the server has no record of is refused before the client's state matters.
+	resp, err := http.Get(ts.URL + "/http/" + "Demo%20client" + "/api/ping")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for a route without a server record, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	token := adminToken(t, ts)
+	demo := findClient(t, listClients(t, ts, token), DemoClientName)
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(demo.ID)+"/http-routes", token,
+		`{"route":"api","targetBaseUrl":"http://127.0.0.1:8080","enabled":true}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create route status %d", resp.StatusCode)
+	}
 
 	// Offline client -> 502, matching the Java HTTP specus gateway.
-	resp, err := http.Get(ts.URL + "/http/" + "Demo%20client" + "/api/ping")
+	resp, err = http.Get(ts.URL + "/http/" + "Demo%20client" + "/api/ping")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

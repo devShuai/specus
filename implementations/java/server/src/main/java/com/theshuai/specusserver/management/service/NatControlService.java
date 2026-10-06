@@ -31,12 +31,11 @@ import java.util.Map;
  *
  * <p>下发协议（{@code NAT_CONTROL}）的 JSON 体一直承载 TCP 端口映射 {@code specusConfigList}；
  * 自从 HTTP 路由也由后台管理后，本服务在每次下发时**额外查询** {@link HttpRouteMappingRepository}
- * 把启用项装到同一条消息的 {@code httpSpecusConfigList} 字段。语义约定见
- * {@link #assembleHttpRoutesIfManaged}：
- * <ul>
- *   <li>该客户端从未在后台创建过任何 HTTP 路由 → 字段缺省 → 客户端继续使用 HTTP 登录响应里的初始快照</li>
- *   <li>创建过至少一条（即便全部禁用/删除）→ 字段为数组（可能为空）→ 客户端整体替换</li>
- * </ul>
+ * 把启用项装到同一条消息的 {@code httpSpecusConfigList} 字段。
+ *
+ * <p>The HTTP route list is always the client's full set of enabled routes, even when it is empty.
+ * A client keeps the list it has when the field is missing, so omitting it once the last route was
+ * deleted left that route forwarding on the client until it reconnected.
  *
  * <p>HTTP 路由本身的 CRUD 在 {@link HttpRouteService}；它每次写入后回调本类的
  * {@link #pushSnapshotIfOnline(ClientAccount)}，因此一次 mutation 始终下发"当前权威全集"。
@@ -239,16 +238,16 @@ public class NatControlService {
     private PushResult pushToClient(TenantContext tenant, ClientAccount account) {
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(tenant.tenantId(), account.getId());
-        List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
+        List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
         if (!sendNatControl(account.getClientName(), mappings, httpRoutes)) {
             throw new IllegalStateException("客户端不在线，无法下发映射");
         }
-        return new PushResult(mappings.size(), httpRoutes == null ? -1 : httpRoutes.size());
+        return new PushResult(mappings.size(), httpRoutes.size());
     }
 
     /**
      * 客户端登录成功后自动下发已启用的映射。不抛出异常，仅在失败时记录日志。
-     * 若两类配置都为空（且 HTTP 未接管），跳过 push 以减少握手抖动。
+     * 若两类配置都为空，跳过 push 以减少握手抖动：HTTP 登录响应已带上同样的空快照。
      */
     @Transactional(readOnly = true)
     public void pushOnLogin(String clientName) {
@@ -258,13 +257,13 @@ public class NatControlService {
         }
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
-        List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
-        if (mappings.isEmpty() && httpRoutes == null) {
+        List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
+        if (mappings.isEmpty() && httpRoutes.isEmpty()) {
             return;
         }
         if (sendNatControl(clientName, mappings, httpRoutes)) {
             log.info("[nat-control] auto pushed {} tcp + {} http route(s) to {} on login",
-                    mappings.size(), httpRoutes == null ? "-" : String.valueOf(httpRoutes.size()), clientName);
+                    mappings.size(), httpRoutes.size(), clientName);
         }
     }
 
@@ -275,26 +274,17 @@ public class NatControlService {
     public void pushSnapshotIfOnline(ClientAccount account) {
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
-        List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
+        List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
         if (sendNatControl(account.getClientName(), mappings, httpRoutes)) {
             log.info("[nat-control] auto-synchronized {} tcp + {} http route(s) to {}",
-                    mappings.size(), httpRoutes == null ? "-" : String.valueOf(httpRoutes.size()),
-                    account.getClientName());
+                    mappings.size(), httpRoutes.size(), account.getClientName());
         }
     }
 
-    /**
-     * 仅当客户端在后台**至少**创建过一条 HTTP 路由（含 disabled）时才视为"接管态"，返回当前
-     * 启用项列表（可能为空）；否则返回 {@code null}，调用方据此决定是否在 JSON 里写出
-     * {@code httpSpecusConfigList} 字段。详见类级 javadoc。
-     */
-    private List<HttpRouteMapping> assembleHttpRoutesIfManaged(long clientId) {
-        ClientAccount account = clientAccountRepository.findById(clientId).orElse(null);
-        if (account == null || !httpRouteMappingRepository.existsByTenantIdAndClientId(account.getTenantId(), clientId)) {
-            return null;
-        }
+    /** The client's enabled HTTP routes, possibly empty; never {@code null}. See the class javadoc. */
+    private List<HttpRouteMapping> loadEnabledHttpRoutes(ClientAccount account) {
         return httpRouteMappingRepository
-                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), clientId);
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
     }
 
     private boolean sendNatControl(String clientName,
@@ -319,18 +309,16 @@ public class NatControlService {
         specusBean.put("remoteAddress", publicAddress);
         specusBean.put("remotePort", nettyPort);
         specusBean.put("specusConfigList", specusConfigList);
-        if (httpRoutes != null) {
-            // null = 未接管，缺省字段；非 null = 接管态，即便 0 项也要发空数组让客户端整体替换
-            List<Map<String, Object>> httpSpecusConfigList = new ArrayList<>(httpRoutes.size());
-            for (HttpRouteMapping route : httpRoutes) {
-                Map<String, Object> entry = new LinkedHashMap<>();
-                entry.put("route", route.getRoute());
-                entry.put("targetBaseUrl", route.getTargetBaseUrl());
-                entry.put("insecureSkipVerify", Boolean.TRUE.equals(route.getInsecureSkipVerify()));
-                httpSpecusConfigList.add(entry);
-            }
-            specusBean.put("httpSpecusConfigList", httpSpecusConfigList);
+        // Always the full list, an empty array included, so the client replaces what it holds.
+        List<Map<String, Object>> httpSpecusConfigList = new ArrayList<>(httpRoutes.size());
+        for (HttpRouteMapping route : httpRoutes) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("route", route.getRoute());
+            entry.put("targetBaseUrl", route.getTargetBaseUrl());
+            entry.put("insecureSkipVerify", Boolean.TRUE.equals(route.getInsecureSkipVerify()));
+            httpSpecusConfigList.add(entry);
         }
+        specusBean.put("httpSpecusConfigList", httpSpecusConfigList);
 
         MessageResponsePacket packet = new MessageResponsePacket();
         packet.setClientName(clientName);
@@ -338,7 +326,7 @@ public class NatControlService {
         packet.setMessage(JsonUtil.objectToString(specusBean));
         channel.writeAndFlush(packet);
         log.info("[nat-control] pushed {} tcp + {} http route(s) to {}",
-                mappings.size(), httpRoutes == null ? "-" : String.valueOf(httpRoutes.size()), clientName);
+                mappings.size(), httpRoutes.size(), clientName);
         return true;
     }
 
@@ -424,7 +412,7 @@ public class NatControlService {
         }
     }
 
-    /** 手动下发 endpoint 的返回值。{@code httpRoutes == -1} 表示客户端未接管态。 */
+    /** 手动下发 endpoint 的返回值：下发的 TCP 映射与 HTTP 路由条数。 */
     public record PushResult(int specusMappings, int httpRoutes) {
     }
 }

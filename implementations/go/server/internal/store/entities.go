@@ -400,12 +400,14 @@ type HTTPRouteMapping struct {
 }
 
 // HTTPRouteAccessPolicy contains only the server-side settings needed before a public
-// HTTP/WS request is allowed into a client's tunnel. A nil policy means the route is not
-// managed by the server and therefore retains the legacy public-access behaviour.
+// HTTP/WS request is allowed into a client's tunnel. A nil policy means the server has no
+// record of the route and the public entry refuses it: a client can still hold a route that
+// was deleted, so only the server's record decides whether, and how, a route is reachable.
 type HTTPRouteAccessPolicy struct {
 	TenantID            string
 	ClientID            int64
 	ResourceID          int64
+	ClientEnabled       bool
 	Enabled             bool
 	PathRewriteEnabled  bool
 	MediaCaptureEnabled bool

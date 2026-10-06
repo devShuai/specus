@@ -40,24 +40,10 @@ public sealed class NatControlService
             return;
         }
 
-        var mappings = await _db.SpecusMappings.AsNoTracking()
-            .Where(m => m.ClientId == account.Id && m.Enabled)
-            .OrderBy(m => m.Id)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
+        var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
 
-        var httpRoutesManaged = await _db.HttpRouteMappings.AsNoTracking()
-            .AnyAsync(r => r.ClientId == account.Id, cancellationToken)
-            .ConfigureAwait(false);
-        var httpRoutes = httpRoutesManaged
-            ? await _db.HttpRouteMappings.AsNoTracking()
-                .Where(r => r.ClientId == account.Id && r.Enabled)
-                .OrderBy(r => r.Id)
-                .ToListAsync(cancellationToken)
-                .ConfigureAwait(false)
-            : null;
-
-        if (mappings.Count == 0 && httpRoutes is null)
+        // Nothing to push beyond the empty snapshot the HTTP login response already carried.
+        if (mappings.Count == 0 && httpRoutes.Count == 0)
         {
             return;
         }
@@ -66,7 +52,7 @@ public sealed class NatControlService
                 .ConfigureAwait(false))
         {
             _logger.LogInformation("[nat-control] pushed {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
-                mappings.Count, httpRoutes is null ? "-" : httpRoutes.Count.ToString(), clientName);
+                mappings.Count, httpRoutes.Count, clientName);
         }
     }
 
@@ -81,7 +67,7 @@ public sealed class NatControlService
         {
             throw new InvalidOperationException("客户端不在线，无法下发映射");
         }
-        return new PushResult(mappings.Count, httpRoutes is null ? -1 : httpRoutes.Count);
+        return new PushResult(mappings.Count, httpRoutes.Count);
     }
 
     public async Task PushSnapshotIfOnlineAsync(long clientId, CancellationToken cancellationToken)
@@ -99,11 +85,11 @@ public sealed class NatControlService
                 .ConfigureAwait(false))
         {
             _logger.LogInformation("[nat-control] synchronized {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
-                mappings.Count, httpRoutes is null ? "-" : httpRoutes.Count.ToString(), account.ClientName);
+                mappings.Count, httpRoutes.Count, account.ClientName);
         }
     }
 
-    private async Task<(IReadOnlyList<SpecusMapping> Mappings, IReadOnlyList<HttpRouteMapping>? HttpRoutes)>
+    private async Task<(IReadOnlyList<SpecusMapping> Mappings, IReadOnlyList<HttpRouteMapping> HttpRoutes)>
         LoadSnapshotAsync(long clientId, CancellationToken cancellationToken)
     {
         var mappings = await _db.SpecusMappings.AsNoTracking()
@@ -112,22 +98,17 @@ public sealed class NatControlService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var httpRoutesManaged = await _db.HttpRouteMappings.AsNoTracking()
-            .AnyAsync(r => r.ClientId == clientId, cancellationToken)
+        var httpRoutes = await _db.HttpRouteMappings.AsNoTracking()
+            .Where(r => r.ClientId == clientId && r.Enabled)
+            .OrderBy(r => r.Id)
+            .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        var httpRoutes = httpRoutesManaged
-            ? await _db.HttpRouteMappings.AsNoTracking()
-                .Where(r => r.ClientId == clientId && r.Enabled)
-                .OrderBy(r => r.Id)
-                .ToListAsync(cancellationToken)
-                .ConfigureAwait(false)
-            : null;
         return (mappings, httpRoutes);
     }
 
     private async Task<bool> SendNatControlAsync(string clientName,
         IReadOnlyList<SpecusMapping> mappings,
-        IReadOnlyList<HttpRouteMapping>? httpRoutes,
+        IReadOnlyList<HttpRouteMapping> httpRoutes,
         CancellationToken cancellationToken)
     {
         var context = _sessions.Find(clientName);
@@ -157,19 +138,19 @@ public sealed class NatControlService
             ["specusConfigList"] = specusConfigList,
         };
 
-        if (httpRoutes is not null)
+        // The HTTP route list is always the full set, even when empty: a client keeps the list it
+        // has when the field is missing, so omitting it after the last route was deleted left that
+        // route forwarding on the client until it reconnected.
+        var httpSpecusConfigList = new List<Dictionary<string, object?>>(httpRoutes.Count);
+        foreach (var route in httpRoutes)
         {
-            var httpSpecusConfigList = new List<Dictionary<string, object?>>(httpRoutes.Count);
-            foreach (var route in httpRoutes)
+            httpSpecusConfigList.Add(new Dictionary<string, object?>
             {
-                httpSpecusConfigList.Add(new Dictionary<string, object?>
-                {
-                    ["route"] = route.Route,
-                    ["targetBaseUrl"] = route.TargetBaseUrl,
-                });
-            }
-            specusBean["httpSpecusConfigList"] = httpSpecusConfigList;
+                ["route"] = route.Route,
+                ["targetBaseUrl"] = route.TargetBaseUrl,
+            });
         }
+        specusBean["httpSpecusConfigList"] = httpSpecusConfigList;
 
         var packet = new MessageResponsePacket
         {
