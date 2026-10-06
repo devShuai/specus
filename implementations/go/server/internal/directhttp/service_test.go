@@ -25,7 +25,7 @@ func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) 
 	service := NewService(nil, func(string, map[string]any) (Stream, error) {
 		opened = true
 		return nil, nil
-	}, nil, time.Second, 4, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	}, nil, time.Second, 4, 1024, nil, publicRoute(), recorder, store.TrafficDetailOptions{Enabled: true})
 	request := specusRequest(http.MethodPost, "/http/Demo%20client/api/upload?debug=true", "12345")
 	response := httptest.NewRecorder()
 
@@ -42,7 +42,7 @@ func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) 
 func TestServeHTTPRecordsOfflineError(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
 	service := NewService(session.NewRegistry(), nil, nil, time.Second, 1024, 1024,
-		nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+		nil, publicRoute(), recorder, store.TrafficDetailOptions{Enabled: true})
 	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", "")
 	response := httptest.NewRecorder()
 
@@ -65,7 +65,7 @@ func TestServeHTTPWaitsForDataReconnect(t *testing.T) {
 	stream.responses = []fakeResponse{{data: []byte("ok")}, {end: true}}
 	service := NewService(registry, func(string, map[string]any) (Stream, error) {
 		return stream, nil
-	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	}, nil, time.Second, 1024, 1024, nil, publicRoute(), nil, store.TrafficDetailOptions{})
 	service.SetReconnectGrace(500 * time.Millisecond)
 
 	reconnected := make(chan struct{})
@@ -93,7 +93,7 @@ func TestServeHTTPUsesDataChannelAsOnlineAuthority(t *testing.T) {
 		stream.responses = []fakeResponse{{end: true}}
 		service := NewService(registry, func(string, map[string]any) (Stream, error) {
 			return stream, nil
-		}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+		}, nil, time.Second, 1024, 1024, nil, publicRoute(), nil, store.TrafficDetailOptions{})
 
 		response := httptest.NewRecorder()
 		service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
@@ -107,7 +107,7 @@ func TestServeHTTPUsesDataChannelAsOnlineAuthority(t *testing.T) {
 		registry := session.NewRegistry()
 		registry.Replace(&fakeOnlineSession{name: "Demo client"})
 		service := NewService(registry, nil, nil, time.Second, 1024, 1024,
-			nil, nil, nil, store.TrafficDetailOptions{})
+			nil, publicRoute(), nil, store.TrafficDetailOptions{})
 
 		response := httptest.NewRecorder()
 		service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
@@ -120,7 +120,7 @@ func TestServeHTTPUsesDataChannelAsOnlineAuthority(t *testing.T) {
 
 func TestServeHTTPDoesNotWaitForUnknownClient(t *testing.T) {
 	service := NewService(session.NewRegistry(), nil, nil, time.Second, 1024, 1024,
-		nil, nil, nil, store.TrafficDetailOptions{})
+		nil, publicRoute(), nil, store.TrafficDetailOptions{})
 	service.SetReconnectGrace(time.Second)
 	response := httptest.NewRecorder()
 	startedAt := time.Now()
@@ -148,7 +148,7 @@ func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
 		opened = metadata
 		return stream, nil
-	}, nil, time.Second, 1024, 1024, traffic, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	}, nil, time.Second, 1024, 1024, traffic, publicRoute(), recorder, store.TrafficDetailOptions{Enabled: true})
 	request := specusRequest(http.MethodPatch, "/http/Demo%20client/api/items?x=%2F", "request-body")
 	request.Header.Set("X-Request", "yes")
 	response := httptest.NewRecorder()
@@ -180,7 +180,7 @@ func TestServeHTTPCapturesOriginalMediaResponseAndExternalizesDetailBody(t *test
 	capture := &capturingMediaSession{externalized: true}
 	service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
 		return stream, nil
-	}, nil, time.Second, 1024, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	}, nil, time.Second, 1024, 1024, nil, publicRoute(), recorder, store.TrafficDetailOptions{Enabled: true})
 	var openedSource string
 	service.SetMediaCapture(func(_ context.Context, clientName, route, method, sourceURL string,
 		status int, headers []string) MediaCaptureSession {
@@ -222,7 +222,7 @@ func TestServeHTTPFiltersUndeclaredAndUnsafePeerResponseTrailers(t *testing.T) {
 	}}}}
 	service := NewService(onlineRegistry("Demo client"), func(string, map[string]any) (Stream, error) {
 		return stream, nil
-	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	}, nil, time.Second, 1024, 1024, nil, publicRoute(), nil, store.TrafficDetailOptions{})
 	recorder := httptest.NewRecorder()
 
 	service.ServeHTTP(recorder, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
@@ -264,7 +264,7 @@ func TestServeHTTPOmitsUnknownContentLengthFromOpen(t *testing.T) {
 	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
 		opened = metadata
 		return stream, nil
-	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	}, nil, time.Second, 1024, 1024, nil, publicRoute(), nil, store.TrafficDetailOptions{})
 	request := specusRequest("PROPFIND", "/http/Demo%20client/api/items", "payload")
 	request.ContentLength = -1
 	request.TransferEncoding = []string{"chunked"}
@@ -292,7 +292,7 @@ func TestServeHTTPPreservesEncodedRelativePath(t *testing.T) {
 	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
 		opened = metadata
 		return stream, nil
-	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	}, nil, time.Second, 1024, 1024, nil, publicRoute(), nil, store.TrafficDetailOptions{})
 	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/%E4%BD%A0%2Fok/%252F?x=%2F", "")
 	response := httptest.NewRecorder()
 
@@ -308,7 +308,7 @@ func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
 	stream := newFakeStream()
 	stream.blockHead = true
 	service := NewService(registry, func(string, map[string]any) (Stream, error) { return stream, nil },
-		nil, 10*time.Millisecond, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+		nil, 10*time.Millisecond, 1024, 1024, nil, publicRoute(), nil, store.TrafficDetailOptions{})
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
@@ -341,7 +341,7 @@ func TestServeHTTPClientResetKeepsReasonOutOfPublicResponse(t *testing.T) {
 			service := NewService(onlineRegistry("Demo client"),
 				func(string, map[string]any) (Stream, error) { return stream, nil },
 				nil, time.Second, 1024, 1024, nil,
-				&staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{Enabled: true, PathRewriteEnabled: true}},
+				&staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{ClientEnabled: true, Enabled: true, PathRewriteEnabled: true}},
 				recorder, store.TrafficDetailOptions{Enabled: true})
 			service.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
 			response := httptest.NewRecorder()
@@ -390,7 +390,7 @@ func TestLogSafeReasonEscapesControlCharactersAndTruncates(t *testing.T) {
 
 func TestServeHTTPEnforcesManagedRouteBasicAuthentication(t *testing.T) {
 	policy := &store.HTTPRouteAccessPolicy{
-		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
+		ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
 	}
 	routes := &staticRouteSettings{policy: policy}
 	opened := false
@@ -442,7 +442,7 @@ func TestServeHTTPStripsProtectedRouteAuthorizationFromTunnelAndDetail(t *testin
 		opened = metadata
 		return stream, nil
 	}, nil, time.Second, 1024, 1024, nil, &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
+		ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
 	}}, recorder, store.TrafficDetailOptions{Enabled: true})
 	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/private", "")
 	request.SetBasicAuth("route-user", "route-password")
@@ -461,11 +461,10 @@ func TestServeHTTPStripsProtectedRouteAuthorizationFromTunnelAndDetail(t *testin
 	}
 }
 
-func TestServeHTTPKeepsAuthorizationForPublicAndUnmanagedRoutes(t *testing.T) {
+func TestServeHTTPKeepsAuthorizationForPublicRoutes(t *testing.T) {
 	for name, settings := range map[string]RouteSettings{
-		"unmanaged": &staticRouteSettings{},
 		"managed public": &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: false,
+			ClientEnabled: true, Enabled: true, AuthEnabled: false,
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -497,13 +496,12 @@ func TestServeHTTPFiltersAuthorizationRequestTrailersByRoutePolicy(t *testing.T)
 		protected bool
 	}{
 		{name: "protected", settings: &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
 			AuthPasswordHash: auth.HashToken("route-password"),
 		}}, protected: true},
 		{name: "managed public", settings: &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true,
+			ClientEnabled: true, Enabled: true,
 		}}},
-		{name: "legacy unmanaged", settings: &staticRouteSettings{}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -544,7 +542,7 @@ func TestServeHTTPFiltersAuthorizationRequestTrailersByRoutePolicy(t *testing.T)
 				}
 			} else if !containsFold(trailerNames, "Authorization") ||
 				!containsHeaderValue(trailers, "Authorization:Bearer trailer-token") {
-				t.Fatalf("public/legacy Authorization trailer was not preserved: names=%#v values=%#v",
+				t.Fatalf("public Authorization trailer was not preserved: names=%#v values=%#v",
 					trailerNames, trailers)
 			}
 		})
@@ -578,22 +576,32 @@ func TestServeHTTPRejectsDisabledAndIncompleteManagedPolicies(t *testing.T) {
 		password   string
 		wantStatus int
 	}{
-		{name: "disabled", policy: &store.HTTPRouteAccessPolicy{Enabled: false},
+		{name: "disabled", policy: &store.HTTPRouteAccessPolicy{ClientEnabled: true, Enabled: false},
 			username: "route-user", password: "password", wantStatus: http.StatusNotFound},
+		// No server record (never created, or deleted while the client still forwards it) fails
+		// closed instead of falling back to anonymous access.
+		{name: "no record", policy: nil,
+			username: "route-user", password: "password", wantStatus: http.StatusNotFound},
+		{name: "disabled client", policy: &store.HTTPRouteAccessPolicy{ClientEnabled: false, Enabled: true},
+			username: "route-user", password: "password", wantStatus: http.StatusNotFound},
+		{name: "protected route of disabled client", policy: &store.HTTPRouteAccessPolicy{
+			ClientEnabled: false, Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
+			AuthPasswordHash: auth.HashToken("password"),
+		}, username: "route-user", password: "password", wantStatus: http.StatusNotFound},
 		{name: "missing username", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthPasswordHash: auth.HashToken("password"),
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthPasswordHash: auth.HashToken("password"),
 		}, username: "", password: "password", wantStatus: http.StatusServiceUnavailable},
 		{name: "whitespace username", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "   ", AuthPasswordHash: auth.HashToken("password"),
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "   ", AuthPasswordHash: auth.HashToken("password"),
 		}, username: "   ", password: "password", wantStatus: http.StatusServiceUnavailable},
 		{name: "missing password hash", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "route-user",
 		}, username: "route-user", password: "password", wantStatus: http.StatusServiceUnavailable},
 		{name: "wrong password hash length", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: strings.Repeat("a", 63),
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: strings.Repeat("a", 63),
 		}, username: "route-user", password: "password", wantStatus: http.StatusServiceUnavailable},
 		{name: "non-hex password hash", policy: &store.HTTPRouteAccessPolicy{
-			Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: strings.Repeat("z", 64),
+			ClientEnabled: true, Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: strings.Repeat("z", 64),
 		}, username: "route-user", password: "password", wantStatus: http.StatusServiceUnavailable},
 	}
 	for _, test := range tests {
@@ -754,6 +762,12 @@ type staticRouteSettings struct {
 	err    error
 }
 
+// publicRoute is an enabled, unauthenticated route of an enabled client: the server record a
+// request needs before it may enter the tunnel at all.
+func publicRoute() *staticRouteSettings {
+	return &staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{ClientEnabled: true, Enabled: true}}
+}
+
 type countingRouteSettings struct {
 	policy *store.HTTPRouteAccessPolicy
 	calls  atomic.Int32
@@ -765,7 +779,7 @@ func (s *countingRouteSettings) HTTPRouteAccessPolicy(context.Context, string, s
 }
 
 func TestRoutePolicyCacheUsesConfiguredTTL(t *testing.T) {
-	routes := &countingRouteSettings{policy: &store.HTTPRouteAccessPolicy{Enabled: true, PathRewriteEnabled: true}}
+	routes := &countingRouteSettings{policy: &store.HTTPRouteAccessPolicy{ClientEnabled: true, Enabled: true, PathRewriteEnabled: true}}
 	service := NewService(nil, nil, nil, time.Second, 1024, 1024, nil, routes, nil, store.TrafficDetailOptions{})
 	service.SetRouteCacheTTL(25 * time.Millisecond)
 	if _, err := service.routePolicy(context.Background(), "client", "route"); err != nil {

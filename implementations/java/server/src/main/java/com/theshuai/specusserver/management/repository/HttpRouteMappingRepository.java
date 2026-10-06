@@ -30,12 +30,5 @@ public interface HttpRouteMappingRepository extends JpaRepository<HttpRouteMappi
 
     Optional<HttpRouteMapping> findByIdAndTenantId(Long id, String tenantId);
 
-    /**
-     * 区分"该客户端从未在后台管理过 HTTP 路由"和"管理过但当前都禁用/删除"。前一种情况下
-     * {@code NatControlService} 会跳过 {@code httpSpecusConfigList} 字段，让客户端继续用本地
-     * {@code client.jsonc} —— 避免升级时误清除遗留配置。
-     */
     boolean existsByClientId(Long clientId);
-
-    boolean existsByTenantIdAndClientId(String tenantId, Long clientId);
 }
