@@ -146,7 +146,7 @@
 | `peer/TurnCredentialServiceTests` | 3 | 部分 | `stun_turn_tests.c`："TURN credential generation mismatch"、"TURN general relay allocation quota mismatch"；"temporary turn credential mismatch" | 未测：从 `pm-<clientId>` 解析 subject，以及未知 subject 的处理。 |
 | `peer/StunTurnServerMetricsTests` | 2 | 无 | — | 私网 peer 拒绝写在 `src/stun_turn.c:peer_address_allowed`，但 `stun_turn_tests` 设置了 `SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS=true`，从未经过这段代码；且 C 放行全部 IPv6。relay worker 队列与丢弃指标 C 不存在这项能力。 |
 
-另外，`stun_turn_tests` 没有覆盖 TURN Refresh、ChannelBind/ChannelData 和过期清理。这些不对应单独的 Java 测试类，但已在 [public-transfer.md](../../../protocol/spec/public-transfer.md) 第 6 节写明。
+`stun_turn_tests` 另外覆盖 TURN Refresh、ChannelBind/ChannelData、438 Stale Nonce、默认的私网对端拒绝与各类过期（#132），这些不对应单独的 Java 测试类。
 
 ## 9. 公共互传：发现、房间、附件
 

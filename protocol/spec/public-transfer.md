@@ -736,7 +736,7 @@ ctest 或 `scripts/` 下的脚本；逐项对照见
   地址取 `SPECUS_PEER_MESH_PUBLIC_ADDRESS`，未配置时取请求 Host。未配置 `SPECUS_PEER_MESH_TURN_SHARED_SECRET` 时进程启动
   生成随机 secret，与 Java 一样重启后旧凭证失效。`stun_turn_tests` 在回环 UDP 上验证 Binding、RFC 5780
   change-request/padding、401 challenge、临时凭证、Allocate（同客户端两个 allocation）、CreatePermission、跨 allocation
-  relay、Send/Data indication 和 allocation 配额；Refresh、ChannelBind/ChannelData 与过期清理已在源码实现但没有测试。
+  relay、Send/Data indication 和 allocation 配额；Refresh、ChannelBind/ChannelData、438 Stale Nonce、默认的私网对端拒绝与 permission/channel/allocation 过期也有测试（#132）。
   没有浏览器或任何客户端经 C TURN relay 的端到端证据。
 - 发现 WebSocket：C 实现 `/ws/public-transfer/discovery` 核心：来源绑定一次性 ticket、持久化 OWNER/EDITOR/VIEWER
   房间解析、同公网地址合并可见域、peer/displayName 冲突与房间容量、hello/roster、定向/广播信令、ping、连接级限流、
