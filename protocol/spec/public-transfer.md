@@ -603,7 +603,7 @@ PENDING --complete / verified OSS callback--> UPLOADED --expiration scan--> EXPI
 `UPLOADED`、`uploadedAt` 和 `updatedAt`。
 
 Java 当前只在对象存储启用时执行 complete 的 HEAD；若运行中关闭存储，已存在的 `PENDING` 记录会跳过 HEAD 后转为
-`UPLOADED`。这是运行中关闭存储时的状态机边界，不代表禁用实现具有附件数据面；C server 仍按第 6 节对六个路径明确返回 `409`。
+`UPLOADED`。这是运行中关闭存储时的状态机边界，不代表禁用实现具有附件数据面；C server 未配置对象存储时按第 6 节对六个路径明确返回 `409`。
 
 下载只允许 `UPLOADED` 且未超过附件保留期限的记录。成功响应为：
 
@@ -727,19 +727,37 @@ OSS V4 签名协议要求 TTL 为正数且最长 7 天，因此上传和直达�
 
 ## 6. C server 当前边界
 
-C server 不是本协议的数据面完整实现：
+C server（`implementations/c/server`）对本协议的实现范围与运行证据如下。下文的测试名均为该目录 CMake 注册的
+ctest 或 `scripts/` 下的脚本；逐项对照见
+[c-server-test-map.md](../../docs/cross-language/alignment/c-server-test-map.md)。
 
-- C 进程不监听 STUN/TURN UDP；公共 ICE 只有在显式配置外部 STUN/TURN 服务时才可以公布该服务，不能根据请求 Host
-  伪装成本进程提供了 STUN/TURN；
-- C 已实现单进程 `/ws/public-transfer/discovery` 核心：来源绑定一次性 ticket、持久化 OWNER/EDITOR/VIEWER
+- STUN/TURN：`SPECUS_PEER_MESH_ENABLED=true` 时 C 进程自己监听 STUN/TURN UDP（`src/stun_turn.c`），
+  `GET /api/public/transfer/ice-config` 按第 1 节返回自托管 STUN、配置的公共 STUN 和带临时凭证的自托管 TURN；TURN
+  地址取 `SPECUS_PEER_MESH_PUBLIC_ADDRESS`，未配置时取请求 Host。未配置 `SPECUS_PEER_MESH_TURN_SHARED_SECRET` 时进程启动
+  生成随机 secret，与 Java 一样重启后旧凭证失效。`stun_turn_tests` 在回环 UDP 上验证 Binding、RFC 5780
+  change-request/padding、401 challenge、临时凭证、Allocate（同客户端两个 allocation）、CreatePermission、跨 allocation
+  relay、Send/Data indication 和 allocation 配额；Refresh、ChannelBind/ChannelData 与过期清理已在源码实现但没有测试。
+  没有浏览器或任何客户端经 C TURN relay 的端到端证据。
+- 发现 WebSocket：C 实现 `/ws/public-transfer/discovery` 核心：来源绑定一次性 ticket、持久化 OWNER/EDITOR/VIEWER
   房间解析、同公网地址合并可见域、peer/displayName 冲突与房间容量、hello/roster、定向/广播信令、ping、连接级限流、
   UTF-8/UTF-16 边界和 STWR2 定向 relay。SQLite 模式还实现 access-token list/create/revoke、8 位配对码创建/原子兑换、
-  20 个有效邀请上限、过期/撤销拒绝和来源 IP 兑换限流；明文邀请和配对码不持久化，真实 socket 与并发兑换测试已覆盖。
-  SQLite 模式也实现本规范四个流程图版本端点：OWNER/EDITOR 可创建，VIEWER 只读，只有 OWNER 可删除；快照严格限制为
-  3 MiB 且每房间保留最新 50 份。当前仍没有 Redis presence、跨实例 revision/routing 和故障关闭，因此不能视为 P0-15
-  多实例发现已通过；在 Redis coordinator 落地前，C 对 `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true` 拒绝启动，禁止静默回退到
-  进程内 presence/routing；
-- C 没有对象存储抽象，六个附件路径不得返回占位成功 URL，必须明确返回 `409 Conflict`。响应为：
+  20 个有效邀请上限、过期/撤销拒绝和来源 IP 兑换限流；明文邀请和配对码不持久化。SQLite 模式也实现本规范四个流程图
+  版本端点：OWNER/EDITOR 可创建，VIEWER 只读，只有 OWNER 可删除；快照严格限制为 3 MiB 且每房间保留最新 50 份。以上由
+  `admin_http_tests` 的真实 socket 与并发兑换用例覆盖。
+- 多实例：`SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true` 时 C 使用 Redis（`src/public_coordination.c`）实现 presence、
+  合并 roster revision、全局名称/peer/容量检查、分布式消息限流和 STCE2 Pub/Sub 文本/二进制路由；Redis 不可用时关闭
+  本地发现 socket，不回退到进程内 presence/routing；`rediss://` 被拒绝。证据：`public_coordination_tests`（独立
+  `redis-server`）、`public_discovery_cluster_e2e`（两个 C 进程共享 Redis：跨实例 roster revision、名称占用、重复 peer、
+  定向文本、二进制 relay、隐藏 peer 回退，以及 Redis 停止后两个实例都失败关闭）和 CI 中的
+  `java_c_discovery_interop.sh`（Java reference server 与 C server 共享 Redis：roster、全局名称占用和双向定向信令）。
+  Go/.NET server 与 C 的 Redis 混部没有证据。
+- 附件 REST 与对象存储：C 只支持 `SPECUS_OBJECT_STORAGE_PROVIDER=aliyun-oss`（第 4.2 节的 OSS V4 签名，
+  `src/object_storage.c`）；其它 provider 值或不完整配置会被启动安全基线拒绝。配置后六个附件路径、OSS callback 和一次性下载 grant 按第 3、4
+  节工作。`object_storage_e2e` 对本地 fake OSS HTTP 端点跑通公开互传路径：presign-upload、直传 PUT、HEAD complete、
+  presign-download、grant 首次 `302`、重放 `410`、`HEAD` `405`、presign 限流 `429`、账号下载计费与 capabilities 快照；
+  `object_storage_tests` 覆盖签名向量、callback header 与过期清理。管理端 `/api/admin/client-messages/attachments/*`
+  的启用分支与公开路径共用实现，但只有“未配置时 `409`”有测试。真实私有 OSS 没有运行证据。
+- 未配置 provider 时，六个附件路径不得返回占位成功 URL，必须明确返回 `409 Conflict`。响应为：
 
 ```json
 {
