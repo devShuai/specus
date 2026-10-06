@@ -21,6 +21,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/specus/implementations/go/server/internal/productmetrics"
 	"github.com/devShuai/specus/implementations/go/server/internal/security"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
@@ -53,6 +54,7 @@ type API struct {
 	packageDirectory string
 	downloadLimiter  *publicDownloadRateLimiter
 	connectivity     *connectivity.Checker
+	productMetrics   *productmetrics.Service
 	logger           *slog.Logger
 }
 
@@ -88,6 +90,7 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 		loginLimiter:    security.NewLoginRateLimiter(authConfig.LoginRateLimit, logger),
 		downloadLimiter: newPublicDownloadRateLimiter(),
 		addressResolver: addressResolver,
+		productMetrics:  productmetrics.New(db, logger),
 		registration:    registration, logger: logger}
 }
 
@@ -220,6 +223,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/services/{id}", a.requireAuth(a.handlePeerMeshDeleteService))
 	mux.HandleFunc("POST /api/admin/peer-mesh/services/import", a.requireAuth(a.handlePeerMeshImportServices))
 	mux.HandleFunc("GET /api/admin/peer-mesh/service-audit", a.requireAuth(a.handlePeerMeshServiceAudit))
+	a.registerProductMetrics(mux)
 }
 
 func (a *API) handlePublicPeerMeshStunConfig(w http.ResponseWriter, r *http.Request) {
@@ -298,6 +302,9 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.loginLimiter.RecordSuccess(req.Username)
+	if !principal.BuiltIn {
+		a.recordMilestone(r.Context(), principal.TenantID, principal.Username, productmetrics.StepSignedIn)
+	}
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
 }
 
@@ -335,6 +342,9 @@ func (a *API) handleVerifyRegistration(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	// The verified registration created the account and this answer signs it in.
+	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepAccountCreated)
+	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepSignedIn)
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(user.Username, user.TenantID, user.Role))
 }
 
@@ -492,6 +502,7 @@ func (a *API) handleOidcToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "OIDC 账号绑定失败")
 		return
 	}
+	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepSignedIn)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accessToken": a.tokens.IssueForUser(user.Username, user.TenantID, user.Role),
 		"idToken":     result.IDToken,
@@ -599,6 +610,7 @@ func (a *API) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepAccountCreated)
 	writeJSON(w, http.StatusCreated, managementUserView(user))
 }
 
@@ -689,6 +701,7 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	a.productMetrics.UserDeleted(r.Context(), normalizeTenant(user.TenantID), user.Username)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1107,6 +1120,7 @@ func (a *API) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	a.recordMilestone(r.Context(), credential.TenantID, credential.OwnerUsername, productmetrics.StepCredentialCreated)
 	writeJSON(w, http.StatusCreated, CredentialResult{Credential: credentialView(credential), Secret: secret})
 }
 
@@ -1437,6 +1451,7 @@ func (a *API) handleCreateSpecus(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	a.recordMilestone(r.Context(), account.TenantID, account.OwnerUsername, productmetrics.StepServicePublished)
 	a.pushNatControl(r.Context(), account.ID, account.ClientName)
 	writeJSON(w, http.StatusCreated, specusView(mapping))
 }
@@ -1640,6 +1655,7 @@ func (a *API) handleCreateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	a.recordMilestone(r.Context(), account.TenantID, account.OwnerUsername, productmetrics.StepServicePublished)
 	a.pushNatControl(r.Context(), account.ID, account.ClientName)
 	writeJSON(w, http.StatusCreated, httpRouteView(mapping))
 }

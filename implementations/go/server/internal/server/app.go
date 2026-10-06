@@ -25,6 +25,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/specus/implementations/go/server/internal/productmetrics"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/security"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
@@ -268,6 +269,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
+	api.ProductMetrics().SetAllowed(cfg.ProductMetrics.Allowed)
 	api.SetConnectivityChecker(connectivity.NewChecker(
 		connectivity.NatDevice{Sessions: sessions, Coordinator: coordinator}, logger))
 	dataDirectory := strings.TrimSpace(cfg.DataDirectory)
@@ -355,6 +357,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		}
 		if account, err := db.FindClientByName(pushCtx, conn.ClientName()); err == nil && account != nil {
 			peerMesh.PushOnLogin(pushCtx, *account)
+			api.ProductMetrics().Milestone(pushCtx, account.TenantID, account.OwnerUsername,
+				productmetrics.StepClientOnline)
 		}
 	})
 
@@ -509,6 +513,7 @@ func (a *App) Run(ctx context.Context) error {
 	launch(a.attachments.RunExpiration)
 	launch(a.mediaCapture.Run)
 	launch(a.api.RunRegistrationCleanup)
+	launch(a.api.RunProductMetricsSweep)
 	launch(func(ctx context.Context) { runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord) })
 
 	errc := make(chan error, 2)
