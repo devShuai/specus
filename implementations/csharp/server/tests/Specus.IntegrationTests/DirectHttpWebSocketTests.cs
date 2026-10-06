@@ -68,6 +68,97 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task DeletedProtectedRouteIsNotFoundAndOpensNoStream()
+    {
+        await using var session = BoundNatSession.Bind(_server!);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var http = _server!.CreateClient();
+        using (var protectedResponse = await http.GetAsync(HttpPath(), cancellation.Token))
+        {
+            Assert.Equal(HttpStatusCode.Unauthorized, protectedResponse.StatusCode);
+        }
+
+        // The bound client still forwards the route from its old list; only the server's record counts.
+        await using (var scope = _server.HostServices.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            db.HttpRouteMappings.RemoveRange(db.HttpRouteMappings.Where(route => route.Route == Route));
+            await db.SaveChangesAsync(cancellation.Token);
+        }
+
+        using var deleted = await http.GetAsync(HttpPath(), cancellation.Token);
+        Assert.Equal(HttpStatusCode.NotFound, deleted.StatusCode);
+        Assert.Equal("no-store", deleted.Headers.CacheControl?.ToString());
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            _server.Server.CreateWebSocketClient().ConnectAsync(WebSocketUri(), cancellation.Token));
+        Assert.Contains("status code: 404", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, session.Writer.OpenCount);
+    }
+
+    [Fact]
+    public async Task RouteOfDisabledClientIsNotFoundEvenWithValidCredentials()
+    {
+        await using var session = BoundNatSession.Bind(_server!);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using (var scope = _server!.HostServices.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ClientAccounts.SingleAsync(client => client.ClientName == ClientName,
+                cancellation.Token);
+            account.Enabled = false;
+            await db.SaveChangesAsync(cancellation.Token);
+        }
+
+        using var http = _server.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, HttpPath());
+        request.Headers.TryAddWithoutValidation("Authorization", BasicAuthorization());
+        using var response = await http.SendAsync(request, cancellation.Token);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(0, session.Writer.OpenCount);
+    }
+
+    [Fact]
+    public async Task DeletingTheLastRoutePushesAnExplicitEmptyRouteList()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var registry = _server!.HostServices.GetRequiredService<SessionRegistry>();
+        using var lifetime = new CancellationTokenSource();
+        var control = new CapturingControlWriter();
+        var context = new SpecusConnectionContext("direct-http-route-push-test", "127.0.0.1:12346", control,
+            lifetime.Token, lifetime.Cancel, new ReadGate(lifetime.Token),
+            new WriteBackpressureGate(64 * 1024, 1024 * 1024));
+        context.OnLoginSuccess(ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            clientSessionId: 1, connectionRole: ConnectionRole.Control);
+        registry.Replace(ClientName, context);
+        try
+        {
+            await using var scope = _server.HostServices.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ClientAccounts.SingleAsync(client => client.ClientName == ClientName,
+                cancellation.Token);
+            db.HttpRouteMappings.RemoveRange(db.HttpRouteMappings.Where(route => route.ClientId == account.Id));
+            await db.SaveChangesAsync(cancellation.Token);
+
+            await scope.ServiceProvider.GetRequiredService<NatControlService>()
+                .PushSnapshotIfOnlineAsync(account.Id, cancellation.Token);
+
+            var pushed = Assert.Single(control.Messages);
+            Assert.Equal(MessageType.NatControl, pushed.MessageType);
+            using var bean = System.Text.Json.JsonDocument.Parse(pushed.Message!);
+            Assert.True(bean.RootElement.TryGetProperty("httpSpecusConfigList", out var routes),
+                "NAT_CONTROL omitted httpSpecusConfigList, so the client keeps its stale routes");
+            Assert.Equal(System.Text.Json.JsonValueKind.Array, routes.ValueKind);
+            Assert.Equal(0, routes.GetArrayLength());
+        }
+        finally
+        {
+            registry.Unbind(ClientName, context);
+            lifetime.Cancel();
+        }
+    }
+
+    [Fact]
     public async Task HttpResponseOnlyPublishesSafeDeclaredPeerTrailers()
     {
         await using var session = BoundNatSession.Bind(_server!);
@@ -741,6 +832,23 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
             _lifetime.Cancel();
             await _nat.OnConnectionClosedAsync(Context);
             _lifetime.Dispose();
+        }
+    }
+
+    /// <summary>Plays a client's control connection and keeps every MESSAGE_RESPONSE pushed to it.</summary>
+    private sealed class CapturingControlWriter : IFrameWriter
+    {
+        private readonly ConcurrentQueue<MessageResponsePacket> _messages = new();
+
+        public IReadOnlyList<MessageResponsePacket> Messages => _messages.ToArray();
+
+        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        {
+            if (packet is MessageResponsePacket message)
+            {
+                _messages.Enqueue(message);
+            }
+            return ValueTask.CompletedTask;
         }
     }
 
