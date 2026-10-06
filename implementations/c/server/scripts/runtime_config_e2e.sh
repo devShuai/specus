@@ -9,6 +9,8 @@ ADMIN_PORT="${ADMIN_PORT:-17111}"
 PUBLIC_PORT="${PUBLIC_PORT:-18180}"
 ECHO_PORT="${ECHO_PORT:-19190}"
 HTTP_UPSTREAM_PORT="${HTTP_UPSTREAM_PORT:-19191}"
+# Nothing listens here: the connectivity check's refused target.
+REFUSED_PORT="${REFUSED_PORT:-19192}"
 JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/specus-client-exec.jar"
 ADMIN_USERNAME="runtime-admin"
 ADMIN_PASSWORD="runtime-admin-password"
@@ -121,6 +123,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response)
 
+    # The connectivity check sends HEAD first and one GET only after 405/501, so HEAD is refused by
+    # method here; GET under /locked wants credentials the check never sends.
+    def do_HEAD(self):
+        self.send_response(405)
+        self.send_header("Allow", "GET, POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        print(f"GET {self.path} user-agent={self.headers.get('User-Agent')}", flush=True)
+        locked = self.path.startswith("/locked")
+        body = b"locked" if locked else b"runtime-get"
+        self.send_response(401 if locked else 200)
+        if locked:
+            self.send_header("WWW-Authenticate", 'Basic realm="runtime"')
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format, *args):
         return
 
@@ -198,7 +220,7 @@ JSON
 CLIENT_PID=$!
 
 if ! python3 - "$ADMIN_PORT" "$PUBLIC_PORT" "$ECHO_PORT" "$HTTP_UPSTREAM_PORT" \
-        "$UPSTREAM_HOST" "$ADMIN_TOKEN" <<'PY'
+        "$UPSTREAM_HOST" "$ADMIN_TOKEN" "$REFUSED_PORT" <<'PY'
 import http.client
 import json
 import socket
@@ -208,6 +230,7 @@ import urllib.parse
 
 admin_port, public_port, echo_port, http_port = map(int, sys.argv[1:5])
 upstream_host, token = sys.argv[5:7]
+refused_port = int(sys.argv[7])
 
 def request(method, path, body=None):
     connection = http.client.HTTPConnection("127.0.0.1", admin_port, timeout=10)
@@ -295,6 +318,52 @@ def wait_direct_http(expected, what):
 
 wait_direct_http(b"runtime:/live?shape=%7Bok%7D:hot-route", "route create")
 
+
+# The connectivity check (protocol/spec/service-connectivity-check.md) probes through the same data
+# connection: HEAD refused by method falls back to one GET, a refused target comes back classified
+# by the client, and a target asking for its own login is unverified, never passed. The result never
+# names the target.
+def connectivity_check(check_route_id, expected, body=None):
+    last = None
+    for _ in range(3):
+        status, result = request("POST", f"/api/admin/http-routes/{check_route_id}/connectivity-check", body or {})
+        if status == 200 and result.get("code") != "DEVICE_ROUTE_NOT_LOADED":
+            break
+        last = (status, result)
+        # A route created a moment ago may not have reached the client yet; the route key allows
+        # one check per 10 s.
+        time.sleep(10.5)
+    else:
+        raise RuntimeError(f"connectivity check of route {check_route_id} never ran: {last}")
+    got = {key: result.get(key) for key in expected}
+    if got != expected or upstream_host in json.dumps(result):
+        raise RuntimeError(f"connectivity check of route {check_route_id}: {result}, expected {expected}")
+
+
+connectivity_check(route_id, {"outcome": "succeeded", "code": "ACCESS_OK", "requests": ["HEAD", "GET"],
+                              "statusClass": "2xx"})
+check_routes = []
+for check_name, check_target in (("refused", f"http://{upstream_host}:{refused_port}"),
+                                 ("locked", f"http://{upstream_host}:{http_port}/locked")):
+    status, created = request("POST", f"/api/admin/clients/{client_id}/http-routes", {
+        "route": check_name,
+        "targetBaseUrl": check_target,
+        "enabled": True,
+    })
+    if status != 201:
+        raise RuntimeError(f"route {check_name} create failed: {status} {created}")
+    check_routes.append(created["id"])
+time.sleep(1)
+connectivity_check(check_routes[0], {"outcome": "failed", "stoppedAt": "target-reachable",
+                                     "code": "TARGET_CONNECT_REFUSED", "requests": ["HEAD"]})
+connectivity_check(check_routes[1], {"outcome": "unverified", "stoppedAt": "access-succeeded",
+                                     "code": "ACCESS_AUTH_REQUIRED", "requests": ["HEAD", "GET"],
+                                     "statusClass": "4xx"})
+for check_route_id in check_routes:
+    status, _ = request("DELETE", f"/api/admin/http-routes/{check_route_id}")
+    if status != 204:
+        raise RuntimeError(f"route {check_route_id} delete failed: {status}")
+
 def echo(payload, timeout=5):
     with socket.create_connection(("127.0.0.1", public_port), timeout=timeout) as connection:
         connection.settimeout(timeout)
@@ -366,7 +435,7 @@ if status != 200 or pushed.get("pushed") != 1 or pushed.get("specusMappings") !=
     raise RuntimeError(f"manual NAT_CONTROL push failed: {status} {pushed}")
 
 print(f"Runtime NAT_CONTROL smoke passed (client={client_name}, pushed on route create/update and "
-      "mapping create/delete/recreate + Direct HTTP + manual push)")
+      "mapping create/delete/recreate + Direct HTTP + connectivity check + manual push)")
 PY
 then
   echo "--- C server log ---" >&2
