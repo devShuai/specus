@@ -8,6 +8,8 @@ import {
 } from "../../lib/macosInstall";
 import { NAT_BEHAVIOR_AXES, NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
 import { CLIENT_ONBOARDING_STEPS } from "../../lib/clientOnboarding";
+import { useProductMetricsCollecting } from "../../hooks/useProductMetricsCollecting";
+import { ProductMetricsDisclosure, ProductMetricsMemberNotice } from "../../components/ProductMetricsDisclosure";
 
 const HELP_TABS = [
   "quickstart",
@@ -17,6 +19,7 @@ const HELP_TABS = [
   "peer-mesh",
   "protocol",
   "faq",
+  "metrics",
 ] as const;
 type HelpTabKey = (typeof HELP_TABS)[number];
 const HELP_TAB_SET = new Set<HelpTabKey>(HELP_TABS);
@@ -140,7 +143,29 @@ export function HelpPanel() {
         <Tab key="faq" title="常见问题">
           <FaqSection />
         </Tab>
+        <Tab key="metrics" title="产品指标">
+          <ProductMetricsSection />
+        </Tab>
       </Tabs>
+    </div>
+  );
+}
+
+/**
+ * The full product-metrics disclosure (protocol/spec/product-metrics.md section 3.1) and, while the
+ * member's organisation collects, the standing one-line notice.
+ */
+function ProductMetricsSection() {
+  // The help page is part of the signed-in management console.
+  const collecting = useProductMetricsCollecting(true);
+  return (
+    <div className="mt-4 flex flex-col gap-4">
+      <DocCard title={collecting ? "你所在的组织已开启产品指标" : "产品指标（默认关闭）"}>
+        {collecting ? <ProductMetricsMemberNotice className="mb-3" /> : (
+          <p className="mb-3 text-small text-default-500">只有管理员显式开启后才会统计；开启前和关闭期间的事不会被补算。</p>
+        )}
+        <ProductMetricsDisclosure />
+      </DocCard>
     </div>
   );
 }

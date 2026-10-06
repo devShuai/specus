@@ -11,6 +11,8 @@ import { AppLogo } from "../components/AppLogo";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { Sidebar, type NavGroup } from "../components/Sidebar";
+import { ProductMetricsMemberNotice } from "../components/ProductMetricsDisclosure";
+import { useProductMetricsCollecting } from "../hooks/useProductMetricsCollecting";
 
 const LazyOverviewPanel = lazy(() => import("./panels/OverviewPanel").then(m => ({ default: m.OverviewPanel })));
 const LazyClientsPanel = lazy(() => import("./panels/ClientsPanel").then(m => ({ default: m.ClientsPanel })));
@@ -23,6 +25,7 @@ const LazyPeerMeshPanel = lazy(() => import("./panels/PeerMeshPanel").then(m => 
 const LazyClientDownloadsPanel = lazy(() => import("./panels/ClientDownloadsPanel").then(m => ({ default: m.ClientDownloadsPanel })));
 const LazyHelpPanel = lazy(() => import("./panels/HelpPanel").then(m => ({ default: m.HelpPanel })));
 const LazySystemPanel = lazy(() => import("./panels/SystemPanel").then(m => ({ default: m.SystemPanel })));
+const LazyProductMetricsPanel = lazy(() => import("./panels/ProductMetricsPanel").then(m => ({ default: m.ProductMetricsPanel })));
 
 const navGroups: NavGroup[] = [
   { label: "概览", items: [{ key: "overview" as const, title: "概览" }] },
@@ -45,6 +48,7 @@ const navGroups: NavGroup[] = [
   { label: "组网", items: [{ key: "peer-mesh" as const, title: "私有组网" }] },
   { label: "系统", items: [
     { key: "system" as const, title: "系统管理" },
+    { key: "metrics" as const, title: "产品指标" },
     { key: "help" as const, title: "帮助文档" },
   ]},
 ];
@@ -53,6 +57,8 @@ const panels = navGroups.flatMap(g => g.items);
 type PanelKey = typeof panels[number]["key"];
 const defaultPanel: PanelKey = "overview";
 const panelKeys = new Set<PanelKey>(panels.map(p => p.key));
+// System management and product metrics are for the tenant's administrators only.
+const adminOnly = (key: PanelKey) => key === "system" || key === "metrics";
 
 function readPanelFromLocation(): PanelKey {
   const h = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0].trim();
@@ -79,10 +85,10 @@ function DashboardContent() {
   }, []);
 
   const visibleGroups = navGroups.map(g => ({
-    ...g, items: g.items.filter(i => i.key !== "system" || profile?.admin)
+    ...g, items: g.items.filter(i => !adminOnly(i.key) || profile?.admin)
   })).filter(g => g.items.length > 0);
 
-  const renderedPanel = activePanel === "system" && !profile?.admin ? defaultPanel : activePanel;
+  const renderedPanel = adminOnly(activePanel) && !profile?.admin ? defaultPanel : activePanel;
   const activeTitle = panels.find(p => p.key === renderedPanel)?.title ?? "概览";
 
   useEffect(() => {
@@ -94,7 +100,7 @@ function DashboardContent() {
 
   // E-17: 非管理员停在 #/system 时纠偏回默认面板，让 URL 与实际渲染一致；补齐依赖避免闭包过期。
   useEffect(() => {
-    if (activePanel === "system" && !profile?.admin) activatePanel(defaultPanel);
+    if (adminOnly(activePanel) && !profile?.admin) activatePanel(defaultPanel);
   }, [activePanel, profile?.admin, activatePanel]);
 
   // E-5: 切换面板后回到页面顶部，避免沿用上一个面板的滚动位置。
@@ -216,6 +222,8 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
   // E-2: 与 UserMenuButton 同一套 mode 计算——跟随系统时只有"跟随系统"一个对勾，
   // 不再因为系统恰好是暗色/浅色而出现双对勾。
   const mode = userOverride ? theme : "system";
+  // The standing member notice of product metrics (protocol/spec/product-metrics.md section 3.1).
+  const metricsCollecting = useProductMetricsCollecting(Boolean(profile));
   return (
     <Dropdown placement={variant === "block" ? "top-start" : "bottom-end"} shouldBlockScroll={false}>
       <DropdownTrigger>
@@ -254,6 +262,7 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
               <div className="text-small font-semibold text-foreground">{name}</div>
               <div className="text-tiny text-default-500">租户: {profile?.tenantId || "-"}</div>
               <div className="text-tiny text-default-500">角色: {profile?.admin ? "管理员" : "普通用户"}</div>
+              {metricsCollecting ? <ProductMetricsMemberNotice className="max-w-64 whitespace-normal pt-1" /> : null}
             </div>
           </DropdownItem>
           <DropdownItem key="logout" className="text-danger" color="danger" textValue="退出">退出登录</DropdownItem>
@@ -276,6 +285,7 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
     case "downloads": return <LazyClientDownloadsPanel />;
     case "help": return <LazyHelpPanel />;
     case "system": return <LazySystemPanel initializing={initializing} onInitializeDatabase={onInitializeDatabase} />;
+    case "metrics": return <LazyProductMetricsPanel />;
     default: return <LazyOverviewPanel />;
   }
 }

@@ -965,3 +965,49 @@ export interface WebSocketTicket {
   ticket: string;
   expiresAt: string;
 }
+
+// ---- opt-in product metrics (protocol/spec/product-metrics.md) ------------------------------------
+
+/** GET/PUT /api/admin/product-metrics/settings; updatedBy only reaches administrators. */
+export interface ProductMetricsSettings {
+  schemaVersion: number;
+  enabled: boolean;
+  disclosureVersion: number;
+  retentionDays: number;
+  onboardingWindowDays: number;
+  updatedAt: string | null;
+  updatedBy?: string | null;
+}
+
+export interface ProductMetricsTally {
+  success: number;
+  failure: number;
+  cancelled: number;
+  /** Basis points of success / (success + failure); cancelled is not in the denominator. */
+  successRateBp: number | null;
+}
+
+export interface ProductMetricsSummary {
+  schemaVersion: number;
+  enabled: boolean;
+  from: string;
+  to: string;
+  generatedAt: string;
+  onboarding: {
+    windowDays: number;
+    cohortUsers: number;
+    pendingUsers: number;
+    final: boolean;
+    steps: { step: string; users: number; fromPreviousRateBp: number | null }[];
+    completed: number;
+    completionRateBp: number | null;
+    durations: { bucket: string; users: number }[];
+    medianDurationBucket: string | null;
+  };
+  transfers: {
+    cells: (ProductMetricsTally & { path: string; sizeBucket: string })[];
+    byMode: (ProductMetricsTally & { mode: string })[];
+    byAttempt: (ProductMetricsTally & { attempt: string })[];
+    total: ProductMetricsTally;
+  };
+}
