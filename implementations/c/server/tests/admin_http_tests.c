@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "admin_http.h"
+#include "client_auth_nonce.h"
 #include "client_package.h"
 #include "crypto.h"
 #include "json.h"
@@ -59,6 +60,55 @@ static void sign_client_auth(const char *api_key,
 static int contains(const char *haystack, const char *needle)
 {
     return strstr(haystack, needle) != NULL;
+}
+
+/*
+ * nettyTls in the login response follows the control listener's TLS settings the way Java and Go
+ * derive it (protocol/spec/client-auth.md): any TLS mode, or TLS terminated by a trusted upstream.
+ * Without it clients with controlTls.enabled unset connect in plaintext to a TLS listener.
+ */
+static int test_client_auth_netty_tls(void)
+{
+    static const struct {
+        const char *mode;
+        const char *terminated_upstream;
+        const char *expected;
+    } cases[] = {
+        {NULL, NULL, "\"nettyTls\":false"},
+        {"disabled", "false", "\"nettyTls\":false"},
+        {"file", NULL, "\"nettyTls\":true"},
+        {"self-signed", NULL, "\"nettyTls\":true"},
+        {" SELF_SIGNED ", NULL, "\"nettyTls\":true"},
+        {NULL, "true", "\"nettyTls\":true"},
+    };
+    static char response[65536];
+    setenv("SPECUS_CLIENT_ACCESS_TOKEN", "tls-runtime-token", 1);
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]) && !failed; ++i) {
+        if (cases[i].mode == NULL) {
+            unsetenv("SPECUS_TLS_MODE");
+        } else {
+            setenv("SPECUS_TLS_MODE", cases[i].mode, 1);
+        }
+        if (cases[i].terminated_upstream == NULL) {
+            unsetenv("SPECUS_TLS_TERMINATED_UPSTREAM");
+        } else {
+            setenv("SPECUS_TLS_TERMINATED_UPSTREAM", cases[i].terminated_upstream, 1);
+        }
+        int len = st_admin_build_response("POST", "/api/client/auth/login", response, sizeof(response));
+        if (len <= 0 || !contains(response, "200 OK") || !contains(response, cases[i].expected)
+            || !contains(response, "\"nettyPort\":7010,\"nettyTls\":")) {
+            fprintf(stderr, "client auth nettyTls mismatch for mode=%s terminatedUpstream=%s: %s\n",
+                    cases[i].mode == NULL ? "(unset)" : cases[i].mode,
+                    cases[i].terminated_upstream == NULL ? "(unset)" : cases[i].terminated_upstream,
+                    response);
+            failed = 1;
+        }
+    }
+    unsetenv("SPECUS_TLS_MODE");
+    unsetenv("SPECUS_TLS_TERMINATED_UPSTREAM");
+    unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    return failed;
 }
 
 static long long nat_control_expected_client_id = 0;
@@ -2839,6 +2889,9 @@ int main(void)
     unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
     unsetenv("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS");
     unsetenv("SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES");
+    if (test_client_auth_netty_tls() != 0) {
+        return 1;
+    }
 
     setenv("SPECUS_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
     setenv("SPECUS_CLIENT_API_KEY", "demo-api", 1);
@@ -2857,6 +2910,39 @@ int main(void)
     len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"accessToken\":\"dev-runtime-token\"")) {
         fprintf(stderr, "client auth signed login response mismatch\n");
+        return 1;
+    }
+    /* The same signed request again is a replay: refused as Java refuses it, with no token. */
+    len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "{\"error\":\"客户端签名 nonce 已使用\"}")
+        || contains(response, "accessToken")) {
+        fprintf(stderr, "client auth replayed environment login was not rejected: %s\n", response);
+        return 1;
+    }
+    /* A request whose signature fails consumes nothing: its nonce still works once signed. */
+    snprintf(timestamp, sizeof(timestamp), "%lld", test_now_millis());
+    snprintf(body,
+             sizeof(body),
+             "{\"apiKey\":\"demo-api\",\"timestamp\":\"%s\",\"nonce\":\"nonce-2\","
+             "\"signature\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+             "\"environment\":{\"machineFingerprint\":\"m_test\",\"osUser\":\"tester\"}}",
+             timestamp);
+    len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "401 Unauthorized")) {
+        fprintf(stderr, "client auth bad signature with a fresh nonce was not rejected\n");
+        return 1;
+    }
+    sign_client_auth("demo-api", timestamp, "nonce-2", "m_test", "tester", "test1234", signature);
+    snprintf(body,
+             sizeof(body),
+             "{\"apiKey\":\"demo-api\",\"timestamp\":\"%s\",\"nonce\":\"nonce-2\",\"signature\":\"%s\","
+             "\"environment\":{\"machineFingerprint\":\"m_test\",\"osUser\":\"tester\"}}",
+             timestamp,
+             signature);
+    len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "client auth nonce was consumed by a request whose signature failed\n");
         return 1;
     }
     len = st_admin_build_response_with_body("POST",
@@ -2915,14 +3001,30 @@ int main(void)
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
              signature);
+    /* The control listener runs TLS here, which the database login advertises too. */
+    setenv("SPECUS_TLS_MODE", "file", 1);
     len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
+    unsetenv("SPECUS_TLS_MODE");
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"tenantId\":\"tenant-db\"")
         || !contains(response, "\"accessToken\":\"cs_")
+        || !contains(response, "\"nettyTls\":true")
         || !contains(response, "\"maxOnlineInstances\":4")
         || !contains(response, "db-host-db-user-")) {
         fprintf(stderr, "client auth database login response mismatch\n");
         return 1;
+    }
+    {
+        /* Replaying the database login must not mint a second session. */
+        static char replay[65536];
+        int replay_len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body,
+                                                           replay, sizeof(replay));
+        if (replay_len <= 0 || !contains(replay, "400 Bad Request")
+            || !contains(replay, "{\"error\":\"客户端签名 nonce 已使用\"}")
+            || contains(replay, "accessToken")) {
+            fprintf(stderr, "client auth replayed database login was not rejected: %s\n", replay);
+            return 1;
+        }
     }
     int runtime_client_id = 0;
     int runtime_client_session_id = 0;

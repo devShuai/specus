@@ -3,6 +3,7 @@
 #include "admin_http.h"
 
 #include "client_address.h"
+#include "client_auth_nonce.h"
 #include "client_package.h"
 #include "crypto.h"
 #include "decompression_limits.h"
@@ -21,6 +22,7 @@
 #include "security.h"
 #include "security_baseline.h"
 #include "storage.h"
+#include "tls_transport.h"
 #include "turn_auth.h"
 
 #include <arpa/inet.h>
@@ -1158,6 +1160,54 @@ static int load_client_api_key(uint8_t key[ST_SHA256_LEN])
     return 0;
 }
 
+/*
+ * protocol/spec/client-auth.md: a login whose signature verified consumes its (apiKey, nonce)
+ * pair, and the pair again within 120 s is refused. Java answers a replay with 400 and this body;
+ * a full in-memory store answers 503 with Retry-After so the client retries rather than gives up.
+ * Returns 0 when the pair was fresh, else the length of the response written to out.
+ */
+static int consume_client_auth_nonce(const char *api_key, const char *nonce, char *out, size_t out_len)
+{
+    int64_t retry_after_seconds = 0;
+    st_client_auth_nonce_result result = st_client_auth_nonce_consume(api_key,
+                                                                      nonce,
+                                                                      current_time_millis(),
+                                                                      &retry_after_seconds);
+    if (result == ST_CLIENT_AUTH_NONCE_ACCEPTED) {
+        return 0;
+    }
+    if (result == ST_CLIENT_AUTH_NONCE_REPLAYED) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端签名 nonce 已使用\"}");
+    }
+    const char *body = "{\"error\":\"客户端认证暂时不可用\"}";
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 503 Service Unavailable\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Retry-After: %lld\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           (long long)(retry_after_seconds < 1 ? 1 : retry_after_seconds),
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/*
+ * nettyTls tells clients whose controlTls.enabled is unset whether the raw control/data endpoint
+ * speaks TLS. Like Java and Go it is the listener's TLS mode, or TLS terminated by a trusted L4
+ * proxy in front of it; main() builds the listener from the same SPECUS_TLS_* settings.
+ */
+static int client_auth_netty_tls(void)
+{
+    st_tls_config tls;
+    st_tls_config_from_env(&tls);
+    return tls.mode != ST_TLS_DISABLED || tls.terminated_upstream;
+}
+
 static int validate_client_api_login(const char *body, char *out, size_t out_len)
 {
     if (body == NULL || *body == '\0') {
@@ -1249,6 +1299,8 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     memset(key, 0, sizeof(key));
     memset(actual_signature, 0, sizeof(actual_signature));
     memset(expected_signature, 0, sizeof(expected_signature));
+    /* Only a request whose signature verified may consume its nonce. */
+    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(api_key, nonce, out, out_len);
     free(api_key);
     free(timestamp);
     free(nonce);
@@ -1259,7 +1311,7 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     if (invalid) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
     }
-    return 0;
+    return nonce_rc;
 }
 
 static int build_client_auth_login_success_response(char *out, size_t out_len)
@@ -1316,7 +1368,7 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
     int build_rc = admin_sb_appendf(&builder,
                                     "{\"tenantId\":\"%s\",\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"clientSessionId\":%lld,\"accessToken\":\"%s\",\"tokenTtlSeconds\":%lld,"
-                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"maxOnlineInstances\":%d,"
+                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"nettyTls\":%s,\"maxOnlineInstances\":%d,"
                                     "\"policy\":{\"enabled\":%s,\"billingStatus\":\"%s\",\"retryAfterSeconds\":%lld},"
                                     "\"peerMesh\":{\"enabled\":false,\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"virtualIp\":\"\",\"cidr\":\"\",\"stunHost\":\"\",\"stunPort\":0,"
@@ -1331,6 +1383,7 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     token_ttl_seconds,
                                     netty_host,
                                     env_int("SPECUS_NETTY_PORT", 7010),
+                                    client_auth_netty_tls() ? "true" : "false",
                                     max_online_instances,
                                     policy_enabled ? "true" : "false",
                                     billing_status,
@@ -2015,7 +2068,7 @@ static int append_db_client_auth_response(char *out,
     int build_rc = admin_sb_appendf(&builder,
                                     "{\"tenantId\":\"%s\",\"clientId\":%lld,\"clientName\":\"%s\","
                                     "\"clientSessionId\":%lld,\"accessToken\":\"%s\",\"tokenTtlSeconds\":%lld,"
-                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"maxOnlineInstances\":%d,"
+                                    "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"nettyTls\":%s,\"maxOnlineInstances\":%d,"
                                     "\"policy\":{\"enabled\":true,\"billingStatus\":\"ACTIVE\",\"retryAfterSeconds\":0},"
                                     "\"peerMesh\":",
                                     tenant_id,
@@ -2026,6 +2079,7 @@ static int append_db_client_auth_response(char *out,
                                     token_ttl_seconds,
                                     netty_host,
                                     env_int("SPECUS_NETTY_PORT", 7010),
+                                    client_auth_netty_tls() ? "true" : "false",
                                     credential->max_online_instances <= 0
                                         ? client_auth_default_max_online_instances()
                                         : credential->max_online_instances);
@@ -2244,6 +2298,22 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(client_version);
         free(java_version);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
+    }
+    int nonce_rc = consume_client_auth_nonce(api_key, nonce, out, out_len);
+    if (nonce_rc != 0) {
+        free(api_key);
+        free(timestamp);
+        free(nonce);
+        free(signature);
+        free(machine_fingerprint);
+        free(os_user);
+        free(hostname);
+        free(os_name);
+        free(os_version);
+        free(os_arch);
+        free(client_version);
+        free(java_version);
+        return nonce_rc;
     }
 
     st_storage_client_identity identity;
