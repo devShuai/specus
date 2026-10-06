@@ -387,38 +387,69 @@ public class NatClientHandler extends NatCommonHandler {
         // Created up front so a failed connect removes only this stream's handler, never one that
         // an earlier stream with the same id still owns.
         LocalSpecusHandler localSpecusHandler = new LocalSpecusHandler(this, streamId);
+        if (channelHandlerMap.putIfAbsent(streamId, localSpecusHandler) != null) {
+            sendReset(streamId, 7, "duplicate TCP stream");
+            return;
+        }
+        // The stream is published while its connect is still under way, the way the Go and .NET
+        // clients keep it, so this loop goes straight back to the other streams on the data
+        // connection. DATA and FIN that arrive in the meantime wait in the handler, within the
+        // stream's receive window, and an RST closes the channel, which abandons the connect.
+        String address = specusConfig.getSpecusAddress();
+        int targetPort = specusConfig.getSpecusPort();
+        ChannelFuture connectFuture;
         try {
-            localConnection.connect(specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), new ChannelInitializer<SocketChannel>() {
+            connectFuture = localConnection.connect(address, targetPort, new ChannelInitializer<SocketChannel>() {
                 @Override
-                protected void initChannel(SocketChannel channel) throws Exception {
-                    if (!removePendingStream(streamId)) {
+                protected void initChannel(SocketChannel channel) {
+                    if (channelHandlerMap.get(streamId) != localSpecusHandler) {
+                        // Reset before the channel even registered.
                         channel.close();
                         return;
                     }
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), localSpecusHandler);
-                    LocalSpecusHandler existing = channelHandlerMap.putIfAbsent(streamId, localSpecusHandler);
-                    if (existing != null) {
-                        sendReset(streamId, 7, "duplicate TCP stream");
-                        channel.close();
-                        return;
-                    }
                     channelGroup.add(channel);
-                    channel.closeFuture().addListener(future -> {
-                        removeLocalHandler(streamId, localSpecusHandler);
-                    });
                 }
             });
-        } catch (Exception e) {
-            // An unreachable target fails this stream only. Letting the exception reach the
-            // pipeline would close the data connection and every other stream on it.
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            log.warn("Local connect for stream {} to {}:{} failed: {}", Integer.toUnsignedString(streamId),
-                    specusConfig.getSpecusAddress(), specusConfig.getSpecusPort(), e.toString());
-            channelHandlerMap.remove(streamId, localSpecusHandler);
-            sendReset(streamId, 1, "local connect failed");
+        } catch (RuntimeException e) {
+            // A connect that cannot even start fails this stream only. Letting the exception reach
+            // the pipeline would close the data connection and every other stream on it.
+            localTcpConnectFailed(streamId, localSpecusHandler, address, targetPort, e);
+            return;
         }
+        Channel localChannel = connectFuture.channel();
+        localSpecusHandler.connecting(localChannel);
+        localChannel.closeFuture().addListener(future -> removeLocalHandler(streamId, localSpecusHandler));
+        connectFuture.addListener((ChannelFuture future) ->
+                localSpecusHandler.connectFinished(future, address, targetPort));
+    }
+
+    /**
+     * Called on the local channel's loop once its connect succeeded. Returns false when the stream
+     * no longer belongs to this handler or the data connection is gone, and the caller closes it.
+     */
+    boolean localTcpConnected(int streamId, LocalSpecusHandler handler) {
+        removePendingStream(streamId);
+        return channelHandlerMap.get(streamId) == handler && ctx != null && ctx.channel().isActive();
+    }
+
+    /**
+     * Fails one stream whose local connect did not succeed. An unreachable target is that stream's
+     * failure alone: it gets a reset with the reason it always had, and the data connection and
+     * every other stream on it keep going.
+     */
+    void localTcpConnectFailed(int streamId, LocalSpecusHandler handler, String address, int port,
+                               Throwable cause) {
+        log.warn("Local connect for stream {} to {}:{} failed: {}", Integer.toUnsignedString(streamId),
+                address, port, cause == null ? "unknown" : cause.toString());
+        channelHandlerMap.remove(streamId, handler);
+        removePendingStream(streamId);
+        resetTcpStream(streamId, 1, "local connect failed");
+    }
+
+    /** The handler of a TCP stream, connected or still connecting; for tests. */
+    LocalSpecusHandler localTcpStream(int streamId) {
+        return channelHandlerMap.get(streamId);
     }
 
     /**

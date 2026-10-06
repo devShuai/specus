@@ -2,7 +2,6 @@ package com.theshuai.specusclient.client;
 
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
@@ -37,26 +36,29 @@ public class TcpConnection implements AutoCloseable {
     }
 
     /**
-     * Connects one local stream. A failure belongs to that stream alone: the worker group also
-     * carries every other stream's local channel, so it is left running for them.
+     * Starts connecting one local stream and returns its connect future at once. The future's
+     * channel is already bound to its event loop, and the future completes on that loop.
+     *
+     * <p>Nothing waits on the connect here: the caller is the data connection's loop, and waiting
+     * on it would stall every other stream on that connection for as long as one target takes to
+     * answer. A failure belongs to that stream alone: the worker group also carries every other
+     * stream's local channel, so it is left running for them.
      */
-    public ChannelFuture connect(String host, int port, ChannelInitializer<SocketChannel> channelInitializer) throws InterruptedException {
+    public ChannelFuture connect(String host, int port, ChannelInitializer<SocketChannel> channelInitializer) {
         EventLoopGroup group = ensureWorkerGroup();
         Bootstrap b = new Bootstrap();
         b.group(group);
         b.channel(NioSocketChannel.class);
         b.option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
-        // The data connection's loop waits on this connect, so an unreachable target gives up
-        // after the same 5 seconds the Go and .NET clients allow, not Netty's 30 second default.
+        // An unreachable target gives up after the same 5 seconds the Go and .NET clients allow,
+        // not Netty's 30 second default.
         b.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS);
         b.option(ChannelOption.SO_KEEPALIVE, true);
         b.option(ChannelOption.TCP_NODELAY, true);
         b.option(ChannelOption.ALLOW_HALF_CLOSURE, true);
         b.option(ChannelOption.WRITE_BUFFER_WATER_MARK, DEFAULT_WRITE_BUFFER_WATER_MARK);
         b.handler(channelInitializer);
-
-        Channel channel = b.connect(host, port).sync().channel();
-        return channel.closeFuture();
+        return b.connect(host, port);
     }
 
     @Override
