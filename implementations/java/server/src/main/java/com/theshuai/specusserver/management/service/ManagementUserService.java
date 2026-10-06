@@ -9,6 +9,7 @@ import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -32,13 +33,24 @@ import java.util.UUID;
 public class ManagementUserService {
     private final ManagementUserRepository repository;
     private final AuthProperties authProperties;
+    /** Ends the shares a user can no longer back; absent only in isolated unit tests. */
+    private final HttpShareService httpShareService;
+    /** Forgets a deleted account's workbench lists; absent only in isolated unit tests. */
     private final WorkbenchReferences workbenchReferences;
 
     public ManagementUserService(ManagementUserRepository repository,
+                                 AuthProperties authProperties) {
+        this(repository, authProperties, null, null);
+    }
+
+    @Autowired
+    public ManagementUserService(ManagementUserRepository repository,
                                  AuthProperties authProperties,
+                                 HttpShareService httpShareService,
                                  WorkbenchReferences workbenchReferences) {
         this.repository = repository;
         this.authProperties = authProperties;
+        this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
     }
 
@@ -405,7 +417,11 @@ public class ManagementUserService {
             user.setEnabled(request.enabled());
         }
         user.setUpdatedAt(Instant.now().toString());
-        return toView(repository.save(user));
+        ManagementUserView view = toView(repository.save(user));
+        if (request.role() != null || request.enabled() != null) {
+            endSharesWithoutCreatorAccess(context, user);
+        }
+        return view;
     }
 
     /** Deletes an account of the caller's tenant and returns its login name. */
@@ -420,9 +436,24 @@ public class ManagementUserService {
         // The workbench lists are personal history: they go with the account, in this transaction,
         // so an account created later under the same name starts empty. The identity is the one
         // the management context carries: tenant and canonical login name of the account record.
-        workbenchReferences.forgetIdentity(TenantContext.normalize(user.getTenantId()), loginName(user));
+        if (workbenchReferences != null) {
+            workbenchReferences.forgetIdentity(TenantContext.normalize(user.getTenantId()), loginName(user));
+        }
         repository.delete(user);
+        endSharesWithoutCreatorAccess(context, user);
         return loginName(user);
+    }
+
+    /**
+     * Same transaction as the user change: the user's own active HTTP shares end when the user can
+     * no longer manage their route. Shares are recorded by login name, and a later user with the
+     * same name must not inherit them.
+     */
+    private void endSharesWithoutCreatorAccess(ManagementContext context, ManagementUser user) {
+        if (httpShareService != null) {
+            httpShareService.onUserChanged(context.username(), TenantContext.normalize(user.getTenantId()),
+                    loginName(user));
+        }
     }
 
     /**

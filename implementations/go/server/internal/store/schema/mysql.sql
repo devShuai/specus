@@ -723,3 +723,36 @@ CREATE TABLE IF NOT EXISTS product_metrics_transfer_daily (
   count BIGINT NOT NULL,
   PRIMARY KEY (tenant_id, day, mode, path, size_bucket, attempt, outcome)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS http_share (
+  share_id VARCHAR(16) NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  route_id BIGINT NOT NULL,
+  token_sha256 VARCHAR(64) NOT NULL,
+  access VARCHAR(8) NOT NULL,
+  path_prefix VARCHAR(256) NOT NULL,
+  label VARCHAR(255),
+  created_by VARCHAR(120) NOT NULL,
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  revoked_at BIGINT,
+  revoked_by VARCHAR(120),
+  revoke_reason VARCHAR(40),
+  expiry_recorded TINYINT NOT NULL DEFAULT 0,
+  KEY idx_http_share_route (route_id),
+  KEY idx_http_share_creator (tenant_id, created_by),
+  KEY idx_http_share_expires (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS http_access_audit (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  occurred_at BIGINT NOT NULL,
+  actor VARCHAR(120),
+  action VARCHAR(40) NOT NULL,
+  route_id BIGINT NOT NULL,
+  share_id VARCHAR(16),
+  detail_json VARCHAR(512) NOT NULL,
+  KEY idx_http_access_audit_route (tenant_id, route_id, id),
+  KEY idx_http_access_audit_at (occurred_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

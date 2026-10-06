@@ -39,15 +39,18 @@ public class HttpRouteService {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final ClientAccountRepository clientAccountRepository;
     private final NatControlService natControlService;
+    private final HttpShareService httpShareService;
     private final WorkbenchReferences workbenchReferences;
 
     public HttpRouteService(HttpRouteMappingRepository httpRouteMappingRepository,
                             ClientAccountRepository clientAccountRepository,
                             NatControlService natControlService,
+                            HttpShareService httpShareService,
                             WorkbenchReferences workbenchReferences) {
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.clientAccountRepository = clientAccountRepository;
         this.natControlService = natControlService;
+        this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
     }
 
@@ -89,16 +92,16 @@ public class HttpRouteService {
     @Transactional
     public HttpRouteView createRoute(TenantContext tenant, long clientId, RouteMutation request) {
         ClientAccount account = findClient(tenant, clientId);
-        return createRoute(tenant, account, request);
+        return createRoute(tenant, account, request, null);
     }
 
     @Transactional
     public HttpRouteView createRoute(ManagementContext context, long clientId, RouteMutation request) {
         ClientAccount account = findClient(context, clientId);
-        return createRoute(context.tenant(), account, request);
+        return createRoute(context.tenant(), account, request, context.username());
     }
 
-    private HttpRouteView createRoute(TenantContext tenant, ClientAccount account, RouteMutation request) {
+    private HttpRouteView createRoute(TenantContext tenant, ClientAccount account, RouteMutation request, String actor) {
         String route = requireRoute(request.route());
         String targetBaseUrl = requireTargetBaseUrl(request.targetBaseUrl());
         httpRouteMappingRepository.findByTenantIdAndClientIdAndRoute(tenant.tenantId(), account.getId(), route).ifPresent(existing -> {
@@ -122,6 +125,8 @@ public class HttpRouteService {
         row.setCreatedAt(now);
         row.setUpdatedAt(now);
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
+        // Same transaction: the route.created audit entry fails the creation if it cannot be written.
+        httpShareService.onRouteCreated(actor, saved);
         natControlService.pushSnapshotIfOnline(account);
         return toView(saved);
     }
@@ -135,7 +140,7 @@ public class HttpRouteService {
     public HttpRouteView updateRoute(TenantContext tenant, long id, RouteMutation request) {
         HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
-        return updateRoute(tenant, row, request);
+        return updateRoute(tenant, row, request, null);
     }
 
     @Transactional
@@ -143,11 +148,14 @@ public class HttpRouteService {
         HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
                 .filter(route -> canAccessClient(context, route.getClientId()))
                 .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
-        return updateRoute(context.tenant(), row, request);
+        return updateRoute(context.tenant(), row, request, context.username());
     }
 
-    private HttpRouteView updateRoute(TenantContext tenant, HttpRouteMapping row, RouteMutation request) {
+    private HttpRouteView updateRoute(TenantContext tenant, HttpRouteMapping row, RouteMutation request,
+                                      String actor) {
         String route = requireRoute(request.route());
+        String exposureBefore = HttpShareService.exposure(row);
+        String authUsernameBefore = row.getAuthUsername();
         String targetBaseUrl = requireTargetBaseUrl(request.targetBaseUrl());
         boolean dataPlaneChanged = !Objects.equals(route, row.getRoute())
                 || !Objects.equals(targetBaseUrl, row.getTargetBaseUrl())
@@ -181,8 +189,14 @@ public class HttpRouteService {
             row.setInsecureSkipVerify(request.insecureSkipVerify());
         }
         applyAuthentication(row, request, false);
+        // A new Basic username or password on a protected route is audited; it never ends shares.
+        boolean credentialsChanged = Boolean.TRUE.equals(row.getAuthEnabled())
+                && (!Objects.equals(authUsernameBefore, row.getAuthUsername())
+                || StringUtils.hasText(request.authPassword()));
         row.setUpdatedAt(Instant.now().toString());
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
+        // Same transaction: exposure audit and, when the route is no longer protected, its shares end.
+        httpShareService.onRouteUpdated(actor, saved, exposureBefore, credentialsChanged);
 
         if (dataPlaneChanged) {
             ClientAccount account = clientAccountRepository
@@ -225,7 +239,7 @@ public class HttpRouteService {
     public void deleteRoute(TenantContext tenant, long id) {
         HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
-        deleteRoute(tenant, row);
+        deleteRoute(tenant, row, null);
     }
 
     @Transactional
@@ -233,14 +247,16 @@ public class HttpRouteService {
         HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
                 .filter(route -> canAccessClient(context, route.getClientId()))
                 .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
-        deleteRoute(context.tenant(), row);
+        deleteRoute(context.tenant(), row, context.username());
     }
 
-    private void deleteRoute(TenantContext tenant, HttpRouteMapping row) {
+    private void deleteRoute(TenantContext tenant, HttpRouteMapping row, String actor) {
         // Same transaction: no workbench favourite or recent open outlives the route.
         workbenchReferences.forgetObject(WorkbenchReferences.HTTP_ROUTE, row.getId());
         httpRouteMappingRepository.delete(row);
         httpRouteMappingRepository.flush();
+        // Same transaction: route.deleted is audited and every active share of the route ends.
+        httpShareService.onRouteDeleted(actor, row);
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(row.getClientId(), tenant.tenantId()).orElse(null);
         if (account != null) {
             natControlService.pushSnapshotIfOnline(account);

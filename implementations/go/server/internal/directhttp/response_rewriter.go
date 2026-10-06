@@ -43,6 +43,17 @@ func newResponseRewriter(maxBodyBytes int) responseRewriter {
 }
 
 func (rw responseRewriter) rewrite(body []byte, clientName, route string, headers []string) ([]byte, bool) {
+	return rw.rewriteWithPrefix(body, routePrefix(clientName, route), headers)
+}
+
+// routePrefix is the public entry of a route.
+func routePrefix(clientName, route string) string {
+	return "/http/" + url.PathEscape(clientName) + "/" + url.PathEscape(route)
+}
+
+// rewriteWithPrefix rewrites root-relative paths in the body under prefix: the route entry
+// /http/{clientName}/{route}, or /http-share/{shareId} for a share.
+func (rw responseRewriter) rewriteWithPrefix(body []byte, prefix string, headers []string) ([]byte, bool) {
 	if len(body) == 0 || rw.maxBodyBytes == 0 || len(body) > rw.maxBodyBytes {
 		return nil, false
 	}
@@ -54,7 +65,6 @@ func (rw responseRewriter) rewrite(body []byte, clientName, route string, header
 	if !ok {
 		return nil, false
 	}
-	prefix := "/http/" + url.PathEscape(clientName) + "/" + url.PathEscape(route)
 	text := string(plain)
 	rewritten := text
 	if contentType == "text/html" {

@@ -44,6 +44,8 @@ public static class ManagementPageSecurityHeaders
         return app;
     }
 
+    // Temporary shares (/http-share/) are target applications too: the portal's CSP,
+    // X-Frame-Options and Referrer-Policy must not reach them.
     private static bool IsHttpSpecusIngress(PathString path) =>
-        path.StartsWithSegments("/http");
+        path.StartsWithSegments("/http") || path.StartsWithSegments("/http-share");
 }

@@ -80,6 +80,8 @@ import type {
   WorkbenchKind,
   WorkbenchRef,
 } from "./types";
+import type { CreateShareBody, CreatedHttpShare, HttpAccessAuditPage, HttpShare } from "../lib/httpShare";
+import { shareManagementMessage } from "../lib/httpShare";
 import { recordWorkbenchOpen, type WorkbenchOpenAction } from "../lib/workbenchRecording";
 import {
   fetchLatestGithubClientDownloads,
@@ -144,10 +146,16 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandled = false;
 }
 
-/** An admin API refusal; status is the HTTP status (0 when the request never got an answer). */
+/**
+ * An admin API refusal; status is the HTTP status (0 when the request never got an answer) and code
+ * the machine-readable code of a `{"code": ...}` error body, when the server sent one.
+ */
 export class ApiError extends Error {
-  constructor(message: string, readonly status = 0) {
+  readonly code?: string;
+
+  constructor(message: string, readonly status = 0, code?: string) {
     super(message);
+    this.code = code;
   }
 }
 
@@ -174,13 +182,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
     // An error page from a proxy or an older server is not JSON; keep the status either way.
-    let body: { error?: string } | null = null;
+    let body: { error?: string; code?: string; message?: string } | null = null;
     try {
       body = text ? JSON.parse(text) : null;
     } catch {
       body = null;
     }
-    throw new ApiError(body?.error || response.statusText, response.status);
+    throw new ApiError(body?.error || shareManagementMessage(body?.code) || body?.message || response.statusText,
+      response.status, body?.code);
   }
   return (text ? JSON.parse(text) : null) as T;
 }
@@ -441,6 +450,19 @@ export const adminApi = {
   updateHttpRoute: (id: number, body: HttpRouteMutation) =>
     request<HttpRoute>(`/http-routes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteHttpRoute: (id: number) => request<null>(`/http-routes/${id}`, { method: "DELETE" }),
+  listHttpShares: (routeId: number) =>
+    request<{ shares: HttpShare[] }>(`/http-routes/${routeId}/shares`).then((body) => body?.shares ?? []),
+  createHttpShare: (routeId: number, body: CreateShareBody) =>
+    request<CreatedHttpShare>(`/http-routes/${routeId}/shares`, { method: "POST", body: JSON.stringify(body) }),
+  revokeHttpShare: (routeId: number, shareId: string) =>
+    request<{ share: HttpShare }>(`/http-routes/${routeId}/shares/${encodeURIComponent(shareId)}/revoke`, {
+      method: "POST",
+      body: "{}",
+    }).then((body) => body.share),
+  listHttpRouteAccessAudit: (routeId: number, limit = 50, before?: number) =>
+    request<HttpAccessAuditPage>(
+      `/http-routes/${routeId}/access-audit?limit=${limit}${before != null ? `&before=${before}` : ""}`,
+    ),
   checkHttpRouteConnectivity: (id: number, path?: string) => checkHttpRouteConnectivity(id, path),
 
   listConnections: (query: ConnectionQuery) => {

@@ -753,3 +753,38 @@ CREATE TABLE IF NOT EXISTS product_metrics_transfer_daily (
   count BIGINT NOT NULL,
   PRIMARY KEY (tenant_id, day, mode, path, size_bucket, attempt, outcome)
 );
+
+CREATE TABLE IF NOT EXISTS http_share (
+  share_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  route_id INTEGER NOT NULL,
+  token_sha256 TEXT NOT NULL,
+  access TEXT NOT NULL,
+  path_prefix TEXT NOT NULL,
+  label TEXT,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  revoked_by TEXT,
+  revoke_reason TEXT,
+  expiry_recorded INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_http_share_route ON http_share (route_id);
+CREATE INDEX IF NOT EXISTS idx_http_share_creator ON http_share (tenant_id, created_by);
+CREATE INDEX IF NOT EXISTS idx_http_share_expires ON http_share (expires_at);
+
+CREATE TABLE IF NOT EXISTS http_access_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL,
+  occurred_at INTEGER NOT NULL,
+  actor TEXT,
+  action TEXT NOT NULL,
+  route_id INTEGER NOT NULL,
+  share_id TEXT,
+  detail_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit (tenant_id, route_id, id);
+CREATE INDEX IF NOT EXISTS idx_http_access_audit_at ON http_access_audit (occurred_at);

@@ -6,6 +6,7 @@ import com.theshuai.common.protocol.WebSocketSpecusFrame;
 import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.specusserver.handler.NatServerHandler;
 import com.theshuai.specusserver.handler.SpecusStreamIds;
+import com.theshuai.specusserver.httpshare.HttpShareStreamRegistry;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
@@ -87,11 +88,16 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         Channel controlChannel = SessionUtil.getDataChannel(clientName);
         if (controlChannel == null || !controlChannel.isActive()) {
             log.warn("[ws-specus][server] clientName={} rejected=client-offline channelId={}", clientName, channelId);
+            releaseShareStream(session);
             session.close(CloseStatus.SERVER_ERROR.withReason("客户端不在线"));
             return;
         }
 
         registry.register(streamId, channelId, session, clientName);
+        if (session.getAttributes().get(ATTR_SHARE_STREAM) instanceof HttpShareStreamRegistry.InFlight shareStream) {
+            // A share that ends (revoked, expired, lapsed) closes this WebSocket with 1008.
+            shareStream.attach(() -> terminate(channelId, CloseStatus.POLICY_VIOLATION, "HTTP share ended"));
+        }
         markStreamOpened(controlChannel, streamId);
         StreamFlowController.get(controlChannel).open(streamId, null);
         channelClientNames.put(channelId, clientName);
@@ -181,6 +187,41 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
         log.info("[ws-specus][browser-closed] channelId={} status={}", channelId, status);
         detachBrowser(channelId, status, false);
+        releaseShareStream(session);
+    }
+
+    /**
+     * Tears a tunnel WebSocket down from the server side: the device gets a NAT RST for the stream
+     * and the browser a close frame with {@code status}. Used when a temporary share ends.
+     */
+    public void terminate(String channelId, CloseStatus status, String resetReason) {
+        String clientName = channelClientNames.remove(channelId);
+        Integer streamId = channelStreamIds.remove(channelId);
+        Channel controlChannel = clientName == null || streamId == null
+                ? null : SessionUtil.getDataChannel(clientName);
+        WebSocketSession session = registry.remove(channelId);
+        if (streamId != null) {
+            clearFragmentState(streamId);
+        }
+        if (controlChannel != null && controlChannel.isActive()) {
+            markStreamClosed(controlChannel, streamId);
+            StreamFlowController.get(controlChannel).reset(streamId, 8, resetReason);
+        }
+        if (session != null && session.isOpen()) {
+            try {
+                synchronized (session) {
+                    session.close(status);
+                }
+            } catch (Exception e) {
+                log.debug("[ws-specus] terminate session {} failed: {}", channelId, e.toString());
+            }
+        }
+    }
+
+    private static void releaseShareStream(WebSocketSession session) {
+        if (session.getAttributes().get(ATTR_SHARE_STREAM) instanceof HttpShareStreamRegistry.InFlight shareStream) {
+            shareStream.release();
+        }
     }
 
     @Override
@@ -392,4 +433,6 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     static final String ATTR_RAW_QUERY = "ws.rawQuery";
     static final String ATTR_HEADERS = "ws.headers";
     static final String ATTR_BODY = "ws.body";
+    /** The in-flight slot of a WebSocket opened through a temporary share, if any. */
+    static final String ATTR_SHARE_STREAM = "ws.shareStream";
 }

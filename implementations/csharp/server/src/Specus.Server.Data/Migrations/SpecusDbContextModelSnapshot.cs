@@ -658,6 +658,60 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("specus_connection_stat", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.HttpAccessAudit", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("Action")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("action");
+
+                    b.Property<string>("Actor")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("actor");
+
+                    b.Property<string>("DetailJson")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("detail_json");
+
+                    b.Property<long>("OccurredAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("occurred_at");
+
+                    b.Property<long>("RouteId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("route_id");
+
+                    b.Property<string>("ShareId")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("share_id");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OccurredAt")
+                        .HasDatabaseName("idx_http_access_audit_at");
+
+                    b.HasIndex("TenantId", "RouteId", "Id")
+                        .HasDatabaseName("idx_http_access_audit_route");
+
+                    b.ToTable("http_access_audit", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.HttpMediaCapture", b =>
                 {
                     b.Property<long>("Id")
@@ -996,6 +1050,94 @@ namespace Specus.Server.Data.Migrations
                         .HasDatabaseName("idx_http_route_tenant_client_enabled_id");
 
                     b.ToTable("http_route_mapping", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.HttpShare", b =>
+                {
+                    b.Property<string>("ShareId")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("share_id");
+
+                    b.Property<string>("Access")
+                        .IsRequired()
+                        .HasMaxLength(8)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("access");
+
+                    b.Property<long>("CreatedAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("CreatedBy")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_by");
+
+                    b.Property<long>("ExpiresAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("expires_at");
+
+                    b.Property<sbyte>("ExpiryRecorded")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue((sbyte)0)
+                        .HasColumnName("expiry_recorded");
+
+                    b.Property<string>("Label")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("label");
+
+                    b.Property<string>("PathPrefix")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("path_prefix");
+
+                    b.Property<string>("RevokeReason")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("revoke_reason");
+
+                    b.Property<long?>("RevokedAt")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("revoked_at");
+
+                    b.Property<string>("RevokedBy")
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("revoked_by");
+
+                    b.Property<long>("RouteId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("route_id");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("TokenSha256")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("token_sha256");
+
+                    b.HasKey("ShareId");
+
+                    b.HasIndex("ExpiresAt")
+                        .HasDatabaseName("idx_http_share_expires");
+
+                    b.HasIndex("RouteId")
+                        .HasDatabaseName("idx_http_share_route");
+
+                    b.HasIndex("TenantId", "CreatedBy")
+                        .HasDatabaseName("idx_http_share_creator");
+
+                    b.ToTable("http_share", (string)null);
                 });
 
             modelBuilder.Entity("Specus.Server.Data.Entities.HttpTrafficExchange", b =>

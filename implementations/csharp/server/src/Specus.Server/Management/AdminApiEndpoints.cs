@@ -700,6 +700,7 @@ public static class AdminApiEndpoints
                 return Results.NoContent();
             });
 
+        app.MapHttpShareApi();
         // The route id is matched as text: a malformed id is a 404 like any other invisible
         // route, and only after the body was found valid.
         app.MapPost(ConnectivityCheckEndpoint.Pattern,

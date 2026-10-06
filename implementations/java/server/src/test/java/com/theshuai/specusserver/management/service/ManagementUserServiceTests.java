@@ -35,7 +35,7 @@ class ManagementUserServiceTests {
         AuthProperties properties = new AuthProperties();
         properties.setUsername("dungouji");
         properties.setTenantId("default");
-        service = new ManagementUserService(repository, properties, mock(WorkbenchReferences.class));
+        service = new ManagementUserService(repository, properties, null, mock(WorkbenchReferences.class));
         when(repository.save(any(ManagementUser.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
         when(repository.saveAndFlush(any(ManagementUser.class)))

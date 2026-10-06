@@ -104,6 +104,14 @@ func (db *DB) UpdateClientAndRenameReferences(ctx context.Context, account Clien
 		return err
 	}
 	defer tx.Rollback()
+	if err := db.updateClientAndRenameReferences(ctx, tx, account, oldName); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (db *DB) updateClientAndRenameReferences(ctx context.Context, tx sqlRunner, account ClientAccount,
+	oldName string) error {
 	accountUpdate := db.rebind(`UPDATE specus_client_account SET owner_username = ?, client_name = ?,
 		password_hash = ?, enabled = ?, connection_rate_limit_per_minute = ?, updated_at = ? WHERE id = ?`)
 	if _, err := tx.ExecContext(ctx, accountUpdate, defaultOwner(account.OwnerUsername), account.ClientName,
@@ -131,7 +139,7 @@ func (db *DB) UpdateClientAndRenameReferences(ctx context.Context, account Clien
 			}
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // DeleteClient removes a client account and its specus/http-route mappings, together with every
@@ -606,11 +614,15 @@ func (db *DB) RouteInUse(ctx context.Context, clientID int64, route string, excl
 
 // InsertHTTPRoute persists a new HTTP route mapping (id is caller-assigned).
 func (db *DB) InsertHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
+	return db.insertHTTPRoute(ctx, db.sql, r)
+}
+
+func (db *DB) insertHTTPRoute(ctx context.Context, runner sqlRunner, r HTTPRouteMapping) error {
 	query := db.rebind(`INSERT INTO http_route_mapping
 		(id, tenant_id, client_id, client_name, route, target_base_url, enabled, detail_capture_enabled,
 		 media_capture_enabled, path_rewrite_enabled, auth_enabled, auth_username, auth_password_hash, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, r.ID, defaultTenant(r.TenantID), r.ClientID, r.ClientName, r.Route,
+	_, err := runner.ExecContext(ctx, query, r.ID, defaultTenant(r.TenantID), r.ClientID, r.ClientName, r.Route,
 		r.TargetBaseURL, boolToInt(r.Enabled), boolToInt(r.DetailCaptureEnabled),
 		boolToInt(r.MediaCaptureEnabled), boolToInt(r.PathRewriteEnabled), boolToInt(r.AuthEnabled), r.AuthUsername, r.AuthPasswordHash,
 		formatTime(r.CreatedAt), formatTime(r.UpdatedAt))
@@ -619,10 +631,14 @@ func (db *DB) InsertHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
 
 // UpdateHTTPRoute updates an HTTP route mapping's mutable fields.
 func (db *DB) UpdateHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
+	return db.updateHTTPRoute(ctx, db.sql, r)
+}
+
+func (db *DB) updateHTTPRoute(ctx context.Context, runner sqlRunner, r HTTPRouteMapping) error {
 	query := db.rebind(`UPDATE http_route_mapping SET route = ?, target_base_url = ?, enabled = ?,
 		detail_capture_enabled = ?, media_capture_enabled = ?, path_rewrite_enabled = ?, auth_enabled = ?, auth_username = ?,
 		auth_password_hash = ?, updated_at = ? WHERE id = ?`)
-	_, err := db.sql.ExecContext(ctx, query, r.Route, r.TargetBaseURL, boolToInt(r.Enabled),
+	_, err := runner.ExecContext(ctx, query, r.Route, r.TargetBaseURL, boolToInt(r.Enabled),
 		boolToInt(r.DetailCaptureEnabled), boolToInt(r.MediaCaptureEnabled), boolToInt(r.PathRewriteEnabled), boolToInt(r.AuthEnabled),
 		r.AuthUsername, r.AuthPasswordHash, formatTime(r.UpdatedAt), r.ID)
 	return err

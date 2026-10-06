@@ -21,7 +21,7 @@ namespace Specus.Server.Http;
 /// strips hop-by-hop headers, bounds request bodies, and delegates the control-channel round trip
 /// to <see cref="DirectHttpDispatcher"/>.
 /// </summary>
-public static class DirectHttpEndpoints
+public static partial class DirectHttpEndpoints
 {
     private static readonly FrozenSet<string> SkippedHeaders = new[]
     {
@@ -52,6 +52,10 @@ public static class DirectHttpEndpoints
     {
         app.MapMethods("/http/{clientName}/{route}/{**rest}", Methods, ForwardAsync);
         app.MapMethods("/http/{clientName}/{route}", Methods, ForwardAsync);
+        // Temporary shares have their own root: they never take the route's Basic gate or the
+        // device and route names into the URL (temporary-http-share.md §6).
+        app.MapMethods("/http-share/{shareId}/{**rest}", Methods, ForwardShareAsync);
+        app.MapMethods("/http-share/{shareId}", Methods, ForwardShareAsync);
     }
 
     private static async Task ForwardAsync(HttpContext context, string clientName, string route,
@@ -109,26 +113,60 @@ public static class DirectHttpEndpoints
             return;
         }
 
+        var target = new ForwardTarget(clientName, route, relativePath,
+            StripAuthorization: accessPolicy.AuthEnabled,
+            PathRewriteEnabled: accessPolicy.PathRewriteEnabled,
+            RewritePrefix: ResponseRewriter.RoutePrefix(clientName, route),
+            ShareId: null,
+            Cut: CancellationToken.None);
         if (RawServerWebSocketConnection.LooksLikeWebSocketUpgrade(context.Request))
         {
-            try
-            {
-                await ForwardWebSocketAsync(context, clientName, route, relativePath, dispatcher,
-                    accessPolicy.AuthEnabled).ConfigureAwait(false);
-            }
-            catch (RawWebSocketHandshakeException ex) when (!context.Response.HasStarted)
-            {
-                await WriteTextErrorAsync(context.Response, ex.StatusCode, ex.Message)
-                    .ConfigureAwait(false);
-            }
+            await ForwardWebSocketUpgradeAsync(context, target, dispatcher).ConfigureAwait(false);
             return;
         }
+        await ForwardHttpAsync(context, target, dispatcher, traffic, options.Value, inspection,
+            mediaCaptures, logger, startedAt).ConfigureAwait(false);
+    }
 
-        var requestHeaders = RequestHeaders(context.Request, accessPolicy.AuthEnabled, false);
+    /// <summary>
+    /// Where and how one admitted request is forwarded: the client and route names the NAT OPEN
+    /// carries, the raw relative path, the path-rewrite prefix, and for a temporary share its id
+    /// (cookie stripping and response rewriting) and the token that cuts the stream when the
+    /// share ends.
+    /// </summary>
+    private sealed record ForwardTarget(string ClientName, string Route, string RelativePath,
+        bool StripAuthorization, bool PathRewriteEnabled, string RewritePrefix, string? ShareId,
+        CancellationToken Cut);
+
+    private static async Task ForwardWebSocketUpgradeAsync(HttpContext context, ForwardTarget target,
+        DirectHttpDispatcher dispatcher)
+    {
+        try
+        {
+            await ForwardWebSocketAsync(context, target, dispatcher).ConfigureAwait(false);
+        }
+        catch (RawWebSocketHandshakeException ex) when (!context.Response.HasStarted)
+        {
+            await WriteTextErrorAsync(context.Response, ex.StatusCode, ex.Message)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static async Task ForwardHttpAsync(HttpContext context, ForwardTarget target,
+        DirectHttpDispatcher dispatcher, TrafficUsageService traffic, DirectHttpOptions options,
+        TrafficInspectionService inspection, HttpMediaCaptureService mediaCaptures, ILogger logger,
+        DateTimeOffset startedAt)
+    {
+        var clientName = target.ClientName;
+        var route = target.Route;
+        var relativePath = target.RelativePath;
+        var requestHeaders = ShareRequestHeaders(target,
+            RequestHeaders(context.Request, target.StripAuthorization, false));
         var requestCapture = new LimitedCapture(64 * 1024);
         var responseCapture = new LimitedCapture(64 * 1024);
         IHttpMediaCaptureSession? mediaCapture = null;
-        var requestTrailerNames = DeclaredRequestTrailers(context.Request, accessPolicy.AuthEnabled);
+        var requestTrailerNames = ShareTrailerNames(target,
+            DeclaredRequestTrailers(context.Request, target.StripAuthorization));
         var requestMetadata = new Dictionary<string, object?>
         {
             ["source"] = "http",
@@ -144,7 +182,7 @@ public static class DirectHttpEndpoints
         {
             requestMetadata["contentLength"] = contentLength;
         }
-        if (context.Request.ContentLength > options.Value.MaxRequestBodySize)
+        if (context.Request.ContentLength > options.MaxRequestBodySize)
         {
             const string message = "HTTP 请求体超过限制";
             var responseBody = Encoding.UTF8.GetBytes(message);
@@ -163,13 +201,21 @@ public static class DirectHttpEndpoints
         {
             await using var stream = await dispatcher.OpenAsync(clientName, requestMetadata,
                     context.RequestAborted).ConfigureAwait(false);
+            // A share that ends while this request is in flight cuts it: the public response is
+            // aborted first so nothing more reaches the visitor, then the device gets a RST.
+            using var cutRegistration = target.Cut.Register(static state =>
+            {
+                var (httpContext, httpStream) = ((HttpContext, HttpSpecusStream))state!;
+                httpContext.Abort();
+                _ = ResetQuietlyAsync(httpStream);
+            }, (context, stream));
             using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
             var pumpTask = PumpRequestAsync(context, stream, traffic, clientName, route,
-                requestCapture, options.Value.MaxRequestBodySize, accessPolicy.AuthEnabled,
+                requestCapture, options.MaxRequestBodySize, target.StripAuthorization,
                 requestTrailerNames, pumpCts.Token);
 
             using var headCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
-            headCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Max(1, options.Value.TimeoutMs)));
+            headCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Max(1, options.TimeoutMs)));
             Dictionary<string, object?> head;
             try
             {
@@ -210,7 +256,7 @@ public static class DirectHttpEndpoints
                 context.Response.DeclareTrailer(trailerName);
             }
 
-            var rewrite = accessPolicy.PathRewriteEnabled && IsRewritable(originalResponseHeaders);
+            var rewrite = target.PathRewriteEnabled && IsRewritable(originalResponseHeaders);
             using var rewriteBuffer = new MemoryStream();
             var responseStarted = false;
             List<string>? responseTrailers = null;
@@ -222,7 +268,10 @@ public static class DirectHttpEndpoints
                     return;
                 }
                 context.Response.StatusCode = validStatusCode;
-                CopyHeaders(responseHeaders, context.Response);
+                CopyHeaders(target.ShareId is null
+                    ? responseHeaders
+                    : HttpShareProtocol.ResponseHeaders(validStatusCode, responseHeaders ?? [], target.ShareId),
+                    context.Response);
                 responseStarted = true;
             }
 
@@ -256,7 +305,7 @@ public static class DirectHttpEndpoints
                 responseCapture.Write(data);
                 traffic.RecordHttpDownload(clientName, route, data.Length);
 
-                if (rewrite && rewriteBuffer.Length + data.Length <= options.Value.RewriteMaxBodyBytes)
+                if (rewrite && rewriteBuffer.Length + data.Length <= options.RewriteMaxBodyBytes)
                 {
                     await rewriteBuffer.WriteAsync(data, context.RequestAborted).ConfigureAwait(false);
                     await stream.ConsumeResponseAsync(data.Length, context.RequestAborted).ConfigureAwait(false);
@@ -281,8 +330,8 @@ public static class DirectHttpEndpoints
             if (rewrite)
             {
                 var body = rewriteBuffer.ToArray();
-                if (ResponseRewriter.TryRewrite(body, clientName, route, originalResponseHeaders,
-                        options.Value.RewriteMaxBodyBytes, out var rewritten))
+                if (ResponseRewriter.TryRewriteWithPrefix(body, target.RewritePrefix, originalResponseHeaders,
+                        options.RewriteMaxBodyBytes, out var rewritten))
                 {
                     body = rewritten;
                     responseHeaders = StripRewriteHeaders(responseHeaders);
@@ -484,18 +533,20 @@ public static class DirectHttpEndpoints
         return headers;
     }
 
-    private static async Task ForwardWebSocketAsync(HttpContext context, string clientName,
-        string route, string relativePath, DirectHttpDispatcher dispatcher, bool stripAuthorization)
+    private static async Task ForwardWebSocketAsync(HttpContext context, ForwardTarget target,
+        DirectHttpDispatcher dispatcher)
     {
+        var clientName = target.ClientName;
         var metadata = new Dictionary<string, object?>
         {
             ["source"] = "ws",
             ["channelId"] = Guid.NewGuid().ToString(),
             ["clientName"] = clientName,
-            ["route"] = route,
-            ["relativePath"] = relativePath,
+            ["route"] = target.Route,
+            ["relativePath"] = target.RelativePath,
             ["rawQuery"] = RawQuery(context.Request.QueryString),
-            ["headers"] = RequestHeaders(context.Request, stripAuthorization, true),
+            ["headers"] = ShareRequestHeaders(target,
+                RequestHeaders(context.Request, target.StripAuthorization, true)),
             ["body"] = Array.Empty<byte>(),
         };
 
@@ -518,9 +569,19 @@ public static class DirectHttpEndpoints
 
         await using var streamLifetime = stream;
         using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+        var cutSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cutRegistration = target.Cut.Register(static state =>
+            ((TaskCompletionSource)state!).TrySetResult(), cutSignal);
         var browserToClient = PumpBrowserWebSocketAsync(socket, stream, closeState, pumpCts.Token);
         var clientToBrowser = PumpClientWebSocketAsync(socket, stream, closeState, pumpCts.Token);
-        var completed = await Task.WhenAny(browserToClient, clientToBrowser).ConfigureAwait(false);
+        var completed = await Task.WhenAny(browserToClient, clientToBrowser, cutSignal.Task)
+            .ConfigureAwait(false);
+        if (ReferenceEquals(completed, cutSignal.Task))
+        {
+            await CutWebSocketAsync(socket, stream, closeState, pumpCts, browserToClient, clientToBrowser)
+                .ConfigureAwait(false);
+            return;
+        }
         var peerPump = ReferenceEquals(completed, browserToClient) ? clientToBrowser : browserToClient;
         if (closeState.CloseStarted && !peerPump.IsCompleted)
         {

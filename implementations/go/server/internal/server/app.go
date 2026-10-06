@@ -270,6 +270,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
 	api.ProductMetrics().SetAllowed(cfg.ProductMetrics.Allowed)
+	directHTTP.SetHTTPShares(api.HTTPShares())
 	api.SetConnectivityChecker(connectivity.NewChecker(
 		connectivity.NatDevice{Sessions: sessions, Coordinator: coordinator}, logger))
 	dataDirectory := strings.TrimSpace(cfg.DataDirectory)
@@ -515,6 +516,8 @@ func (a *App) Run(ctx context.Context) error {
 	launch(a.api.RunRegistrationCleanup)
 	launch(a.api.RunWorkbenchSweep)
 	launch(a.api.RunProductMetricsSweep)
+	launch(a.api.HTTPShares().RunSweeper)
+	launch(a.api.HTTPShares().RunStreamWatch)
 	launch(func(ctx context.Context) { runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord) })
 
 	errc := make(chan error, 2)
@@ -618,7 +621,16 @@ func (a *App) managementHandler() http.Handler {
 	fileServer := http.FileServerFS(web.StaticFS())
 	mux.Handle("/", staticResourceCacheHeaders(fileServer))
 
-	return a.observeManagementHTTP(securityHeaders(mux, a.cfg.ObjectStorage))
+	// The share entry sees the raw path before the mux would clean dot segments and redirect: its
+	// scope check must refuse them rather than have them silently resolved.
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if directhttp.IsSharePath(r) {
+			a.directHTTP.ServeShare(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	return a.observeManagementHTTP(securityHeaders(root, a.cfg.ObjectStorage))
 }
 
 func staticResourceCacheHeaders(next http.Handler) http.Handler {
@@ -654,7 +666,9 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		// HTTP specus responses belong to the target application. Adding the portal
 		// policy here would make browsers enforce both policies and can block target
 		// features such as WebAssembly even when the application explicitly allows it.
-		if r.URL.Path == "/http" || strings.HasPrefix(r.URL.Path, "/http/") {
+		// Temporary shares under /http-share/ relay the same target applications.
+		if r.URL.Path == "/http" || strings.HasPrefix(r.URL.Path, "/http/") ||
+			r.URL.Path == "/http-share" || strings.HasPrefix(r.URL.Path, "/http-share/") {
 			next.ServeHTTP(w, r)
 			return
 		}

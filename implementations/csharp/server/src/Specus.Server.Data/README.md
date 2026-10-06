@@ -69,6 +69,10 @@ Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补�
 时间列是 epoch 毫秒，日期列是 UTC `yyyy-MM-dd` 文本，计数表没有任何用户列；表名与列名和 Go、Java、C 服务端一致，
 启动兼容 SQL 也会幂等建表。三套迁移和快照保持同步。
 
+临时 HTTP 分享由三套 `AddTemporaryHttpShare` migration 新增 `http_share` 与 `http_access_audit`
+（protocol/spec/temporary-http-share.md）。列名与类型和 Go、Java、C 服务端一致，以便共用同一个库：时刻一律是
+整数 epoch 秒，`expiry_recorded` 是 0/1 整数（SQLite INTEGER、PostgreSQL smallint、MySQL tinyint），不是布尔。
+
 Provider-specific EF migrations for these tables are committed for SQLite, PostgreSQL, and MySQL.
 Runtime startup also creates the tables and Java-aligned query indexes idempotently so deployments
 with older or incomplete migration history can read/write detailed traffic records without a

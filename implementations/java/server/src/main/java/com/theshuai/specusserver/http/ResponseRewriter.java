@@ -93,18 +93,25 @@ public class ResponseRewriter {
      * 改写响应正文的绝对路径。条件不满足时返回 {@link Optional#empty()}，调用方应原样透传 body。
      */
     public Optional<byte[]> rewrite(byte[] body, String clientName, String route, List<String> headers) {
+        return rewriteWithPrefix(body, PREFIX_TEMPLATE.formatted(clientName, route), headers);
+    }
+
+    /**
+     * 与 {@link #rewrite(byte[], String, String, List)} 相同，但隧道前缀由调用方给出：临时分享入口
+     * 使用 {@code /http-share/{shareId}}，不能把访客带到 route 自己的 Basic 入口，也不能暴露设备名与 route 名。
+     */
+    public Optional<byte[]> rewriteWithPrefix(byte[] body, String prefix, List<String> headers) {
         if (!mayRewrite(body, headers)) {
-            log.debug("[rewrite] skip: not a rewrite candidate, clientName={} route={}", clientName, route);
+            log.debug("[rewrite] skip: not a rewrite candidate, prefix={}", prefix);
             return Optional.empty();
         }
         String contentType = extractContentType(headers);
         byte[] decompressed = decompressIfNeeded(body, headers);
         if (decompressed == null) {
-            log.warn("[rewrite] skip: decompress failed, clientName={} route={} contentType={} encoding={}",
-                    clientName, route, contentType, extractHeader(headers, "content-encoding"));
+            log.warn("[rewrite] skip: decompress failed, prefix={} contentType={} encoding={}",
+                    prefix, contentType, extractHeader(headers, "content-encoding"));
             return Optional.empty();
         }
-        String prefix = PREFIX_TEMPLATE.formatted(clientName, route);
         String text = new String(decompressed, StandardCharsets.UTF_8);
         String rewritten = text;
 
@@ -138,12 +145,12 @@ public class ResponseRewriter {
         rewritten = rewritten.replace(placeholder, prefix + "/");
 
         if (rewritten.equals(text)) {
-            log.debug("[rewrite] no-op: no absolute paths matched, clientName={} route={} contentType={} bytes={}",
-                    clientName, route, contentType, body.length);
+            log.debug("[rewrite] no-op: no absolute paths matched, prefix={} contentType={} bytes={}",
+                    prefix, contentType, body.length);
             return Optional.empty();
         }
-        log.debug("[rewrite] applied clientName={} route={} contentType={} originalBytes={} rewrittenBytes={} prefix={}",
-                clientName, route, contentType, body.length, rewritten.length(), prefix);
+        log.debug("[rewrite] applied contentType={} originalBytes={} rewrittenBytes={} prefix={}",
+                contentType, body.length, rewritten.length(), prefix);
         return Optional.of(rewritten.getBytes(StandardCharsets.UTF_8));
     }
 

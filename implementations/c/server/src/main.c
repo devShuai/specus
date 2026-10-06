@@ -3,6 +3,7 @@
 #include "admin_http.h"
 #include "crypto.h"
 #include "elasticsearch_traffic.h"
+#include "http_share.h"
 #include "json.h"
 #include "media_capture.h"
 #include "object_storage.h"
@@ -172,6 +173,8 @@ typedef struct direct_http_pending {
     int reset;
     /* Set when error holds the client's RST reason rather than a server-side failure. */
     int client_reset;
+    /* The temporary HTTP share the request came through ended: reset the stream and stop. */
+    int cancelled;
     uint32_t reset_code;
     /* metadata.failure of the client's RST, for the connectivity check; "" when absent. */
     char failure[32];
@@ -1804,6 +1807,21 @@ static int optional_string_array(const char *json, const char *key, char ***out,
  * caller. It is tombstoned before it leaves the list, so a late client RST always finds one of
  * the two and is never mistaken for a never-opened stream.
  */
+typedef struct {
+    specus_session *session;
+    direct_http_pending *pending;
+} direct_cancel_ctx;
+
+/* A temporary HTTP share ended under the stream: wakes the forwarder, which resets the stream. */
+static void direct_pending_cancel(void *ctx)
+{
+    direct_cancel_ctx *cancel = (direct_cancel_ctx *)ctx;
+    pthread_mutex_lock(&cancel->session->direct_lock);
+    cancel->pending->cancelled = 1;
+    pthread_cond_broadcast(&cancel->pending->cond);
+    pthread_mutex_unlock(&cancel->session->direct_lock);
+}
+
 static void direct_pending_retire(specus_session *session, direct_http_pending *pending)
 {
     pthread_mutex_lock(&session->map_lock);
@@ -1866,6 +1884,12 @@ static int direct_http_forward(void *ctx,
     pending.next = session->direct_pending;
     session->direct_pending = &pending;
     pthread_mutex_unlock(&session->direct_lock);
+    /* A request through a temporary HTTP share can be cut from another thread once it ends. */
+    direct_cancel_ctx cancel = {session, &pending};
+    int opened = 0;
+    if (sink->bind_cancel != NULL) {
+        sink->bind_cancel(sink->ctx, direct_pending_cancel, &cancel);
+    }
 
     char *request_json = json_http_request(request);
     if (request_json == NULL) {
@@ -1878,6 +1902,7 @@ static int direct_http_forward(void *ctx,
     if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
         goto failed;
     }
+    opened = 1;
 
     for (size_t offset = 0; offset < request->body_len;) {
         size_t chunk_len = request->body_len - offset;
@@ -1885,10 +1910,10 @@ static int direct_http_forward(void *ctx,
             chunk_len = 64U * 1024U;
         }
         pthread_mutex_lock(&session->direct_lock);
-        while (pending.error == NULL && !pending.done && pending.send_credit < chunk_len) {
+        while (pending.error == NULL && !pending.done && !pending.cancelled && pending.send_credit < chunk_len) {
             pthread_cond_wait(&pending.cond, &session->direct_lock);
         }
-        if (pending.error != NULL || pending.done) {
+        if (pending.error != NULL || pending.done || pending.cancelled) {
             pthread_mutex_unlock(&session->direct_lock);
             goto failed;
         }
@@ -1919,7 +1944,7 @@ static int direct_http_forward(void *ctx,
     int delivered_head = 0;
     for (;;) {
         pthread_mutex_lock(&session->direct_lock);
-        while (pending.events_head == NULL && pending.error == NULL
+        while (pending.events_head == NULL && pending.error == NULL && !pending.cancelled
                && !(pending.done && pending.response_started)) {
             int rc = delivered_head
                 ? pthread_cond_wait(&pending.cond, &session->direct_lock)
@@ -1929,13 +1954,23 @@ static int direct_http_forward(void *ctx,
                 break;
             }
         }
-        direct_http_event *event = result == 0 ? direct_pending_pop(&pending) : NULL;
-        char *pending_error = event == NULL && pending.error != NULL
+        int cancelled = pending.cancelled;
+        int already_reset = pending.reset;
+        direct_http_event *event = result == 0 && !cancelled ? direct_pending_pop(&pending) : NULL;
+        char *pending_error = !cancelled && event == NULL && pending.error != NULL
             ? dup_string(pending.error) : NULL;
         int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
+        if (cancelled) {
+            if (!already_reset) {
+                send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE,
+                           ST_ADMIN_HTTP_SHARE_RESET_REASON);
+            }
+            result = ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED;
+            break;
+        }
         if (result != 0) {
             send_reset(session, pending.stream_id, 30U, "HTTP response header timeout");
             break;
@@ -2011,6 +2046,10 @@ static int direct_http_forward(void *ctx,
         }
     }
 
+    /* After the unbind no canceller can reach this stack frame any more. */
+    if (sink->bind_cancel != NULL) {
+        sink->bind_cancel(sink->ctx, NULL, NULL);
+    }
     direct_pending_retire(session, &pending);
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
@@ -2018,9 +2057,20 @@ static int direct_http_forward(void *ctx,
     return result;
 
 failed:
+    if (sink->bind_cancel != NULL) {
+        sink->bind_cancel(sink->ctx, NULL, NULL);
+    }
+    pthread_mutex_lock(&session->direct_lock);
+    int failed_cancelled = pending.cancelled;
+    int failed_reset = pending.reset;
+    pthread_mutex_unlock(&session->direct_lock);
+    if (failed_cancelled && opened && !failed_reset) {
+        send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE, ST_ADMIN_HTTP_SHARE_RESET_REASON);
+    }
     direct_pending_retire(session, &pending);
     /* A client RST while the request body was still uploading is reported like one after it. */
-    int failed_result = pending.client_reset && pending.error != NULL
+    int failed_result = failed_cancelled ? ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED
+        : pending.client_reset && pending.error != NULL
         ? direct_report_client_reset(sink, pending.reset_code, pending.error) : -1;
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
@@ -2678,6 +2728,8 @@ typedef struct {
     time_t next_media_cleanup;
     time_t next_workbench_sweep;
     time_t next_product_metrics_sweep;
+    time_t next_catalog_expiry;
+    time_t next_share_sweep;
 } peer_mesh_maintenance_state;
 
 /* The workbench retention sweep runs at the first maintenance tick, then hourly. */
@@ -2704,7 +2756,12 @@ static void *peer_mesh_maintenance_thread(void *unused)
     while (!peer_mesh_maintenance.stop) {
         struct timespec deadline;
         if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) break;
-        deadline.tv_sec += 30;
+        /*
+         * One second: temporary HTTP share streams are cut within a second of their expiry and
+         * re-read every two (protocol/spec/temporary-http-share.md 6.6); the other jobs keep their
+         * own next_* times.
+         */
+        deadline.tv_sec += 1;
         int wait_rc = pthread_cond_timedwait(&peer_mesh_maintenance.condition,
                                              &peer_mesh_maintenance.lock,
                                              &deadline);
@@ -2719,10 +2776,20 @@ static void *peer_mesh_maintenance_thread(void *unused)
             2
         };
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
-        if (st_peer_mesh_expire_catalogs(&runtime) != 0) {
-            fprintf(stderr, "[peer-mesh] stale catalog cleanup failed\n");
-        }
+        st_admin_http_share_tick();
         time_t now = time(NULL);
+        if (now >= peer_mesh_maintenance.next_catalog_expiry) {
+            if (st_peer_mesh_expire_catalogs(&runtime) != 0) {
+                fprintf(stderr, "[peer-mesh] stale catalog cleanup failed\n");
+            }
+            peer_mesh_maintenance.next_catalog_expiry = now + 30;
+        }
+        if (now >= peer_mesh_maintenance.next_share_sweep) {
+            if (st_admin_http_share_sweep() != 0) {
+                fprintf(stderr, "[http-share] sweep failed\n");
+            }
+            peer_mesh_maintenance.next_share_sweep = now + ST_HTTP_SHARE_SWEEP_INTERVAL_SECONDS;
+        }
         if (now >= peer_mesh_maintenance.next_registration_cleanup) {
             char now_text[64];
             if (current_utc_timestamp(now_text) != 0
@@ -2780,6 +2847,9 @@ static int peer_mesh_maintenance_start(const char *database_path)
     peer_mesh_maintenance.next_workbench_sweep = now;
     /* The first sweep comes at the first maintenance tick a minute after start, then hourly. */
     peer_mesh_maintenance.next_product_metrics_sweep = now + ST_PRODUCT_METRICS_SWEEP_FIRST_DELAY_SECONDS;
+    peer_mesh_maintenance.next_catalog_expiry = now + 30;
+    /* The first share sweep runs right after start, then every 30 seconds. */
+    peer_mesh_maintenance.next_share_sweep = now + 1;
     snprintf(peer_mesh_maintenance.database_path,
              sizeof(peer_mesh_maintenance.database_path), "%s", database_path);
     if (pthread_create(&peer_mesh_maintenance.thread, NULL,
@@ -2808,6 +2878,8 @@ static void peer_mesh_maintenance_stop(void)
     peer_mesh_maintenance.next_media_cleanup = 0;
     peer_mesh_maintenance.next_workbench_sweep = 0;
     peer_mesh_maintenance.next_product_metrics_sweep = 0;
+    peer_mesh_maintenance.next_catalog_expiry = 0;
+    peer_mesh_maintenance.next_share_sweep = 0;
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
 }
 
