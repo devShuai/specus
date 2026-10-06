@@ -293,6 +293,40 @@ typedef struct {
     char http_body[256];
 } route_auth_test_context;
 
+#define ROUTE_RESET_REASON \
+    "dial http://10.20.30.40:8080/admin/internal?token=s3cret&user=root failed: " \
+    "connection refused\r\nX-Forged: yes"
+
+/* Redirects stderr into a temporary file so a test can read what the server logged. */
+static int stderr_capture_begin(FILE **capture, int *saved_fd)
+{
+    fflush(stderr);
+    *capture = tmpfile();
+    if (*capture == NULL) {
+        return -1;
+    }
+    *saved_fd = dup(STDERR_FILENO);
+    if (*saved_fd < 0 || dup2(fileno(*capture), STDERR_FILENO) < 0) {
+        if (*saved_fd >= 0) {
+            close(*saved_fd);
+        }
+        fclose(*capture);
+        return -1;
+    }
+    return 0;
+}
+
+static void stderr_capture_end(FILE *capture, int saved_fd, char *out, size_t out_len)
+{
+    fflush(stderr);
+    (void)dup2(saved_fd, STDERR_FILENO);
+    close(saved_fd);
+    rewind(capture);
+    size_t read_len = fread(out, 1U, out_len - 1U, capture);
+    out[read_len] = '\0';
+    fclose(capture);
+}
+
 static void route_auth_test_context_reset(route_auth_test_context *context)
 {
     pthread_mutex_lock(&context->lock);
@@ -390,6 +424,13 @@ static int route_auth_http_forwarder(void *ctx,
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
     pthread_mutex_unlock(&context->lock);
+    if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
+        /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
+        if (sink->on_reset != NULL) {
+            sink->on_reset(sink->ctx, 1U, ROUTE_RESET_REASON);
+        }
+        return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
+    }
     char *headers[] = {"Content-Type: text/plain; charset=UTF-8"};
     static const uint8_t response_body[] = "forwarded";
     return sink->on_headers(sink->ctx, 200, headers, 1U, NULL, 0U) == 0
@@ -1963,6 +2004,36 @@ static int route_auth_detail_is_sanitized(const char *database_path)
     return result;
 }
 
+static int test_log_safe_reason(void)
+{
+    char safe[2048];
+    /* CR/LF/TAB/backslash, C0 NUL-free control, DEL, C1 (U+0085), U+2028, invalid UTF-8. */
+    st_admin_log_safe_reason("a\r\nb\tc\x01" "d\x7f" "e\xc2\x85" "f\xe2\x80\xa8" "g\\h\xff" "\xe7\x95\x8c",
+                             safe,
+                             sizeof(safe));
+    if (strcmp(safe, "a\\r\\nb\\tc\\u0001d\\u007fe\\u0085f\\u2028g\\\\h\\xff\xe7\x95\x8c") != 0) {
+        fprintf(stderr, "log-safe reason escaping mismatch: %s\n", safe);
+        return 1;
+    }
+    char long_reason[400];
+    memset(long_reason, 'x', sizeof(long_reason) - 1U);
+    long_reason[sizeof(long_reason) - 1U] = '\0';
+    size_t written = st_admin_log_safe_reason(long_reason, safe, sizeof(safe));
+    if (written != ST_ADMIN_LOG_REASON_MAX_CODE_POINTS + strlen("...(truncated)")
+        || strncmp(safe + ST_ADMIN_LOG_REASON_MAX_CODE_POINTS, "...(truncated)", 15U) != 0) {
+        fprintf(stderr, "log-safe reason truncation mismatch: %s\n", safe);
+        return 1;
+    }
+    char tiny[8];
+    if (st_admin_log_safe_reason("abc\r\ndefgh", tiny, sizeof(tiny)) >= sizeof(tiny)
+        || strcmp(tiny, "abc\\r\\n") != 0
+        || st_admin_log_safe_reason(NULL, tiny, sizeof(tiny)) != 0U || tiny[0] != '\0') {
+        fprintf(stderr, "log-safe reason bounds mismatch: %s\n", tiny);
+        return 1;
+    }
+    return 0;
+}
+
 static int test_direct_http_route_authentication(const char *database_path)
 {
     route_auth_test_context context;
@@ -2080,6 +2151,46 @@ static int test_direct_http_route_authentication(const char *database_path)
             pthread_mutex_destroy(&context.lock);
             return 1;
         }
+    }
+
+    snprintf(request,
+             sizeof(request),
+             "GET /http/C%%20managed%%202/api/upstream-reset?token=s3cret&user=root HTTP/1.1\r\n"
+             "Host: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n");
+    route_auth_test_context_reset(&context);
+    FILE *log_capture = NULL;
+    int saved_stderr = -1;
+    char logged[4096];
+    if (stderr_capture_begin(&log_capture, &saved_stderr) != 0) {
+        fprintf(stderr, "direct HTTP reset log capture setup failed\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    int reset_roundtrip = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    stderr_capture_end(log_capture, saved_stderr, logged, sizeof(logged));
+    if (reset_roundtrip != 0
+        || !contains(response, "502 Bad Gateway")
+        || !contains(response, "{\"error\":\"" ST_ADMIN_DIRECT_HTTP_RESET_BODY "\"}")
+        || contains(response, "offline")
+        || contains(response, "10.20.30.40")
+        || contains(response, "s3cret")
+        || contains(response, "http://")
+        || contains(response, "X-Forged")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)) {
+        fprintf(stderr, "direct HTTP client reset leaked its reason or lost the 502: %s\n", response);
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    if (!contains(logged, "stream reset")
+        || !contains(logged, "http://10.20.30.40:8080/admin/internal?token=s3cret&user=root")
+        || !contains(logged, "refused\\r\\nX-Forged: yes")
+        || contains(logged, "\r")) {
+        fprintf(stderr, "direct HTTP client reset reason was not logged escaped: %s\n", logged);
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
     }
 
     snprintf(request,
@@ -4255,7 +4366,7 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_direct_http_route_authentication(db_path) != 0) {
+    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
         return 1;
     }
     st_direct_http_response rewrite_response;

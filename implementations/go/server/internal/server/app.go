@@ -257,6 +257,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return mediaCapture.Open(ctx, clientName, route, method, sourceURL, statusCode, responseHeaders)
 	})
 	directHTTP.SetReconnectGrace(3 * time.Second)
+	directHTTP.SetLogger(logger)
 	directHTTP.SetRouteCacheTTL(time.Duration(cfg.HTTP.RouteCacheTTLms) * time.Millisecond)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
