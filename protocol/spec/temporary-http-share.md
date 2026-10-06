@@ -4,7 +4,7 @@ route 的所有者或租户管理员，可以为**一条已有、受保护的 HT
 
 关联 [issue #38](https://github.com/devShuai/specus/issues/38) 的待办「临时 HTTP 分享：有效期、撤销、访问范围与权限变更审计；各 server 实现保持一致，禁止把长期公开路由当作临时邀请」，见 [docs/issues/product-followups.md](../../docs/issues/product-followups.md)。
 
-**状态：草案，待维护者确认第 15 节的待定事项；尚无实现。** 共享向量 `protocol/test-vectors/temporary-http-share-v1.json` 由 `tools/protocol/generate_temporary_share_vectors.py` 生成。
+**状态：契约已定（第 15 节各项采用建议默认值），尚无实现。** 共享向量 `protocol/test-vectors/temporary-http-share-v1.json` 由 `tools/protocol/generate_temporary_share_vectors.py` 生成。
 
 ## 1. 现状
 
@@ -526,7 +526,9 @@ WHERE share_id = ? AND revoked_at IS NULL AND expires_at > ?
 | 在审计中记录访客访问 | 访客内容不属于审计；需要时由所有者开启 route 的流量明细 |
 | 复用现有的固定窗口限流器 | 窗口边界会放过双倍突发；GCRA 每键一个整数，容易写成跨语言一致的向量 |
 
-## 15. 待定事项（附建议默认值）
+## 15. 已定事项（采用建议默认值）
+
+以下各项在草案阶段列为待定，维护者此前对同类问题的做法是采用建议默认值，这里按各条的建议值确定。
 
 1. **最长有效期是否可配置。** 建议：固定为 7 天，与房间邀请一致；以后如需配置，只允许调低。
 2. **次数上限、一次性链接。** 建议：v1 不做。需要时另起版本，引入按访客的会话表，cookie 改为会话 id，`maxUses` 计兑换次数。

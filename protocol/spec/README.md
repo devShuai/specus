@@ -17,7 +17,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | [public-transfer.md](public-transfer.md) | 免登录公共互传的 ICE 配置、发现信令、附件 REST、对象存储和滥用防护 |
 | [public-transfer-cluster.md](public-transfer-cluster.md) | 公共互传多实例 Redis presence、修订、共享限流、管理事件恢复与 STCE v2 内部 Pub/Sub 帧 |
 | [client-messages.md](client-messages.md) | 管理端与客户端消息 WebSocket、一次性 ticket、能力判断和服务端备用投递 |
-| [temporary-http-share.md](temporary-http-share.md) | 对单条受保护 HTTP route 的临时分享：有效期、撤销、路径与方法范围、fragment 换 cookie、级联失效与审计；草案，未实现 |
+| [temporary-http-share.md](temporary-http-share.md) | 对单条受保护 HTTP route 的临时分享：有效期、撤销、路径与方法范围、fragment 换 cookie、级联失效与审计；契约已定、未实现 |
 
 ## 参考实现入口
 
