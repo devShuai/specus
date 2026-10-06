@@ -12,7 +12,9 @@ The consumer's rule sends 203.0.113.0/24 through the egress. That prefix holds t
 purpose: the control connection and STUN only survive if the bypass /32 is really installed, and a
 bypass route on a physical interface is what a kill -9 leaves behind for the next start to reclaim.
 198.51.100.10 is the same target reached by no rule, which is how "unmatched stays local" and the
-leak checks tell the two source addresses apart.
+leak checks tell the two source addresses apart. The target also answers on 169.254.169.254 and
+10.90.9.10, two addresses an egress must refuse, so that a refusal that did not happen shows up in
+its log rather than as a connection nobody answered.
 
 Run as root inside a fresh network and mount namespace: `sudo unshare -n -m python3 lab.py ...` on a
 machine with sudo, `unshare -rnm python3 lab.py ...` without. It refuses to run in a namespace whose
@@ -45,7 +47,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from target import blob_chunks, blob_sha256  # noqa: E402
+from target import SLOW_TICK, blob_chunks, blob_sha256  # noqa: E402
 
 SERVER_IP = "203.0.113.2"
 TARGET_IP = "203.0.113.10"  # under the consumer's rule
@@ -64,10 +66,43 @@ DIRECT_URL = f"http://{TARGET_DIRECT_IP}"
 
 CURL_OK, CURL_CONNECT_FAILED, CURL_PARTIAL, CURL_TIMEOUT, CURL_RECV_FAILED = 0, 7, 18, 28, 56
 
+# The policy's destination rules. RULE_GRANT is the lab's own; BROAD_GRANT is the 0.0.0.0/0 an
+# operator writes to let a device out to anything, which the forced-deny list must still beat.
+RULE_GRANT = {"cidr": RULE_CIDR, "protocols": ["tcp", "udp"], "portRanges": [[1, 65535]]}
+BROAD_GRANT = {"cidr": "0.0.0.0/0", "protocols": ["tcp", "udp"], "portRanges": [[1, 65535]]}
+
+# Issue #42's refusals (protocol/spec/peer-egress.md). Two addresses the target answers on that no
+# flow through the egress may reach: the cloud metadata address, on the forced-deny list whatever a
+# policy grants, and a private address, outside a PUBLIC egress's scope. The router sends both to the
+# target, so the egress's own network reaches them and only its decision stands in the way.
+METADATA_IP = "169.254.169.254"
+PRIVATE_IP = "10.90.9.10"
+CODE_CONSUMER_DENIED = "EGRESS_CONSUMER_DENIED"
+CODE_FORBIDDEN = "EGRESS_FORBIDDEN_DESTINATION"
+CODE_SCOPE = "EGRESS_SCOPE_DENIED"
+CODE_LIMIT = "EGRESS_LIMIT_EXCEEDED"
+# The egress's new-flow bucket per consumer: 128 at once, refilled at 64 a second. The burst is three
+# buckets, and below the 500 packets a TUN device queues, so none is lost on the consumer's side
+# before the egress can judge it. Of what reaches the egress, the egress may admit no more than
+# RATE_BUCKET + RATE_REFILL_PER_SECOND x (how long it took over the burst) + RATE_SLACK and must
+# refuse the rest; the slack covers the last answer coming a little before the egress finished.
+RATE_BUCKET, RATE_REFILL_PER_SECOND = 128, 64
+RATE_BURST_FLOWS = 3 * RATE_BUCKET
+RATE_SLACK = 32
+# The admitted datagram flows stay live until they are idle this long. Short, so that they are gone
+# before the flow caps come back down, rather than holding 200 slots for a minute.
+RATE_IDLE_SECONDS = 3
+CONCURRENCY_CAP = 4
+
 # Phase two (protocol/spec/peer-egress-dns.md). The name exists only in the egress's /etc/hosts: the
 # consumer can reach it through the takeover or not at all. The consumer's original nameserver is an
 # address nothing answers on, so a name the rules do not claim fails rather than resolving locally.
 NAMED_HOST = "named.lab.test"
+# DNS rebinding: names under the same rule that the egress resolves to an address it must refuse, and
+# one to a public address no destination rule names, which only a domain grant lets through.
+REBIND_METADATA_HOST = "metadata.lab.test"
+REBIND_PRIVATE_HOST = "private.lab.test"
+GRANTED_HOST = "granted.lab.test"
 DOMAIN_RULE = "*.lab.test"
 CONSUMER_NAMESERVER = "198.51.100.53"
 FAKE_IP_POOL = "198.18.0.0/15"
@@ -92,6 +127,75 @@ GATE_LOSSY_SECONDS = 10.0
 GATE_FIRST_BYTE_SAMPLES = 20
 GATE_FIRST_BYTE_P95_MS = 50.0
 GATE_MEMORY_GROWTH_MIB = 200.0
+
+# Run in the consumer's namespace as `python3 -c BURST_SCRIPT HOST PORT COUNT QUIET`: one datagram
+# from each of COUNT sockets, so COUNT new flows, sent back to back. A datagram flow costs the
+# egress no handshake with the target, so how fast the burst meets the bucket does not depend on
+# how fast the egress can dial. Listens for the answers until QUIET seconds pass without one, and
+# prints how many came and when the last did: the egress admits flows for about that long, and the
+# bucket refills for as long as it does.
+BURST_SCRIPT = """\
+import json, selectors, socket, sys, time
+host, port, count, quiet = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+selector = selectors.DefaultSelector()
+sockets = []
+for _ in range(count):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setblocking(False)
+    sockets.append(s)
+started = time.monotonic()
+for s in sockets:
+    s.sendto(b'burst', (host, port))
+    selector.register(s, selectors.EVENT_READ)
+sent = time.monotonic() - started
+answered, last = 0, 0.0
+deadline = time.monotonic() + quiet
+while answered < count and selector.get_map():
+    events = selector.select(max(0.0, deadline - time.monotonic()))
+    if not events:
+        break
+    for key, _ in events:
+        selector.unregister(key.fileobj)
+        try:
+            key.fileobj.recv(512)
+        except OSError:
+            continue
+        answered += 1
+        last = time.monotonic() - started
+        deadline = time.monotonic() + quiet
+for s in sockets:
+    s.close()
+print(json.dumps({'sent': count, 'answered': answered, 'sendSeconds': round(sent, 3), 'lastAnswer': round(last, 3)}))
+"""
+
+# Run as `python3 -c HOLD_SCRIPT HOST PORT ATTEMPTS`: connects one at a time and keeps each
+# connection open, until one is not accepted or ATTEMPTS is reached; then resets them all. Prints
+# how many were held and how the next one ended.
+HOLD_SCRIPT = """\
+import json, socket, struct, sys
+host, port, attempts = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+held, outcome = [], 'never refused'
+for _ in range(attempts):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect((host, port))
+    except ConnectionRefusedError:
+        outcome = 'refused'
+    except socket.timeout:
+        outcome = 'timeout'
+    except OSError as error:
+        outcome = type(error).__name__
+    else:
+        held.append(s)
+        continue
+    s.close()
+    break
+for s in held:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+    s.close()
+print(json.dumps({'held': len(held), 'next': outcome}))
+"""
 
 
 def p95(samples):
@@ -231,6 +335,7 @@ class Lab:
         self.secrets = {"egress": secrets.token_hex(16), "consumer": secrets.token_hex(16)}
         self.started = time.time()
         self.netem = None
+        self.last_refused = None
 
     # -- plumbing ---------------------------------------------------------------------------------
 
@@ -331,6 +436,11 @@ class Lab:
         sh(["ip", "-n", "tgt", "addr", "add", f"{TARGET_IP}/24", "dev", "tgt0"])
         sh(["ip", "-n", "tgt", "addr", "add", f"{TARGET_DIRECT_IP}/24", "dev", "tgt0"])
         sh(["ip", "-n", "tgt", "route", "add", "default", "via", WAN_GW])
+        # The addresses an egress must refuse, on the target too: a refusal that did not happen
+        # reaches it and is logged, rather than failing for want of anything listening.
+        for address in (METADATA_IP, PRIVATE_IP):
+            sh(["ip", "-n", "tgt", "addr", "add", f"{address}/32", "dev", "tgt0"])
+            sh(["ip", "route", "add", f"{address}/32", "via", TARGET_IP])
         for name, address, gateway in (("con", CONSUMER_IP, CONSUMER_GW), ("egr", EGRESS_IP, EGRESS_GW)):
             sh(["ip", "netns", "add", name])
             sh(["ip", "link", "add", f"r-{name}", "type", "veth", "peer", "name", f"{name}0"])
@@ -490,13 +600,30 @@ class Lab:
     def devices(self):
         return self.admin.call("GET", "/api/admin/peer-mesh/devices") or []
 
-    def policy(self, allowed):
+    def policy(self, allowed, destinations=(RULE_GRANT,), domains=(), max_flows=256, per_consumer=128,
+               idle_seconds=60):
+        # Every field is sent every time. The server keeps whatever a request leaves out, so a grant
+        # or a limit set for one check would otherwise outlive it into the next.
         return self.admin.call("POST", "/api/admin/peer-mesh/egress/policies", {
             "egressClientId": self.egress_id, "enabled": True, "scope": "PUBLIC",
             "allowedConsumerClientIds": allowed,
-            "destinationRules": [{"cidr": RULE_CIDR, "protocols": ["tcp", "udp"], "portRanges": [[1, 65535]]}],
-            "maxConcurrentFlows": 256, "maxFlowsPerConsumer": 128, "idleTimeoutSeconds": 60,
+            "destinationRules": list(destinations), "domainRules": list(domains),
+            "maxConcurrentFlows": max_flows, "maxFlowsPerConsumer": per_consumer,
+            "idleTimeoutSeconds": idle_seconds,
         })
+
+    def set_policy(self, allowed, **fields):
+        """policy(), then the egress's word that it applied that push: a check run against the policy
+        before it would prove nothing about this one. The log line carries the number of destination
+        rules, which tells a push with an extra rule from the one before it."""
+        egress = self.procs["egress"]
+        offset = egress.log_offset()
+        self.policy(allowed, **fields)
+        rules = len(fields.get("destinations", (RULE_GRANT,)))
+        applied = egress.wait_log(rf"policy applied enabled=true revision=\d+ rules={rules}\b", 15, offset)
+        if not applied:
+            self.note(f"the egress did not log a policy with {rules} destination rule(s) within 15 s of the change")
+        return bool(applied)
 
     def switch(self, enabled):
         return self.admin.call("PUT", "/api/admin/peer-mesh/egress/switch", {"enabled": enabled})
@@ -527,8 +654,8 @@ class Lab:
                        "total": float(fields[3]), "down": float(fields[4]), "up": float(fields[5])}
         return {"code": completed.returncode, "body": body, "stderr": completed.stderr.strip(), **metrics}
 
-    def whoami(self, url):
-        got = self.curl(f"{url}/whoami", timeout=8)
+    def whoami(self, url, netns_name="con"):
+        got = self.curl(f"{url}/whoami", timeout=8, netns_name=netns_name)
         src = None
         if got["code"] == CURL_OK:
             try:
@@ -565,6 +692,77 @@ class Lab:
         self.check(name, not leaks,
                    f"{len(leaks)} request(s) reached the covered target from the consumer's own address"
                    if leaks else "no request from the consumer's own address reached the covered target")
+
+    def nothing_reached(self, name, mark, address):
+        """leak_check for an address no flow may reach at all: not from the consumer's own address,
+        and not from the egress's on the consumer's behalf."""
+        reached = [entry for entry in self.target_entries(mark) if entry.get("dst") == address]
+        sources = ", ".join(sorted({str(entry.get("src")) for entry in reached}))
+        self.check(name, not reached, f"{len(reached)} request(s) reached {address} from {sources}"
+                   if reached else f"nothing reached {address} from any address")
+
+    # -- the egress's own account of what it refused ------------------------------------------------
+
+    def egress_section(self):
+        """The egress role's section of the egress's status: whether it serves, its live flows and its
+        cumulative refusals by code. None when the status cannot be read."""
+        status = self.client_status("egress")
+        for instance in (status or {}).get("data", {}).get("instances", []):
+            section = (instance.get("egress") or {}).get("egress")
+            if isinstance(section, dict):
+                return section
+        return None
+
+    def egress_counts(self):
+        """The egress's refusals by code and the number of flows it has ever admitted, from its
+        status; None for what cannot be read."""
+        section = self.egress_section()
+        if section is None:
+            return None, None
+        refused = {code: count for code, count in (section.get("refused") or {}).items() if isinstance(count, int)}
+        total = section.get("totalFlows")
+        return refused, total if isinstance(total, int) else None
+
+    def egress_refused(self):
+        return self.egress_counts()[0]
+
+    def refusal_baseline(self):
+        """The egress's refusal counts with the last policy push fully accounted for. A push revokes
+        the flows it no longer allows, lingering ones included, and counts each under its code; the
+        status file is rewritten every second, so after two and a half the revocations are in it and
+        whatever the count gains from here on is the probe's."""
+        time.sleep(2.5)
+        return self.egress_refused() or {}
+
+    def refused_at_egress(self, code, before, timeout=15, at_least=1):
+        """The egress's counts once it has counted `code` at least `at_least` more times than in
+        `before`, else None. The egress counts a refusal when it makes it, whether or not its reset
+        and flow-reject reach the consumer: this is the evidence that the egress is where the flow
+        stopped."""
+        last = {}
+
+        def gained():
+            counts = self.egress_refused()
+            if counts is not None:
+                last["counts"] = counts
+            return counts if counts is not None and counts.get(code, 0) - before.get(code, 0) >= at_least else None
+        counts, _ = self.wait_for(f"the egress to count {code} {at_least} more time(s)", gained, timeout, 1.0)
+        self.last_refused = last.get("counts")
+        return counts
+
+    def refusal_evidence(self, code, before, counts):
+        # When the count never got there, what it last read is the evidence.
+        seen = counts if counts is not None else getattr(self, "last_refused", None)
+        after = (seen or {}).get(code, before.get(code, 0))
+        return f"egress refused[{code}] {before.get(code, 0)} -> {after}"
+
+    def consumer_view(self, code, offset):
+        """What the consumer heard about a refusal: the flow-reject it logs, and its rejected count.
+        Evidence only: the flow-reject is a datagram, and losing it is allowed."""
+        logged = self.procs["consumer"].wait_log(rf"refused flow code={code}\b", 5, offset)
+        blocked = ((self.consumer_section() or {}).get("blocked") or {}).get("rejected-" + code.lower(), 0)
+        return (f"consumer {'logged the flow-reject' if logged else 'logged no flow-reject'}, "
+                f"rejected-{code.lower()}={blocked}")
 
     @staticmethod
     def human(size):
@@ -1240,6 +1438,11 @@ class Lab:
         back = consumer.wait_log(r"control connection established|Connected to .*\(awaiting login response\)", 90, offset)
         self.check("server back: the consumer reconnects", bool(back))
         self.check("server back: flows go through the egress again", bool(self.wait_ready()))
+        # The restarted server numbers its pushes from 1 again. An egress that kept the last session's
+        # revision ignored each of them as older and went on enforcing the policy from before.
+        applied = self.set_policy([self.consumer_id])
+        self.check("server back: the egress applies a policy change the restarted server pushes", applied,
+                   "the egress logged it" if applied else "no 'policy applied' in the egress's log within 15 s")
         # Whatever the reconnect did to the table, what it ends with is what matters.
         table = self.consumer_table()
         self.snapshots["after the control connection came back"] = table
@@ -1303,6 +1506,242 @@ class Lab:
                    not leftover and user_present, "\n".join(leftover) if leftover else "clean")
         self.sh(ns("con", "ip", "route", "del", USER_ROUTE), check=False)
 
+    # -- refusals at the egress (#42) -------------------------------------------------------------
+
+    def refusals(self):
+        """Issue #42's last acceptance item, end to end: an unauthorized device, a restricted target
+        and resource exhaustion are refused by the egress. A request failing proves nothing about
+        where it was stopped, so every check takes the egress's own refusal count under the expected
+        code as the evidence, and reads the target's log for anything that got through. A refused
+        connect must also end as one, curl's exit 7, not as a timeout: the egress answers the SYN with
+        a reset, and an application left to retransmit into the refusal until its own timeout is the
+        failure the explicit-failure rule exists to prevent. DNS rebinding needs the DNS takeover and
+        is checked in phase two; the README says why cross-tenant access is left to the servers' unit
+        tests."""
+        self.say("refusals at the egress")
+        consumer = self.procs.get("consumer")
+        if consumer is not None and consumer.alive:
+            consumer.stop()
+        # A second rule sends the metadata address to the egress. A consumer rule names a destination
+        # and nothing more, so nothing on the consumer's side refuses it: only the egress can.
+        rules = [{"match": RULE_CIDR, "action": "egress", "egressClientId": self.egress_id},
+                 {"match": f"{METADATA_IP}/32", "action": "egress", "egressClientId": self.egress_id}]
+        self.start_client("consumer", self.client_config("consumer", rules))
+        ready = self.wait_ready()
+        routed, _ = self.wait_for("the metadata rule's route", self.metadata_route_present, 30)
+        self.check("refusals: the consumer routes the metadata address into the tunnel and serves through the egress",
+                   ready and bool(routed), "\n".join(self.lab_routes(self.consumer_table())))
+        if not ready:
+            return
+        self.refusal_forbidden_destination()
+        self.refusal_concurrency_cap()
+        self.refusal_rate_limit()
+        self.refusal_consumer_denied()
+
+    def metadata_route_present(self):
+        return any(line.split()[0] in (METADATA_IP, f"{METADATA_IP}/32") and f"dev {CONSUMER_TUN}" in line
+                   for line in self.consumer_table().splitlines() if line.strip())
+
+    def refusal_forbidden_destination(self):
+        """A target on the forced-deny list, under a policy that grants 0.0.0.0/0 as well."""
+        got = self.whoami(f"http://{METADATA_IP}", netns_name="egr")
+        self.check("restricted target: the egress's own network reaches the metadata address, so only its decision "
+                   "stands in the way", got["src"] == EGRESS_IP, f"target saw src={got['src']} ({self.describe(got)})")
+        # Two destination rules, so that the applied push is told from the one before it by its count.
+        applied = self.set_policy([self.consumer_id], destinations=(RULE_GRANT, BROAD_GRANT))
+        before = self.refusal_baseline()
+        mark = self.target_mark()
+        offset = self.procs["consumer"].log_offset()
+        got = self.whoami(f"http://{METADATA_IP}")
+        counts = self.refused_at_egress(CODE_FORBIDDEN, before)
+        self.check(f"restricted target: {METADATA_IP} under a 0.0.0.0/0 grant is refused by the egress ({CODE_FORBIDDEN})",
+                   applied and got["code"] == CURL_CONNECT_FAILED and counts is not None,
+                   f"0.0.0.0/0 {'applied' if applied else 'not confirmed applied'}; {self.describe(got)}; "
+                   f"{self.refusal_evidence(CODE_FORBIDDEN, before, counts)}; {self.consumer_view(CODE_FORBIDDEN, offset)}")
+        self.nothing_reached("restricted target: nothing reached the metadata address", mark, METADATA_IP)
+        self.set_policy([self.consumer_id])
+
+    def refusal_concurrency_cap(self):
+        """maxFlowsPerConsumer: that many connections held open through the egress, then the next
+        one refused by it, and a slot back once the held ones are gone."""
+        applied = self.set_policy([self.consumer_id], per_consumer=CONCURRENCY_CAP)
+        # Live flows count against the cap and lingering ones do not (#88). Whatever the checks before
+        # left open is given a moment to finish, so that the number held is the cap and nothing else.
+        idle, _ = self.wait_for("the egress to carry no live flow",
+                                lambda: (self.egress_section() or {}).get("flows") == 0, 15, 1.0)
+        before = self.refusal_baseline()
+        mark = self.target_mark()
+        offset = self.procs["consumer"].log_offset()
+        held = self.sh(ns("con", sys.executable, "-c", HOLD_SCRIPT, TARGET_IP, "80", str(CONCURRENCY_CAP + 2)),
+                       check=False, timeout=90)
+        try:
+            result = json.loads(held.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            result = {}
+        counts = self.refused_at_egress(CODE_LIMIT, before)
+        self.check(f"resource exhaustion: with maxFlowsPerConsumer {CONCURRENCY_CAP}, {CONCURRENCY_CAP} flows are held "
+                   f"and the next is refused by the egress ({CODE_LIMIT})",
+                   applied and result.get("held") == CONCURRENCY_CAP and result.get("next") == "refused"
+                   and counts is not None,
+                   (f"held {result.get('held')}, the next one {result.get('next')}" if result
+                    else f"the probe printed nothing usable: {(held.stdout + held.stderr).strip()[-300:]}")
+                   + f"; the egress {'had no live flow' if idle else 'still carried flows'} before; "
+                   f"{self.refusal_evidence(CODE_LIMIT, before, counts)}; {self.consumer_view(CODE_LIMIT, offset)}")
+        # The probe reset what it held as it exited, which is what frees the slots.
+        got, elapsed = self.wait_for("a new flow under the same cap", self.through_egress, 15, 1.0)
+        self.check("resource exhaustion: the held flows' slots come back, a new flow goes through under the same cap",
+                   bool(got), f"after {elapsed:.1f}s" if got else "no flow went through within 15 s")
+        self.leak_check("resource exhaustion, flow cap: nothing leaked to the target from the consumer's address", mark)
+        self.set_policy([self.consumer_id])
+
+    def batch_through_egress(self, count):
+        """count new flows at once; how many, if every one of them left from the egress."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+            sources = [got["src"] for got in pool.map(lambda _: self.whoami(TARGET_URL), range(count))]
+        through = sum(1 for source in sources if source == EGRESS_IP)
+        return through if through == count else None
+
+    def refusal_rate_limit(self):
+        """The new-flow bucket: RATE_BURST_FLOWS new datagram flows at once while one established TCP
+        flow runs through it, with both flow caps raised out of reach so that the bucket is the only
+        limit the burst can meet.
+
+        A burst of TCP connects could not show it: an admitted connect waits for the egress to dial
+        the target, so a slow dial paces the burst to the refill rate, and a refused one was not told
+        (fixed alongside this, see TestConsumerKeepsAnOpeningFlowTheEgressRejectedForItsReset) and
+        retried until it got in. A datagram flow is admitted without a handshake, so the burst meets
+        the bucket as fast as the egress can read it."""
+        roomy = 4 * RATE_BURST_FLOWS
+        applied = self.set_policy([self.consumer_id], max_flows=roomy, per_consumer=roomy,
+                                  idle_seconds=RATE_IDLE_SECONDS)
+        mark = self.target_mark()
+        seconds, interval = 15, 0.25
+        expected = max(1, int(seconds / interval)) * len(SLOW_TICK)
+        stream = self.work / "slow-through-burst.out"
+        stream.unlink(missing_ok=True)
+        slow = subprocess.Popen(ns("con", "curl", "-sS", "--no-buffer", "--max-time", str(seconds + 45), "-o",
+                                   str(stream), f"{TARGET_URL}/slow?seconds={seconds}&interval={interval}"),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        streaming, _ = self.wait_for("the established stream to start",
+                                     lambda: stream.exists() and stream.stat().st_size > 0, 15)
+        # The pause also refills what the stream and the checks before took from the bucket, and lets
+        # the status catch up with the policy push (see refusal_baseline).
+        time.sleep(2.5)
+        before, admitted_before = self.egress_counts()
+        before = before or {}
+        offset = self.procs["consumer"].log_offset()
+        burst = self.sh(ns("con", sys.executable, "-c", BURST_SCRIPT, TARGET_IP, str(UDP_PORT),
+                           str(RATE_BURST_FLOWS), "1"), check=False, timeout=90)
+        ended = time.monotonic()
+        try:
+            result = json.loads(burst.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            result = {}
+        # Once the egress has counted a refusal, a moment more for its status to take in the rest.
+        self.refused_at_egress(CODE_LIMIT, before, timeout=10)
+        time.sleep(1.2)
+        after, admitted_after = self.egress_counts()
+        refused = after.get(CODE_LIMIT, 0) - before.get(CODE_LIMIT, 0) if after is not None else None
+        admitted = (admitted_after - admitted_before
+                    if admitted_before is not None and admitted_after is not None else None)
+        # The egress admitted flows for about as long as answers kept coming, and the bucket refilled
+        # for that long; of what reached it, everything beyond that it must have refused. Judged on
+        # what reached the egress rather than on what was sent, so a datagram lost on the way does
+        # not count against it.
+        window = max(float(result.get("sendSeconds") or 0.0), float(result.get("lastAnswer") or 0.0))
+        allowed = RATE_BUCKET + RATE_REFILL_PER_SECOND * window
+        answered = int(result.get("answered") or 0)
+        judged = refused is not None and admitted is not None
+        reached = refused + admitted if judged else None
+        floor = max(1, math.ceil(reached - allowed - RATE_SLACK)) if judged else None
+        self.check(f"resource exhaustion: a burst of {RATE_BURST_FLOWS} new flows meets the egress's new-flow bucket, "
+                   f"which refuses what its {RATE_BUCKET} and {RATE_REFILL_PER_SECOND}/s do not cover ({CODE_LIMIT})",
+                   applied and judged and refused >= floor and answered >= RATE_BUCKET // 2,
+                   (f"{reached} of {RATE_BURST_FLOWS} reached the egress: {admitted} admitted, which the bucket allows "
+                    f"{allowed:.0f} of in the {window:.2f}s until the last answer, and {refused} refused where at "
+                    f"least {floor} must be; {answered} answered" if judged and result
+                    else f"burst {json.dumps(result) if result else (burst.stdout + burst.stderr).strip()[-300:]}; "
+                         f"egress refused/admitted before {before} {admitted_before}, after {after} {admitted_after}")
+                   + f"; {self.consumer_view(CODE_LIMIT, offset)}")
+        if judged:
+            self.measure("new-flow burst: flows the egress admitted out of the burst", admitted)
+            self.measure("new-flow burst: how long the egress took over it", round(window, 3), "s")
+        # Two seconds refill the whole bucket, so a batch of new flows at once then has to find room.
+        time.sleep(max(0.0, 2.0 - (time.monotonic() - ended)))
+        batch, waited = self.wait_for("16 new flows at once through the egress",
+                                      lambda: self.batch_through_egress(16), 10, 1.0)
+        since = time.monotonic() - ended
+        self.check("resource exhaustion: two seconds after the burst the bucket is full again, 16 new flows at once "
+                   "go through the egress", bool(batch),
+                   f"all 16 through the egress {since:.1f}s after the burst ended" if batch
+                   else f"not every flow of a batch went through within {since:.0f} s of the burst")
+        try:
+            _, stderr = slow.communicate(timeout=seconds + 40)
+            size = stream.stat().st_size if stream.exists() else 0
+            self.check("resource exhaustion: a flow established before the burst runs to its end",
+                       bool(streaming) and slow.returncode == CURL_OK and size == expected,
+                       f"curl exit {slow.returncode}, {size}/{expected} B ({stderr.strip()[:100]})")
+        except subprocess.TimeoutExpired:
+            slow.kill()
+            self.check("resource exhaustion: a flow established before the burst runs to its end", False,
+                       f"the {seconds}s stream was still running {seconds + 40}s later")
+        self.leak_check("resource exhaustion, new-flow burst: nothing leaked to the target from the consumer's address",
+                        mark)
+        # The admitted datagram flows end on the short idle timeout. Gone before the caps come back
+        # down, they cannot hold slots against the checks that follow.
+        self.wait_for("the burst's flows to go idle", lambda: (self.egress_section() or {}).get("flows") == 0,
+                      10 + 2 * RATE_IDLE_SECONDS, 1.0)
+        self.set_policy([self.consumer_id])
+
+    def refusal_consumer_denied(self):
+        """EGRESS_CONSUMER_DENIED, the egress's own allow-list check.
+
+        The server takes a consumer off an egress in two messages: the egress-config to the egress and
+        a catalogue without that egress to the consumer. Delivered together, the consumer blocks the
+        flow itself as not-offered and the egress never sees it, which is the ACL-revoked fault. The
+        egress checks its allow list again before every connect for the time in between, and on a real
+        network that time is however long the consumer's control connection takes to deliver. This
+        makes it long on purpose: a blackhole route in the server's namespace holds back everything the
+        server sends the consumer, while the peer path, which never passes the server when it is
+        direct, still carries the flow to the egress. The server itself is not changed."""
+        section = self.consumer_section()
+        path = next((peer.get("path") for peer in (section or {}).get("peers") or []
+                     if peer.get("clientId") == self.egress_id), None)
+        if path != "direct":
+            self.note(f"unauthorized device: not checked, the consumer reaches its egress by path {path}; holding "
+                      "back what the server sends would hold back the flow as well")
+            return
+        title = (f"unauthorized device: a consumer taken off the allow list, its catalogue not yet updated, is "
+                 f"refused by the egress ({CODE_CONSUMER_DENIED})")
+        consumer = self.procs["consumer"]
+        mark = self.target_mark()
+        blackhole = ["blackhole", f"{CONSUMER_IP}/32"]
+        if self.sh(["ip", "-n", "srv", "route", "add", *blackhole], check=False).returncode != 0:
+            self.check(title, False, "could not hold back the server's messages to the consumer")
+            return
+        try:
+            applied = self.set_policy([])
+            before = self.refusal_baseline()
+            standing = self.standing_of(self.consumer_section(), self.egress_id)
+            offset = consumer.log_offset()
+            got = self.whoami(TARGET_URL)
+        finally:
+            self.sh(["ip", "-n", "srv", "route", "del", *blackhole], check=False)
+        counts = self.refused_at_egress(CODE_CONSUMER_DENIED, before)
+        # Offered or still unknown both mean the consumer sent the flow on; not-offered would mean it
+        # blocked the flow itself and the egress was never asked.
+        self.check(title, applied and standing in ("offered", "unknown") and got["code"] == CURL_CONNECT_FAILED
+                   and counts is not None,
+                   f"the consumer's catalogue still said {standing}; {self.describe(got)}; "
+                   f"{self.refusal_evidence(CODE_CONSUMER_DENIED, before, counts)}; "
+                   f"{self.consumer_view(CODE_CONSUMER_DENIED, offset)}")
+        self.leak_check("unauthorized device: nothing leaked to the target from the consumer's address", mark)
+        self.set_policy([self.consumer_id])
+        got, elapsed = self.wait_for("flows through the egress once the server's messages arrive",
+                                     self.through_egress, 60, 1.0)
+        self.check("unauthorized device: allowed again, flows go through the egress once the held-back messages arrive",
+                   bool(got), f"after {elapsed:.1f}s" if got else "no flow went through within 60 s")
+
     # -- phase two: domain rules through the DNS takeover (#52) -----------------------------------
 
     def private_etc(self):
@@ -1322,16 +1761,19 @@ class Lab:
         staged = Path("/etc/resolv.conf.lab")
         staged.write_text(f"nameserver {CONSUMER_NAMESERVER}\n", encoding="utf-8")
         os.replace(staged, "/etc/resolv.conf")
-        files = {"con": {"resolv.conf": f"nameserver {CONSUMER_NAMESERVER}\n"},
-                 "egr": {"hosts": f"127.0.0.1 localhost\n{TARGET_IP} {NAMED_HOST}\n"}}
+        names = {NAMED_HOST: TARGET_IP, GRANTED_HOST: TARGET_DIRECT_IP,
+                 REBIND_METADATA_HOST: METADATA_IP, REBIND_PRIVATE_HOST: PRIVATE_IP}
+        hosts = "127.0.0.1 localhost\n" + "".join(f"{address} {name}\n" for name, address in names.items())
+        files = {"con": {"resolv.conf": f"nameserver {CONSUMER_NAMESERVER}\n"}, "egr": {"hosts": hosts}}
         for name, contents in files.items():
             directory = Path("/etc/netns") / name
             directory.mkdir(parents=True, exist_ok=True)
             for file, content in contents.items():
                 (directory / file).write_text(content, encoding="utf-8")
         self.note("phase two: an overlay on /etc in the lab's mount namespace holds /etc/netns/con/resolv.conf "
-                  f"(nameserver {CONSUMER_NAMESERVER}) and /etc/netns/egr/hosts ({NAMED_HOST} -> {TARGET_IP}); "
-                  "nothing is written to the host")
+                  f"(nameserver {CONSUMER_NAMESERVER}) and /etc/netns/egr/hosts ("
+                  + ", ".join(f"{name} -> {address}" for name, address in names.items())
+                  + "); nothing is written to the host")
 
     @staticmethod
     def consumer_resolv_conf():
@@ -1349,11 +1791,11 @@ class Lab:
         return (self.consumer_resolv_conf() == RESOLV_CONF_WRITTEN and journal is not None
                 and journal.get("state") == "committed")
 
-    def named_request(self, timeout=8):
+    def named_request(self, timeout=8, host=NAMED_HOST):
         """The name, fetched from the consumer: through the responder, the pool and the egress."""
         body = self.work / f"curl-{next(self.counter)}.out"
         completed = self.sh(ns("con", "curl", "-sS", "--max-time", str(timeout), "-o", str(body),
-                               "-w", "%{remote_ip}", f"http://{NAMED_HOST}/whoami"), check=False, timeout=timeout + 30)
+                               "-w", "%{remote_ip}", f"http://{host}/whoami"), check=False, timeout=timeout + 30)
         src = None
         if completed.returncode == CURL_OK:
             try:
@@ -1445,6 +1887,9 @@ class Lab:
                    and (section or {}).get("blocked", {}).get("fake-ip-unmapped", 0) >= 1,
                    json.dumps({"dns": dns, "blocked": (section or {}).get("blocked")}))
 
+        if not self.args.skip_refusals:
+            self.rebinding()
+
         # Killed: the takeover outlives the process, and the journal is what gives it back.
         killed_pid = (self.dns_journal() or {}).get("pid")
         consumer.kill()
@@ -1480,6 +1925,67 @@ class Lab:
                    self.consumer_resolv_conf() == original and self.dns_journal() is None,
                    self.consumer_resolv_conf())
 
+    @staticmethod
+    def in_fake_pool(address):
+        try:
+            return ipaddress.ip_address(address) in ipaddress.ip_network(FAKE_IP_POOL)
+        except (TypeError, ValueError):
+            return False
+
+    def consumer_resolves(self, host):
+        """The address the consumer's own resolver gives for a name, which under the takeover is the
+        fake IP the responder hands out for it."""
+        got = self.sh(ns("con", "getent", "ahostsv4", host), check=False, timeout=20)
+        fields = got.stdout.split()
+        return fields[0] if got.returncode == 0 and fields else None
+
+    def rebinding(self):
+        """DNS rebinding (protocol/spec/peer-egress-dns.md, section 5): names under the consumer's
+        domain rule that the egress's own resolver answers with the cloud metadata address and with a
+        private one, while the policy's domainRules grant every name under the rule. The grant is
+        shown to be in force by a public name no destination rule covers going through; the forced-deny
+        list and the scope judge the address a name resolves to, so the same grant must not carry the
+        other two past them."""
+        resolved = []
+        for host, address in ((GRANTED_HOST, TARGET_DIRECT_IP), (REBIND_METADATA_HOST, METADATA_IP),
+                              (REBIND_PRIVATE_HOST, PRIVATE_IP)):
+            got = self.whoami(f"http://{host}", netns_name="egr")
+            resolved.append((host, address, got["src"] == EGRESS_IP, self.describe(got)))
+        self.check("DNS rebinding: the egress resolves each name to its address and its own network reaches it",
+                   all(ok for _, _, ok, _ in resolved),
+                   "; ".join(f"{host} -> {address}: {'reached' if ok else detail}"
+                             for host, address, ok, detail in resolved))
+
+        grant = ({"match": DOMAIN_RULE, "protocols": ["tcp", "udp"], "portRanges": [[1, 65535]]},)
+        applied = self.set_policy([self.consumer_id], domains=grant)
+        got, _ = self.wait_for(f"{GRANTED_HOST} through the egress",
+                               lambda: (lambda r: r if r["src"] == EGRESS_IP else None)(
+                                   self.named_request(host=GRANTED_HOST)), 15, 1.0)
+        got = got or self.named_request(host=GRANTED_HOST)
+        self.check(f"DNS rebinding: the domain grant is in force: {GRANTED_HOST}, whose {TARGET_DIRECT_IP} no "
+                   "destination rule covers, goes through the egress",
+                   applied and got["src"] == EGRESS_IP,
+                   f"curl exit {got['code']}, target saw src={got['src']}"
+                   + (f" ({got['stderr'][:120]})" if got["stderr"] else ""))
+
+        before = self.refusal_baseline()
+        consumer = self.procs["consumer"]
+        for host, address, code in ((REBIND_METADATA_HOST, METADATA_IP, CODE_FORBIDDEN),
+                                    (REBIND_PRIVATE_HOST, PRIVATE_IP, CODE_SCOPE)):
+            mark = self.target_mark()
+            offset = consumer.log_offset()
+            fake = self.consumer_resolves(host)
+            got = self.named_request(host=host)
+            counts = self.refused_at_egress(code, before)
+            self.check(f"DNS rebinding: {host}, granted by name but resolved by the egress to {address}, is refused by "
+                       f"the egress ({code})",
+                       applied and self.in_fake_pool(fake) and got["code"] == CURL_CONNECT_FAILED and counts is not None,
+                       f"the consumer resolved it to {fake or '-'}; curl exit {got['code']}"
+                       + (f" ({got['stderr'][:80]})" if got["stderr"] else "")
+                       + f"; {self.refusal_evidence(code, before, counts)}; {self.consumer_view(code, offset)}")
+            self.nothing_reached(f"DNS rebinding: nothing reached {address}", mark, address)
+        self.set_policy([self.consumer_id])
+
     # -- report -----------------------------------------------------------------------------------
 
     def report(self, aborted=None):
@@ -1492,7 +1998,8 @@ class Lab:
                  f"{self.client_label('egress')} egress against the Go server; {netem}.", "",
                  "Topology: the router namespace bridges the server (203.0.113.2) and the target (203.0.113.10 under "
                  "the rule, 198.51.100.10 under none); the consumer (10.90.1.2) and the egress (10.90.2.2) sit "
-                 "behind it on their own links. Nothing is NATed. The rule sends 203.0.113.0/24 through the egress.",
+                 "behind it on their own links. Nothing is NATed. The rule sends 203.0.113.0/24 through the egress. "
+                 f"The target also answers on {METADATA_IP} and {PRIVATE_IP}, which the egress must refuse.",
                  ""]
         if aborted:
             lines += ["## Aborted", "", "```", aborted, "```", ""]
@@ -1545,6 +2052,8 @@ class Lab:
                 self.fault_server_restart()
                 self.fault_rule_block()
                 self.fault_kill_9()
+            if not self.args.skip_refusals:
+                self.refusals()
             if not self.args.skip_dns:
                 self.phase_two()
         except LabAbort as error:
@@ -1586,6 +2095,8 @@ def main():
     parser.add_argument("--skip-lossy", action="store_true")
     parser.add_argument("--skip-faults", action="store_true")
     parser.add_argument("--skip-dns", action="store_true", help="skip phase two (domain rules, DNS takeover)")
+    parser.add_argument("--skip-refusals", action="store_true",
+                        help="skip the refusals at the egress (#42) and the DNS rebinding checks of phase two")
     parser.add_argument("--switch-off-repetitions", type=int, choices=range(1, 21), default=1,
                         help="repeat established-flow revocation (1-20 rounds)")
     parser.add_argument("--performance-gate", action="store_true",

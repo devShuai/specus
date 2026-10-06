@@ -3514,8 +3514,9 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
 
 static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
 {
+    /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
-                              "{\"id\":%lld,\"clientId\":%lld,\"clientName\":",
+                              "{\"id\":\"%lld\",\"clientId\":%lld,\"clientName\":",
                               item->id,
                               item->client_id);
     if (rc == 0) rc = admin_sb_append_json_string(builder, item->client_name);
@@ -10511,6 +10512,121 @@ typedef struct {
     size_t trailer_names_len;
 } admin_direct_http_sink_state;
 
+/* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
+static size_t admin_log_utf8_sequence(const unsigned char *text, uint32_t *code_point)
+{
+    size_t length;
+    uint32_t value;
+    uint32_t minimum;
+    if (text[0] >= 0xc0U && text[0] <= 0xdfU) {
+        length = 2U;
+        value = text[0] & 0x1fU;
+        minimum = 0x80U;
+    } else if (text[0] >= 0xe0U && text[0] <= 0xefU) {
+        length = 3U;
+        value = text[0] & 0x0fU;
+        minimum = 0x800U;
+    } else if (text[0] >= 0xf0U && text[0] <= 0xf4U) {
+        length = 4U;
+        value = text[0] & 0x07U;
+        minimum = 0x10000U;
+    } else {
+        return 0U;
+    }
+    for (size_t i = 1U; i < length; ++i) {
+        if ((text[i] & 0xc0U) != 0x80U) {
+            return 0U;
+        }
+        value = (value << 6) | (text[i] & 0x3fU);
+    }
+    if (value < minimum || value > 0x10ffffU || (value >= 0xd800U && value <= 0xdfffU)) {
+        return 0U;
+    }
+    *code_point = value;
+    return length;
+}
+
+size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0U) {
+        return 0U;
+    }
+    out[0] = '\0';
+    if (reason == NULL) {
+        return 0U;
+    }
+    static const char truncated[] = "...(truncated)";
+    const unsigned char *cursor = (const unsigned char *)reason;
+    size_t written = 0U;
+    size_t code_points = 0U;
+    while (*cursor != '\0') {
+        if (code_points == ST_ADMIN_LOG_REASON_MAX_CODE_POINTS) {
+            if (written + sizeof(truncated) <= out_len) {
+                memcpy(out + written, truncated, sizeof(truncated));
+                written += sizeof(truncated) - 1U;
+            }
+            break;
+        }
+        char escaped[16];
+        const char *piece = escaped;
+        size_t piece_len = 0U;
+        size_t consumed = 1U;
+        uint32_t code_point = *cursor;
+        if (*cursor == '\\' || *cursor == '\n' || *cursor == '\r' || *cursor == '\t') {
+            escaped[0] = '\\';
+            escaped[1] = *cursor == '\\' ? '\\' : *cursor == '\n' ? 'n' : *cursor == '\r' ? 'r' : 't';
+            piece_len = 2U;
+        } else if (*cursor < 0x20U || *cursor == 0x7fU) {
+            piece_len = (size_t)snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned)*cursor);
+        } else if (*cursor < 0x80U) {
+            piece = (const char *)cursor;
+            piece_len = 1U;
+        } else {
+            size_t sequence = admin_log_utf8_sequence(cursor, &code_point);
+            if (sequence == 0U) {
+                piece_len = (size_t)snprintf(escaped, sizeof(escaped), "\\x%02x", (unsigned)*cursor);
+            } else if (code_point <= 0x9fU || code_point == 0x2028U || code_point == 0x2029U) {
+                consumed = sequence;
+                piece_len = (size_t)snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned)code_point);
+            } else {
+                consumed = sequence;
+                piece = (const char *)cursor;
+                piece_len = sequence;
+            }
+        }
+        if (written + piece_len >= out_len) {
+            break;
+        }
+        memcpy(out + written, piece, piece_len);
+        written += piece_len;
+        out[written] = '\0';
+        cursor += consumed;
+        ++code_points;
+    }
+    return written;
+}
+
+static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
+{
+    const admin_direct_http_sink_state *state = (const admin_direct_http_sink_state *)ctx;
+    char safe_client[512];
+    char safe_route[512];
+    char safe_method[64];
+    char safe_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
+    (void)st_admin_log_safe_reason(state->client_name, safe_client, sizeof(safe_client));
+    (void)st_admin_log_safe_reason(state->route, safe_route, sizeof(safe_route));
+    (void)st_admin_log_safe_reason(state->method, safe_method, sizeof(safe_method));
+    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(safe_reason));
+    fprintf(stderr,
+            "[http-stream-v2] stream reset client=%s route=%s method=%s status=502 errorCode=%u reason=%s\n",
+            safe_client,
+            safe_route,
+            safe_method,
+            (unsigned)code,
+            safe_reason);
+    fflush(stderr);
+}
+
 static void direct_free_strings(char **values, size_t values_len)
 {
     if (values == NULL) {
@@ -13138,7 +13254,8 @@ static int handle_direct_http_request(st_admin_server *server,
         .ctx = &sink_state,
         .on_headers = direct_sink_on_headers,
         .on_data = direct_sink_on_data,
-        .on_end = direct_sink_on_end
+        .on_end = direct_sink_on_end,
+        .on_reset = direct_sink_on_reset
     };
     char remote_address[128];
     admin_fd_remote_text(fd, remote_address);
@@ -13157,6 +13274,9 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 504, "direct http response timeout");
     } else if (!sink_state.started && rc == -3) {
         send_text_http_error(fd, 404, "direct http route is not configured");
+    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
+        /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
+        send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
     } else if (!sink_state.started) {
         send_text_http_error(fd, 502, "direct http target client is offline");
     }

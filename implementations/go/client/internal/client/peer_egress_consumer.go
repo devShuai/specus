@@ -82,6 +82,10 @@ type egressConsumerFlow struct {
 	// replied is set once the egress has sent anything back on this flow. Until then a flow to a
 	// fake address carries its name-bind on every datagram (see handleOutbound).
 	replied bool
+	// rejected is set by a flow-reject for a TCP flow the application has acknowledged nothing on
+	// yet: one that is still opening. Such a flow is kept rather than forgotten (see
+	// handleInboundControl), and the mark keeps a repeated rejection from being counted again.
+	rejected bool
 }
 
 type egressConsumer struct {
@@ -746,7 +750,8 @@ func tcpPacketIsOpening(packet []byte) bool {
 }
 
 // A flow-reject can overtake (or survive loss of) the remote RST on the UDP peer path.
-// Reset locally before forgetting the flow, and only accept its actual egress as the sender.
+// Reset locally before forgetting the flow, and only accept its actual egress as the sender. A TCP
+// flow still opening cannot be reset locally and is kept for the egress's RST instead.
 func (c *egressConsumer) handleInboundControl(frame peerEgressFrame, fromEgress int64, now time.Time) {
 	control, ok := decodePeerEgressControl(frame.Body)
 	if !ok || control.Type != peerEgressControlFlowReject {
@@ -767,6 +772,23 @@ func (c *egressConsumer) handleInboundControl(frame peerEgressFrame, fromEgress 
 		return
 	}
 	reset := egressFlowResetPacket(flow)
+	if reset == nil && key.protocol == ipv4ProtocolTCP {
+		// Still opening: the application has acknowledged nothing, so there is no reset to make
+		// here, and the egress's own RST is what ends its connect. That RST may arrive behind this
+		// message and reaches the application only past the return check, which needs the flow.
+		// Forgetting the flow here dropped it as return-no-flow, and the application retransmitted
+		// its SYN into the same refusal until its own timeout. The RST closes the flow like any
+		// other; if it is lost, the retransmitted SYN draws another.
+		if flow.rejected {
+			c.mu.Unlock()
+			return
+		}
+		flow.rejected = true
+		c.recordBlockedLocked("rejected-" + strings.ToLower(control.Code))
+		c.mu.Unlock()
+		c.logger.Printf("[peer-egress-consumer] egress=%d refused flow code=%s", fromEgress, control.Code)
+		return
+	}
 	delete(c.flows, key)
 	c.recordBlockedLocked("rejected-" + strings.ToLower(control.Code))
 	toTun := c.toTun

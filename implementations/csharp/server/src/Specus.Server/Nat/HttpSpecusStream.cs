@@ -8,6 +8,19 @@ namespace Specus.Server.Nat;
 internal readonly record struct HttpStreamReadResult(
     byte[]? Data, Dictionary<string, object?>? Metadata, bool End);
 
+/// <summary>
+/// Terminal error of an HTTP stream that was reset. <see cref="Reason"/> is free text, for a
+/// client RST supplied by the client, and can carry the target URL, internal hosts or the raw
+/// query; the exception message therefore omits it so it cannot reach a public response.
+/// </summary>
+internal sealed class HttpStreamResetException(uint code, string? reason)
+    : IOException("HTTP stream reset")
+{
+    public uint Code { get; } = code;
+
+    public string Reason { get; } = reason ?? string.Empty;
+}
+
 /// <summary>One mandatory NAT stream v2 HTTP exchange.</summary>
 internal sealed class HttpSpecusStream : IAsyncDisposable
 {
@@ -205,11 +218,9 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
         }
     }
 
-    public bool OnReset(string? reason)
+    public bool OnReset(uint code, string? reason)
     {
-        var error = new IOException(string.IsNullOrWhiteSpace(reason)
-            ? "HTTP stream reset by client"
-            : reason);
+        var error = new HttpStreamResetException(code, reason);
         var written = Enqueue(new HttpStreamEvent(HttpStreamEventKind.Reset, null, null, error));
         Close();
         return written;

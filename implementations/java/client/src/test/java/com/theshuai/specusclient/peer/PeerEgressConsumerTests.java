@@ -307,15 +307,69 @@ class PeerEgressConsumerTests {
     }
 
     /**
-     * A rejection removes the matching flow rather than leaving it to expire.
+     * A connection still opening has nothing the consumer could reset it with, so the egress's own
+     * RST is what ends the application's connect. The egress sends its flow-reject first; forgetting
+     * the flow on it dropped the RST behind it as return-no-flow, and the application retransmitted
+     * its SYN into the same refusal until it timed out (the peer egress lab, #42).
      */
     @Test
-    void dropsAFlowTheEgressRejected() {
+    void keepsAnOpeningFlowTheEgressRejectedForItsReset() {
         PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of(2L, true));
-        consumer.handleOutbound(packetTo("203.0.113.10", 443), EPOCH);
+        byte[] syn = packetTo("203.0.113.10", 443);
+        consumer.handleOutbound(syn, EPOCH);
+
+        byte[] reject = PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
+                PeerEgressFrame.encodeControl(PeerEgressFrame.Control.flowReject(
+                        "tcp", VIRTUAL_IP, 40000, "203.0.113.10", 443, PeerEgressCodes.LIMIT_EXCEEDED)));
+        consumer.handleInbound(reject, 2, EPOCH);
+        assertEquals(1, consumer.flowCount(), "the opening flow was forgotten on the reject");
+        assertTrue(toTun.isEmpty(), "a reset was made up for a flow the application acknowledged nothing on");
+
+        // The egress's reset, exactly as it answers a refused SYN, reaches the application.
+        byte[] reset = PeerEgressSegment.buildReset(PeerEgressSegment.parse(syn));
+        consumer.handleInbound(PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, reset), 2, EPOCH);
+        assertEquals(1, toTun.size(), "the egress's reset did not reach the application: "
+                + consumer.blockedCounts());
+        var delivered = PeerEgressSegment.parse(toTun.get(0));
+        assertNotNull(delivered);
+        assertTrue(delivered.has(PeerEgressSegment.FLAG_RST));
+        assertEquals(1001, delivered.ack());
+
+        // A repeated reject, as for a retransmitted SYN, is neither counted again nor acted on.
+        consumer.handleInbound(reject, 2, EPOCH);
+        assertEquals(1L, consumer.blockedCounts().get("rejected-egress_limit_exceeded"));
+        assertFalse(consumer.blockedCounts().containsKey("return-no-flow"));
+        assertEquals(1, toTun.size());
+    }
+
+    /** The order can also be the other way round: the reset first, then the reject for the flow. */
+    @Test
+    void takesTheEgressResetBeforeItsReject() {
+        PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of(2L, true));
+        byte[] syn = packetTo("203.0.113.10", 443);
+        consumer.handleOutbound(syn, EPOCH);
+        consumer.handleInbound(PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false,
+                PeerEgressSegment.buildReset(PeerEgressSegment.parse(syn))), 2, EPOCH);
+        consumer.handleInbound(PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false,
+                PeerEgressFrame.encodeControl(PeerEgressFrame.Control.flowReject(
+                        "tcp", VIRTUAL_IP, 40000, "203.0.113.10", 443, PeerEgressCodes.PORT_DENIED))), 2, EPOCH);
+        assertEquals(1, toTun.size(), "want only the egress's reset");
+        assertEquals(1L, consumer.blockedCounts().get("rejected-egress_port_denied"));
+    }
+
+    /**
+     * A rejected datagram flow is forgotten: UDP has no reset to wait for, and the next datagram is
+     * judged afresh.
+     */
+    @Test
+    void forgetsADatagramFlowTheEgressRejected() {
+        PeerEgressConsumer consumer = newConsumer(consumerRules(), Map.of(2L, true));
+        consumer.handleOutbound(PeerEgressDatagram.build(new PeerEgressDatagram.Datagram(
+                address(VIRTUAL_IP), address("203.0.113.10"), 40000, 53,
+                "query".getBytes(StandardCharsets.US_ASCII))), EPOCH);
 
         byte[] body = PeerEgressFrame.encodeControl(PeerEgressFrame.Control.flowReject(
-                "tcp", VIRTUAL_IP, 40000, "203.0.113.10", 443, PeerEgressCodes.PORT_DENIED));
+                "udp", VIRTUAL_IP, 40000, "203.0.113.10", 53, PeerEgressCodes.PORT_DENIED));
         consumer.handleInbound(
                 PeerEgressFrame.encode(PeerEgressFrame.TYPE_CONTROL, false, body), 2, EPOCH);
 

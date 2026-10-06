@@ -119,7 +119,7 @@ internal sealed class NatClientSession : IAsyncDisposable
                 if (_httpStreams.TryGetValue(packet.StreamId, out var httpEnd))
                 {
                     var valid = packet.NatMessageType == NatMessageType.Rst
-                        ? httpEnd.OnReset(AsString(packet.MetaData, "reason"))
+                        ? httpEnd.OnReset(packet.Value, AsString(packet.MetaData, "reason"))
                         : httpEnd.OnResponseEnd(packet.MetaData);
                     if (!valid)
                     {
@@ -271,7 +271,7 @@ internal sealed class NatClientSession : IAsyncDisposable
         _externalChannels.Clear();
         foreach (var stream in _httpStreams.Values)
         {
-            stream.OnReset("control channel closed");
+            stream.OnReset(0, "control channel closed");
         }
         _httpStreams.Clear();
         foreach (var stream in _webSocketStreams.Values)

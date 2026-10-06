@@ -309,11 +309,10 @@ func (s *HTTPStream) onEnd(metadata map[string]any) httpStreamFrameResult {
 	return s.enqueue(httpStreamEvent{kind: httpEventEnd, metadata: cloneMetadata(metadata)})
 }
 
-func (s *HTTPStream) onReset(reason string) {
-	if reason == "" {
-		reason = "HTTP stream reset by client"
-	}
-	event := httpStreamEvent{kind: httpEventReset, err: errors.New(reason)}
+// onReset terminates the stream with err. A client RST arrives as *directhttp.StreamResetError
+// so the public HTTP path can tell its free-text reason apart from server-side failures.
+func (s *HTTPStream) onReset(err error) {
+	event := httpStreamEvent{kind: httpEventReset, err: err}
 	select {
 	case s.head <- event:
 	default:

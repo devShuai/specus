@@ -48,6 +48,9 @@ public class HttpSpecusController {
             "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
     );
+    /** Fixed public body for a stream RST before the response is committed (http-route.md §1). */
+    static final String STREAM_RESET_BODY = "HTTP 转发请求失败";
+    private static final int MAX_LOGGED_REASON_CODE_POINTS = 256;
 
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
@@ -237,7 +240,7 @@ public class HttpSpecusController {
                     }
                     natHandler.consumeHttpResponseData(streamId, bytes.length);
                 } else if (event instanceof HttpStreamExchange.Reset reset) {
-                    throw new HttpForwardFailure(502, reset.reason());
+                    throw new HttpStreamExchange.HttpStreamException(reset.reason(), reset.errorCode());
                 } else {
                     break;
                 }
@@ -263,8 +266,14 @@ public class HttpSpecusController {
             Throwable cause = unwrap(error);
             String errorMessage = cause.getMessage() == null
                     ? cause.getClass().getSimpleName() : cause.getMessage();
-            boolean clientDisconnected = response.isCommitted() && isClientDisconnect(cause);
-            mediaCapture.fail(errorMessage);
+            // A stream RST carries peer-supplied free text (target URL, internal hosts, raw query):
+            // it is logged escaped and truncated, and the public caller only sees a fixed body.
+            HttpStreamExchange.HttpStreamException streamReset =
+                    cause instanceof HttpStreamExchange.HttpStreamException reset ? reset : null;
+            String diagnostic = streamReset == null ? errorMessage : logSafeReason(errorMessage);
+            boolean clientDisconnected = streamReset == null
+                    && response.isCommitted() && isClientDisconnect(cause);
+            mediaCapture.fail(diagnostic);
             if (opened && natHandler != null && exchange != null) {
                 natHandler.cancelHttpStream(exchange.streamId(), errorMessage);
             }
@@ -275,18 +284,25 @@ public class HttpSpecusController {
             } else {
                 int errorStatus = cause instanceof HttpForwardFailure typed ? typed.statusCode :
                         cause instanceof TimeoutException ? 504 : 502;
-                failure = errorMessage;
+                String publicMessage = streamReset == null ? errorMessage : STREAM_RESET_BODY;
+                failure = diagnostic;
                 statusCode = errorStatus;
                 responseHeaders = plainErrorHeaders();
                 if (!responseBodyExternalized) {
-                    responseCapture.append(failure.getBytes(StandardCharsets.UTF_8));
+                    responseCapture.append(publicMessage.getBytes(StandardCharsets.UTF_8));
                 }
                 if (!response.isCommitted()) {
-                    writeError(response, errorStatus, failure);
+                    writeError(response, errorStatus, publicMessage);
                 }
-                log.warn("[http-stream-v2][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
-                        clientName, request.getMethod(), route, errorStatus, failure,
-                        System.currentTimeMillis() - startedAt);
+                if (streamReset != null) {
+                    log.warn("[http-stream-v2][server-egress] stream reset clientName={} method={} route={} status={} errorCode={} reason={} elapsedMs={}",
+                            clientName, request.getMethod(), route, errorStatus, streamReset.errorCode(), failure,
+                            System.currentTimeMillis() - startedAt);
+                } else {
+                    log.warn("[http-stream-v2][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
+                            clientName, request.getMethod(), route, errorStatus, failure,
+                            System.currentTimeMillis() - startedAt);
+                }
             }
         } finally {
             if (natHandler != null && exchange != null) {
@@ -360,6 +376,43 @@ public class HttpSpecusController {
         response.setStatus(statusCode);
         response.setContentType("text/plain;charset=UTF-8");
         response.getOutputStream().write(message.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Makes a peer-supplied RST reason safe for one log field: at most 256 code points, with
+     * control and line-separator characters escaped so the text cannot forge log lines.
+     */
+    static String logSafeReason(String reason) {
+        if (reason == null) {
+            return "";
+        }
+        StringBuilder safe = new StringBuilder(Math.min(reason.length(), MAX_LOGGED_REASON_CODE_POINTS) + 16);
+        int[] codePoints = reason.codePoints().toArray();
+        int limit = Math.min(codePoints.length, MAX_LOGGED_REASON_CODE_POINTS);
+        for (int index = 0; index < limit; index++) {
+            int codePoint = codePoints[index];
+            int type = Character.getType(codePoint);
+            if (codePoint == '\\') {
+                safe.append("\\\\");
+            } else if (codePoint == '\n') {
+                safe.append("\\n");
+            } else if (codePoint == '\r') {
+                safe.append("\\r");
+            } else if (codePoint == '\t') {
+                safe.append("\\t");
+            } else if (Character.isISOControl(codePoint)
+                    || type == Character.LINE_SEPARATOR
+                    || type == Character.PARAGRAPH_SEPARATOR
+                    || type == Character.SURROGATE) {
+                safe.append(String.format(Locale.ROOT, "\\u%04x", codePoint));
+            } else {
+                safe.appendCodePoint(codePoint);
+            }
+        }
+        if (codePoints.length > limit) {
+            safe.append("...(truncated)");
+        }
+        return safe.toString();
     }
 
     static List<String> flattenTrailers(Map<String, String> trailers, boolean stripAuthorization) {
