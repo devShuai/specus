@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading.Channels;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Specus.Protocol;
 using Specus.Protocol.Packets;
 using Specus.Server.Authentication;
@@ -26,11 +27,13 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     private const string Password = "ws-password";
     private static readonly string ClientName = DatabaseInitializer.DemoClientName;
 
+    private readonly CapturingLoggerProvider _logs = new();
     private TestServerFixture? _server;
 
     public async Task InitializeAsync()
     {
-        _server = await TestServerFixture.StartAsync();
+        _server = await TestServerFixture.StartAsync(
+            configureServices: services => services.AddSingleton<ILoggerProvider>(_logs));
         await SeedProtectedRouteAsync();
     }
 
@@ -117,6 +120,63 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         {
             Assert.False(response.TrailingHeaders.Contains(name));
         }
+    }
+
+    [Fact]
+    public async Task ClientResetBeforeResponseHeadersReturnsGenericBadGatewayAndLogsReason()
+    {
+        const string reason = "dial http://10.20.30.40:8080/admin/internal?token=s3cret&user=root failed: "
+                              + "connection refused\r\nX-Forged: yes";
+        await using var session = BoundNatSession.Bind(_server!);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var http = _server!.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            HttpPath("admin/internal") + "?token=s3cret&user=root");
+        request.Headers.Authorization = System.Net.Http.Headers.AuthenticationHeaderValue.Parse(
+            BasicAuthorization());
+
+        var responseTask = http.SendAsync(request, cancellation.Token);
+        var opened = await session.Writer.ReadAsync(
+            packet => packet.NatMessageType == NatMessageType.Open
+                      && Equals(packet.MetaData?["source"], "http"), cancellation.Token);
+        await session.Writer.InjectAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Rst,
+            StreamId = opened.StreamId,
+            Value = 1,
+            MetaData = new Dictionary<string, object?> { ["reason"] = reason },
+        });
+
+        using var response = await responseTask;
+        var body = await response.Content.ReadAsStringAsync(cancellation.Token);
+
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal(DirectHttpEndpoints.StreamResetBody, body);
+        var headers = response.Headers.Concat(response.Content.Headers)
+            .SelectMany(header => header.Value.Prepend(header.Key))
+            .ToArray();
+        foreach (var leaked in new[] { "10.20.30.40", "s3cret", "http://", "X-Forged" })
+        {
+            Assert.DoesNotContain(leaked, body, StringComparison.Ordinal);
+            Assert.DoesNotContain(headers, value => value.Contains(leaked, StringComparison.Ordinal));
+        }
+        var logged = Assert.Single(_logs.Messages(DirectHttpEndpoints.LoggerCategory),
+            message => message.Contains("stream reset", StringComparison.Ordinal));
+        Assert.Contains("http://10.20.30.40:8080/admin/internal?token=s3cret&user=root", logged,
+            StringComparison.Ordinal);
+        Assert.Contains(@"\r\nX-Forged: yes", logged, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", logged, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", logged, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LogSafeReasonEscapesControlCharactersAndTruncates()
+    {
+        Assert.Equal(@"a\r\nb\tc\u0000d\u2028e\\f",
+            DirectHttpEndpoints.LogSafeReason("a\r\nb\tc\0d\u2028e\\f"));
+        Assert.Equal(string.Empty, DirectHttpEndpoints.LogSafeReason(null));
+        Assert.Equal(new string('x', 256) + "...(truncated)",
+            DirectHttpEndpoints.LogSafeReason(new string('x', 300)));
     }
 
     [Fact]
@@ -601,6 +661,33 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
                 _output.Dispose();
             }
             base.Dispose(disposing);
+        }
+    }
+
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<(string Category, string Message)> _messages = new();
+
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(this, categoryName);
+
+        public IReadOnlyList<string> Messages(string category) => _messages
+            .Where(entry => entry.Category == category)
+            .Select(entry => entry.Message)
+            .ToArray();
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class CapturingLogger(CapturingLoggerProvider provider, string category) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter) =>
+                provider._messages.Enqueue((category, formatter(state, exception)));
         }
     }
 

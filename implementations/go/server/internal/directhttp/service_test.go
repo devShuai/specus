@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -317,6 +318,76 @@ func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
 	}
 }
 
+func TestServeHTTPClientResetKeepsReasonOutOfPublicResponse(t *testing.T) {
+	const reason = "dial http://10.20.30.40:8080/admin/internal?token=s3cret&user=root failed: " +
+		"connection refused\r\nX-Forged: yes"
+	cases := map[string]func(*fakeStream){
+		"before response headers": func(stream *fakeStream) {
+			stream.headErr = &StreamResetError{Code: 1, Reason: reason}
+		},
+		"while buffering for rewrite": func(stream *fakeStream) {
+			stream.head = map[string]any{"statusCode": 200, "headers": []string{"Content-Type:text/html"}}
+			stream.responses = []fakeResponse{
+				{data: []byte("<html>")}, {err: &StreamResetError{Code: 1, Reason: reason}},
+			}
+		},
+	}
+	for name, configure := range cases {
+		t.Run(name, func(t *testing.T) {
+			recorder := &capturingDetailRecorder{}
+			stream := newFakeStream()
+			configure(stream)
+			var logs bytes.Buffer
+			service := NewService(onlineRegistry("Demo client"),
+				func(string, map[string]any) (Stream, error) { return stream, nil },
+				nil, time.Second, 1024, 1024, nil,
+				&staticRouteSettings{policy: &store.HTTPRouteAccessPolicy{Enabled: true, PathRewriteEnabled: true}},
+				recorder, store.TrafficDetailOptions{Enabled: true})
+			service.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+			response := httptest.NewRecorder()
+
+			service.ServeHTTP(response, specusRequest(http.MethodGet,
+				"/http/Demo%20client/api/admin/internal?token=s3cret&user=root", ""))
+
+			body := response.Body.String()
+			if response.Code != http.StatusBadGateway || body != errForwardFailed.Error() ||
+				body == errOffline.Error() {
+				t.Fatalf("public response = %d/%q, want 502 with the generic body", response.Code, body)
+			}
+			for _, leaked := range []string{"10.20.30.40", "s3cret", "http://", "X-Forged"} {
+				if strings.Contains(body, leaked) {
+					t.Fatalf("public body leaks %q: %q", leaked, body)
+				}
+				for name, values := range response.Header() {
+					if strings.Contains(name+strings.Join(values, ","), leaked) {
+						t.Fatalf("public header leaks %q: %s=%v", leaked, name, values)
+					}
+				}
+			}
+			// The reason reaches the server log, escaped onto the single record line.
+			logged := logs.String()
+			if !strings.Contains(logged, "http://10.20.30.40:8080/admin/internal?token=s3cret&user=root") ||
+				!strings.Contains(logged, "X-Forged: yes") || strings.Contains(logged, "\r") ||
+				strings.Count(logged, "\n") != 1 {
+				t.Fatalf("server log does not carry the escaped reason on one line: %q", logged)
+			}
+			if string(recorder.record.ResponseBody) != errForwardFailed.Error() ||
+				recorder.record.Error != logSafeReason(reason) {
+				t.Fatalf("unexpected detail: body=%q error=%q", recorder.record.ResponseBody, recorder.record.Error)
+			}
+		})
+	}
+}
+
+func TestLogSafeReasonEscapesControlCharactersAndTruncates(t *testing.T) {
+	if got := logSafeReason("a\r\nb\tc\x00d\u2028e\\f\xff"); got != `a\r\nb\tc\u0000d\u2028e\\f\xff` {
+		t.Fatalf("escaped reason = %q", got)
+	}
+	if got := logSafeReason(strings.Repeat("界", 300)); got != strings.Repeat("界", 256)+"...(truncated)" {
+		t.Fatalf("truncated reason = %q", got)
+	}
+}
+
 func TestServeHTTPEnforcesManagedRouteBasicAuthentication(t *testing.T) {
 	policy := &store.HTTPRouteAccessPolicy{
 		Enabled: true, AuthEnabled: true, AuthUsername: "route-user", AuthPasswordHash: auth.HashToken("route-password"),
@@ -598,6 +669,7 @@ type fakeStream struct {
 	consumed       int
 	resetReason    string
 	blockHead      bool
+	headErr        error
 	finishMetadata map[string]any
 }
 
@@ -622,6 +694,9 @@ func (s *fakeStream) WaitResponseHead(ctx context.Context) (map[string]any, erro
 	}
 	select {
 	case <-s.finished:
+		if s.headErr != nil {
+			return nil, s.headErr
+		}
 		return s.head, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()

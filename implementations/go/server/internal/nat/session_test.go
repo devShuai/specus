@@ -2,7 +2,9 @@ package nat
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -64,6 +66,31 @@ func TestUnknownTCPStreamResetsDataAndFinButRejectsNeverOpenedRST(t *testing.T) 
 		Type: protocol.NatRST, StreamID: 44,
 	}); err == nil {
 		t.Fatal("RST for a never-opened stream must close the data connection")
+	}
+}
+
+func TestHTTPClientRSTKeepsReasonOutOfTheErrorText(t *testing.T) {
+	const reason = "dial http://10.20.30.40:8080/admin?token=s3cret failed"
+	stream := newHTTPStream(nil, 46, nil)
+	session := &clientSession{
+		httpStreams: map[uint32]*HTTPStream{46: stream},
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	if err := session.handle(protocol.NatMessage{
+		Type: protocol.NatRST, StreamID: 46, Value: 3,
+		Metadata: map[string]any{"reason": reason},
+	}); err != nil {
+		t.Fatalf("client RST closed the data connection: %v", err)
+	}
+
+	_, err := stream.WaitResponseHead(context.Background())
+	var reset *directhttp.StreamResetError
+	if !errors.As(err, &reset) || reset.Code != 3 || reset.Reason != reason {
+		t.Fatalf("WaitResponseHead error = %#v, want StreamResetError{3, reason}", err)
+	}
+	if bytes.Contains([]byte(err.Error()), []byte("10.20.30.40")) {
+		t.Fatalf("reset error text leaks the client reason: %q", err.Error())
 	}
 }
 
@@ -324,7 +351,7 @@ func TestHTTPStreamRequiresExactlyOneResponseHeadBeforeDataAndFin(t *testing.T) 
 	}
 
 	reset := newHTTPStream(nil, 52, nil)
-	reset.onReset("cancelled")
+	reset.onReset(errors.New("cancelled"))
 	if !reset.isClosed() {
 		t.Fatal("RST must close the response stream")
 	}

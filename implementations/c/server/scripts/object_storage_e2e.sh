@@ -247,6 +247,26 @@ upload_request = {
     "roomId": "object-e2e-room",
     "roomToken": room_token,
 }
+# A VIEWER invite resolves the room but may not upload. The refusal happens before the source-address
+# limiter, so the one presign this run allows is still available for the owner below.
+status, _, invite = api("POST", "/api/public/transfer/rooms/access-tokens",
+                        {"roomId": "object-e2e-room", "roomToken": room_token, "role": "VIEWER"})
+if status != 200 or not invite.get("token"):
+    raise RuntimeError(f"viewer invite failed: {status} {invite}")
+viewer_request = dict(upload_request, roomToken=invite["token"])
+status, _, refused = api("POST", "/api/public/transfer/attachments/presign-upload", viewer_request, token)
+if status != 403 or attachment_state().get("transfer_attachment"):
+    raise RuntimeError(f"viewer upload must be refused without a reservation: {status} {refused}")
+# The OSS callback needs no bearer token, only a valid OSS signature; a forged one is 403, not 401.
+status, _, refused = api("POST", "/api/public/transfer/oss-callback",
+                         {"bucket": "examplebucket", "object": "prefix/forged.txt", "size": 1},
+                         token="not-a-jwt")
+if status != 403:
+    raise RuntimeError(f"forged OSS callback must be refused with 403: {status} {refused}")
+status, _, refused = api("POST", "/api/public/transfer/attachments/1/complete", {"roomToken": room_token}, token)
+if status != 400:
+    raise RuntimeError(f"complete of an unknown attachment must be 400: {status} {refused}")
+
 status, _, upload = api("POST", "/api/public/transfer/attachments/presign-upload", upload_request, token)
 if status != 200:
     raise RuntimeError(f"presign upload failed: {status} {upload}")
@@ -254,6 +274,11 @@ if upload["attachment"]["fileName"] != "demo.txt" or upload["attachment"]["statu
     raise RuntimeError(f"upload response mismatch: {upload}")
 # The unexpired reservation counts with its declared size until completion replaces it.
 capabilities(1, "with a pending reservation")
+# Before the PUT the object store has nothing under the key: complete is refused and stays PENDING.
+status, _, refused = api("POST", f"/api/public/transfer/attachments/{upload['attachmentId']}/complete",
+                         {"roomToken": room_token}, token)
+if status != 409 or attachment_state()["transfer_attachment"][0][13] != "PENDING":
+    raise RuntimeError(f"complete before the upload must be refused: {status} {refused}")
 
 direct = urllib.parse.urlsplit(upload["uploadUrl"])
 connection = http.client.HTTPConnection("127.0.0.1", oss_port, timeout=10)

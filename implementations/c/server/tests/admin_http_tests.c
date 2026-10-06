@@ -8,6 +8,7 @@
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
+#include "security.h"
 #include "storage.h"
 
 #include <arpa/inet.h>
@@ -293,6 +294,40 @@ typedef struct {
     char http_body[256];
 } route_auth_test_context;
 
+#define ROUTE_RESET_REASON \
+    "dial http://10.20.30.40:8080/admin/internal?token=s3cret&user=root failed: " \
+    "connection refused\r\nX-Forged: yes"
+
+/* Redirects stderr into a temporary file so a test can read what the server logged. */
+static int stderr_capture_begin(FILE **capture, int *saved_fd)
+{
+    fflush(stderr);
+    *capture = tmpfile();
+    if (*capture == NULL) {
+        return -1;
+    }
+    *saved_fd = dup(STDERR_FILENO);
+    if (*saved_fd < 0 || dup2(fileno(*capture), STDERR_FILENO) < 0) {
+        if (*saved_fd >= 0) {
+            close(*saved_fd);
+        }
+        fclose(*capture);
+        return -1;
+    }
+    return 0;
+}
+
+static void stderr_capture_end(FILE *capture, int saved_fd, char *out, size_t out_len)
+{
+    fflush(stderr);
+    (void)dup2(saved_fd, STDERR_FILENO);
+    close(saved_fd);
+    rewind(capture);
+    size_t read_len = fread(out, 1U, out_len - 1U, capture);
+    out[read_len] = '\0';
+    fclose(capture);
+}
+
 static void route_auth_test_context_reset(route_auth_test_context *context)
 {
     pthread_mutex_lock(&context->lock);
@@ -390,6 +425,13 @@ static int route_auth_http_forwarder(void *ctx,
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
     pthread_mutex_unlock(&context->lock);
+    if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
+        /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
+        if (sink->on_reset != NULL) {
+            sink->on_reset(sink->ctx, 1U, ROUTE_RESET_REASON);
+        }
+        return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
+    }
     char *headers[] = {"Content-Type: text/plain; charset=UTF-8"};
     static const uint8_t response_body[] = "forwarded";
     return sink->on_headers(sink->ctx, 200, headers, 1U, NULL, 0U) == 0
@@ -1942,6 +1984,547 @@ cleanup:
     return result;
 }
 
+/*
+ * /ws/connections over real sockets, with the semantics of Java ConnectionEventsWebSocketHandler:
+ * a created or updated event reaches every session of its tenant that may see the connection, i.e.
+ * administrators, and other users only for connections of a client they own.
+ */
+static int connection_events_bearer(const char *username, const char *tenant, const char *role,
+                                    char *out, size_t out_len)
+{
+    char token[2048];
+    if (st_security_issue_local_token(username, tenant, role, getenv("SPECUS_AUTH_JWT_SECRET"), 600,
+                                      token, sizeof(token)) != 0) {
+        return -1;
+    }
+    int written = snprintf(out, out_len, "Bearer %s", token);
+    return written < 0 || (size_t)written >= out_len ? -1 : 0;
+}
+
+static char *connection_events_ticket(int port, const char *authorization, const char *endpoint)
+{
+    char body[96];
+    char request[4096];
+    char response[4096] = {0};
+    int body_len = snprintf(body, sizeof(body), "{\"endpoint\":\"%s\"}", endpoint);
+    snprintf(request, sizeof(request),
+             "POST /api/admin/ws-tickets HTTP/1.1\r\nHost: localhost\r\nAuthorization: %s\r\n"
+             "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+             authorization, body_len, body);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")) {
+        fprintf(stderr, "connection events ticket request failed: %s\n", response);
+        return NULL;
+    }
+    return st_json_get_string(response, "ticket");
+}
+
+/* Opens /ws/connections with the ticket; *status gets the handshake status code. */
+static int connection_events_connect(int port, const char *ticket, int *status)
+{
+    *status = -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0
+        || connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    char request[2048];
+    int request_len = snprintf(request, sizeof(request),
+                               "GET /ws/connections%s%s HTTP/1.1\r\nHost: localhost\r\n"
+                               "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+                               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                               ticket == NULL ? "" : "?ticket=", ticket == NULL ? "" : ticket);
+    char response[2048] = {0};
+    size_t received = 0U;
+    if (request_len > 0 && send(fd, request, (size_t)request_len, 0) == request_len) {
+        while (received + 1U < sizeof(response) && recv(fd, response + received, 1U, 0) == 1) {
+            ++received;
+            if (received >= 4U && strcmp(response + received - 4U, "\r\n\r\n") == 0) break;
+        }
+    }
+    if (strncmp(response, "HTTP/1.1 ", 9U) == 0) *status = atoi(response + 9);
+    if (*status != 101) {
+        close(fd);
+        return -1;
+    }
+    /* The server registers the session before it reads frames, so a pong proves registration. */
+    uint8_t opcode = 0U;
+    uint8_t pong[16];
+    size_t pong_len = 0U;
+    if (test_websocket_send_masked_frame(fd, 0x9U, (const uint8_t *)"sync", 4U) != 0
+        || test_websocket_read_frame(fd, &opcode, pong, sizeof(pong), &pong_len) != 0
+        || opcode != 0xAU || pong_len != 4U || memcmp(pong, "sync", 4U) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int connection_events_open(int port, const char *username, const char *tenant, const char *role)
+{
+    char authorization[2300];
+    int status = -1;
+    char *ticket = connection_events_bearer(username, tenant, role, authorization, sizeof(authorization)) == 0
+        ? connection_events_ticket(port, authorization, "connections") : NULL;
+    int fd = ticket == NULL ? -1 : connection_events_connect(port, ticket, &status);
+    if (fd < 0) fprintf(stderr, "connection events socket for %s/%s failed (%d)\n", tenant, username, status);
+    free(ticket);
+    return fd;
+}
+
+static void connection_events_broadcast(const char *tenant, const char *type, long long id, long long client_id,
+                                        const char *disconnected_at)
+{
+    st_storage_connection connection;
+    memset(&connection, 0, sizeof(connection));
+    connection.id = id;
+    connection.client_id = client_id;
+    connection.success = 1;
+    snprintf(connection.tenant_id, sizeof(connection.tenant_id), "%s", tenant);
+    snprintf(connection.client_name, sizeof(connection.client_name), "events-client-%lld", id);
+    snprintf(connection.channel_id, sizeof(connection.channel_id), "channel-%lld", id);
+    snprintf(connection.remote_address, sizeof(connection.remote_address), "203.0.113.10");
+    snprintf(connection.connected_at, sizeof(connection.connected_at), "2026-07-22T00:00:00Z");
+    snprintf(connection.disconnected_at, sizeof(connection.disconnected_at), "%s",
+             disconnected_at == NULL ? "" : disconnected_at);
+    st_admin_broadcast_connection_event(tenant, type, &connection);
+}
+
+/* Reads the next event and checks tenant, type, connection id and the Java DTO field set. */
+static int connection_events_expect(int fd, const char *tenant, const char *type, long long id, const char *label)
+{
+    char payload[4096] = {0};
+    char expected_tenant[96];
+    char expected_type[48];
+    char expected_id[48];
+    snprintf(expected_tenant, sizeof(expected_tenant), "{\"tenantId\":\"%s\",", tenant);
+    snprintf(expected_type, sizeof(expected_type), "\"type\":\"%s\"", type);
+    snprintf(expected_id, sizeof(expected_id), "\"connection\":{\"id\":%lld,", id);
+    static const char *const fields[] = {
+        "\"clientId\":", "\"clientName\":", "\"channelId\":", "\"remoteAddress\":", "\"connectedAt\":",
+        "\"disconnectedAt\":", "\"success\":true", "\"failureReason\":", "\"disconnectReason\":",
+        "\"disconnectReasonText\":"
+    };
+    int ok = test_websocket_read_text(fd, payload, sizeof(payload)) == 0
+        && strncmp(payload, expected_tenant, strlen(expected_tenant)) == 0
+        && contains(payload, expected_type) && contains(payload, expected_id);
+    for (size_t i = 0; ok && i < sizeof(fields) / sizeof(fields[0]); ++i) ok = contains(payload, fields[i]);
+    if (!ok) fprintf(stderr, "%s: expected %s %s #%lld, got %s\n", label, tenant, type, id, payload);
+    return ok ? 0 : -1;
+}
+
+static int connection_events_silent(int fd, const char *label)
+{
+    struct timeval quick = {.tv_sec = 0, .tv_usec = 300000};
+    struct timeval normal = {.tv_sec = 5, .tv_usec = 0};
+    uint8_t byte = 0U;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &quick, sizeof(quick));
+    ssize_t received = recv(fd, &byte, 1U, MSG_PEEK);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &normal, sizeof(normal));
+    if (received < 0) return 0;
+    fprintf(stderr, "%s: an event leaked to this session\n", label);
+    return -1;
+}
+
+static int test_connection_events_websocket(long long owned_client_id)
+{
+    st_admin_server server;
+    memset(&server, 0, sizeof(server));
+    server.fd = -1;
+    if (st_admin_server_start(&server, 0, "") != 0) {
+        fprintf(stderr, "connection events server start failed\n");
+        return 1;
+    }
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    int port = getsockname(server.fd, (struct sockaddr *)&address, &address_len) == 0 ? ntohs(address.sin_port) : -1;
+    int admin = -1, owner = -1, stranger = -1, other_tenant = -1;
+    int result = 1;
+    char response[4096];
+    char authorization[2300];
+    int status = -1;
+    if (port <= 0) goto cleanup;
+
+    /* Plain HTTP is told to upgrade; missing, cross-endpoint and reused tickets are refused. */
+    int len = st_admin_build_response("GET", "/ws/connections", response, sizeof(response));
+    if (len <= 0 || !contains(response, "426 Upgrade Required")) {
+        fprintf(stderr, "plain GET /ws/connections must be 426\n");
+        goto cleanup;
+    }
+    if (connection_events_connect(port, NULL, &status) >= 0 || status != 403) {
+        fprintf(stderr, "/ws/connections without a ticket must be 403, got %d\n", status);
+        goto cleanup;
+    }
+    char *ticket = connection_events_bearer("admin", "tenant-db", "ADMIN", authorization, sizeof(authorization)) == 0
+        ? connection_events_ticket(port, authorization, "client-messages") : NULL;
+    int issued = ticket != NULL;
+    int refused = issued ? connection_events_connect(port, ticket, &status) : -1;
+    free(ticket);
+    if (!issued || refused >= 0 || status != 403) {
+        fprintf(stderr, "a client-messages ticket must not open /ws/connections (%d)\n", status);
+        if (refused >= 0) close(refused);
+        goto cleanup;
+    }
+    ticket = connection_events_ticket(port, authorization, "connections");
+    admin = ticket == NULL ? -1 : connection_events_connect(port, ticket, &status);
+    int reused = ticket == NULL || admin < 0 ? -1 : connection_events_connect(port, ticket, &status);
+    free(ticket);
+    if (admin < 0 || reused >= 0 || status != 403) {
+        fprintf(stderr, "a connections ticket must open exactly one session (%d)\n", status);
+        if (reused >= 0) close(reused);
+        goto cleanup;
+    }
+    owner = connection_events_open(port, "owner-db", "tenant-db", "USER");
+    stranger = connection_events_open(port, "someone-else", "tenant-db", "USER");
+    other_tenant = connection_events_open(port, "admin", "tenant-other", "ADMIN");
+    if (owner < 0 || stranger < 0 || other_tenant < 0) goto cleanup;
+
+    /* Another tenant's event, then a created/updated pair of the owner's client, then a
+     * connection of no owned client. Each session sees exactly its share, in order. */
+    connection_events_broadcast("tenant-other", "created", 501, 0, NULL);
+    connection_events_broadcast("tenant-db", "created", 502, owned_client_id, NULL);
+    connection_events_broadcast("tenant-db", "updated", 502, owned_client_id, "2026-07-22T00:05:00Z");
+    connection_events_broadcast("tenant-db", "created", 503, 0, NULL);
+    connection_events_broadcast("tenant-other", "updated", 504, 0, "2026-07-22T00:06:00Z");
+    if (connection_events_expect(admin, "tenant-db", "created", 502, "administrator, first event") != 0
+        || connection_events_expect(admin, "tenant-db", "updated", 502, "administrator, second event") != 0
+        || connection_events_expect(admin, "tenant-db", "created", 503, "administrator, third event") != 0
+        || connection_events_silent(admin, "administrator after its tenant's events") != 0
+        || connection_events_expect(owner, "tenant-db", "created", 502, "owner, first event") != 0
+        || connection_events_expect(owner, "tenant-db", "updated", 502, "owner, second event") != 0
+        || connection_events_silent(owner, "owner after its client's events") != 0
+        || connection_events_silent(stranger, "user without clients") != 0
+        || connection_events_expect(other_tenant, "tenant-other", "created", 501, "other tenant, first event") != 0
+        || connection_events_expect(other_tenant, "tenant-other", "updated", 504, "other tenant, second event") != 0
+        || connection_events_silent(other_tenant, "other tenant after its events") != 0) {
+        goto cleanup;
+    }
+    /* A closed session is dropped: later events still reach the others. */
+    test_close_websocket(owner);
+    owner = -1;
+    connection_events_broadcast("tenant-db", "updated", 503, 0, "2026-07-22T00:07:00Z");
+    if (connection_events_expect(admin, "tenant-db", "updated", 503, "administrator after a session closed") != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    test_close_websocket(admin);
+    test_close_websocket(owner);
+    test_close_websocket(stranger);
+    test_close_websocket(other_tenant);
+    route_auth_stop_server(&server);
+    return result;
+}
+
+/*
+ * Status codes, authentication and response shape of force-refresh-port-mapping,
+ * traffic/inspection-status, traffic/http-exchanges/{id} and peer-mesh/egress/activity, against
+ * the Java ClientResource, TrafficResource and PeerEgressResource DTOs.
+ */
+static long long endpoint_push_client_id = 0;
+static int endpoint_push_calls = 0;
+
+static int endpoint_nat_push(void *ctx, long long client_id, const char *client_name)
+{
+    (void)ctx;
+    (void)client_name;
+    if (client_id != endpoint_push_client_id) return -1;
+    ++endpoint_push_calls;
+    return 0;
+}
+
+static long long endpoint_runtime_client_id = 0;
+
+static int endpoint_runtime_status(void *ctx, long long client_id, const char *client_name,
+                                   st_admin_client_runtime_status *status)
+{
+    (void)ctx;
+    (void)client_name;
+    memset(status, 0, sizeof(*status));
+    status->online = client_id == endpoint_runtime_client_id;
+    return 0;
+}
+
+/* username NULL sends no credentials at all. */
+static int endpoint_call(const char *method, const char *path, const char *username, const char *tenant,
+                         const char *role, char *out, size_t out_len)
+{
+    char authorization[2300];
+    if (username != NULL
+        && connection_events_bearer(username, tenant, role, authorization, sizeof(authorization)) != 0) {
+        return -1;
+    }
+    return st_admin_build_response_with_auth(method, path, username == NULL ? NULL : authorization, NULL,
+                                             out, out_len);
+}
+
+static int endpoint_expect(int len, const char *response, const char *status, const char *needle, const char *label)
+{
+    int ok = len > 0 && strncmp(response, status, strlen(status)) == 0 && (needle == NULL || contains(response, needle));
+    if (!ok) fprintf(stderr, "%s: expected %s%s%s, got %s\n", label, status, needle == NULL ? "" : " with ",
+                     needle == NULL ? "" : needle, len > 0 ? response : "(none)");
+    return ok ? 0 : -1;
+}
+
+static int endpoint_body_equals(int len, const char *response, const char *body, const char *label)
+{
+    const char *actual = len > 0 ? strstr(response, "\r\n\r\n") : NULL;
+    int ok = actual != NULL && strncmp(response, "HTTP/1.1 200 OK", 15U) == 0 && strcmp(actual + 4, body) == 0;
+    if (!ok) fprintf(stderr, "%s: expected 200 %s, got %s\n", label, body, len > 0 ? response : "(none)");
+    return ok ? 0 : -1;
+}
+
+static long long endpoint_exchange_id(const char *database_path, const char *client_name)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long id = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT id FROM specus_http_traffic_exchange WHERE client_name=?",
+                              -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        id = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (db != NULL) sqlite3_close(db);
+    return id;
+}
+
+static int endpoint_seed_exchange(const char *database_path, const char *tenant, const st_storage_client *client)
+{
+    st_storage_http_exchange_record record;
+    memset(&record, 0, sizeof(record));
+    record.tenant_id = tenant;
+    record.client_id = client->id;
+    record.client_name = client->client_name;
+    record.route = "api";
+    record.method = "GET";
+    record.relative_path = "/status";
+    record.raw_query = "verbose=1";
+    record.status_code = 200;
+    record.success = 1;
+    record.remote_address = "203.0.113.10";
+    record.request_bytes = 12;
+    record.response_bytes = 34;
+    record.elapsed_ms = 5;
+    record.response_content_type = "application/json";
+    record.response_body_type = "json";
+    record.request_headers = "Accept: application/json";
+    record.response_headers = "Content-Type: application/json";
+    record.response_body = (const uint8_t *)"{\"ok\":true}";
+    record.response_body_len = 11U;
+    record.captured_at = "2026-07-22T00:00:00Z";
+    return st_storage_record_http_exchange(database_path, &record);
+}
+
+static int endpoint_seed_activity(const char *database_path, const char *tenant, const st_storage_client *client,
+                                  long long active_flows, const char *rejected_flows)
+{
+    st_storage_peer_mesh_egress_activity row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.tenant_id, sizeof(row.tenant_id), "%s", tenant);
+    row.egress_client_id = client->id;
+    snprintf(row.egress_client_name, sizeof(row.egress_client_name), "%s", client->client_name);
+    row.session_id = 1;
+    row.revision = 3;
+    row.active_flows = active_flows;
+    row.total_flows = active_flows + 10;
+    snprintf(row.rejected_flows, sizeof(row.rejected_flows), "%s", rejected_flows);
+    row.bytes_in = 1000;
+    row.bytes_out = 2000;
+    snprintf(row.reported_at, sizeof(row.reported_at), "2026-07-22T00:00:00Z");
+    return st_storage_upsert_peer_mesh_egress_activity(database_path, &row);
+}
+
+static int test_admin_endpoint_contracts(void)
+{
+    char db_path[256];
+    char path[160];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-admin-endpoints-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-admin-endpoint-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    st_storage_client alpha, bravo, charlie;
+    st_storage_mapping mapping;
+    st_storage_http_route route;
+    int failed = st_storage_init(db_path, 0) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "endpoint-alpha", "alice", 1, 60, &alpha) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "endpoint-bravo", "bob", 1, 60, &bravo) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-b", "endpoint-charlie", "alice", 1, 60, &charlie) != 0
+        || st_storage_create_mapping_for_client(db_path, alpha.id, 18080, "127.0.0.1", 8080, 1, 0, &mapping) != 0
+        || st_storage_create_mapping_for_client(db_path, alpha.id, 18081, "127.0.0.1", 8081, 0, 0, &mapping) != 0;
+    if (failed) fprintf(stderr, "admin endpoint fixture setup failed\n");
+    int len = 0;
+
+    /* POST /api/admin/clients/{id}/force-refresh-port-mapping: {specusMappings, httpRoutes}. */
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/force-refresh-port-mapping", alpha.id);
+    if (!failed) {
+        len = endpoint_call("POST", path, NULL, NULL, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "force refresh without token") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("POST", path, "alice", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "客户端不在线", "force refresh of an offline client") != 0;
+    }
+    endpoint_push_client_id = alpha.id;
+    endpoint_push_calls = 0;
+    st_admin_set_nat_control_handler(endpoint_nat_push, NULL);
+    /* Only enabled mappings count; httpRoutes is -1 until a route was ever created. */
+    if (!failed) {
+        len = endpoint_call("POST", path, "alice", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"specusMappings\":1", "force refresh") != 0
+            || !contains(response, "\"httpRoutes\":-1") || endpoint_push_calls != 1;
+    }
+    if (!failed) {
+        failed = st_storage_create_http_route_for_client(db_path, alpha.id, "disabled-route", "http://127.0.0.1:8080",
+                                                         0, 0, 0, 0, 0, 0, NULL, NULL, &route) != 0;
+        len = failed ? -1 : endpoint_call("POST", path, "root", "tenant-a", "ADMIN", response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 200 ", "\"httpRoutes\":0",
+                                           "force refresh by the tenant administrator") != 0
+            || endpoint_push_calls != 2;
+    }
+    if (!failed) {
+        len = endpoint_call("POST", path, "bob", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh of another owner's client") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("POST", path, "root", "tenant-b", "ADMIN", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh from another tenant") != 0
+            || endpoint_push_calls != 2;
+    }
+    st_admin_set_nat_control_handler(NULL, NULL);
+
+    /* GET /api/admin/traffic/inspection-status: TrafficInspectionService.Snapshot. */
+    if (!failed) {
+        len = endpoint_call("GET", "/api/admin/traffic/inspection-status", NULL, NULL, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "inspection status without token") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("GET", "/api/admin/traffic/inspection-status", "alice", "tenant-a", "USER",
+                            response, sizeof(response));
+        failed = endpoint_body_equals(len, response,
+            "{\"enabled\":false,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,"
+            "\"lastFlushedAt\":null}", "inspection status") != 0;
+    }
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    if (!failed) {
+        len = endpoint_call("GET", "/api/admin/traffic/inspection-status", "alice", "tenant-a", "USER",
+                            response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "{\"enabled\":true,", "enabled inspection status") != 0;
+    }
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+
+    /* GET /api/admin/traffic/http-exchanges/{id}: HttpTrafficExchangeView or 404. */
+    failed = failed || endpoint_seed_exchange(db_path, "tenant-a", &alpha) != 0
+        || endpoint_seed_exchange(db_path, "tenant-a", &bravo) != 0
+        || endpoint_seed_exchange(db_path, "tenant-b", &charlie) != 0;
+    long long alpha_exchange = endpoint_exchange_id(db_path, alpha.client_name);
+    long long charlie_exchange = endpoint_exchange_id(db_path, charlie.client_name);
+    failed = failed || alpha_exchange <= 0 || charlie_exchange <= 0;
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%lld", alpha_exchange);
+    if (!failed) {
+        len = endpoint_call("GET", path, NULL, NULL, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "exchange detail without token") != 0;
+    }
+    if (!failed) {
+        char expected_id[64];
+        snprintf(expected_id, sizeof(expected_id), "{\"id\":\"%lld\",\"clientId\":%lld,", alpha_exchange, alpha.id);
+        static const char *const fields[] = {
+            "\"clientName\":\"endpoint-alpha\"", "\"route\":\"api\"", "\"resourceId\":", "\"resourceName\":",
+            "\"method\":\"GET\"", "\"relativePath\":\"/status\"", "\"rawQuery\":\"verbose=1\"", "\"statusCode\":200",
+            "\"success\":true", "\"error\":", "\"remoteAddress\":\"203.0.113.10\"", "\"requestBytes\":12",
+            "\"responseBytes\":34", "\"elapsedMs\":5", "\"requestContentType\":", "\"responseContentType\":",
+            "\"responseBodyType\":\"json\"", "\"requestHeaders\":", "\"responseHeaders\":", "\"requestPreviewHex\":",
+            "\"requestPreviewText\":", "\"responsePreviewHex\":", "\"responsePreviewText\":",
+            "\"requestTruncated\":false", "\"responseTruncated\":false", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
+        };
+        len = endpoint_call("GET", path, "alice", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", expected_id, "exchange detail for its owner") != 0;
+        for (size_t i = 0; !failed && i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            if (!contains(response, fields[i])) {
+                fprintf(stderr, "exchange detail is missing %s: %s\n", fields[i], response);
+                failed = 1;
+            }
+        }
+    }
+    if (!failed) {
+        len = endpoint_call("GET", path, "root", "tenant-a", "ADMIN", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"endpoint-alpha\"",
+                                 "exchange detail for the tenant administrator") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("GET", path, "bob", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "HTTP exchange not found",
+                                 "exchange detail for another owner") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("GET", path, "root", "tenant-b", "ADMIN", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "exchange detail from another tenant") != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%lld", charlie_exchange + 1000);
+        len = endpoint_call("GET", path, "root", "tenant-a", "ADMIN", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "unknown exchange detail") != 0;
+    }
+
+    /* GET /api/admin/peer-mesh/egress/activity: PeerMeshEgressActivityView[] of the tenant. */
+    if (!failed) {
+        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", NULL, NULL, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "egress activity without token") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "alice", "tenant-a", "USER",
+                            response, sizeof(response));
+        failed = endpoint_body_equals(len, response, "[]", "egress activity before any report") != 0;
+    }
+    failed = failed || endpoint_seed_activity(db_path, "tenant-a", &bravo, 1, "{}") != 0
+        || endpoint_seed_activity(db_path, "tenant-a", &alpha, 2, "{\"EGRESS_POLICY_DENIED\":4}") != 0
+        || endpoint_seed_activity(db_path, "tenant-b", &charlie, 3, "{}") != 0;
+    endpoint_runtime_client_id = alpha.id;
+    st_admin_set_client_runtime_status_handler(endpoint_runtime_status, NULL);
+    if (!failed) {
+        char expected[1024];
+        snprintf(expected, sizeof(expected),
+            "[{\"egressClientId\":%lld,\"egressClientName\":\"endpoint-alpha\",\"online\":true,\"revision\":3,"
+            "\"activeFlows\":2,\"totalFlows\":12,\"rejectedFlows\":{\"EGRESS_POLICY_DENIED\":4},\"bytesIn\":1000,"
+            "\"bytesOut\":2000,\"reportedAt\":\"2026-07-22T00:00:00Z\"},"
+            "{\"egressClientId\":%lld,\"egressClientName\":\"endpoint-bravo\",\"online\":false,\"revision\":3,"
+            "\"activeFlows\":1,\"totalFlows\":11,\"rejectedFlows\":{},\"bytesIn\":1000,"
+            "\"bytesOut\":2000,\"reportedAt\":\"2026-07-22T00:00:00Z\"}]", alpha.id, bravo.id);
+        /* Every account of the tenant sees the tenant's devices, ordered by name, like Java. */
+        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "bob", "tenant-a", "USER",
+                            response, sizeof(response));
+        failed = endpoint_body_equals(len, response, expected, "egress activity of the tenant") != 0;
+    }
+    if (!failed) {
+        len = endpoint_call("GET", "/api/admin/peer-mesh/egress/activity", "root", "tenant-b", "ADMIN",
+                            response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"egressClientName\":\"endpoint-charlie\"",
+                                 "egress activity of another tenant") != 0
+            || contains(response, "endpoint-alpha") || contains(response, "endpoint-bravo");
+        if (failed) fprintf(stderr, "egress activity leaked across tenants: %s\n", response);
+    }
+    st_admin_set_client_runtime_status_handler(NULL, NULL);
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 static int route_auth_detail_is_sanitized(const char *database_path)
 {
     sqlite3 *db = NULL;
@@ -1961,6 +2544,36 @@ static int route_auth_detail_is_sanitized(const char *database_path)
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return result;
+}
+
+static int test_log_safe_reason(void)
+{
+    char safe[2048];
+    /* CR/LF/TAB/backslash, C0 NUL-free control, DEL, C1 (U+0085), U+2028, invalid UTF-8. */
+    st_admin_log_safe_reason("a\r\nb\tc\x01" "d\x7f" "e\xc2\x85" "f\xe2\x80\xa8" "g\\h\xff" "\xe7\x95\x8c",
+                             safe,
+                             sizeof(safe));
+    if (strcmp(safe, "a\\r\\nb\\tc\\u0001d\\u007fe\\u0085f\\u2028g\\\\h\\xff\xe7\x95\x8c") != 0) {
+        fprintf(stderr, "log-safe reason escaping mismatch: %s\n", safe);
+        return 1;
+    }
+    char long_reason[400];
+    memset(long_reason, 'x', sizeof(long_reason) - 1U);
+    long_reason[sizeof(long_reason) - 1U] = '\0';
+    size_t written = st_admin_log_safe_reason(long_reason, safe, sizeof(safe));
+    if (written != ST_ADMIN_LOG_REASON_MAX_CODE_POINTS + strlen("...(truncated)")
+        || strncmp(safe + ST_ADMIN_LOG_REASON_MAX_CODE_POINTS, "...(truncated)", 15U) != 0) {
+        fprintf(stderr, "log-safe reason truncation mismatch: %s\n", safe);
+        return 1;
+    }
+    char tiny[8];
+    if (st_admin_log_safe_reason("abc\r\ndefgh", tiny, sizeof(tiny)) >= sizeof(tiny)
+        || strcmp(tiny, "abc\\r\\n") != 0
+        || st_admin_log_safe_reason(NULL, tiny, sizeof(tiny)) != 0U || tiny[0] != '\0') {
+        fprintf(stderr, "log-safe reason bounds mismatch: %s\n", tiny);
+        return 1;
+    }
+    return 0;
 }
 
 static int test_direct_http_route_authentication(const char *database_path)
@@ -2080,6 +2693,46 @@ static int test_direct_http_route_authentication(const char *database_path)
             pthread_mutex_destroy(&context.lock);
             return 1;
         }
+    }
+
+    snprintf(request,
+             sizeof(request),
+             "GET /http/C%%20managed%%202/api/upstream-reset?token=s3cret&user=root HTTP/1.1\r\n"
+             "Host: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n");
+    route_auth_test_context_reset(&context);
+    FILE *log_capture = NULL;
+    int saved_stderr = -1;
+    char logged[4096];
+    if (stderr_capture_begin(&log_capture, &saved_stderr) != 0) {
+        fprintf(stderr, "direct HTTP reset log capture setup failed\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    int reset_roundtrip = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    stderr_capture_end(log_capture, saved_stderr, logged, sizeof(logged));
+    if (reset_roundtrip != 0
+        || !contains(response, "502 Bad Gateway")
+        || !contains(response, "{\"error\":\"" ST_ADMIN_DIRECT_HTTP_RESET_BODY "\"}")
+        || contains(response, "offline")
+        || contains(response, "10.20.30.40")
+        || contains(response, "s3cret")
+        || contains(response, "http://")
+        || contains(response, "X-Forged")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)) {
+        fprintf(stderr, "direct HTTP client reset leaked its reason or lost the 502: %s\n", response);
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+    if (!contains(logged, "stream reset")
+        || !contains(logged, "http://10.20.30.40:8080/admin/internal?token=s3cret&user=root")
+        || !contains(logged, "refused\\r\\nX-Forged: yes")
+        || contains(logged, "\r")) {
+        fprintf(stderr, "direct HTTP client reset reason was not logged escaped: %s\n", logged);
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
     }
 
     snprintf(request,
@@ -3009,6 +3662,9 @@ int main(void)
         return 1;
     }
     if (test_client_messages_websocket() != 0) {
+        return 1;
+    }
+    if (test_connection_events_websocket(runtime_client_id) != 0) {
         return 1;
     }
     if (test_public_room_access_contract() != 0) {
@@ -4255,7 +4911,7 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_direct_http_route_authentication(db_path) != 0) {
+    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -5026,6 +5682,9 @@ int main(void)
                                      sizeof(path),
                                      &content_type) == 0) {
         fprintf(stderr, "static traversal was allowed\n");
+        return 1;
+    }
+    if (test_admin_endpoint_contracts() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");

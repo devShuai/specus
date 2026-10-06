@@ -1080,8 +1080,25 @@ final class PeerEgressRuntime {
      * which is what the application waits on anyway.
      */
     private void unreachable(long consumer, PeerEgressFlowTable.Key key, Exception cause) {
-        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}",
-                consumer, key.protocolName(), connectReason(cause));
+        log.info("[peer-egress] connect failed consumer={} protocol={} reason={}{}",
+                consumer, key.protocolName(), connectReason(cause), connectDetail(cause));
+    }
+
+    /**
+     * What follows the reason: the JVM option the egress lacks when that is why the dial failed,
+     * otherwise nothing.
+     *
+     * <p>Without {@value PeerEgressSocketHandles#EXPORT_OPTION} every dial on Windows and macOS is
+     * refused, and {@code reason=error} alone would leave an operator nothing to go on. The reason
+     * stays {@code error}, one of the words every runtime shares; the option is a field after it.
+     */
+    static String connectDetail(Throwable cause) {
+        for (Throwable error = cause; error != null; error = error.getCause()) {
+            if (error instanceof PeerEgressSocketHandles.MissingExportException) {
+                return " missing=\"" + PeerEgressSocketHandles.EXPORT_OPTION + "\"";
+            }
+        }
+        return "";
     }
 
     /**
@@ -1258,6 +1275,21 @@ final class PeerEgressRuntime {
             }
             revision = candidate;
             return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * A new control session. Revisions count within one, and a restarted server numbers its pushes
+     * from 1 again; the last session's revision would hold every push of the new one back until the
+     * count caught up, leaving the policy from before the restart in force. Go and .NET get the same
+     * by building a new plane for each session.
+     */
+    void newControlSession() {
+        lock.lock();
+        try {
+            revision = 0;
         } finally {
             lock.unlock();
         }

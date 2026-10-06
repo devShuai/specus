@@ -15,7 +15,9 @@ The consumer's rule sends `203.0.113.0/24` through the egress, and that prefix h
 purpose: the control connection only survives if the bypass `/32` is really installed, and a bypass
 on a physical interface is what a `kill -9` leaves behind for the next start to take back. The
 target's second address is the same server reached under no rule, which is what lets the leak checks
-tell the consumer's own address from the egress's.
+tell the consumer's own address from the egress's. The target also answers on `169.254.169.254` and
+`10.90.9.10`, routed to it by the router: addresses the egress must refuse, there so that a refusal
+that did not happen reaches the target and is logged, instead of failing for want of a listener.
 
 ## What it checks
 
@@ -35,16 +37,83 @@ tell the consumer's own address from the egress's.
 - Fault injection, each with a leak check on the target's log: ACL revoked (the catalogue stops offering the
   egress and the consumer blocks it as `not-offered`, or the egress refuses a flow that beat the
   catalogue), tenant switch off (an established flow is cut, a new one refused), egress process
-  stopped and restarted, rule changed to `block` across a consumer restart, consumer `kill -9`
-  with a user route of its own in the table.
+  stopped and restarted, server restarted (routes held while the control connection is down, and a
+  policy change the restarted server pushes is applied by the egress), rule changed to `block`
+  across a consumer restart, consumer `kill -9` with a user route of its own in the table.
 - The consumer's routing table after a normal exit, after `kill -9`, after the restart, and at the
   end.
+- Refusals at the egress (#42): a restricted target under a `0.0.0.0/0` grant, a consumer taken off
+  the allow list before its catalogue says so, the per-consumer flow cap and the new-flow bucket, and
+  in phase two DNS rebinding to the metadata and to a private address. See below.
+- Phase two (#52): the DNS takeover, a name through the egress, an unmapped fake IP refused, and the
+  takeover given back after a normal exit, after `kill -9` and by `egress dns restore`.
 
 A leak check can fail intermittently, and when it does it is not the lab being flaky. A control
 connection that drops takes the client through its full restart, which withdraws every route it
 owns and reinstalls them a couple of seconds later; requests under a rule go out locally in that
 window. It reproduces on some runs and not others, which is why the probe that catches it also
 captures the consumer's routing table at that instant. Tracked in issue #73.
+
+## Refusals at the egress (#42)
+
+Issue #42 asks that an unauthorized device, a restricted target, DNS rebinding and resource
+exhaustion be refused by the egress. A failed request does not say where it was stopped, so each of
+these checks takes as its evidence the egress's own cumulative refusal count under the expected code
+(`egress.refused` in the egress's `egress --json`), read before and after the probe once the policy
+push it depends on has been logged by the egress and published in its status. The consumer's view,
+the `refused flow code=` line and its `rejected-<code>` count, is added to the evidence but not
+required: the `flow-reject` is a datagram, and losing it is allowed. The target's log is read for
+anything that got through, from any address. A refused connect must also end as one, curl's exit 7
+rather than a timeout: the egress answers a refused SYN with a reset, and an application left to
+retransmit into the refusal until its own timeout is what the explicit-failure rule forbids.
+
+That last requirement found a bug in all three consumers. The egress sends its `flow-reject` before
+the reset, and the consumers forgot a flow on the `flow-reject` even when it was still opening,
+which has no acknowledgement to make a reset from; the egress's reset arriving next was dropped as
+`return-no-flow`, and every refused connect hung for curl's whole 8 s while the egress refused its
+retransmitted SYNs. A consumer now keeps an opening TCP flow on a `flow-reject`, counts the rejection
+once, and lets the egress's reset through.
+
+The policy changes these checks make found a second one, in the Java egress: it kept the last
+control session's `egress-config` revision across a reconnect, and a restarted server numbers from 1
+again, so after the server-restart fault it ignored every policy change and went on enforcing the
+policy from before (here, a flow cap of 128 when 4 was pushed). Go and .NET build a new plane for
+each session; Java now resets the revision when a control session starts, and the server-restart
+fault checks that the egress applies a change the restarted server pushes.
+
+| Check | How | Expected code |
+| --- | --- | --- |
+| Restricted target | The consumer gets a second rule, `169.254.169.254/32` to the egress, and the policy grants `0.0.0.0/0` next to the lab's prefix. The egress's own network reaches the target on that address (checked first), so only the forced-deny list stands in the way | `EGRESS_FORBIDDEN_DESTINATION`; nothing reaches `169.254.169.254` |
+| Unauthorized device | The consumer is taken off the allow list while a blackhole route in the server's namespace holds back everything the server sends the consumer, so its catalogue still offers the egress (the check reads `standing`) and it sends the flow on. The peer path is direct and never passes the server; the server is not changed. Afterwards the consumer is allowed again and flows recover once the held-back messages arrive | `EGRESS_CONSUMER_DENIED` |
+| Flow cap | `maxFlowsPerConsumer` 4: four connections held open through the egress, the fifth refused; once they are reset a new flow goes through under the same cap | `EGRESS_LIMIT_EXCEEDED` |
+| New-flow bucket | Both flow caps raised out of reach and the idle timeout cut to 3 s, then one datagram from each of 384 sockets at once: 384 new flows (three buckets of 128, refilled at 64 a second). A datagram flow needs no handshake with the target, so the burst meets the bucket as fast as the egress reads it rather than as fast as it dials. Of what reached the egress (refused plus its `totalFlows` delta), at most 128 + 64/s over the time until the last answer, plus a slack of 32, may be admitted, and the rest must be refused; at least 64 must be answered. A TCP flow established before the burst runs to its end, and two seconds later 16 new flows at once go through | `EGRESS_LIMIT_EXCEEDED` |
+| DNS rebinding (phase two) | The policy's `domainRules` grant `*.lab.test`, shown to be in force by `granted.lab.test`, a public address no destination rule covers, going through. `metadata.lab.test` and `private.lab.test` resolve, in the egress's hosts file, to `169.254.169.254` and `10.90.9.10`; the consumer resolves each to a fake IP | `EGRESS_FORBIDDEN_DESTINATION` and `EGRESS_SCOPE_DENIED`; nothing reaches either address |
+
+`EGRESS_CONSUMER_DENIED` does not happen end to end while the two messages a policy change sends
+arrive together: the server takes a consumer off an egress in the egress's `egress-config` and in the
+consumer's catalogue at once, and a consumer the catalogue no longer offers the egress to blocks the
+flow itself as `egress-not-offered` (the ACL-revoked fault). The egress checks its allow list again
+before every connect for the time in between, which on a real network is however long the consumer's
+control connection takes to deliver. The lab makes that time long on purpose rather than hoping to
+land in it. If the consumer reaches its egress by relay, holding back the server would hold back the
+flow too, and the check is skipped with a note.
+
+Not covered here, and why:
+
+- **Cross-tenant access.** The lab's server has one built-in tenant; a second needs a second admin and
+  credentials written into the server's database. More to the point, nothing about it can be refused
+  at the egress: the server never lets devices of different tenants peer (`CanPeer` compares tenants
+  before anything else), so a device of another tenant gets no Peer Mesh session with the egress and
+  no catalogue entry for it, and cannot put a frame in front of it. That is server behaviour, covered
+  by the servers' unit tests (`TestCanPeerMatchesJavaCaseSensitiveIdentityAndDirectionalACLs` in Go,
+  for a tenant differing only in case). Should a frame arrive anyway, the egress refuses it with the
+  steps the shared `peer-egress-authz-v1.json` vectors pin for all three clients: `peer-acl-denies`
+  and the `consumer-*` cases.
+- **`EGRESS_PEER_ACL_DENIED`.** Both lab devices belong to the same owner, which the base Peer ACL
+  always allows, and an ACL withdrawal takes the session away rather than leaving one for the egress
+  to refuse on. The `peer-acl-denies` vector covers it.
+- **The rate bucket's exact arithmetic** (millisecond refill, the boundaries) is the shared
+  `peer-egress-rate-v1.json` vector's job; the lab checks the bucket's shape with real flows.
 
 ## Performance gate (#50)
 
@@ -78,7 +147,8 @@ sudo -n unshare -n -m python3 scripts/peer-egress-lab/lab.py \
 Without sudo, a user namespace's fake root is enough on a kernel that lets it create TUN devices
 (WSL 2 does): `unshare -rnm python3 scripts/peer-egress-lab/lab.py ...`. The lab refuses to run in
 a namespace whose main table is not empty, so started on a machine's own network it stops instead
-of rearranging its routes. `--skip-faults` and `--skip-lossy` shorten a run while iterating.
+of rearranging its routes. `--skip-faults`, `--skip-lossy`, `--skip-refusals` and `--skip-dns` shorten
+a run while iterating.
 It also requires a private mount namespace and always mounts a private tmpfs over `/run`; a mount
 namespace alone would hide the namespace mounts but still leave their empty handle files on the host.
 
