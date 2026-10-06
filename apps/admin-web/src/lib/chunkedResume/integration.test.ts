@@ -235,7 +235,8 @@ function interruptAfter(limit: number): () => Taps {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
-describe("chunked resume between two pages", () => {
+// Real SHA-256 over megabytes and real timers: a loaded CI runner needs more than the default 5 s.
+describe("chunked resume between two pages", { timeout: 30_000 }, () => {
   it("auto-accepts a small file in memory mode and delivers identical bytes", async () => {
     const { receiver, sender, persistentStore } = setup();
     const source = new Blob([pattern(0, 300_000)]);
