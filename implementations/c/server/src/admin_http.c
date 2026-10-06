@@ -13481,6 +13481,9 @@ static int handle_direct_http_request(st_admin_server *server,
     } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
         /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
         send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
+    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
+        /* The stream could not be created, answered as Java HttpSpecusController does. */
+        send_text_http_error(fd, 502, "HTTP 流创建失败");
     } else if (!sink_state.started) {
         send_text_http_error(fd, 502, "direct http target client is offline");
     }
