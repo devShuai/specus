@@ -17,10 +17,12 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -43,6 +45,12 @@
 #define ST_MAX_QUEUED_DATA_EVENTS 4096U
 #define ST_HTTP_MAX_REQUEST_BODY (16U * 1024U * 1024U)
 #define ST_HTTP_MAX_RESPONSE_BODY (64U * 1024U * 1024U)
+/* How long a graceful shutdown waits for closed channels to finish their bookkeeping. */
+#define ST_SHUTDOWN_DRAIN_SECONDS 10
+/* Upper bound on NETTY_ONLINE rows one control login inspects for stale-session cleanup. */
+#define ST_MAX_STALE_SESSION_SCAN 256U
+/* A displaced client has at most one control and one data connection; slack covers a race. */
+#define ST_MAX_DISPLACED_SESSIONS 8U
 
 typedef struct {
     long long id;
@@ -73,6 +81,7 @@ typedef struct {
     char public_address[256];
     int control_read_idle_seconds;
     int control_write_timeout_seconds;
+    int per_machine_user_max_instances;
     int max_global_external_connections;
     int max_client_external_connections;
     int max_port_external_connections;
@@ -190,6 +199,8 @@ struct specus_session {
     specus_listener *listeners;
     direct_http_pending *direct_pending;
     int active;
+    /* Set, under active_session_lock, when a newer login of the same client took this role over. */
+    int replaced;
     size_t references;
     uint32_t next_stream_id;
     char remote[128];
@@ -197,6 +208,7 @@ struct specus_session {
     long long connected_since_ms;
     char connected_at[64];
     struct specus_session *active_next;
+    struct specus_session *live_next;
 };
 
 typedef struct {
@@ -216,6 +228,23 @@ static pthread_mutex_t global_external_lock = PTHREAD_MUTEX_INITIALIZER;
 static int global_external_connections = 0;
 static pthread_mutex_t active_session_lock = PTHREAD_MUTEX_INITIALIZER;
 static specus_session *active_sessions = NULL;
+/*
+ * Serialises control-login admission (stale-session cleanup, the online-instance counts and the
+ * NETTY_ONLINE write) with the DISCONNECTED write of a control connection that is going away.
+ * Without it a re-login of the same session could be marked online and then overwritten by the
+ * departing connection, leaving a live control whose session the database reports as offline.
+ */
+static pthread_mutex_t control_admission_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * Every accepted connection, logged in or not, so a graceful shutdown can close each of them and
+ * wait for its bookkeeping. A session's socket is closed only while holding this lock, which lets
+ * the shutdown path shut sockets down without racing a close.
+ */
+static pthread_mutex_t connection_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t connection_registry_cond = PTHREAD_COND_INITIALIZER;
+static specus_session *live_connections = NULL;
+static size_t live_connection_count = 0U;
+static int server_stopping = 0;
 
 static char *json_http_request(const st_direct_http_request *request);
 static int send_reset(specus_session *session, uint32_t stream_id,
@@ -702,6 +731,8 @@ static int load_config(server_config *config)
                          &config->control_read_idle_seconds) != 0
         || env_int_range("SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS", 30, 1, 300,
                          &config->control_write_timeout_seconds) != 0
+        || env_int_range("SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", 1, 1, 1000000,
+                         &config->per_machine_user_max_instances) != 0
         || env_int_range("SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
                          &config->max_global_external_connections) != 0
         || env_int_range("SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
@@ -729,7 +760,10 @@ static int load_config(server_config *config)
         }
         char startup_time[64];
         if (current_utc_timestamp(startup_time) == 0) {
+            /* Nothing is connected yet, so every online session and open connection record was
+             * left behind by a previous process that never ran its disconnect handlers. */
             (void)st_storage_close_client_sessions_by_status(database_path, "NETTY_ONLINE", startup_time);
+            (void)st_storage_close_open_connections(database_path, "SERVER_RESTARTED", startup_time, NULL);
         }
     }
     if (access_token_hash != NULL && *access_token_hash != '\0') {
@@ -1457,15 +1491,26 @@ static void session_reference_release(specus_session *session)
     pthread_mutex_unlock(&active_session_lock);
 }
 
-static void active_session_close_peer_locked(specus_session *session)
+/*
+ * A control connection going away takes its data connection with it (protocol/spec/control-
+ * protocol.md). Only the data connection of the same runtime session qualifies: one that belongs to
+ * a newer session of the same client is that client's current pair and must survive. A data
+ * connection already marked inactive by a protocol violation is still in the list and is closed
+ * too, so it cannot linger holding its listeners. The reverse is deliberately not done, as in Java
+ * and Go: a data connection that goes away leaves its control alone, the client rebuilds the pair,
+ * and the control's record keeps its own disconnect reason.
+ */
+static void active_session_close_data_locked(specus_session *control)
 {
-    if (session == NULL) {
+    if (control == NULL || control->is_data_connection) {
         return;
     }
-    specus_session *peer = active_session_find_role_locked(
-        session->config.client_name, !session->is_data_connection);
-    if (peer != NULL && peer != session) {
-        shutdown(peer->control_fd, SHUT_RDWR);
+    for (specus_session *data = active_sessions; data != NULL; data = data->active_next) {
+        if (data->is_data_connection
+            && data->config.client_session_id == control->config.client_session_id
+            && strcmp(data->config.client_name, control->config.client_name) == 0) {
+            shutdown(data->control_fd, SHUT_RDWR);
+        }
     }
 }
 
@@ -1478,6 +1523,181 @@ static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
         sink->on_reset(sink->ctx, code, reason);
     }
     return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
+}
+
+/* Whether a bound control connection still carries this runtime session. */
+static int control_session_live_locked(long long client_session_id)
+{
+    for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
+        if (session->active
+            && !session->is_data_connection
+            && session->config.client_session_id == client_session_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int control_session_live(long long client_session_id)
+{
+    pthread_mutex_lock(&active_session_lock);
+    int live = control_session_live_locked(client_session_id);
+    pthread_mutex_unlock(&active_session_lock);
+    return live;
+}
+
+/*
+ * Retires a connection a newer login has taken over: it leaves the routing list at once, so no
+ * request is routed to it again, and its socket is shut down so its own thread unwinds and frees
+ * its NAT streams, pending Direct HTTP requests and listeners. The caller keeps a reference until
+ * it is done with the session.
+ */
+static void displace_session_locked(specus_session *session)
+{
+    session->replaced = 1;
+    ++session->references;
+    shutdown(session->control_fd, SHUT_RDWR);
+    active_session_remove_locked(session);
+}
+
+/*
+ * Releases the public TCP ports of a displaced data connection before the replacing login is
+ * answered. Its own thread would close them too, but only after it notices the shutdown; the
+ * client's next REGISTER for the same port would otherwise race that and fail to bind. Shutting a
+ * listening socket down takes it out of LISTEN, which with SO_REUSEADDR already frees the port;
+ * the descriptor itself is left to the listener thread, which closes it once accept() fails, so
+ * no descriptor is closed under a thread still blocked on it.
+ */
+static void release_session_listeners(specus_session *session)
+{
+    pthread_mutex_lock(&session->map_lock);
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+        if (listener->fd >= 0) {
+            shutdown(listener->fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&session->map_lock);
+}
+
+/*
+ * Binds a freshly authenticated connection as its client's current connection of that role.
+ *
+ * The protocol keeps one control and one data connection per client and lets a newer login
+ * replace the older one instead of refusing it. That is what lets a client whose previous socket
+ * died without a FIN reconnect at once rather than wait out the read-idle timeout. A control login
+ * also retires the client's data connection, which belongs to the pair it just superseded. A data
+ * login re-checks its control under the same lock that publishes it, so a control replaced while
+ * the data login was being verified cannot leave a data connection bound to a session that is gone.
+ */
+static int activate_session(specus_session *session, const char **reason)
+{
+    specus_session *displaced[ST_MAX_DISPLACED_SESSIONS];
+    size_t displaced_count = 0U;
+    pthread_mutex_lock(&active_session_lock);
+    if (session->is_data_connection) {
+        specus_session *control = active_session_find_role_locked(session->config.client_name, 0);
+        if (control == NULL || control->config.client_session_id != session->config.client_session_id) {
+            pthread_mutex_unlock(&active_session_lock);
+            *reason = "数据连接未找到匹配的控制连接";
+            return -1;
+        }
+    }
+    specus_session *cursor = active_sessions;
+    while (cursor != NULL) {
+        specus_session *next = cursor->active_next;
+        int same_client = strcmp(cursor->config.client_name, session->config.client_name) == 0;
+        int same_role = cursor->is_data_connection == session->is_data_connection;
+        if (cursor != session && same_client && (same_role || !session->is_data_connection)) {
+            displace_session_locked(cursor);
+            if (displaced_count < ST_MAX_DISPLACED_SESSIONS) {
+                displaced[displaced_count++] = cursor;
+            } else {
+                --cursor->references;
+            }
+        }
+        cursor = next;
+    }
+    active_session_add_locked(session);
+    pthread_mutex_unlock(&active_session_lock);
+
+    for (size_t i = 0; i < displaced_count; ++i) {
+        printf("[%s] replaced by new login client=%s remote=%s\n",
+               displaced[i]->is_data_connection ? "data" : "control",
+               displaced[i]->config.client_name,
+               displaced[i]->remote);
+        if (displaced[i]->is_data_connection) {
+            release_session_listeners(displaced[i]);
+        }
+        session_reference_release(displaced[i]);
+    }
+    *reason = NULL;
+    return 0;
+}
+
+/* Returns -1 once shutdown has begun, so a connection accepted during the drain is refused. */
+static int connection_register(specus_session *session)
+{
+    pthread_mutex_lock(&connection_registry_lock);
+    if (server_stopping) {
+        pthread_mutex_unlock(&connection_registry_lock);
+        return -1;
+    }
+    session->live_next = live_connections;
+    live_connections = session;
+    ++live_connection_count;
+    pthread_mutex_unlock(&connection_registry_lock);
+    return 0;
+}
+
+static void connection_unregister(specus_session *session)
+{
+    pthread_mutex_lock(&connection_registry_lock);
+    for (specus_session **cursor = &live_connections; *cursor != NULL; cursor = &(*cursor)->live_next) {
+        if (*cursor == session) {
+            *cursor = session->live_next;
+            session->live_next = NULL;
+            --live_connection_count;
+            break;
+        }
+    }
+    pthread_cond_broadcast(&connection_registry_cond);
+    pthread_mutex_unlock(&connection_registry_lock);
+}
+
+static int connection_registry_stopping(void)
+{
+    pthread_mutex_lock(&connection_registry_lock);
+    int stopping = server_stopping;
+    pthread_mutex_unlock(&connection_registry_lock);
+    return stopping;
+}
+
+/*
+ * Closes every control and data connection and waits, up to the drain timeout, for their threads
+ * to finish: each one marks its runtime session DISCONNECTED and stamps its connection record
+ * before it exits. This is the C counterpart of Go closing every connection with SERVER_SHUTDOWN
+ * and awaiting the handlers before the store is closed. Returns the connections still running.
+ */
+static size_t close_live_connections_and_wait(int timeout_seconds)
+{
+    pthread_mutex_lock(&connection_registry_lock);
+    server_stopping = 1;
+    for (specus_session *session = live_connections; session != NULL; session = session->live_next) {
+        if (session->control_fd >= 0) {
+            shutdown(session->control_fd, SHUT_RDWR);
+        }
+    }
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_seconds;
+    while (live_connection_count > 0U) {
+        if (pthread_cond_timedwait(&connection_registry_cond, &connection_registry_lock, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+    size_t remaining = live_connection_count;
+    pthread_mutex_unlock(&connection_registry_lock);
+    return remaining;
 }
 
 static int direct_http_forward(void *ctx,
@@ -2333,6 +2553,37 @@ static void peer_mesh_maintenance_stop(void)
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
 }
 
+/*
+ * Java ClientAuthService.closeStaleOnlineSessions: before the online-instance limits are counted,
+ * a NETTY_ONLINE row of this credential whose session no bound control connection carries is
+ * marked DISCONNECTED. Such a row is left by a disconnect whose DISCONNECTED write failed, and
+ * would otherwise lock the machine user out until the next restart. Runs under
+ * control_admission_lock, so a control that is still being admitted cannot be mistaken for stale.
+ */
+static void close_stale_online_sessions(const char *database_path,
+                                        long long credential_id,
+                                        long long current_session_id,
+                                        const char *now_text)
+{
+    long long ids[ST_MAX_STALE_SESSION_SCAN];
+    size_t id_count = 0U;
+    if (st_storage_list_online_session_ids_by_credential(database_path,
+                                                         credential_id,
+                                                         ids,
+                                                         ST_MAX_STALE_SESSION_SCAN,
+                                                         &id_count) != 0) {
+        return;
+    }
+    for (size_t i = 0; i < id_count; ++i) {
+        if (ids[i] == current_session_id || control_session_live(ids[i])) {
+            continue;
+        }
+        if (st_storage_mark_client_session_disconnected(database_path, ids[i], now_text) == 0) {
+            printf("[control] closed stale online session=%lld credential=%lld\n", ids[i], credential_id);
+        }
+    }
+}
+
 static int verify_database_login(specus_session *session, const st_login_request *request, const char **reason)
 {
     server_config *config = &session->config;
@@ -2374,9 +2625,6 @@ static int verify_database_login(specus_session *session, const st_login_request
             *reason = "数据连接未找到匹配的控制连接";
             return 0;
         }
-    } else if (strcmp(client_session.status, "HTTP_AUTHENTICATED") != 0) {
-        *reason = "同一台机器和用户已经有在线实例";
-        return 0;
     }
     char now_text[64];
     if (current_utc_timestamp(now_text) != 0) {
@@ -2387,6 +2635,29 @@ static int verify_database_login(specus_session *session, const st_login_request
         (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
         *reason = "客户端访问令牌已过期";
         return 0;
+    }
+    /*
+     * The runtime token is reusable until it expires: an ordinary reconnect presents the same
+     * clientSessionId + accessToken again, whatever status the previous connection left behind
+     * (protocol/spec/client-auth.md). What may not come back is a session a later HTTP login of
+     * the same machine user replaced: the client has moved on to the newer token, so the old one
+     * is answered as invalid, which makes a real client refresh instead of giving up.
+     */
+    if (!session->is_data_connection) {
+        int superseded = 0;
+        if (st_storage_client_session_superseded(config->database_path,
+                                                 client_session.credential_id,
+                                                 client_session.machine_fingerprint,
+                                                 client_session.os_user,
+                                                 client_session.id,
+                                                 &superseded) != 0) {
+            *reason = "客户端在线状态不可用";
+            return 0;
+        }
+        if (superseded) {
+            *reason = "客户端访问令牌无效";
+            return 0;
+        }
     }
 
     st_storage_client client;
@@ -2402,6 +2673,11 @@ static int verify_database_login(specus_session *session, const st_login_request
     }
 
     int online_count = 0;
+    if (!session->is_data_connection) {
+        close_stale_online_sessions(config->database_path, client_session.credential_id, client_session.id, now_text);
+    }
+    /* Both counts leave this session out: a re-login of the same session is the same instance
+     * coming back, not "another" one, and activate_session() replaces its old connections. */
     if (!session->is_data_connection
         && st_storage_count_online_sessions_by_machine(config->database_path,
                                                     client_session.credential_id,
@@ -2412,7 +2688,7 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "客户端在线状态不可用";
         return 0;
     }
-    if (!session->is_data_connection && online_count >= 1) {
+    if (!session->is_data_connection && online_count >= config->per_machine_user_max_instances) {
         *reason = "同一台机器和用户已经有在线实例";
         return 0;
     }
@@ -2440,7 +2716,8 @@ static int verify_database_login(specus_session *session, const st_login_request
         return 0;
     }
     if (reload_config_for_client_session(config, &client_session) != 0) {
-        if (!session->is_data_connection) {
+        /* A failed re-login must not take a session offline that an older control still carries. */
+        if (!session->is_data_connection && !control_session_live(client_session.id)) {
             (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
         }
         *reason = "客户端配置加载失败";
@@ -3638,9 +3915,13 @@ static void session_shutdown(specus_session *session)
     if (session->control_fd >= 0) {
         st_tls_connection_free(session->tls_connection);
         session->tls_connection = NULL;
+        /* The shutdown path shuts registered sockets down under this lock; closing under it too
+         * keeps that path from ever touching a descriptor number that was already reused. */
+        pthread_mutex_lock(&connection_registry_lock);
         shutdown(session->control_fd, SHUT_RDWR);
         close(session->control_fd);
         session->control_fd = -1;
+        pthread_mutex_unlock(&connection_registry_lock);
     }
     pthread_mutex_unlock(&session->send_lock);
 
@@ -3727,6 +4008,16 @@ static void *client_thread(void *arg)
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
+    if (connection_register(session) != 0) {
+        /* Accepted just as the server began to stop: nothing was read, so nothing to record. */
+        close(session->control_fd);
+        pthread_mutex_destroy(&session->send_lock);
+        pthread_mutex_destroy(&session->map_lock);
+        pthread_mutex_destroy(&session->direct_lock);
+        pthread_cond_destroy(&session->reference_cond);
+        free(session);
+        return NULL;
+    }
     printf("[control] accepted %s\n", session->remote);
 
     if (st_tls_server_context_enabled(session->config.tls_context)) {
@@ -3738,6 +4029,7 @@ static void *client_thread(void *arg)
                                      sizeof(tls_error)) != 0) {
             fprintf(stderr, "[tls] handshake rejected remote=%s: %s\n", session->remote, tls_error);
             session_shutdown(session);
+            connection_unregister(session);
             pthread_mutex_destroy(&session->send_lock);
             pthread_mutex_destroy(&session->map_lock);
             pthread_mutex_destroy(&session->direct_lock);
@@ -3750,6 +4042,7 @@ static void *client_thread(void *arg)
 
     int logged_in = 0;
     const char *disconnect_reason = "CLIENT_CLOSED";
+    int heartbeat_logged = 0;
     for (;;) {
         st_frame_header header;
         uint8_t *body = NULL;
@@ -3790,18 +4083,26 @@ static void *client_thread(void *arg)
 
             session->is_data_connection = strcmp(
                 request.connection_role, ST_CONNECTION_ROLE_DATA) == 0;
-            pthread_mutex_lock(&active_session_lock);
-            specus_session *same_role = active_session_find_role_locked(
-                request.client_name, session->is_data_connection);
-            pthread_mutex_unlock(&active_session_lock);
+            /*
+             * A login for a client that already has a connection of this role is not refused: the
+             * spec keeps one control and one data per client and lets the newer connection replace
+             * the older one. The session is published before the response is written, so once the
+             * client sees success its next frame already finds this connection bound.
+             */
             const char *reason = NULL;
-            if (same_role != NULL) {
-                reason = session->is_data_connection
-                    ? "客户端已有数据连接"
-                    : "客户端已有控制连接";
-                logged_in = 0;
-            } else {
-                logged_in = verify_login(session, &request, &reason);
+            int control_login = !session->is_data_connection;
+            if (control_login) {
+                pthread_mutex_lock(&control_admission_lock);
+            }
+            logged_in = verify_login(session, &request, &reason);
+            if (logged_in) {
+                session->connected_since_ms = now_ms();
+                if (activate_session(session, &reason) != 0) {
+                    logged_in = 0;
+                }
+            }
+            if (control_login) {
+                pthread_mutex_unlock(&control_admission_lock);
             }
             st_buffer response = st_protocol_encode_login_response(
                 request.client_name == NULL ? "" : request.client_name,
@@ -3826,10 +4127,6 @@ static void *client_thread(void *arg)
             printf("[%s] login ok client=%s remote=%s\n",
                    session->is_data_connection ? "data" : "control",
                    request.client_name, session->remote);
-            session->connected_since_ms = now_ms();
-            pthread_mutex_lock(&active_session_lock);
-            active_session_add_locked(session);
-            pthread_mutex_unlock(&active_session_lock);
             if (!session->is_data_connection) {
                 record_login_success_event(session);
                 st_buffer nat_control = st_protocol_encode_nat_control(session->config.client_name,
@@ -3859,6 +4156,14 @@ static void *client_thread(void *arg)
             if (session_send_packet(session, &response) != 0) {
                 disconnect_reason = "HEARTBEAT_WRITE_FAILED";
                 break;
+            }
+            /* Only the first one per connection is logged: it shows the client's keepalive reaches
+             * the server and is answered, without a line every few seconds for every channel. */
+            if (!heartbeat_logged) {
+                heartbeat_logged = 1;
+                printf("[%s] first heartbeat answered client=%s remote=%s\n",
+                       session->is_data_connection ? "data" : "control",
+                       session->config.client_name, session->remote);
             }
             continue;
         }
@@ -3959,27 +4264,35 @@ static void *client_thread(void *arg)
     direct_pending_fail_all(session, "control connection closed");
 
     pthread_mutex_lock(&active_session_lock);
-    active_session_close_peer_locked(session);
+    int replaced = session->replaced;
+    /* A replaced control's data connection was retired by the login that replaced it, and
+     * whatever of this client is still bound belongs to the newer pair. A connection that never
+     * logged in owns no pair: its config still names the default client, which it must not touch. */
+    if (logged_in && !replaced) {
+        active_session_close_data_locked(session);
+    }
     active_session_remove_locked(session);
     while (session->references > 1U) {
         pthread_cond_wait(&session->reference_cond, &active_session_lock);
     }
     pthread_mutex_unlock(&active_session_lock);
+    if (replaced) {
+        disconnect_reason = "REPLACED_BY_NEW_LOGIN";
+    } else if (connection_registry_stopping()) {
+        disconnect_reason = "SERVER_SHUTDOWN";
+    }
     if (logged_in && !session->is_data_connection) {
-        if (session->config.database_path[0] != '\0') {
-            st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
-            if (st_peer_mesh_handle_disconnect(&peer_runtime,
-                                               session->config.client_name) != 0) {
-                fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
-                        session->config.client_name);
-            }
-            /* After active_session_remove_locked above, so the rosters count it as offline. */
-            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
-                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n",
-                        session->config.client_name);
-            }
-        }
-        if (session->config.database_path[0] != '\0'
+        /*
+         * The runtime session goes offline only if no other control carries it: after a re-login
+         * of the same session the newer control does, and writing DISCONNECTED here would leave
+         * the live client looking offline and refuse its data connection. The decision and the
+         * write happen under the admission lock so a concurrent re-login cannot slip between them.
+         */
+        int session_still_live;
+        pthread_mutex_lock(&control_admission_lock);
+        session_still_live = control_session_live(session->config.client_session_id);
+        if (!session_still_live
+            && session->config.database_path[0] != '\0'
             && session->config.client_session_db_backed
             && session->config.client_session_id > 0) {
             char disconnected_at[64];
@@ -3989,9 +4302,27 @@ static void *client_thread(void *arg)
                                                                   disconnected_at);
             }
         }
+        pthread_mutex_unlock(&control_admission_lock);
+        if (session->config.database_path[0] != '\0') {
+            st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+            /* The catalog is keyed by runtime session; a newer control of the same session owns it now. */
+            if (!session_still_live
+                && st_peer_mesh_handle_disconnect(&peer_runtime,
+                                                  session->config.client_name) != 0) {
+                fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
+                        session->config.client_name);
+            }
+            /* After active_session_remove_locked above, so the rosters count it as offline; a
+             * client already back on a newer control is still online and is left alone. */
+            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
+                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n",
+                        session->config.client_name);
+            }
+        }
         record_session_disconnected_event(session, disconnect_reason);
     }
     session_shutdown(session);
+    connection_unregister(session);
     pthread_mutex_destroy(&session->send_lock);
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
@@ -4000,9 +4331,65 @@ static void *client_thread(void *arg)
     return NULL;
 }
 
+static pthread_mutex_t shutdown_signal_lock = PTHREAD_MUTEX_INITIALIZER;
+static int shutdown_wake_fd = -1;
+static sigset_t shutdown_signals;
+
+/*
+ * SIGTERM/SIGINT are blocked in every thread and taken here, so the accept loop can run the
+ * graceful shutdown on its own thread instead of the process dying with channels still open,
+ * sessions still NETTY_ONLINE and connection records never stamped.
+ */
+static void *shutdown_signal_thread(void *unused)
+{
+    (void)unused;
+    int signal_number = 0;
+    if (sigwait(&shutdown_signals, &signal_number) != 0) {
+        return NULL;
+    }
+    printf("[server] signal %d received, shutting down\n", signal_number);
+    fflush(stdout);
+    /* Written under the lock main closes the pipe under, so the byte never lands in a reused fd. */
+    pthread_mutex_lock(&shutdown_signal_lock);
+    int wake_fd = shutdown_wake_fd;
+    if (wake_fd >= 0) {
+        char byte = 1;
+        while (write(wake_fd, &byte, 1) < 0 && errno == EINTR) {
+        }
+    }
+    pthread_mutex_unlock(&shutdown_signal_lock);
+    if (wake_fd < 0) {
+        /* Still starting up: nothing is connected yet, so stop as the default action would. */
+        fprintf(stderr, "[server] signal %d outside the serving loop, exiting\n", signal_number);
+        _exit(128 + signal_number);
+    }
+    return NULL;
+}
+
+static int start_shutdown_signal_thread(void)
+{
+    sigemptyset(&shutdown_signals);
+    sigaddset(&shutdown_signals, SIGTERM);
+    sigaddset(&shutdown_signals, SIGINT);
+    /* Before any other thread exists, so every thread inherits the blocked mask. */
+    if (pthread_sigmask(SIG_BLOCK, &shutdown_signals, NULL) != 0) {
+        return -1;
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, shutdown_signal_thread, NULL) != 0) {
+        return -1;
+    }
+    pthread_detach(thread);
+    return 0;
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+    if (start_shutdown_signal_thread() != 0) {
+        fprintf(stderr, "shutdown signal handling failed to start\n");
+        return 1;
+    }
 
     if (st_security_baseline_validate_current() != 0) {
         return 1;
@@ -4110,7 +4497,59 @@ int main(void)
         return 1;
     }
 
+    int shutdown_pipe[2] = {-1, -1};
+    int listener_flags = fcntl(listener, F_GETFL, 0);
+    /* Nonblocking, so a connection that vanishes between poll() and accept() cannot park the loop
+     * where it would no longer notice a shutdown request. */
+    if (pipe(shutdown_pipe) != 0
+        || listener_flags < 0
+        || fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) != 0) {
+        perror("shutdown pipe");
+        if (shutdown_pipe[0] >= 0) {
+            close(shutdown_pipe[0]);
+            close(shutdown_pipe[1]);
+        }
+        peer_mesh_maintenance_stop();
+        st_admin_set_nat_control_handler(NULL, NULL);
+        st_admin_set_client_runtime_status_handler(NULL, NULL);
+        st_admin_set_client_message_handler(NULL, NULL);
+        st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        close(listener);
+        st_stun_turn_server_stop(stun_turn_server);
+        st_tls_server_context_free(config.tls_context);
+        free(config.nat_control_json);
+        st_public_discovery_shutdown();
+        return 1;
+    }
+    pthread_mutex_lock(&shutdown_signal_lock);
+    shutdown_wake_fd = shutdown_pipe[1];
+    pthread_mutex_unlock(&shutdown_signal_lock);
+
     for (;;) {
+        struct pollfd ready[2];
+        ready[0].fd = listener;
+        ready[0].events = POLLIN;
+        ready[0].revents = 0;
+        ready[1].fd = shutdown_pipe[0];
+        ready[1].events = POLLIN;
+        ready[1].revents = 0;
+        if (poll(ready, 2, -1) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            break;
+        }
+        if (ready[1].revents != 0) {
+            break;
+        }
+        if ((ready[0].revents & POLLIN) == 0) {
+            if ((ready[0].revents & (POLLERR | POLLNVAL)) != 0) {
+                fprintf(stderr, "control listener failed\n");
+                break;
+            }
+            continue;
+        }
         client_args *args = (client_args *)calloc(1, sizeof(*args));
         if (args == NULL) {
             fprintf(stderr, "out of memory\n");
@@ -4120,11 +4559,16 @@ int main(void)
         args->fd = accept(listener, (struct sockaddr *)&args->remote, &args->remote_len);
         if (args->fd < 0) {
             free(args);
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
                 continue;
             }
             perror("accept");
             break;
+        }
+        /* Linux does not pass O_NONBLOCK on to accepted sockets, but other systems do. */
+        int accepted_flags = fcntl(args->fd, F_GETFL, 0);
+        if (accepted_flags >= 0 && (accepted_flags & O_NONBLOCK) != 0) {
+            (void)fcntl(args->fd, F_SETFL, accepted_flags & ~O_NONBLOCK);
         }
         args->config = config;
         args->config.owns_nat_control_json = 0;
@@ -4142,7 +4586,38 @@ int main(void)
         pthread_detach(thread);
     }
 
+    /*
+     * Graceful shutdown, in the order Java and Go use: stop accepting, close every control/data
+     * channel and let each one write its own disconnect (session DISCONNECTED, connection record
+     * stamped) while storage is still in use, sweep whatever did not finish in time, and only then
+     * stop the background writers. C opens SQLite per call, so there is no store handle to close;
+     * what matters is that no channel bookkeeping is still pending when the process exits.
+     */
+    printf("[server] stopping: closing control/data connections\n");
+    fflush(stdout);
     close(listener);
+    size_t unfinished = close_live_connections_and_wait(ST_SHUTDOWN_DRAIN_SECONDS);
+    if (unfinished > 0U) {
+        fprintf(stderr, "[server] %zu connection(s) did not finish within %d s\n",
+                unfinished, ST_SHUTDOWN_DRAIN_SECONDS);
+    }
+    if (config.database_path[0] != '\0') {
+        char stopped_at[64];
+        if (current_utc_timestamp(stopped_at) == 0) {
+            int swept = 0;
+            (void)st_storage_close_open_connections(config.database_path, "SERVER_SHUTDOWN", stopped_at, &swept);
+            if (unfinished > 0U) {
+                (void)st_storage_close_client_sessions_by_status(config.database_path, "NETTY_ONLINE", stopped_at);
+            }
+            printf("[server] stopped: %zu connection(s) unfinished, %d open connection record(s) swept\n",
+                   unfinished, swept);
+        }
+    }
+    pthread_mutex_lock(&shutdown_signal_lock);
+    shutdown_wake_fd = -1;
+    close(shutdown_pipe[1]);
+    pthread_mutex_unlock(&shutdown_signal_lock);
+    close(shutdown_pipe[0]);
     peer_mesh_maintenance_stop();
     st_admin_set_nat_control_handler(NULL, NULL);
     st_admin_set_client_runtime_status_handler(NULL, NULL);

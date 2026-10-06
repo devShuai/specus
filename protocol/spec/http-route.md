@@ -200,7 +200,7 @@ data frame 可在 16 MiB 上限内规范化为一组 SWS2：首段保留 opcode/
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
 | .NET | `DirectHttpEndpoints`、`HttpSpecusStream`、`WebSocketSpecusStream` | `HttpStreamChannel`、`WebSocketSpecusChannel` |
 | Android | — | `SpecusCore.HttpStreamForwarder`、`SpecusCore.LocalWebSocketSpecus` |
-| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET） | 使用 Java/Go/.NET/Android v2 客户端 |
+| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET）。请求体（定长或 chunked）先完整缓冲再以已知 `contentLength` 发送，chunked 的请求 trailers 被丢弃、不声明 `trailerNames` | 使用 Java/Go/.NET/Android v2 客户端 |
 
 中央合法与 malformed NAT frame 位于 `protocol/test-vectors/control-v2/frames`；SWS2 的 canonical 与 malformed 样例位于
 `protocol/test-vectors/application-protocol-v2.json` 的 `webSocket`。

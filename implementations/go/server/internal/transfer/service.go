@@ -158,6 +158,8 @@ type Service struct {
 	// rooms resolves the persistent public-transfer room and the caller's role. Admin-only
 	// deployments may omit it, but new public uploads and bound attachments fail closed without it.
 	rooms *RoomService
+	// now is the clock the capability snapshot reads; tests replace it to replay a fixed instant.
+	now func() time.Time
 }
 
 // SetRoomService attaches the persistent room resolver used to authorize public attachments.
@@ -166,7 +168,8 @@ func (s *Service) SetRoomService(rooms *RoomService) { s.rooms = rooms }
 func NewService(db *store.DB, objectCfg config.ObjectStorageConfig, publicCfg config.PublicTransferConfig,
 	sharedRateLimiter ...SharedRateLimiter) *Service {
 	service := &Service{db: db, storage: NewObjectStorage(objectCfg), objectCfg: objectCfg,
-		publicCfg: publicCfg, rateByIP: make(map[string]rateWindow), maxTrackedSources: maxTrackedRateSources}
+		publicCfg: publicCfg, rateByIP: make(map[string]rateWindow), maxTrackedSources: maxTrackedRateSources,
+		now: time.Now}
 	if len(sharedRateLimiter) > 0 {
 		service.sharedRateLimiter = sharedRateLimiter[0]
 	}

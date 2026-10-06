@@ -288,6 +288,9 @@ typedef struct {
     int normalized_accept_encoding_headers;
     char http_raw_query[256];
     char ws_raw_query[256];
+    char http_relative_path[256];
+    char ws_relative_path[256];
+    char http_body[256];
 } route_auth_test_context;
 
 #define ROUTE_RESET_REASON \
@@ -333,6 +336,9 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->normalized_accept_encoding_headers = 0;
     context->http_raw_query[0] = '\0';
     context->ws_raw_query[0] = '\0';
+    context->http_relative_path[0] = '\0';
+    context->ws_relative_path[0] = '\0';
+    context->http_body[0] = '\0';
     pthread_mutex_unlock(&context->lock);
 }
 
@@ -380,6 +386,17 @@ static int route_auth_test_queries_match(route_auth_test_context *context,
     return matches;
 }
 
+static int route_auth_test_paths_match(route_auth_test_context *context,
+                                       const char *http_path,
+                                       const char *ws_path)
+{
+    pthread_mutex_lock(&context->lock);
+    int matches = strcmp(context->http_relative_path, http_path) == 0
+        && strcmp(context->ws_relative_path, ws_path) == 0;
+    pthread_mutex_unlock(&context->lock);
+    return matches;
+}
+
 static int route_auth_http_forwarder(void *ctx,
                                      const char *client_name,
                                      const st_direct_http_request *request,
@@ -397,6 +414,15 @@ static int route_auth_http_forwarder(void *ctx,
              sizeof(context->http_raw_query),
              "%s",
              request->raw_query == NULL ? "" : request->raw_query);
+    snprintf(context->http_relative_path,
+             sizeof(context->http_relative_path),
+             "%s",
+             request->relative_path == NULL ? "" : request->relative_path);
+    snprintf(context->http_body,
+             sizeof(context->http_body),
+             "%.*s",
+             request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
+             request->body == NULL ? "" : (const char *)request->body);
     pthread_mutex_unlock(&context->lock);
     if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
         /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
@@ -425,6 +451,10 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_raw_query),
              "%s",
              request->raw_query == NULL ? "" : request->raw_query);
+    snprintf(context->ws_relative_path,
+             sizeof(context->ws_relative_path),
+             "%s",
+             request->relative_path == NULL ? "" : request->relative_path);
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -2072,20 +2102,55 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* The path after the route keeps its percent-encoding: "+" is not a space and "%2F" is not
+     * a separator there, so decoding it would send the app a different path. */
     snprintf(request,
              sizeof(request),
-             "GET %s?template={0}&encoded=%%7B1%%7D HTTP/1.1\r\nHost: localhost\r\n"
+             "GET %s/a+b/c%%20d/%%E4%%BD%%A0/x%%2Fy?template={0}&encoded=%%7B1%%7D HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
              protected_path);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "200 OK")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
-        || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")) {
-        fprintf(stderr, "direct HTTP raw query brace encoding mismatch\n");
+        || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")
+        || !route_auth_test_paths_match(&context, "/items/a+b/c%20d/%E4%BD%A0/x%2Fy", "")) {
+        fprintf(stderr, "direct HTTP raw path or query brace encoding mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
         return 1;
+    }
+
+    /* A chunked body reaches the target decoded (extensions and trailers dropped); a chunked
+     * body that also declares a length, or that ends early, never reaches it. */
+    static const char *const chunked_requests[][2] = {
+        {"Transfer-Encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n7\r\n, world\r\n0\r\nX-Sum: 1\r\n\r\n",
+         "200 OK"},
+        {"Transfer-Encoding: chunked\r\nContent-Length: 10\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+         "400 Bad Request"},
+        {"Transfer-Encoding: chunked\r\n\r\n5\r\nhel", "400 Bad Request"},
+        {"Transfer-Encoding: gzip\r\n\r\nxx", "501 Not Implemented"},
+    };
+    for (size_t i = 0; i < sizeof(chunked_requests) / sizeof(chunked_requests[0]); ++i) {
+        /* PUT, because the traffic detail test later counts the POST exchanges in this database. */
+        snprintf(request,
+                 sizeof(request),
+                 "PUT %s HTTP/1.1\r\nHost: localhost\r\n"
+                 "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s",
+                 protected_path,
+                 chunked_requests[i][0]);
+        route_auth_test_context_reset(&context);
+        int forwarded = i == 0;
+        if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+            || !contains(response, chunked_requests[i][1])
+            || !route_auth_test_context_matches(&context, forwarded, 0, 0)
+            || (forwarded && strcmp(context.http_body, "hello, world") != 0)) {
+            fprintf(stderr, "direct HTTP chunked request %zu mismatch: %s\n", i, response);
+            route_auth_stop_server(&server);
+            pthread_mutex_destroy(&context.lock);
+            return 1;
+        }
     }
 
     snprintf(request,
@@ -2146,7 +2211,7 @@ static int test_direct_http_route_authentication(const char *database_path)
 
     snprintf(request,
              sizeof(request),
-             "GET %s?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+             "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
              "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
@@ -2155,7 +2220,8 @@ static int test_direct_http_route_authentication(const char *database_path)
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
-        || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")) {
+        || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);

@@ -161,18 +161,20 @@ jobs:
         run: timeout --preserve-status 120s bash implementations/c/server/scripts/java_c_discovery_interop.sh build/c-server/specus-server-c
       - name: Build Java reference client
         run: mvn -pl :specus-client -am package -DskipTests
-      - name: Java client NAT and Direct HTTP/WebSocket E2E
+      - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Java client SQLite runtime configuration E2E
         run: timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
-      # The same NAT, Direct HTTP and WebSocket smoke with the Go and .NET clients, against the
-      # server the Java run above already built and unit-tested.
+      - name: Java client Direct HTTP and WebSocket E2E
+        run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
+      # The same E2E scripts with the Go and .NET clients, against the server the Java run above
+      # already built and unit-tested.
       - name: Set up Go for the Go client
         uses: actions/setup-go@v5
         with:
           go-version-file: implementations/go/client/go.mod
           cache-dependency-path: implementations/go/client/go.sum
-      - name: Go client NAT and Direct HTTP/WebSocket E2E
+      - name: Go client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: |
           (cd implementations/go/client && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/specus-client-go" ./cmd/specus-client)
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
@@ -181,11 +183,15 @@ jobs:
         run: |
           SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
+      - name: Go client Direct HTTP and WebSocket E2E
+        run: |
+          SPECUS_CLIENT_COMMAND="$RUNNER_TEMP/specus-client-go" SPECUS_CLIENT_LABEL=Go SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
       - name: Set up .NET 10 for the .NET client
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      - name: .NET client NAT and Direct HTTP/WebSocket E2E
+      - name: .NET client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: |
           dotnet build implementations/csharp/client/src/Specus.Client/Specus.Client.csproj -c Release -v quiet
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
@@ -196,6 +202,11 @@ jobs:
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
+      - name: .NET client Direct HTTP and WebSocket E2E
+        run: |
+          dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
+          SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh
