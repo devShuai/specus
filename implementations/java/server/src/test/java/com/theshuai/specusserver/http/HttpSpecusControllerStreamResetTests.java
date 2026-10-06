@@ -90,7 +90,7 @@ class HttpSpecusControllerStreamResetTests {
         String body = response.getContentAsString(StandardCharsets.UTF_8);
         assertThat(body).isEqualTo(HttpSpecusController.STREAM_RESET_BODY)
                 .isNotEqualTo("客户端不在线")
-                .doesNotContain("10.20.30.40", "s3cret", "http://", "X-Forged");
+                .doesNotContain("10.20.30.40", "s3cret", "http://", "X-Forged", "connect-refused");
         assertThat(response.getHeaderNames()).noneMatch(name -> name.equalsIgnoreCase("X-Forged"));
 
         List<String> messages = logs.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
@@ -134,7 +134,9 @@ class HttpSpecusControllerStreamResetTests {
                 reset.setNatMessageType(NatMessageType.RST);
                 reset.setStreamId(streamId);
                 reset.setValue(1);
-                reset.setMetaData(Map.of("reason", reason));
+                // A capable client classifies the failure next to the reason; the public answer
+                // must not change for it (the connectivity check is the only reader of failure).
+                reset.setMetaData(Map.of("reason", reason, "failure", "connect-refused"));
                 ctx.fireChannelRead(reset);
             }
         }

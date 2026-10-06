@@ -4,10 +4,13 @@ import com.theshuai.common.handler.StreamFlowController;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class HttpStreamExchangeTests {
@@ -107,5 +110,51 @@ class HttpStreamExchangeTests {
         assertFalse(reset.onResponseHead(responseHead));
         assertFalse(reset.onData(new byte[]{1}));
         assertFalse(reset.onFin(Map.of()));
+    }
+
+    /**
+     * The client's RST hands its failure classification to whoever waits for the head (the
+     * connectivity check); a reset of this server's own, or of the connection, never carries one.
+     */
+    @Test
+    void aClientResetCarriesItsFailureToTheHeadWaiter() {
+        HttpStreamExchange peer = new HttpStreamExchange(9);
+        peer.onReset(26, Map.of("reason", "dial tcp 10.0.0.1:80: refused", "failure", "connect-refused"));
+        HttpStreamExchange.HttpStreamException reset = resetOf(peer);
+        assertEquals(HttpStreamExchange.ResetOrigin.PEER, reset.origin());
+        assertEquals("connect-refused", reset.failure());
+        assertEquals(26, reset.errorCode());
+
+        HttpStreamExchange unclassified = new HttpStreamExchange(10);
+        unclassified.onReset(26, Map.of("reason", "refused"));
+        assertNull(resetOf(unclassified).failure());
+
+        for (HttpStreamExchange.ResetOrigin origin : new HttpStreamExchange.ResetOrigin[]{
+                HttpStreamExchange.ResetOrigin.LOCAL, HttpStreamExchange.ResetOrigin.CONNECTION}) {
+            HttpStreamExchange ours = new HttpStreamExchange(11);
+            ours.onReset(8, Map.of("reason", "cancelled", "failure", "connect-refused"), origin);
+            assertEquals(origin, resetOf(ours).origin());
+            assertNull(resetOf(ours).failure());
+        }
+    }
+
+    @Test
+    void theResponseEndsOnlyWithItsFin() {
+        HttpStreamExchange exchange = new HttpStreamExchange(12);
+        assertFalse(exchange.responseEnded());
+        assertTrue(exchange.onResponseHead(Map.of("source", "http", "phase", "response", "statusCode", 204)));
+        assertFalse(exchange.responseEnded());
+        assertTrue(exchange.onFin(Map.of()));
+        assertTrue(exchange.responseEnded());
+
+        HttpStreamExchange reset = new HttpStreamExchange(13);
+        assertTrue(reset.onResponseHead(Map.of("source", "http", "phase", "response", "statusCode", 204)));
+        reset.onReset(8, Map.of("reason", "cancelled"));
+        assertFalse(reset.responseEnded());
+    }
+
+    private static HttpStreamExchange.HttpStreamException resetOf(HttpStreamExchange exchange) {
+        ExecutionException ended = assertThrows(ExecutionException.class, () -> exchange.awaitResponseHead(1_000));
+        return assertInstanceOf(HttpStreamExchange.HttpStreamException.class, ended.getCause());
     }
 }

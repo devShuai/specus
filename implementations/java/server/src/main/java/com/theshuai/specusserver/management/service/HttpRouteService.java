@@ -18,6 +18,7 @@ import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * HTTP 路由（{@link HttpRouteMapping}）的 CRUD 服务。每次 mutation 之后都调用
@@ -191,6 +192,27 @@ public class HttpRouteService {
         return toView(saved);
     }
 
+    /**
+     * The route as {@link #updateRoute(ManagementContext, long, RouteMutation)} sees it: same tenant,
+     * and the caller is an admin or owns the route's client. Empty for anything else, so a caller
+     * cannot tell a route of someone else from one that does not exist.
+     */
+    @Transactional(readOnly = true)
+    public Optional<HttpRouteMapping> findVisibleRoute(ManagementContext context, long id) {
+        return httpRouteMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
+                .filter(route -> canAccessClient(context, route.getClientId()));
+    }
+
+    /** Whether a stored targetBaseUrl passes the validation applied when it is saved. */
+    public static boolean isValidTargetBaseUrl(String targetBaseUrl) {
+        try {
+            requireTargetBaseUrl(targetBaseUrl);
+            return true;
+        } catch (IllegalArgumentException invalid) {
+            return false;
+        }
+    }
+
     @Transactional
     public void deleteRoute(long id) {
         deleteRoute(TenantContext.defaultTenant(), id);
@@ -271,7 +293,7 @@ public class HttpRouteService {
         return normalized;
     }
 
-    private String requireTargetBaseUrl(String targetBaseUrl) {
+    private static String requireTargetBaseUrl(String targetBaseUrl) {
         if (!StringUtils.hasText(targetBaseUrl)) {
             throw new IllegalArgumentException("targetBaseUrl cannot be blank");
         }
