@@ -12,6 +12,7 @@ import { ConfirmModal } from "../components/ConfirmModal";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { Sidebar, type NavGroup } from "../components/Sidebar";
 
+const LazyWorkbenchPanel = lazy(() => import("./panels/WorkbenchPanel").then(m => ({ default: m.WorkbenchPanel })));
 const LazyOverviewPanel = lazy(() => import("./panels/OverviewPanel").then(m => ({ default: m.OverviewPanel })));
 const LazyClientsPanel = lazy(() => import("./panels/ClientsPanel").then(m => ({ default: m.ClientsPanel })));
 const LazyAdminMessagesPanel = lazy(() => import("./panels/AdminMessagesPanel").then(m => ({ default: m.AdminMessagesPanel })));
@@ -25,7 +26,10 @@ const LazyHelpPanel = lazy(() => import("./panels/HelpPanel").then(m => ({ defau
 const LazySystemPanel = lazy(() => import("./panels/SystemPanel").then(m => ({ default: m.SystemPanel })));
 
 const navGroups: NavGroup[] = [
-  { label: "概览", items: [{ key: "overview" as const, title: "概览" }] },
+  { label: "概览", items: [
+    { key: "workbench" as const, title: "工作台" },
+    { key: "overview" as const, title: "概览" },
+  ]},
   { label: "接入", items: [
     { key: "clients" as const, title: "客户端" },
     { key: "messages" as const, title: "消息" },
@@ -51,7 +55,8 @@ const navGroups: NavGroup[] = [
 
 const panels = navGroups.flatMap(g => g.items);
 type PanelKey = typeof panels[number]["key"];
-const defaultPanel: PanelKey = "overview";
+// The service workbench is where everyone lands; 概览 stays one click away in the navigation.
+const defaultPanel: PanelKey = "workbench";
 const panelKeys = new Set<PanelKey>(panels.map(p => p.key));
 
 function readPanelFromLocation(): PanelKey {
@@ -83,7 +88,7 @@ function DashboardContent() {
   })).filter(g => g.items.length > 0);
 
   const renderedPanel = activePanel === "system" && !profile?.admin ? defaultPanel : activePanel;
-  const activeTitle = panels.find(p => p.key === renderedPanel)?.title ?? "概览";
+  const activeTitle = panels.find(p => p.key === renderedPanel)?.title ?? "工作台";
 
   useEffect(() => {
     const sync = () => setActivePanel(readPanelFromLocation());
@@ -276,7 +281,8 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
     case "downloads": return <LazyClientDownloadsPanel />;
     case "help": return <LazyHelpPanel />;
     case "system": return <LazySystemPanel initializing={initializing} onInitializeDatabase={onInitializeDatabase} />;
-    default: return <LazyOverviewPanel />;
+    case "overview": return <LazyOverviewPanel />;
+    default: return <LazyWorkbenchPanel />;
   }
 }
 function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-md border border-default-200 bg-content1" role="status"><Spinner label="加载页面…" /></div>; }

@@ -48,15 +48,18 @@ public class NatControlService {
     private final ClientAccountRepository clientAccountRepository;
     private final int nettyPort;
     private final String publicAddress;
+    private final WorkbenchReferences workbenchReferences;
 
     public NatControlService(SpecusMappingRepository specusMappingRepository,
                              HttpRouteMappingRepository httpRouteMappingRepository,
                              ClientAccountRepository clientAccountRepository,
+                             WorkbenchReferences workbenchReferences,
                              @Value("${specus.netty.port:7010}") int nettyPort,
                              @Value("${specus.public-address:}") String publicAddress) {
         this.specusMappingRepository = specusMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.clientAccountRepository = clientAccountRepository;
+        this.workbenchReferences = workbenchReferences;
         this.nettyPort = nettyPort;
         this.publicAddress = StringUtils.hasText(publicAddress) ? publicAddress.trim() : null;
     }
@@ -205,6 +208,8 @@ public class NatControlService {
     }
 
     private void deleteMapping(TenantContext tenant, SpecusMapping mapping) {
+        // Same transaction: no workbench favourite or recent open outlives the mapping.
+        workbenchReferences.forgetObject(WorkbenchReferences.TCP_MAPPING, mapping.getId());
         specusMappingRepository.delete(mapping);
         specusMappingRepository.flush();
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(mapping.getClientId(), tenant.tenantId()).orElse(null);

@@ -39,13 +39,16 @@ public class HttpRouteService {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final ClientAccountRepository clientAccountRepository;
     private final NatControlService natControlService;
+    private final WorkbenchReferences workbenchReferences;
 
     public HttpRouteService(HttpRouteMappingRepository httpRouteMappingRepository,
                             ClientAccountRepository clientAccountRepository,
-                            NatControlService natControlService) {
+                            NatControlService natControlService,
+                            WorkbenchReferences workbenchReferences) {
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.clientAccountRepository = clientAccountRepository;
         this.natControlService = natControlService;
+        this.workbenchReferences = workbenchReferences;
     }
 
     @Transactional(readOnly = true)
@@ -234,6 +237,8 @@ public class HttpRouteService {
     }
 
     private void deleteRoute(TenantContext tenant, HttpRouteMapping row) {
+        // Same transaction: no workbench favourite or recent open outlives the route.
+        workbenchReferences.forgetObject(WorkbenchReferences.HTTP_ROUTE, row.getId());
         httpRouteMappingRepository.delete(row);
         httpRouteMappingRepository.flush();
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(row.getClientId(), tenant.tenantId()).orElse(null);

@@ -409,8 +409,15 @@ public sealed class ManagementUserService
         {
             throw new ArgumentException("用户不存在: " + normalized);
         }
+        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+        // Unlike the account's other data, its workbench lists are personal history: they go with the
+        // account row, so an account created later under the same name starts empty.
+        await WorkbenchService.DeleteIdentityAsync(_db, ManagementContext.NormalizeTenant(user.TenantId),
+            user.Username, cancellationToken).ConfigureAwait(false);
         _db.ManagementUsers.Remove(user);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public static void RequireAdmin(ManagementContext context)
