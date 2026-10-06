@@ -27,10 +27,11 @@ import {
   TableRow,
   useDisclosure,
 } from "@heroui/react";
-import { adminApi } from "../../api/client";
+import { adminApi, recordWorkbenchOpenAsCaller } from "../../api/client";
 import type { Client, HttpRoute } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
 import { copyTextWithFeedback } from "../../lib/clipboard";
+import { copyThenRecord, isLinkOpeningClick } from "../../lib/workbenchRecording";
 import { notify, notifyError } from "../../components/toast";
 import { useClients } from "../../hooks/useClients";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
@@ -437,6 +438,7 @@ export function HttpRoutesPanel() {
                           href={accessUrl}
                           rel="noreferrer"
                           target="_blank"
+                          {...routeLinkRecording(item)}
                         >
                           {accessUrl}
                         </a>
@@ -444,7 +446,7 @@ export function HttpRoutesPanel() {
                           size="sm"
                           className="w-fit"
                           variant="light"
-                          onPress={() => void copyAccessUrl(accessUrl)}
+                          onPress={() => void copyRouteLink(item, accessUrl)}
                         >
                           复制
                         </Button>
@@ -646,11 +648,12 @@ function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
         rel="noreferrer"
         target="_blank"
         title={accessUrl}
+        {...routeLinkRecording(route)}
       >
         {accessUrl}
       </a>
       <div>
-        <Button size="sm" variant="light" onPress={() => void copyAccessUrl(accessUrl)}>
+        <Button size="sm" variant="light" onPress={() => void copyRouteLink(route, accessUrl)}>
           复制
         </Button>
       </div>
@@ -763,8 +766,23 @@ function encodeRouteSegment(value: string): string {
   return encodeURIComponent(value.trim());
 }
 
-async function copyAccessUrl(url: string): Promise<void> {
-  await copyTextWithFeedback(url, "访问链接已复制");
+async function copyAccessUrl(url: string): Promise<boolean> {
+  return copyTextWithFeedback(url, "访问链接已复制");
+}
+
+// Opening a route's access link (left or middle click) and copying it are the explicit actions the
+// service workbench lists under 「最近打开」; the link stays native and nothing waits for the record.
+function routeLinkRecording(route: HttpRoute) {
+  const record = () => void recordWorkbenchOpenAsCaller("http-route.open-link", { kind: "http-route", id: route.id });
+  return {
+    onClick: (event: React.MouseEvent<HTMLAnchorElement>) => { if (isLinkOpeningClick(event)) record(); },
+    onAuxClick: (event: React.MouseEvent<HTMLAnchorElement>) => { if (event.button === 1) record(); },
+  };
+}
+
+async function copyRouteLink(route: HttpRoute, url: string): Promise<void> {
+  await copyThenRecord(() => copyAccessUrl(url),
+    () => recordWorkbenchOpenAsCaller("http-route.copy-link", { kind: "http-route", id: route.id }));
 }
 
 interface EditHttpRouteModalProps {

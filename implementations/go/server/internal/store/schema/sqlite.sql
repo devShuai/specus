@@ -696,3 +696,18 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
   updated_by TEXT,
   updated_at TEXT NOT NULL
 );
+
+-- Service workbench: favourites and recently opened services per management identity. A row is
+-- a reference (kind, object_id) and one epoch-millisecond time, nothing else.
+CREATE TABLE IF NOT EXISTS management_workbench_item (
+  tenant_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  list TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  object_id INTEGER NOT NULL,
+  at_ms INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, username, list, kind, object_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mwi_object ON management_workbench_item (tenant_id, kind, object_id);
+CREATE INDEX IF NOT EXISTS idx_mwi_list_at ON management_workbench_item (list, at_ms);

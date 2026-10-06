@@ -32,11 +32,14 @@ import java.util.UUID;
 public class ManagementUserService {
     private final ManagementUserRepository repository;
     private final AuthProperties authProperties;
+    private final WorkbenchReferences workbenchReferences;
 
     public ManagementUserService(ManagementUserRepository repository,
-                                 AuthProperties authProperties) {
+                                 AuthProperties authProperties,
+                                 WorkbenchReferences workbenchReferences) {
         this.repository = repository;
         this.authProperties = authProperties;
+        this.workbenchReferences = workbenchReferences;
     }
 
     @Transactional(readOnly = true)
@@ -412,7 +415,12 @@ public class ManagementUserService {
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户不能删除");
         }
-        repository.delete(requireMutableUserInTenant(context, normalized, "delete"));
+        ManagementUser user = requireMutableUserInTenant(context, normalized, "delete");
+        // The workbench lists are personal history: they go with the account, in this transaction,
+        // so an account created later under the same name starts empty. The identity is the one
+        // the management context carries: tenant and canonical login name of the account record.
+        workbenchReferences.forgetIdentity(TenantContext.normalize(user.getTenantId()), loginName(user));
+        repository.delete(user);
     }
 
     /**

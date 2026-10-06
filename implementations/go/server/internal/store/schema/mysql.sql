@@ -668,3 +668,17 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
   updated_by VARCHAR(80),
   updated_at VARCHAR(40) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Service workbench: favourites and recently opened services per management identity. A row is
+-- a reference (kind, object_id) and one epoch-millisecond time, nothing else.
+CREATE TABLE IF NOT EXISTS management_workbench_item (
+  tenant_id VARCHAR(80) NOT NULL,
+  username VARCHAR(80) NOT NULL,
+  list VARCHAR(16) NOT NULL,
+  kind VARCHAR(32) NOT NULL,
+  object_id BIGINT NOT NULL,
+  at_ms BIGINT NOT NULL,
+  PRIMARY KEY (tenant_id, username, list, kind, object_id),
+  KEY idx_mwi_object (tenant_id, kind, object_id),
+  KEY idx_mwi_list_at (list, at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

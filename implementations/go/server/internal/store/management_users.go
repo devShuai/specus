@@ -98,11 +98,24 @@ func (db *DB) UpdateManagementUser(ctx context.Context, user ManagementUser) err
 	return err
 }
 
-// DeleteManagementUser removes a DB-backed management user.
+// DeleteManagementUser removes a DB-backed management user together with the account's workbench
+// lists, in one transaction: a recreated account with the same name must start with empty lists.
+// Usernames are globally unique, so the stored spelling names the account's rows.
 func (db *DB) DeleteManagementUser(ctx context.Context, username string) error {
-	_, err := db.sql.ExecContext(ctx,
-		db.rebind(`DELETE FROM specus_management_user WHERE LOWER(username) = LOWER(?)`), username)
-	return err
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM management_workbench_item WHERE username IN
+		(SELECT username FROM specus_management_user WHERE LOWER(username) = LOWER(?))`), username); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		db.rebind(`DELETE FROM specus_management_user WHERE LOWER(username) = LOWER(?)`), username); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ResolveOrProvisionOIDCUser atomically resolves an issuer/subject binding, links an enabled

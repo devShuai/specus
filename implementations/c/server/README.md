@@ -279,6 +279,13 @@ mutations immediately refresh online tenant clients so revoked devices, ACLs, sh
 leave stale visibility. When `SPECUS_PEER_MESH_ENABLED=true`, the process also binds the configured STUN/TURN
 UDP port, supports RFC 5780 alternate-address probes, allocates relay ports, enforces permissions/quotas, and
 expires sessions, catalogs, allocations, permissions, and channels.
+The service workbench endpoints (`protocol/spec/service-workbench.md`) `GET /api/admin/workbench`,
+`PUT/DELETE /api/admin/workbench/favorites/{kind}/{id}`, `DELETE /api/admin/workbench/favorites`,
+`POST/DELETE /api/admin/workbench/recents/{kind}/{id}`, and `DELETE /api/admin/workbench/recents` keep the
+caller's favourites (at most 50) and recent opens (20, 30 days) as bare `(kind, id)` references in
+`management_workbench_item`, keyed by the re-read account's tenant and username. Adding and opening are rate
+limited per identity in process memory; deleting a route, mapping, Peer service, client, or account deletes
+the references in the same transaction, and the maintenance thread sweeps expired recent opens hourly.
 The public-transfer discovery WebSocket works in process-local mode by default and can use Redis for
 multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message
 limits, and STCE2 Pub/Sub text/binary routing. Redis outages fail closed by terminating local discovery

@@ -24,6 +24,7 @@
 #include "storage.h"
 #include "tls_transport.h"
 #include "turn_auth.h"
+#include "workbench.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -852,13 +853,11 @@ static int admin_path_requires_auth(const char *method, const char *path)
         || admin_path_equals(path, "/auth/refresh");
 }
 
+#define ST_ADMIN_UNAUTHORIZED_BODY "{\"error\":\"missing or invalid bearer token\"}"
+
 static int write_admin_unauthorized(char *out, size_t out_len)
 {
-    return write_response(out,
-                          out_len,
-                          401,
-                          "Unauthorized",
-                          "{\"error\":\"missing or invalid bearer token\"}");
+    return write_response(out, out_len, 401, "Unauthorized", ST_ADMIN_UNAUTHORIZED_BODY);
 }
 
 static int write_admin_forbidden(char *out, size_t out_len)
@@ -8597,6 +8596,165 @@ static int handle_management_user_delete(const st_admin_context *context, const 
     return response_len;
 }
 
+/*
+ * Every workbench answer, success or refusal, is private to the identity that asked and must not
+ * be kept by any cache: Cache-Control is "private, no-store" rather than the usual "no-store".
+ */
+static int write_workbench_response(char *out,
+                                    size_t out_len,
+                                    int status,
+                                    const char *body,
+                                    long long retry_after_seconds)
+{
+    const char *reason;
+    switch (status) {
+    case 200: reason = "OK"; break;
+    case 400: reason = "Bad Request"; break;
+    case 401: reason = "Unauthorized"; break;
+    case 403: reason = "Forbidden"; break;
+    case 404: reason = "Not Found"; break;
+    case 409: reason = "Conflict"; break;
+    case 429: reason = "Too Many Requests"; break;
+    case 503: reason = "Service Unavailable"; break;
+    default: reason = "Internal Server Error"; break;
+    }
+    char retry_after[48] = "";
+    if (retry_after_seconds > 0) {
+        int retry_len = snprintf(retry_after, sizeof(retry_after), "Retry-After: %lld\r\n", retry_after_seconds);
+        if (retry_len < 0 || (size_t)retry_len >= sizeof(retry_after)) {
+            return -1;
+        }
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: private, no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "%s"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           status,
+                           reason,
+                           retry_after,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+static int write_workbench_error(char *out,
+                                 size_t out_len,
+                                 int status,
+                                 const char *code,
+                                 const char *error,
+                                 long long retry_after_seconds)
+{
+    char body[256];
+    int written = snprintf(body, sizeof(body), "{\"code\":\"%s\",\"error\":\"%s\"}", code, error);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return -1;
+    }
+    return write_workbench_response(out, out_len, status, body, retry_after_seconds);
+}
+
+/* A refusal of the shared authentication layer, with the workbench's header on a workbench path. */
+static int write_auth_refusal(char *out,
+                              size_t out_len,
+                              int workbench_path,
+                              int status,
+                              const char *reason,
+                              const char *body)
+{
+    return workbench_path
+        ? write_workbench_response(out, out_len, status, body, 0)
+        : write_response(out, out_len, status, reason, body);
+}
+
+/* Only failures of the store are logged, and never with the reference: no access log can form. */
+static void admin_workbench_log_unavailable(const st_admin_context *context, st_workbench_op op)
+{
+    char tenant[256];
+    char user[256];
+    (void)st_admin_log_safe_reason(context->tenant_id, tenant, sizeof(tenant));
+    (void)st_admin_log_safe_reason(context->username, user, sizeof(user));
+    fprintf(stderr, "[workbench] tenant=%s user=%s op=%s code=WORKBENCH_UNAVAILABLE\n",
+            tenant, user, st_workbench_op_name(op));
+}
+
+/* Growth needs the object visible now, by the rule the kind's list endpoint applies. */
+static int admin_workbench_target_visible(const void *ctx, const st_storage_client *client)
+{
+    return admin_can_access_client((const st_admin_context *)ctx, client);
+}
+
+/*
+ * The service workbench endpoints (protocol/spec/service-workbench.md section 5), reached after the
+ * shared authentication layer has re-read the account: the identity is the account's tenant and
+ * canonical username, never anything in the path, query or body, so nobody -- administrators
+ * included -- can read or clear another identity's lists. Order: invalid reference 400, growth
+ * rate limit 429, store failure 503 (the identity's rows are read before the target is looked
+ * at), growth target not visible 404, favourites full 409, else 200 with the whole document, for
+ * writes too. Reads never write; removal and clearing are never limited and never check
+ * visibility.
+ */
+static int handle_workbench_request(const st_admin_context *context,
+                                    const st_workbench_request *request,
+                                    char *out,
+                                    size_t out_len)
+{
+    if (!request->reference_valid) {
+        return write_workbench_error(out, out_len, 400, "WORKBENCH_REQUEST_INVALID",
+                                     "invalid service reference", 0);
+    }
+    long long now_ms = st_workbench_now_ms();
+    if (st_workbench_op_is_growth(request->op)) {
+        long long wait_ms = st_workbench_rate_limit_acquire(context->tenant_id, context->username, now_ms);
+        if (wait_ms > 0) {
+            return write_workbench_error(out, out_len, 429, "WORKBENCH_RATE_LIMITED",
+                                         "too many workbench writes",
+                                         st_workbench_retry_after_seconds(wait_ms));
+        }
+    }
+    const char *database_path = admin_database_path();
+    st_storage_workbench_document doc;
+    memset(&doc, 0, sizeof(doc));
+    int rc = -1;
+    if (database_path != NULL && request->op == ST_WORKBENCH_GET) {
+        rc = st_storage_workbench_read(database_path, context->tenant_id, context->username, now_ms, &doc);
+    } else if (database_path != NULL) {
+        st_storage_workbench_write_request write = {
+            .op = st_workbench_storage_op(request->op),
+            .tenant_id = context->tenant_id,
+            .username = context->username,
+            .kind = request->has_reference ? request->kind : NULL,
+            .object_id = request->object_id,
+            .now_ms = now_ms,
+            .visible = admin_workbench_target_visible,
+            .visible_ctx = context
+        };
+        rc = st_storage_workbench_write(database_path, &write, &doc);
+    }
+    if (rc == ST_STORAGE_WORKBENCH_TARGET_NOT_FOUND) {
+        return write_workbench_error(out, out_len, 404, "WORKBENCH_TARGET_NOT_FOUND", "service not found", 0);
+    }
+    if (rc == ST_STORAGE_WORKBENCH_FAVORITES_FULL) {
+        return write_workbench_error(out, out_len, 409, "WORKBENCH_FAVORITES_FULL",
+                                     "favourites are full", 0);
+    }
+    char *body = rc == 0 ? st_workbench_render_document(&doc) : NULL;
+    st_storage_workbench_document_free(&doc);
+    int response_len = body == NULL ? -1 : write_workbench_response(out, out_len, 200, body, 0);
+    free(body);
+    if (response_len < 0) {
+        /* A store that cannot be read is never reported as empty lists. */
+        admin_workbench_log_unavailable(context, request->op);
+        return write_workbench_error(out, out_len, 503, "WORKBENCH_UNAVAILABLE",
+                                     "workbench store unavailable", 0);
+    }
+    return response_len;
+}
+
 static int write_management_token_response(const char *username,
                                            const char *tenant_id,
                                            const char *role,
@@ -8820,6 +8978,8 @@ static int st_admin_build_response_internal(const char *method,
     st_admin_context context;
     admin_context_from_env(&context);
     if (admin_path_requires_auth(method, path)) {
+        /* Workbench answers are private, the shared layer's refusals included. */
+        int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
@@ -8829,13 +8989,13 @@ static int st_admin_build_response_internal(const char *method,
                                       "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}");
             }
             if (auth_rc == -2) {
-                return write_response(out, out_len, 403, "Forbidden",
-                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+                return write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
+                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
             if (auth_rc == -3) {
-                return write_response(out, out_len, 500, "Internal Server Error",
-                                      "{\"error\":\"management user store unavailable\"}");
+                return write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
+                                          "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
         } else {
@@ -8843,10 +9003,16 @@ static int st_admin_build_response_internal(const char *method,
         }
         if (unauthorized) {
             /* Every answer of the connectivity check is private, the 401 included. */
-            return admin_connectivity_check_path(path, NULL, 0U)
-                ? write_connectivity_response(out, out_len, 401, 0, "{\"error\":\"missing or invalid bearer token\"}")
-                : write_admin_unauthorized(out, out_len);
+            if (admin_connectivity_check_path(path, NULL, 0U)) {
+                return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
+            }
+            return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
+                                      ST_ADMIN_UNAUTHORIZED_BODY);
         }
+    }
+    st_workbench_request workbench_request;
+    if (st_workbench_match(method, path, &workbench_request)) {
+        return handle_workbench_request(&context, &workbench_request, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/health")) {
         return write_response(out, out_len, 200, "OK", "{\"status\":\"ok\"}");
@@ -13958,6 +14124,26 @@ static void handle_client(st_admin_server *server, int fd)
             free(host_header);
             free(body_buffer);
             send_text_http_error(fd, 500, "HTTP media response allocation failed");
+            close(fd);
+            return;
+        }
+    }
+    /*
+     * A workbench document is at most about 70 entries (6 KiB), but every stored favourite is
+     * returned, also when rows beyond the bound of 50 were written around the API; give such a
+     * list room instead of failing it on the 32 KiB stack buffer.
+     */
+    if (strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0) {
+        response_capacity = 256U * 1024U;
+        response = (char *)malloc(response_capacity);
+        if (response == NULL) {
+            free(authorization);
+            free(oss_public_key_url);
+            free(range_header);
+            free(content_type);
+            free(host_header);
+            free(body_buffer);
+            send_text_http_error(fd, 500, "HTTP response allocation failed");
             close(fd);
             return;
         }

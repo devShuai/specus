@@ -1357,6 +1357,47 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("specus_management_user_email", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.ManagementWorkbenchItem", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Username")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("username");
+
+                    b.Property<string>("List")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("list");
+
+                    b.Property<string>("Kind")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("kind");
+
+                    b.Property<long>("ObjectId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("object_id");
+
+                    b.Property<long>("AtMs")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("at_ms");
+
+                    b.HasKey("TenantId", "Username", "List", "Kind", "ObjectId");
+
+                    b.HasIndex("List", "AtMs")
+                        .HasDatabaseName("idx_mwi_list_at");
+
+                    b.HasIndex("TenantId", "Kind", "ObjectId")
+                        .HasDatabaseName("idx_mwi_object");
+
+                    b.ToTable("management_workbench_item", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.PeerMeshAcl", b =>
                 {
                     b.Property<long>("Id")
