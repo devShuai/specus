@@ -75,6 +75,8 @@ import type {
   UserDiagramDocumentMutation,
   WebSocketTicket,
 } from "./types";
+import type { CreateShareBody, CreatedHttpShare, HttpAccessAuditPage, HttpShare } from "../lib/httpShare";
+import { shareManagementMessage } from "../lib/httpShare";
 import {
   fetchLatestGithubClientDownloads,
   hasCompleteGithubClientDownloadSet,
@@ -132,7 +134,15 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandled = false;
 }
 
-class ApiError extends Error {}
+export class ApiError extends Error {
+  /** The machine-readable code of a `{"code": ...}` error body, when the server sent one. */
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.code = code;
+  }
+}
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -157,7 +167,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new ApiError(body?.error || response.statusText);
+    throw new ApiError(body?.error || shareManagementMessage(body?.code) || body?.message || response.statusText, body?.code);
   }
   return body as T;
 }
@@ -353,6 +363,19 @@ export const adminApi = {
   updateHttpRoute: (id: number, body: HttpRouteMutation) =>
     request<HttpRoute>(`/http-routes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteHttpRoute: (id: number) => request<null>(`/http-routes/${id}`, { method: "DELETE" }),
+  listHttpShares: (routeId: number) =>
+    request<{ shares: HttpShare[] }>(`/http-routes/${routeId}/shares`).then((body) => body?.shares ?? []),
+  createHttpShare: (routeId: number, body: CreateShareBody) =>
+    request<CreatedHttpShare>(`/http-routes/${routeId}/shares`, { method: "POST", body: JSON.stringify(body) }),
+  revokeHttpShare: (routeId: number, shareId: string) =>
+    request<{ share: HttpShare }>(`/http-routes/${routeId}/shares/${encodeURIComponent(shareId)}/revoke`, {
+      method: "POST",
+      body: "{}",
+    }).then((body) => body.share),
+  listHttpRouteAccessAudit: (routeId: number, limit = 50, before?: number) =>
+    request<HttpAccessAuditPage>(
+      `/http-routes/${routeId}/access-audit?limit=${limit}${before != null ? `&before=${before}` : ""}`,
+    ),
 
   listConnections: (query: ConnectionQuery) => {
     const params = new URLSearchParams();

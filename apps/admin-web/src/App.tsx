@@ -3,6 +3,7 @@ import { useAuth } from "./auth/AuthContext";
 import { tokenStore } from "./api/client";
 import { AuthDialog } from "./components/AuthDialog";
 import { readPublicRoute, type PublicRoute } from "./lib/publicRoute";
+import { captureShareToken } from "./lib/httpShare";
 
 const LazyLoginPage = lazy(() => import("./pages/LoginPage").then((module) => ({ default: module.LoginPage })));
 const LazyDashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })));
@@ -22,6 +23,21 @@ const LazyDiagramEmbedPage = lazy(() =>
 const LazyPublicDownloadPage = lazy(() =>
   import("./pages/PublicDownloadPage").then((module) => ({ default: module.PublicDownloadPage })),
 );
+const LazyHttpShareLandingPage = lazy(() =>
+  import("./pages/HttpShareLandingPage").then((module) => ({ default: module.HttpShareLandingPage })),
+);
+
+/**
+ * Resolves the public page and, for a share link, takes the token out of the address bar before
+ * anything else loads or runs.
+ */
+function currentPublicRoute(): PublicRoute | null {
+  const route = readPublicRoute(window.location);
+  if (route === "http-share") {
+    captureShareToken(window.location, window.history);
+  }
+  return route;
+}
 
 function hasOidcCallback() {
   const params = new URLSearchParams(window.location.search);
@@ -30,10 +46,18 @@ function hasOidcCallback() {
 
 export function App() {
   const { ready, authed } = useAuth();
-  const [publicRoute, setPublicRoute] = useState<PublicRoute | null>(() => readPublicRoute(window.location));
+  const [publicRoute, setPublicRoute] = useState<PublicRoute | null>(currentPublicRoute);
 
   useEffect(() => {
-    const syncPublicRoute = () => setPublicRoute(readPublicRoute(window.location));
+    const syncPublicRoute = () => {
+      const route = currentPublicRoute();
+      // Opening a share link from an open tab fires popstate and then hashchange; the first one
+      // already took the token and cleared the fragment, so the second must not unmount the
+      // landing page in the middle of its exchange. Any other hash still leaves it.
+      setPublicRoute((previous) =>
+        previous === "http-share" && route === null && window.location.hash === "" ? previous : route,
+      );
+    };
     window.addEventListener("hashchange", syncPublicRoute);
     window.addEventListener("popstate", syncPublicRoute);
     return () => {
@@ -74,6 +98,8 @@ export function App() {
     content = <LazyDiagramEmbedPage />;
   } else if (publicRoute === "download") {
     content = <LazyPublicDownloadPage />;
+  } else if (publicRoute === "http-share") {
+    content = <LazyHttpShareLandingPage />;
   } else {
     const canShowGuestShell = !ready && !tokenStore.valid() && !hasOidcCallback();
     if (!ready && !canShowGuestShell) {

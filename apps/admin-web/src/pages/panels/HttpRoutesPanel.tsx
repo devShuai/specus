@@ -46,6 +46,7 @@ import {
   type HttpRouteAuthDraft,
 } from "./httpRouteAuth";
 import { findHttpRouteClient } from "./httpRouteClient";
+import { HttpRouteSharesModal } from "./HttpRouteSharesModal";
 
 const PAGE_SIZE = 10;
 type RouteToggleField = "enabled" | "detailCaptureEnabled" | "mediaCaptureEnabled" | "pathRewriteEnabled";
@@ -70,6 +71,7 @@ export function HttpRoutesPanel() {
   const [lastCreatedAccessUrl, setLastCreatedAccessUrl] = useState("");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<HttpRoute | null>(null);
+  const [sharing, setSharing] = useState<HttpRoute | null>(null);
   const pendingKeysRef = useRef<Set<string>>(new Set());
   const [pendingKeys, setPendingKeys] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<{ title: string; description: string; confirmLabel?: string; action: () => Promise<void> } | null>(null);
@@ -453,6 +455,9 @@ export function HttpRoutesPanel() {
                     <Button size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                       编辑
                     </Button>
+                    <Button size="sm" variant="flat" onPress={() => setSharing(item)}>
+                      分享
+                    </Button>
                     <Button size="sm" color="danger" variant="flat" onPress={() => remove(item)}>
                       删除
                     </Button>
@@ -583,6 +588,9 @@ export function HttpRoutesPanel() {
                   <Button className="min-w-0 px-2" size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                     编辑
                   </Button>
+                  <Button className="min-w-0 px-2" size="sm" variant="flat" onPress={() => setSharing(item)}>
+                    分享
+                  </Button>
                   <Button className="min-w-0 px-2" size="sm" color="danger" variant="flat" onPress={() => remove(item)}>
                     删除
                   </Button>
@@ -602,6 +610,12 @@ export function HttpRoutesPanel() {
       ) : null}
 
       <EditHttpRouteModal disclosure={editModal} route={editing} onSaved={() => void load()} />
+      <HttpRouteSharesModal
+        route={sharing}
+        clientEnabled={sharing ? findHttpRouteClient(sharing, clients)?.enabled : undefined}
+        isOpen={sharing != null}
+        onClose={() => setSharing(null)}
+      />
       <ConfirmModal
         isOpen={confirm != null}
         onClose={() => setConfirm(null)}
