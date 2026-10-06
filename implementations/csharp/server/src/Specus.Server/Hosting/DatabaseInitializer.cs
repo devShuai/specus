@@ -64,6 +64,7 @@ public sealed class DatabaseInitializer
         await EnsureProductMetricsTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureTrafficDetailTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsurePeerMeshTablesAsync(db, cancellationToken).ConfigureAwait(false);
+        await EnsureWorkbenchTableAsync(db, cancellationToken).ConfigureAwait(false);
 
         var environment = DeploymentEnvironments.Parse(_specus.Value.Env);
         var cleanup = await DisableLegacyDemoCredentialsAsync(db, environment, cancellationToken)
@@ -1052,6 +1053,30 @@ public sealed class DatabaseInitializer
             boolType, cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "peer_mesh_shared_service", "allowed_client_ids",
             "VARCHAR(512) NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Service workbench references (protocol/spec/service-workbench.md 4.2). Same shape as the
+    /// AddManagementWorkbench migrations: the natural key, no surrogate id, no foreign key.
+    /// </summary>
+    internal static async Task EnsureWorkbenchTableAsync(SpecusDbContext db,
+        CancellationToken cancellationToken)
+    {
+        await ExecuteSchemaSqlAsync(db, """
+            CREATE TABLE IF NOT EXISTS management_workbench_item (
+              tenant_id VARCHAR(80) NOT NULL,
+              username VARCHAR(80) NOT NULL,
+              list VARCHAR(16) NOT NULL,
+              kind VARCHAR(32) NOT NULL,
+              object_id BIGINT NOT NULL,
+              at_ms BIGINT NOT NULL,
+              PRIMARY KEY (tenant_id, username, list, kind, object_id)
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_mwi_object", "management_workbench_item",
+            "tenant_id, kind, object_id", cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_mwi_list_at", "management_workbench_item",
+            "list, at_ms", cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task EnsureIndexAsync(SpecusDbContext db, string indexName, string table,

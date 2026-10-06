@@ -115,6 +115,10 @@ builder.Services.AddScoped<ManagementMutationService>();
 builder.Services.AddScoped<ClientPackageService>();
 builder.Services.AddScoped<ManagementUserService>();
 builder.Services.AddScoped<UserDiagramDocumentService>();
+builder.Services.AddScoped<WorkbenchService>();
+builder.Services.AddSingleton<WorkbenchClock>();
+builder.Services.AddSingleton<WorkbenchRateLimiter>();
+builder.Services.AddHostedService<WorkbenchRetentionSweepService>();
 builder.Services.AddScoped<PublicTransferRoomService>();
 builder.Services.AddScoped<RegistrationService>();
 builder.Services.AddSingleton<IRegistrationEmailSender, SmtpRegistrationEmailSender>();
@@ -231,6 +235,7 @@ using (var scope = app.Services.CreateScope())
 }
 
 app.UseManagementSecurityHeaders();
+app.UseWorkbenchNoStore();
 app.UseAdminApiExceptionHandling();
 app.UseProductMetricsNoStore();
 app.UseAdminApiAuthentication();
@@ -242,6 +247,7 @@ app.MapGet("/", () => Results.LocalRedirect("/index.html"));
 app.MapStaticAssets();
 
 app.MapAdminApi();
+app.MapWorkbenchApi();
 app.MapClientAuthApi();
 app.MapProductMetricsApi();
 app.MapTransferAttachmentApi();

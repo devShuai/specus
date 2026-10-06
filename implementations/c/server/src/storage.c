@@ -102,6 +102,30 @@ static int open_db(const char *path, sqlite3 **db)
 
 static const char *normalize_tenant_id(const char *tenant_id);
 
+/*
+ * Deletes every identity's workbench references to one object, whatever their tenant: no
+ * reference may outlive its object, so an id handed out again never inherits one. Runs inside the
+ * caller's transaction, next to the deletion of the object itself.
+ */
+static int workbench_delete_object_refs(sqlite3 *db, const char *kind, long long object_id)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "DELETE FROM management_workbench_item WHERE kind = ? AND object_id = ?",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 2, object_id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 int st_storage_init(const char *path, int seed_demo_client)
 {
     sqlite3 *db = NULL;
@@ -797,6 +821,25 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_source ON peer_mesh_session(tenant_id, source_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_target ON peer_mesh_session(tenant_id, target_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_status ON peer_mesh_session(status);");
+    }
+    if (rc == 0) {
+        /*
+         * Service workbench: one row per (identity, list, reference), nothing but the reference
+         * and an epoch-millisecond time. No foreign keys, like every other table: the deletions
+         * of routes, mappings, Peer services, clients and accounts remove their rows themselves.
+         */
+        rc = exec_sql(db,
+            "CREATE TABLE IF NOT EXISTS management_workbench_item ("
+            "tenant_id TEXT NOT NULL,"
+            "username TEXT NOT NULL,"
+            "list TEXT NOT NULL,"
+            "kind TEXT NOT NULL,"
+            "object_id INTEGER NOT NULL,"
+            "at_ms INTEGER NOT NULL,"
+            "PRIMARY KEY(tenant_id, username, list, kind, object_id)"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_mwi_object ON management_workbench_item(tenant_id, kind, object_id);"
+            "CREATE INDEX IF NOT EXISTS idx_mwi_list_at ON management_workbench_item(list, at_ms);");
     }
     if (rc == 0) {
         /*
@@ -1776,20 +1819,51 @@ int st_storage_delete_management_user(const char *path, const char *tenant_id, c
     if (open_db(path, &db) != 0) {
         return -1;
     }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    /*
+     * The account's workbench rows go in the same transaction: favourites and recent opens are
+     * personal history, and an account created later under the same name must start empty.
+     */
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "DELETE FROM specus_management_user WHERE tenant_id = ? AND lower(username) = lower(?)",
+        "DELETE FROM management_workbench_item WHERE (tenant_id, username) IN ("
+        "SELECT tenant_id, username FROM specus_management_user "
+        "WHERE tenant_id = ? AND lower(username) = lower(?))",
         -1,
         &stmt,
         NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db,
+            "DELETE FROM specus_management_user WHERE tenant_id = ? AND lower(username) = lower(?)",
+            -1,
+            &stmt,
+            NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    } else {
+        (void)exec_sql(db, "ROLLBACK");
+    }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
 }
@@ -3317,15 +3391,49 @@ int st_storage_delete_client(const char *path, long long id)
     if (open_db(path, &db) != 0) {
         return -1;
     }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE client_name = ?", -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-    } else {
-        rc = -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
     }
-    sqlite3_finalize(stmt);
+    /*
+     * Workbench references to everything the client carries go first, in the same transaction:
+     * its routes and mappings below, and its Peer services, whose rows this deletion leaves in
+     * place but which no longer resolve to a client.
+     */
+    static const char *const workbench_refs_sql[] = {
+        "DELETE FROM management_workbench_item WHERE kind = 'http-route' AND object_id IN ("
+        "SELECT id FROM http_route_mapping WHERE client_name = ?)",
+        "DELETE FROM management_workbench_item WHERE kind = 'tcp-mapping' AND object_id IN ("
+        "SELECT id FROM specus_mapping WHERE client_name = ?)",
+        "DELETE FROM management_workbench_item WHERE kind = 'peer-service' AND object_id IN ("
+        "SELECT id FROM peer_mesh_shared_service WHERE client_id = ?)"
+    };
+    sqlite3_stmt *stmt = NULL;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < sizeof(workbench_refs_sql) / sizeof(workbench_refs_sql[0]); ++i) {
+        if (sqlite3_prepare_v2(db, workbench_refs_sql[i], -1, &stmt, NULL) != SQLITE_OK) {
+            rc = -1;
+        } else {
+            if (i < 2U) {
+                sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_int64(stmt, 1, id);
+            }
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE client_name = ?", -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db, "DELETE FROM http_route_mapping WHERE client_name = ?", -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
@@ -3345,6 +3453,11 @@ int st_storage_delete_client(const char *path, long long id)
             rc = -1;
         }
         sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    } else {
+        (void)exec_sql(db, "ROLLBACK");
     }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
@@ -3628,14 +3741,22 @@ int st_storage_update_mapping_by_id(const char *path,
     return out_mapping == NULL ? 0 : load_mapping_by_id(path, id, out_mapping);
 }
 
-int st_storage_delete_mapping_by_id(const char *path, long long id)
+/* Deletes one route or mapping by id together with every workbench reference to it. */
+static int delete_object_by_id_with_workbench_refs(const char *path,
+                                                   const char *delete_sql,
+                                                   const char *workbench_kind,
+                                                   long long id)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
     }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE id = ?", -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db, delete_sql, -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int64(stmt, 1, id);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
@@ -3643,8 +3764,24 @@ int st_storage_delete_mapping_by_id(const char *path, long long id)
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    if (rc == 0) {
+        rc = workbench_delete_object_refs(db, workbench_kind, id);
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    } else {
+        (void)exec_sql(db, "ROLLBACK");
+    }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
+}
+
+int st_storage_delete_mapping_by_id(const char *path, long long id)
+{
+    return delete_object_by_id_with_workbench_refs(path,
+                                                   "DELETE FROM specus_mapping WHERE id = ?",
+                                                   "tcp-mapping",
+                                                   id);
 }
 
 int st_storage_load_http_routes(const char *path,
@@ -3963,21 +4100,10 @@ int st_storage_update_http_route_by_id(const char *path,
 
 int st_storage_delete_http_route_by_id(const char *path, long long id)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "DELETE FROM http_route_mapping WHERE id = ?", -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, 1, id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
-    } else {
-        rc = -1;
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    return delete_object_by_id_with_workbench_refs(path,
+                                                   "DELETE FROM http_route_mapping WHERE id = ?",
+                                                   "http-route",
+                                                   id);
 }
 
 int st_storage_record_connection(const char *path,
@@ -6347,15 +6473,26 @@ int st_storage_delete_peer_mesh_service(const char *path,
 {
     sqlite3 *db = NULL;
     if (id <= 0 || open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "DELETE FROM peer_mesh_shared_service WHERE id=? AND tenant_id=?", -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int64(stmt, 1, id);
         sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : 1;
+        if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+        else rc = sqlite3_changes(db) == 1 ? 0 : 1;
     } else rc = -1;
     sqlite3_finalize(stmt);
+    /* The service's workbench references go with it, in the same transaction. */
+    if (rc == 0 && workbench_delete_object_refs(db, "peer-service", id) != 0) rc = -1;
+    if (rc == 0) {
+        if (exec_sql(db, "COMMIT") != 0) rc = -1;
+    }
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
     return rc;
 }
@@ -7579,4 +7716,427 @@ void st_storage_tcp_frame_free(st_storage_tcp_frame *frame)
         frame->payload_data = NULL;
         frame->payload_data_len = 0;
     }
+}
+
+/* ---- Service workbench --------------------------------------------------------------------- */
+
+/* The fixed kind order that breaks ties: http-route, tcp-mapping, peer-service. */
+#define ST_WORKBENCH_KIND_ORDER_SQL \
+    "CASE kind WHEN 'http-route' THEN 0 WHEN 'tcp-mapping' THEN 1 ELSE 2 END"
+
+void st_storage_workbench_document_free(st_storage_workbench_document *doc)
+{
+    if (doc == NULL) {
+        return;
+    }
+    free(doc->favorites);
+    memset(doc, 0, sizeof(*doc));
+}
+
+static int workbench_scan_entry(sqlite3_stmt *stmt, st_storage_workbench_entry *entry)
+{
+    memset(entry, 0, sizeof(*entry));
+    entry->object_id = sqlite3_column_int64(stmt, 1);
+    entry->at_ms = sqlite3_column_int64(stmt, 2);
+    return copy_text_column(stmt, 0, entry->kind, sizeof(entry->kind));
+}
+
+/* Prepares sql and binds the identity to ?1 (tenant_id) and ?2 (username). */
+static int workbench_prepare(sqlite3 *db,
+                             const char *sql,
+                             const char *tenant_id,
+                             const char *username,
+                             sqlite3_stmt **stmt)
+{
+    *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, stmt, NULL) != SQLITE_OK
+        || sqlite3_bind_text(*stmt, 1, tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK
+        || sqlite3_bind_text(*stmt, 2, username, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(*stmt);
+        *stmt = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int workbench_read_document(sqlite3 *db,
+                                   const char *tenant_id,
+                                   const char *username,
+                                   long long now_ms,
+                                   st_storage_workbench_document *doc)
+{
+    memset(doc, 0, sizeof(*doc));
+    sqlite3_stmt *stmt = NULL;
+    if (workbench_prepare(db,
+            "SELECT kind, object_id, at_ms FROM management_workbench_item "
+            "WHERE tenant_id = ?1 AND username = ?2 AND list = 'favorite' "
+            "ORDER BY at_ms ASC, " ST_WORKBENCH_KIND_ORDER_SQL " ASC, object_id ASC",
+            tenant_id, username, &stmt) != 0) {
+        return -1;
+    }
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (doc->favorites_len == capacity) {
+            size_t next = capacity == 0U ? 16U : capacity * 2U;
+            st_storage_workbench_entry *grown = (st_storage_workbench_entry *)realloc(
+                doc->favorites, next * sizeof(st_storage_workbench_entry));
+            if (grown == NULL) {
+                rc = SQLITE_NOMEM;
+                break;
+            }
+            doc->favorites = grown;
+            capacity = next;
+        }
+        if (workbench_scan_entry(stmt, &doc->favorites[doc->favorites_len]) != 0) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        ++doc->favorites_len;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        st_storage_workbench_document_free(doc);
+        return -1;
+    }
+    /* A recent entry is visible while now - visitedAt < 30 days, i.e. visitedAt > now - 30 days. */
+    if (workbench_prepare(db,
+            "SELECT kind, object_id, at_ms FROM management_workbench_item "
+            "WHERE tenant_id = ?1 AND username = ?2 AND list = 'recent' AND at_ms > ?3 "
+            "ORDER BY at_ms DESC, " ST_WORKBENCH_KIND_ORDER_SQL " ASC, object_id ASC LIMIT ?4",
+            tenant_id, username, &stmt) != 0
+        || sqlite3_bind_int64(stmt, 3, now_ms - ST_STORAGE_WORKBENCH_RECENT_RETENTION_MS) != SQLITE_OK
+        || sqlite3_bind_int(stmt, 4, ST_STORAGE_WORKBENCH_MAX_RECENTS) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        st_storage_workbench_document_free(doc);
+        return -1;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (doc->recents_len >= ST_STORAGE_WORKBENCH_MAX_RECENTS
+            || workbench_scan_entry(stmt, &doc->recents[doc->recents_len]) != 0) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        ++doc->recents_len;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        st_storage_workbench_document_free(doc);
+        return -1;
+    }
+    return 0;
+}
+
+int st_storage_workbench_read(const char *path,
+                              const char *tenant_id,
+                              const char *username,
+                              long long now_ms,
+                              st_storage_workbench_document *doc)
+{
+    if (doc == NULL) {
+        return -1;
+    }
+    memset(doc, 0, sizeof(*doc));
+    if (path == NULL || tenant_id == NULL || username == NULL) {
+        return -1;
+    }
+    /* Read-only, like the account lookup: reading the workbench never creates or changes anything. */
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    /* One read transaction, so both lists come from the same snapshot. */
+    int rc = exec_sql(db, "BEGIN");
+    if (rc == 0) {
+        rc = workbench_read_document(db, tenant_id, username, now_ms, doc);
+        if (rc == 0) {
+            rc = exec_sql(db, "COMMIT");
+        } else {
+            (void)exec_sql(db, "ROLLBACK");
+        }
+    }
+    sqlite3_close(db);
+    if (rc != 0) {
+        st_storage_workbench_document_free(doc);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * The client that carries the object, as the kind's list endpoint sees it: 0 when found, 1 when
+ * there is no such object (or its route or mapping has no client), -1 when the store failed.
+ */
+static int workbench_object_client(sqlite3 *db, const char *kind, long long object_id, st_storage_client *client)
+{
+    const char *sql = NULL;
+    if (strcmp(kind, "http-route") == 0) {
+        sql = "SELECT c.rowid, c.tenant_id, c.owner_username FROM http_route_mapping r "
+              "JOIN client_account c ON c.client_name = r.client_name WHERE r.id = ?";
+    } else if (strcmp(kind, "tcp-mapping") == 0) {
+        sql = "SELECT c.rowid, c.tenant_id, c.owner_username FROM specus_mapping m "
+              "JOIN client_account c ON c.client_name = m.client_name WHERE m.id = ?";
+    } else if (strcmp(kind, "peer-service") == 0) {
+        /* Peer services are listed by their own tenant; the owner is that of the client. */
+        sql = "SELECT COALESCE(c.rowid, 0), s.tenant_id, COALESCE(c.owner_username, '') "
+              "FROM peer_mesh_shared_service s LEFT JOIN client_account c ON c.rowid = s.client_id "
+              "WHERE s.id = ?";
+    } else {
+        return 1;
+    }
+    memset(client, 0, sizeof(*client));
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, object_id);
+    int rc = sqlite3_step(stmt);
+    int result;
+    if (rc == SQLITE_ROW) {
+        client->id = sqlite3_column_int64(stmt, 0);
+        result = copy_text_column(stmt, 1, client->tenant_id, sizeof(client->tenant_id)) == 0
+                && copy_text_column(stmt, 2, client->owner_username, sizeof(client->owner_username)) == 0
+            ? 0 : -1;
+    } else {
+        result = rc == SQLITE_DONE ? 1 : -1;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+static int workbench_count_favorites(sqlite3 *db, const char *tenant_id, const char *username, long long *count)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (workbench_prepare(db,
+            "SELECT COUNT(*) FROM management_workbench_item "
+            "WHERE tenant_id = ?1 AND username = ?2 AND list = 'favorite'",
+            tenant_id, username, &stmt) != 0) {
+        return -1;
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        *count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_ROW ? 0 : -1;
+}
+
+static int workbench_favorite_exists(sqlite3 *db,
+                                     const st_storage_workbench_write_request *request,
+                                     int *exists)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (workbench_prepare(db,
+            "SELECT 1 FROM management_workbench_item WHERE tenant_id = ?1 AND username = ?2 "
+            "AND list = 'favorite' AND kind = ?3 AND object_id = ?4",
+            request->tenant_id, request->username, &stmt) != 0
+        || sqlite3_bind_text(stmt, 3, request->kind, -1, SQLITE_TRANSIENT) != SQLITE_OK
+        || sqlite3_bind_int64(stmt, 4, request->object_id) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    *exists = rc == SQLITE_ROW;
+    return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+/*
+ * Writes one reference at now. A row that is already there keeps the later of the two times, so
+ * an instance whose clock is behind never moves a recent entry back.
+ */
+static int workbench_upsert(sqlite3 *db, const st_storage_workbench_write_request *request, const char *list)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (workbench_prepare(db,
+            "INSERT INTO management_workbench_item(tenant_id, username, list, kind, object_id, at_ms) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6) "
+            "ON CONFLICT(tenant_id, username, list, kind, object_id) "
+            "DO UPDATE SET at_ms = max(at_ms, excluded.at_ms)",
+            request->tenant_id, request->username, &stmt) != 0
+        || sqlite3_bind_text(stmt, 3, list, -1, SQLITE_STATIC) != SQLITE_OK
+        || sqlite3_bind_text(stmt, 4, request->kind, -1, SQLITE_TRANSIENT) != SQLITE_OK
+        || sqlite3_bind_int64(stmt, 5, request->object_id) != SQLITE_OK
+        || sqlite3_bind_int64(stmt, 6, request->now_ms) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/* Deletes one reference of a list, or the whole list when request->kind is NULL. */
+static int workbench_delete(sqlite3 *db, const st_storage_workbench_write_request *request, const char *list)
+{
+    sqlite3_stmt *stmt = NULL;
+    int single = request->kind != NULL;
+    if (workbench_prepare(db,
+            single
+                ? "DELETE FROM management_workbench_item WHERE tenant_id = ?1 AND username = ?2 "
+                  "AND list = ?3 AND kind = ?4 AND object_id = ?5"
+                : "DELETE FROM management_workbench_item WHERE tenant_id = ?1 AND username = ?2 "
+                  "AND list = ?3",
+            request->tenant_id, request->username, &stmt) != 0
+        || sqlite3_bind_text(stmt, 3, list, -1, SQLITE_STATIC) != SQLITE_OK
+        || (single && sqlite3_bind_text(stmt, 4, request->kind, -1, SQLITE_TRANSIENT) != SQLITE_OK)
+        || (single && sqlite3_bind_int64(stmt, 5, request->object_id) != SQLITE_OK)) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/*
+ * After every successful write the identity's recents are kept within the contract: expired rows
+ * (now - at >= 30 days) are deleted, then every row ranked after the 20th. Deleted, not hidden.
+ */
+static int workbench_normalize_recents(sqlite3 *db, const st_storage_workbench_write_request *request)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (workbench_prepare(db,
+            "DELETE FROM management_workbench_item WHERE tenant_id = ?1 AND username = ?2 "
+            "AND list = 'recent' AND at_ms <= ?3",
+            request->tenant_id, request->username, &stmt) != 0
+        || sqlite3_bind_int64(stmt, 3, request->now_ms - ST_STORAGE_WORKBENCH_RECENT_RETENTION_MS)
+            != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return -1;
+    }
+    if (workbench_prepare(db,
+            "DELETE FROM management_workbench_item WHERE tenant_id = ?1 AND username = ?2 "
+            "AND list = 'recent' AND rowid NOT IN ("
+            "SELECT rowid FROM management_workbench_item WHERE tenant_id = ?1 AND username = ?2 "
+            "AND list = 'recent' "
+            "ORDER BY at_ms DESC, " ST_WORKBENCH_KIND_ORDER_SQL " ASC, object_id ASC LIMIT ?3)",
+            request->tenant_id, request->username, &stmt) != 0
+        || sqlite3_bind_int(stmt, 3, ST_STORAGE_WORKBENCH_MAX_RECENTS) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_workbench_write(const char *path,
+                               const st_storage_workbench_write_request *request,
+                               st_storage_workbench_document *doc)
+{
+    if (doc == NULL) {
+        return -1;
+    }
+    memset(doc, 0, sizeof(*doc));
+    if (path == NULL || request == NULL || request->tenant_id == NULL || request->username == NULL) {
+        return -1;
+    }
+    st_storage_workbench_write_op op = request->op;
+    int growth = op == ST_STORAGE_WORKBENCH_ADD_FAVORITE || op == ST_STORAGE_WORKBENCH_RECORD_VISIT;
+    int clearing = op == ST_STORAGE_WORKBENCH_CLEAR_FAVORITES || op == ST_STORAGE_WORKBENCH_CLEAR_RECENTS;
+    if ((!clearing && request->kind == NULL) || (clearing && request->kind != NULL)
+        || (growth && request->visible == NULL)) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    /* IMMEDIATE serialises writers, so the favourite bound holds under concurrent adds. */
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    /*
+     * The identity's rows are read first: a store that cannot be read fails here, before the
+     * visibility of the target is looked at, so it answers as unavailable even for an object
+     * that does not exist.
+     */
+    long long favorites = 0;
+    int result = workbench_count_favorites(db, request->tenant_id, request->username, &favorites);
+    if (result == 0 && growth) {
+        st_storage_client client;
+        int found = workbench_object_client(db, request->kind, request->object_id, &client);
+        if (found < 0) {
+            result = -1;
+        } else if (found > 0 || !request->visible(request->visible_ctx, &client)) {
+            result = ST_STORAGE_WORKBENCH_TARGET_NOT_FOUND;
+        }
+    }
+    if (result == 0) {
+        switch (op) {
+        case ST_STORAGE_WORKBENCH_ADD_FAVORITE: {
+            /* Adding one that is there changes nothing, its addedAt included, even at the bound. */
+            int exists = 0;
+            result = workbench_favorite_exists(db, request, &exists);
+            if (result == 0 && !exists) {
+                result = favorites >= ST_STORAGE_WORKBENCH_MAX_FAVORITES
+                    ? ST_STORAGE_WORKBENCH_FAVORITES_FULL
+                    : workbench_upsert(db, request, "favorite");
+            }
+            break;
+        }
+        case ST_STORAGE_WORKBENCH_RECORD_VISIT:
+            result = workbench_upsert(db, request, "recent");
+            break;
+        case ST_STORAGE_WORKBENCH_REMOVE_FAVORITE:
+        case ST_STORAGE_WORKBENCH_CLEAR_FAVORITES:
+            result = workbench_delete(db, request, "favorite");
+            break;
+        case ST_STORAGE_WORKBENCH_REMOVE_RECENT:
+        case ST_STORAGE_WORKBENCH_CLEAR_RECENTS:
+            result = workbench_delete(db, request, "recent");
+            break;
+        default:
+            result = -1;
+            break;
+        }
+    }
+    if (result == 0) {
+        result = workbench_normalize_recents(db, request);
+    }
+    if (result == 0) {
+        result = workbench_read_document(db, request->tenant_id, request->username, request->now_ms, doc);
+    }
+    if (result == 0 && exec_sql(db, "COMMIT") != 0) {
+        result = -1;
+    }
+    if (result != 0) {
+        (void)exec_sql(db, "ROLLBACK");
+        st_storage_workbench_document_free(doc);
+    }
+    sqlite3_close(db);
+    return result;
+}
+
+int st_storage_workbench_sweep(const char *path, long long now_ms)
+{
+    sqlite3 *db = NULL;
+    if (path == NULL || open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "DELETE FROM management_workbench_item WHERE list = 'recent' AND at_ms <= ?",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, now_ms - ST_STORAGE_WORKBENCH_RECENT_RETENTION_MS);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
 }

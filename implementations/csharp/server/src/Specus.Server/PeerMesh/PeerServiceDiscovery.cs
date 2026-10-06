@@ -189,8 +189,16 @@ public sealed partial class PeerMeshService
                 .FirstOrDefaultAsync(item => item.TenantId == context.TenantId && item.Id == id, cancellationToken)
                 .ConfigureAwait(false)
             ?? throw new ArgumentException("service not found");
-        _db.PeerMeshSharedServices.Remove(row);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                         .ConfigureAwait(false))
+        {
+            // Every identity's workbench references to the service go in the same transaction.
+            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.PeerService, row.Id,
+                cancellationToken).ConfigureAwait(false);
+            _db.PeerMeshSharedServices.Remove(row);
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
         var account = await _db.ClientAccounts.AsNoTracking()
                 .FirstAsync(item => item.TenantId == row.TenantId && item.Id == row.ClientId, cancellationToken)
                 .ConfigureAwait(false);

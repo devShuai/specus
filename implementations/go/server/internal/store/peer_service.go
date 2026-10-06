@@ -123,10 +123,10 @@ func (db *DB) UpdatePeerMeshSharedService(ctx context.Context, row PeerMeshShare
 	return err
 }
 
+// DeletePeerMeshSharedService removes a Peer service and every workbench reference to it.
 func (db *DB) DeletePeerMeshSharedService(ctx context.Context, tenantID string, id int64) error {
-	query := db.rebind(`DELETE FROM peer_mesh_shared_service WHERE tenant_id = ? AND id = ?`)
-	_, err := db.sql.ExecContext(ctx, query, defaultTenant(tenantID), id)
-	return err
+	return db.deleteWithWorkbenchReferences(ctx, WorkbenchKindPeerService, id,
+		`DELETE FROM peer_mesh_shared_service WHERE tenant_id = ? AND id = ?`, defaultTenant(tenantID), id)
 }
 
 func (db *DB) CountEnabledPeerMeshSharedServices(ctx context.Context, tenantID string) (int64, error) {

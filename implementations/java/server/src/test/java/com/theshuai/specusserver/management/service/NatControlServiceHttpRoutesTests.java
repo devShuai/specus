@@ -28,7 +28,8 @@ class NatControlServiceHttpRoutesTests {
     private final SpecusMappingRepository specusMappingRepository = mock(SpecusMappingRepository.class);
     private final HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
     private final NatControlService service = new NatControlService(
-            specusMappingRepository, httpRouteMappingRepository, mock(ClientAccountRepository.class), 7010, "");
+            specusMappingRepository, httpRouteMappingRepository, mock(ClientAccountRepository.class),
+            mock(WorkbenchReferences.class), 7010, "");
 
     private final ClientAccount account = new ClientAccount();
     private final EmbeddedChannel control = new EmbeddedChannel();

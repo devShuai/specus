@@ -27,6 +27,7 @@ public sealed class MultiProviderModelTests
         "peer_mesh_acl",
         "specus_traffic_usage",
         "specus_connection_stat",
+        "management_workbench_item",
     };
 
     public static TheoryData<string> Providers => new() { "sqlite", "postgres", "mysql" };

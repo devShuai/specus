@@ -53,6 +53,7 @@ type API struct {
 	registration     *registrationService
 	packageDirectory string
 	downloadLimiter  *publicDownloadRateLimiter
+	workbench        *workbench
 	connectivity     *connectivity.Checker
 	productMetrics   *productmetrics.Service
 	logger           *slog.Logger
@@ -89,6 +90,7 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile,
 		loginLimiter:    security.NewLoginRateLimiter(authConfig.LoginRateLimit, logger),
 		downloadLimiter: newPublicDownloadRateLimiter(),
+		workbench:       newWorkbench(),
 		addressResolver: addressResolver,
 		productMetrics:  productmetrics.New(db, logger),
 		registration:    registration, logger: logger}
@@ -223,6 +225,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/services/{id}", a.requireAuth(a.handlePeerMeshDeleteService))
 	mux.HandleFunc("POST /api/admin/peer-mesh/services/import", a.requireAuth(a.handlePeerMeshImportServices))
 	mux.HandleFunc("GET /api/admin/peer-mesh/service-audit", a.requireAuth(a.handlePeerMeshServiceAudit))
+
+	a.registerWorkbench(mux)
 	a.registerProductMetrics(mux)
 }
 

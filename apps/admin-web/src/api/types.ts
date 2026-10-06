@@ -966,6 +966,33 @@ export interface WebSocketTicket {
   expiresAt: string;
 }
 
+// ---- service workbench (protocol/spec/service-workbench.md) ---------------------------
+
+/** The closed set of service kinds; the order is also the tie-break order of both lists. */
+export const WORKBENCH_KINDS = ["http-route", "tcp-mapping", "peer-service"] as const;
+export type WorkbenchKind = typeof WORKBENCH_KINDS[number];
+
+export interface WorkbenchRef {
+  kind: WorkbenchKind;
+  id: number;
+}
+
+export interface WorkbenchFavorite extends WorkbenchRef {
+  addedAt: string;
+}
+
+export interface WorkbenchRecent extends WorkbenchRef {
+  visitedAt: string;
+}
+
+/** GET /api/admin/workbench and every successful write answer the whole document. */
+export interface WorkbenchDocument {
+  schemaVersion: number;
+  limits: { maxFavorites: number; maxRecents: number; recentRetentionDays: number };
+  favorites: WorkbenchFavorite[];
+  recents: WorkbenchRecent[];
+}
+
 // ---- opt-in product metrics (protocol/spec/product-metrics.md) ------------------------------------
 
 /** GET/PUT /api/admin/product-metrics/settings; updatedBy only reaches administrators. */
