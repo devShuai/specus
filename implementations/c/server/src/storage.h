@@ -1199,4 +1199,82 @@ int st_storage_list_tcp_stream_visible(const char *path,
                                        size_t *item_count);
 void st_storage_tcp_frame_free(st_storage_tcp_frame *frame);
 
+/*
+ * Service workbench (protocol/spec/service-workbench.md): favourites and recently opened services
+ * of one management identity (tenant_id + username), kept in management_workbench_item as bare
+ * references (kind, object_id) with an epoch-millisecond time. The bounds are fixed by the contract.
+ */
+#define ST_STORAGE_WORKBENCH_MAX_FAVORITES 50
+#define ST_STORAGE_WORKBENCH_MAX_RECENTS 20
+#define ST_STORAGE_WORKBENCH_RECENT_RETENTION_DAYS 30
+#define ST_STORAGE_WORKBENCH_RECENT_RETENTION_MS 2592000000LL
+/* Results of st_storage_workbench_write besides 0 (done) and -1 (the store failed). */
+#define ST_STORAGE_WORKBENCH_TARGET_NOT_FOUND 1
+#define ST_STORAGE_WORKBENCH_FAVORITES_FULL 2
+
+typedef enum {
+    ST_STORAGE_WORKBENCH_ADD_FAVORITE = 1,
+    ST_STORAGE_WORKBENCH_REMOVE_FAVORITE,
+    ST_STORAGE_WORKBENCH_CLEAR_FAVORITES,
+    ST_STORAGE_WORKBENCH_RECORD_VISIT,
+    ST_STORAGE_WORKBENCH_REMOVE_RECENT,
+    ST_STORAGE_WORKBENCH_CLEAR_RECENTS
+} st_storage_workbench_write_op;
+
+typedef struct {
+    char kind[16];
+    long long object_id;
+    long long at_ms;
+} st_storage_workbench_entry;
+
+/* Favourites are all stored rows (more than 50 only when rows were written around the bound). */
+typedef struct {
+    st_storage_workbench_entry *favorites;
+    size_t favorites_len;
+    st_storage_workbench_entry recents[ST_STORAGE_WORKBENCH_MAX_RECENTS];
+    size_t recents_len;
+} st_storage_workbench_document;
+
+/*
+ * Visibility of the object a growth write names, decided by the caller from the client that
+ * carries it: only tenant_id, owner_username and id are filled (owner_username is empty when a
+ * Peer service's client is gone). Nonzero means visible.
+ */
+typedef int (*st_storage_workbench_visible_fn)(const void *ctx, const st_storage_client *client);
+
+typedef struct {
+    st_storage_workbench_write_op op;
+    const char *tenant_id;
+    const char *username;
+    const char *kind;      /* NULL for the clear operations */
+    long long object_id;
+    long long now_ms;
+    st_storage_workbench_visible_fn visible;
+    const void *visible_ctx;
+} st_storage_workbench_write_request;
+
+/*
+ * Reads the identity's document as of now_ms: every favourite (addedAt ascending, then kind order,
+ * then id) and the first 20 recents younger than 30 days (visitedAt descending, kind order, id).
+ * Never writes. 0 on success, -1 when the store cannot be read; doc is empty on failure.
+ */
+int st_storage_workbench_read(const char *path,
+                              const char *tenant_id,
+                              const char *username,
+                              long long now_ms,
+                              st_storage_workbench_document *doc);
+/*
+ * Applies one write in a single IMMEDIATE transaction: the identity's rows are read before the
+ * visibility of a growth target is checked, a successful write normalises the identity's recents
+ * (expired rows, then rows ranked after the 20th, are deleted) and doc receives the document as
+ * committed. Returns 0, ST_STORAGE_WORKBENCH_TARGET_NOT_FOUND, ST_STORAGE_WORKBENCH_FAVORITES_FULL
+ * (nothing written for either) or -1 when the store failed.
+ */
+int st_storage_workbench_write(const char *path,
+                               const st_storage_workbench_write_request *request,
+                               st_storage_workbench_document *doc);
+void st_storage_workbench_document_free(st_storage_workbench_document *doc);
+/* Global retention sweep: deletes every identity's recents with at_ms <= now_ms - 30 days. */
+int st_storage_workbench_sweep(const char *path, long long now_ms);
+
 #endif

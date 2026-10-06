@@ -14,6 +14,7 @@
 #include "stream_tombstones.h"
 #include "stun_turn.h"
 #include "tls_transport.h"
+#include "workbench.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -2523,7 +2524,11 @@ typedef struct {
     time_t next_registration_cleanup;
     time_t next_object_cleanup;
     time_t next_media_cleanup;
+    time_t next_workbench_sweep;
 } peer_mesh_maintenance_state;
+
+/* The workbench retention sweep runs at the first maintenance tick, then hourly. */
+#define WORKBENCH_SWEEP_INTERVAL_SECONDS 3600
 
 static peer_mesh_maintenance_state peer_mesh_maintenance = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
@@ -2589,6 +2594,13 @@ static void *peer_mesh_maintenance_thread(void *unused)
             peer_mesh_maintenance.next_media_cleanup = now
                 + maintenance_interval_seconds("SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS", 60000LL);
         }
+        if (now >= peer_mesh_maintenance.next_workbench_sweep) {
+            /* Recent opens older than 30 days, of every identity; idempotent. */
+            if (st_workbench_sweep(peer_mesh_maintenance.database_path) != 0) {
+                fprintf(stderr, "[workbench] retention sweep failed\n");
+            }
+            peer_mesh_maintenance.next_workbench_sweep = now + WORKBENCH_SWEEP_INTERVAL_SECONDS;
+        }
         pthread_mutex_lock(&peer_mesh_maintenance.lock);
     }
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
@@ -2607,6 +2619,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
         + maintenance_interval_seconds("SPECUS_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS", 3600000LL);
     peer_mesh_maintenance.next_media_cleanup = now
         + maintenance_interval_seconds("SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS", 60000LL);
+    peer_mesh_maintenance.next_workbench_sweep = now;
     snprintf(peer_mesh_maintenance.database_path,
              sizeof(peer_mesh_maintenance.database_path), "%s", database_path);
     if (pthread_create(&peer_mesh_maintenance.thread, NULL,
@@ -2633,6 +2646,7 @@ static void peer_mesh_maintenance_stop(void)
     peer_mesh_maintenance.next_registration_cleanup = 0;
     peer_mesh_maintenance.next_object_cleanup = 0;
     peer_mesh_maintenance.next_media_cleanup = 0;
+    peer_mesh_maintenance.next_workbench_sweep = 0;
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
 }
 
