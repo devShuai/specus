@@ -205,6 +205,10 @@ stored only as SHA-256 digests; management responses expose `authPasswordConfigu
 password or digest. Authentication runs before HTTP request bodies and WebSocket upgrades, and a
 successful protected request has its outer `Authorization` header removed before tunnel forwarding
 and traffic-detail capture. Environment-only routes remain public for compatibility.
+The ingress fails closed before any of that: a request enters the tunnel only for a route the
+server defines, an enabled SQLite row of an enabled client or a `SPECUS_HTTP_ROUTES` entry (with a
+database, of an enabled client). Anything else, a deleted route the client may still forward
+included, is a `404` and never reaches the data connection.
 SQLite-backed routes also persist the Java-compatible `insecureSkipVerify` flag. It is returned by
 the management API and included in both `/api/client/auth/login.httpSpecusConfigList` and
 `NAT_CONTROL.httpSpecusConfigList`; omitted values and environment-only routes default to `false`.
