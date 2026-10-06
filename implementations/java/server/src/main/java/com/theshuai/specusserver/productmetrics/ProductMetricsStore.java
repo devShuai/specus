@@ -87,16 +87,19 @@ public class ProductMetricsStore {
                 SWITCH);
     }
 
-    /** Writes the whole switch row, inserting it when absent. */
+    /**
+     * Writes the whole switch row, inserting it when absent, in one upsert (an UPDATE that changes
+     * nothing may report no affected row, so "update, else insert" could collide).
+     */
     public void saveSwitch(SwitchRow row) {
-        int updated = jdbc.update("UPDATE product_metrics_switch SET enabled = ?, updated_by = ?, updated_at = ?,"
-                        + " purged_at = ? WHERE tenant_id = ?",
-                row.enabled(), row.updatedBy(), row.updatedAt(), row.purgedAt(), row.tenantId());
-        if (updated == 0) {
-            jdbc.update("INSERT INTO product_metrics_switch (tenant_id, enabled, updated_by, updated_at, purged_at)"
-                    + " VALUES (?, ?, ?, ?, ?)", row.tenantId(), row.enabled(), row.updatedBy(), row.updatedAt(),
-                    row.purgedAt());
-        }
+        String sql = mysql
+                ? "INSERT INTO product_metrics_switch (tenant_id, enabled, updated_by, updated_at, purged_at)"
+                + " VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE enabled = VALUES(enabled),"
+                + " updated_by = VALUES(updated_by), updated_at = VALUES(updated_at), purged_at = VALUES(purged_at)"
+                : "INSERT INTO product_metrics_switch (tenant_id, enabled, updated_by, updated_at, purged_at)"
+                + " VALUES (?, ?, ?, ?, ?) ON CONFLICT (tenant_id) DO UPDATE SET enabled = excluded.enabled,"
+                + " updated_by = excluded.updated_by, updated_at = excluded.updated_at, purged_at = excluded.purged_at";
+        jdbc.update(sql, row.tenantId(), row.enabled(), row.updatedBy(), row.updatedAt(), row.purgedAt());
     }
 
     // -- onboarding progress ------------------------------------------------------------------------
