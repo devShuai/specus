@@ -31,7 +31,7 @@ func (s *Service) Capabilities(ctx context.Context, tenantID, username string) (
 	lock := s.quotaLock(tenantID, username)
 	lock.Lock()
 	defer lock.Unlock()
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	used, err := s.db.SumActiveTransferStorageBytes(ctx, tenantID, username, -1, now)
 	if err != nil {
 		return Capabilities{}, internalError(err)

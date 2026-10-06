@@ -198,28 +198,38 @@ func TestEgressStatusCountsRefusalsByCode(t *testing.T) {
 	}
 }
 
-// The refusal counts the status reports survive the report draining its own.
+// A report carries the refusal counts the status shows, and leaves them as they were.
 //
-// Without this an implementation could read the report's map and pass every other case here, and
-// the status would quietly start answering "since the last report went out" the day the periodic
-// egress-report is wired up. Nothing calls drainCounts in production yet, which is exactly why the
-// coupling would go unnoticed.
-func TestEgressStatusRefusalsSurviveTheReportDrainingItsOwnCounts(t *testing.T) {
+// Both read one tally that nothing resets. A report that took its counts by draining them would
+// leave the status answering "since the last report went out", which is not a question anybody
+// asked; and since the server keeps only the latest report, the page would lose them too.
+func TestEgressStatusRefusalsSurviveAReport(t *testing.T) {
 	mesh := newEgressMeshHarness(t)
 	defer mesh.shutdownEgress()
+	var sent []egressReportMessage
+	mesh.mu.Lock()
+	mesh.egressReportSend = func(message any) error {
+		sent = append(sent, message.(egressReportMessage))
+		return nil
+	}
+	mesh.mu.Unlock()
+	mesh.applyEgressControl(`{"type":"egress-config","enabled":true,"revision":1,"scope":"PUBLIC",
+		"allowedConsumerClientIds":[5],
+		"destinationRules":[{"cidr":"203.0.113.0/24","protocols":["tcp"],"portRanges":[[443,443]]}]}`)
 	runtime := mesh.ensureEgress()
 	runtime.mu.Lock()
 	runtime.rejections.record(5, egressCodeDestinationDenied, time.Now())
-	drained := runtime.rejections.drainCounts()
 	runtime.mu.Unlock()
-	if drained[egressCodeDestinationDenied] != 1 {
-		t.Fatalf("the report drained %#v, so this test is not exercising the drain", drained)
+
+	mesh.checkEgressReport(runtime, time.Now())
+	if len(sent) != 1 || sent[0].RejectedFlows[egressCodeDestinationDenied] != 1 {
+		t.Fatalf("reports = %#v, want one carrying the refusal", sent)
 	}
 
 	egress := mapSection(t, mesh.egressStatusJSON(), "egress")
 	refused, _ := egress["refused"].(map[string]int64)
 	if refused[egressCodeDestinationDenied] != 1 {
-		t.Errorf("refused = %#v; the status lost the refusal to the report's drain", refused)
+		t.Errorf("refused = %#v; the status lost the refusal to the report", refused)
 	}
 }
 
