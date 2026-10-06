@@ -55,6 +55,7 @@ public class PeerServiceDiscoveryService {
     private final ClientSessionRepository clientSessionRepository;
     private final SpecusMappingRepository specusMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
+    private final WorkbenchReferences workbenchReferences;
     private final Map<CatalogKey, CatalogSnapshot> catalogs = new ConcurrentHashMap<>();
     private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
     private final Map<CatalogKey, Long> reportRevisions = new ConcurrentHashMap<>();
@@ -70,7 +71,8 @@ public class PeerServiceDiscoveryService {
                                        ClientAccountRepository clientAccountRepository,
                                        ClientSessionRepository clientSessionRepository,
                                        SpecusMappingRepository specusMappingRepository,
-                                       HttpRouteMappingRepository httpRouteMappingRepository) {
+                                       HttpRouteMappingRepository httpRouteMappingRepository,
+                                       WorkbenchReferences workbenchReferences) {
         this.peerMeshService = peerMeshService;
         this.sharingRepository = sharingRepository;
         this.serviceRepository = serviceRepository;
@@ -79,6 +81,7 @@ public class PeerServiceDiscoveryService {
         this.clientSessionRepository = clientSessionRepository;
         this.specusMappingRepository = specusMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
+        this.workbenchReferences = workbenchReferences;
     }
 
     @Transactional(readOnly = true)
@@ -204,6 +207,8 @@ public class PeerServiceDiscoveryService {
         requireAdmin(context);
         PeerMeshSharedService row = serviceRepository.findByIdAndTenantId(id, context.tenant().tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("service not found: " + id));
+        // Same transaction: no workbench favourite or recent open outlives the service.
+        workbenchReferences.forgetObject(WorkbenchReferences.PEER_SERVICE, row.getId());
         serviceRepository.delete(row);
         audit("service-delete", row.getTenantId(), row.getClientId(), null, row.getServiceId(), "deleted");
         return new ServiceMutationResult(toView(row, true),

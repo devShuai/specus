@@ -48,15 +48,18 @@ public class ClientAccountService {
     private final TrafficUsageRepository trafficUsageRepository;
     private final ClientSessionRepository clientSessionRepository;
     private final ClientNameReferenceRepository clientNameReferenceRepository;
+    private final WorkbenchReferences workbenchReferences;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
                                 ClientSessionRepository clientSessionRepository,
-                                ClientNameReferenceRepository clientNameReferenceRepository) {
+                                ClientNameReferenceRepository clientNameReferenceRepository,
+                                WorkbenchReferences workbenchReferences) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
         this.clientNameReferenceRepository = clientNameReferenceRepository;
+        this.workbenchReferences = workbenchReferences;
     }
 
     @Transactional(readOnly = true)
@@ -215,6 +218,7 @@ public class ClientAccountService {
         ClientAccount account = findClientById(tenant, id);
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
         invalidateNameCache(account.getClientName());
+        workbenchReferences.forgetClientServices(account.getId());
         clientAccountRepository.delete(account);
     }
 
@@ -223,6 +227,9 @@ public class ClientAccountService {
         ClientAccount account = findClientById(context, id);
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
         invalidateNameCache(account.getClientName());
+        // The client's routes, mappings and Peer services stay behind as rows, but they are gone
+        // for the workbench: every identity's reference to them goes in this transaction.
+        workbenchReferences.forgetClientServices(account.getId());
         clientAccountRepository.delete(account);
     }
 
