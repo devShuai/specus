@@ -1,0 +1,3441 @@
+{
+  "description": "Draft contract for resumable direct (WebRTC DataChannel) file transfer between two browser pages. File bytes are generated: byte i = (i % 251) ^ (floor(i / 251) & 0xff). Replay each section against the implementation; every expectation was produced by the reference model in tools/protocol/generate_chunked_resume_vectors.py and asserted against hand-written results. See protocol/spec/chunked-resume.md.",
+  "constants": {
+    "chunkSizeMin": 65536,
+    "chunkSizeMax": 4194304,
+    "chunkSizeDefault": 1048576,
+    "maxChunkCount": 4096,
+    "maxResumableBytes": 2147483648,
+    "memoryLimitBytes": 134217728,
+    "maxStoredPartials": 4,
+    "maxPartialBytesTotal": 4294967296,
+    "storageMarginBytes": 67108864,
+    "maxActiveReceives": 2,
+    "maxChunkMismatchesPerSession": 3,
+    "maxIntegrityFailures": 16,
+    "resumeTtlSeconds": 86400,
+    "frameHeaderBytes": 36,
+    "frameMaxBytes": 65536
+  },
+  "hashing": [
+    {
+      "name": "empty",
+      "sizeBytes": 0,
+      "chunkSize": 1048576,
+      "chunkCount": 0,
+      "fileName": "empty.bin",
+      "mimeType": "application/octet-stream",
+      "chunkSha256": [],
+      "rootSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "manifestPreimageHex": "53544652312d6d616e69666573740000000000000000000010000000000000e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8550009656d7074792e62696e00186170706c69636174696f6e2f6f637465742d73747265616d",
+      "manifestDigest": "003c49ccee37c3430371f63a62dc207be52598fc521d7bc21f30105ec33a4e1e"
+    },
+    {
+      "name": "one-full-chunk",
+      "sizeBytes": 65536,
+      "chunkSize": 65536,
+      "chunkCount": 1,
+      "fileName": "a.bin",
+      "mimeType": "application/octet-stream",
+      "chunkSha256": [
+        "9a94d1fe70f679e05bdb8eb6291d21b036f060b16ca06e41ccd6381e0be51c09"
+      ],
+      "rootSha256": "a1ab0ce217bd2b7a60804c17a7bac067cb7b37e6e6817eae8cda05b0c6a72194",
+      "manifestPreimageHex": "53544652312d6d616e69666573740000000000000100000001000000000001a1ab0ce217bd2b7a60804c17a7bac067cb7b37e6e6817eae8cda05b0c6a721940005612e62696e00186170706c69636174696f6e2f6f637465742d73747265616d",
+      "manifestDigest": "4597d69c605537176091ffc6e8420073eb554331813d74f005e6aeb2c541d896"
+    },
+    {
+      "name": "three-chunks-short-tail",
+      "sizeBytes": 150000,
+      "chunkSize": 65536,
+      "chunkCount": 3,
+      "fileName": "photo.jpg",
+      "mimeType": "image/jpeg",
+      "chunkSha256": [
+        "9a94d1fe70f679e05bdb8eb6291d21b036f060b16ca06e41ccd6381e0be51c09",
+        "2930961fa3517f5152dd325a5e1900f92ccbc8b26c06c3bf5fda639e92d07cb4",
+        "a477b8ae87eda9d4929fb6f742192138c50a73d0e4dafc4c98726692b997f1fe"
+      ],
+      "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+      "manifestPreimageHex": "53544652312d6d616e69666573740000000000000249f0000100000000000305d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf000970686f746f2e6a7067000a696d6167652f6a706567",
+      "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+    },
+    {
+      "name": "unicode-name",
+      "sizeBytes": 70000,
+      "chunkSize": 65536,
+      "chunkCount": 2,
+      "fileName": "报告 2026 😀.pdf",
+      "mimeType": "application/pdf",
+      "chunkSha256": [
+        "9a94d1fe70f679e05bdb8eb6291d21b036f060b16ca06e41ccd6381e0be51c09",
+        "ce7463b57aa719b5f813d7b25e4d12f5000ab8800705bdd2fbf29eac80b8fd4a"
+      ],
+      "rootSha256": "a1d2380b7d7a31f1ecf1aa39e9b86aa84a266d5b68435b877403ae93d63e1384",
+      "manifestPreimageHex": "53544652312d6d616e69666573740000000000000111700001000000000002a1d2380b7d7a31f1ecf1aa39e9b86aa84a266d5b68435b877403ae93d63e13840014e68aa5e5918a203230323620f09f98802e706466000f6170706c69636174696f6e2f706466",
+      "manifestDigest": "4e2b700394e342cf2b78e3be83dfb04f55010cbe4d8e5e0cfbf63f85e688ce1f"
+    },
+    {
+      "name": "default-chunk-size-one-byte-tail",
+      "sizeBytes": 1048577,
+      "chunkSize": 1048576,
+      "chunkCount": 2,
+      "fileName": "video.mp4",
+      "mimeType": "video/mp4",
+      "chunkSha256": [
+        "1bfeab6e93ec363017c4e0352d91de303d51422538e9a287e31595fa3e6b1aa2",
+        "d1211001882d2ce16a8553e449b6c8b7f71e61836efc2e416143808f20e721e7"
+      ],
+      "rootSha256": "3a66a50edc8a5349be13bde1c21e4748164222e0a6d51179e6125101be70e93d",
+      "manifestPreimageHex": "53544652312d6d616e696665737400000000000010000100100000000000023a66a50edc8a5349be13bde1c21e4748164222e0a6d51179e6125101be70e93d0009766964656f2e6d70340009766964656f2f6d7034",
+      "manifestDigest": "19000896140d71f1159561b71ec3dc19f6ac69db9d158438cdfe320567b6e0d2"
+    }
+  ],
+  "offerValidation": [
+    {
+      "name": "valid",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "OK"
+    },
+    {
+      "name": "valid-empty-file",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "empty.bin",
+        "mimeType": "application/octet-stream",
+        "sizeBytes": 0,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 1048576,
+          "chunkCount": 0,
+          "rootSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "manifestDigest": "003c49ccee37c3430371f63a62dc207be52598fc521d7bc21f30105ec33a4e1e"
+        }
+      },
+      "expect": "OK"
+    },
+    {
+      "name": "valid-unicode-name",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "报告 2026 😀.pdf",
+        "mimeType": "application/pdf",
+        "sizeBytes": 70000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 2,
+          "rootSha256": "a1d2380b7d7a31f1ecf1aa39e9b86aa84a266d5b68435b877403ae93d63e1384",
+          "manifestDigest": "4e2b700394e342cf2b78e3be83dfb04f55010cbe4d8e5e0cfbf63f85e688ce1f"
+        }
+      },
+      "expect": "OK"
+    },
+    {
+      "name": "missing-resume-object-is-a-legacy-offer",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null
+      },
+      "expect": "UNSUPPORTED_VERSION"
+    },
+    {
+      "name": "resume-version-2",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 2,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "UNSUPPORTED_VERSION"
+    },
+    {
+      "name": "uppercase-transfer-id",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899AABBCCDDEEFF",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_TRANSFER_ID"
+    },
+    {
+      "name": "short-transfer-id",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddee",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_TRANSFER_ID"
+    },
+    {
+      "name": "negative-size",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": -1,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_SIZE"
+    },
+    {
+      "name": "fractional-size",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 1.5,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_SIZE"
+    },
+    {
+      "name": "string-size",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": "150000",
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_SIZE"
+    },
+    {
+      "name": "size-above-2-gib",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 2147483649,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "TOO_LARGE"
+    },
+    {
+      "name": "chunk-size-not-power-of-two",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 100000,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_CHUNK_SIZE"
+    },
+    {
+      "name": "chunk-size-below-64-kib",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 32768,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_CHUNK_SIZE"
+    },
+    {
+      "name": "chunk-size-above-4-mib",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 8388608,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_CHUNK_SIZE"
+    },
+    {
+      "name": "chunk-count-off-by-one",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 4,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_CHUNK_COUNT"
+    },
+    {
+      "name": "too-many-chunks",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 2147483648,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 32768,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "TOO_MANY_CHUNKS"
+    },
+    {
+      "name": "empty-file-name",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_FILE_NAME"
+    },
+    {
+      "name": "file-name-with-slash",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "dir/photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_FILE_NAME"
+    },
+    {
+      "name": "file-name-with-control-char",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo\n.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_FILE_NAME"
+    },
+    {
+      "name": "file-name-over-1024-utf8-bytes",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_FILE_NAME"
+    },
+    {
+      "name": "file-name-of-exactly-1024-utf8-bytes",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文文a",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "a642672bae2c8f544f39acd984bb20becfaf3c9031b3cc357f3eafdc9280656e"
+        }
+      },
+      "expect": "OK"
+    },
+    {
+      "name": "empty-mime-type",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_MIME_TYPE"
+    },
+    {
+      "name": "non-ascii-mime-type",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpég",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_MIME_TYPE"
+    },
+    {
+      "name": "mime-type-with-parameter",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "text/plain; charset=utf-8",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "570da15e90331485f09d0677b90ac49daf7e45b9c389810a57f1d84f6f3d7172"
+        }
+      },
+      "expect": "OK"
+    },
+    {
+      "name": "uppercase-root",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05D4CB315F91136A45B85268936FC1435C8EAACCA2F42CD16E5AD20C6E9F3AAF",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "BAD_DIGEST_FORMAT"
+    },
+    {
+      "name": "digest-of-another-name",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "other.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "05d4cb315f91136a45b85268936fc1435c8eaacca2f42cd16e5ad20c6e9f3aaf",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "MANIFEST_DIGEST_MISMATCH"
+    },
+    {
+      "name": "digest-of-another-root",
+      "offer": {
+        "kind": "file-meta",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "fileName": "photo.jpg",
+        "mimeType": "image/jpeg",
+        "sizeBytes": 150000,
+        "sha256": null,
+        "resume": {
+          "version": 1,
+          "chunkSize": 65536,
+          "chunkCount": 3,
+          "rootSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+        }
+      },
+      "expect": "MANIFEST_DIGEST_MISMATCH"
+    }
+  ],
+  "frames": [
+    {
+      "name": "data",
+      "frameHex": "535446520102000000112233445566778899aabbccddeeff00000001000080000000000824232221202f2e2d",
+      "expect": {
+        "type": "DATA",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "index": 1,
+        "offset": 32768,
+        "payloadHex": "24232221202f2e2d"
+      }
+    },
+    {
+      "name": "hashes",
+      "frameHex": "535446520101000000112233445566778899aabbccddeeff0000000000000000000000409a94d1fe70f679e05bdb8eb6291d21b036f060b16ca06e41ccd6381e0be51c092930961fa3517f5152dd325a5e1900f92ccbc8b26c06c3bf5fda639e92d07cb4",
+      "expect": {
+        "type": "HASHES",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "index": 0,
+        "offset": 0,
+        "payloadHex": "9a94d1fe70f679e05bdb8eb6291d21b036f060b16ca06e41ccd6381e0be51c092930961fa3517f5152dd325a5e1900f92ccbc8b26c06c3bf5fda639e92d07cb4"
+      }
+    },
+    {
+      "name": "truncated-header",
+      "frameHex": "535446520102000000112233445566778899aabbccddeeff0000000000000000000000",
+      "expect": {
+        "error": "TRUNCATED"
+      }
+    },
+    {
+      "name": "bad-magic",
+      "frameHex": "535441500102000000112233445566778899aabbccddeeff00000000000000000000000101",
+      "expect": {
+        "error": "BAD_MAGIC"
+      }
+    },
+    {
+      "name": "version-2",
+      "frameHex": "535446520202000000112233445566778899aabbccddeeff00000000000000000000000101",
+      "expect": {
+        "error": "BAD_VERSION"
+      }
+    },
+    {
+      "name": "type-0",
+      "frameHex": "535446520100000000112233445566778899aabbccddeeff00000000000000000000000101",
+      "expect": {
+        "error": "BAD_TYPE"
+      }
+    },
+    {
+      "name": "type-3",
+      "frameHex": "535446520103000000112233445566778899aabbccddeeff00000000000000000000000101",
+      "expect": {
+        "error": "BAD_TYPE"
+      }
+    },
+    {
+      "name": "flags-set",
+      "frameHex": "535446520102000100112233445566778899aabbccddeeff00000000000000000000000101",
+      "expect": {
+        "error": "BAD_FLAGS"
+      }
+    },
+    {
+      "name": "declared-longer-than-frame",
+      "frameHex": "535446520102000000112233445566778899aabbccddeeff00000000000000000000000924232221202f2e2d",
+      "expect": {
+        "error": "LENGTH_MISMATCH"
+      }
+    },
+    {
+      "name": "trailing-byte",
+      "frameHex": "535446520102000000112233445566778899aabbccddeeff00000000000000000000000824232221202f2e2d00",
+      "expect": {
+        "error": "LENGTH_MISMATCH"
+      }
+    },
+    {
+      "name": "empty-payload",
+      "frameHex": "535446520102000000112233445566778899aabbccddeeff000000000000000000000000",
+      "expect": {
+        "error": "EMPTY_PAYLOAD"
+      }
+    },
+    {
+      "name": "hashes-not-multiple-of-32",
+      "frameHex": "535446520101000000112233445566778899aabbccddeeff000000000000000000000021000000000000000000000000000000000000000000000000000000000000000000",
+      "expect": {
+        "error": "BAD_HASHES_LAYOUT"
+      }
+    },
+    {
+      "name": "hashes-with-offset",
+      "frameHex": "535446520101000000112233445566778899aabbccddeeff0000000000000020000000200000000000000000000000000000000000000000000000000000000000000000",
+      "expect": {
+        "error": "BAD_HASHES_LAYOUT"
+      }
+    },
+    {
+      "name": "one-byte-over-64-kib",
+      "frameHex": "535446520102000000112233445566778899aabbccddeeff00000000000000000000ffdd",
+      "appendZeroBytes": 65501,
+      "expect": {
+        "error": "TOO_LARGE"
+      }
+    }
+  ],
+  "bitmap": {
+    "encode": [
+      {
+        "chunkCount": 0,
+        "have": [],
+        "bitmap": ""
+      },
+      {
+        "chunkCount": 3,
+        "have": [
+          0,
+          2
+        ],
+        "bitmap": "BQ"
+      },
+      {
+        "chunkCount": 3,
+        "have": [
+          0,
+          1,
+          2
+        ],
+        "bitmap": "Bw"
+      },
+      {
+        "chunkCount": 10,
+        "have": [
+          0,
+          9
+        ],
+        "bitmap": "AQI"
+      },
+      {
+        "chunkCount": 16,
+        "have": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "bitmap": "__8"
+      },
+      {
+        "chunkCount": 17,
+        "have": [
+          16
+        ],
+        "bitmap": "AAAB"
+      }
+    ],
+    "decode": [
+      {
+        "chunkCount": 3,
+        "bitmap": "BQ",
+        "expect": {
+          "have": [
+            0,
+            2
+          ]
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "Bw",
+        "expect": {
+          "have": [
+            0,
+            1,
+            2
+          ]
+        }
+      },
+      {
+        "chunkCount": 0,
+        "bitmap": "",
+        "expect": {
+          "have": []
+        }
+      },
+      {
+        "chunkCount": 17,
+        "bitmap": "AAAB",
+        "expect": {
+          "have": [
+            16
+          ]
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "CA",
+        "expect": {
+          "error": "TRAILING_BITS"
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "AQI",
+        "expect": {
+          "error": "BAD_LENGTH"
+        }
+      },
+      {
+        "chunkCount": 0,
+        "bitmap": "AA",
+        "expect": {
+          "error": "BAD_LENGTH"
+        }
+      },
+      {
+        "chunkCount": 16,
+        "bitmap": "_w",
+        "expect": {
+          "error": "BAD_LENGTH"
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "BQ==",
+        "expect": {
+          "error": "BAD_ENCODING"
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "B+",
+        "expect": {
+          "error": "BAD_ENCODING"
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "BR",
+        "expect": {
+          "error": "BAD_ENCODING"
+        }
+      },
+      {
+        "chunkCount": 3,
+        "bitmap": "B",
+        "expect": {
+          "error": "BAD_ENCODING"
+        }
+      }
+    ],
+    "progress": [
+      {
+        "manifest": "three-chunks-short-tail",
+        "bitmap": "AA",
+        "expect": {
+          "firstMissing": 0,
+          "resumeOffset": 0,
+          "receivedBytes": 0,
+          "missing": [
+            0,
+            1,
+            2
+          ],
+          "complete": false
+        }
+      },
+      {
+        "manifest": "three-chunks-short-tail",
+        "bitmap": "AQ",
+        "expect": {
+          "firstMissing": 1,
+          "resumeOffset": 65536,
+          "receivedBytes": 65536,
+          "missing": [
+            1,
+            2
+          ],
+          "complete": false
+        }
+      },
+      {
+        "manifest": "three-chunks-short-tail",
+        "bitmap": "BQ",
+        "expect": {
+          "firstMissing": 1,
+          "resumeOffset": 65536,
+          "receivedBytes": 84464,
+          "missing": [
+            1
+          ],
+          "complete": false
+        }
+      },
+      {
+        "manifest": "three-chunks-short-tail",
+        "bitmap": "Bg",
+        "expect": {
+          "firstMissing": 0,
+          "resumeOffset": 0,
+          "receivedBytes": 84464,
+          "missing": [
+            0
+          ],
+          "complete": false
+        }
+      },
+      {
+        "manifest": "three-chunks-short-tail",
+        "bitmap": "Bw",
+        "expect": {
+          "firstMissing": null,
+          "resumeOffset": 150000,
+          "receivedBytes": 150000,
+          "missing": [],
+          "complete": true
+        }
+      }
+    ],
+    "merge": [
+      {
+        "chunkCount": 3,
+        "left": "AQ",
+        "right": "BA",
+        "expect": "BQ"
+      },
+      {
+        "chunkCount": 3,
+        "left": "Aw",
+        "right": "Ag",
+        "expect": "Aw"
+      },
+      {
+        "chunkCount": 10,
+        "left": "AAA",
+        "right": "AAI",
+        "expect": "AAI"
+      }
+    ]
+  },
+  "receiver": [
+    {
+      "name": "fresh-transfer",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": false,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 3,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_VERIFIED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 32768,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 0
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 32768,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 1
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 2
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "final-verify",
+            "corruptStored": []
+          },
+          "expect": {
+            "result": "VERIFIED",
+            "send": [
+              {
+                "kind": "transfer-complete"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "COMPLETE"
+          }
+        }
+      ],
+      "final": {
+        "have": "Bw",
+        "integrityFailures": 0,
+        "state": "COMPLETE",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "partial-hash-list-is-discarded-on-disconnect",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": false,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 2,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "session-close"
+          },
+          "expect": {
+            "result": "INTERRUPTED",
+            "send": [],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 2,
+            "count": 1,
+            "content": "original"
+          },
+          "expect": {
+            "result": "UNEXPECTED_OFFSET",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 3,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_VERIFIED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "hash-list-split-across-frames",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": false,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 1,
+            "count": 3,
+            "content": "original"
+          },
+          "expect": {
+            "result": "OUT_OF_RANGE",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 1,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 2,
+            "count": 1,
+            "content": "original"
+          },
+          "expect": {
+            "result": "UNEXPECTED_OFFSET",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 1,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 1,
+            "count": 2,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_VERIFIED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 1,
+            "content": "original"
+          },
+          "expect": {
+            "result": "UNEXPECTED_OFFSET",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "INTERRUPTED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "hash-list-must-match-root",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": false,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "hashes",
+            "index": 0,
+            "count": 3,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "ROOT_MISMATCH",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "INTEGRITY_FAILED"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "FAILED"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "NO_SESSION",
+            "send": [],
+            "sessionOpen": false,
+            "state": "FAILED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "FAILED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "data-before-hash-list",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": false,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "HASHES_INCOMPLETE",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "INTERRUPTED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "partial-chunk-is-discarded-on-disconnect",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AQ",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "session-close"
+          },
+          "expect": {
+            "result": "INTERRUPTED",
+            "send": [],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 32768,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "UNEXPECTED_OFFSET",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 32768,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 1
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "Aw",
+        "integrityFailures": 0,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "next-chunk-before-current-completes",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "UNEXPECTED_OFFSET",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "INTERRUPTED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "duplicate-chunk-is-idempotent",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "Aw",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 32768,
+            "length": 32768,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "DUPLICATE",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 0
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 2
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "DUPLICATE",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 2
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "Bw",
+        "integrityFailures": 0,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "mismatch-is-re-requested",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 32768,
+            "length": 32768,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "HASH_MISMATCH",
+            "send": [
+              {
+                "kind": "chunk-nack",
+                "index": 0,
+                "code": "HASH_MISMATCH"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 32768,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 0
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "AQ",
+        "integrityFailures": 1,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "mismatch-retries-are-bounded-per-session",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "HASH_MISMATCH",
+            "send": [
+              {
+                "kind": "chunk-nack",
+                "index": 2,
+                "code": "HASH_MISMATCH"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "HASH_MISMATCH",
+            "send": [
+              {
+                "kind": "chunk-nack",
+                "index": 2,
+                "code": "HASH_MISMATCH"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "RETRY_EXHAUSTED",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "RETRY_EXHAUSTED"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "HASH_MISMATCH",
+            "send": [
+              {
+                "kind": "chunk-nack",
+                "index": 2,
+                "code": "HASH_MISMATCH"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 2
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "BA",
+        "integrityFailures": 4,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "integrity-failure-budget-fails-the-transfer",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "Aw",
+        "hashesComplete": true,
+        "integrityFailures": 15
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "corrupt"
+          },
+          "expect": {
+            "result": "INTEGRITY_FAILED",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "INTEGRITY_FAILED"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "FAILED"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "NO_SESSION",
+            "send": [],
+            "sessionOpen": false,
+            "state": "FAILED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 16,
+        "state": "FAILED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "out-of-range-ends-the-session",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 3,
+            "offset": 0,
+            "length": 100,
+            "content": "original"
+          },
+          "expect": {
+            "result": "OUT_OF_RANGE",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18929,
+            "content": "original"
+          },
+          "expect": {
+            "result": "OUT_OF_RANGE",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        },
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 2
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "BA",
+        "integrityFailures": 0,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "frame-of-another-transfer",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 0,
+            "offset": 0,
+            "length": 32768,
+            "content": "original",
+            "transferId": "ffeeddccbbaa99887766554433221100"
+          },
+          "expect": {
+            "result": "WRONG_TRANSFER",
+            "send": [
+              {
+                "kind": "transfer-error",
+                "code": "PROTOCOL_ERROR"
+              }
+            ],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "INTERRUPTED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "frames-without-a-session-are-ignored",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "AA",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "data",
+            "index": 2,
+            "offset": 0,
+            "length": 18928,
+            "content": "original"
+          },
+          "expect": {
+            "result": "NO_SESSION",
+            "send": [],
+            "sessionOpen": false,
+            "state": "INTERRUPTED"
+          }
+        }
+      ],
+      "final": {
+        "have": "AA",
+        "integrityFailures": 0,
+        "state": "INTERRUPTED",
+        "sessionOpen": false
+      }
+    },
+    {
+      "name": "storage-corruption-found-by-final-verification",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "Bw",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "final-verify",
+            "corruptStored": [
+              1
+            ]
+          },
+          "expect": {
+            "result": "STORAGE_CORRUPT",
+            "send": [
+              {
+                "kind": "chunk-nack",
+                "index": 1,
+                "code": "STORAGE_CORRUPT"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 0,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "PARTIAL",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "data",
+            "index": 1,
+            "offset": 32768,
+            "length": 32768,
+            "content": "original"
+          },
+          "expect": {
+            "result": "STORED",
+            "send": [
+              {
+                "kind": "chunk-ack",
+                "index": 1
+              }
+            ],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "final-verify",
+            "corruptStored": []
+          },
+          "expect": {
+            "result": "VERIFIED",
+            "send": [
+              {
+                "kind": "transfer-complete"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "COMPLETE"
+          }
+        }
+      ],
+      "final": {
+        "have": "Bw",
+        "integrityFailures": 1,
+        "state": "COMPLETE",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "final-verification-needs-every-chunk",
+      "manifest": "three-chunks-short-tail",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "BQ",
+        "hashesComplete": true,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "final-verify",
+            "corruptStored": []
+          },
+          "expect": {
+            "result": "NOT_READY",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        }
+      ],
+      "final": {
+        "have": "BQ",
+        "integrityFailures": 0,
+        "state": "RECEIVING",
+        "sessionOpen": true
+      }
+    },
+    {
+      "name": "empty-file",
+      "manifest": "empty",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "initial": {
+        "have": "",
+        "hashesComplete": false,
+        "integrityFailures": 0
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "session-open"
+          },
+          "expect": {
+            "result": "OPENED",
+            "send": [],
+            "sessionOpen": true,
+            "state": "RECEIVING"
+          }
+        },
+        {
+          "event": {
+            "type": "final-verify",
+            "corruptStored": []
+          },
+          "expect": {
+            "result": "VERIFIED",
+            "send": [
+              {
+                "kind": "transfer-complete"
+              }
+            ],
+            "sessionOpen": true,
+            "state": "COMPLETE"
+          }
+        }
+      ],
+      "final": {
+        "have": "",
+        "integrityFailures": 0,
+        "state": "COMPLETE",
+        "sessionOpen": true
+      }
+    }
+  ],
+  "consent": [
+    {
+      "name": "confirmation-required-small-file",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_PERSISTENT"
+      }
+    },
+    {
+      "name": "auto-accept-small-file-stays-in-memory",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "AUTO_ACCEPT_MEMORY"
+      }
+    },
+    {
+      "name": "auto-accept-at-memory-limit",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 134217728,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "AUTO_ACCEPT_MEMORY"
+      }
+    },
+    {
+      "name": "auto-accept-never-writes-disk-without-a-click",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 134217729,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_PERSISTENT"
+      }
+    },
+    {
+      "name": "auto-accept-without-persistence",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": false,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "AUTO_ACCEPT_MEMORY"
+      }
+    },
+    {
+      "name": "viewer-cannot-send",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "senderAllowed": false,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "NOT_ALLOWED"
+      }
+    },
+    {
+      "name": "transfer-id-already-known",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": true,
+      "expect": {
+        "decision": "REJECT",
+        "code": "TRANSFER_ID_IN_USE"
+      }
+    },
+    {
+      "name": "no-persistence-small-file",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": false,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 104857600,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_MEMORY",
+        "memoryReason": "PERSISTENCE_UNAVAILABLE"
+      }
+    },
+    {
+      "name": "no-persistence-large-file",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": false,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 209715200,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "PERSISTENCE_UNAVAILABLE"
+      }
+    },
+    {
+      "name": "too-many-partials-small-file",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        }
+      ],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_MEMORY",
+        "memoryReason": "TOO_MANY_PARTIALS"
+      }
+    },
+    {
+      "name": "too-many-partials-large-file",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 1073741824,
+      "livePartials": [
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        }
+      ],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "TOO_MANY_PARTIALS"
+      }
+    },
+    {
+      "name": "partial-total-at-limit",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 1073741824,
+      "livePartials": [
+        {
+          "sizeBytes": 1610612736,
+          "receivedBytes": 536870912
+        },
+        {
+          "sizeBytes": 1610612736,
+          "receivedBytes": 536870912
+        }
+      ],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_PERSISTENT"
+      }
+    },
+    {
+      "name": "partial-total-over-limit",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 1073741825,
+      "livePartials": [
+        {
+          "sizeBytes": 1610612736,
+          "receivedBytes": 536870912
+        },
+        {
+          "sizeBytes": 1610612736,
+          "receivedBytes": 536870912
+        }
+      ],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "PARTIAL_BYTES_LIMIT"
+      }
+    },
+    {
+      "name": "quota-exactly-enough",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 2147483648,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 1006632960,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_PERSISTENT"
+      }
+    },
+    {
+      "name": "quota-one-byte-short",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 2147483648,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 1006632961,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "INSUFFICIENT_STORAGE"
+      }
+    },
+    {
+      "name": "quota-short-small-file",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 1178599424,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 104857600,
+      "livePartials": [],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_MEMORY",
+        "memoryReason": "INSUFFICIENT_STORAGE"
+      }
+    },
+    {
+      "name": "other-partials-reserve-their-remaining-bytes",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 3221225472,
+        "usageBytes": 1610612736
+      },
+      "sizeBytes": 536870912,
+      "livePartials": [
+        {
+          "sizeBytes": 1073741824,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1073741824,
+          "receivedBytes": 1073741824
+        }
+      ],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "INSUFFICIENT_STORAGE"
+      }
+    },
+    {
+      "name": "other-partials-that-finished-reserve-nothing",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 3221225472,
+        "usageBytes": 1610612736
+      },
+      "sizeBytes": 536870912,
+      "livePartials": [
+        {
+          "sizeBytes": 1073741824,
+          "receivedBytes": 1073741824
+        },
+        {
+          "sizeBytes": 1073741824,
+          "receivedBytes": 1073741824
+        }
+      ],
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_PERSISTENT"
+      }
+    }
+  ],
+  "resume": [
+    {
+      "name": "resume-within-consent",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "RESUME",
+        "have": "AQ",
+        "needHashes": false,
+        "complete": false,
+        "ttlSeconds": 86400,
+        "firstMissing": 1,
+        "resumeOffset": 65536,
+        "receivedBytes": 65536,
+        "missing": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "unknown-transfer",
+      "manifest": "three-chunks-short-tail",
+      "record": null,
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "UNKNOWN_TRANSFER"
+      }
+    },
+    {
+      "name": "other-transfer-id",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "ffeeddccbbaa99887766554433221100",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "UNKNOWN_TRANSFER"
+      }
+    },
+    {
+      "name": "wrong-token-looks-unknown",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "00000000000000000000000000000000",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "UNKNOWN_TRANSFER"
+      }
+    },
+    {
+      "name": "wrong-token-hides-expiry",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-07T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "00000000000000000000000000000000",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "UNKNOWN_TRANSFER"
+      }
+    },
+    {
+      "name": "expired-at-expiry-instant",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-07T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "EXPIRED"
+      }
+    },
+    {
+      "name": "one-second-before-expiry",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-07T11:59:59Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "RESUME",
+        "have": "AQ",
+        "needHashes": false,
+        "complete": false,
+        "ttlSeconds": 1,
+        "firstMissing": 1,
+        "resumeOffset": 65536,
+        "receivedBytes": 65536,
+        "missing": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "manifest-changed",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "abababababababababababababababababababababababababababababababab"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "MANIFEST_CHANGED"
+      }
+    },
+    {
+      "name": "expiry-before-manifest-change",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-07T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "abababababababababababababababababababababababababababababababab"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "EXPIRED"
+      }
+    },
+    {
+      "name": "sender-lost-permission",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": false,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "NOT_ALLOWED"
+      }
+    },
+    {
+      "name": "failed-transfer-is-gone",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "FAILED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "UNKNOWN_TRANSFER"
+      }
+    },
+    {
+      "name": "cancelled-transfer-is-gone",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "CANCELLED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "UNKNOWN_TRANSFER"
+      }
+    },
+    {
+      "name": "already-complete-is-idempotent",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "COMPLETE",
+        "have": "Bw",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 2,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "RESUME",
+        "have": "Bw",
+        "needHashes": false,
+        "complete": true,
+        "ttlSeconds": 86400,
+        "firstMissing": null,
+        "resumeOffset": 150000,
+        "receivedBytes": 150000,
+        "missing": []
+      }
+    },
+    {
+      "name": "receiver-busy",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AQ",
+        "hashesComplete": true
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 2,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "REJECT",
+        "code": "BUSY"
+      }
+    },
+    {
+      "name": "hash-list-not-yet-persisted",
+      "manifest": "three-chunks-short-tail",
+      "record": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312",
+        "expiresAt": "2026-10-07T12:00:00Z",
+        "state": "INTERRUPTED",
+        "have": "AA",
+        "hashesComplete": false
+      },
+      "now": "2026-10-06T12:00:00Z",
+      "senderAllowed": true,
+      "otherActiveSessions": 0,
+      "offer": {
+        "kind": "resume-offer",
+        "transferId": "00112233445566778899aabbccddeeff",
+        "resumeToken": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "manifestDigest": "14377fe3c167682111c22fa15e5eb9ca61db1203b19a504025d56eb6b629e312"
+      },
+      "expect": {
+        "result": "RESUME",
+        "have": "AA",
+        "needHashes": true,
+        "complete": false,
+        "ttlSeconds": 86400,
+        "firstMissing": 0,
+        "resumeOffset": 0,
+        "receivedBytes": 0,
+        "missing": [
+          0,
+          1,
+          2
+        ]
+      }
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "page-load-cleanup",
+      "now": "2026-10-06T12:00:00Z",
+      "records": [
+        {
+          "transferId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "state": "INTERRUPTED",
+          "expiresAt": "2026-10-06T12:00:00Z",
+          "saved": false
+        },
+        {
+          "transferId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "state": "INTERRUPTED",
+          "expiresAt": "2026-10-07T12:00:00Z",
+          "saved": false
+        },
+        {
+          "transferId": "cccccccccccccccccccccccccccccccc",
+          "state": "FAILED",
+          "expiresAt": "2026-10-07T12:00:00Z",
+          "saved": false
+        },
+        {
+          "transferId": "dddddddddddddddddddddddddddddddd",
+          "state": "CANCELLED",
+          "expiresAt": "2026-10-07T12:00:00Z",
+          "saved": false
+        },
+        {
+          "transferId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "state": "COMPLETE",
+          "expiresAt": "2026-10-07T12:00:00Z",
+          "saved": true
+        },
+        {
+          "transferId": "ffffffffffffffffffffffffffffffff",
+          "state": "COMPLETE",
+          "expiresAt": "2026-10-07T12:00:00Z",
+          "saved": false
+        },
+        {
+          "transferId": "11111111111111111111111111111111",
+          "state": "RECEIVING",
+          "expiresAt": "2026-10-06T12:00:01Z",
+          "saved": false
+        }
+      ],
+      "chunkTransferIds": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "ffffffffffffffffffffffffffffffff",
+        "99999999999999999999999999999999"
+      ],
+      "expect": {
+        "keepRecords": [
+          "11111111111111111111111111111111",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "ffffffffffffffffffffffffffffffff"
+        ],
+        "deleteRecords": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "cccccccccccccccccccccccccccccccc",
+          "dddddddddddddddddddddddddddddddd",
+          "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        ],
+        "deleteChunksOf": [
+          "99999999999999999999999999999999",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        ]
+      }
+    },
+    {
+      "name": "nothing-stored",
+      "now": "2026-10-06T12:00:00Z",
+      "records": [],
+      "chunkTransferIds": [],
+      "expect": {
+        "keepRecords": [],
+        "deleteRecords": [],
+        "deleteChunksOf": []
+      }
+    }
+  ],
+  "senderPlan": [
+    {
+      "name": "send-missing-in-order",
+      "manifest": "three-chunks-short-tail",
+      "have": "AQ",
+      "needHashes": false,
+      "reselectedSizeBytes": 150000,
+      "modifiedChunks": [],
+      "expect": {
+        "result": "SEND_ALL",
+        "hashesFirst": false,
+        "send": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "fresh-start-sends-hash-list-first",
+      "manifest": "three-chunks-short-tail",
+      "have": "AA",
+      "needHashes": true,
+      "reselectedSizeBytes": 150000,
+      "modifiedChunks": [],
+      "expect": {
+        "result": "SEND_ALL",
+        "hashesFirst": true,
+        "send": [
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "receiver-already-has-everything",
+      "manifest": "three-chunks-short-tail",
+      "have": "Bw",
+      "needHashes": false,
+      "reselectedSizeBytes": 150000,
+      "modifiedChunks": [],
+      "expect": {
+        "result": "SEND_ALL",
+        "hashesFirst": false,
+        "send": []
+      }
+    },
+    {
+      "name": "reselected-file-changed-in-a-missing-chunk",
+      "manifest": "three-chunks-short-tail",
+      "have": "AQ",
+      "needHashes": false,
+      "reselectedSizeBytes": 150000,
+      "modifiedChunks": [
+        2
+      ],
+      "expect": {
+        "result": "SOURCE_CHANGED",
+        "hashesFirst": false,
+        "send": [
+          1
+        ],
+        "changedIndex": 2
+      }
+    },
+    {
+      "name": "change-inside-an-already-received-chunk-is-harmless",
+      "manifest": "three-chunks-short-tail",
+      "have": "AQ",
+      "needHashes": false,
+      "reselectedSizeBytes": 150000,
+      "modifiedChunks": [
+        0
+      ],
+      "expect": {
+        "result": "SEND_ALL",
+        "hashesFirst": false,
+        "send": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "reselected-file-of-another-size",
+      "manifest": "three-chunks-short-tail",
+      "have": "AQ",
+      "needHashes": false,
+      "reselectedSizeBytes": 150001,
+      "modifiedChunks": [],
+      "expect": {
+        "result": "SOURCE_SIZE_MISMATCH",
+        "hashesFirst": false,
+        "send": []
+      }
+    }
+  ]
+}
