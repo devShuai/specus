@@ -154,6 +154,9 @@ typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
     int response_started;
+    /* Set when error holds the client's RST reason rather than a server-side failure. */
+    int client_reset;
+    uint32_t reset_code;
     char *error;
     direct_http_event *events_head;
     direct_http_event *events_tail;
@@ -1341,6 +1344,8 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
         char *reason = st_json_get_string(metadata, "reason");
         free(pending->error);
         pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
+        pending->client_reset = 1;
+        pending->reset_code = message->value;
         pending->done = 1;
         pthread_cond_broadcast(&pending->cond);
     } else if (message->type == ST_NAT_WINDOW_UPDATE) {
@@ -1464,6 +1469,17 @@ static void active_session_close_peer_locked(specus_session *session)
     }
 }
 
+/* Hands a client RST reason to the sink for server-side logging; it never reaches the caller. */
+static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
+                                      uint32_t code,
+                                      const char *reason)
+{
+    if (sink->on_reset != NULL) {
+        sink->on_reset(sink->ctx, code, reason);
+    }
+    return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
+}
+
 static int direct_http_forward(void *ctx,
                                const char *client_name,
                                const st_direct_http_request *request,
@@ -1580,6 +1596,8 @@ static int direct_http_forward(void *ctx,
         direct_http_event *event = result == 0 ? direct_pending_pop(&pending) : NULL;
         char *pending_error = event == NULL && pending.error != NULL
             ? dup_string(pending.error) : NULL;
+        int client_reset = pending.client_reset;
+        uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
         if (result != 0) {
@@ -1587,8 +1605,9 @@ static int direct_http_forward(void *ctx,
             break;
         }
         if (pending_error != NULL) {
+            result = client_reset
+                ? direct_report_client_reset(sink, reset_code, pending_error) : -1;
             free(pending_error);
-            result = -1;
             break;
         }
         if (event == NULL) {
@@ -1670,10 +1689,13 @@ failed:
     direct_pending_remove(session, &pending);
     direct_pending_free_events(&pending);
     pthread_mutex_unlock(&session->direct_lock);
+    /* A client RST while the request body was still uploading is reported like one after it. */
+    int failed_result = pending.client_reset && pending.error != NULL
+        ? direct_report_client_reset(sink, pending.reset_code, pending.error) : -1;
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
-    return -1;
+    return failed_result;
 }
 
 static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
