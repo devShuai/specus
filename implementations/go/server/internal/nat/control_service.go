@@ -28,11 +28,10 @@ func NewControlService(db *store.DB, sessions *session.Registry, remotePort int,
 	return &ControlService{db: db, sessions: sessions, remotePort: remotePort, publicAddress: publicAddress}
 }
 
-// PushResult reports how many entries were pushed. HTTPRoutes is -1 when HTTP routes are
-// unmanaged for the client (the httpSpecusConfigList key is omitted entirely).
+// PushResult reports how many entries were pushed.
 type PushResult struct {
-	SpecusMappings    int
-	HTTPRoutes int
+	SpecusMappings int
+	HTTPRoutes     int
 }
 
 // PushToName pushes the current snapshot to an online client by name; returns false if offline.
@@ -57,38 +56,27 @@ func (s *ControlService) pushSnapshot(ctx context.Context, clientID int64, clien
 	if err != nil {
 		return PushResult{}, false, err
 	}
-	httpManaged, err := s.db.CountHTTPRoutes(ctx, clientID)
+	httpRoutes, err := s.db.ListEnabledHTTPRoutes(ctx, clientID)
 	if err != nil {
 		return PushResult{}, false, err
-	}
-	var httpRoutes []store.HTTPRouteMapping
-	if httpManaged > 0 {
-		httpRoutes, err = s.db.ListEnabledHTTPRoutes(ctx, clientID)
-		if err != nil {
-			return PushResult{}, false, err
-		}
 	}
 
 	bound, ok := s.sessions.Find(clientName)
 	if !ok {
 		return PushResult{}, false, nil
 	}
-	message, err := s.buildMessage(clientName, mappings, httpManaged > 0, httpRoutes)
+	message, err := s.buildMessage(clientName, mappings, httpRoutes)
 	if err != nil {
 		return PushResult{}, false, err
 	}
 	if err := bound.Send(message); err != nil {
 		return PushResult{}, false, err
 	}
-	result := PushResult{SpecusMappings: len(mappings), HTTPRoutes: -1}
-	if httpManaged > 0 {
-		result.HTTPRoutes = len(httpRoutes)
-	}
-	return result, true, nil
+	return PushResult{SpecusMappings: len(mappings), HTTPRoutes: len(httpRoutes)}, true, nil
 }
 
 func (s *ControlService) buildMessage(clientName string, mappings []store.SpecusMapping,
-	httpManaged bool, httpRoutes []store.HTTPRouteMapping) (protocol.MessageResponse, error) {
+	httpRoutes []store.HTTPRouteMapping) (protocol.MessageResponse, error) {
 	specusConfigList := make([]map[string]any, 0, len(mappings))
 	for _, mapping := range mappings {
 		specusConfigList = append(specusConfigList, map[string]any{
@@ -108,16 +96,17 @@ func (s *ControlService) buildMessage(clientName string, mappings []store.Specus
 	} else {
 		bean["remoteAddress"] = nil
 	}
-	if httpManaged {
-		httpList := make([]map[string]any, 0, len(httpRoutes))
-		for _, route := range httpRoutes {
-			httpList = append(httpList, map[string]any{
-				"route":         route.Route,
-				"targetBaseUrl": route.TargetBaseURL,
-			})
-		}
-		bean["httpSpecusConfigList"] = httpList
+	// The HTTP route list is always the full set, even when empty: a client keeps the list it
+	// has when the field is missing, so omitting it after the last route was deleted left that
+	// route forwarding on the client until it reconnected.
+	httpList := make([]map[string]any, 0, len(httpRoutes))
+	for _, route := range httpRoutes {
+		httpList = append(httpList, map[string]any{
+			"route":         route.Route,
+			"targetBaseUrl": route.TargetBaseURL,
+		})
 	}
+	bean["httpSpecusConfigList"] = httpList
 
 	payload, err := json.Marshal(bean)
 	if err != nil {
