@@ -21,6 +21,8 @@ export function TransferFilePreflight(props: Props) {
   const { input, recipientLabel, allowCloud, canOfferCloudFallback, onAllowCloud, onModeChange, onRemove, onCancel, onConfirm, onLogin } = props;
   const result = checkFilePreflight(input);
   const cloud = input.mode === "link" || (canOfferCloudFallback && allowCloud);
+  // Above the 128 MiB memory limit only when this browser can send with chunked resume.
+  const resumable = input.memoryLimitBytes > 128 * 1024 * 1024;
   return (
     <Modal isOpen onClose={onCancel} size="2xl" scrollBehavior="inside" placement="center">
       <ModalContent>
@@ -29,7 +31,7 @@ export function TransferFilePreflight(props: Props) {
           <div className="rounded-lg border border-primary-200 bg-primary-50/40 p-3" role="status">
             <p className="text-base font-semibold">{input.mode === "device" ? `发送给：${recipientLabel}` : "生成文件链接 · 不直接发送给设备"}</p>
             <p className="mt-1 text-small">{input.files.length} 个文件 · 合计 <span className="font-mono">{formatBytes(result.totalBytes)}</span></p>
-            <p className="mt-1 text-tiny text-default-500">尚未发送任何文件内容。确认后顺序发送，不支持断点续传。</p>
+            <p className="mt-1 text-tiny text-default-500">尚未发送任何文件内容。确认后顺序发送{resumable ? "；设备传输按 1 MiB 分块校验，中断后可以从缺失的块继续，详见常见问题。" : "，当前页面不支持断点续传。"}</p>
           </div>
           <ul aria-label="待确认文件" className="max-h-48 space-y-2 overflow-y-auto">
             {input.files.map((file, index) => (
@@ -43,7 +45,7 @@ export function TransferFilePreflight(props: Props) {
             ))}
           </ul>
           <div className="space-y-2 text-small">
-            <p><strong>设备传输：</strong>每个文件最多 {input.memoryLimitBytes / (1024 * 1024)} MiB，直连和 TURN 中继共享此上限；接收文件暂存在浏览器内存，请及时保存。实际可接收量还受对方内存影响。</p>
+            <p><strong>设备传输：</strong>{resumable ? <>每个文件最多 {formatBytes(input.memoryLimitBytes)}，直连和 TURN 中继共享此上限。128 MiB 以内对方可以直接收进内存；更大的文件需要对方点击同意，写入其浏览器存储；对方页面是旧版本时上限仍为 128 MiB。</> : <>每个文件最多 {input.memoryLimitBytes / (1024 * 1024)} MiB，直连和 TURN 中继共享此上限；接收文件暂存在浏览器内存，请及时保存。实际可接收量还受对方内存影响。</>}</p>
             <p><strong>本次方式：</strong>{input.mode === "link" ? "上传到服务端配置的临时存储，生成文件链接；接收方需登录并持有链接和访问口令。" : cloud ? "优先直连 → TURN 中继；都失败后允许上传临时存储，对方需要登录下载。" : "直连 → TURN 中继；不会上传临时存储，失败后保留任务供重试。"}</p>
             {input.mode === "device" && canOfferCloudFallback ? <Checkbox isSelected={allowCloud} onValueChange={onAllowCloud}>设备连接失败时，允许将这些文件上传临时存储</Checkbox> : null}
             {cloud ? <div data-testid="transfer-cloud-quota" className="rounded-md border border-default-200 bg-default-50/30 p-3 text-tiny">

@@ -30,6 +30,7 @@ import type { NearbyDeviceAction } from "../components/NearbyDeviceActions";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { TransferFilePreflight } from "../components/TransferFilePreflight";
+import { ResumableTransfersPanel } from "../components/ResumableTransfersPanel";
 import { useFileLeaveWarning } from "../hooks/useFileLeaveWarning";
 import { useTransferCapabilities } from "../hooks/useTransferCapabilities";
 import { SyncedClipboard } from "../components/SyncedClipboard";
@@ -94,6 +95,10 @@ import {
 } from "../lib/directPeerTransport";
 import {
   DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
+  DIRECT_SEND_USER_CANCEL,
+  directResumeSupported,
+  directSendFailureKind,
+  directSendLimitBytes,
   receivingTransferKey,
   useDirectTransfer,
   type DirectPendingTransfer,
@@ -147,6 +152,9 @@ interface IncomingAttachment {
   downloading?: boolean;
   downloadProgress?: number;
   downloadError?: string | null;
+  /** Resumable direct receives kept in this browser's storage until saved or expired. */
+  resumeTransferId?: string;
+  restored?: boolean;
 }
 
 interface PreviewTarget {
@@ -228,7 +236,8 @@ class FileTransferRoomChangedError extends Error {
 }
 
 const INCOMING_ITEM_LIMIT = 20;
-const DIRECT_MEMORY_LIMIT_BYTES = DEFAULT_DIRECT_MEMORY_LIMIT_BYTES;
+// 2 GiB with chunked resume (secure context); the legacy 128 MiB memory limit otherwise.
+const DIRECT_SEND_LIMIT_BYTES = directSendLimitBytes();
 const STREAM_DOWNLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const AUTO_PREVIEW_LIMIT_BYTES = 8 * 1024 * 1024;
 const CLIPBOARD_EVENT_LIMIT = 20;
@@ -284,6 +293,16 @@ function readInitialTransferTool(): TransferToolMode {
 
 function isDiscoveryPermissionError(message: string): boolean {
   return /无权|权限|只读|forbidden|unauthorized|token|口令/i.test(message);
+}
+
+function memoryReasonText(reason: string): string {
+  switch (reason) {
+    case "PERSISTENCE_UNAVAILABLE": return "本机浏览器存储不可用，例如无痕窗口";
+    case "TOO_MANY_PARTIALS": return "本机未完成的接收已达 4 个";
+    case "PARTIAL_BYTES_LIMIT": return "本机未完成接收的总大小已达 4 GiB";
+    case "INSUFFICIENT_STORAGE": return "本机浏览器存储空间不足";
+    default: return reason;
+  }
 }
 
 function userFacingTransferError(message: string): string {
@@ -811,12 +830,19 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     rejectIncomingTransfer,
     cancelIncomingTransfer,
     invalidateConnections,
+    storedReceives,
+    outgoingResumes,
+    resumeOutgoing,
+    abandonOutgoing,
+    abandonStoredReceive,
+    markDirectSaved,
+    clearResumeData,
   } = useDirectTransfer({
     selfPeerId: peerId,
     connectionScopeKey: transferRoomScopeKey,
     iceConfig,
     peers,
-    directMemoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
+    directMemoryLimitBytes: DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
     receiveConfirmationRequired,
     preconnectPeerChannels: true,
     sendSignal: sendDiscoverySignal,
@@ -844,6 +870,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     },
     onProgress: setProgress,
     onError: (message) => setError(userFacingTransferError(message)),
+    onNotice: setNotice,
   });
 
   useEffect(() => {
@@ -897,7 +924,10 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return;
     }
     pendingTransfers.forEach((item) => {
-      acceptIncomingTransfer(item.sourcePeerId, item.transferId);
+      // Writing to this browser's storage always needs the user's click (chunked resume §6).
+      if (item.storage !== "persistent") {
+        acceptIncomingTransfer(item.sourcePeerId, item.transferId);
+      }
     });
   }, [acceptIncomingTransfer, pendingTransfers, receiveConfirmationRequired]);
 
@@ -1377,7 +1407,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const preflightInput = (draft: DraftFileTransfer): FilePreflightInput => ({
     files: draft.files,
     mode: draft.mode,
-    memoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
+    memoryLimitBytes: DIRECT_SEND_LIMIT_BYTES,
     queuedCount: queuedFileTransfersRef.current.length + (uploadInFlightRef.current ? 1 : 0),
     signedIn: ossFallbackEnabled,
     rtcSupported: typeof RTCPeerConnection !== "undefined",
@@ -2147,6 +2177,20 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               peerTransferRejected = true;
               break;
             }
+            const failureKind = directSendFailureKind(err);
+            if (failureKind === "final") {
+              // Decided by a person or paused for a later resume: no other transport, no cloud.
+              peerTransferError = message;
+              peerTransferFatal = true;
+              break;
+            }
+            if (failureKind === "cloud") {
+              // The receiver cannot hold this file; relay would be refused the same way, so
+              // only an allowed cloud fallback is left.
+              peerTransferError = message;
+              peerTransferFatal = task.targetSameLan || !task.ossFallbackAllowed;
+              break;
+            }
             if (transportMode === "direct") {
               setNotice("点对点连接未建立，正在尝试 TURN 中继");
             }
@@ -2226,7 +2270,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     });
     uploadInFlightRef.current = null;
     activeOutgoingActivityIdRef.current = "";
-    task.abortController.abort();
+    task.abortController.abort(DIRECT_SEND_USER_CANCEL);
     setProgress(0);
     setError(null);
     setState("idle");
@@ -2631,7 +2675,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (activeTask?.activityId === activityId) {
       uploadInFlightRef.current = null;
       activeOutgoingActivityIdRef.current = "";
-      activeTask.abortController.abort();
+      activeTask.abortController.abort(DIRECT_SEND_USER_CANCEL);
       setProgress(0);
       setState("idle");
       window.setTimeout(() => runQueuedTransfersRef.current(), 0);
@@ -2694,6 +2738,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           triggerUrlDownload(item.downloadUrl || item.previewUrl || "", item.attachment.fileName);
         } else {
           throw new Error("直连文件缓存不可用");
+        }
+        if (item.resumeTransferId) {
+          // Deleted from this browser's storage on the next page load, not now: the
+          // browser may still be reading the object URL.
+          markDirectSaved(item.resumeTransferId);
         }
         setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
         setNotice(`已开始下载：${item.attachment.fileName}`);
@@ -2946,8 +2995,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   }, [openFilePicker, selectTransferTool]);
 
+  const clearLocalTransferData = () => {
+    void clearResumeData().then(() => {
+      setNotice("已清除本机保存的互传数据：未完成的接收、未保存的已收文件和可续传的发送记录");
+    });
+  };
+
   const hasReceivedFiles = incoming.length + receivingTransfers.length + pendingTransfers.length > 0;
-  const incomingFilesPanel = <IncomingFilesPanel
+  const incomingFilesPanel = <><IncomingFilesPanel
     pendingTransfers={pendingTransfers}
     receivingTransfers={receivingTransfers}
     peerTransportPaths={peerTransportPaths}
@@ -2961,7 +3016,17 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     onDownload={downloadIncoming}
     onLogin={openLogin}
     onPreview={setPreviewTarget}
-  />;
+  />
+  <ResumableTransfersPanel
+    storedReceives={storedReceives}
+    outgoingResumes={outgoingResumes}
+    peerDisplayNames={diagramPeerDisplayNames}
+    onResumeOutgoing={resumeOutgoing}
+    onAbandonOutgoing={(transferId) => { abandonOutgoing(transferId); setNotice("已放弃该发送"); }}
+    onAbandonReceive={(transferId) => { abandonStoredReceive(transferId); setNotice("已放弃并删除本机保存的部分数据"); }}
+    onClearAll={clearLocalTransferData}
+    onError={(message) => setError(message)}
+  /></>;
 
   const sharedModals = (
     <>
@@ -3574,7 +3639,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               </div>
             ) : null}
             {volatileFileWork ? <p role="status" data-testid="transfer-leave-warning" className="mt-3 rounded-md border border-warning-200 bg-warning-50/30 p-3 text-tiny">
-              当前有待处理文件。离开或刷新会中断传输，文件草稿和未保存的接收文件不会恢复；浏览器可能无法弹出提醒，请先完成传输并保存收到的文件。
+              当前有待处理文件。离开或刷新会中断传输：文件草稿和只在内存中接收的文件不会恢复；写入本机存储的接收在 24 小时内可以续传，但发送方需要重新选择同一文件。浏览器可能无法弹出提醒，请先完成传输并保存收到的文件。
             </p> : null}
           </div>
 
@@ -3954,7 +4019,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <>
               <ModalHeader>互传帮助</ModalHeader>
               <ModalBody className="pb-5">
-                <TransferFaq iceConfig={iceConfig} sharedRoom={sharedRoomActive} ossFallbackEnabled={ossFallbackEnabled} />
+                <TransferFaq iceConfig={iceConfig} sharedRoom={sharedRoomActive} ossFallbackEnabled={ossFallbackEnabled} onClearResumeData={clearLocalTransferData} />
               </ModalBody>
               <ModalFooter><Button color="primary" radius="sm" onPress={onClose}>知道了</Button></ModalFooter>
             </>
@@ -4454,6 +4519,15 @@ function IncomingFilesPanel({
                   待确认
                 </Chip>
               </div>
+              {item.storage === "persistent" ? (
+                <p className="mt-2 text-tiny text-amber-900/80 dark:text-amber-100/75">
+                  接收后已校验的分块会写入本机浏览器存储，中断或刷新后 24 小时内可续传，可随时放弃并删除；浏览器可能自行清除这些数据。同一站点的页面可以读取它们，共用电脑建议拒绝。
+                </p>
+              ) : item.storage === "memory" ? (
+                <p className="mt-2 text-tiny text-amber-900/80 dark:text-amber-100/75">
+                  只在内存中接收{item.memoryReason ? `（${memoryReasonText(item.memoryReason)}）` : ""}：网络短暂中断可以续传，刷新或关闭页面后无法恢复。
+                </p>
+              ) : null}
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <Button size="sm" radius="sm" color="primary" onPress={() => onAcceptDirect(item)}>
                   接收
@@ -4477,6 +4551,7 @@ function IncomingFilesPanel({
                 <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
                 <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
                   来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}{pathLabel ? ` · ${pathLabel}` : ""}
+                  {item.storage === "persistent" ? " · 写入本机，可续传" : item.storage === "memory" ? " · 仅内存" : ""}
                 </div>
                 <div className="mt-2 flex items-center gap-2">
                   <Progress className="flex-1" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
@@ -5137,11 +5212,14 @@ function TransferFaq({
   iceConfig,
   sharedRoom,
   ossFallbackEnabled,
+  onClearResumeData,
 }: {
   iceConfig: PublicTransferIceConfig | null;
   sharedRoom: boolean;
   ossFallbackEnabled: boolean;
+  onClearResumeData?: () => void;
 }) {
+  const resumable = directResumeSupported();
   const routeLabel = iceConfig?.turnAuthRequired ? "中继授权会在连接时自动申请" : "传输方式以实际连接结果为准";
 
   return (
@@ -5162,7 +5240,7 @@ function TransferFaq({
             : "不可以。未登录时不会上传云端，需要先选择一台在线设备。"}
         </FaqItem>
         <FaqItem title="文件会怎么传？">
-          {`选择、拖入或粘贴文件后先查看发送前确认。设备文件优先直连，连接不通时尝试 TURN 中继；两者的单文件内存上限均为 128 MiB。中继不会生成云端副本。${ossFallbackEnabled ? "只有在发送前明确允许云端回退时，远程设备连接失败才会改用临时存储；接收方需要登录下载。" : "未登录时不会上传云端。"}`}
+          {`选择、拖入或粘贴文件后先查看发送前确认。设备文件优先直连，连接不通时尝试 TURN 中继，中继不会生成云端副本。${resumable ? "单文件最多 2 GiB：128 MiB 以内可以直接收进内存；更大的文件需要接收方点击同意，写入其浏览器本地存储。对方页面是旧版本时上限仍为 128 MiB。" : "当前页面不是安全连接（HTTPS），无法分块续传，单文件内存上限为 128 MiB。"}${ossFallbackEnabled ? "只有在发送前明确允许云端回退时，远程设备连接失败才会改用临时存储；接收方需要登录下载。" : "未登录时不会上传云端。"}`}
         </FaqItem>
         <FaqItem title="为什么有时需要手动写入系统剪贴板？">
           浏览器可能阻止网页改写系统剪贴板。收到的文字仍在页面里，点击“复制到剪贴板”即可重试。本页不会持续读取你在其他应用中复制的内容。
@@ -5173,8 +5251,21 @@ function TransferFaq({
         <FaqItem title="云端额度是多少？">
           存储额度、下载额度、单文件上限和文件保存时长由服务端配置。选择云端方式后，发送前确认会读取当前账号的额度快照；旧服务端不支持或查询失败时会明确提示未核验。查询不预占额度，实际上传仍可能失败；申请上传可能预占存储额度。下载授权首次打开并成功跳转时，按文件完整大小计入下载额度。临时下载地址只能使用一次，重新下载需重新申请；这不代表文件分享链接只能用一次。文件有效期以生成结果为准。
         </FaqItem>
-        <FaqItem title="关闭页面后能继续传吗？">
-          不能。当前传输和文件草稿只存在于页面中，失败重试会从头开始，不支持断点续传。接收完成也不等于已保存到设备，请点击“保存到设备”并检查浏览器下载记录。网页会尝试提醒离开，但浏览器或手机系统可能不显示提醒。
+        <FaqItem title="中断或关闭页面后能继续传吗？">
+          <p>
+            部分可以。设备传输按 1 MiB 分块逐块校验：网络中断或在直连与中继之间切换时，只要两端页面都开着，发送方会自动重连并从缺失的块继续，最多重试 5 次。
+          </p>
+          <p className="mt-2">
+            接收方点击同意写入本机存储的文件，刷新或重新打开页面后可以续传，有效期 24 小时，从同意时起算，续传不会延长。发送方刷新后浏览器不允许网页自动重新读取文件，需要在“未完成的发送”里重新选择同一文件；文件内容变了只能作为新传输重新发送，并需要对方重新同意。
+          </p>
+          <p className="mt-2">
+            自动接收或只在内存中接收的文件不写入本机存储，任一端刷新后都要从头开始；文件草稿也不会保留。已收数据只保存在本机浏览器，浏览器可能自行清除；页面关闭期间不会运行任何清理，过期数据要到下次打开本站页面时才删除。接收完成也不等于已保存到设备，请点击“保存到设备”并检查浏览器下载记录。网页会尝试提醒离开，但浏览器或手机系统可能不显示提醒。
+          </p>
+          {onClearResumeData ? (
+            <Button className="mt-2" size="sm" radius="sm" variant="flat" onPress={onClearResumeData}>
+              清除互传本地数据
+            </Button>
+          ) : null}
         </FaqItem>
         <FaqItem title="更多说明">
           {sharedRoom
