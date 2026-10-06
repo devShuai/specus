@@ -38,6 +38,14 @@ typedef struct {
     int (*on_end)(void *ctx, char *const *trailers, size_t trailers_len);
     /* Optional: reports the client's free-text RST reason for server-side logging only. */
     void (*on_reset)(void *ctx, uint32_t code, const char *reason);
+    /*
+     * Optional: lets another thread end the stream early (a temporary HTTP share that ended,
+     * protocol/spec/temporary-http-share.md section 6.6). The forwarder binds cancel(cancel_ctx)
+     * once its NAT stream exists and binds NULL before that stream is released; cancel only wakes
+     * the forwarder, which then resets the NAT stream and returns
+     * ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED.
+     */
+    void (*bind_cancel)(void *ctx, void (*cancel)(void *cancel_ctx), void *cancel_ctx);
 } st_admin_direct_http_sink;
 
 /*
@@ -51,6 +59,11 @@ typedef struct {
  * streams; the public caller gets 502 "HTTP 流创建失败", as Java HttpSpecusController answers.
  */
 #define ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT (-6)
+/* Forwarder result once sink->bind_cancel's canceller ran: the NAT stream was reset. */
+#define ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED (-7)
+/* The NAT RST code and reason that end the in-flight streams of a temporary HTTP share. */
+#define ST_ADMIN_HTTP_SHARE_RESET_CODE 31U
+#define ST_ADMIN_HTTP_SHARE_RESET_REASON "HTTP share ended"
 #define ST_ADMIN_LOG_REASON_MAX_CODE_POINTS 256U
 
 /*
@@ -203,6 +216,21 @@ int st_admin_deliver_client_message_to_admin(const char *tenant_id,
 void st_admin_broadcast_connection_event(const char *tenant_id,
                                          const char *type,
                                          const st_storage_connection *connection);
+
+/*
+ * Temporary HTTP shares (protocol/spec/temporary-http-share.md section 6.6 and 7.5). The
+ * maintenance thread calls the tick every second: it cuts streams whose share expired and, every
+ * two seconds, re-reads each share that has streams on this instance, so a revoke made by another
+ * instance cuts them within five seconds. The sweep runs every 30 seconds.
+ */
+void st_admin_http_share_tick(void);
+int st_admin_http_share_sweep(void);
+/* Cuts this instance's streams of the share: NAT RST, HTTP aborted, WebSocket closed with 1008. */
+void st_admin_http_share_cut(const char *share_id);
+size_t st_admin_http_share_stream_count(const char *share_id);
+/* Test hooks: placeholder streams that count against the 64-stream admission limit. */
+int st_admin_http_share_occupy_for_testing(const char *share_id, size_t count);
+void st_admin_http_share_release_for_testing(void);
 /* One SWS2 envelope (protocol/spec/http-route.md section 7); payload points into the encoding. */
 typedef struct {
     uint8_t opcode;

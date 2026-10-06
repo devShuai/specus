@@ -24,6 +24,7 @@ add_library(specus_c_core
     src/elasticsearch_traffic.c
     src/github_release.c
     src/http_client.c
+    src/http_share.c
     src/json.c
     src/login_rate_limiter.c
     src/media_capture.c
@@ -98,6 +99,14 @@ add_test(NAME elasticsearch_traffic_tests
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/elasticsearch_traffic_test.sh
                  $<TARGET_FILE:specus_c_elasticsearch_traffic_tests>)
 set_tests_properties(elasticsearch_traffic_tests PROPERTIES TIMEOUT 45)
+
+add_executable(specus_c_http_share_tests tests/http_share_tests.c)
+target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_share_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_share_tests PRIVATE
+    ST_SHARE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/temporary-http-share-v1.json")
+add_test(NAME http_share_tests COMMAND specus_c_http_share_tests)
+set_tests_properties(http_share_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_json_tests tests/json_tests.c)
 target_link_libraries(specus_c_json_tests PRIVATE specus_c_core)

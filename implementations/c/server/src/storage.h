@@ -1199,4 +1199,235 @@ int st_storage_list_tcp_stream_visible(const char *path,
                                        size_t *item_count);
 void st_storage_tcp_frame_free(st_storage_tcp_frame *frame);
 
+/*
+ * Temporary HTTP shares (protocol/spec/temporary-http-share.md). Every function takes "now" in
+ * epoch milliseconds from the share clock and stores whole seconds; a share has expired once
+ * now >= expires_at. Share decisions read the share, route, client and creator afresh each time.
+ */
+typedef struct {
+    char share_id[17];
+    char tenant_id[128];
+    long long route_id;
+    char token_sha256[65];
+    char access[9];
+    char path_prefix[257];
+    char label[256];
+    int has_label;
+    char created_by[128];
+    long long created_at;
+    long long expires_at;
+    int revoked;
+    long long revoked_at;
+    char revoked_by[128];
+    int has_revoked_by;
+    char revoke_reason[41];
+    int expiry_recorded;
+} st_storage_http_share;
+
+/* The built-in admin, who has no specus_management_user row; accepted says it may sign in now. */
+typedef struct {
+    const char *username;
+    const char *tenant_id;
+    int accepted;
+} st_storage_share_builtin_admin;
+
+/* Share ids a call revoked, so the caller can cut this instance's streams of them. */
+typedef struct {
+    char (*ids)[17];
+    size_t len;
+    size_t cap;
+} st_storage_share_ids;
+
+typedef struct {
+    int found;
+    st_storage_http_share share;
+    int route_found;
+    int client_found;
+    long long client_id;
+    char client_name[256];
+    char route_name[128];
+    int path_rewrite_enabled;
+    /* Only for an active share: why its route, client or creator no longer allows it, else NULL. */
+    const char *lapse_reason;
+} st_storage_http_share_resolution;
+
+typedef struct {
+    long long id;
+    long long occurred_at;
+    char actor[128];
+    int has_actor;
+    char action[41];
+    long long route_id;
+    char share_id[17];
+    int has_share_id;
+    char detail_json[513];
+} st_storage_http_access_audit;
+
+#define ST_STORAGE_SHARE_OK 0
+#define ST_STORAGE_SHARE_ROUTE_NOT_FOUND 1
+#define ST_STORAGE_SHARE_ROUTE_DISABLED 2
+#define ST_STORAGE_SHARE_CLIENT_DISABLED 3
+#define ST_STORAGE_SHARE_ROUTE_PUBLIC 4
+#define ST_STORAGE_SHARE_LIMIT_REACHED 5
+#define ST_STORAGE_SHARE_ID_TAKEN 6
+#define ST_STORAGE_SHARE_NOT_FOUND 7
+
+int st_storage_share_ids_add(st_storage_share_ids *ids, const char *share_id);
+void st_storage_share_ids_free(st_storage_share_ids *ids);
+/* Test hook: every share read and write fails as if the store were unreadable. */
+void st_storage_http_share_fail_for_testing(int failing);
+
+/* Whether caller (re-read now) may manage the route; 0, or -1 when the store cannot be read. */
+int st_storage_http_share_caller_can_manage(const char *path,
+                                            const st_storage_share_builtin_admin *builtin,
+                                            const char *caller,
+                                            const char *caller_tenant,
+                                            long long route_id,
+                                            int *allowed);
+/* Whether caller (re-read now) is an enabled tenant admin; fills its tenant. */
+int st_storage_http_share_caller_is_admin(const char *path,
+                                          const st_storage_share_builtin_admin *builtin,
+                                          const char *caller,
+                                          const char *caller_tenant,
+                                          int *admin,
+                                          char tenant_id[128]);
+/*
+ * Spec 4.1 steps 3-9 in one transaction. draft carries share_id, token_sha256, access,
+ * path_prefix, label, created_at and expires_at; tenant and creator come from the route and the
+ * caller. Returns ST_STORAGE_SHARE_* or -1.
+ */
+int st_storage_http_share_create(const char *path,
+                                 const st_storage_share_builtin_admin *builtin,
+                                 const char *caller,
+                                 const char *caller_tenant,
+                                 long long route_id,
+                                 const st_storage_http_share *draft,
+                                 int max_active,
+                                 long long now_ms,
+                                 st_storage_http_share *out);
+/*
+ * The stored shares of a route (or the one share_id of it), newest first, after revoking in place
+ * every active one that has lapsed. *shares is malloc'd.
+ */
+int st_storage_http_share_list(const char *path,
+                               const st_storage_share_builtin_admin *builtin,
+                               long long route_id,
+                               const char *share_id,
+                               long long now_ms,
+                               st_storage_http_share **shares,
+                               size_t *count,
+                               st_storage_share_ids *revoked);
+/* Spec 4.3: ROUTE_NOT_FOUND, NOT_FOUND or OK with the share as it is now; *changed when revoked. */
+int st_storage_http_share_revoke(const char *path,
+                                 const st_storage_share_builtin_admin *builtin,
+                                 const char *caller,
+                                 const char *caller_tenant,
+                                 long long route_id,
+                                 const char *share_id,
+                                 long long now_ms,
+                                 st_storage_http_share *out,
+                                 int *changed);
+/* Reads a share with its route and client as they are now (spec 6.1 step 3). */
+int st_storage_http_share_resolve(const char *path,
+                                  const st_storage_share_builtin_admin *builtin,
+                                  const char *share_id,
+                                  long long now_ms,
+                                  st_storage_http_share_resolution *out);
+/* Read-time revoke (spec 7.4): conditional update plus audit, actor NULL; *changed when it won. */
+int st_storage_http_share_revoke_lapsed(const char *path,
+                                        const char *share_id,
+                                        const char *reason,
+                                        long long now_ms,
+                                        int *changed);
+/* Spec 7.5: record expiries, revoke lapsed shares, delete rows past retention. */
+int st_storage_http_share_sweep(const char *path,
+                                const st_storage_share_builtin_admin *builtin,
+                                long long now_ms,
+                                st_storage_share_ids *revoked);
+/* Audit entries of a tenant (route_id 0: every route), id descending, id < before when before > 0. */
+int st_storage_http_access_audit_list(const char *path,
+                                      const char *tenant_id,
+                                      long long route_id,
+                                      long long before,
+                                      int limit,
+                                      st_storage_http_access_audit **entries,
+                                      size_t *count,
+                                      int *more);
+
+/*
+ * Route, client and user changes with their share hooks and audit in the same transaction
+ * (spec 7.3 and 8). actor is the acting user; revoked collects the shares that ended.
+ */
+int st_storage_create_http_route_audited(const char *path,
+                                         long long client_id,
+                                         const char *route,
+                                         const char *target_base_url,
+                                         int enabled,
+                                         int detail_capture_enabled,
+                                         int media_capture_enabled,
+                                         int path_rewrite_enabled,
+                                         int insecure_skip_verify,
+                                         int auth_enabled,
+                                         const char *auth_username,
+                                         const char *auth_password_hash,
+                                         int password_set,
+                                         const char *actor,
+                                         long long now_ms,
+                                         st_storage_http_route *out_route,
+                                         st_storage_share_ids *revoked);
+int st_storage_update_http_route_audited(const char *path,
+                                         long long id,
+                                         const char *route,
+                                         const char *target_base_url,
+                                         int enabled,
+                                         int detail_capture_enabled,
+                                         int media_capture_enabled,
+                                         int path_rewrite_enabled,
+                                         int insecure_skip_verify,
+                                         int auth_enabled,
+                                         const char *auth_username,
+                                         const char *auth_password_hash,
+                                         int password_set,
+                                         const char *actor,
+                                         long long now_ms,
+                                         st_storage_http_route *out_route,
+                                         st_storage_share_ids *revoked);
+int st_storage_delete_http_route_audited(const char *path,
+                                         long long id,
+                                         const char *actor,
+                                         long long now_ms,
+                                         st_storage_share_ids *revoked);
+int st_storage_update_client_audited(const char *path,
+                                     long long id,
+                                     const char *client_name,
+                                     int enabled,
+                                     int connection_rate_limit_per_minute,
+                                     const char *actor,
+                                     long long now_ms,
+                                     st_storage_client *out_client,
+                                     st_storage_share_ids *revoked);
+int st_storage_delete_client_audited(const char *path,
+                                     long long id,
+                                     const char *actor,
+                                     long long now_ms,
+                                     st_storage_share_ids *revoked);
+int st_storage_update_management_user_audited(const char *path,
+                                              const st_storage_share_builtin_admin *builtin,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              const char *password_hash,
+                                              const char *role,
+                                              int enabled,
+                                              const char *actor,
+                                              long long now_ms,
+                                              st_storage_management_user *out_user,
+                                              st_storage_share_ids *revoked);
+int st_storage_delete_management_user_audited(const char *path,
+                                              const st_storage_share_builtin_admin *builtin,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              const char *actor,
+                                              long long now_ms,
+                                              st_storage_share_ids *revoked);
+
 #endif
