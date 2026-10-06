@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 using Specus.Server.Configuration;
+using Specus.Server.Connectivity;
 using Specus.Server.Hosting;
 using Specus.Server.PeerMesh;
 using Specus.Server.Security;
@@ -89,6 +90,10 @@ public static class AdminApiEndpoints
             var principal = await tokens.ValidateAsync(token, context.RequestAborted).ConfigureAwait(false);
             if (principal is null)
             {
+                if (ConnectivityCheckEndpoint.Matches(context.Request.Path))
+                {
+                    context.Response.Headers.CacheControl = ConnectivityCheck.CacheControl;
+                }
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 await context.Response.WriteAsJsonAsync(new { error = "未授权" }).ConfigureAwait(false);
                 return;
@@ -671,6 +676,13 @@ public static class AdminApiEndpoints
                     .ConfigureAwait(false);
                 return Results.NoContent();
             });
+
+        // The route id is matched as text: a malformed id is a 404 like any other invisible
+        // route, and only after the body was found valid.
+        app.MapPost(ConnectivityCheckEndpoint.Pattern,
+            (HttpContext context, string routeId, IOptions<AuthOptions> authOptions,
+                ConnectivityCheckService service, TimeProvider time, IHostApplicationLifetime lifetime) =>
+                ConnectivityCheckEndpoint.HandleAsync(context, routeId, authOptions, service, time, lifetime));
 
         app.MapGet("/api/admin/connections",
             (long? clientId, bool? success, string? from, string? to, int? page, int? size,

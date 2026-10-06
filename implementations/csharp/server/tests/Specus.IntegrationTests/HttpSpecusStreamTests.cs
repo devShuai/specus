@@ -57,6 +57,47 @@ public sealed class HttpSpecusStreamTests
         }));
     }
 
+    [Fact]
+    public async Task DiscardedBodyNeverFillsTheQueueOrEarnsCreditButStillCountsAgainstTheWindow()
+    {
+        var writer = new CapturingFrameWriter();
+        await using var stream = CreateStream(writer);
+        stream.DiscardResponseBody();
+
+        Assert.True(stream.OnResponseHead(new Dictionary<string, object?> { ["statusCode"] = 200 }));
+        for (var i = 0; i < 100; i++)
+        {
+            Assert.True(stream.OnResponseData(new byte[1024]));
+        }
+        Assert.False(stream.OnResponseData(new byte[checked((int)StreamSendWindow.InitialBytes)]));
+        Assert.False(stream.ResponseEnded);
+        Assert.True(stream.OnResponseEnd(null));
+        Assert.True(stream.ResponseEnded);
+
+        var head = await stream.WaitResponseHeadAsync(CancellationToken.None);
+        Assert.Equal(200, Convert.ToInt32(head["statusCode"]));
+        Assert.Empty(writer.Packets);
+    }
+
+    [Fact]
+    public async Task ResetCarriesTheFailureAndALostLinkIsNotAClientReset()
+    {
+        await using var reset = CreateStream(new CapturingFrameWriter());
+        Assert.True(reset.OnReset(26, "dial tcp 10.0.0.1:80: refused", "connect-refused"));
+        var error = await Assert.ThrowsAsync<HttpStreamResetException>(
+            async () => await reset.WaitResponseHeadAsync(CancellationToken.None));
+        Assert.Equal("connect-refused", error.Failure);
+        Assert.False(error.LinkLost);
+        Assert.DoesNotContain("10.0.0.1", error.Message, StringComparison.Ordinal);
+
+        await using var lost = CreateStream(new CapturingFrameWriter());
+        lost.OnLinkLost();
+        var lostError = await Assert.ThrowsAsync<HttpStreamResetException>(
+            async () => await lost.WaitResponseHeadAsync(CancellationToken.None));
+        Assert.True(lostError.LinkLost);
+        Assert.Null(lostError.Failure);
+    }
+
     private static HttpSpecusStream CreateStream(IFrameWriter writer)
     {
         var context = new SpecusConnectionContext(

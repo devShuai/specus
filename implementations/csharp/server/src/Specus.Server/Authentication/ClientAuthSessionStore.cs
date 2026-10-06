@@ -28,6 +28,8 @@ public sealed class ClientAuthSessionStore
             MachineFingerprint = environment.MachineFingerprint ?? "",
             OsUser = environment.OsUser ?? "",
             Hostname = environment.Hostname ?? "",
+            // Absent or negative means an older client whose RST metadata.failure is not trusted.
+            HttpRouteCapabilityVersion = Math.Max(0, environment.ClientHttpRouteCapabilities?.Version ?? 0),
             Status = ClientAuthSessionStatus.HttpAuthenticated,
         };
         _byTokenHash[session.TokenHash] = session;
@@ -114,6 +116,14 @@ public sealed class ClientAuthSession
     public string MachineFingerprint { get; init; } = "";
     public string OsUser { get; init; } = "";
     public string Hostname { get; init; } = "";
+
+    /// <summary>
+    /// <c>environment.clientHttpRouteCapabilities.version</c> announced at login. The connectivity
+    /// check trusts RST <c>metadata.failure</c> only on a data connection of a session announcing
+    /// at least <see cref="Specus.Protocol.HttpRoute.HttpRouteFailure.CapabilityVersion"/>.
+    /// </summary>
+    public int HttpRouteCapabilityVersion { get; init; }
+
     public ClientAuthSessionStatus Status { get; set; }
     public string? ChannelId { get; set; }
     public string? RemoteAddress { get; set; }
