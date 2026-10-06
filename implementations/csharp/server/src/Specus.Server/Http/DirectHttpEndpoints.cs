@@ -41,6 +41,13 @@ public static class DirectHttpEndpoints
     // so WebDAV and application-specific verbs are forwarded as-is.
     private static readonly string[] Methods = [];
 
+    /// <summary>Fixed public body for a stream RST before the response starts (http-route.md §1).</summary>
+    internal const string StreamResetBody = "HTTP 转发请求失败";
+
+    internal const string LoggerCategory = "Specus.Server.Http.DirectHttpEndpoints";
+
+    private const int MaxLoggedReasonRunes = 256;
+
     public static void MapDirectHttpSpecus(this WebApplication app)
     {
         app.MapMethods("/http/{clientName}/{route}/{**rest}", Methods, ForwardAsync);
@@ -50,9 +57,10 @@ public static class DirectHttpEndpoints
     private static async Task ForwardAsync(HttpContext context, string clientName, string route,
         string? rest, DirectHttpDispatcher dispatcher, TrafficUsageService traffic,
         IOptions<DirectHttpOptions> options, SpecusDbContext db, TrafficInspectionService inspection,
-        HttpMediaCaptureService mediaCaptures)
+        HttpMediaCaptureService mediaCaptures, ILoggerFactory loggerFactory)
     {
         var startedAt = DateTimeOffset.UtcNow;
+        var logger = loggerFactory.CreateLogger(LoggerCategory);
         var relativePath = RelativePath(context, rest);
         HttpRouteAccessPolicy accessPolicy;
         try
@@ -171,6 +179,10 @@ public static class DirectHttpEndpoints
                     .ConfigureAwait(false);
                 throw new DirectHttpSpecusException(StatusCodes.Status504GatewayTimeout, "HTTP 转发请求超时");
             }
+            catch (HttpStreamResetException reset)
+            {
+                throw StreamResetFailure(logger, reset, clientName, route, context.Request.Method, startedAt);
+            }
 
             var statusCode = AsInt(head, "statusCode");
             if (statusCode is not int validStatusCode || validStatusCode is < 100 or > 599)
@@ -213,7 +225,23 @@ public static class DirectHttpEndpoints
 
             while (true)
             {
-                var item = await stream.ReadResponseAsync(context.RequestAborted).ConfigureAwait(false);
+                HttpStreamReadResult item;
+                try
+                {
+                    item = await stream.ReadResponseAsync(context.RequestAborted).ConfigureAwait(false);
+                }
+                catch (HttpStreamResetException reset)
+                {
+                    var failure = StreamResetFailure(logger, reset, clientName, route,
+                        context.Request.Method, startedAt);
+                    if (!responseStarted && !context.Response.HasStarted)
+                    {
+                        throw failure;
+                    }
+                    // Response headers are already on the wire: the RST can only cut the response.
+                    context.Abort();
+                    return;
+                }
                 if (item.End)
                 {
                     responseTrailers = AsStrings(item.Metadata, "trailers");
@@ -282,16 +310,17 @@ public static class DirectHttpEndpoints
         }
         catch (DirectHttpSpecusException ex)
         {
+            var diagnostic = ex.Diagnostic ?? ex.Message;
             if (mediaCapture is not null)
             {
-                await mediaCapture.FailAsync(ex.Message, CancellationToken.None).ConfigureAwait(false);
+                await mediaCapture.FailAsync(diagnostic, CancellationToken.None).ConfigureAwait(false);
             }
             var responseBody = Encoding.UTF8.GetBytes(ex.Message);
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
                     context.Request.Method, relativePath, RawQuery(context.Request.QueryString),
                     requestHeaders, requestCapture.Bytes(),
                     ex.StatusCode, PlainErrorHeaders(), responseBody, startedAt, context.Connection.RemoteIpAddress?.ToString(),
-                    ex.Message), CancellationToken.None)
+                    diagnostic), CancellationToken.None)
                 .ConfigureAwait(false);
             await WriteTextErrorAsync(context.Response, ex.StatusCode, ex.Message).ConfigureAwait(false);
         }
@@ -1042,6 +1071,76 @@ public static class DirectHttpEndpoints
     }
 
     private static bool ShouldForward(string name) => !SkippedHeaders.Contains(name);
+
+    /// <summary>
+    /// Logs a stream RST with its escaped, truncated reason and returns the generic public 502.
+    /// The reason only travels as the server-side diagnostic, never as the response body.
+    /// </summary>
+    private static DirectHttpSpecusException StreamResetFailure(ILogger logger,
+        HttpStreamResetException reset, string clientName, string route, string method,
+        DateTimeOffset startedAt)
+    {
+        var reason = LogSafeReason(reset.Reason);
+        logger.LogWarning(
+            "[http-stream-v2] stream reset client={ClientName} route={Route} method={Method} status={Status} errorCode={ErrorCode} reason={Reason} elapsedMs={ElapsedMs}",
+            clientName, route, method, StatusCodes.Status502BadGateway, reset.Code, reason,
+            (long)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds);
+        return new DirectHttpSpecusException(StatusCodes.Status502BadGateway, StreamResetBody, reason, reset);
+    }
+
+    /// <summary>
+    /// Keeps at most 256 runes of a peer-supplied reason and escapes control and line-separator
+    /// characters so the text cannot forge log lines.
+    /// </summary>
+    internal static string LogSafeReason(string? reason)
+    {
+        if (string.IsNullOrEmpty(reason))
+        {
+            return string.Empty;
+        }
+        var safe = new StringBuilder(Math.Min(reason.Length, MaxLoggedReasonRunes) + 16);
+        var runes = 0;
+        foreach (var rune in reason.EnumerateRunes())
+        {
+            if (runes == MaxLoggedReasonRunes)
+            {
+                safe.Append("...(truncated)");
+                break;
+            }
+            runes++;
+            switch (rune.Value)
+            {
+                case '\\':
+                    safe.Append(@"\\");
+                    break;
+                case '\n':
+                    safe.Append(@"\n");
+                    break;
+                case '\r':
+                    safe.Append(@"\r");
+                    break;
+                case '\t':
+                    safe.Append(@"\t");
+                    break;
+                default:
+                    var category = Rune.GetUnicodeCategory(rune);
+                    if (category is System.Globalization.UnicodeCategory.Control
+                        or System.Globalization.UnicodeCategory.LineSeparator
+                        or System.Globalization.UnicodeCategory.ParagraphSeparator
+                        || rune == Rune.ReplacementChar)
+                    {
+                        safe.Append(System.Globalization.CultureInfo.InvariantCulture,
+                            $"\\u{rune.Value:x4}");
+                    }
+                    else
+                    {
+                        safe.Append(rune.ToString());
+                    }
+                    break;
+            }
+        }
+        return safe.ToString();
+    }
 
     private static async Task WriteTextErrorAsync(HttpResponse response, int statusCode, string message)
     {
