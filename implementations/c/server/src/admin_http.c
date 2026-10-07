@@ -1348,16 +1348,21 @@ static int load_client_api_key(uint8_t key[ST_SHA256_LEN])
 /*
  * protocol/spec/client-auth.md: a login whose signature verified consumes its (apiKey, nonce)
  * pair, and the pair again within 120 s is refused. Java answers a replay with 400 and this body;
- * a full in-memory store answers 503 with Retry-After so the client retries rather than gives up.
- * Returns 0 when the pair was fresh, else the length of the response written to out.
+ * a full in-memory store or a failing database answers 503 with Retry-After so the client retries
+ * rather than gives up. The pairs live in the database when there is one (database_path), as in
+ * Java, so a restart does not forget them. Returns 0 when the pair was fresh, else the length of
+ * the response written to out.
  */
-static int consume_client_auth_nonce(const char *api_key, const char *nonce, char *out, size_t out_len)
+static int consume_client_auth_nonce(const char *database_path,
+                                     const char *api_key,
+                                     const char *nonce,
+                                     char *out,
+                                     size_t out_len)
 {
-    int64_t retry_after_seconds = 0;
-    st_client_auth_nonce_result result = st_client_auth_nonce_consume(api_key,
-                                                                      nonce,
-                                                                      current_time_millis(),
-                                                                      &retry_after_seconds);
+    int64_t retry_after_seconds = 1;
+    st_client_auth_nonce_result result = database_path != NULL
+        ? st_client_auth_nonce_consume_stored(database_path, api_key, nonce, current_time_millis())
+        : st_client_auth_nonce_consume(api_key, nonce, current_time_millis(), &retry_after_seconds);
     if (result == ST_CLIENT_AUTH_NONCE_ACCEPTED) {
         return 0;
     }
@@ -1393,7 +1398,7 @@ static int client_auth_netty_tls(void)
     return tls.mode != ST_TLS_DISABLED || tls.terminated_upstream;
 }
 
-static int validate_client_api_login(const char *body, char *out, size_t out_len)
+static int validate_client_api_login(const char *database_path, const char *body, char *out, size_t out_len)
 {
     if (body == NULL || *body == '\0') {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"client auth request body is required\"}");
@@ -1485,7 +1490,7 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     memset(actual_signature, 0, sizeof(actual_signature));
     memset(expected_signature, 0, sizeof(expected_signature));
     /* Only a request whose signature verified may consume its nonce. */
-    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(api_key, nonce, out, out_len);
+    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(database_path, api_key, nonce, out, out_len);
     free(api_key);
     free(timestamp);
     free(nonce);
@@ -2544,7 +2549,7 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(java_version);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
     }
-    int nonce_rc = consume_client_auth_nonce(api_key, nonce, out, out_len);
+    int nonce_rc = consume_client_auth_nonce(database_path, api_key, nonce, out, out_len);
     if (nonce_rc != 0) {
         free(api_key);
         free(timestamp);
@@ -2713,14 +2718,17 @@ static int build_client_auth_login_response(const char *body, char *out, size_t 
 {
     const char *database_path = admin_database_path();
     if (database_path != NULL
-        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
+        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        database_path = NULL;
+    }
+    if (database_path != NULL) {
         int db_response = build_database_client_auth_login_response(database_path, body, out, out_len);
         if (db_response != 0) {
             return db_response;
         }
     }
     if (client_api_auth_required()) {
-        int auth_rc = validate_client_api_login(body, out, out_len);
+        int auth_rc = validate_client_api_login(database_path, body, out, out_len);
         if (auth_rc != 0) {
             return auth_rc;
         }
@@ -2899,11 +2907,16 @@ static void record_direct_http_traffic(const char *client_name,
                                              download_bytes);
 }
 
+/*
+ * response_externalized: media capture stored the response body, so the record keeps its size
+ * but not its bytes (Java TrafficInspectionService, externalizedMediaKeepsActualSizeWithout...).
+ */
 static void record_direct_http_exchange(const char *client_name,
                                         const char *route,
                                         const st_direct_http_request *request,
                                         const st_direct_http_response *response,
                                         size_t response_bytes,
+                                        int response_externalized,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
@@ -2978,8 +2991,8 @@ static void record_direct_http_exchange(const char *client_name,
         .response_headers = response_headers,
         .request_body = request->body,
         .request_body_len = request->body_len,
-        .response_body = response->body,
-        .response_body_len = response->body_len,
+        .response_body = response_externalized ? NULL : response->body,
+        .response_body_len = response_externalized ? 0U : response->body_len,
         .request_content_encoding = request_content_encoding,
         .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
@@ -4076,12 +4089,29 @@ static int append_http_exchange_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
+    /*
+     * The detail's preview texts are the stored bodies as Java's HttpBodyDataCodec shows them: the
+     * decoded text, or data:<type>;base64,... for a binary body.
+     */
+    char *request_text = NULL;
+    char *response_text = NULL;
+    if (rc == 0 && detail) {
+        request_text = st_traffic_body_display_text(item->request_body_data, item->request_body_data_len,
+                                                    item->request_content_type, item->request_headers,
+                                                    item->request_preview_text);
+        response_text = st_traffic_body_display_text(item->response_body_data, item->response_body_data_len,
+                                                     item->response_content_type, item->response_headers,
+                                                     item->response_preview_text);
+        rc = request_text != NULL && response_text != NULL ? 0 : -1;
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_text : NULL);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, request_text);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_text : NULL);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, response_text);
+    free(request_text);
+    free(response_text);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -4597,60 +4627,227 @@ static int handle_peer_mesh_sessions_close_open(const st_admin_context *context,
     return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
 }
 
+/* A JSON number for a double the way Java's Double.toString writes it here: 0.75, 12.5, 80.0. */
+static int admin_sb_append_json_double(st_admin_string_builder *builder, double value)
+{
+    char text[64];
+    double magnitude = value < 0.0 ? -value : value;
+    /* Java writes plain decimals from 1e-3 up to 1e7, with at least one fractional digit. */
+    int plain = value == 0.0 || (magnitude >= 1e-3 && magnitude < 1e7);
+    for (int precision = 1; precision <= 17; ++precision) {
+        snprintf(text, sizeof(text), plain ? "%.*f" : "%.*g", precision, value);
+        if (strtod(text, NULL) == value) {
+            break;
+        }
+    }
+    return admin_sb_append(builder, text);
+}
+
+/* Adds devices to label's count in a list kept in first-seen order, as Java's LinkedHashMap. */
+typedef struct {
+    char label[128];
+    long long devices;
+} admin_peer_mesh_count;
+
+static int admin_peer_mesh_count_merge(admin_peer_mesh_count **items, size_t *count, const char *label,
+                                       long long devices)
+{
+    for (size_t i = 0; i < *count; ++i) {
+        if (strcmp((*items)[i].label, label) == 0) {
+            (*items)[i].devices += devices;
+            return 0;
+        }
+    }
+    admin_peer_mesh_count *grown = (admin_peer_mesh_count *)realloc(*items, (*count + 1U) * sizeof(**items));
+    if (grown == NULL) {
+        return -1;
+    }
+    *items = grown;
+    snprintf(grown[*count].label, sizeof(grown[*count].label), "%s", label);
+    grown[*count].devices = devices;
+    ++*count;
+    return 0;
+}
+
+static int admin_peer_mesh_has_text(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Java PeerMeshService.normalizeNatBehavior: the trimmed value, or UNKNOWN when blank. */
+static void admin_peer_mesh_nat_behavior(const char *value, char *out, size_t out_len)
+{
+    if (!admin_peer_mesh_has_text(value)) {
+        snprintf(out, out_len, "UNKNOWN");
+        return;
+    }
+    const char *start = value;
+    while (isspace((unsigned char)*start)) ++start;
+    size_t len = strlen(start);
+    while (len > 0U && isspace((unsigned char)start[len - 1U])) --len;
+    snprintf(out, out_len, "%.*s", (int)len, start);
+}
+
+static int admin_peer_mesh_nat_behavior_classified(const char *value)
+{
+    return admin_peer_mesh_has_text(value) && admin_ascii_casecmp(value, "UNKNOWN") != 0
+        && admin_ascii_casecmp(value, "UNSUPPORTED") != 0;
+}
+
+static int admin_peer_mesh_append_counts(st_admin_string_builder *builder, const char *name, const char *key,
+                                         const admin_peer_mesh_count *items, size_t count)
+{
+    int rc = admin_sb_appendf(builder, ",\"%s\":[", name);
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        rc = admin_sb_appendf(builder, "%s{\"%s\":", i == 0U ? "" : ",", key);
+        if (rc == 0) rc = admin_sb_append_json_string(builder, items[i].label);
+        if (rc == 0) rc = admin_sb_appendf(builder, ",\"devices\":%lld}", items[i].devices);
+    }
+    return rc == 0 ? admin_sb_append(builder, "]") : rc;
+}
+
+/*
+ * Java PeerMeshService.pathStats (and Go/.NET): totals and the direct ratio of the active sessions
+ * from the (path type, status) groups, those groups with their reported count, mean RTT and bytes,
+ * the address-family groups, NAT types (blank as UNKNOWN), and the NAT behaviour distribution of the
+ * devices that reported any behaviour, with the share whose mapping and filtering were classified.
+ */
 static int build_peer_mesh_stats_response(const st_admin_context *context, char *out, size_t out_len)
 {
     const char *database_path = admin_database_path();
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
-    size_t count = 0U;
+    st_storage_peer_mesh_stats stats;
+    memset(&stats, 0, sizeof(stats));
     if (database_path != NULL
-        && st_storage_list_peer_mesh_sessions_visible(database_path, context->tenant_id,
-            context->username, context->admin, 1, ST_ADMIN_MAX_PEER_SESSIONS,
-            sessions, ST_ADMIN_MAX_PEER_SESSIONS, &count) != 0) {
+        && (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+            || st_storage_peer_mesh_stats_visible(database_path, context->tenant_id, context->username,
+                                                  context->admin, &stats) != 0)) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
     }
-    long long reported = 0, active = 0, direct = 0, relay = 0;
-    long long direct_bytes = 0, relay_bytes = 0;
-    for (size_t i = 0; i < count; ++i) {
-        int is_reported = sessions[i].rtt_millis >= 0 || sessions[i].local_endpoint[0] != '\0'
-            || sessions[i].remote_endpoint[0] != '\0' || sessions[i].last_traffic_at[0] != '\0';
-        if (is_reported) ++reported;
-        if (strcmp(sessions[i].status, "ACTIVE") == 0) {
-            ++active;
-            if (strcmp(sessions[i].path_type, "RELAY") == 0) ++relay;
-            else if (strcmp(sessions[i].path_type, "DIRECT") == 0) ++direct;
+    long long total = 0, reported = 0, active = 0, active_direct = 0, active_relay = 0;
+    for (size_t i = 0; i < stats.path_count; ++i) {
+        const st_storage_peer_mesh_path_aggregate *item = &stats.paths[i];
+        total += item->sessions;
+        reported += item->reported_sessions;
+        if (strcmp(item->status, "ACTIVE") == 0) {
+            active += item->sessions;
+            if (strcmp(item->path_type, "DIRECT") == 0) active_direct += item->sessions;
+            else if (strcmp(item->path_type, "RELAY") == 0) active_relay += item->sessions;
         }
-        direct_bytes += sessions[i].direct_bytes;
-        relay_bytes += sessions[i].relay_bytes;
     }
-    char body[4096];
-    int written = snprintf(body, sizeof(body),
-        "{\"totalSessions\":%zu,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
-        "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":%s,"
-        "\"pathTypes\":[{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
-        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":%lld,\"relayBytes\":0},"
-        "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
-        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":%lld}],"
-        "\"addressFamilies\":[],\"natTypes\":[],\"natBehaviorDevices\":0,"
-        "\"natBehaviorClassifiedDevices\":0,\"natBehaviorSuccessRatio\":null,"
-        "\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],\"natBehaviorDiscoveries\":[]}",
-        count, reported, active, direct, relay, active > 0 ? "0" : "null",
-        direct, direct, direct_bytes, relay, relay, relay_bytes);
-    if (written < 0 || (size_t)written >= sizeof(body)) {
+    admin_peer_mesh_count *nat_types = NULL, *mappings = NULL, *filterings = NULL, *discoveries = NULL;
+    size_t nat_type_count = 0U, mapping_count = 0U, filtering_count = 0U, discovery_count = 0U;
+    long long behavior_devices = 0, classified_devices = 0;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stats.nat_type_count; ++i) {
+        const st_storage_peer_mesh_nat_aggregate *item = &stats.nat_types[i];
+        rc = admin_peer_mesh_count_merge(&nat_types, &nat_type_count,
+                                         admin_peer_mesh_has_text(item->nat_type) ? item->nat_type : "UNKNOWN",
+                                         item->devices);
+    }
+    for (size_t i = 0; rc == 0 && i < stats.behavior_count; ++i) {
+        const st_storage_peer_mesh_behavior_aggregate *item = &stats.behaviors[i];
+        if (!admin_peer_mesh_has_text(item->mapping) && !admin_peer_mesh_has_text(item->filtering)
+            && !admin_peer_mesh_has_text(item->discovery)) {
+            continue;
+        }
+        char mapping[128], filtering[128], discovery[128];
+        admin_peer_mesh_nat_behavior(item->mapping, mapping, sizeof(mapping));
+        admin_peer_mesh_nat_behavior(item->filtering, filtering, sizeof(filtering));
+        admin_peer_mesh_nat_behavior(item->discovery, discovery, sizeof(discovery));
+        behavior_devices += item->devices;
+        if (admin_peer_mesh_nat_behavior_classified(mapping) && admin_peer_mesh_nat_behavior_classified(filtering)) {
+            classified_devices += item->devices;
+        }
+        rc = admin_peer_mesh_count_merge(&mappings, &mapping_count, mapping, item->devices);
+        if (rc == 0) rc = admin_peer_mesh_count_merge(&filterings, &filtering_count, filtering, item->devices);
+        if (rc == 0) rc = admin_peer_mesh_count_merge(&discoveries, &discovery_count, discovery, item->devices);
+    }
+
+    st_admin_string_builder builder = {0};
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder,
+                              "{\"totalSessions\":%lld,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
+                              "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":",
+                              total, reported, active, active_direct, active_relay);
+    }
+    if (rc == 0) {
+        rc = active == 0 ? admin_sb_append(&builder, "null")
+                         : admin_sb_append_json_double(&builder, (double)active_direct / (double)active);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"pathTypes\":[");
+    for (size_t i = 0; rc == 0 && i < stats.path_count; ++i) {
+        const st_storage_peer_mesh_path_aggregate *item = &stats.paths[i];
+        rc = admin_sb_append(&builder, i == 0U ? "{\"pathType\":" : ",{\"pathType\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->path_type);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->status);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"sessions\":%lld,\"reportedSessions\":%lld,\"avgRttMillis\":",
+                                  item->sessions, item->reported_sessions);
+        }
+        if (rc == 0) {
+            rc = item->has_avg_rtt ? admin_sb_append_json_double(&builder, item->avg_rtt_millis)
+                                   : admin_sb_append(&builder, "null");
+        }
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"directBytes\":%lld,\"relayBytes\":%lld}",
+                                  item->direct_bytes, item->relay_bytes);
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "],\"addressFamilies\":[");
+    for (size_t i = 0; rc == 0 && i < stats.family_count; ++i) {
+        const st_storage_peer_mesh_family_aggregate *item = &stats.families[i];
+        rc = admin_sb_append(&builder, i == 0U ? "{\"addressFamily\":" : ",{\"addressFamily\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->address_family);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->status);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"pathType\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->path_type);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"sessions\":%lld,\"reportedSessions\":%lld}",
+                                  item->sessions, item->reported_sessions);
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc == 0) rc = admin_peer_mesh_append_counts(&builder, "natTypes", "natType", nat_types, nat_type_count);
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder, ",\"natBehaviorDevices\":%lld,\"natBehaviorClassifiedDevices\":%lld,"
+                              "\"natBehaviorSuccessRatio\":", behavior_devices, classified_devices);
+    }
+    if (rc == 0) {
+        rc = behavior_devices == 0
+            ? admin_sb_append(&builder, "null")
+            : admin_sb_append_json_double(&builder, (double)classified_devices / (double)behavior_devices);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natMappingBehaviors", "behavior", mappings, mapping_count);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natFilteringBehaviors", "behavior", filterings,
+                                           filtering_count);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natBehaviorDiscoveries", "behavior", discoveries,
+                                           discovery_count);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(nat_types);
+    free(mappings);
+    free(filterings);
+    free(discoveries);
+    st_storage_peer_mesh_stats_free(&stats);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
     }
-    if (active > 0) {
-        char ratio[32];
-        snprintf(ratio, sizeof(ratio), "%.6f", (double)direct / (double)active);
-        char *placeholder = strstr(body, "\"activeDirectRatio\":0,");
-        if (placeholder != NULL) {
-            size_t prefix = (size_t)(placeholder - body) + strlen("\"activeDirectRatio\":");
-            char rebuilt[4096];
-            snprintf(rebuilt, sizeof(rebuilt), "%.*s%s%s", (int)prefix, body, ratio,
-                     placeholder + strlen("\"activeDirectRatio\":0"));
-            snprintf(body, sizeof(body), "%s", rebuilt);
-        }
-    }
-    return write_response(out, out_len, 200, "OK", body);
+    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return response_len;
 }
 
 static int append_peer_mesh_service_view(st_admin_string_builder *builder,
@@ -6530,6 +6727,7 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
     }
     st_admin_string_builder builder = {0};
     int rc = append_http_exchange_view(&builder, match, 1);
+    st_storage_http_exchange_free_bodies(match);
     free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -13061,7 +13259,7 @@ static void record_direct_http_failure(const char *client_name,
             .error = (char *)(failure == NULL ? public_message : failure)
         };
         long long elapsed_ms = admin_now_ms() - started_ms;
-        record_direct_http_exchange(client_name, route, request, &response, body_len, remote_address,
+        record_direct_http_exchange(client_name, route, request, &response, body_len, 0, remote_address,
                                     elapsed_ms < 0 ? 0 : elapsed_ms);
     }
     free(body);
@@ -13293,6 +13491,8 @@ typedef struct {
     const char *method;
     const char *source_url;
     st_media_capture_session *media_capture;
+    /* Media capture took the response body (Java responseBodyExternalized): the detail keeps none. */
+    int response_externalized;
     st_direct_http_response response;
     char **trailer_names;
     size_t trailer_names_len;
@@ -13758,6 +13958,7 @@ static int direct_sink_on_headers(void *ctx,
                                                 status_code,
                                                 state->response.headers,
                                                 state->response.headers_len);
+    state->response_externalized = st_media_capture_externalized(state->media_capture);
     state->buffer_for_rewrite = state->trailer_names_len == 0U
         && direct_should_buffer_rewrite(
             state->client_name, state->route, state->response.headers,
@@ -16256,7 +16457,8 @@ static void admin_forward_direct_http(st_admin_server *server,
         record_direct_http_traffic(client_name, route, (long long)body_len,
                                    (long long)sink_state.response_bytes);
         record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                    sink_state.response_bytes, remote_address, elapsed_ms);
+                                    sink_state.response_bytes, sink_state.response_externalized,
+                                    remote_address, elapsed_ms);
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
         /* The share ended mid-exchange: the public connection was already shut down. */
     } else {
@@ -16279,7 +16481,8 @@ static void admin_forward_direct_http(st_admin_server *server,
             free(sink_state.response.error);
             sink_state.response.error = admin_dup_string(failure);
             record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                        sink_state.response_bytes, remote_address, elapsed_ms);
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
         }
     }
 
@@ -17342,8 +17545,12 @@ static void handle_client(st_admin_server *server, int fd)
         }
     }
     if (strncmp(path, "/api/admin/http-routes/", strlen("/api/admin/http-routes/")) == 0
-        || admin_path_equals(path, "/api/admin/http-access-audit")) {
-        /* A route keeps its ended shares for 30 days and an audit page holds up to 200 entries. */
+        || admin_path_equals(path, "/api/admin/http-access-audit")
+        || strncmp(path, "/api/admin/traffic/http-exchanges/", strlen("/api/admin/traffic/http-exchanges/")) == 0) {
+        /*
+         * A route keeps its ended shares for 30 days and an audit page holds up to 200 entries; an
+         * exchange's detail carries both stored bodies, up to 64 KiB each, as text or data: URLs.
+         */
         response_capacity = 2U * 1024U * 1024U;
         response = (char *)malloc(response_capacity);
         if (response == NULL) {

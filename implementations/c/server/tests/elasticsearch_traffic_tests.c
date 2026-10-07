@@ -2,6 +2,7 @@
 
 #include "elasticsearch_traffic.h"
 #include "storage.h"
+#include "traffic_capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,9 +73,60 @@ int main(int argc, char **argv)
         && strcmp(exchange_detail->request_headers, "Content-Type: text/plain") == 0
         && strcmp(exchange_detail->response_preview_text, "{\"items\":[1]}") == 0
         && strcmp(exchange_detail->request_preview_hex, "72 65 71 75 65 73 74 2D 69 74 65 6D 73") == 0;
+    if (exchange_detail != NULL) st_storage_http_exchange_free_bodies(exchange_detail);
     free(exchange_detail);
     if (!detail_ok) {
         fprintf(stderr, "Elasticsearch HTTP detail lookup mismatch\n");
+        return 1;
+    }
+
+    /* HttpTrafficExchangeStoreTests.elasticsearchSummaryDoesNotEncodeBinaryBody: a PNG body is kept
+     * as binary requestBodyData/responseBodyData, left out of the summary, and its detail shows it
+     * as a data: URL. */
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    st_storage_http_exchange_record image = http;
+    image.route = "images";
+    image.method = "GET";
+    image.request_bytes = 0;
+    image.request_body = NULL;
+    image.request_body_len = 0U;
+    image.response_bytes = (long long)sizeof(png);
+    image.response_content_type = "image/png";
+    image.response_headers = "Content-Type: image/png";
+    image.response_body = png;
+    image.response_body_len = sizeof(png);
+    if (st_storage_record_http_exchange(argv[1], &image) != 0) return 1;
+    exchange_count = 0;
+    if (st_storage_list_http_exchanges_visible(argv[1], client.id, "images", NULL, NULL, NULL,
+                                               "default", "admin", 1, 0, 10,
+                                               exchanges, 4, &exchange_count, &total) != 0
+        || exchange_count != 1 || exchanges[0].response_body_data != NULL
+        || exchanges[0].response_preview_hex[0] != '\0' || exchanges[0].response_headers[0] != '\0') {
+        fprintf(stderr, "Elasticsearch HTTP summary carried the binary body\n");
+        return 1;
+    }
+    exchange_detail = (st_storage_http_exchange *)calloc(1U, sizeof(*exchange_detail));
+    exchange_found = 0;
+    char *shown = NULL;
+    detail_ok = exchange_detail != NULL
+        && st_storage_get_http_exchange_visible(argv[1], exchanges[0].id, "default", "admin", 1,
+                                                exchange_detail, &exchange_found) == 0
+        && exchange_found
+        && exchange_detail->response_body_data_len == sizeof(png)
+        && memcmp(exchange_detail->response_body_data, png, sizeof(png)) == 0
+        && strcmp(exchange_detail->response_headers, "Content-Type: image/png") == 0
+        && strcmp(exchange_detail->response_preview_hex, "89 50 4E 47 0D 0A 1A 0A") == 0
+        && (shown = st_traffic_body_display_text(exchange_detail->response_body_data,
+                                                 exchange_detail->response_body_data_len,
+                                                 exchange_detail->response_content_type,
+                                                 exchange_detail->response_headers,
+                                                 exchange_detail->response_preview_text)) != NULL
+        && strcmp(shown, "data:image/png;base64,iVBORw0KGgo=") == 0;
+    free(shown);
+    if (exchange_detail != NULL) st_storage_http_exchange_free_bodies(exchange_detail);
+    free(exchange_detail);
+    if (!detail_ok) {
+        fprintf(stderr, "Elasticsearch HTTP binary body detail mismatch\n");
         return 1;
     }
 

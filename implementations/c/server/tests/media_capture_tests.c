@@ -627,6 +627,66 @@ static int test_streaming_response_without_content_length(void)
     return 0;
 }
 
+/*
+ * TrafficInspectionServiceTests.externalizedMediaKeepsActualSizeWithoutDuplicatingBody: with HTTP
+ * detail capture on for the media route, the exchange of a response that media capture took keeps
+ * its size and type but neither the body nor a preview of it.
+ */
+static int test_captured_media_detail_keeps_no_body(void)
+{
+    uint8_t body[1024];
+    fill_pattern(body, 0, sizeof(body));
+    upstream_script script = upstream(200, body, sizeof(body));
+    upstream_header(&script, "Content-Type: video/mp4");
+    upstream_header(&script, "Content-Length: 1024");
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    sqlite3 *db = NULL;
+    int failed = sqlite3_open(g_database_path, &db) != SQLITE_OK
+        || sqlite3_exec(db, "UPDATE http_route_mapping SET detail_capture_enabled = 1 WHERE route = 'media'",
+                        NULL, NULL, NULL) != SQLITE_OK
+        || capture_via_http("/detail.mp4", &script) != 0;
+    long long bytes = -1;
+    int body_kept = -1;
+    int truncated = -1;
+    char preview_hex[64] = "";
+    char preview_text[64] = "";
+    char body_type[32] = "";
+    /* The exchange is written once the answer went out, so it may trail the response briefly. */
+    for (int attempt = 0; !failed && bytes < 0 && attempt < 100; ++attempt) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT response_bytes, response_body_data IS NOT NULL, COALESCE(response_preview_hex, ''), "
+                "COALESCE(response_preview_text, ''), response_body_type, response_truncated "
+                "FROM specus_http_traffic_exchange WHERE relative_path = '/detail.mp4'",
+                -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            bytes = sqlite3_column_int64(stmt, 0);
+            body_kept = sqlite3_column_int(stmt, 1);
+            column_text(stmt, 2, preview_hex, sizeof(preview_hex));
+            column_text(stmt, 3, preview_text, sizeof(preview_text));
+            column_text(stmt, 4, body_type, sizeof(body_type));
+            truncated = sqlite3_column_int(stmt, 5);
+        }
+        sqlite3_finalize(stmt);
+        if (bytes < 0) {
+            struct timespec pause = {0, 50L * 1000L * 1000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+    if (db != NULL) {
+        (void)sqlite3_exec(db, "UPDATE http_route_mapping SET detail_capture_enabled = 0 WHERE route = 'media'",
+                           NULL, NULL, NULL);
+    }
+    sqlite3_close(db);
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    if (failed || bytes != 1024 || body_kept != 0 || preview_hex[0] != '\0' || preview_text[0] != '\0'
+        || strcmp(body_type, "video") != 0 || truncated != 0) {
+        fprintf(stderr, "captured media exchange: %lld bytes, body kept %d, preview \"%s\"/\"%s\", type %s, "
+                "truncated %d\n", bytes, body_kept, preview_hex, preview_text, body_type, truncated);
+        return 1;
+    }
+    return 0;
+}
+
 /* retainsReceivedRangeWhenPlayerCancelsRequest */
 static int test_interrupted_response_keeps_received_range(void)
 {
@@ -1473,6 +1533,7 @@ int main(void)
     int (*const tests[])(void) = {
         test_large_response_is_a_multipart_upload,
         test_streaming_response_without_content_length,
+        test_captured_media_detail_keeps_no_body,
         test_interrupted_response_keeps_received_range,
         test_repeated_range_is_not_stored_again,
         test_partial_range_can_be_retried,

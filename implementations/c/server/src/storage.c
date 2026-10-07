@@ -677,7 +677,9 @@ int st_storage_init(const char *path, int seed_demo_client)
         "response_preview_text TEXT,"
         "request_truncated INTEGER NOT NULL DEFAULT 0,"
         "response_truncated INTEGER NOT NULL DEFAULT 0,"
-        "captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        "captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "request_body_data BLOB,"
+        "response_body_data BLOB"
         ");"
         "CREATE TABLE IF NOT EXISTS specus_tcp_traffic_frame ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -895,6 +897,12 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "connection_record", "disconnect_reason", "TEXT");
     }
     if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_http_traffic_exchange", "request_body_data", "BLOB");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_http_traffic_exchange", "response_body_data", "BLOB");
+    }
+    if (rc == 0) {
         rc = add_column_if_missing(db, "connection_stat", "client_id", "INTEGER");
     }
     if (rc == 0) {
@@ -986,6 +994,19 @@ int st_storage_init(const char *path, int seed_demo_client)
             ");"
             "CREATE INDEX IF NOT EXISTS idx_mwi_object ON management_workbench_item(tenant_id, kind, object_id);"
             "CREATE INDEX IF NOT EXISTS idx_mwi_list_at ON management_workbench_item(list, at_ms);");
+    }
+    if (rc == 0) {
+        /*
+         * Consumed client-login nonces (protocol/spec/client-auth.md), Java's table and columns:
+         * the id is SHA-256(hex(SHA-256(apiKey)) + "\n" + nonce), expires_at UTC ISO-8601 text.
+         */
+        rc = exec_sql(db,
+            "CREATE TABLE IF NOT EXISTS specus_client_auth_nonce ("
+            "id VARCHAR(64) NOT NULL PRIMARY KEY,"
+            "api_key_hash VARCHAR(64) NOT NULL,"
+            "expires_at VARCHAR(40) NOT NULL"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expires ON specus_client_auth_nonce(expires_at);");
     }
     if (rc == 0) {
         /*
@@ -1491,6 +1512,10 @@ static void bind_nullable_text_limit(sqlite3_stmt *stmt, int index, const char *
 
 static int scan_http_exchange(sqlite3_stmt *stmt, st_storage_http_exchange *item)
 {
+    item->request_body_data = NULL;
+    item->request_body_data_len = 0U;
+    item->response_body_data = NULL;
+    item->response_body_data_len = 0U;
     item->id = sqlite3_column_int64(stmt, 0);
     if (copy_text_column(stmt, 1, item->tenant_id, sizeof(item->tenant_id)) != 0
         || copy_text_column(stmt, 3, item->client_name, sizeof(item->client_name)) != 0
@@ -1523,6 +1548,32 @@ static int scan_http_exchange(sqlite3_stmt *stmt, st_storage_http_exchange *item
     item->request_truncated = sqlite3_column_int(stmt, 26) != 0;
     item->response_truncated = sqlite3_column_int(stmt, 27) != 0;
     return 0;
+}
+
+/* Copies a BLOB column into *out (NULL when empty or NULL); -1 when out of memory. */
+static int copy_blob_column(sqlite3_stmt *stmt, int column, uint8_t **out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    const void *blob = sqlite3_column_blob(stmt, column);
+    int len = sqlite3_column_bytes(stmt, column);
+    if (blob == NULL || len <= 0) return 0;
+    *out = (uint8_t *)malloc((size_t)len);
+    if (*out == NULL) return -1;
+    memcpy(*out, blob, (size_t)len);
+    *out_len = (size_t)len;
+    return 0;
+}
+
+void st_storage_http_exchange_free_bodies(st_storage_http_exchange *item)
+{
+    if (item == NULL) return;
+    free(item->request_body_data);
+    free(item->response_body_data);
+    item->request_body_data = NULL;
+    item->request_body_data_len = 0U;
+    item->response_body_data = NULL;
+    item->response_body_data_len = 0U;
 }
 
 static int scan_tcp_frame(sqlite3_stmt *stmt, st_storage_tcp_frame *frame, int include_payload)
@@ -1759,6 +1810,18 @@ int st_storage_list_management_users(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/*
+ * Login names are matched case-insensitively, but the username key is case-sensitive, so a legacy
+ * or foreign database may hold "Alice" and "alice" (in one tenant or two). Like Java's bare legacy
+ * login (ManagementUserService.authenticate), such a name resolves to no one rather than to
+ * whichever row comes first. Called after the first row was scanned; an error counts as a match,
+ * so it fails closed too.
+ */
+static int another_user_matches(sqlite3_stmt *stmt)
+{
+    return sqlite3_step(stmt) != SQLITE_DONE;
+}
+
 int st_storage_get_management_user(const char *path,
                                    const char *username,
                                    st_storage_management_user *user)
@@ -1780,7 +1843,7 @@ int st_storage_get_management_user(const char *path,
     }
     sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0;
+    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0 && !another_user_matches(stmt);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return ok ? 0 : -1;
@@ -1809,7 +1872,7 @@ int st_storage_get_management_user_in_tenant(const char *path,
     sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0;
+    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0 && !another_user_matches(stmt);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return ok ? 0 : -1;
@@ -1839,8 +1902,13 @@ int st_storage_find_management_user(const char *path,
     }
     sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    int result = rc == SQLITE_ROW ? (scan_management_user(stmt, user) == 0 ? 0 : -1)
-        : rc == SQLITE_DONE ? 1 : -1;
+    /* An ambiguous name is no one's: its token resolves to nobody, as a missing user's does. */
+    int result = -1;
+    if (rc == SQLITE_ROW) {
+        result = scan_management_user(stmt, user) != 0 ? -1 : another_user_matches(stmt) ? 1 : 0;
+    } else if (rc == SQLITE_DONE) {
+        result = 1;
+    }
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return result;
@@ -1865,9 +1933,11 @@ int st_storage_create_management_user(const char *path,
         role = "USER";
     }
     sqlite3_stmt *stmt = NULL;
+    /* One statement checks and inserts, so no other spelling of the name can slip in between. */
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, updated_at) "
-        "VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "SELECT ?1,?2,?3,?4,?5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP "
+        "WHERE NOT EXISTS (SELECT 1 FROM specus_management_user WHERE lower(username) = lower(?1))",
         -1,
         &stmt,
         NULL);
@@ -1877,7 +1947,7 @@ int st_storage_create_management_user(const char *path,
         sqlite3_bind_text(stmt, 3, password_hash, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, role, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 5, enabled ? 1 : 0);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;
     }
@@ -2030,8 +2100,9 @@ static int oidc_user_by_identity_key(sqlite3 *db, const char *identity_key, st_s
 }
 
 /*
- * Like oidc_user_by_identity_key, by login name. *bound is set when any OIDC column already has
- * text, and bound_key receives the stored identity key.
+ * Like oidc_user_by_identity_key, by login name, and 2 when the name matches more than one row.
+ * *bound is set when any OIDC column already has text, and bound_key receives the stored identity
+ * key.
  */
 static int oidc_user_by_username(sqlite3 *db,
                                  const char *username,
@@ -2061,7 +2132,8 @@ static int oidc_user_by_username(sqlite3 *db,
         *bound = (issuer != NULL && *issuer != '\0')
             || (subject != NULL && *subject != '\0')
             || *bound_key != '\0';
-        result = 0;
+        /* Two spellings of the name: neither is linked, and no third account is created. */
+        result = another_user_matches(stmt) ? 2 : 0;
     }
     sqlite3_finalize(stmt);
     return result;
@@ -2133,6 +2205,8 @@ int st_storage_resolve_oidc_user(const char *path,
                     result = found == 0 ? (user.enabled ? 0 : 1) : found == 1 ? 1 : -1;
                 }
             }
+        } else if (found == 2) {
+            result = 1;
         } else if (found == 1 && password_hash == NULL) {
             result = 2;
         } else if (found == 1) {
@@ -2363,6 +2437,57 @@ int st_storage_delete_expired_registration_challenges(const char *path, const ch
     return rc;
 }
 
+int st_storage_consume_client_auth_nonce(const char *path,
+                                         const char *nonce_id,
+                                         const char *api_key_hash,
+                                         long long now_ms,
+                                         long long ttl_ms)
+{
+    if (path == NULL || nonce_id == NULL || api_key_hash == NULL || now_ms < 0 || ttl_ms <= 0
+        || now_ms > LLONG_MAX - ttl_ms) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    /*
+     * Java ClientAuthNonceService: drop what expired, then insert-if-absent decides. expires_at is
+     * Java's text form, "2026-10-07T01:02:03.004Z" here: fixed width, so text order is time order.
+     */
+    sqlite3_stmt *stmt = NULL;
+    int result = -1;
+    int rc = sqlite3_prepare_v2(db,
+        "DELETE FROM specus_client_auth_nonce "
+        "WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%S', ?1 / 1000, 'unixepoch') || printf('.%03dZ', ?1 % 1000)",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, now_ms);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+               "INSERT OR IGNORE INTO specus_client_auth_nonce(id, api_key_hash, expires_at) "
+               "VALUES(?1, ?2, strftime('%Y-%m-%dT%H:%M:%S', ?3 / 1000, 'unixepoch') || printf('.%03dZ', ?3 % 1000))",
+               -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, nonce_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, api_key_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, now_ms + ttl_ms);
+        if (sqlite3_step(stmt) == SQLITE_DONE) {
+            result = sqlite3_changes(db) == 1 ? 0 : 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (result >= 0 && exec_sql(db, "COMMIT") != 0) result = -1;
+    if (result < 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    return result;
+}
+
 int st_storage_complete_registration(const char *path,
                                      const st_storage_registration_challenge *challenge,
                                      const char *tenant_id,
@@ -2376,14 +2501,16 @@ int st_storage_complete_registration(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO specus_management_user(username,tenant_id,password_hash,role,enabled,created_at,updated_at) "
-        "VALUES(?,?,?,'USER',1,?,?)", -1, &stmt, NULL);
+        "SELECT ?1,?2,?3,'USER',1,?4,?5 "
+        "WHERE NOT EXISTS (SELECT 1 FROM specus_management_user WHERE lower(username) = lower(?1))",
+        -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, challenge->username, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, challenge->password_hash, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, challenge->updated_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 5, challenge->updated_at, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
     if (rc == 0) rc = sqlite3_prepare_v2(db,
@@ -6438,6 +6565,208 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Grows *items (each item_size bytes) so that one more fits; 0 on success. */
+static int peer_mesh_stats_reserve(void **items, size_t count, size_t *capacity, size_t item_size)
+{
+    if (count < *capacity) return 0;
+    size_t next = *capacity == 0U ? 8U : *capacity * 2U;
+    if (next > SIZE_MAX / item_size) return -1;
+    void *grown = realloc(*items, next * item_size);
+    if (grown == NULL) return -1;
+    memset((char *)grown + *capacity * item_size, 0, (next - *capacity) * item_size);
+    *items = grown;
+    *capacity = next;
+    return 0;
+}
+
+/* Text of a column, "" for NULL, cut to fit. */
+static void peer_mesh_stats_text(sqlite3_stmt *stmt, int column, char *out, size_t out_len)
+{
+    const unsigned char *value = sqlite3_column_text(stmt, column);
+    snprintf(out, out_len, "%s", value == NULL ? "" : (const char *)value);
+}
+
+/* SQL for the snprintf formats below, so '%' is written '%%'. */
+#define ST_PEER_MESH_EFFECTIVE_PATH \
+    "CASE WHEN s.relay_bytes > s.direct_bytes THEN 'RELAY' " \
+    "WHEN s.direct_bytes > s.relay_bytes THEN 'DIRECT' ELSE s.path_type END"
+#define ST_PEER_MESH_ADDRESS_FAMILY \
+    "CASE WHEN s.remote_endpoint IS NULL OR TRIM(s.remote_endpoint) = '' THEN 'UNKNOWN' " \
+    "WHEN s.remote_endpoint LIKE '[%%' THEN 'IPv6' ELSE 'IPv4' END"
+
+static int peer_mesh_stats_sessions(sqlite3 *db,
+                                    const char *tenant_id,
+                                    const char *owner_username,
+                                    int include_all_clients,
+                                    st_storage_peer_mesh_stats *stats)
+{
+    char where[512];
+    char sql[1536];
+    if (append_peer_mesh_session_visible_where(where, sizeof(where), include_all_clients, 1, "s") != 0) return -1;
+    int written = snprintf(sql, sizeof(sql),
+        "SELECT " ST_PEER_MESH_EFFECTIVE_PATH " AS effective_path, s.status, COUNT(*), COUNT(s.rtt_millis), "
+        "AVG(s.rtt_millis), COALESCE(SUM(s.direct_bytes), 0), COALESCE(SUM(s.relay_bytes), 0) "
+        "FROM peer_mesh_session s%s GROUP BY effective_path, s.status ORDER BY effective_path, s.status",
+        where);
+    if (written < 0 || (size_t)written >= sizeof(sql)) return -1;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    int bind_index = 1;
+    bind_peer_mesh_session_visible(stmt, tenant_id, owner_username, include_all_clients, &bind_index);
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->paths, stats->path_count, &capacity,
+                                    sizeof(*stats->paths)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_path_aggregate *item = &stats->paths[stats->path_count++];
+        peer_mesh_stats_text(stmt, 0, item->path_type, sizeof(item->path_type));
+        peer_mesh_stats_text(stmt, 1, item->status, sizeof(item->status));
+        item->sessions = sqlite3_column_int64(stmt, 2);
+        item->reported_sessions = sqlite3_column_int64(stmt, 3);
+        item->has_avg_rtt = sqlite3_column_type(stmt, 4) != SQLITE_NULL;
+        item->avg_rtt_millis = item->has_avg_rtt ? sqlite3_column_double(stmt, 4) : 0.0;
+        item->direct_bytes = sqlite3_column_int64(stmt, 5);
+        item->relay_bytes = sqlite3_column_int64(stmt, 6);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+
+    written = snprintf(sql, sizeof(sql),
+        "SELECT " ST_PEER_MESH_ADDRESS_FAMILY " AS family, s.status, " ST_PEER_MESH_EFFECTIVE_PATH " AS effective_path, "
+        "COUNT(*), COUNT(s.rtt_millis) FROM peer_mesh_session s%s "
+        "GROUP BY family, s.status, effective_path ORDER BY family, s.status, effective_path",
+        where);
+    if (written < 0 || (size_t)written >= sizeof(sql)) return -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    bind_index = 1;
+    bind_peer_mesh_session_visible(stmt, tenant_id, owner_username, include_all_clients, &bind_index);
+    capacity = 0U;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->families, stats->family_count, &capacity,
+                                    sizeof(*stats->families)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_family_aggregate *item = &stats->families[stats->family_count++];
+        peer_mesh_stats_text(stmt, 0, item->address_family, sizeof(item->address_family));
+        peer_mesh_stats_text(stmt, 1, item->status, sizeof(item->status));
+        peer_mesh_stats_text(stmt, 2, item->path_type, sizeof(item->path_type));
+        item->sessions = sqlite3_column_int64(stmt, 3);
+        item->reported_sessions = sqlite3_column_int64(stmt, 4);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int peer_mesh_stats_devices(sqlite3 *db,
+                                   const char *tenant_id,
+                                   const char *owner_username,
+                                   int include_all_clients,
+                                   st_storage_peer_mesh_stats *stats)
+{
+    const char *owner = include_all_clients ? "" : " AND owner_username = ?";
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT nat_type, COUNT(*) FROM peer_mesh_device WHERE tenant_id = ?%s "
+             "GROUP BY nat_type ORDER BY nat_type", owner);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    if (!include_all_clients) {
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
+    }
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->nat_types, stats->nat_type_count, &capacity,
+                                    sizeof(*stats->nat_types)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_nat_aggregate *item = &stats->nat_types[stats->nat_type_count++];
+        item->has_value = sqlite3_column_type(stmt, 0) != SQLITE_NULL;
+        peer_mesh_stats_text(stmt, 0, item->nat_type, sizeof(item->nat_type));
+        item->devices = sqlite3_column_int64(stmt, 1);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+
+    snprintf(sql, sizeof(sql),
+             "SELECT nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery, COUNT(*) "
+             "FROM peer_mesh_device WHERE tenant_id = ?%s "
+             "GROUP BY nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery "
+             "ORDER BY nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery", owner);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    if (!include_all_clients) {
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
+    }
+    capacity = 0U;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->behaviors, stats->behavior_count, &capacity,
+                                    sizeof(*stats->behaviors)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_behavior_aggregate *item = &stats->behaviors[stats->behavior_count++];
+        peer_mesh_stats_text(stmt, 0, item->mapping, sizeof(item->mapping));
+        peer_mesh_stats_text(stmt, 1, item->filtering, sizeof(item->filtering));
+        peer_mesh_stats_text(stmt, 2, item->discovery, sizeof(item->discovery));
+        item->devices = sqlite3_column_int64(stmt, 3);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_peer_mesh_stats_visible(const char *path,
+                                       const char *tenant_id,
+                                       const char *owner_username,
+                                       int include_all_clients,
+                                       st_storage_peer_mesh_stats *stats)
+{
+    if (stats == NULL) return -1;
+    memset(stats, 0, sizeof(*stats));
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE peer_mesh_session SET status = 'CLOSED', "
+        "closed_at = COALESCE(NULLIF(closed_at, ''), CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP "
+        "WHERE tenant_id = ? AND status <> 'CLOSED' AND expires_at <= CURRENT_TIMESTAMP",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0) rc = peer_mesh_stats_sessions(db, tenant_id, owner_username, include_all_clients, stats);
+    if (rc == 0) rc = peer_mesh_stats_devices(db, tenant_id, owner_username, include_all_clients, stats);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) {
+        (void)exec_sql(db, "ROLLBACK");
+        st_storage_peer_mesh_stats_free(stats);
+    }
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+void st_storage_peer_mesh_stats_free(st_storage_peer_mesh_stats *stats)
+{
+    if (stats == NULL) return;
+    free(stats->paths);
+    free(stats->families);
+    free(stats->nat_types);
+    free(stats->behaviors);
+    memset(stats, 0, sizeof(*stats));
+}
+
 int st_storage_close_peer_mesh_session_visible(const char *path,
                                                long long id,
                                                const char *tenant_id,
@@ -6554,8 +6883,8 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
         "status_code, success, error, remote_address, request_bytes, response_bytes, elapsed_ms, "
         "request_content_type, response_content_type, response_body_type, request_headers, response_headers, "
         "request_preview_hex, request_preview_text, response_preview_hex, response_preview_text, "
-        "request_truncated, response_truncated, captured_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "request_truncated, response_truncated, captured_at, request_body_data, response_body_data) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -6589,10 +6918,27 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
         bind_nullable_text(stmt, 23, request_text);
         bind_nullable_text(stmt, 24, response_hex);
         bind_nullable_text(stmt, 25, response_text);
-        /* C keeps previews, not bodies: truncated says the preview holds less than the body. */
-        sqlite3_bind_int(stmt, 26, record->request_body_len > preview_bytes ? 1 : 0);
-        sqlite3_bind_int(stmt, 27, record->response_body_len > preview_bytes ? 1 : 0);
+        /*
+         * The first ST_TRAFFIC_BODY_CAPTURE_BYTES of each body; truncated says the body was longer
+         * than what was kept. A body handed over as nothing (one media capture took) is not.
+         */
+        size_t request_kept = record->request_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+            ? record->request_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+        size_t response_kept = record->response_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+            ? record->response_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+        sqlite3_bind_int(stmt, 26, request_kept > 0U && record->request_bytes > (long long)request_kept ? 1 : 0);
+        sqlite3_bind_int(stmt, 27, response_kept > 0U && record->response_bytes > (long long)response_kept ? 1 : 0);
         sqlite3_bind_text(stmt, 28, record->captured_at == NULL ? "" : record->captured_at, -1, SQLITE_TRANSIENT);
+        if (request_kept > 0U) {
+            sqlite3_bind_blob(stmt, 29, record->request_body, (int)request_kept, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 29);
+        }
+        if (response_kept > 0U) {
+            sqlite3_bind_blob(stmt, 30, record->response_body, (int)response_kept, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 30);
+        }
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -8080,7 +8426,7 @@ int st_storage_get_http_exchange_visible(const char *path,
               "h.request_content_type, h.response_content_type, h.response_body_type, "
               "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
               "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
-              "h.response_truncated, h.captured_at "
+              "h.response_truncated, h.captured_at, h.request_body_data, h.response_body_data "
               "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id "
               "WHERE h.id = ? AND c.tenant_id = ?"
             : "SELECT h.id, h.tenant_id, h.client_id, h.client_name, h.route, h.resource_id, "
@@ -8089,7 +8435,7 @@ int st_storage_get_http_exchange_visible(const char *path,
               "h.request_content_type, h.response_content_type, h.response_body_type, "
               "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
               "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
-              "h.response_truncated, h.captured_at "
+              "h.response_truncated, h.captured_at, h.request_body_data, h.response_body_data "
               "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id "
               "WHERE h.id = ? AND c.tenant_id = ? AND c.owner_username = ?",
         -1,
@@ -8107,7 +8453,11 @@ int st_storage_get_http_exchange_visible(const char *path,
     rc = sqlite3_step(stmt);
     int result = 0;
     if (rc == SQLITE_ROW) {
-        result = scan_http_exchange(stmt, item) == 0 ? 0 : -1;
+        result = scan_http_exchange(stmt, item) == 0
+            && copy_blob_column(stmt, 29, &item->request_body_data, &item->request_body_data_len) == 0
+            && copy_blob_column(stmt, 30, &item->response_body_data, &item->response_body_data_len) == 0
+            ? 0 : -1;
+        if (result != 0) st_storage_http_exchange_free_bodies(item);
         *found = result == 0;
     } else if (rc != SQLITE_DONE) {
         result = -1;
@@ -9312,14 +9662,18 @@ static int share_load_principal(sqlite3 *db,
     int result = 0;
     if (rc == SQLITE_ROW) {
         char role[32];
+        int enabled = sqlite3_column_int(stmt, 3) != 0;
         if (copy_text_column(stmt, 0, principal->username, sizeof(principal->username)) != 0
             || copy_text_column(stmt, 1, principal->tenant_id, sizeof(principal->tenant_id)) != 0
             || copy_text_column(stmt, 2, role, sizeof(role)) != 0) {
             result = -1;
+        } else if (another_user_matches(stmt)) {
+            /* An ambiguous name is no one: the principal does not exist. */
+            memset(principal, 0, sizeof(*principal));
         } else {
             principal->exists = 1;
             principal->admin = share_role_is_admin(role);
-            principal->enabled = sqlite3_column_int(stmt, 3) != 0;
+            principal->enabled = enabled;
         }
     } else if (rc != SQLITE_DONE) {
         result = -1;
@@ -10373,6 +10727,11 @@ static int share_load_user_state(sqlite3 *db, const char *username, share_user_s
             && copy_text_column(stmt, 2, state->role, sizeof(state->role)) == 0
             ? 0 : -1;
         state->enabled = sqlite3_column_int(stmt, 3) != 0;
+        if (result == 0 && another_user_matches(stmt)) {
+            /* Ambiguous: like a missing user, so the caller's change fails closed. */
+            memset(state, 0, sizeof(*state));
+            result = 1;
+        }
     }
     sqlite3_finalize(stmt);
     return result;
