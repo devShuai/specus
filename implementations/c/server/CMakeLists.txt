@@ -259,6 +259,17 @@ add_test(NAME security_rules_tests
     COMMAND specus_c_security_rules_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(security_rules_tests PROPERTIES TIMEOUT 120)
 
+# Java HttpWebSocketRoutingTests on a real server process: how /http/** splits WebSocket upgrades
+# from plain requests, raw query characters, and the public route runtime asset.
+add_executable(specus_c_http_websocket_routing_tests tests/http_websocket_routing_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_websocket_routing_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_websocket_routing_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_websocket_routing_tests PRIVATE
+    ST_ADMIN_WEB_PUBLIC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../apps/admin-web/public")
+add_test(NAME http_websocket_routing_tests
+    COMMAND specus_c_http_websocket_routing_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_websocket_routing_tests PROPERTIES TIMEOUT 120)
+
 # Java ConnectionArchiveServiceTests on a real server process: the scheduled monthly archive.
 add_executable(specus_c_connection_archive_tests tests/connection_archive_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_connection_archive_tests PRIVATE specus_c_core)
