@@ -17262,8 +17262,47 @@ static void handle_client(st_admin_server *server, int fd)
                                                         0,
                                                         response,
                                                         response_capacity);
+    /*
+     * A management read can answer more than the buffer chosen above: a page of traffic detail, a
+     * TCP stream with its payloads, a long list. Java has no such bound, so a GET under /api/admin/
+     * that did not fit is built again in a larger buffer; a read is safe to repeat.
+     */
+    static const size_t larger_capacities[] = {1024U * 1024U, 16U * 1024U * 1024U, 128U * 1024U * 1024U};
+    for (size_t attempt = 0;
+         response_len < 0 && strcmp(method, "GET") == 0 && strncmp(path, "/api/admin/", 11U) == 0
+             && attempt < sizeof(larger_capacities) / sizeof(larger_capacities[0]);
+         ++attempt) {
+        if (larger_capacities[attempt] <= response_capacity) {
+            continue;
+        }
+        char *grown = (char *)malloc(larger_capacities[attempt]);
+        if (grown == NULL) {
+            break;
+        }
+        if (response != response_stack) {
+            free(response);
+        }
+        response = grown;
+        response_capacity = larger_capacities[attempt];
+        response_len = st_admin_build_response_internal(method,
+                                                        path,
+                                                        authorization,
+                                                        oss_public_key_url,
+                                                        range_header,
+                                                        host_header,
+                                                        content_type,
+                                                        body,
+                                                        available_body_len,
+                                                        request_remote_address,
+                                                        0,
+                                                        response,
+                                                        response_capacity);
+    }
     if (response_len > 0) {
         send_all(fd, response, (size_t)response_len);
+    } else if (response_len < 0) {
+        /* Better a status than a connection closed without any answer. */
+        send_text_http_error(fd, 500, "response too large");
     }
     if (response != response_stack) {
         free(response);

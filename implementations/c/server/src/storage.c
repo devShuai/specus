@@ -5004,7 +5004,7 @@ int st_storage_list_connections(const char *path,
     bind_index = 1;
     append_connection_filters(db, stmt, client_id, success_filter, from, to, &bind_index);
     sqlite3_bind_int(stmt, bind_index++, size);
-    sqlite3_bind_int(stmt, bind_index, page * size);
+    sqlite3_bind_int64(stmt, bind_index, (sqlite3_int64)page * size);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (*connection_count >= max_connections || scan_connection(stmt, &connections[*connection_count]) != 0) {
             sqlite3_finalize(stmt);
@@ -5127,7 +5127,7 @@ int st_storage_list_connections_visible(const char *path,
                                       to,
                                       &bind_index);
     sqlite3_bind_int(stmt, bind_index++, size);
-    sqlite3_bind_int(stmt, bind_index, page * size);
+    sqlite3_bind_int64(stmt, bind_index, (sqlite3_int64)page * size);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (*connection_count >= max_connections || scan_connection(stmt, &connections[*connection_count]) != 0) {
             sqlite3_finalize(stmt);
@@ -7920,7 +7920,7 @@ int st_storage_list_http_exchanges_visible(const char *path,
     bind_http_filters(stmt, tenant_id, owner_username, include_all_clients, client_id, route,
                       response_body_type, field, query, &bind_index);
     sqlite3_bind_int(stmt, bind_index++, size);
-    sqlite3_bind_int(stmt, bind_index, page * size);
+    sqlite3_bind_int64(stmt, bind_index, (sqlite3_int64)page * size);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (*item_count >= max_items || scan_http_exchange(stmt, &items[*item_count]) != 0) {
             sqlite3_finalize(stmt);
@@ -8221,7 +8221,7 @@ static int list_tcp_frames_internal(const char *path,
     bind_index = 1;
     bind_tcp_visible_filters(stmt, tenant_id, owner_username, include_all_clients, client_id, listen_port, channel_id, &bind_index);
     sqlite3_bind_int(stmt, bind_index++, size);
-    sqlite3_bind_int(stmt, bind_index, page * size);
+    sqlite3_bind_int64(stmt, bind_index, (sqlite3_int64)page * size);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (*item_count >= max_items || scan_tcp_frame(stmt, &items[*item_count], include_payload) != 0) {
             sqlite3_finalize(stmt);
