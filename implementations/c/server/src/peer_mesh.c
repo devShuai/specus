@@ -176,6 +176,92 @@ static int pm_generate_token(char out[64])
         && pm_base64url(random, sizeof(random), out, 64U) == 0 ? 0 : -1;
 }
 
+/*
+ * Session tokens this process granted, by session id (Java PeerMeshService.sessionTokenCache).
+ * The database keeps only the token's hash, so a session can be handed out again only while its
+ * token is held here; a session whose token was evicted, or granted before a restart, is simply
+ * not reused and the pair gets a new one.
+ */
+#define ST_PEER_MESH_TOKEN_CACHE 1024U
+
+typedef struct {
+    long long session_id;
+    unsigned long long stored;
+    char token[64];
+} pm_session_token;
+
+static pm_session_token peer_session_tokens[ST_PEER_MESH_TOKEN_CACHE];
+static unsigned long long peer_session_token_clock;
+static pthread_mutex_t peer_session_token_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pm_remember_session_token(long long session_id, const char *token)
+{
+    pthread_mutex_lock(&peer_session_token_lock);
+    pm_session_token *slot = &peer_session_tokens[0];
+    for (size_t i = 0U; i < ST_PEER_MESH_TOKEN_CACHE; ++i) {
+        pm_session_token *candidate = &peer_session_tokens[i];
+        if (candidate->session_id == session_id || candidate->session_id == 0) {
+            slot = candidate;
+            break;
+        }
+        if (candidate->stored < slot->stored) slot = candidate;
+    }
+    slot->session_id = session_id;
+    slot->stored = ++peer_session_token_clock;
+    snprintf(slot->token, sizeof(slot->token), "%s", token);
+    pthread_mutex_unlock(&peer_session_token_lock);
+}
+
+static int pm_session_token_for(long long session_id, char out[64])
+{
+    int found = 0;
+    pthread_mutex_lock(&peer_session_token_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_TOKEN_CACHE && !found; ++i) {
+        if (peer_session_tokens[i].session_id == session_id && session_id > 0) {
+            snprintf(out, 64U, "%s", peer_session_tokens[i].token);
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&peer_session_token_lock);
+    return found;
+}
+
+static void pm_forget_session_token(long long session_id)
+{
+    pthread_mutex_lock(&peer_session_token_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_TOKEN_CACHE; ++i) {
+        if (peer_session_tokens[i].session_id == session_id) {
+            memset(&peer_session_tokens[i], 0, sizeof(peer_session_tokens[i]));
+        }
+    }
+    pthread_mutex_unlock(&peer_session_token_lock);
+}
+
+/*
+ * Java reusableSessionGrant: an open, unexpired session between the two clients, in either
+ * direction, whose token is still held is granted again with that token. Without it, two peers
+ * whose offers cross would each open a session and negotiate on different ones.
+ */
+static int pm_reusable_session(const st_peer_mesh_runtime *runtime,
+                               const st_storage_client *source,
+                               const st_storage_client *target,
+                               st_storage_peer_mesh_session *session,
+                               char token[64])
+{
+    st_storage_peer_mesh_session open_sessions[16];
+    size_t count = 0U;
+    if (st_storage_open_peer_mesh_sessions_between(runtime->database_path, source->tenant_id,
+                                                   source->id, target->id,
+                                                   open_sessions, 16U, &count) != 0) return 0;
+    for (size_t i = 0U; i < count; ++i) {
+        if (pm_session_token_for(open_sessions[i].id, token)) {
+            *session = open_sessions[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int pm_has_text(const char *value)
 {
     if (value == NULL) return 0;
@@ -364,27 +450,32 @@ static int pm_handle_report(const st_peer_mesh_runtime *runtime,
     }
     long long session_id = 0;
     if (st_json_get_i64(message, "sessionId", &session_id) != 0 || session_id <= 0) return -1;
+    /*
+     * Each type records only its own fields, as Java PeerMeshService does: a close only closes, a
+     * traffic report only counts bytes (the storage derives the path type from the counters), and
+     * a path-report carries the path but no bytes.
+     */
+    if (strcmp(type, "close") == 0) {
+        pm_forget_session_token(session_id);
+        return st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
+            NULL, NULL, -1, NULL, NULL, 0, 0, 1, NULL);
+    }
+    if (strcmp(type, "traffic-report") == 0) {
+        long long direct = 0;
+        long long relay = 0;
+        (void)st_json_get_i64(message, "directBytes", &direct);
+        (void)st_json_get_i64(message, "relayBytes", &relay);
+        return st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
+            NULL, NULL, -1, NULL, NULL, direct, relay, 0, NULL);
+    }
     char *path_type = st_json_get_top_level_string(message, "pathType");
     char *status = st_json_get_top_level_string(message, "status");
     char *local = st_json_get_top_level_string(message, "localEndpoint");
     char *remote = st_json_get_top_level_string(message, "remoteEndpoint");
     long long rtt = -1;
-    long long direct = 0;
-    long long relay = 0;
     (void)st_json_get_i64(message, "rttMillis", &rtt);
-    (void)st_json_get_i64(message, "directBytes", &direct);
-    (void)st_json_get_i64(message, "relayBytes", &relay);
-    int close_session = strcmp(type, "close") == 0;
-    if (strcmp(type, "path-report") == 0 && !pm_has_text(status)) {
-        free(status);
-        status = strdup("ACTIVE");
-    }
-    if (strcmp(type, "traffic-report") == 0) {
-        free(path_type);
-        path_type = strdup(relay > 0 ? "RELAY" : (direct > 0 ? "DIRECT" : ""));
-    }
     int rc = st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
-        path_type, status, rtt, local, remote, direct, relay, close_session, NULL);
+        path_type, pm_has_text(status) ? status : "ACTIVE", rtt, local, remote, 0, 0, 0, NULL);
     free(path_type); free(status); free(local); free(remote);
     return rc;
 }
@@ -461,7 +552,7 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
     long long existing_session_id = 0;
     int opens = (strcmp(type, "candidates") == 0 || strcmp(type, "offer") == 0)
         && st_json_get_i64(message, "sessionId", &existing_session_id) != 0;
-    if (opens) {
+    if (opens && !pm_reusable_session(runtime, &source, &target, &opened, token)) {
         uint8_t token_hash_bytes[ST_SHA256_LEN];
         char token_hash[ST_SHA256_HEX_LEN + 1U];
         long long ttl = pm_env_i64("SPECUS_PEER_MESH_SESSION_TTL_SECONDS", 3600);
@@ -477,6 +568,9 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
             free(type);
             return -1;
         }
+        pm_remember_session_token(opened.id, token);
+    }
+    if (opens) {
         opened_ptr = &opened;
         token_ptr = token;
         char *grant = pm_build_grant(&source, &source_device, &target, &target_device, &opened, token);

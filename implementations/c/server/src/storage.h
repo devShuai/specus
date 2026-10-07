@@ -1083,6 +1083,14 @@ int st_storage_get_peer_mesh_session(const char *path,
                                      const char *tenant_id,
                                      long long id,
                                      st_storage_peer_mesh_session *out_session);
+/* Open, unexpired sessions between two clients in either direction, newest first; closes the expired. */
+int st_storage_open_peer_mesh_sessions_between(const char *path,
+                                               const char *tenant_id,
+                                               long long first_client_id,
+                                               long long second_client_id,
+                                               st_storage_peer_mesh_session *sessions,
+                                               size_t max_sessions,
+                                               size_t *session_count);
 int st_storage_report_peer_mesh_session(const char *path,
                                         const st_storage_client *reporter,
                                         long long id,
