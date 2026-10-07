@@ -167,11 +167,15 @@ jobs:
       # upstream logs here on exit, passed or failed; the last step uploads them for review.
       - name: Keep client E2E logs
         run: echo "SPECUS_E2E_LOG_DIR=$RUNNER_TEMP/c-server-e2e-logs" >> "$GITHUB_ENV"
+      # The Makefile build is checked on its own: its unit tests take minutes, and the E2E steps below
+      # each have a few minutes for the end-to-end part alone.
+      - name: Makefile build and unit tests
+        run: timeout --preserve-status 600s make -C implementations/c/server test
       - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
-        run: timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+        run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Java client SQLite runtime configuration E2E
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
-        run: timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
+        run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: Java client Direct HTTP and WebSocket E2E
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
         run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
