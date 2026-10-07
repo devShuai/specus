@@ -1,4 +1,4 @@
-package com.theshuai.specusserver.config;
+package com.theshuai.specusserver.database;
 
 import org.hibernate.cfg.SchemaToolingSettings;
 import org.hibernate.tool.schema.JdbcMetadataAccessStrategy;
@@ -10,7 +10,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class SqliteSchemaMetadataConfigTests {
+class SqliteSchemaMetadataConfigurationTests {
     private static final String STRATEGY = SchemaToolingSettings.HBM2DDL_JDBC_METADATA_EXTRACTOR_STRATEGY;
 
     @Test
@@ -45,7 +45,7 @@ class SqliteSchemaMetadataConfigTests {
         if (!url.isEmpty()) {
             environment.setProperty("spring.datasource.url", url);
         }
-        new SqliteSchemaMetadataConfig().sqliteSchemaMetadataCustomizer(environment).customize(properties);
+        new SqliteSchemaMetadataConfiguration().sqliteSchemaMetadataCustomizer(environment).customize(properties);
         return properties;
     }
 }

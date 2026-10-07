@@ -1,4 +1,4 @@
-package com.theshuai.specusserver.config;
+package com.theshuai.specusserver.database;
 
 import org.hibernate.cfg.SchemaToolingSettings;
 import org.hibernate.tool.schema.JdbcMetadataAccessStrategy;
@@ -17,8 +17,8 @@ import org.springframework.core.env.Environment;
  * searches every namespace, so on MySQL/PostgreSQL a same-named table in another database or
  * schema would be taken for it and the table never created.
  */
-@Configuration
-public class SqliteSchemaMetadataConfig {
+@Configuration(proxyBeanMethods = false)
+public class SqliteSchemaMetadataConfiguration {
     private static final String SQLITE_URL_PREFIX = "jdbc:sqlite:";
 
     @Bean
