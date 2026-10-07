@@ -7,8 +7,10 @@
  *      and acknowledged as written, a client's reply fanned out to every session of that
  *      administrator, and no delivery while the sending account is disabled.
  *   2. An in-process admin listener: a write to the target that fails after the online check is
- *      reported as failed / target-write-failed, as Java reports a failed channel write; and
- *      /ws/connections refuses binary (1003) and unmasked (1002) frames as Java's container does.
+ *      reported as failed / target-write-failed, as Java reports a failed channel write; number
+ *      and boolean command members read as their text (a numeric messageId is echoed); and
+ *      /ws/connections refuses binary (1003) and unmasked (1002) frames, text over Tomcat's 8192
+ *      characters (1009) and text that is not UTF-8 (1007) as Java's container does.
  *
  *   client_messages_tests <specus-server-c>
  */
@@ -35,6 +37,32 @@
 
 /* ------------------------------------------------------------------------------------------- */
 /* WebSocket client                                                                              */
+
+static int ws_send_frame(int fd, uint8_t opcode, const uint8_t *data, size_t len)
+{
+    uint8_t header[14];
+    size_t header_len = 0U;
+    header[header_len++] = (uint8_t)(0x80U | opcode);
+    if (len < 126U) {
+        header[header_len++] = (uint8_t)(0x80U | len);
+    } else if (len <= 0xffffU) {
+        header[header_len++] = 0x80U | 126U;
+        header[header_len++] = (uint8_t)(len >> 8);
+        header[header_len++] = (uint8_t)len;
+    } else {
+        return -1;
+    }
+    static const uint8_t mask[4] = {0x12U, 0x34U, 0x56U, 0x78U};
+    memcpy(header + header_len, mask, sizeof(mask));
+    header_len += sizeof(mask);
+    uint8_t *frame = (uint8_t *)malloc(header_len + len);
+    if (frame == NULL) return -1;
+    memcpy(frame, header, header_len);
+    for (size_t i = 0; i < len; ++i) frame[header_len + i] = data[i] ^ mask[i % 4U];
+    int rc = send_all(fd, frame, header_len + len);
+    free(frame);
+    return rc;
+}
 
 static int ws_send_text(int fd, const char *text)
 {
@@ -310,6 +338,38 @@ static int scenario_message_channel(test_server *server)
     return 0;
 }
 
+/*
+ * Sends one text message of count copies of unit on a new /ws/connections socket. With then_ping,
+ * a ping follows and 0 means it was answered (the message was taken); otherwise the close code
+ * the message drew. -1 when neither came.
+ */
+static int connections_text_outcome(int port, const char *token, const char *unit, size_t count, int then_ping)
+{
+    int fd = ws_open_endpoint(port, token, "connections", NULL, 0U);
+    if (fd < 0) return -1;
+    size_t unit_len = strlen(unit);
+    uint8_t *text = (uint8_t *)malloc(unit_len * count);
+    int rc = text == NULL ? -1 : 0;
+    for (size_t i = 0; rc == 0 && i < count; ++i) memcpy(text + i * unit_len, unit, unit_len);
+    if (rc == 0) rc = ws_send_frame(fd, 0x1U, text, unit_len * count);
+    free(text);
+    if (rc == 0 && then_ping) rc = ws_send_frame(fd, 0x9U, (const uint8_t *)"p", 1U);
+    int outcome = -1;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    uint8_t header[2];
+    uint8_t payload[125];
+    if (rc == 0 && recv_exact(fd, header, sizeof(header), deadline) == 1 && (header[1] & 0x7fU) <= 125U) {
+        size_t len = header[1] & 0x7fU;
+        if (len == 0U || recv_exact(fd, payload, len, deadline) == 1) {
+            uint8_t opcode = header[0] & 0x0fU;
+            if (opcode == 0xAU && then_ping) outcome = 0;
+            else if (opcode == 0x8U && len >= 2U) outcome = (payload[0] << 8) | payload[1];
+        }
+    }
+    close(fd);
+    return outcome;
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* 2. A write that fails after the checks                                                        */
 
@@ -391,10 +451,36 @@ static int test_write_failure(void)
         && ws_read_text(fd, text, sizeof(text), IO_TIMEOUT_MS) == 1
         && strcmp(text, "{\"type\":\"failed\",\"messageId\":\"m-gone\",\"error\":\"target-write-failed\"}") == 0;
     if (!ok) fprintf(stderr, "write failure answer: %s\n", text);
+    /*
+     * Jackson binds a number or a boolean into ClientMessageCommand's String fields as its literal
+     * text: the messageId is echoed so, and a numeric body is a message like any other.
+     */
+    static const struct {
+        const char *command;
+        const char *answer;
+    } coerced[] = {
+        {"{\"type\":\"message\",\"messageId\":42,\"toClientName\":\"\",\"message\":\"y\"}",
+         "{\"type\":\"error\",\"messageId\":\"42\",\"error\":\"target-and-message-required\"}"},
+        {"{\"type\":7,\"messageId\":true}",
+         "{\"type\":\"error\",\"messageId\":\"true\",\"error\":\"unsupported-type\"}"},
+        {"{\"type\":\"message\",\"messageId\":-1.50,\"toClientName\":\"msg-target\",\"message\":12345}",
+         "{\"type\":\"failed\",\"messageId\":\"-1.50\",\"error\":\"target-write-failed\"}"},
+        {"{\"type\":\"message\",\"messageId\":null,\"toClientName\":\"\",\"message\":\"y\"}",
+         "{\"type\":\"error\",\"messageId\":\"\",\"error\":\"target-and-message-required\"}"},
+    };
+    int coerced_ok = fd >= 0;
+    for (size_t i = 0; coerced_ok && i < sizeof(coerced) / sizeof(coerced[0]); ++i) {
+        text[0] = '\0';
+        coerced_ok = ws_send_text(fd, coerced[i].command) == 0
+            && ws_read_text(fd, text, sizeof(text), IO_TIMEOUT_MS) == 1 && strcmp(text, coerced[i].answer) == 0;
+        if (!coerced_ok) fprintf(stderr, "command %s answered %s, expected %s\n", coerced[i].command, text,
+                                 coerced[i].answer);
+    }
     if (fd >= 0) close(fd);
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);
     CHECK(ok, "a failed write after the checks must answer failed / target-write-failed");
+    CHECK(coerced_ok, "scalar command members must read as their text");
 
     /* /ws/connections as Java's TextWebSocketHandler: binary closes 1003, an unmasked frame 1002. */
     int port = ntohs(address.sin_port);
@@ -406,10 +492,23 @@ static int test_write_failure(void)
     static const uint8_t unmasked[] = {0x81U, 0x02U, 'h', 'i'};
     int unmasked_code = fd >= 0 && send_all(fd, unmasked, sizeof(unmasked)) == 0 ? ws_read_close_code(fd) : -1;
     if (fd >= 0) close(fd);
+    /*
+     * The handler sets no text limit, so Tomcat's default buffer of 8192 characters applies: a
+     * longer message closes 1009, counted in UTF-16 code units, not bytes; text that is not UTF-8
+     * closes 1007.
+     */
+    int ascii_limit = connections_text_outcome(port, token, "a", 8192U, 1);
+    int euro_limit = connections_text_outcome(port, token, "\xe2\x82\xac", 8192U, 1);
+    int over_limit = connections_text_outcome(port, token, "a", 8193U, 0);
+    int not_utf8 = connections_text_outcome(port, token, "\xc3\x28", 1U, 0);
     unlink(path);
     rmdir(dir);
     CHECK(binary_code == 1003, "a binary frame on /ws/connections must close 1003, got %d", binary_code);
     CHECK(unmasked_code == 1002, "an unmasked frame on /ws/connections must close 1002, got %d", unmasked_code);
+    CHECK(ascii_limit == 0 && euro_limit == 0,
+          "8192 characters on /ws/connections must be taken (ASCII %d, three-byte %d)", ascii_limit, euro_limit);
+    CHECK(over_limit == 1009, "8193 characters on /ws/connections must close 1009, got %d", over_limit);
+    CHECK(not_utf8 == 1007, "invalid UTF-8 on /ws/connections must close 1007, got %d", not_utf8);
     return 0;
 }
 
