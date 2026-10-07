@@ -2735,6 +2735,7 @@ typedef struct {
     time_t next_product_metrics_sweep;
     time_t next_catalog_expiry;
     time_t next_share_sweep;
+    time_t next_connection_archive;
 } peer_mesh_maintenance_state;
 
 /* The workbench retention sweep runs at the first maintenance tick, then hourly. */
@@ -2752,6 +2753,28 @@ static time_t maintenance_interval_seconds(const char *name, long long fallback_
     long long milliseconds = parsed < 1000LL ? 1000LL : (long long)parsed;
     long long seconds = (milliseconds + 999LL) / 1000LL;
     return seconds > (long long)INT_MAX ? (time_t)INT_MAX : (time_t)seconds;
+}
+
+/*
+ * Java ConnectionArchiveService: detail older than SPECUS_CONNECTION_DETAIL_RETENTION_DAYS (60)
+ * UTC days is rolled up into monthly totals every SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS (an hour),
+ * the first run one interval after start; a retention of 0 or less turns the archive off.
+ */
+static time_t connection_archive_interval_seconds(void)
+{
+    return maintenance_interval_seconds("SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS", 3600000LL);
+}
+
+static void run_connection_archive(const char *database_path)
+{
+    int64_t retention_days = 60;
+    if (env_i64_range("SPECUS_CONNECTION_DETAIL_RETENTION_DAYS", 60, INT_MIN, INT_MAX, &retention_days) != 0) {
+        retention_days = 60;
+    }
+    if (st_storage_archive_expired_connections(database_path, (int)retention_days,
+                                               (long long)time(NULL)) != 0) {
+        fprintf(stderr, "[archive] connection archive failed\n");
+    }
 }
 
 static void *peer_mesh_maintenance_thread(void *unused)
@@ -2831,6 +2854,11 @@ static void *peer_mesh_maintenance_thread(void *unused)
             (void)st_product_metrics_sweep(peer_mesh_maintenance.database_path);
             peer_mesh_maintenance.next_product_metrics_sweep = now + ST_PRODUCT_METRICS_SWEEP_INTERVAL_SECONDS;
         }
+        if (now >= peer_mesh_maintenance.next_connection_archive) {
+            run_connection_archive(peer_mesh_maintenance.database_path);
+            /* A fixed delay after the run, as Java's @Scheduled(fixedDelay). */
+            peer_mesh_maintenance.next_connection_archive = time(NULL) + connection_archive_interval_seconds();
+        }
         pthread_mutex_lock(&peer_mesh_maintenance.lock);
     }
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
@@ -2855,6 +2883,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
     peer_mesh_maintenance.next_catalog_expiry = now + 30;
     /* The first share sweep runs right after start, then every 30 seconds. */
     peer_mesh_maintenance.next_share_sweep = now + 1;
+    peer_mesh_maintenance.next_connection_archive = now + connection_archive_interval_seconds();
     snprintf(peer_mesh_maintenance.database_path,
              sizeof(peer_mesh_maintenance.database_path), "%s", database_path);
     if (pthread_create(&peer_mesh_maintenance.thread, NULL,
@@ -2885,6 +2914,7 @@ static void peer_mesh_maintenance_stop(void)
     peer_mesh_maintenance.next_product_metrics_sweep = 0;
     peer_mesh_maintenance.next_catalog_expiry = 0;
     peer_mesh_maintenance.next_share_sweep = 0;
+    peer_mesh_maintenance.next_connection_archive = 0;
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
 }
 

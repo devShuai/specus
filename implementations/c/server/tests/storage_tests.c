@@ -1483,7 +1483,7 @@ int main(void)
     }
     int successes = 0;
     int failures = 0;
-    if (st_storage_load_connection_stat(path, "Demo client", "2026-06-20", &successes, &failures) != 0
+    if (st_storage_load_connection_stat(path, "Demo client", "2026-06", &successes, &failures) != 0
         || successes != 1
         || failures != 1) {
         fprintf(stderr, "connection archive mismatch\n");
@@ -1495,7 +1495,7 @@ int main(void)
     if (st_storage_list_connection_stats(path, "Demo client", 10, stats, 4, &stat_count) != 0
         || stat_count != 1U
         || strcmp(stats[0].client_name, "Demo client") != 0
-        || strcmp(stats[0].month, "2026-06-20") != 0
+        || strcmp(stats[0].month, "2026-06") != 0
         || stats[0].total != 2
         || stats[0].success != 1
         || stats[0].failure != 1) {

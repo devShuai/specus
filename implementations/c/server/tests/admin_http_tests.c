@@ -5904,7 +5904,7 @@ int main(void)
                                   sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed 2\"")
-        || !contains(response, "\"month\":\"2026-06-20\"")
+        || !contains(response, "\"month\":\"2026-06\"")
         || !contains(response, "\"total\":1")
         || !contains(response, "\"success\":1")
         || !contains(response, "\"failure\":0")
