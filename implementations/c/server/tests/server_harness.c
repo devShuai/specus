@@ -243,6 +243,42 @@ static int read_string_field(const uint8_t *body, size_t body_len, size_t *pos, 
     return 0;
 }
 
+int read_login_response(int fd, int timeout_ms, int *command, int *success, char *reason, size_t reason_len)
+{
+    *command = 0;
+    *success = 0;
+    reason[0] = '\0';
+    st_frame_header header;
+    uint8_t *body = NULL;
+    int rc = read_frame(fd, timeout_ms, &header, &body);
+    if (rc != 1) {
+        snprintf(reason, reason_len, "no login response (rc=%d)", rc);
+        return -1;
+    }
+    *command = header.command;
+    if (header.command != ST_CMD_LOGIN_RESPONSE) {
+        free(body);
+        snprintf(reason, reason_len, "command %d came before the login response", header.command);
+        return 0;
+    }
+    char client_name[256];
+    size_t pos = 0U;
+    if (read_string_field(body, header.length, &pos, client_name, sizeof(client_name)) != 0
+        || pos >= header.length) {
+        free(body);
+        snprintf(reason, reason_len, "malformed login response");
+        return -1;
+    }
+    *success = body[pos++] == 1U;
+    if (read_string_field(body, header.length, &pos, reason, reason_len) != 0) {
+        free(body);
+        snprintf(reason, reason_len, "malformed login response reason");
+        return -1;
+    }
+    free(body);
+    return 1;
+}
+
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len)
 {
@@ -256,35 +292,12 @@ int channel_login(int port, const runtime_session *runtime, const char *role,
         snprintf(reason, reason_len, "connect/send failed");
         return -1;
     }
-    st_frame_header header;
-    uint8_t *body = NULL;
-    int rc = read_frame(fd, IO_TIMEOUT_MS, &header, &body);
-    if (rc != 1 || header.command != ST_CMD_LOGIN_RESPONSE) {
-        if (rc == 1) {
-            free(body);
-        }
-        close(fd);
-        snprintf(reason, reason_len, "no login response (rc=%d)", rc);
-        return -1;
-    }
-    char client_name[256];
-    size_t pos = 0U;
+    int command = 0;
     int success = 0;
-    if (read_string_field(body, header.length, &pos, client_name, sizeof(client_name)) != 0
-        || pos >= header.length) {
-        free(body);
+    if (read_login_response(fd, IO_TIMEOUT_MS, &command, &success, reason, reason_len) != 1) {
         close(fd);
-        snprintf(reason, reason_len, "malformed login response");
         return -1;
     }
-    success = body[pos++] == 1U;
-    if (read_string_field(body, header.length, &pos, reason, reason_len) != 0) {
-        free(body);
-        close(fd);
-        snprintf(reason, reason_len, "malformed login response reason");
-        return -1;
-    }
-    free(body);
     if (!success) {
         close(fd);
         return 0;
