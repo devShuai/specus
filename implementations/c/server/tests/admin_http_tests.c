@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -3212,6 +3213,113 @@ static int test_http_route_service_rules(void)
         len = route_rules_create(client_a.id, "root-a", "tenant-a", body, response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 201 ", expected, "a 60-character route") != 0
             || !contains(response, "\"targetBaseUrl\":\"https://user@[::1]:8443/base\"");
+    }
+    /* createRoutePersistsRowAndDefaultsEnabledTrue */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"plain\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"enabled\":true", "route defaults") != 0
+            || !contains(response, "\"clientName\":\"RouteClientB\"") || !contains(response, "\"mediaCaptureEnabled\":false")
+            || !contains(response, "\"insecureSkipVerify\":false") || !contains(response, "\"createdAt\":\"2")
+            || !contains(response, "\"updatedAt\":\"2");
+        if (failed) fprintf(stderr, "route defaults: %s\n", response);
+    }
+    /* updateRouteRewritesFieldsAndRefreshesTimestamp (timestamps have second resolution here) */
+    if (!failed) {
+        char *created_at = st_json_get_string(strstr(response, "\r\n\r\n"), "updatedAt");
+        st_storage_http_route plain;
+        failed = created_at == NULL
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "plain", &plain, &found) != 0
+            || !found;
+        if (!failed) {
+            struct timespec pause = {.tv_sec = 1, .tv_nsec = 100000000L};
+            nanosleep(&pause, NULL);
+            snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", plain.id);
+            len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                    "{\"route\":\"api2\",\"targetBaseUrl\":\"https://api.example.com\",\"enabled\":false}",
+                                    response, sizeof(response));
+            char *updated_at = len > 0 ? st_json_get_string(strstr(response, "\r\n\r\n"), "updatedAt") : NULL;
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"route\":\"api2\"", "route update") != 0
+                || !contains(response, "\"targetBaseUrl\":\"https://api.example.com\"")
+                || !contains(response, "\"enabled\":false")
+                || updated_at == NULL || strcmp(updated_at, created_at) == 0;
+            if (failed) fprintf(stderr, "route update kept updatedAt %s: %s\n", created_at, response);
+            free(updated_at);
+        }
+        free(created_at);
+    }
+    /* partialUpdatePreservesEnabledAndCaptureFlags, routeCanSkipTlsVerificationAndPartialUpdatePreservesIt */
+    st_storage_http_route media;
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"media\",\"targetBaseUrl\":\"https://127.0.0.1:8443\",\"enabled\":false,"
+                                 "\"detailCaptureEnabled\":true,\"mediaCaptureEnabled\":true,\"pathRewriteEnabled\":true,"
+                                 "\"insecureSkipVerify\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"insecureSkipVerify\":true", "flagged route") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "media", &media, &found) != 0
+            || !found;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", media.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"media\",\"targetBaseUrl\":\"https://127.0.0.1:9443\"}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"targetBaseUrl\":\"https://127.0.0.1:9443\"",
+                                 "partial route update") != 0
+            || !contains(response, "\"enabled\":false") || !contains(response, "\"detailCaptureEnabled\":true")
+            || !contains(response, "\"mediaCaptureEnabled\":true") || !contains(response, "\"pathRewriteEnabled\":true")
+            || !contains(response, "\"insecureSkipVerify\":true");
+        if (failed) fprintf(stderr, "a partial update changed the flags: %s\n", response);
+    }
+    /* firstEnableRequiresUsernameAndPassword (C's message for the colon differs, the 400 does not) */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"viewer\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "authPassword", "authentication without a password") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"bad:user\",\"authPassword\":\"secret\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", NULL, "a username with ':'") != 0;
+    }
+    /* createProtectedRouteHashesPassword..., blankPasswordUpdatePreservesCredentialsAcrossDisableAndReenable */
+    st_storage_http_route private_route;
+    char stored_hash[ST_SHA256_HEX_LEN + 1] = "";
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"  viewer  \",\"authPassword\":\"secret:with-spaces \"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"authUsername\":\"viewer\"", "protected route") != 0
+            || !contains(response, "\"authPasswordConfigured\":true") || contains(response, "secret:with-spaces")
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "private", &private_route, &found) != 0
+            || !found || strcmp(private_route.auth_password_hash, "secret:with-spaces ") == 0;
+        snprintf(stored_hash, sizeof(stored_hash), "%s", found ? private_route.auth_password_hash : "");
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", private_route.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                "\"authEnabled\":false,\"authPassword\":\"   \"}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":false", "authentication off") != 0
+            || !contains(response, "\"authPasswordConfigured\":true");
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"authEnabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":true", "authentication on again") != 0
+            || !contains(response, "\"authUsername\":\"viewer\"")
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "private", &private_route, &found) != 0
+            || !found || strcmp(private_route.auth_password_hash, stored_hash) != 0;
+        if (failed) fprintf(stderr, "re-enabling authentication lost the credentials: %s\n", response);
     }
     /* unknownClientIsRejectedOnCreate (C answers 404, Java's IllegalArgumentException maps to 400) */
     if (!failed) {
