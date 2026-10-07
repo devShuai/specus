@@ -14,7 +14,7 @@ typedef struct {
     pthread_cond_t cond;
     int received;
     uint8_t kind;
-    char target[ST_PUBLIC_CLUSTER_PEER_BYTES + 1U];
+    char target[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
     char payload[256];
 } event_capture;
 

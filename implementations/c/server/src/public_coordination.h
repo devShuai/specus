@@ -11,6 +11,9 @@
 #define ST_PUBLIC_CLUSTER_ROOM_BYTES 480U
 #define ST_PUBLIC_CLUSTER_ADDRESS_BYTES 128U
 #define ST_PUBLIC_CLUSTER_ROOM_KEY_BYTES 80U
+/* STCE v2 frame limits (protocol/spec/public-transfer-cluster.md): group and identity UTF-8 bytes. */
+#define ST_PUBLIC_CLUSTER_EVENT_GROUP_BYTES 128U
+#define ST_PUBLIC_CLUSTER_EVENT_ID_BYTES 512U
 
 typedef struct {
     char lease_id[ST_PUBLIC_CLUSTER_LEASE_BYTES + 1U];
@@ -44,9 +47,9 @@ typedef struct {
     uint8_t kind;
     int exclude_source;
     uint64_t revision;
-    char group_id[ST_PUBLIC_CLUSTER_ID_BYTES + 1U];
-    char target_peer_id[ST_PUBLIC_CLUSTER_PEER_BYTES + 1U];
-    char source_lease_id[ST_PUBLIC_CLUSTER_LEASE_BYTES + 1U];
+    char group_id[ST_PUBLIC_CLUSTER_EVENT_GROUP_BYTES + 1U];
+    char target_peer_id[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
+    char source_lease_id[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
     uint8_t *payload;
     size_t payload_len;
 } st_public_cluster_event;

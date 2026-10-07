@@ -22,8 +22,8 @@
 #include <unistd.h>
 
 #define ST_CLUSTER_EVENT_HEADER_BYTES 26U
-#define ST_CLUSTER_EVENT_MAX_GROUP_BYTES 128U
-#define ST_CLUSTER_EVENT_MAX_ID_BYTES 512U
+#define ST_CLUSTER_EVENT_MAX_GROUP_BYTES ST_PUBLIC_CLUSTER_EVENT_GROUP_BYTES
+#define ST_CLUSTER_EVENT_MAX_ID_BYTES ST_PUBLIC_CLUSTER_EVENT_ID_BYTES
 #define ST_CLUSTER_EVENT_MAX_PAYLOAD_BYTES (256U * 1024U)
 #define ST_CLUSTER_REVISION_TTL_MS 604800000LL
 
@@ -1398,8 +1398,8 @@ static int cluster_event_decode(const uint8_t *encoded,
     if (kind < ST_PUBLIC_CLUSTER_EVENT_ROSTER || kind > ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
         || (flags & ~1U) != 0U || encoded[7] != 0U
         || group_len == 0U || group_len > ST_CLUSTER_EVENT_MAX_GROUP_BYTES
-        || target_len > ST_PUBLIC_CLUSTER_PEER_BYTES
-        || source_len > ST_PUBLIC_CLUSTER_LEASE_BYTES
+        || target_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
+        || source_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
         || payload_len > ST_CLUSTER_EVENT_MAX_PAYLOAD_BYTES
         || ST_CLUSTER_EVENT_HEADER_BYTES + group_len + target_len + source_len + payload_len
             != encoded_len
