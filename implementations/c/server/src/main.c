@@ -231,6 +231,12 @@ struct specus_session {
     struct specus_session *live_next;
 };
 
+/* The connections a login took out of service, each still referenced by that login. */
+typedef struct {
+    specus_session *sessions[ST_MAX_DISPLACED_SESSIONS];
+    size_t count;
+} displaced_sessions;
+
 typedef struct {
     int fd;
     struct sockaddr_storage remote;
@@ -1215,19 +1221,28 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
     return 0;
 }
 
-static int session_send_packet(specus_session *session, st_buffer *packet)
+/* Writes a packet on a connection whose send_lock the caller already holds. */
+static int session_send_packet_locked(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
-    if (packet->data != NULL) {
-        pthread_mutex_lock(&session->send_lock);
-        if (session->control_fd >= 0) {
-            rc = session->tls_connection == NULL
-                ? send_all(session->control_fd, packet->data, packet->len)
-                : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
-        }
-        pthread_mutex_unlock(&session->send_lock);
+    if (packet->data != NULL && session->control_fd >= 0) {
+        rc = session->tls_connection == NULL
+            ? send_all(session->control_fd, packet->data, packet->len)
+            : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
     }
     st_buffer_free(packet);
+    return rc;
+}
+
+static int session_send_packet(specus_session *session, st_buffer *packet)
+{
+    if (packet->data == NULL) {
+        st_buffer_free(packet);
+        return -1;
+    }
+    pthread_mutex_lock(&session->send_lock);
+    int rc = session_send_packet_locked(session, packet);
+    pthread_mutex_unlock(&session->send_lock);
     return rc;
 }
 
@@ -1709,11 +1724,15 @@ static void release_session_listeners(specus_session *session)
  * also retires the client's data connection, which belongs to the pair it just superseded. A data
  * login re-checks its control under the same lock that publishes it, so a control replaced while
  * the data login was being verified cannot leave a data connection bound to a session that is gone.
+ *
+ * The caller holds session->send_lock from before this publishes the connection until its login
+ * response is written (see client_thread). The connections it displaces are handed back, each with
+ * a reference, for release_displaced_sessions once send_lock is let go: dropping a reference takes
+ * active_session_lock, and a published connection's send_lock is never held while taking it.
  */
-static int activate_session(specus_session *session, const char **reason)
+static int activate_session(specus_session *session, displaced_sessions *displaced, const char **reason)
 {
-    specus_session *displaced[ST_MAX_DISPLACED_SESSIONS];
-    size_t displaced_count = 0U;
+    displaced->count = 0U;
     pthread_mutex_lock(&active_session_lock);
     if (session->is_data_connection) {
         specus_session *control = active_session_find_role_locked(session->config.client_name, 0);
@@ -1730,8 +1749,8 @@ static int activate_session(specus_session *session, const char **reason)
         int same_role = cursor->is_data_connection == session->is_data_connection;
         if (cursor != session && same_client && (same_role || !session->is_data_connection)) {
             displace_session_locked(cursor, "REPLACED_BY_NEW_LOGIN");
-            if (displaced_count < ST_MAX_DISPLACED_SESSIONS) {
-                displaced[displaced_count++] = cursor;
+            if (displaced->count < ST_MAX_DISPLACED_SESSIONS) {
+                displaced->sessions[displaced->count++] = cursor;
             } else {
                 --cursor->references;
             }
@@ -1741,18 +1760,29 @@ static int activate_session(specus_session *session, const char **reason)
     active_session_add_locked(session);
     pthread_mutex_unlock(&active_session_lock);
 
-    for (size_t i = 0; i < displaced_count; ++i) {
+    for (size_t i = 0; i < displaced->count; ++i) {
+        specus_session *old = displaced->sessions[i];
         printf("[%s] replaced by new login client=%s remote=%s\n",
-               displaced[i]->is_data_connection ? "data" : "control",
-               displaced[i]->config.client_name,
-               displaced[i]->remote);
-        if (displaced[i]->is_data_connection) {
-            release_session_listeners(displaced[i]);
+               old->is_data_connection ? "data" : "control",
+               old->config.client_name,
+               old->remote);
+        /* Under the new connection's send_lock, which is fine: no thread sends while holding a
+         * map_lock, so none can hold this one and wait for that send_lock. */
+        if (old->is_data_connection) {
+            release_session_listeners(old);
         }
-        session_reference_release(displaced[i]);
     }
     *reason = NULL;
     return 0;
+}
+
+/* Drops the references activate_session kept on the connections a login displaced. */
+static void release_displaced_sessions(displaced_sessions *displaced)
+{
+    for (size_t i = 0; i < displaced->count; ++i) {
+        session_reference_release(displaced->sessions[i]);
+    }
+    displaced->count = 0U;
 }
 
 /*
@@ -4621,6 +4651,58 @@ static void session_shutdown(specus_session *session)
     }
 }
 
+/*
+ * SPECUS_LOGIN_TEST_GATE_DIR, honoured outside production only, holds every successful login
+ * between publishing its connection and writing its response, with send_lock held, as a slow
+ * scheduler could: the login creates <dir>/<role>-published, waits for <dir>/<role>-release (at
+ * most LOGIN_TEST_GATE_MAX_WAIT_MS) and removes both, role being "control" or "data". The session
+ * lifecycle tests use it to send on a connection inside that window.
+ */
+#define LOGIN_TEST_GATE_MAX_WAIT_MS 30000
+static char login_test_gate_dir[256];
+
+static int configure_login_test_gate(void)
+{
+    const char *dir = getenv("SPECUS_LOGIN_TEST_GATE_DIR");
+    if (dir == NULL || *dir == '\0') {
+        return 0;
+    }
+    if (!st_deployment_environment_allows_demo_data(getenv("SPECUS_ENV"))) {
+        fprintf(stderr, "SPECUS_LOGIN_TEST_GATE_DIR is ignored in production\n");
+        return 0;
+    }
+    if (copy_config_string(login_test_gate_dir, sizeof(login_test_gate_dir),
+                           "SPECUS_LOGIN_TEST_GATE_DIR", dir) != 0) {
+        return -1;
+    }
+    printf("[test] login gate enabled dir=%s\n", login_test_gate_dir);
+    return 0;
+}
+
+static void login_test_gate_wait(const specus_session *session)
+{
+    if (login_test_gate_dir[0] == '\0') {
+        return;
+    }
+    const char *role = session->is_data_connection ? "data" : "control";
+    char published[320];
+    char release[320];
+    snprintf(published, sizeof(published), "%s/%s-published", login_test_gate_dir, role);
+    snprintf(release, sizeof(release), "%s/%s-release", login_test_gate_dir, role);
+    int fd = open(published, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        close(fd);
+    }
+    const struct timespec poll_interval = {0, 10L * 1000000L};
+    for (int waited_ms = 0;
+         access(release, F_OK) != 0 && waited_ms < LOGIN_TEST_GATE_MAX_WAIT_MS;
+         waited_ms += 10) {
+        nanosleep(&poll_interval, NULL);
+    }
+    unlink(release);
+    unlink(published);
+}
+
 static void *client_thread(void *arg)
 {
     client_args *args = (client_args *)arg;
@@ -4722,28 +4804,42 @@ static void *client_thread(void *arg)
              * spec keeps one control and one data per client and lets the newer connection replace
              * the older one. The session is published before the response is written, so once the
              * client sees success its next frame already finds this connection bound.
+             *
+             * Once published, other threads can send on the connection at once: a NAT OPEN for a
+             * public request on a data connection, a NAT_CONTROL or message push on a control one.
+             * Clients take the first frame after their login request to be its response, so
+             * send_lock is taken before the session can be found and held until the response is
+             * written; whatever those threads send queues behind it.
              */
             const char *reason = NULL;
+            displaced_sessions displaced = {.count = 0U};
             int control_login = !session->is_data_connection;
             if (control_login) {
                 pthread_mutex_lock(&control_admission_lock);
             }
             logged_in = verify_login(session, &request, &reason);
+            pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
                 session->connected_since_ms = now_ms();
-                if (activate_session(session, &reason) != 0) {
+                if (activate_session(session, &displaced, &reason) != 0) {
                     logged_in = 0;
                 }
             }
             if (control_login) {
                 pthread_mutex_unlock(&control_admission_lock);
             }
+            if (logged_in) {
+                login_test_gate_wait(session);
+            }
             /* An accepted login answers with the name it is bound under: the account's current name. */
             st_buffer response = st_protocol_encode_login_response(
                 logged_in ? session->config.client_name : (request.client_name == NULL ? "" : request.client_name),
                 logged_in,
                 reason);
-            if (session_send_packet(session, &response) != 0) {
+            int response_rc = session_send_packet_locked(session, &response);
+            pthread_mutex_unlock(&session->send_lock);
+            release_displaced_sessions(&displaced);
+            if (response_rc != 0) {
                 st_login_request_free(&request);
                 break;
             }
@@ -5075,6 +5171,9 @@ int main(void)
         return 1;
     }
     if (st_media_capture_validate_current() != 0) {
+        return 1;
+    }
+    if (configure_login_test_gate() != 0) {
         return 1;
     }
     if (st_public_discovery_initialize() != 0) {
