@@ -1441,7 +1441,12 @@ int main(void)
         fprintf(stderr, "media capture backend initialization failed\n");
         return 1;
     }
-    snprintf(g_database_path, sizeof(g_database_path), "%s", "/tmp/specus-c-media-XXXXXX");
+    /*
+     * The scenarios commit a few hundred SQLite transactions. On tmpfs their fsyncs are free, so a
+     * slow or busy disk cannot stretch the run past the ctest timeout.
+     */
+    snprintf(g_database_path, sizeof(g_database_path), "%s/specus-c-media-XXXXXX",
+             access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp");
     int fd = mkstemp(g_database_path);
     if (fd < 0) {
         return 1;
