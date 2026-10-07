@@ -90,6 +90,18 @@ int st_public_coordination_allow_rate(const char *bucket,
                                       long window_seconds,
                                       int *allowed);
 
+/*
+ * The STCE v2 Pub/Sub envelope (protocol/spec/public-transfer-cluster.md). Both return 0 on success
+ * and -1 for an event Java's PublicTransferClusterFrame refuses; the encoded buffer and a decoded
+ * payload are malloc'ed and owned by the caller.
+ */
+int st_public_cluster_event_encode(const st_public_cluster_event *event,
+                                   uint8_t **encoded,
+                                   size_t *encoded_len);
+int st_public_cluster_event_decode(const uint8_t *encoded,
+                                   size_t encoded_len,
+                                   st_public_cluster_event *event);
+
 int st_public_coordination_publish_roster(const char *group_id, uint64_t revision);
 int st_public_coordination_publish_text(const char *group_id,
                                         const char *target_peer_id,
