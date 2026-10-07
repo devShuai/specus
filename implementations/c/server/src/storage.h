@@ -821,15 +821,19 @@ int st_storage_upsert_client(const char *path,
                              int connection_rate_limit_per_minute,
                              st_storage_client *out_client);
 int st_storage_delete_client(const char *path, long long id);
+/*
+ * The mapping and route lists below have no upper bound: on success *mappings / *routes is a heap
+ * array of every matching record that the caller frees (NULL when there is none).
+ */
+/* The enabled mappings of client_name, by listen port. */
 int st_storage_load_mappings(const char *path,
                              const char *client_name,
-                             st_storage_mapping *mappings,
-                             size_t max_mappings,
+                             st_storage_mapping **mappings,
                              size_t *mapping_count);
+/* Every mapping of the client, or of all clients when client_id <= 0, newest first. */
 int st_storage_list_mappings(const char *path,
                              long long client_id,
-                             st_storage_mapping *mappings,
-                             size_t max_mappings,
+                             st_storage_mapping **mappings,
                              size_t *mapping_count);
 int st_storage_get_mapping(const char *path, long long id, st_storage_mapping *mapping);
 int st_storage_get_mapping_by_client_port(const char *path,
@@ -859,15 +863,15 @@ int st_storage_update_mapping_by_id(const char *path,
                                     int detail_capture_enabled,
                                     st_storage_mapping *out_mapping);
 int st_storage_delete_mapping_by_id(const char *path, long long id);
+/* The enabled routes of client_name, by route name. */
 int st_storage_load_http_routes(const char *path,
                                 const char *client_name,
-                                st_storage_http_route *routes,
-                                size_t max_routes,
+                                st_storage_http_route **routes,
                                 size_t *route_count);
+/* Every route of the client, or of all clients when client_id <= 0, newest first. */
 int st_storage_list_http_routes(const char *path,
                                 long long client_id,
-                                st_storage_http_route *routes,
-                                size_t max_routes,
+                                st_storage_http_route **routes,
                                 size_t *route_count);
 int st_storage_get_http_route(const char *path, long long id, st_storage_http_route *route);
 /* -1 when the records could not be read; otherwise 0 with *found telling whether the route exists. */

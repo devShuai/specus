@@ -96,6 +96,34 @@ UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 
 | `NAT_CONTROL` | `4` |
 | `PEER_CONTROL` | `5` |
 
+## NAT_CONTROL 的大小
+
+`NAT_CONTROL` 是一条 `messageType=4` 的 `MESSAGE_RESPONSE`，body 依次是 `clientName`、空的
+`toClientName`、`messageType` 和 JSON 文本 `message`。JSON 里有 `clientName`、`remoteAddress`、
+`remotePort`、`specusConfigList`（TCP 映射）和 `httpSpecusConfigList`（HTTP route）。服务端每次下发都带上该
+客户端全部已启用的映射和 route，所以条目多、或 route 的目标 URL 长时，body 会超过上面 `MESSAGE_*` 的
+1 MiB 上限。这样的帧发不出去，客户端也就收不到配置。四个服务端在管理接口上统一拦住这种情况：
+
+- **何时检查**：新建一个启用的 TCP 映射或 HTTP route，或修改一个条目且修改后它是启用的（包括启用一个
+  已停用的条目，以及修改一个启用中的条目），都要检查。停用和删除只会让消息变小，不检查。
+- **怎样计算**：按修改之后的配置，以该实现真正发送时的编码（CompactBinary body 加上它自己的 JSON
+  序列化）计算 body 字节数。计入该客户端所有启用的条目，不管客户端本身是否启用。C 服务端另外计入
+  `SPECUS_TCP_MAPPINGS`、`SPECUS_HTTP_ROUTES` 配置的条目。各实现 JSON 的字段顺序和转义不同，所以同样的配置
+  在不同实现里可能差几个字节，能放下的条目数也可能不同。
+- **为改名预留**：客户端名按改名允许的最长值计算，所以之后无论怎样改名，已经接受的配置都不会越界。
+  名字最长 120 个字符：`clientName` 字段按 480 字节计（每个字符 4 个 UTF-8 字节），JSON 里的
+  `clientName` 值按 720 字节计（每个字符一个 6 字节的 `\uXXXX` 转义）。
+- **超出时**：body 超过 1,048,576 字节就返回 `400`，`error` 为「客户端的 TCP 映射和 HTTP route 将超过单条
+  NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端」。调用方只应依赖其中的 `NAT_CONTROL`。被拒绝的修改不落库，
+  也不推送。正好等于 1,048,576 字节的配置可以接受。
+
+换算方法：设 `clientName` 为空串时 JSON 共 `J` 字节，预留之后 body 为
+`482 + 1 + 1 + varint(J + 721) + J + 720` 字节。其中 482 是 480 字节的名字加 2 字节长度，两个 1 分别是
+`toClientName` 和 `messageType`，`varint(J + 721)` 是 JSON 长度前缀。`J` 不超过 1,047,369 时 body 不会超出上限。
+
+本规则生效之前写入的超限配置，只能靠停用或删除条目回到上限以内；在那之前，登录和运行时推送仍按各实现
+原来的方式失败。共享向量见 `protocol/test-vectors/nat-control-size-v1.json`。
+
 ## NAT stream v2
 
 `NAT_MESSAGE` body 由固定 16 字节头、可选 JSON object metadata 和原始 data 组成：
