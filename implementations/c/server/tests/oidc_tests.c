@@ -61,6 +61,7 @@ typedef struct {
     char *jwks;
     int jwks_status;
     int jwks_hits;
+    int jwks_delay_ms;
     int token_requests;
     char *last_token_request;
     idp_code codes[IDP_MAX_CODES];
@@ -240,7 +241,12 @@ static void idp_handle(int client)
         int status = idp.jwks_status;
         char *body = duplicate(status == 200 ? idp.jwks : "{\"error\":\"unavailable\"}");
         ++idp.jwks_hits;
+        int delay_ms = idp.jwks_delay_ms;
         pthread_mutex_unlock(&idp.lock);
+        if (delay_ms > 0) {
+            struct timespec pause = {delay_ms / 1000, (long)(delay_ms % 1000) * 1000000L};
+            nanosleep(&pause, NULL);
+        }
         idp_respond(client, status, body);
         free(body);
     } else if (strncmp(request, "POST /token ", strlen("POST /token ")) == 0) {
@@ -1162,6 +1168,94 @@ static void test_key_rotation_and_refetch_cooldown(void)
     idp_publish(jwk_main, jwk_next, jwk_weak, jwk_ec);
 }
 
+static void idp_set_jwks_delay_ms(int delay_ms)
+{
+    pthread_mutex_lock(&idp.lock);
+    idp.jwks_delay_ms = delay_ms;
+    pthread_mutex_unlock(&idp.lock);
+}
+
+static long long elapsed_ms(const struct timespec *since)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)(now.tv_sec - since->tv_sec) * 1000LL + (now.tv_nsec - since->tv_nsec) / 1000000L;
+}
+
+typedef struct {
+    char *token;
+    int result;
+    long long elapsed_ms;
+} slow_validation;
+
+static void *validate_while_the_idp_is_slow(void *arg)
+{
+    slow_validation *validation = (slow_validation *)arg;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    st_oidc_identity identity;
+    validation->result = st_oidc_validate_id_token(validation->token, "nonce-slow", &identity);
+    if (validation->result == ST_OIDC_OK) {
+        st_oidc_identity_free(&identity);
+    }
+    validation->elapsed_ms = elapsed_ms(&start);
+    return NULL;
+}
+
+/*
+ * A refetch for an unknown kid must not hold up tokens a cached key verifies: an identity provider
+ * that hangs, or a stream of random kids, would otherwise stall every OIDC sign-in behind it.
+ */
+static void test_slow_refetch_does_not_block_cached_keys(void)
+{
+    st_oidc_jwks_reset();
+    st_oidc_jwks_set_refresh_cooldown_ms(0);
+    idp_publish(jwk_main, NULL, NULL, NULL);
+    claims_spec spec = id_claims("subject-alice", "alice", "nonce-slow");
+    char *cached = make_token(key_main, "k1", &spec);
+    st_oidc_identity identity;
+    CHECK(st_oidc_validate_id_token(cached, "nonce-slow", &identity) == ST_OIDC_OK,
+          "the cached key did not verify before the slow refetch");
+    st_oidc_identity_free(&identity);
+
+    /* k2 is not published yet: its token sends the server to the identity provider, which hangs. */
+    idp_set_jwks_delay_ms(2000);
+    int hits = idp_jwks_hits();
+    slow_validation unknown = {make_token(key_next, "k2", &spec), -1, 0LL};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, validate_while_the_idp_is_slow, &unknown) == 0, "slow thread");
+    while (idp_jwks_hits() == hits) {
+        struct timespec pause = {0, 10L * 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int cached_result = st_oidc_validate_id_token(cached, "nonce-slow", &identity);
+    long long cached_ms = elapsed_ms(&start);
+    if (cached_result == ST_OIDC_OK) {
+        st_oidc_identity_free(&identity);
+    }
+    CHECK(cached_result == ST_OIDC_OK && cached_ms < 500LL,
+          "a token of a cached key waited for a refetch in flight");
+
+    /* A second miss during the fetch waits for that fetch rather than issuing its own. */
+    slow_validation second = {make_token(key_next, "k2", &spec), -1, 0LL};
+    pthread_t second_thread;
+    CHECK(pthread_create(&second_thread, NULL, validate_while_the_idp_is_slow, &second) == 0, "second thread");
+    pthread_join(thread, NULL);
+    pthread_join(second_thread, NULL);
+    CHECK(unknown.result != ST_OIDC_OK && second.result != ST_OIDC_OK,
+          "a key the identity provider does not publish verified");
+    CHECK(idp_jwks_hits() == hits + 1, "concurrent misses fetched the JWKS more than once");
+
+    idp_set_jwks_delay_ms(0);
+    free(cached);
+    free(unknown.token);
+    free(second.token);
+    st_oidc_jwks_reset();
+    idp_publish(jwk_main, jwk_next, jwk_weak, jwk_ec);
+}
+
 static void test_callback_replay_is_refused(void)
 {
     /* state never reaches the server: the SPA compares it with its sessionStorage copy and drops
@@ -1467,6 +1561,7 @@ int main(void)
     test_expiry_and_not_before();
     test_signature_and_key_selection();
     test_key_rotation_and_refetch_cooldown();
+    test_slow_refetch_does_not_block_cached_keys();
     test_callback_replay_is_refused();
     test_tenant_claim_does_not_choose_tenant();
     test_direct_bearer_tokens();
