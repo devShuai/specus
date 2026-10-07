@@ -136,4 +136,12 @@ const char *st_product_metrics_user_deleted(const char *database_path,
 /* The four retention steps of section 9 at the clock's now; idempotent. 0 on success. */
 int st_product_metrics_sweep(const char *database_path);
 
+/*
+ * Tests only: st_product_metrics_sweep calls hook(context) right after it read the switches, before
+ * it reads the progress rows or deletes anything, so a test can change a switch in between. NULL
+ * removes the hook.
+ */
+typedef void (*st_product_metrics_sweep_hook)(void *context);
+void st_product_metrics_set_sweep_hook_for_testing(st_product_metrics_sweep_hook hook, void *context);
+
 #endif
