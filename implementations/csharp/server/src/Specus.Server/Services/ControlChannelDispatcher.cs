@@ -9,6 +9,7 @@ using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Nat;
 using Specus.Server.PeerMesh;
+using Specus.Server.ProductMetrics;
 using Specus.Server.Sessions;
 using Specus.Server.WebSockets;
 
@@ -447,6 +448,15 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 _logger.LogInformation("[{ChannelId}] dedicated data connection ready for {ClientName}",
                     context.ChannelId, packet.ClientName);
                 return;
+            }
+
+            if (result.Account is not null)
+            {
+                // Never throws: product metrics must not affect the login it observes.
+                await scope.ServiceProvider.GetRequiredService<ProductMetricsService>()
+                    .MilestoneAsync(result.Account.TenantId, result.Account.OwnerUsername,
+                        ProductMetricsModel.StepClientOnline, context.Lifetime)
+                    .ConfigureAwait(false);
             }
 
             try

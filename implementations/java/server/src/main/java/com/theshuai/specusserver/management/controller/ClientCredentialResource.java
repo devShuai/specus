@@ -4,7 +4,10 @@ import com.theshuai.specusserver.management.service.ClientCredentialService;
 import com.theshuai.specusserver.management.service.ClientCredentialService.ClientCredentialView;
 import com.theshuai.specusserver.management.service.ClientCredentialService.CredentialMutation;
 import com.theshuai.specusserver.management.service.ClientCredentialService.CredentialResult;
+import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
+import com.theshuai.specusserver.productmetrics.ProductMetricsModel;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -25,11 +28,14 @@ import java.util.List;
 public class ClientCredentialResource {
     private final ClientCredentialService credentialService;
     private final ManagementContextResolver contextResolver;
+    private final ProductMetricsService productMetrics;
 
     public ClientCredentialResource(ClientCredentialService credentialService,
-                                    ManagementContextResolver contextResolver) {
+                                    ManagementContextResolver contextResolver,
+                                    ProductMetricsService productMetrics) {
         this.credentialService = credentialService;
         this.contextResolver = contextResolver;
+        this.productMetrics = productMetrics;
     }
 
     @GetMapping
@@ -40,8 +46,12 @@ public class ClientCredentialResource {
     @PostMapping
     public ResponseEntity<CredentialResult> create(@AuthenticationPrincipal Jwt jwt,
                                                    @RequestBody CredentialMutation request) {
-        return ResponseEntity.status(HttpStatus.CREATED)
-                .body(credentialService.create(contextResolver.resolve(jwt), request));
+        ManagementContext context = contextResolver.resolve(jwt);
+        CredentialResult created = credentialService.create(context, request);
+        // The credential belongs to the caller (ClientCredentialService.create sets the owner).
+        productMetrics.milestone(context.tenant().tenantId(), context.username(),
+                ProductMetricsModel.STEP_CREDENTIAL_CREATED);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
     @PutMapping("/{id}")

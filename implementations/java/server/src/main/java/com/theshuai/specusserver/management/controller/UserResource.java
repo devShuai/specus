@@ -5,6 +5,8 @@ import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.UserMutation;
+import com.theshuai.specusserver.productmetrics.ProductMetricsModel;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -25,11 +27,14 @@ import java.util.List;
 public class UserResource {
     private final ManagementContextResolver contextResolver;
     private final ManagementUserService userService;
+    private final ProductMetricsService productMetrics;
 
     public UserResource(ManagementContextResolver contextResolver,
-                        ManagementUserService userService) {
+                        ManagementUserService userService,
+                        ProductMetricsService productMetrics) {
         this.contextResolver = contextResolver;
         this.userService = userService;
+        this.productMetrics = productMetrics;
     }
 
     @GetMapping("/me")
@@ -46,7 +51,9 @@ public class UserResource {
     public ResponseEntity<ManagementUserView> createUser(@AuthenticationPrincipal Jwt jwt,
                                                          @RequestBody UserMutation request) {
         ManagementContext context = contextResolver.resolve(jwt);
-        return ResponseEntity.status(HttpStatus.CREATED).body(userService.createUser(context, request));
+        ManagementUserView created = userService.createUser(context, request);
+        productMetrics.milestone(created.tenantId(), created.username(), ProductMetricsModel.STEP_ACCOUNT_CREATED);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
     @PutMapping("/users/{username}")
@@ -58,7 +65,9 @@ public class UserResource {
 
     @DeleteMapping("/users/{username}")
     public ResponseEntity<Void> deleteUser(@AuthenticationPrincipal Jwt jwt, @PathVariable String username) {
-        userService.deleteUser(contextResolver.resolve(jwt), username);
+        ManagementContext context = contextResolver.resolve(jwt);
+        String deleted = userService.deleteUser(context, username);
+        productMetrics.userDeleted(context.tenant().tenantId(), deleted);
         return ResponseEntity.noContent().build();
     }
 }

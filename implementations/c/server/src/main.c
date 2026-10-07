@@ -8,6 +8,7 @@
 #include "media_capture.h"
 #include "object_storage.h"
 #include "peer_mesh.h"
+#include "product_metrics.h"
 #include "protocol.h"
 #include "public_discovery.h"
 #include "security_baseline.h"
@@ -928,6 +929,23 @@ static void record_login_failure_event(const server_config *config,
                           timestamp);
     connection.client_id = client_id;
     st_admin_broadcast_connection_event(config->tenant_id, "created", &connection);
+}
+
+/*
+ * The client_online onboarding milestone of opt-in product metrics (product-metrics.md section 4.1)
+ * after a successful control login: it belongs to the owner of the client account. It never
+ * affects the login; the hook ignores tenants that are off and logs its own storage errors.
+ */
+static void record_client_online_milestone(const specus_session *session)
+{
+    if (session->config.database_path[0] == '\0') {
+        return;
+    }
+    st_storage_client client;
+    if (st_storage_get_client(session->config.database_path, session->config.client_id, &client) == 0) {
+        (void)st_product_metrics_milestone(session->config.database_path, client.tenant_id,
+                                           client.owner_username, ST_PRODUCT_METRICS_STEP_CLIENT_ONLINE);
+    }
 }
 
 static void record_login_success_event(specus_session *session)
@@ -2709,6 +2727,7 @@ typedef struct {
     time_t next_object_cleanup;
     time_t next_media_cleanup;
     time_t next_workbench_sweep;
+    time_t next_product_metrics_sweep;
     time_t next_catalog_expiry;
     time_t next_share_sweep;
 } peer_mesh_maintenance_state;
@@ -2802,6 +2821,11 @@ static void *peer_mesh_maintenance_thread(void *unused)
             }
             peer_mesh_maintenance.next_workbench_sweep = now + WORKBENCH_SWEEP_INTERVAL_SECONDS;
         }
+        if (now >= peer_mesh_maintenance.next_product_metrics_sweep) {
+            /* Product metrics retention (product-metrics.md section 9); idempotent, logs its own failure. */
+            (void)st_product_metrics_sweep(peer_mesh_maintenance.database_path);
+            peer_mesh_maintenance.next_product_metrics_sweep = now + ST_PRODUCT_METRICS_SWEEP_INTERVAL_SECONDS;
+        }
         pthread_mutex_lock(&peer_mesh_maintenance.lock);
     }
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
@@ -2821,6 +2845,8 @@ static int peer_mesh_maintenance_start(const char *database_path)
     peer_mesh_maintenance.next_media_cleanup = now
         + maintenance_interval_seconds("SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS", 60000LL);
     peer_mesh_maintenance.next_workbench_sweep = now;
+    /* The first sweep comes at the first maintenance tick a minute after start, then hourly. */
+    peer_mesh_maintenance.next_product_metrics_sweep = now + ST_PRODUCT_METRICS_SWEEP_FIRST_DELAY_SECONDS;
     peer_mesh_maintenance.next_catalog_expiry = now + 30;
     /* The first share sweep runs right after start, then every 30 seconds. */
     peer_mesh_maintenance.next_share_sweep = now + 1;
@@ -2851,6 +2877,7 @@ static void peer_mesh_maintenance_stop(void)
     peer_mesh_maintenance.next_object_cleanup = 0;
     peer_mesh_maintenance.next_media_cleanup = 0;
     peer_mesh_maintenance.next_workbench_sweep = 0;
+    peer_mesh_maintenance.next_product_metrics_sweep = 0;
     peer_mesh_maintenance.next_catalog_expiry = 0;
     peer_mesh_maintenance.next_share_sweep = 0;
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
@@ -4549,6 +4576,7 @@ static void *client_thread(void *arg)
                    request.client_name, session->remote);
             if (!session->is_data_connection) {
                 record_login_success_event(session);
+                record_client_online_milestone(session);
                 st_buffer nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                                        session->config.nat_control_json);
                 if (session_send_packet(session, &nat_control) != 0) {

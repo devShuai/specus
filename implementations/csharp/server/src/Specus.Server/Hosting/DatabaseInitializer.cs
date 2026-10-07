@@ -61,6 +61,7 @@ public sealed class DatabaseInitializer
         await EnsureTransferRoomCredentialColumnsAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureMappingCompatibilityColumnsAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureHttpMediaTablesAsync(db, cancellationToken).ConfigureAwait(false);
+        await EnsureProductMetricsTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureTrafficDetailTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsurePeerMeshTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureWorkbenchTableAsync(db, cancellationToken).ConfigureAwait(false);
@@ -1242,6 +1243,65 @@ public sealed class DatabaseInitializer
 
         var count = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return Convert.ToInt64(count) > 0;
+    }
+
+    /// <summary>
+    /// Opt-in product metrics (protocol/spec/product-metrics.md section 6). Same shape as the
+    /// AddProductMetrics migrations and the Go, Java and C servers: natural keys, no surrogate id,
+    /// no foreign key, epoch-millisecond times and UTC day text.
+    /// </summary>
+    internal static async Task EnsureProductMetricsTablesAsync(SpecusDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var enabledType = DatabaseDialect(db.Database.ProviderName) switch
+        {
+            "mysql" => "TINYINT(1) NOT NULL DEFAULT 0",
+            "postgresql" => "BOOLEAN NOT NULL DEFAULT FALSE",
+            _ => "INTEGER NOT NULL DEFAULT 0",
+        };
+        await ExecuteSchemaSqlAsync(db, $"""
+            CREATE TABLE IF NOT EXISTS product_metrics_switch (
+              tenant_id VARCHAR(80) NOT NULL PRIMARY KEY,
+              enabled {enabledType},
+              updated_by VARCHAR(80),
+              updated_at BIGINT,
+              purged_at BIGINT
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await ExecuteSchemaSqlAsync(db, """
+            CREATE TABLE IF NOT EXISTS product_metrics_onboarding_progress (
+              tenant_id VARCHAR(80) NOT NULL,
+              username VARCHAR(80) NOT NULL,
+              started_at BIGINT NOT NULL,
+              signed_in_at BIGINT,
+              credential_created_at BIGINT,
+              client_online_at BIGINT,
+              PRIMARY KEY (tenant_id, username)
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await ExecuteSchemaSqlAsync(db, """
+            CREATE TABLE IF NOT EXISTS product_metrics_onboarding_daily (
+              tenant_id VARCHAR(80) NOT NULL,
+              cohort_day VARCHAR(10) NOT NULL,
+              reached_step VARCHAR(32) NOT NULL,
+              duration_bucket VARCHAR(16) NOT NULL,
+              users BIGINT NOT NULL,
+              PRIMARY KEY (tenant_id, cohort_day, reached_step, duration_bucket)
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await ExecuteSchemaSqlAsync(db, """
+            CREATE TABLE IF NOT EXISTS product_metrics_transfer_daily (
+              tenant_id VARCHAR(80) NOT NULL,
+              day VARCHAR(10) NOT NULL,
+              mode VARCHAR(16) NOT NULL,
+              path VARCHAR(16) NOT NULL,
+              size_bucket VARCHAR(16) NOT NULL,
+              attempt VARCHAR(32) NOT NULL,
+              outcome VARCHAR(16) NOT NULL,
+              count BIGINT NOT NULL,
+              PRIMARY KEY (tenant_id, day, mode, path, size_bucket, attempt, outcome)
+            )
+            """, cancellationToken).ConfigureAwait(false);
     }
 
     private static string BooleanColumnType(string? providerName)

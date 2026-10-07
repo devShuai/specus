@@ -34,6 +34,8 @@ import type {
   PeerEgressPolicy,
   PeerEgressPolicyMutation,
   PeerEgressSwitch,
+  ProductMetricsSettings,
+  ProductMetricsSummary,
   PeerMeshAcl,
   PeerMeshAclMutation,
   PeerMeshDevice,
@@ -91,6 +93,7 @@ import {
   type ConnectivityCheckAnswer,
   type ConnectivityCheckResult,
 } from "../lib/connectivityCheck";
+import { PRODUCT_METRICS_DISCLOSURE_VERSION, type TransferOutcomeEvent } from "../lib/productMetrics";
 
 const ADMIN_PREFIX = "/api/admin";
 
@@ -653,7 +656,75 @@ export const adminApi = {
     request<AttachmentPresignDownloadResponse>(`/client-messages/attachments/${attachmentId}/presign-download`, {
       method: "POST",
     }),
+
+  // Opt-in product metrics (protocol/spec/product-metrics.md section 7).
+  productMetricsSettings: () => request<ProductMetricsSettings>("/product-metrics/settings", { cache: "no-store" }),
+  setProductMetricsEnabled: (enabled: boolean) =>
+    request<ProductMetricsSettings>("/product-metrics/settings", {
+      method: "PUT",
+      body: JSON.stringify(enabled ? { enabled, disclosureVersion: PRODUCT_METRICS_DISCLOSURE_VERSION } : { enabled }),
+    }),
+  purgeProductMetrics: () =>
+    request<{ purged: boolean; enabled: boolean }>("/product-metrics/data", { method: "DELETE" }),
+  productMetricsSummary: (range: { from?: string; to?: string } = {}) => {
+    const params = new URLSearchParams();
+    if (range.from) params.set("from", range.from);
+    if (range.to) params.set("to", range.to);
+    const query = params.toString();
+    return request<ProductMetricsSummary>(`/product-metrics/summary${query ? `?${query}` : ""}`, { cache: "no-store" });
+  },
 };
+
+/**
+ * Whether the signed-in member's tenant collects product metrics. Silent: any failure (signed out,
+ * an older server without the endpoint, a network error) reads as "not collecting", and a 401 here
+ * never signs the page out.
+ */
+export async function fetchProductMetricsCollecting(): Promise<boolean> {
+  const token = tokenStore.get();
+  if (!token) return false;
+  try {
+    const response = await fetch(`${ADMIN_PREFIX}/product-metrics/settings`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+    if (!response.ok) return false;
+    const body = (await response.json()) as { enabled?: unknown };
+    return body?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sends one batch of finished transfer attempts (section 7.4). Exactly the closed fields go out; the
+ * caller drops the batch on any answer but 200 and never retries, so nothing is sent twice. On
+ * pagehide the request is kept alive so it can finish after the page is gone.
+ */
+export async function reportTransferOutcomes(
+  events: TransferOutcomeEvent[],
+  keepalive: boolean,
+): Promise<{ status: number; collecting?: boolean }> {
+  const token = tokenStore.get();
+  if (!token) return { status: 401 };
+  const response = await fetch(`${ADMIN_PREFIX}/product-metrics/transfer-outcomes`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      schemaVersion: 1,
+      events: events.map(({ mode, path, sizeBucket, attempt, outcome }) => ({ mode, path, sizeBucket, attempt, outcome })),
+    }),
+    keepalive,
+    cache: "no-store",
+  });
+  if (response.status !== 200) return { status: response.status };
+  try {
+    const body = (await response.json()) as { collecting?: unknown };
+    return { status: 200, collecting: body?.collecting === true };
+  } catch {
+    return { status: 200 };
+  }
+}
 
 // ---- public API（默认免登录；公开互传附件单独要求 Bearer）-----------------------------
 

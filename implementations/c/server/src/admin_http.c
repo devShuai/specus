@@ -17,6 +17,7 @@
 #include "object_storage.h"
 #include "password_hash.h"
 #include "peer_mesh.h"
+#include "product_metrics.h"
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
@@ -2845,6 +2846,25 @@ static int ensure_admin_database(const char **path, char *out, size_t out_len)
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"database init failed\"}");
     }
     return 0;
+}
+
+/*
+ * An onboarding milestone of opt-in product metrics (product-metrics.md section 4.1), reported
+ * after the write path it belongs to succeeded. It never fails that write path: the hook logs its
+ * own storage errors (tenant, step and error class only) and is ignored while the tenant is off.
+ */
+static void admin_product_metrics_milestone(const char *tenant_id, const char *username, const char *step)
+{
+    const char *database_path = admin_database_path();
+    if (database_path != NULL) {
+        (void)st_product_metrics_milestone(database_path, tenant_id, username, step);
+    }
+}
+
+/* Whether a management token response carries a session (200), so signed_in may be recorded. */
+static int admin_token_response_issued(const char *out, int response_len)
+{
+    return response_len > 0 && strncmp(out, "HTTP/1.1 200 ", strlen("HTTP/1.1 200 ")) == 0;
 }
 
 static int handle_database_initialize(const st_admin_context *context, char *out, size_t out_len)
@@ -6813,6 +6833,7 @@ static int handle_specus_create(const st_admin_context *context, long long clien
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or specus create failed\"}");
     }
     admin_notify_nat_control(&owner);
+    admin_product_metrics_milestone(owner.tenant_id, owner.owner_username, ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED);
     return build_mapping_response(&mapping, 201, "Created", out, out_len);
 }
 
@@ -7053,6 +7074,7 @@ static int handle_http_route_create(const st_admin_context *context, long long c
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
     admin_notify_nat_control(&owner);
+    admin_product_metrics_milestone(owner.tenant_id, owner.owner_username, ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED);
     return build_http_route_response(&route, 201, "Created", out, out_len);
 }
 
@@ -8175,6 +8197,8 @@ static int handle_credential_create(const st_admin_context *context, const char 
         free(secret);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"credential create failed\"}");
     }
+    admin_product_metrics_milestone(credential.tenant_id, credential.owner_username,
+                                    ST_PRODUCT_METRICS_STEP_CREDENTIAL_CREATED);
     int response_len = build_credential_result_response(&credential, admin_trim(secret), 201, "Created", out, out_len);
     free(secret);
     return response_len;
@@ -9444,6 +9468,7 @@ static int handle_management_user_create(const st_admin_context *context, const 
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"user create failed\"}");
     }
+    admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
     st_admin_string_builder builder = {0};
     if (append_stored_management_user_view(&builder, &user) != 0 || builder.data == NULL) {
         free(builder.data);
@@ -9598,6 +9623,10 @@ static int handle_management_user_delete(const st_admin_context *context, const 
         free(username);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be deleted\"}");
     }
+    /* The stored spelling of the name, which keys the account's product metrics progress row. */
+    st_storage_management_user target;
+    int have_target = st_storage_get_management_user_in_tenant(database_path, context->tenant_id,
+                                                               username, &target) == 0;
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     st_storage_share_ids revoked = {0};
     /* Deleting the user ends its shares in the same transaction, so a later namesake never inherits them. */
@@ -9605,6 +9634,9 @@ static int handle_management_user_delete(const st_admin_context *context, const 
                                                        context->username, st_http_share_now_ms(), &revoked);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == 0 && have_target) {
+        (void)st_product_metrics_user_deleted(database_path, target.tenant_id, target.username);
+    }
     int response_len = rc != 0
         ? write_management_user_not_found(context, "delete", username, out, out_len)
         : write_response(out, out_len, 204, "No Content", "");
@@ -9845,6 +9877,7 @@ static int handle_management_auth_login(const char *body,
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
     int ok = 0;
+    int database_user = 0;
     char token_username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
@@ -9890,6 +9923,7 @@ static int handle_management_auth_login(const char *body,
                 snprintf(token_username, sizeof(token_username), "%s", user.username);
                 snprintf(token_tenant, sizeof(token_tenant), "%s", user.tenant_id);
                 snprintf(token_role, sizeof(token_role), "%s", normalize_management_role(user.role));
+                database_user = 1;
             }
         }
     }
@@ -9901,7 +9935,12 @@ static int handle_management_auth_login(const char *body,
     if (!ok) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
-    return write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    int response_len = write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    /* The built-in admin is no user row and never enters the onboarding cohort. */
+    if (database_user && admin_token_response_issued(out, response_len)) {
+        admin_product_metrics_milestone(token_tenant, token_username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
+    }
+    return response_len;
 }
 
 /* The context was re-read from the user record, so the new token carries today's tenant and role. */
@@ -9971,7 +10010,92 @@ static int handle_management_registration_verify(const char *body, char *out, si
     if (st_registration_verify(database_path, body, &user, &status, error, sizeof(error)) != 0) {
         return write_registration_error_response(status, error, out, out_len);
     }
-    return write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    /* Verification created the account and signs it in at once: two milestones, in step order. */
+    admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
+    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    if (admin_token_response_issued(out, response_len)) {
+        admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
+    }
+    return response_len;
+}
+
+/*
+ * Every product metrics answer, success or refusal, is private to the identity that asked and must
+ * not be kept by any cache: "private, no-store" rather than the usual "no-store".
+ */
+static int write_product_metrics_response(char *out, size_t out_len, int status, const char *body)
+{
+    const char *reason;
+    switch (status) {
+    case 200: reason = "OK"; break;
+    case 400: reason = "Bad Request"; break;
+    case 401: reason = "Unauthorized"; break;
+    case 403: reason = "Forbidden"; break;
+    case 404: reason = "Not Found"; break;
+    case 409: reason = "Conflict"; break;
+    case 413: reason = "Payload Too Large"; break;
+    case 429: reason = "Too Many Requests"; break;
+    case 503: reason = "Service Unavailable"; break;
+    default: reason = "Internal Server Error"; break;
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: private, no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           status,
+                           reason,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/*
+ * The product metrics endpoints (protocol/spec/product-metrics.md section 7), reached after the
+ * shared authentication layer re-read the account: the tenant and the username are the session's,
+ * never anything in the path, query or body. The request body is handed over as raw bytes with its
+ * length (the ingest size check runs on them before any parsing) and is never logged.
+ */
+static int handle_product_metrics_request(const st_admin_context *context,
+                                          const char *method,
+                                          const char *path,
+                                          const char *body,
+                                          size_t body_len,
+                                          char *out,
+                                          size_t out_len)
+{
+    st_product_metrics_endpoint endpoint = st_product_metrics_match(method, path);
+    if (endpoint == ST_PRODUCT_METRICS_NO_ENDPOINT) {
+        return write_product_metrics_response(out, out_len, 404, "{\"error\":\"not found\"}");
+    }
+    /* Without a usable database every endpoint that reaches storage answers 503 UNAVAILABLE. */
+    const char *database_path = admin_database_path();
+    if (database_path != NULL && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        database_path = NULL;
+    }
+    const char *query = strchr(path, '?');
+    st_product_metrics_actor actor = {
+        .tenant_id = context->tenant_id,
+        .username = context->username,
+        .admin = context->admin
+    };
+    st_product_metrics_response response;
+    st_product_metrics_handle(database_path, endpoint, &actor, query == NULL ? NULL : query + 1,
+                              body, body == NULL ? 0U : body_len, &response);
+    int response_len;
+    if (response.body != NULL) {
+        response_len = write_product_metrics_response(out, out_len, response.status, response.body);
+    } else if (response.status == 403) {
+        response_len = write_product_metrics_response(out, out_len, 403, "{\"error\":\"需要 admin 权限\"}");
+    } else {
+        response_len = write_product_metrics_response(out, out_len, 500, "{\"error\":\"product metrics failed\"}");
+    }
+    st_product_metrics_response_free(&response);
+    return response_len;
 }
 
 static int st_admin_build_response_internal(const char *method,
@@ -9993,6 +10117,8 @@ static int st_admin_build_response_internal(const char *method,
     }
     st_admin_context context;
     admin_context_from_env(&context);
+    /* Product metrics answers are private, the shared layer's refusals included. */
+    int product_metrics_path = st_product_metrics_path(path);
     if (admin_path_requires_auth(method, path)) {
         /* Workbench answers are private, the shared layer's refusals included. */
         int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
@@ -10005,19 +10131,29 @@ static int st_admin_build_response_internal(const char *method,
                                       "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}");
             }
             if (auth_rc == -2) {
-                return write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
-                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+                return product_metrics_path
+                    ? write_product_metrics_response(out, out_len, 403,
+                                                     "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}")
+                    : write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
+                                         "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
             if (auth_rc == -3) {
-                return write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
-                                          "{\"error\":\"management user store unavailable\"}");
+                return product_metrics_path
+                    ? write_product_metrics_response(out, out_len, 500,
+                                                     "{\"error\":\"management user store unavailable\"}")
+                    : write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
+                                         "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
         } else {
             unauthorized = !allow_default_admin;
         }
         if (unauthorized) {
+            if (product_metrics_path) {
+                return write_product_metrics_response(out, out_len, 401,
+                                                      "{\"error\":\"missing or invalid bearer token\"}");
+            }
             /* Every answer of the connectivity check is private, the 401 included. */
             if (admin_connectivity_check_path(path, NULL, 0U)) {
                 return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
@@ -10025,6 +10161,9 @@ static int st_admin_build_response_internal(const char *method,
             return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
+    }
+    if (product_metrics_path) {
+        return handle_product_metrics_request(&context, method, path, body, body_len, out, out_len);
     }
     st_workbench_request workbench_request;
     if (st_workbench_match(method, path, &workbench_request)) {
