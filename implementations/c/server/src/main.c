@@ -4160,6 +4160,8 @@ static void *external_writer_thread(void *arg)
             conn->queued_write_bytes -= chunk->len;
             pthread_mutex_unlock(&conn->write_lock);
 
+            /* Captured before it is forwarded, as Java does, so capture order is relay order. */
+            record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
             int fd;
             pthread_mutex_lock(&session->map_lock);
             fd = conn->fd;
@@ -4184,7 +4186,6 @@ static void *external_writer_thread(void *arg)
                 break;
             }
             record_tcp_traffic(session, conn->port, 0, (long long)chunk->len);
-            record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
             if (send_window_update(session, conn->stream_id, chunk->len) != 0) {
                 free(chunk->data);
                 free(chunk);
@@ -4237,11 +4238,12 @@ static void *external_conn_thread(void *arg)
             if (consume_send_credit(conn, (size_t)read_len) != 0) {
                 break;
             }
+            /* Captured before it is forwarded, as Java does, so capture order is relay order. */
+            record_tcp_frame(session, conn, "PUBLIC_TO_CLIENT", buffer, (size_t)read_len);
             if (send_data(session, conn->stream_id, buffer, (size_t)read_len) != 0) {
                 break;
             }
             record_tcp_traffic(session, conn->port, (long long)read_len, 0);
-            record_tcp_frame(session, conn, "PUBLIC_TO_CLIENT", buffer, (size_t)read_len);
             continue;
         }
         if (read_len < 0 && errno == EINTR) {
