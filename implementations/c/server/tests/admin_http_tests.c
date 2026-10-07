@@ -7130,6 +7130,7 @@ int main(void)
         fprintf(stderr, "peer mesh devices updated list response mismatch\n");
         return 1;
     }
+    /* Unexpired: listing sessions closes the expired ones first, as Java's expireIfStale. */
     char peer_session_sql[2048];
     snprintf(peer_session_sql,
              sizeof(peer_session_sql),
@@ -7138,10 +7139,10 @@ int main(void)
              "path_type, status, token_hash, started_at, updated_at, expires_at, rtt_millis, "
              "local_endpoint, remote_endpoint, direct_bytes, relay_bytes, last_traffic_at) VALUES "
              "(99001, 'tenant-admin', %d, 'C managed', %d, 'C peer target', 'DIRECT', 'ACTIVE', 'hash-a', "
-             "'2026-06-25T01:00:00Z', '2026-06-25T01:01:00Z', '2026-06-25T02:00:00Z', 12, "
+             "'2026-06-25T01:00:00Z', '2026-06-25T01:01:00Z', '2999-06-25T02:00:00Z', 12, "
              "'10.0.0.1:10000', '10.0.0.2:10001', 128, 0, '2026-06-25T01:01:00Z'),"
              "(99002, 'tenant-admin', %d, 'C managed', %d, 'C peer target', 'RELAY', 'NEGOTIATING', 'hash-b', "
-             "'2026-06-25T01:02:00Z', '2026-06-25T01:03:00Z', '2026-06-25T02:03:00Z', NULL, "
+             "'2026-06-25T01:02:00Z', '2026-06-25T01:03:00Z', '2999-06-25T02:03:00Z', NULL, "
              "NULL, 'relay.example:3478', 0, 64, NULL)",
              created_client_id,
              target_client_id,
