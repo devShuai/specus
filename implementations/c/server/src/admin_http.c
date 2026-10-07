@@ -12199,9 +12199,18 @@ static int send_text_http_error(int fd, int status, const char *message)
         && send_all(fd, body, (size_t)body_len) == 0;
 }
 
+/*
+ * The texts of Java HttpSpecusController for the route gate and an offline client, carried in this
+ * server's {"error":"..."} envelope (http-route.md section 1).
+ */
+#define ADMIN_ROUTE_NOT_FOUND_TEXT "HTTP 路由不存在或未启用"
+#define ADMIN_ROUTE_AUTH_REQUIRED_TEXT "需要 HTTP Basic 认证"
+#define ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT "HTTP 路由认证暂不可用"
+#define ADMIN_ROUTE_CLIENT_OFFLINE_TEXT "客户端不在线"
+
 static int send_http_route_auth_challenge(int fd)
 {
-    static const char body[] = "{\"error\":\"HTTP route authentication required\"}";
+    static const char body[] = "{\"error\":\"" ADMIN_ROUTE_AUTH_REQUIRED_TEXT "\"}";
     char header[384];
     int header_len = snprintf(header,
                               sizeof(header),
@@ -12223,7 +12232,7 @@ static int send_http_route_auth_challenge(int fd)
 
 static int send_http_route_policy_unavailable(int fd)
 {
-    static const char body[] = "{\"error\":\"HTTP route authentication is temporarily unavailable\"}";
+    static const char body[] = "{\"error\":\"" ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT "\"}";
     char header[384];
     int header_len = snprintf(header,
                               sizeof(header),
@@ -12354,7 +12363,7 @@ static int admin_env_http_route_configured(const char *route_name, char *target,
 
 static int send_http_route_not_found(int fd)
 {
-    send_text_http_error(fd, 404, "HTTP route is not configured or disabled");
+    send_text_http_error(fd, 404, ADMIN_ROUTE_NOT_FOUND_TEXT);
     return -1;
 }
 
@@ -15286,7 +15295,7 @@ static void admin_forward_direct_http(st_admin_server *server,
         /* The stream could not be created, answered as Java HttpSpecusController does. */
         send_text_http_error(fd, 502, "HTTP 流创建失败");
     } else if (!sink_state.started) {
-        send_text_http_error(fd, 502, "direct http target client is offline");
+        send_text_http_error(fd, 502, ADMIN_ROUTE_CLIENT_OFFLINE_TEXT);
     }
 
     if (rc != 0) {
