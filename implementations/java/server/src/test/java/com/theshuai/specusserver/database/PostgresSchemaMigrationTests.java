@@ -1,7 +1,13 @@
 package com.theshuai.specusserver.database;
 
 import com.theshuai.specusserver.SpecusServerApplication;
+import com.theshuai.specusserver.management.model.HttpTrafficExchange;
+import com.theshuai.specusserver.management.model.HttpTrafficExchangeView;
 import com.theshuai.specusserver.management.model.SortableInstant;
+import com.theshuai.specusserver.management.repository.HttpTrafficExchangeRepository;
+import com.theshuai.specusserver.management.storage.HttpTrafficExchangeStore;
+import com.theshuai.specusserver.management.storage.HttpTrafficSearchField;
+import com.theshuai.specusserver.management.tenant.TenantContext;
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -10,6 +16,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -71,6 +78,37 @@ class PostgresSchemaMigrationTests {
             assertThat(second.getBean(DatabaseInitializer.class).initialize())
                     .containsEntry("initialized", true);
             assertThat(indexes(second)).isEqualTo(indexes);
+        }
+    }
+
+    /** Update never changes a column's type, so a database the old varchar(8192) headers created keeps them. */
+    @Test
+    void httpHeaderColumnsTheOldMappingCreatedKeepWorking() {
+        String database = createDatabase();
+
+        try (ConfigurableApplicationContext first = start(database)) {
+            JdbcTemplate jdbc = first.getBean(JdbcTemplate.class);
+            assertThat(httpHeaderColumnTypes(jdbc)).containsOnly("text");
+            for (String column : List.of("request_headers", "response_headers")) {
+                jdbc.execute("alter table specus_http_traffic_exchange alter column " + column + " type varchar(8192)");
+            }
+        }
+
+        try (ConfigurableApplicationContext second = start(database)) {
+            assertThat(httpHeaderColumnTypes(second.getBean(JdbcTemplate.class)))
+                    .containsOnly("character varying(8192)");
+            HttpTrafficExchangeRepository repository = second.getBean(HttpTrafficExchangeRepository.class);
+            HttpTrafficExchange exchange = repository.save(WidestHttpTrafficExchange.create());
+
+            assertThat(repository.findById(exchange.getId()).orElseThrow())
+                    .usingRecursiveComparison()
+                    .isEqualTo(exchange);
+            assertThat(second.getBean(HttpTrafficExchangeStore.class)
+                    .search(TenantContext.defaultTenant(), null, null, null, null,
+                            HttpTrafficSearchField.RESPONSE_HEADERS, "x-response", PageRequest.of(0, 20))
+                    .getContent())
+                    .extracting(HttpTrafficExchangeView::id)
+                    .containsExactly(exchange.getId().toString());
         }
     }
 
@@ -233,6 +271,15 @@ class PostgresSchemaMigrationTests {
                  where schemaname = current_schema()
                  order by tablename, indexname
                 """);
+    }
+
+    private static List<String> httpHeaderColumnTypes(JdbcTemplate jdbc) {
+        return jdbc.queryForList("""
+                select data_type || coalesce('(' || character_maximum_length || ')', '')
+                  from information_schema.columns
+                 where table_schema = current_schema() and table_name = 'specus_http_traffic_exchange'
+                   and column_name in ('request_headers', 'response_headers')
+                """, String.class);
     }
 
     private static void migrateTwice(DataSource dataSource, Runnable migration) {

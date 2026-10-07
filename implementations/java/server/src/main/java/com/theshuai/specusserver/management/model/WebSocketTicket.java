@@ -8,6 +8,7 @@ import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.Length;
 
 @Entity
 @Table(name = "specus_websocket_ticket", indexes = {
@@ -23,8 +24,9 @@ public class WebSocketTicket {
     @Column(nullable = false, length = 40)
     private String scope;
 
+    // A @Lob column keeps @Column's default length of 255, which MySQL turns into tinytext.
     @Lob
-    @Column(name = "attributes_json", nullable = false)
+    @Column(name = "attributes_json", nullable = false, length = Length.LONG32)
     private String attributesJson;
 
     @Column(name = "remote_address_hash", length = 64)
