@@ -436,6 +436,14 @@ typedef struct {
     int request_truncated;
     int response_truncated;
     char captured_at[64];
+    /*
+     * The stored bodies (at most ST_TRAFFIC_BODY_CAPTURE_BYTES each), read only by the detail
+     * lookup; NULL in a list. Freed by st_storage_http_exchange_free_bodies.
+     */
+    uint8_t *request_body_data;
+    size_t request_body_data_len;
+    uint8_t *response_body_data;
+    size_t response_body_data_len;
 } st_storage_http_exchange;
 
 typedef struct {
@@ -605,6 +613,17 @@ int st_storage_update_registration_attempts(const char *path,
                                             const char *updated_at);
 int st_storage_delete_registration_challenge(const char *path, const char *registration_id);
 int st_storage_delete_expired_registration_challenges(const char *path, const char *expires_before);
+/*
+ * Java ClientAuthNonceService.consume on specus_client_auth_nonce, in one write transaction:
+ * deletes the rows that expired before now_ms, then inserts (nonce_id, api_key_hash) to expire at
+ * now_ms + ttl_ms unless the id is already there. 0 = consumed, 1 = already consumed (a replay),
+ * -1 = the database failed.
+ */
+int st_storage_consume_client_auth_nonce(const char *path,
+                                         const char *nonce_id,
+                                         const char *api_key_hash,
+                                         long long now_ms,
+                                         long long ttl_ms);
 int st_storage_complete_registration(const char *path,
                                      const st_storage_registration_challenge *challenge,
                                      const char *tenant_id,
@@ -1071,6 +1090,67 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
                                                st_storage_peer_mesh_session *sessions,
                                                size_t max_sessions,
                                                size_t *session_count);
+/* One (effective path type, status) group of Java PeerMeshSessionRepository.aggregatePathTypes. */
+typedef struct {
+    char path_type[32];
+    char status[32];
+    long long sessions;
+    long long reported_sessions;
+    int has_avg_rtt;
+    double avg_rtt_millis;
+    long long direct_bytes;
+    long long relay_bytes;
+} st_storage_peer_mesh_path_aggregate;
+
+/* One (address family, status, effective path type) group of aggregateAddressFamilies. */
+typedef struct {
+    char address_family[16];
+    char status[32];
+    char path_type[32];
+    long long sessions;
+    long long reported_sessions;
+} st_storage_peer_mesh_family_aggregate;
+
+/* One stored natType of the devices (has_value is 0 for NULL), aggregateNatTypes. */
+typedef struct {
+    char nat_type[128];
+    int has_value;
+    long long devices;
+} st_storage_peer_mesh_nat_aggregate;
+
+/* One stored (mapping, filtering, discovery) triple of aggregateNatBehaviors; NULL reads as "". */
+typedef struct {
+    char mapping[128];
+    char filtering[128];
+    char discovery[128];
+    long long devices;
+} st_storage_peer_mesh_behavior_aggregate;
+
+typedef struct {
+    st_storage_peer_mesh_path_aggregate *paths;
+    size_t path_count;
+    st_storage_peer_mesh_family_aggregate *families;
+    size_t family_count;
+    st_storage_peer_mesh_nat_aggregate *nat_types;
+    size_t nat_type_count;
+    st_storage_peer_mesh_behavior_aggregate *behaviors;
+    size_t behavior_count;
+} st_storage_peer_mesh_stats;
+
+/*
+ * The grouped rows behind /api/admin/peer-mesh/stats (Java PeerMeshService.pathStats): first the
+ * tenant's sessions past their expiry are closed, as Java's expireIfStale does, then sessions are
+ * grouped by the path that carried more bytes (the stored path type on a tie) and status, and by
+ * remote address family as well; devices by NAT type and by NAT behaviour triple. An administrator
+ * sees the whole tenant, anyone else the sessions of the clients it owns and its own devices. The
+ * arrays are allocated; st_storage_peer_mesh_stats_free releases them.
+ */
+int st_storage_peer_mesh_stats_visible(const char *path,
+                                       const char *tenant_id,
+                                       const char *owner_username,
+                                       int include_all_clients,
+                                       st_storage_peer_mesh_stats *stats);
+void st_storage_peer_mesh_stats_free(st_storage_peer_mesh_stats *stats);
 int st_storage_close_peer_mesh_session_visible(const char *path,
                                                long long id,
                                                const char *tenant_id,
@@ -1205,9 +1285,9 @@ int st_storage_list_peer_mesh_service_audits(const char *path,
                                              size_t *event_count);
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record);
 /*
- * A page of exchange summaries: as Java's summary views, the headers and the request/response
- * previews are neither read nor returned (left empty); st_storage_get_http_exchange_visible
- * reads one exchange with them.
+ * A page of exchange summaries: as Java's summary views, the headers, the request/response
+ * previews and the stored bodies are neither read nor returned (left empty);
+ * st_storage_get_http_exchange_visible reads one exchange with them.
  */
 int st_storage_list_http_exchanges_visible(const char *path,
                                            long long client_id,
@@ -1231,6 +1311,8 @@ int st_storage_get_http_exchange_visible(const char *path,
                                          int include_all_clients,
                                          st_storage_http_exchange *item,
                                          int *found);
+/* Frees the bodies a detail lookup read into item; item itself stays the caller's. */
+void st_storage_http_exchange_free_bodies(st_storage_http_exchange *item);
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record);
 int st_storage_list_tcp_frames_visible(const char *path,
                                        long long client_id,

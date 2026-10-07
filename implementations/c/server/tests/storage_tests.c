@@ -1,5 +1,7 @@
 #include "storage.h"
 
+#include "client_auth_nonce.h"
+#include "crypto.h"
 #include "peer_egress.h"
 
 #include <sqlite3.h>
@@ -662,6 +664,73 @@ static int exec_script(const char *path, const char *sql)
 }
 
 /*
+ * Java ClientAuthNonceServiceIntegrationTests on the stored form: each (api key, nonce) pair is
+ * consumed once, under Java's id and with Java's text expiry; a row still answers at its exact
+ * expiry instant (Java deletes rows with expiresAt < now) and is gone a millisecond later, and
+ * every consume sweeps what has expired.
+ */
+static int test_client_auth_nonce_store(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "client-auth-nonce");
+    if (st_storage_init(path, 0) != 0) {
+        unlink(path);
+        return 1;
+    }
+    const long long now = 1791374400000LL; /* 2026-10-07T12:00:00.000Z */
+    int failures = 0;
+    if (st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now) != ST_CLIENT_AUTH_NONCE_ACCEPTED
+        || st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now) != ST_CLIENT_AUTH_NONCE_REPLAYED
+        || st_client_auth_nonce_consume_stored(path, "api-key-b", "nonce", now) != ST_CLIENT_AUTH_NONCE_ACCEPTED) {
+        fprintf(stderr, "stored nonce: each api key and nonce pair must be consumed exactly once\n");
+        failures = 1;
+    }
+    uint8_t digest[ST_SHA256_LEN];
+    char api_key_hash[ST_SHA256_HEX_LEN + 1];
+    char material[ST_SHA256_HEX_LEN + 16];
+    char nonce_id[ST_SHA256_HEX_LEN + 1];
+    st_sha256((const uint8_t *)"api-key-a", strlen("api-key-a"), digest);
+    st_hex_encode(digest, sizeof(digest), api_key_hash);
+    snprintf(material, sizeof(material), "%s\nnonce", api_key_hash);
+    st_sha256((const uint8_t *)material, strlen(material), digest);
+    st_hex_encode(digest, sizeof(digest), nonce_id);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM specus_client_auth_nonce WHERE id = '%s' AND api_key_hash = '%s' "
+             "AND expires_at = '2026-10-07T12:02:00.000Z'", nonce_id, api_key_hash);
+    if (!failures && query_int(path, sql) != 1) {
+        fprintf(stderr, "stored nonce row is not Java's id, api key hash and expiry\n");
+        failures = 1;
+    }
+    if (!failures
+        && (st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now + 120000LL)
+                != ST_CLIENT_AUTH_NONCE_REPLAYED
+            || st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now + 120001LL)
+                != ST_CLIENT_AUTH_NONCE_ACCEPTED
+            || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce") != 1)) {
+        fprintf(stderr, "stored nonce expiry boundary or sweep mismatch\n");
+        failures = 1;
+    }
+    if (!failures
+        && (st_client_auth_nonce_consume_stored(path, "api-key-c", "other", now + 300000LL)
+                != ST_CLIENT_AUTH_NONCE_ACCEPTED
+            || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce WHERE expires_at = "
+                               "'2026-10-07T12:07:00.000Z'") != 1
+            || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce") != 1)) {
+        fprintf(stderr, "stored nonce sweep of expired rows mismatch\n");
+        failures = 1;
+    }
+    unlink(path);
+    /* A database that cannot be opened fails closed. */
+    if (!failures && st_client_auth_nonce_consume_stored("/nonexistent-dir/specus.db", "api-key-a", "nonce", now)
+                         != ST_CLIENT_AUTH_NONCE_UNAVAILABLE) {
+        fprintf(stderr, "stored nonce on a broken database did not fail closed\n");
+        failures = 1;
+    }
+    return failures;
+}
+
+/*
  * Java PeerServiceDiscoverySchemaMigratorTests, createsTablesDisabledByDefaultAndAddsSessionCapabilityColumns.
  * A session table from before peer service discovery and peer egress gains the four capability
  * columns, and a row already there as well as a new row that does not set them announce nothing.
@@ -990,6 +1059,9 @@ int main(void)
         return 1;
     }
     if (test_peer_mesh_acl_direction_migration() != 0) {
+        return 1;
+    }
+    if (test_client_auth_nonce_store() != 0) {
         return 1;
     }
     if (test_peer_service_discovery_migration() != 0) {
