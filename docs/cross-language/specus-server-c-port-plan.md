@@ -225,7 +225,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
   - `remoteAddress`
   - `remotePort`
   - `specusConfigList`
-  - `httpSpecusConfigList`（存在数据库或 `SPECUS_HTTP_ROUTES` 配置时下发；空数组表示清空）
+  - `httpSpecusConfigList`（始终下发完整列表，没有 route 时为空数组；客户端把缺省同样当作清空）
 - REGISTER 校验：
   - `clientName` 必须等于登录 session。
   - `port/specusAddress/specusPort` 必须存在于服务端下发配置。
