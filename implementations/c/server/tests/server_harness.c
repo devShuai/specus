@@ -246,8 +246,17 @@ static int read_string_field(const uint8_t *body, size_t body_len, size_t *pos, 
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len)
 {
+    return channel_login_answer(port, runtime, role, fd_out, NULL, 0U, reason, reason_len);
+}
+
+int channel_login_answer(int port, const runtime_session *runtime, const char *role, int *fd_out,
+                         char *answered_name, size_t answered_name_len, char *reason, size_t reason_len)
+{
     *fd_out = -1;
     reason[0] = '\0';
+    if (answered_name != NULL && answered_name_len > 0U) {
+        answered_name[0] = '\0';
+    }
     int fd = connect_local(port);
     if (fd < 0 || send_login_request(fd, runtime, role) != 0) {
         if (fd >= 0) {
@@ -278,6 +287,9 @@ int channel_login(int port, const runtime_session *runtime, const char *role,
         return -1;
     }
     success = body[pos++] == 1U;
+    if (answered_name != NULL && answered_name_len > 0U) {
+        snprintf(answered_name, answered_name_len, "%s", client_name);
+    }
     if (read_string_field(body, header.length, &pos, reason, reason_len) != 0) {
         free(body);
         close(fd);
