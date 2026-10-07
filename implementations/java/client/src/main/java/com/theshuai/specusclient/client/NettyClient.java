@@ -413,14 +413,18 @@ public class NettyClient {
         onLoginSuccess(ConnectionRole.CONTROL, controlChannel.get());
     }
 
+    /**
+     * Applies a NAT_CONTROL push. Each push is the client's full snapshot of TCP mappings and HTTP
+     * routes, so a missing or null list means "none": routes only ever come from the HTTP login and
+     * NAT_CONTROL, and an older server left the HTTP list out once the last route was deleted.
+     * Without a live data connection only the bean the next data connection is built from changes.
+     */
     public void applyNatControl(SpecusBean updated) {
         if (updated == null) {
             return;
         }
         specusBean.setSpecusConfigList(nonNullList(updated.getSpecusConfigList()));
-        if (updated.getHttpSpecusConfigList() != null) {
-            specusBean.setHttpSpecusConfigList(nonNullList(updated.getHttpSpecusConfigList()));
-        }
+        specusBean.setHttpSpecusConfigList(nonNullList(updated.getHttpSpecusConfigList()));
         Channel data = dataChannel.get();
         if (data == null || !data.isActive()) {
             return;
@@ -429,9 +433,7 @@ public class NettyClient {
             NatClientHandler handler = data.pipeline().get(NatClientHandler.class);
             if (handler != null) {
                 handler.applyConfig(updated);
-                if (updated.getHttpSpecusConfigList() != null) {
-                    handler.applyHttpRoutes(updated.getHttpSpecusConfigList());
-                }
+                handler.applyHttpRoutes(updated.getHttpSpecusConfigList());
             }
         });
     }

@@ -1196,10 +1196,9 @@ public final class SpecusCore {
             if (specusArray != null) {
                 specusMappings = parseSpecusMappings(specusArray);
             }
-            JSONArray routeArray = json.optJSONArray("httpSpecusConfigList");
-            if (routeArray != null) {
-                httpRoutes = parseHttpRoutes(routeArray);
-            }
+            // Every NAT_CONTROL carries the full HTTP route set; a missing or null list means no
+            // routes. Keeping the old list there kept a deleted route forwarding until a reconnect.
+            httpRoutes = parseHttpRoutes(json.optJSONArray("httpSpecusConfigList"));
             String nextName = json.optString("clientName", "");
             if (!nextName.trim().isEmpty()) {
                 clientName = nextName;

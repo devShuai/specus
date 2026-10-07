@@ -159,6 +159,50 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ControlLoginWithoutRoutesOrMappingsPushesAnExplicitEmptyRouteList()
+    {
+        // A client that reconnects with its access token gets no new HTTP login snapshot, so if
+        // its last route was deleted while it was offline the login push is the only way it learns.
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var registry = _server!.HostServices.GetRequiredService<SessionRegistry>();
+        using var lifetime = new CancellationTokenSource();
+        var control = new CapturingControlWriter();
+        var context = new SpecusConnectionContext("direct-http-login-push-test", "127.0.0.1:12347", control,
+            lifetime.Token, lifetime.Cancel, new ReadGate(lifetime.Token),
+            new WriteBackpressureGate(64 * 1024, 1024 * 1024));
+        context.OnLoginSuccess(ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            clientSessionId: 1, connectionRole: ConnectionRole.Control);
+        registry.Replace(ClientName, context);
+        try
+        {
+            await using var scope = _server.HostServices.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ClientAccounts.SingleAsync(client => client.ClientName == ClientName,
+                cancellation.Token);
+            db.HttpRouteMappings.RemoveRange(db.HttpRouteMappings.Where(route => route.ClientId == account.Id));
+            db.SpecusMappings.RemoveRange(db.SpecusMappings.Where(mapping => mapping.ClientId == account.Id));
+            await db.SaveChangesAsync(cancellation.Token);
+
+            await scope.ServiceProvider.GetRequiredService<NatControlService>()
+                .PushOnLoginAsync(ClientName, cancellation.Token);
+
+            var pushed = Assert.Single(control.Messages);
+            Assert.Equal(MessageType.NatControl, pushed.MessageType);
+            using var bean = System.Text.Json.JsonDocument.Parse(pushed.Message!);
+            Assert.Equal(0, bean.RootElement.GetProperty("specusConfigList").GetArrayLength());
+            Assert.True(bean.RootElement.TryGetProperty("httpSpecusConfigList", out var routes),
+                "NAT_CONTROL omitted httpSpecusConfigList, so the client keeps its stale routes");
+            Assert.Equal(System.Text.Json.JsonValueKind.Array, routes.ValueKind);
+            Assert.Equal(0, routes.GetArrayLength());
+        }
+        finally
+        {
+            registry.Unbind(ClientName, context);
+            lifetime.Cancel();
+        }
+    }
+
+    [Fact]
     public async Task HttpResponseOnlyPublishesSafeDeclaredPeerTrailers()
     {
         await using var session = BoundNatSession.Bind(_server!);

@@ -1,0 +1,397 @@
+{
+  "name": "http-route-lifecycle-v1",
+  "version": 1,
+  "description": "When an HTTP route stops being reachable, and how the client learns it: the fail-closed public entry, the full route list on every NAT_CONTROL (login included), connections closed with a disabled, renamed or deleted client, and clients replacing their route table on every push. See protocol/spec/http-route.md.",
+  "notes": [
+    "server.scenarios：每个 scenario 在一台全新服务端上用一个新客户端账户（或种子客户端）从空 route 开始顺序重放 steps。createRoute/setRouteEnabled/deleteRoute/setClientEnabled/renameClient/deleteClient/createClient 走各实现的管理 API；connect 用一个假客户端完成控制与数据连接的登录（凭已有 token 或重新 HTTP 登录均可），disconnect 关闭这两条连接并等服务端确认离线。",
+    "假客户端对每个 HTTP OPEN 都回 200、Content-Type:text/plain、body 为 forwarded，模拟仍持有旧 route 列表、对任何 route 名都继续转发的客户端；它记录收到的 OPEN，expect.forwarded 断言该请求是否到达它。",
+    "expectLoginPush：connect 后控制连接上的第一条 NAT_CONTROL 必须带 httpSpecusConfigList 数组（空数组也必须出现），按集合比较 route 名。expectPush：该管理操作之后客户端在线时收到的下一条 NAT_CONTROL，比较方式相同；为 null 表示客户端离线，无需断言。",
+    "expectSessionClosed 为 true 时服务端必须在 5 秒内关闭假客户端的控制与数据连接；为 false 时不断言。",
+    "request：GET /http/{client}/{route}{path}，client 默认是当前账户名（URL 段按百分号编码），former 指最近一次 renameClient 之前的名字；route 为 null 时请求 /http/{client}/。credentials 为 none（不带 Authorization）、valid（Basic route-user:route-password）或 wrong（Basic route-user:wrong）。websocket 为 true 时带 Upgrade: websocket 与合法的 Sec-WebSocket-Key/Version 头。",
+    "expect：status 或 statusAnyOf 比较状态码；noStore 为 true 时 Cache-Control 必须含 no-store；basicChallenge 为 true 时 WWW-Authenticate 必须以 Basic 开头；body 存在时比较响应体；forwarded 见上。WebSocket 被拒绝时不得返回 101。",
+    "createRoute 的 targetBaseUrl 用 targetBaseUrl 字段，auth 为 true 时启用 Basic，凭据见 basicCredentials。renameClient 把当前账户名改为原名加 suffix。deleteClient 连同其 route 一起删除；createClient 用被删账户的原名新建账户，之后的 createRoute 属于新账户。",
+    "client.cases：客户端先以 loginSnapshot 作为 HTTP 登录快照，再依次处理 natControl（真实推送的 JSON 原文），每步之后的 route 表（route 名到 targetBaseUrl）必须等于 expectRoutes。"
+  ],
+  "basicCredentials": {"username": "route-user", "password": "route-password"},
+  "targetBaseUrl": "http://127.0.0.1:18080",
+  "fakeClientResponse": {
+    "status": 200,
+    "headers": ["Content-Type:text/plain"],
+    "body": "forwarded"
+  },
+  "server": {
+    "scenarios": [
+      {
+        "id": "delete-last-protected-route-while-online",
+        "title": "删除在线客户端最后一条受保护 route：推送空数组，入口 404，即使客户端仍在转发",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": true, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 401, "basicChallenge": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "credentials": "wrong",
+            "path": "/secret",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 401, "basicChallenge": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "credentials": "valid",
+            "path": "/secret",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 200, "body": "forwarded", "forwarded": true}
+          },
+          {
+            "op": "deleteRoute",
+            "route": "web",
+            "expectPush": []
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "credentials": "valid",
+            "path": "/secret",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "credentials": "valid",
+            "websocket": true,
+            "path": "/secret",
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          }
+        ]
+      },
+      {
+        "id": "delete-last-route-while-offline",
+        "title": "客户端离线时删除最后一条 route：凭 token 重连后的登录推送带空数组",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 200, "body": "forwarded", "forwarded": true}
+          },
+          {"op": "disconnect"},
+          {"op": "deleteRoute", "route": "web", "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": []
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          }
+        ]
+      },
+      {
+        "id": "disable-and-enable-one-of-two-routes",
+        "title": "停用两条 route 中的一条：推送只剩另一条，被停用的 404；重新启用后恢复",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {"op": "createRoute", "route": "api", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web", "api"]
+          },
+          {
+            "op": "setRouteEnabled",
+            "route": "web",
+            "enabled": false,
+            "expectPush": ["api"]
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "api",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 200, "body": "forwarded", "forwarded": true}
+          },
+          {
+            "op": "setRouteEnabled",
+            "route": "web",
+            "enabled": true,
+            "expectPush": ["web", "api"]
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 200, "body": "forwarded", "forwarded": true}
+          }
+        ]
+      },
+      {
+        "id": "unknown-route-and-missing-segment",
+        "title": "从未创建的 route 与缺少 route 段的路径都是 404，不转发",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {
+            "op": "request",
+            "route": "never-created",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "never-created",
+            "websocket": true,
+            "path": "/secret",
+            "credentials": "none",
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": null,
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "forwarded": false}
+          }
+        ]
+      },
+      {
+        "id": "disabled-client",
+        "title": "停用客户端：断开在线连接，route 404",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {"op": "setClientEnabled", "enabled": false, "expectSessionClosed": true},
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "websocket": true,
+            "path": "/secret",
+            "credentials": "none",
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          }
+        ]
+      },
+      {
+        "id": "renamed-client",
+        "title": "改名客户端：断开在线连接；旧名下的 route 404，新名下离线",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {"op": "renameClient", "suffix": "-renamed", "expectSessionClosed": true},
+          {
+            "op": "request",
+            "route": "web",
+            "client": "former",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {
+              "statusAnyOf": [502, 503],
+              "forwarded": false
+            }
+          }
+        ]
+      },
+      {
+        "id": "deleted-client-name-reused",
+        "title": "删除客户端后用同名新建：旧连接已断开，新客户端的 route 不会转发到旧连接",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {"op": "deleteClient", "expectSessionClosed": true},
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 404, "noStore": true, "forwarded": false}
+          },
+          {"op": "createClient"},
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {
+              "statusAnyOf": [502, 503],
+              "forwarded": false
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "client": {
+    "cases": [
+      {
+        "id": "list-replaces-the-login-snapshot",
+        "title": "完整列表整体替换登录快照",
+        "loginSnapshot": [
+          {"route": "web", "targetBaseUrl": "http://127.0.0.1:8080", "insecureSkipVerify": false}
+        ],
+        "steps": [
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[],\"httpSpecusConfigList\":[{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8081\",\"insecureSkipVerify\":false},{\"route\":\"api\",\"targetBaseUrl\":\"https://127.0.0.1:9443\",\"insecureSkipVerify\":true}]}",
+            "expectRoutes": {"web": "http://127.0.0.1:8081", "api": "https://127.0.0.1:9443"}
+          }
+        ]
+      },
+      {
+        "id": "empty-list-clears",
+        "title": "空数组清空全部 route",
+        "loginSnapshot": [
+          {"route": "web", "targetBaseUrl": "http://127.0.0.1:8080", "insecureSkipVerify": false}
+        ],
+        "steps": [
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[],\"httpSpecusConfigList\":[]}",
+            "expectRoutes": {}
+          }
+        ]
+      },
+      {
+        "id": "missing-list-clears",
+        "title": "字段缺省同样清空：客户端没有本地 route 可保留",
+        "loginSnapshot": [
+          {"route": "web", "targetBaseUrl": "http://127.0.0.1:8080", "insecureSkipVerify": false}
+        ],
+        "steps": [
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[]}",
+            "expectRoutes": {}
+          }
+        ]
+      },
+      {
+        "id": "null-list-clears",
+        "title": "字段为 null 同样清空",
+        "loginSnapshot": [
+          {"route": "web", "targetBaseUrl": "http://127.0.0.1:8080", "insecureSkipVerify": false}
+        ],
+        "steps": [
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[],\"httpSpecusConfigList\":null}",
+            "expectRoutes": {}
+          }
+        ]
+      },
+      {
+        "id": "routes-come-and-go",
+        "title": "route 先下发、再缺省、再换成另一条",
+        "loginSnapshot": [],
+        "steps": [
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[],\"httpSpecusConfigList\":[{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"insecureSkipVerify\":false}]}",
+            "expectRoutes": {"web": "http://127.0.0.1:8080"}
+          },
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[]}",
+            "expectRoutes": {}
+          },
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[],\"httpSpecusConfigList\":[{\"route\":\"api\",\"targetBaseUrl\":\"https://127.0.0.1:9443\",\"insecureSkipVerify\":true}]}",
+            "expectRoutes": {"api": "https://127.0.0.1:9443"}
+          },
+          {
+            "natControl": "{\"clientName\":\"route-lifecycle\",\"remoteAddress\":\"127.0.0.1\",\"remotePort\":7010,\"specusConfigList\":[],\"httpSpecusConfigList\":[]}",
+            "expectRoutes": {}
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -33,9 +33,10 @@ import java.util.Map;
  * 自从 HTTP 路由也由后台管理后，本服务在每次下发时**额外查询** {@link HttpRouteMappingRepository}
  * 把启用项装到同一条消息的 {@code httpSpecusConfigList} 字段。
  *
- * <p>The HTTP route list is always the client's full set of enabled routes, even when it is empty.
- * A client keeps the list it has when the field is missing, so omitting it once the last route was
- * deleted left that route forwarding on the client until it reconnected.
+ * <p>The HTTP route list is always the client's full set of enabled routes, even when it is empty,
+ * on every push including the one sent on login. Older clients keep the list they have when the field
+ * is missing, so omitting it once the last route was deleted left that route forwarding on the client
+ * until it reconnected.
  *
  * <p>HTTP 路由本身的 CRUD 在 {@link HttpRouteService}；它每次写入后回调本类的
  * {@link #pushSnapshotIfOnline(ClientAccount)}，因此一次 mutation 始终下发"当前权威全集"。
@@ -252,7 +253,10 @@ public class NatControlService {
 
     /**
      * 客户端登录成功后自动下发已启用的映射。不抛出异常，仅在失败时记录日志。
-     * 若两类配置都为空，跳过 push 以减少握手抖动：HTTP 登录响应已带上同样的空快照。
+     *
+     * <p>Always pushes the full snapshot, empty lists included. A client that reconnects after a
+     * network drop reuses its access token without a new HTTP login, so this push is the only way it
+     * learns that its last mapping or route was deleted while it was offline.
      */
     @Transactional(readOnly = true)
     public void pushOnLogin(String clientName) {
@@ -263,9 +267,6 @@ public class NatControlService {
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
-        if (mappings.isEmpty() && httpRoutes.isEmpty()) {
-            return;
-        }
         if (sendNatControl(clientName, mappings, httpRoutes)) {
             log.info("[nat-control] auto pushed {} tcp + {} http route(s) to {} on login",
                     mappings.size(), httpRoutes.size(), clientName);

@@ -164,36 +164,15 @@ func TestNormalizeOSUserMatchesJavaStyleUsername(t *testing.T) {
 	}
 }
 
-func TestNatControlConfigDistinguishesMissingAndEmptyHTTPRoutesLikeJava(t *testing.T) {
-	var missing natControlConfig
-	if err := json.Unmarshal([]byte(`{"specusConfigList":[]}`), &missing); err != nil {
-		t.Fatal(err)
-	}
-	if missing.HTTPSpecusConfigList != nil {
-		t.Fatalf("missing httpSpecusConfigList should keep current routes, got %#v", missing.HTTPSpecusConfigList)
-	}
-
-	var empty natControlConfig
-	if err := json.Unmarshal([]byte(`{"specusConfigList":[],"httpSpecusConfigList":[]}`), &empty); err != nil {
-		t.Fatal(err)
-	}
-	if empty.HTTPSpecusConfigList == nil {
-		t.Fatal("empty httpSpecusConfigList should be a present empty slice")
-	}
-	if len(*empty.HTTPSpecusConfigList) != 0 {
-		t.Fatalf("empty httpSpecusConfigList length = %d", len(*empty.HTTPSpecusConfigList))
-	}
-}
-
 func TestNatControlConfigReadsPerRouteTLSPolicy(t *testing.T) {
 	var snapshot natControlConfig
 	if err := json.Unmarshal([]byte(`{"specusConfigList":[],"httpSpecusConfigList":[{"route":"secure","targetBaseUrl":"https://localhost:8443","insecureSkipVerify":true}]}`), &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.HTTPSpecusConfigList == nil || len(*snapshot.HTTPSpecusConfigList) != 1 {
+	if len(snapshot.HTTPSpecusConfigList) != 1 {
 		t.Fatalf("unexpected HTTP route snapshot: %#v", snapshot.HTTPSpecusConfigList)
 	}
-	if !(*snapshot.HTTPSpecusConfigList)[0].InsecureSkipVerify {
+	if !snapshot.HTTPSpecusConfigList[0].InsecureSkipVerify {
 		t.Fatal("route-level insecureSkipVerify was not preserved")
 	}
 }
