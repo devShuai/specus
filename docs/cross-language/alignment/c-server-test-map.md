@@ -20,7 +20,7 @@
 
 ## 汇总
 
-79 个 Java 测试类中，**覆盖 20 个，部分 46 个，无 13 个**（2026-10-06 随 C 认证修复、#132、NAT stream 语义修正与 C OIDC 对齐更新）。
+79 个 Java 测试类中，**覆盖 25 个，部分 41 个，无 13 个**（2026-10-06 随 C 认证修复、#132、NAT stream 语义修正与 C OIDC 对齐更新；2026-10-07 随 C HTTP 媒体采集对齐更新）。
 
 审计点名的类目前的状态如下：
 
@@ -122,15 +122,15 @@
 
 ## 7. HTTP 媒体采集
 
-均由 ctest `media_capture_tests` 经 `scripts/media_capture_test.sh` 对 fake S3 运行；没有接过真实 RustFS。
+均由 ctest `media_capture_tests` 经 `scripts/media_capture_test.sh` 对 fake S3 运行；没有接过真实 RustFS。测试在进程内起真实的管理监听：采集走 `/http/{client}/{route}`，由脚本化的 forwarder 扮演客户端上游（完整正文、正文中途 RST，或保持响应不结束）；回放、票据和采集列表经 loopback socket 请求真实的公开与管理端点。fake S3 记录发起的上传和删除的对象，供测试核对。
 
 | Java 测试类 | @Test | 状态 | C 证据 | 说明 |
 | --- | ---: | --- | --- | --- |
-| `management/service/HttpMediaCaptureServiceTests` | 10 | 部分 | `media_capture_tests.c`："completed media capture database mismatch"、"first/second sparse media range capture failed"、"expired media capture cleanup mismatch" | 未测：无 Content-Length 的流、大文件 multipart、播放器取消后保留已收区间、跳过重复区间、部分区间重试、唯一键竞争、源 URL 去 token、提高保留期后延长。 |
-| `management/service/HttpMediaManifestSupportTests` | 4 | 部分 | "rewritten HLS manifest response mismatch"、"public rewritten HLS manifest response mismatch" | 未测：媒体响应分类、DASH 模板 token、非法 Content-Range。 |
-| `management/service/HttpMediaPlaybackServiceTests` | 8 | 部分 | "public media ranged playback mismatch"、"sparse media range stitching mismatch" | 未测：在首个未缓存字节处截断、起点落在空洞时拒绝、离线合并、后缀 Range、保留 Content-Encoding。 |
-| `management/service/HttpMediaPlaybackTicketServiceTests` | 2 | 部分 | "sparse media playback ticket mismatch" | 未测：回源开关写入 ticket。 |
-| `management/controller/PublicHttpMediaPlaybackResourceTests` | 5 | 部分 | "public media ranged playback mismatch" | 未测：Range 未命中不回退、开启回源时重定向、manifest 资源未采集时返回 `404` 或重定向。 |
+| `management/service/HttpMediaCaptureServiceTests` | 10 | 覆盖 | `media_capture_tests.c`：`test_streaming_response_without_content_length`、`test_large_response_is_a_multipart_upload`（"completed media capture database mismatch"；脚本另核对 5 MiB 与 3 字节两个 part）、`test_interrupted_response_keeps_received_range`、`test_repeated_range_is_not_stored_again`、`test_partial_range_can_be_retried`、`test_different_ranges_are_separate_objects`、`test_concurrent_duplicate_is_externalized`、`test_source_url_view_is_redacted`、`test_retention_cleanup`（"raised media retention did not extend the capture"、"expired media capture cleanup mismatch"） | 10 项都有对应，另测了过期未清理的去重键会让出（`test_stale_deduplication_key_is_released`）。本次修正：无 Content-Length 的流不再生成去重键；响应中断时 `content_range_end` 改为实际收到的最后一个字节（原先保留 Content-Range 声明的终点）；重复区间返回 externalized、非 active 的会话（原先返回 NULL）；过期去重键原先会让新行在唯一索引上插入失败；脱敏标记由 `[REDACTED]` 改为 `***`。两处测法不同：播放器取消用上游中途 RST 触发，C 里两者都经 `admin_forward_direct_http` 调 `st_media_capture_fail`，而浏览器断开后哪次发送失败没有确定时机；唯一键竞争在 C 不会出现，因为查重和插入在同一个 `BEGIN IMMEDIATE` 事务里，测试断言的是 Java 用例要的结果：第一个请求仍在 CAPTURING 时，同区间的第二个请求成为 externalized 重复，不另起上传。 |
+| `management/service/HttpMediaManifestSupportTests` | 4 | 覆盖 | `test_media_response_classification`、`test_live_hls_manifest`（"HLS manifest references mismatch"、"public rewritten HLS manifest response mismatch"）、`test_dash_template_tokens`、`test_invalid_content_ranges`；另有 `test_encoded_vod_hls_manifest` | Java 直接调用 `classify`/`parse`/`rewrite`/`parseContentRange`，C 经采集和回放端点看同样的结果：分类写入 `media_kind`，解析结果写入 `specus_http_media_reference`（INITIALIZATION、KEY、序号 12 的 SEGMENT 及解析后的路径）和 `live_stream`，改写结果取自公开 manifest 响应。本次修正：C 原先完全不解析清单（不存引用、没有直播窗口、不填 `segment_sequence`/`initialization_segment`）；`$` 被编码成 `%24`，DASH 模板失效；`Content-Range` 后带多余文本也被接受；引用解析不处理 `../`、CRLF 行尾和 gzip 编码的清单。差异：`br` 编码的清单 C 无法解码，按存储的原字节处理。 |
+| `management/service/HttpMediaPlaybackServiceTests` | 8 | 覆盖 | `test_range_across_objects`（"sparse media range stitching mismatch"）、`test_sparse_resource_playback`、`test_initial_request_plays_selected_block`、`test_offline_cache_layout`、`test_suffix_range_keeps_content_encoding` | 8 项都经公开 `/play`、票据或采集列表验证：跨对象拼接、在首个未缓存字节处截断、起点落在空洞时 `416` 并给出原因、无 Range 时播放锚点自身的区块、离线合并（票据的 `cachedRanges`）、稀疏与相邻区间的可用性（列表的 `playable`/`offlineReady`/`playbackMessage`）、后缀 Range 与保留 Content-Encoding。本次修正：无 Range 时原先从第一个区块播起；原先列表只看单行，票据只报单行区间。差异：C 把正文缓冲在约 20 MiB 的响应缓冲里，超出时以 `206` 返回较短的区间，Java 流式输出。 |
+| `management/service/HttpMediaPlaybackTicketServiceTests` | 2 | 覆盖 | `test_playback_tickets`（"sparse media playback ticket mismatch"、"resolved media playback ticket backfill mismatch"）；`test_live_hls_manifest`（"HLS playback ticket mismatch"） | 票据的 `playUrl`、`totalBytes`、初始区间、`cachedRanges` 和 `backfillMissing` 与 Java 断言一致。回源开关经解析后的票据验证：同一处缺口，不回源的票据得到 `416`，回源的得到 `307`。清单票据与 Java 一样不报总长和区间。 |
+| `management/controller/PublicHttpMediaPlaybackResourceTests` | 5 | 覆盖 | `test_initial_request_plays_selected_block`（"initial request did not play the selected cached block"）、`test_public_range_miss`、`test_public_uncaptured_asset` | 5 项都有对应：无 Range 的首个请求得到 `206 bytes 100-149/300`；Range 未命中时 `416`，没有 Location，带 `bytes */3197229691`、`private, no-store` 和原因正文；开启回源时 `307` 到 `/http/{client}/{route}{source}`；未采集的 asset `404` 或 `307`。本次修正：`416` 原先正文为空；asset 的 `url` 参数解码后原样写进 Location，CR/LF 可注入响应头，现在剔除换行并对 URI 不允许的字节做百分号编码（测试覆盖了注入尝试）。 |
 
 ## 8. Peer Mesh、Egress、STUN/TURN
 
