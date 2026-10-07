@@ -68,6 +68,12 @@ void close_fd(int *fd);
 /* Control and data connections */
 int send_login_request(int fd, const runtime_session *runtime, const char *role);
 /*
+ * Reads the next frame as the answer to a LOGIN_REQUEST: 1 when it is a LOGIN_RESPONSE, with
+ * *success and the server's reason filled; 0 when another frame came first (its command in
+ * *command); -1 on I/O failure, a timeout or a malformed response. reason describes the failure.
+ */
+int read_login_response(int fd, int timeout_ms, int *command, int *success, char *reason, size_t reason_len);
+/*
  * Logs a connection in with the given role. Returns 1 and keeps the socket in *fd_out when the
  * server accepts, 0 with the server's reason when it refuses (the socket is closed), -1 on I/O
  * failure.

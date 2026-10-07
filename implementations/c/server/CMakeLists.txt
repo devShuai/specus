@@ -224,6 +224,22 @@ add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 45)
+# The STCE envelope and the cluster identifiers against protocol/test-vectors/public-transfer-cluster-v2.json
+# (Java PublicTransferClusterFrameTests and PublicTransferCoordinationServiceTests).
+add_executable(specus_c_public_cluster_codec_tests tests/public_cluster_codec_tests.c)
+target_link_libraries(specus_c_public_cluster_codec_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_public_cluster_codec_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_public_cluster_codec_tests PRIVATE
+    ST_CLUSTER_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/public-transfer-cluster-v2.json")
+add_test(NAME public_cluster_codec_tests COMMAND specus_c_public_cluster_codec_tests)
+# Discovery, the STWR2 relay, WebSocket tickets and public rooms over loopback HTTP and WebSocket
+# (Java PublicTransferDiscoveryWebSocketHandlerTests, PublicTransferRelayFrameTests,
+# WebSocketTicketServiceTests, PublicTransferRoomResourceTests, PublicTransferRoomServiceTests).
+add_executable(specus_c_public_transfer_tests tests/public_transfer_tests.c)
+target_link_libraries(specus_c_public_transfer_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_public_transfer_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME public_transfer_tests COMMAND specus_c_public_transfer_tests)
+set_tests_properties(public_transfer_tests PROPERTIES TIMEOUT 120)
 
 # The shared product metrics vector through the real request handling, the write-path hooks, and a
 # real server process (client_online on a control login, the HTTP layer's body hand-over).
