@@ -58,12 +58,17 @@ type API struct {
 	shares           *httpshare.Service
 	connectivity     *connectivity.Checker
 	productMetrics   *productmetrics.Service
+	clientTokens     *auth.SessionStore
 	logger           *slog.Logger
 }
 
 // SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
 // long-standing NewAPI constructor used by integration tests.
 func (a *API) SetMediaCapture(service *media.Service) { a.mediaCapture = service }
+
+// SetClientTokenSessions attaches the store of issued client runtime tokens, so that deleting an
+// account revokes its tokens and renaming it renames its sessions.
+func (a *API) SetClientTokenSessions(sessions *auth.SessionStore) { a.clientTokens = sessions }
 
 // SetClientPackageDirectory configures the durable filesystem location used by the package
 // catalog. The directory is created lazily on the first upload so read-only deployments that do
@@ -1037,6 +1042,9 @@ func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 	}
 	a.shares.CutStreams(revoked)
 
+	if oldName != account.ClientName && a.clientTokens != nil {
+		a.clientTokens.RenameClient(account.ID, account.ClientName)
+	}
 	// Kick the live session if the account was renamed or disabled.
 	if !account.Enabled && (wasEnabled || oldName != account.ClientName) {
 		a.kick(oldName, store.ReasonAdminDisabled)
@@ -1073,6 +1081,7 @@ func (a *API) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.shares.CutStreams(revoked)
+	a.revokeClientTokens(r.Context(), account.ID)
 	a.kick(account.ClientName, store.ReasonAdminDeleted)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -2641,6 +2650,21 @@ func (a *API) pushNatControl(ctx context.Context, clientID int64, clientName str
 	pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _, _ = a.natControl.PushToID(pushCtx, clientID, clientName)
+}
+
+// revokeClientTokens forgets the runtime tokens of a deleted account and closes their session rows.
+// The token login resolves accounts by id, so this is defense in depth: no reconnect of the deleted
+// account's machines can log in again, whichever account later takes its name.
+func (a *API) revokeClientTokens(ctx context.Context, clientID int64) {
+	if a.clientTokens == nil {
+		return
+	}
+	now := time.Now()
+	for _, sessionID := range a.clientTokens.RevokeClient(clientID) {
+		if err := a.db.MarkClientSessionDisconnected(ctx, sessionID, auth.StatusDisconnected, now); err != nil {
+			a.logger.Warn("close revoked client session failed", "session", sessionID, "err", err)
+		}
+	}
 }
 
 func (a *API) kick(clientName, reason string) {

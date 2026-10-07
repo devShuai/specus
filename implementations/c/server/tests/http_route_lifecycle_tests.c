@@ -214,6 +214,8 @@ typedef struct {
     char former_name[256];
     route_record routes[MAX_ROUTES];
     size_t route_count;
+    /* The name the last connect logged in with; reconnect presents its token under it again. */
+    char connected_name[256];
     int control;
     int data;
     int failures;
@@ -905,6 +907,44 @@ static int op_expect_still_connected(replay *r)
     return 0;
 }
 
+/* Another account under the name before the last rename, with the given routes; it never logs in. */
+static int op_create_former_name_client(replay *r, const char *step)
+{
+    STEP_CHECK(r, *r->former_name != '\0', "createFormerNameClient without an earlier renameClient");
+    char *name_json = st_json_escape(r->former_name);
+    char body[512];
+    snprintf(body, sizeof(body), "{\"clientName\":\"%s\",\"enabled\":true}", name_json == NULL ? "" : name_json);
+    free(name_json);
+    char *response = NULL;
+    STEP_CHECK(r, admin_call(r, "POST", "/api/admin/clients", body, 201, &response) == 0,
+               "client %s was not created", r->former_name);
+    long long id = 0;
+    int parsed = st_json_get_i64(response, "id", &id) == 0 && id > 0;
+    free(response);
+    STEP_CHECK(r, parsed && id != r->client_id, "the created client %s has no id of its own", r->former_name);
+    char **routes = NULL;
+    size_t route_count = 0U;
+    STEP_CHECK(r, vec_string_list(step, "routes", &routes, &route_count) == 0, "createFormerNameClient without routes");
+    int failed = 0;
+    for (size_t i = 0; !failed && i < route_count; ++i) {
+        char *route_json = st_json_escape(routes[i]);
+        char *target_json = st_json_escape(target_base_url);
+        char route_body[1024];
+        char path[128];
+        snprintf(route_body, sizeof(route_body), "{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"enabled\":true}",
+                 route_json == NULL ? "" : route_json, target_json == NULL ? "" : target_json);
+        snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", id);
+        free(route_json);
+        free(target_json);
+        failed = admin_call(r, "POST", path, route_body, 201, NULL) != 0;
+        if (failed) {
+            step_fail(r, __LINE__, "route %s of %s was not created", routes[i], r->former_name);
+        }
+    }
+    st_json_free_string_array(routes, route_count);
+    return failed;
+}
+
 static int op_connect(replay *r)
 {
     char reason[256];
@@ -913,6 +953,35 @@ static int op_connect(replay *r)
     STEP_CHECK(r, control_rc == 1, "control login of %s: %s", r->runtime.client_name, reason);
     int data_rc = channel_login(r->server->control_port, &r->runtime, "data", &r->data, reason, sizeof(reason));
     STEP_CHECK(r, data_rc == 1, "data login of %s: %s", r->runtime.client_name, reason);
+    snprintf(r->connected_name, sizeof(r->connected_name), "%s", r->runtime.client_name);
+    return 0;
+}
+
+/*
+ * The token of the last connect again, under the name it logged in with then and no new HTTP
+ * login: refused, or accepted under the account's current name.
+ */
+static int op_reconnect(replay *r, const char *step)
+{
+    STEP_CHECK(r, r->control < 0 && r->data < 0, "reconnect while the fake client is still connected");
+    STEP_CHECK(r, *r->connected_name != '\0', "reconnect without an earlier connect");
+    STEP_CHECK(r, vec_present(step, "expectRefused"), "reconnect without expectRefused");
+    runtime_session token = r->runtime;
+    snprintf(token.client_name, sizeof(token.client_name), "%s", r->connected_name);
+    char answered[256];
+    char reason[256];
+    int control_rc = channel_login_answer(r->server->control_port, &token, "control", &r->control,
+                                          answered, sizeof(answered), reason, sizeof(reason));
+    if (vec_bool(step, "expectRefused")) {
+        STEP_CHECK(r, control_rc == 0, "the token of %s %s, expected it refused (answered as %s)",
+                   r->connected_name, control_rc == 1 ? "logged in again" : "got no login answer", answered);
+        return 0;
+    }
+    STEP_CHECK(r, control_rc == 1, "control login with the token of %s: %s", r->connected_name, reason);
+    STEP_CHECK(r, strcmp(answered, r->client_name) == 0,
+               "control login answered as %s, expected the account's current name %s", answered, r->client_name);
+    int data_rc = channel_login(r->server->control_port, &token, "data", &r->data, reason, sizeof(reason));
+    STEP_CHECK(r, data_rc == 1, "data login with the token of %s: %s", r->connected_name, reason);
     return 0;
 }
 
@@ -961,8 +1030,12 @@ static int run_step(replay *r, const char *step)
         closed_reason = "ADMIN_DELETED";
     } else if (strcmp(op, "createClient") == 0) {
         failed = op_create_client(r);
+    } else if (strcmp(op, "createFormerNameClient") == 0) {
+        failed = op_create_former_name_client(r, step);
     } else if (strcmp(op, "connect") == 0) {
         failed = op_connect(r) || check_push(r, step, "expectLoginPush");
+    } else if (strcmp(op, "reconnect") == 0) {
+        failed = op_reconnect(r, step) || (!vec_bool(step, "expectRefused") && check_push(r, step, "expectLoginPush"));
     } else if (strcmp(op, "disconnect") == 0) {
         failed = op_disconnect(r);
     } else if (strcmp(op, "request") == 0) {

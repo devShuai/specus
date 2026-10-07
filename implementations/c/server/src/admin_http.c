@@ -2537,6 +2537,35 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(java_version);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client identity build failed\"}");
     }
+    /*
+     * The identity names its account by id; the name it recorded may since belong to another
+     * account. As Java and Go do, the account is loaded by id within the credential's tenant, and its
+     * current name is what the session, the route snapshot and the response carry.
+     */
+    st_storage_client account;
+    int account_state = st_storage_get_client(database_path, identity.client_id, &account) != 0
+        || strcmp(account.tenant_id[0] == '\0' ? "default" : account.tenant_id,
+                  credential.tenant_id[0] == '\0' ? "default" : credential.tenant_id) != 0
+        ? -1
+        : (account.enabled ? 0 : 1);
+    if (account_state != 0) {
+        free(api_key);
+        free(timestamp);
+        free(nonce);
+        free(signature);
+        free(machine_fingerprint);
+        free(os_user);
+        free(hostname);
+        free(os_name);
+        free(os_version);
+        free(os_arch);
+        free(client_version);
+        free(java_version);
+        return account_state > 0
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端已停用\"}")
+            : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client account missing\"}");
+    }
+    snprintf(identity.client_name, sizeof(identity.client_name), "%s", account.client_name);
 
     char *peer_public_key = st_json_get_string(body, "peerPublicKey");
     if (peer_public_key != NULL && *peer_public_key != '\0'
