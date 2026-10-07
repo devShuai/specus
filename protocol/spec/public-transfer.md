@@ -743,20 +743,23 @@ ctest 或 `scripts/` 下的脚本；逐项对照见
   UTF-8/UTF-16 边界和 STWR2 定向 relay。SQLite 模式还实现 access-token list/create/revoke、8 位配对码创建/原子兑换、
   20 个有效邀请上限、过期/撤销拒绝和来源 IP 兑换限流；明文邀请和配对码不持久化。SQLite 模式也实现本规范四个流程图
   版本端点：OWNER/EDITOR 可创建，VIEWER 只读，只有 OWNER 可删除；快照严格限制为 3 MiB 且每房间保留最新 50 份。以上由
-  `admin_http_tests` 的真实 socket 与并发兑换用例覆盖。
+  `admin_http_tests` 与 `public_transfer_tests` 的真实 socket 与并发兑换用例覆盖。
 - 多实例：`SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true` 时 C 使用 Redis（`src/public_coordination.c`）实现 presence、
-  合并 roster revision、全局名称/peer/容量检查、分布式消息限流和 STCE2 Pub/Sub 文本/二进制路由；Redis 不可用时关闭
-  本地发现 socket，不回退到进程内 presence/routing；`rediss://` 被拒绝。证据：`public_coordination_tests`（独立
-  `redis-server`）、`public_discovery_cluster_e2e`（两个 C 进程共享 Redis：跨实例 roster revision、名称占用、重复 peer、
-  定向文本、二进制 relay、隐藏 peer 回退，以及 Redis 停止后两个实例都失败关闭）和 CI 中的
+  合并 roster revision、全局名称/peer/容量检查、分布式消息限流、配对码兑换与公开 presign 的共享来源 IP 窗口
+  （[public-transfer-cluster.md](public-transfer-cluster.md) 第 6 节）和 STCE2 Pub/Sub 文本/二进制路由；Redis 不可用时关闭
+  本地发现 socket、两个来源 IP 窗口回 `429`，不回退到进程内 presence/routing/计数；`rediss://` 被拒绝。证据：
+  `public_coordination_tests`（独立 `redis-server`，另起一个进程作为第二个实例）、`public_cluster_codec_tests`（STCE2 共享向量）、
+  `public_discovery_cluster_e2e`（两个 C 进程共享 Redis：跨实例 roster revision、名称占用、重复 peer、
+  定向文本、二进制 relay、隐藏 peer 回退与续期、跨实例共享的兑换窗口，以及 Redis 停止后两个实例都失败关闭）和 CI 中的
   `java_c_discovery_interop.sh`（Java reference server 与 C server 共享 Redis：roster、全局名称占用和双向定向信令）。
   Go/.NET server 与 C 的 Redis 混部没有证据。
 - 附件 REST 与对象存储：C 只支持 `SPECUS_OBJECT_STORAGE_PROVIDER=aliyun-oss`（第 4.2 节的 OSS V4 签名，
   `src/object_storage.c`）；其它 provider 值或不完整配置会被启动安全基线拒绝。配置后六个附件路径、OSS callback 和一次性下载 grant 按第 3、4
   节工作。`object_storage_e2e` 对本地 fake OSS HTTP 端点跑通公开互传路径：presign-upload、直传 PUT、HEAD complete、
   presign-download、grant 首次 `302`、重放 `410`、`HEAD` `405`、presign 限流 `429`、账号下载计费与 capabilities 快照；
-  `object_storage_tests` 覆盖签名向量、callback header 与过期清理。管理端 `/api/admin/client-messages/attachments/*`
-  的启用分支与公开路径共用实现，但只有“未配置时 `409`”有测试。真实私有 OSS 没有运行证据。
+  `object_storage_tests` 经模块入口与 loopback fake OSS 覆盖签名向量、callback header、callback 验签与公钥缓存、房间与账号
+  额度、文件名规范化、ID 冲突重试和分批过期清理，管理端 `/api/admin/client-messages/attachments/*` 的启用分支（目标访问、
+  租户隔离、作用域分离）也有测试。真实私有 OSS 没有运行证据。
 - 未配置 provider 时，六个附件路径不得返回占位成功 URL，必须明确返回 `409 Conflict`。响应为：
 
 ```json
