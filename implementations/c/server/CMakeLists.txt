@@ -78,6 +78,12 @@ target_link_libraries(specus_c_github_release_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_github_release_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME github_release_tests COMMAND specus_c_github_release_tests)
 
+# The client catalogue and hosted packages against the Java ClientDownloadLink*/ClientPackage* tests.
+add_executable(specus_c_client_package_tests tests/client_package_tests.c)
+target_link_libraries(specus_c_client_package_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_package_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_package_tests COMMAND specus_c_client_package_tests)
+
 add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -252,6 +258,14 @@ target_compile_options(specus_c_security_rules_tests PRIVATE -Wall -Wextra -Wped
 add_test(NAME security_rules_tests
     COMMAND specus_c_security_rules_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(security_rules_tests PROPERTIES TIMEOUT 120)
+
+# Java ConnectionArchiveServiceTests on a real server process: the scheduled monthly archive.
+add_executable(specus_c_connection_archive_tests tests/connection_archive_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connection_archive_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connection_archive_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connection_archive_tests
+    COMMAND specus_c_connection_archive_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connection_archive_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_http_route_lifecycle_tests tests/http_route_lifecycle_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_http_route_lifecycle_tests PRIVATE specus_c_core)

@@ -330,21 +330,7 @@ char *st_json_escape(const char *value)
     return out;
 }
 
-static int append_byte(char **out, size_t *len, size_t *cap, unsigned char value)
-{
-    if (*len + 2U > *cap) {
-        size_t next = *cap == 0 ? 32U : *cap * 2U;
-        char *grown = (char *)realloc(*out, next);
-        if (grown == NULL) {
-            return -1;
-        }
-        *out = grown;
-        *cap = next;
-    }
-    (*out)[(*len)++] = (char)value;
-    (*out)[*len] = '\0';
-    return 0;
-}
+static int append_bytes(char **out, size_t *len, size_t *cap, const unsigned char *bytes, size_t need);
 
 static int append_utf8(char **out, size_t *len, size_t *cap, unsigned int codepoint)
 {
@@ -369,6 +355,11 @@ static int append_utf8(char **out, size_t *len, size_t *cap, unsigned int codepo
         bytes[3] = (unsigned char)(0x80U | (codepoint & 0x3fU));
         need = 4;
     }
+    return append_bytes(out, len, cap, bytes, need);
+}
+
+static int append_bytes(char **out, size_t *len, size_t *cap, const unsigned char *bytes, size_t need)
+{
     if (*len + need + 1U > *cap) {
         size_t next = *cap == 0 ? 32U : *cap;
         while (next < *len + need + 1U) {
@@ -463,11 +454,9 @@ static char *parse_json_string_value_len(const char **cursor, size_t *out_len)
                 free(out);
                 return NULL;
             }
-            for (size_t i = 0U; i < sequence; ++i) {
-                if (append_byte(&out, &len, &cap, (unsigned char)p[i]) != 0) {
-                    free(out);
-                    return NULL;
-                }
+            if (append_bytes(&out, &len, &cap, (const unsigned char *)p, sequence) != 0) {
+                free(out);
+                return NULL;
             }
             p += sequence;
             continue;
@@ -554,7 +543,11 @@ static char *parse_json_string_value_len(const char **cursor, size_t *out_len)
                     return NULL;
             }
         }
-        if (append_utf8(&out, &len, &cap, ch) != 0) {
+        /*
+         * What is left here is ASCII (raw UTF-8 was copied above and escapes either yield ASCII or
+         * were appended as UTF-8), so one byte is one character.
+         */
+        if (append_bytes(&out, &len, &cap, &ch, 1U) != 0) {
             free(out);
             return NULL;
         }

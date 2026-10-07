@@ -153,8 +153,10 @@ Additional runtime knobs:
 | `SPECUS_MEDIA_CAPTURE_ENABLED` | `false` | Enables route-level media capture after its S3-compatible endpoint/bucket/credentials validate. |
 | `SPECUS_MEDIA_CAPTURE_ENDPOINT` / `REGION` / `BUCKET` | unset | Dedicated RustFS/S3-compatible media store. |
 | `SPECUS_ELASTICSEARCH_URIS` | unset | Enables Elasticsearch HTTP/TCP detail storage and management queries; unset keeps SQLite details. |
-| `SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY` | `data/client-packages` | Root for hosted client-package artifacts. |
+| `SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY` | `./data` | Parent directory of hosted client-package artifacts; the bytes live in its `packages` child, as in Java. |
 | `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED` | `true` | Merges validated official GitHub latest-release assets for targets without any configured row. |
+| `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` | `60` | Connection detail older than this many UTC days is rolled into monthly totals and deleted; `0` or less turns the archive off. |
+| `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` | Delay between archive runs; the first run comes one interval after start. |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `false` | Enables `/auth/register`; optional SMTP verification and Turnstile use the `SPECUS_AUTH_EMAIL_*`, `SPECUS_AUTH_SMTP_*`, and `SPECUS_AUTH_TURNSTILE_*` groups. |
 | `SPECUS_OIDC_CLIENT_ID` | unset | OIDC browser client id. Non-blank marks OIDC as configured in `/oidc-config`; without it `/oidc/token` answers `503`. ID tokens must list it in `aud`, and `azp` must equal it when present or when `aud` has several entries. |
 | `SPECUS_OIDC_ISSUER` | `https://certus.devshuai.com` | Exact `iss` required of ID tokens and of identity-provider bearer tokens. Set but blank refuses every token, as Java does. |
@@ -237,7 +239,8 @@ The management API skeleton is enabled by setting `SPECUS_ADMIN_PORT`. It curren
 `GET/POST /api/admin/clients`, `PUT/DELETE /api/admin/clients/{id}`, startup credential endpoints
 `GET/POST /api/admin/client-credentials`, `PUT/DELETE /api/admin/client-credentials/{id}`,
 client package endpoints `GET /api/public/client-downloads`, `GET /api/public/client-version-check`,
-`GET/HEAD /api/public/client-packages/{id}/download`, `GET/POST /api/admin/client-downloads`,
+`GET/HEAD /api/public/client-packages/{id}/download` (byte ranges and `If-None-Match` as Spring serves a
+`Resource`), `GET/POST /api/admin/client-downloads`,
 `POST /api/admin/client-packages`, `POST /api/admin/client-downloads/{id}/latest`, and
 `PUT/DELETE /api/admin/client-downloads/{id}`,
 TCP mapping endpoints `GET /api/admin/specus-mappings`, `POST /api/admin/clients/{id}/specus-mappings`,
@@ -377,7 +380,10 @@ with missing `clientId`, `channelId`, `remoteAddress`, `disconnectedAt`, and dis
 fields represented as `null`.
 `GET /api/admin/connection-stats` follows Java's monthly archive view shape and returns an array of
 `id`, `clientId`, `clientName`, `month`, `total`, `success`, `failure`, and `updatedAt`. Existing
-archive rows without `client_id` or `updated_at` are returned with nullable fields.
+archive rows without `client_id` or `updated_at` are returned with nullable fields. The totals come
+from the background archive (Java `ConnectionArchiveService`): every
+`SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS`, detail older than `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS`
+UTC days is added to its client's `yyyy-MM` row and deleted in the same transaction.
 `GET /api/admin/traffic` and `GET /api/admin/traffic/resources` follow the Java summary view
 shapes for daily client traffic and per-resource traffic. When `SPECUS_DATABASE_PATH` is set, the
 C server records successful TCP specus bytes as `TCP_SPECUS` resources with keys such as

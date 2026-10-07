@@ -932,7 +932,15 @@ int st_storage_list_connections_visible(const char *path,
                                         size_t max_connections,
                                         size_t *connection_count,
                                         long long *total_count);
+/* Rolls detail rows connected before the timestamp into monthly connection_stat rows, then deletes them. */
 int st_storage_archive_connections(const char *path, const char *before_timestamp);
+/*
+ * The "yyyy-MM-dd" UTC date retention_days before now (Java's archive cutoff); -1 when
+ * retention_days <= 0.
+ */
+int st_storage_connection_archive_cutoff(int retention_days, long long now_epoch_seconds, char out[11]);
+/* Java ConnectionArchiveService.archive: nothing when retention_days <= 0. */
+int st_storage_archive_expired_connections(const char *path, int retention_days, long long now_epoch_seconds);
 int st_storage_load_connection_stat(const char *path,
                                     const char *client_name,
                                     const char *stat_date,
