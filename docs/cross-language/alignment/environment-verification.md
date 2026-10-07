@@ -53,7 +53,8 @@
   - CI：「C server (Linux)」任务的 CTest 步骤自动包含新单测与 `tls_deployment_e2e`；Java、Go、.NET 各新增一步 `tls_client_e2e.sh`（Java 不带额外参数，Go/.NET 与既有步骤同样以 `SPECUS_CLIENT_COMMAND` + `SPECUS_SMOKE_REUSE_BUILD=1` 运行）。记录时尚未有包含这些改动的 CI 运行。
 - C server NAT stream 语义（2026-10-06，分支 `fix/c-server-stream-semantics`）：`Ubuntu-24.04` WSL 中以 `git archive` 导出的全新目录做 Release CMake 构建 0 warning，新增的 `nat_stream_tests` 用同一测试二进制对修复前（`5394a3b`）的 server 运行时，除 413 与 4 MiB 队列两项（行为未变、仅补覆盖）外 13 项检查逐条失败，对修复后的 server 全部通过（1024 个 pending HTTP 流的检查约 30 s）。合并 `main`（含 #130 的客户端 RST 统一 502、#133 的登录 nonce 与 TLS）后补了公网侧半关闭、REGISTER 绑定失败与 KEEPALIVE 三项检查，重新导出验证：CTest `28/28` 通过（`nat_stream_tests` 在 `-j 4` 下约 128 s，其中 1024 个 pending 流约 48 s），`session_lifecycle_tests` 经共享 harness 跑 main 新增的登录重放检查通过，`make test` 0 warning 全部通过，Go client（`GOOS=linux` 构建）下 `nat_e2e_smoke.sh` 与 `direct_route_e2e.sh` 均通过。WSL 无 JDK，Java client 路径以 CI 为准。
 - C server 登录响应顺序（2026-10-07，分支 `fix/c-server-login-response-order`）：
-  - 构建与 CTest：代码提交 `26d696b` 以 `git -c core.autocrlf=false archive HEAD` 导出到 `Ubuntu-24.04` WSL 全新目录，CMake Release 构建 0 warning，CTest `40/40` 通过（`-j 4` 约 263 s）。
+  - 构建与 CTest：代码提交 `26d696b` 以 `git -c core.autocrlf=false archive HEAD` 导出到 `Ubuntu-24.04` WSL 全新目录，CMake Release 构建 0 warning，CTest `40/40` 通过（`-j 4` 约 263 s），`make test` 0 warning 通过（首次运行 `admin_http_tests` 偶发失败一次，单独重跑与整体重跑均通过，`main` 的 make 构建单独运行也通过）。
+  - 合并 `main`（`e9195e3`）后重新导出：0 warning，CTest `41/41` 通过（约 151 s），两个新场景连续 3 次通过。
   - 回归测试：`session_lifecycle_tests` 新增 control（登录停在闸门时推 NAT_CONTROL）与 data（登录停在闸门时路由 HTTP 请求）两个场景。
   - 反向验证：保留 `SPECUS_LOGIN_TEST_GATE_DIR` 闸门、去掉加锁修复的 server 上，两个场景各 3 次全部失败，报错分别为 `command -2 was written before the login response` 和 `command 6 was written before the login response`；修复后 3/3 通过。
   - TSan：`-fsanitize=thread` 构建经 `setarch -R` 运行（WSL 内核的 ASLR 熵过高，否则 TSan 无法启动），没有 lock-order-inversion 报告。
