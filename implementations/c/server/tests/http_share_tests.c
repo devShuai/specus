@@ -1308,10 +1308,9 @@ static void test_create(void)
               expected_status, response);
         CHECK(code_matches(expect, response), "create %s: code mismatch: %.300s", name, response);
         char cache[64] = "";
-        if (expected_status != 401) {
-            CHECK(response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
-                      && strcmp(cache, "private, no-store") == 0, "create %s: Cache-Control %s", name, cache);
-        }
+        /* Every answer, the authentication layer's 401 included. */
+        CHECK(response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
+                  && strcmp(cache, "private, no-store") == 0, "create %s: Cache-Control %s", name, cache);
         char *expected_body = jget(expect, "body");
         if (expected_body != NULL) {
             CHECK(jequal(expected_body, response_body(response)), "create %s: body %s, expected %s", name,
@@ -2486,8 +2485,21 @@ static void test_cascades_from_endpoints(void)
           "endpoint cascades: bad limit");
     CHECK(manage("GET", "/api/admin/http-access-audit", "eve", NULL, response, RESPONSE_CAP) == 200
               && strstr(response, "\"entries\":[]") != NULL, "endpoint cascades: other tenant sees nothing");
-    CHECK(manage("GET", "/api/admin/http-routes/42/shares", NULL, NULL, response, RESPONSE_CAP) == 401,
-          "endpoint cascades: anonymous list");
+    static const char *const anonymous[][2] = {
+        {"POST", "/api/admin/http-routes/42/shares"},
+        {"GET", "/api/admin/http-routes/42/shares"},
+        {"GET", "/api/admin/http-routes/42/shares/abcdefghijklmnop"},
+        {"POST", "/api/admin/http-routes/42/shares/abcdefghijklmnop/revoke"},
+        {"GET", "/api/admin/http-routes/42/access-audit"},
+        {"GET", "/api/admin/http-access-audit"}
+    };
+    for (size_t i = 0U; i < sizeof(anonymous) / sizeof(anonymous[0]); ++i) {
+        char cache[64] = "";
+        CHECK(manage(anonymous[i][0], anonymous[i][1], NULL, NULL, response, RESPONSE_CAP) == 401
+                  && response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
+                  && strcmp(cache, "private, no-store") == 0,
+              "endpoint cascades: anonymous %s %s answered %.200s", anonymous[i][0], anonymous[i][1], response);
+    }
     CHECK(manage("GET", "/api/admin/http-routes/abc/shares", "admin", NULL, response, RESPONSE_CAP) == 404
               && body_has_code(response, "SHARE_ROUTE_NOT_FOUND"), "endpoint cascades: non-numeric route id");
     free(response);

@@ -9915,15 +9915,15 @@ static int write_workbench_error(char *out,
     return write_workbench_response(out, out_len, status, body, retry_after_seconds);
 }
 
-/* A refusal of the shared authentication layer, with the workbench's header on a workbench path. */
+/* A refusal of the shared authentication layer, private on a path whose every answer is private. */
 static int write_auth_refusal(char *out,
                               size_t out_len,
-                              int workbench_path,
+                              int private_path,
                               int status,
                               const char *reason,
                               const char *body)
 {
-    return workbench_path
+    return private_path
         ? write_workbench_response(out, out_len, status, body, 0)
         : write_response(out, out_len, status, reason, body);
 }
@@ -10329,8 +10329,15 @@ static int st_admin_build_response_internal(const char *method,
     /* Product metrics answers are private, the shared layer's refusals included. */
     int product_metrics_path = st_product_metrics_path(path);
     if (admin_path_requires_auth(method, path)) {
-        /* Workbench answers are private, the shared layer's refusals included. */
-        int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
+        /*
+         * Workbench and temporary-share management answers are private, the shared layer's refusals
+         * included (service-workbench.md, temporary-http-share.md section 4).
+         */
+        admin_share_path share_path;
+        admin_parse_share_path(path, &share_path);
+        int private_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0
+            || share_path.kind != ADMIN_SHARE_PATH_NONE
+            || admin_path_equals(path, "/api/admin/http-access-audit");
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
@@ -10350,7 +10357,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 403,
                                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
+                    : write_auth_refusal(out, out_len, private_path, 403, "Forbidden",
                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
@@ -10358,7 +10365,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 500,
                                                      "{\"error\":\"management user store unavailable\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
+                    : write_auth_refusal(out, out_len, private_path, 500, "Internal Server Error",
                                          "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
@@ -10374,7 +10381,7 @@ static int st_admin_build_response_internal(const char *method,
             if (admin_connectivity_check_path(path, NULL, 0U)) {
                 return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
             }
-            return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
+            return write_auth_refusal(out, out_len, private_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
     }
