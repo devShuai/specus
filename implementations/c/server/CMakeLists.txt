@@ -159,6 +159,13 @@ add_test(NAME client_messages_tests
     COMMAND specus_c_client_messages_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(client_messages_tests PROPERTIES TIMEOUT 120)
 
+# Management lists with more rows than the arrays C used to read them into, over real HTTP.
+add_executable(specus_c_management_lists_tests tests/management_lists_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_lists_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_lists_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_lists_tests COMMAND specus_c_management_lists_tests)
+set_tests_properties(management_lists_tests PROPERTIES TIMEOUT 180)
+
 add_executable(specus_c_http_share_tests tests/http_share_tests.c)
 target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_share_tests PRIVATE -Wall -Wextra -Wpedantic)
