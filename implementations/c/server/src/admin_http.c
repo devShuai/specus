@@ -310,6 +310,33 @@ void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler h
     pthread_mutex_unlock(&admin_client_disconnect_lock);
 }
 
+static pthread_mutex_t admin_external_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_external_connection_stats_handler admin_external_stats_handler = NULL;
+static void *admin_external_stats_ctx = NULL;
+
+void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,
+                                                    void *ctx)
+{
+    pthread_mutex_lock(&admin_external_stats_lock);
+    admin_external_stats_handler = handler;
+    admin_external_stats_ctx = ctx;
+    pthread_mutex_unlock(&admin_external_stats_lock);
+}
+
+/* Without a runtime (the management API on its own) there are no public connections. */
+static void admin_external_connection_stats(const char *tenant_id, long long *active, long long *rejected)
+{
+    *active = 0;
+    *rejected = 0;
+    pthread_mutex_lock(&admin_external_stats_lock);
+    st_admin_external_connection_stats_handler handler = admin_external_stats_handler;
+    void *ctx = admin_external_stats_ctx;
+    pthread_mutex_unlock(&admin_external_stats_lock);
+    if (handler != NULL) {
+        handler(ctx, tenant_id, active, rejected);
+    }
+}
+
 static pthread_mutex_t admin_connectivity_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_connectivity_checker *admin_connectivity_checker;
 
@@ -2841,16 +2868,95 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
     return load_current_tcp_mappings(client.client_name, mappings, mapping_count);
 }
 
+/* How many of the caller's connection records have this outcome (Java countBy...AndSuccess). */
+static int admin_count_connections(const char *database_path,
+                                   const st_admin_context *context,
+                                   int success,
+                                   long long *count)
+{
+    st_storage_connection first;
+    size_t listed = 0U;
+    return st_storage_list_connections_visible(database_path, 0, success, NULL, NULL, context->tenant_id,
+                                               context->username, context->admin, 0, 1, &first, 1U, &listed,
+                                               count);
+}
+
+/*
+ * GET /api/admin/overview as Java OverviewService: the caller's clients (an administrator's whole
+ * tenant), how many are online, their traffic, the successful and failed logins of the tenant (of
+ * the caller's clients for anyone else) and, for an administrator only, the tenant's open and
+ * refused public connections. C adds its server name, a status and the visible TCP mapping count.
+ */
 static int build_overview_response(const st_admin_context *context, char *out, size_t out_len)
 {
     size_t mapping_count = 0;
     if (load_visible_tcp_mapping_count(context, &mapping_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
     }
-    char body[256];
+    long long clients = 0;
+    long long online_clients = 0;
+    long long upload_bytes = 0;
+    long long download_bytes = 0;
+    long long successful_connections = 0;
+    long long failed_connections = 0;
+    const char *database_path = admin_database_path();
+    if (database_path != NULL) {
+        size_t client_count = 0U;
+        st_storage_client *all = admin_list_all_clients(database_path, &client_count);
+        if (all == NULL) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
+        }
+        for (size_t i = 0; i < client_count; ++i) {
+            if (!admin_can_access_client(context, &all[i])) {
+                continue;
+            }
+            st_admin_client_runtime_status runtime_status;
+            admin_get_client_runtime_status(all[i].id, all[i].client_name, &runtime_status);
+            ++clients;
+            online_clients += runtime_status.online ? 1 : 0;
+            upload_bytes += all[i].upload_bytes;
+            download_bytes += all[i].download_bytes;
+        }
+        free(all);
+        /* Someone without clients has no logins to count (Java answers 0 without asking). */
+        if ((context->admin || clients > 0)
+            && (admin_count_connections(database_path, context, 1, &successful_connections) != 0
+                || admin_count_connections(database_path, context, 0, &failed_connections) != 0)) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
+        }
+    } else {
+        st_storage_client client = {0};
+        client.id = env_i64("SPECUS_CLIENT_ID", 1);
+        snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+        snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("SPECUS_CLIENT_NAME", "Demo client"));
+        snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+        if (admin_can_access_client(context, &client)) {
+            st_admin_client_runtime_status runtime_status;
+            admin_get_client_runtime_status(client.id, client.client_name, &runtime_status);
+            clients = 1;
+            online_clients = runtime_status.online ? 1 : 0;
+        }
+    }
+    long long external_connections = 0;
+    long long rejected_external_connections = 0;
+    if (context->admin) {
+        admin_external_connection_stats(context->tenant_id, &external_connections, &rejected_external_connections);
+    }
+    char body[512];
     int written = snprintf(body,
                            sizeof(body),
-                           "{\"server\":\"c\",\"status\":\"ok\",\"onlineClients\":0,\"tcpMappings\":%zu}",
+                           "{\"clients\":%lld,\"onlineClients\":%lld,\"successfulConnections\":%lld,"
+                           "\"failedConnections\":%lld,\"uploadBytes\":%lld,\"downloadBytes\":%lld,"
+                           "\"externalConnections\":%lld,\"rejectedExternalConnections\":%lld,"
+                           "\"server\":\"c\",\"status\":\"ok\",\"tcpMappings\":%zu}",
+                           clients,
+                           online_clients,
+                           successful_connections,
+                           failed_connections,
+                           upload_bytes,
+                           download_bytes,
+                           external_connections,
+                           rejected_external_connections,
                            mapping_count);
     if (written < 0 || (size_t)written >= sizeof(body)) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response too large\"}");
@@ -6256,10 +6362,11 @@ static int build_traffic_usage_response(const st_admin_context *context, const c
     int limit = 100;
     (void)admin_query_i64(path, "clientId", &filter_client_id);
     (void)admin_query_int_any(path, "limit", &limit);
+    /* Java TrafficViewService: Math.clamp(limit, 1, 500). */
     if (limit < 1) {
         limit = 1;
-    } else if (limit > (int)ST_ADMIN_MAX_TRAFFIC_ITEMS) {
-        limit = 100;
+    } else if (limit > 500) {
+        limit = 500;
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
@@ -6308,10 +6415,11 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
     int limit = 200;
     (void)admin_query_i64(path, "clientId", &filter_client_id);
     (void)admin_query_int_any(path, "limit", &limit);
+    /* Java TrafficViewService: Math.clamp(limit, 1, 500). */
     if (limit < 1) {
         limit = 1;
-    } else if (limit > (int)ST_ADMIN_MAX_TRAFFIC_ITEMS) {
-        limit = 200;
+    } else if (limit > 500) {
+        limit = 500;
     }
     char *type = admin_query_string(path, "type");
     const char *database_path = admin_database_path();

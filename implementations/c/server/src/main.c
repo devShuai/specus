@@ -3830,6 +3830,58 @@ static int process_ws_closed(specus_session *session, const st_nat_message *mess
     return 1;
 }
 
+/*
+ * Java RemotePortServerManager's per-tenant counters, which the management overview reports: the
+ * public connections open now and the ones a connection limit refused. Guarded by
+ * global_external_lock; entries live as long as the process.
+ */
+typedef struct tenant_external_stats {
+    struct tenant_external_stats *next;
+    char tenant_id[128];
+    long long active;
+    long long rejected;
+} tenant_external_stats;
+
+static tenant_external_stats *tenant_external_stats_list = NULL;
+
+static tenant_external_stats *tenant_external_stats_locked(const char *tenant_id, int create)
+{
+    const char *key = tenant_id == NULL || *tenant_id == '\0' ? "default" : tenant_id;
+    for (tenant_external_stats *stats = tenant_external_stats_list; stats != NULL; stats = stats->next) {
+        if (strcmp(stats->tenant_id, key) == 0) {
+            return stats;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    tenant_external_stats *stats = (tenant_external_stats *)calloc(1, sizeof(*stats));
+    if (stats != NULL) {
+        snprintf(stats->tenant_id, sizeof(stats->tenant_id), "%s", key);
+        stats->next = tenant_external_stats_list;
+        tenant_external_stats_list = stats;
+    }
+    return stats;
+}
+
+static void record_rejected_external_locked(const char *tenant_id)
+{
+    tenant_external_stats *stats = tenant_external_stats_locked(tenant_id, 1);
+    if (stats != NULL) {
+        ++stats->rejected;
+    }
+}
+
+static void external_connection_stats(void *ctx, const char *tenant_id, long long *active, long long *rejected)
+{
+    (void)ctx;
+    pthread_mutex_lock(&global_external_lock);
+    tenant_external_stats *stats = tenant_external_stats_locked(tenant_id, 0);
+    *active = stats == NULL ? 0 : stats->active;
+    *rejected = stats == NULL ? 0 : stats->rejected;
+    pthread_mutex_unlock(&global_external_lock);
+}
+
 static void release_external_count(external_conn *conn)
 {
     if (!conn->counted) {
@@ -3838,6 +3890,10 @@ static void release_external_count(external_conn *conn)
     pthread_mutex_lock(&global_external_lock);
     if (global_external_connections > 0) {
         --global_external_connections;
+    }
+    tenant_external_stats *stats = tenant_external_stats_locked(conn->session->config.tenant_id, 0);
+    if (stats != NULL && stats->active > 0) {
+        --stats->active;
     }
     conn->counted = 0;
     pthread_mutex_unlock(&global_external_lock);
@@ -4002,17 +4058,26 @@ static int try_count_external_connection(external_conn *conn)
     int client_count = 0;
     int port_count = 0;
     count_external_locked(session, conn->port, &client_count, &port_count);
+    /* Java records every refusal by a connection limit against the client's tenant. */
     if (client_count >= session->config.max_client_external_connections
         || port_count >= session->config.max_port_external_connections) {
+        pthread_mutex_lock(&global_external_lock);
+        record_rejected_external_locked(session->config.tenant_id);
+        pthread_mutex_unlock(&global_external_lock);
         return -1;
     }
 
     pthread_mutex_lock(&global_external_lock);
     if (global_external_connections >= session->config.max_global_external_connections) {
+        record_rejected_external_locked(session->config.tenant_id);
         pthread_mutex_unlock(&global_external_lock);
         return -1;
     }
     ++global_external_connections;
+    tenant_external_stats *stats = tenant_external_stats_locked(session->config.tenant_id, 1);
+    if (stats != NULL) {
+        ++stats->active;
+    }
     conn->counted = 1;
     pthread_mutex_unlock(&global_external_lock);
     return 0;
@@ -5177,6 +5242,7 @@ int main(void)
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
+    st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);
     const st_connectivity_device connectivity_device = {
         .presence = connectivity_presence,
         .probe = connectivity_probe,
@@ -5201,6 +5267,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
+        st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -5216,6 +5283,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
+        st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -5237,6 +5305,7 @@ int main(void)
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
+        st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
@@ -5343,6 +5412,7 @@ int main(void)
     st_admin_set_client_message_handler(NULL, NULL);
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
     st_admin_set_client_disconnect_handler(NULL, NULL);
+    st_admin_set_external_connection_stats_handler(NULL, NULL);
     st_stun_turn_server_stop(stun_turn_server);
     st_tls_server_context_free(config.tls_context);
     free(config.nat_control_json);

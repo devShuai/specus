@@ -5057,13 +5057,20 @@ int st_storage_list_connections_visible(const char *path,
         sqlite3_close(db);
         return -1;
     }
+    /*
+     * Java filters an administrator's view by the record's tenant only, so records whose client was
+     * deleted, and failed logins under names no account has, stay listed (and counted); everyone
+     * else sees the records of the clients they own.
+     */
+    const char *client_join = include_all_clients ? "LEFT JOIN" : "JOIN";
     char sql[1024];
     int written = snprintf(sql,
                            sizeof(sql),
                            "SELECT COUNT(*) FROM connection_record r "
-                           "JOIN client_account c ON c.rowid = r.client_id OR "
+                           "%s client_account c ON c.rowid = r.client_id OR "
                            "(r.client_id IS NULL AND c.client_name = r.client_name "
                            "AND c.tenant_id = COALESCE(NULLIF(r.tenant_id, ''), c.tenant_id, 'default'))%s",
+                           client_join,
                            where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         sqlite3_close(db);
@@ -5102,10 +5109,11 @@ int st_storage_list_connections_visible(const char *path,
                        "r.client_id, r.client_name, r.channel_id, r.remote_address, "
                        "r.success, r.reason, r.disconnect_reason, r.connected_at, r.disconnected_at "
                        "FROM connection_record r "
-                       "JOIN client_account c ON c.rowid = r.client_id OR "
+                       "%s client_account c ON c.rowid = r.client_id OR "
                        "(r.client_id IS NULL AND c.client_name = r.client_name "
                        "AND c.tenant_id = COALESCE(NULLIF(r.tenant_id, ''), c.tenant_id, 'default'))%s "
                        "ORDER BY r.id DESC LIMIT ? OFFSET ?",
+                       client_join,
                        where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         sqlite3_close(db);
