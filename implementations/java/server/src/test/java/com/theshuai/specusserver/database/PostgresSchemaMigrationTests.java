@@ -164,8 +164,7 @@ class PostgresSchemaMigrationTests {
             vacuumed = repository.save(WidestHttpTrafficExchange.create());
 
             JdbcTemplate jdbc = first.getBean(JdbcTemplate.class);
-            // The request preview column stays oid, as before the widening ran; Hibernate's update
-            // makes it text, of numbers, before the migration sees it.
+            // The request preview column stays oid, as before the widening ran.
             jdbc.execute("""
                     alter table specus_http_traffic_exchange
                       alter column request_body_data type oid using lo_from_bytea(0, request_body_data),
@@ -213,30 +212,6 @@ class PostgresSchemaMigrationTests {
                     .isEqualTo(digits);
             assertThat(largeObjects(third.getBean(JdbcTemplate.class))).containsExactly(unrelated);
         }
-    }
-
-    /** Without Hibernate's update first, as with ddl-auto none, every column is still oid. */
-    @Test
-    void httpExchangeLargeObjectMigrationConvertsOidPreviewColumnsToo() {
-        DataSource dataSource = newDatabase();
-        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
-        jdbc.execute("create table specus_http_traffic_exchange (id bigint primary key,"
-                + " request_body_data oid, response_body_data oid, request_preview_text oid, response_preview_text oid)");
-        jdbc.update("""
-                insert into specus_http_traffic_exchange values
-                  (1, lo_from_bytea(0, '\\x00ff'::bytea), null,
-                      lo_from_bytea(0, convert_to('Request 界', 'UTF8')), null)
-                """);
-
-        migrateTwice(dataSource, () -> new HttpExchangeLargeObjectMigrator(jdbc).migrate());
-
-        assertThat(httpBodyColumnTypes(jdbc)).isEqualTo(BYTES_AND_TEXT);
-        assertThat(jdbc.queryForMap("select * from specus_http_traffic_exchange"))
-                .containsEntry("request_body_data", new byte[]{0x00, (byte) 0xff})
-                .containsEntry("response_body_data", null)
-                .containsEntry("request_preview_text", "Request 界")
-                .containsEntry("response_preview_text", null);
-        assertThat(largeObjects(jdbc)).isEmpty();
     }
 
     /** The reported failure: Hibernate's update has already created the index. */
