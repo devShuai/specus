@@ -1,5 +1,6 @@
 package com.theshuai.specusserver.management.repository;
 
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.TransferAttachment;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -17,6 +18,7 @@ public interface TransferAttachmentRepository extends JpaRepository<TransferAtta
 
     long countByScopeAndPublicTransferRoomIdAndStatus(String scope, Long publicTransferRoomId, String status);
 
+    /** {@code now} and both expiry columns are {@link SortableInstant} text, so the string order is the time order. */
     @Query("""
             select coalesce(sum(attachment.sizeBytes), 0)
               from TransferAttachment attachment
