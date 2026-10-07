@@ -52,7 +52,7 @@ v1 只覆盖**两个浏览器页面之间经 `bulk` RTCDataChannel 的直连文�
 | `maxStoredPartials` | 4 | 接收方同时保留的未清理记录数 |
 | `maxPartialBytesTotal` | 4 GiB | 上述记录声明大小之和的上限 |
 | `storageMarginBytes` | 64 MiB | 配额检查的安全余量 |
-| `maxActiveReceives` | 2 | 同时处于活动会话的接收传输数；每个 bulk 通道仍只有 1 个 |
+| `maxActiveReceives` | 2 | 同时处于活动会话的接收传输数；每个 bulk 通道同一时间仍只有 1 个待确认或接收中的文件（第 8 节） |
 | `maxChunkMismatchesPerSession` | 3 | 同一块在一个会话内第 3 次校验失败即结束会话 |
 | `maxIntegrityFailures` | 16 | 单个 transfer 跨会话累计失败数，持久化保存 |
 | `resumeTtlSeconds` | 86400 | 同意与部分数据的绝对有效期，从同意时刻起算 |
@@ -210,6 +210,9 @@ DATA 帧不得跨块，块按帧顺序从 offset 0 连续发送。
    - 来源当前无发送权限：`NOT_ALLOWED`。
    - 已 `COMPLETE`：回 `resume-state complete=true`，用于补发丢失的完成通知，不占用活动名额。
    - 其它传输的活动会话已达 `maxActiveReceives`：`BUSY`。
+   - 这条通道上已有其它 transfer 的活动会话，或有待确认（含用户已点击、记录尚未建好）的 offer：`BUSY`。每个 bulk
+     通道同一时间只承载一个文件；不同 transfer 之间不互相取代，否则对方仍在途的帧会交给另一个 transfer 的状态机
+     （`WRONG_TRANSFER`），被挤掉的记录也会一直占着活动名额。通道占用不在向量 `resume` 的输入里。
    - 否则回 `resume-state`。若该 transfer 在另一条通道上还有旧会话，新会话**取代**旧会话（旧通道可能已半断开）。
 3. S 按 `have` 继续发送。`resume-state` 附带的 `firstMissing`、`resumeOffset = firstMissing × chunkSize`（全部收齐时
    等于 `sizeBytes`）和 `receivedBytes` 只用于界面，发送范围以位图为准。
