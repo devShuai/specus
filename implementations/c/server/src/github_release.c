@@ -61,12 +61,17 @@ static int release_numeric_identifier(const char *value)
     return 1;
 }
 
+/*
+ * Dot-separated identifiers, none empty: strtok_r would silently skip the empty one in "a..b" or
+ * a leading or trailing dot, which Java's SemVer pattern rejects.
+ */
 static int release_validate_identifiers(char *value, int reject_numeric_leading_zero)
 {
     if (value == NULL || *value == '\0') return -1;
-    char *save = NULL;
-    for (char *part = strtok_r(value, ".", &save); part != NULL;
-         part = strtok_r(NULL, ".", &save)) {
+    char *part = value;
+    for (;;) {
+        char *dot = strchr(part, '.');
+        if (dot != NULL) *dot = '\0';
         if (*part == '\0') return -1;
         int numeric = 1;
         for (const unsigned char *p = (const unsigned char *)part; *p != '\0'; ++p) {
@@ -74,16 +79,21 @@ static int release_validate_identifiers(char *value, int reject_numeric_leading_
             if (!isdigit(*p)) numeric = 0;
         }
         if (reject_numeric_leading_zero && numeric && !release_numeric_identifier(part)) return -1;
+        if (dot == NULL) return 0;
+        part = dot + 1;
     }
-    return 0;
 }
 
+/*
+ * Java SemanticVersion.parse(tag, "release tag") then normalize: one lowercase "v" removed, at
+ * most 32 characters, strict SemVer 2.0. (The tag itself arrives trimmed, as Java's text() reads it.)
+ */
 static int release_normalize_version(const char *tag, char out[81])
 {
     if (tag == NULL || *tag == '\0') return -1;
-    const char *normalized = (*tag == 'v' || *tag == 'V') ? tag + 1 : tag;
+    const char *normalized = *tag == 'v' ? tag + 1 : tag;
     size_t len = strlen(normalized);
-    if (len == 0U || len >= 81U) return -1;
+    if (len == 0U || len > 32U) return -1;
     char copy[81];
     snprintf(copy, sizeof(copy), "%s", normalized);
     char *build = strchr(copy, '+');
@@ -96,12 +106,14 @@ static int release_normalize_version(const char *tag, char out[81])
         *pre++ = '\0';
         if (release_validate_identifiers(pre, 1) != 0) return -1;
     }
-    char *save = NULL;
-    char *major = strtok_r(copy, ".", &save);
-    char *minor = strtok_r(NULL, ".", &save);
-    char *patch = strtok_r(NULL, ".", &save);
+    char *major = copy;
+    char *minor = strchr(major, '.');
+    char *patch = minor == NULL ? NULL : strchr(minor + 1, '.');
+    if (minor == NULL || patch == NULL || strchr(patch + 1, '.') != NULL) return -1;
+    *minor++ = '\0';
+    *patch++ = '\0';
     if (!release_numeric_identifier(major) || !release_numeric_identifier(minor)
-        || !release_numeric_identifier(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+        || !release_numeric_identifier(patch)) return -1;
     snprintf(out, 81U, "%s", normalized);
     return 0;
 }
@@ -188,6 +200,15 @@ int st_github_release_map(const char *json,
     if (json == NULL || out == NULL || out_count == NULL) return -1;
     *out_count = 0U;
     char *tag = st_json_get_top_level_string(json, "tag_name");
+    if (tag != NULL) {
+        /* Java's text() reads every string field trimmed (String.trim: characters up to space). */
+        char *start = tag;
+        while (*start != '\0' && (unsigned char)*start <= ' ') ++start;
+        size_t len = strlen(start);
+        while (len > 0U && (unsigned char)start[len - 1U] <= ' ') --len;
+        memmove(tag, start, len);
+        tag[len] = '\0';
+    }
     char version[81];
     if (tag == NULL || release_normalize_version(tag, version) != 0) {
         free(tag);
@@ -266,6 +287,27 @@ int st_github_release_map(const char *json,
     free(created);
     st_json_free_string_array(assets, asset_count);
     free(tag);
+    return 0;
+}
+
+int st_github_release_may_supply_missing_target(const st_storage_client_download_link *catalogue,
+                                                size_t catalogue_count)
+{
+    if (!release_env_enabled()) return 0;
+    st_release_descriptor descriptors[ST_GITHUB_RELEASE_MAX_PACKAGES];
+    size_t descriptor_count = release_descriptors("v0.0.0", descriptors);
+    for (size_t i = 0U; i < descriptor_count; ++i) {
+        int configured = 0;
+        for (size_t j = 0U; catalogue != NULL && j < catalogue_count; ++j) {
+            if (strcmp(catalogue[j].implementation, descriptors[i].implementation) == 0
+                && strcmp(catalogue[j].platform, descriptors[i].platform) == 0
+                && strcmp(catalogue[j].arch, descriptors[i].arch) == 0) {
+                configured = 1;
+                break;
+            }
+        }
+        if (!configured) return 1;
+    }
     return 0;
 }
 
