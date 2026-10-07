@@ -6246,9 +6246,11 @@ int main(void)
         fprintf(stderr, "http exchange status search response mismatch\n");
         return 1;
     }
+    /* The route gate's 401 answers recorded earlier are JSON as well, the JavaScript one is not. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=responseDataType&q=json&page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"total\":1")
+        || !contains(response, "\"relativePath\":\"/items\"")
+        || contains(response, "/vendor.js")
         || !contains(response, "\"responseBodyType\":\"json\"")) {
         fprintf(stderr, "http exchange response data type search response mismatch\n");
         return 1;

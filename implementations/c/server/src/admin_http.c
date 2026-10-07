@@ -2821,8 +2821,8 @@ static void record_direct_http_exchange(const char *client_name,
     }
     st_storage_client client;
     st_storage_http_route http_route;
+    /* As in Java, the route's switch decides, also for the refusal of a disabled client or route. */
     if (st_storage_get_client_by_name(database_path, client_name, &client) != 0
-        || !client.enabled
         || st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) != 0
         || !http_route.detail_capture_enabled) {
         return;
@@ -11184,12 +11184,14 @@ static int admin_wire_read(admin_wire_reader *reader, char *out, size_t len)
  * Reads a chunked request body (RFC 9112 section 7.1) into one malloc'd, NUL-terminated buffer,
  * the way a Content-Length body is read. Chunk extensions are dropped; the trailer fields come back
  * in *trailers as they arrived (the caller keeps only declared ones). Returns 0, -1 for a malformed
- * or truncated body, or -2 once it outgrows max_len.
+ * or truncated body, or -2 once it outgrows max_len; then *out keeps the first refused_capture
+ * bytes of the body for the record of the refused request.
  */
 static int admin_read_chunked_body(int fd,
                                    const char *received,
                                    size_t received_len,
                                    size_t max_len,
+                                   size_t refused_capture,
                                    char **out,
                                    size_t *out_len,
                                    char ***trailers,
@@ -11238,6 +11240,16 @@ static int admin_read_chunked_body(int fd,
             break;
         }
         if (size > max_len - len) {
+            /* What arrives of this chunk still belongs to the capture of the refused body. */
+            size_t wanted = len < refused_capture ? refused_capture - len : 0U;
+            size_t take = size < wanted ? size : wanted;
+            char *grown = take == 0U ? body : (char *)realloc(body, len + take + 1U);
+            if (grown != NULL) {
+                body = grown;
+                if (take > 0U && admin_wire_read(reader, body + len, take) == 0) {
+                    len += take;
+                }
+            }
             rc = -2;
             break;
         }
@@ -11279,11 +11291,23 @@ static int admin_read_chunked_body(int fd,
     }
     free(reader);
     if (rc != 0) {
-        free(body);
         for (size_t i = 0; i < field_count; ++i) {
             free(fields[i]);
         }
         free(fields);
+        if (rc == -2 && refused_capture > 0U && body != NULL) {
+            /* Only the first bytes stay, for the record of the refusal. */
+            size_t kept = len < refused_capture ? len : refused_capture;
+            char *shrunk = (char *)realloc(body, kept + 1U);
+            if (shrunk != NULL) {
+                body = shrunk;
+            }
+            body[kept] = '\0';
+            *out = body;
+            *out_len = kept;
+            return rc;
+        }
+        free(body);
         return rc;
     }
     body[len] = '\0';
@@ -12385,9 +12409,142 @@ static int admin_env_http_route_configured(const char *route_name, char *target,
     return configured;
 }
 
+static void admin_fd_remote_text(int fd, char out[128]);
+
+/*
+ * Records a /http/ exchange that ended in an answer of this server instead of a relayed response
+ * (http-route.md section 9: every request is recorded with its failure reason), as Java
+ * HttpSpecusController and HttpSpecusBodyLimitFilter record theirs: the response is the
+ * {"error":"message"} answer that went out, and the record only happens with the server switch
+ * and the route's detailCaptureEnabled, like a relayed exchange.
+ */
+static void record_direct_http_failure(const char *client_name,
+                                       const char *route,
+                                       const st_direct_http_request *request,
+                                       int status,
+                                       const char *public_message,
+                                       const char *failure,
+                                       const char *remote_address,
+                                       long long started_ms)
+{
+    if (!st_traffic_capture_enabled()) {
+        return;
+    }
+    char *escaped = st_json_escape(public_message == NULL ? "" : public_message);
+    if (escaped == NULL) {
+        return;
+    }
+    size_t body_len = strlen("{\"error\":\"\"}") + strlen(escaped);
+    char *body = (char *)malloc(body_len + 1U);
+    char content_type[] = "Content-Type:application/json";
+    char *headers[] = {content_type};
+    if (body != NULL) {
+        snprintf(body, body_len + 1U, "{\"error\":\"%s\"}", escaped);
+        st_direct_http_response response = {
+            .status_code = status,
+            .headers = headers,
+            .headers_len = 1U,
+            .body = (uint8_t *)body,
+            .body_len = body_len,
+            .error = (char *)(failure == NULL ? public_message : failure)
+        };
+        long long elapsed_ms = admin_now_ms() - started_ms;
+        record_direct_http_exchange(client_name, route, request, &response, body_len, remote_address,
+                                    elapsed_ms < 0 ? 0 : elapsed_ms);
+    }
+    free(body);
+    free(escaped);
+}
+
+/*
+ * record_direct_http_failure for a request refused before it was forwarded: its client, route,
+ * relative path and query come from the request path; headers and body are what the refusal may
+ * show of the request (none for a refusal of the route gate, as in Java).
+ */
+static void record_direct_http_refusal(int fd,
+                                       const char *method,
+                                       const char *path,
+                                       char **headers,
+                                       size_t headers_len,
+                                       const uint8_t *body,
+                                       size_t body_len,
+                                       int status,
+                                       const char *message,
+                                       long long started_ms)
+{
+    char *client_name = NULL;
+    char *route = NULL;
+    if (!st_traffic_capture_enabled() || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+        return;
+    }
+    const char *query = strchr(path, '?');
+    size_t path_len = query == NULL ? strlen(path) : (size_t)(query - path);
+    const char *client_end = memchr(path + 6, '/', path_len - 6U);
+    const char *route_end = client_end == NULL ? NULL
+        : memchr(client_end + 1, '/', (size_t)(path + path_len - client_end - 1));
+    char *relative_path = route_end == NULL ? admin_dup_string("/")
+        : admin_dup_range(route_end, (size_t)(path + path_len - route_end));
+    char *raw_query = admin_encode_raw_query_for_forwarding(query == NULL ? "" : query + 1);
+    if (relative_path != NULL && raw_query != NULL) {
+        st_direct_http_request request = {
+            .request_method = (char *)method,
+            .route = route,
+            .relative_path = relative_path,
+            .raw_query = raw_query,
+            .headers = headers,
+            .headers_len = headers_len,
+            .body = body,
+            .body_len = body_len
+        };
+        char remote_address[128];
+        admin_fd_remote_text(fd, remote_address);
+        record_direct_http_failure(client_name, route, &request, status, message, NULL, remote_address,
+                                   started_ms);
+    }
+    free(relative_path);
+    free(raw_query);
+    free(client_name);
+    free(route);
+}
+
+/* Whether a refused request on this /http/ path would be recorded, so its body is worth capturing. */
+static int admin_direct_route_captured(const char *path)
+{
+    char *client_name = NULL;
+    char *route = NULL;
+    const char *database_path = admin_database_path();
+    if (!st_traffic_capture_enabled() || database_path == NULL
+        || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+        return 0;
+    }
+    st_storage_http_route http_route;
+    int captured = st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
+        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
+        && http_route.detail_capture_enabled;
+    free(client_name);
+    free(route);
+    return captured;
+}
+
 static int send_http_route_not_found(int fd)
 {
     send_text_http_error(fd, 404, ADMIN_ROUTE_NOT_FOUND_TEXT);
+    return -1;
+}
+
+/* A refusal of the route gate: the answer, then its record (no request headers or body, as Java). */
+static int refuse_direct_http_route(int fd, const char *method, const char *path, int status, long long started_ms)
+{
+    const char *message = status == 401 ? ADMIN_ROUTE_AUTH_REQUIRED_TEXT
+        : status == 503 ? ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT : ADMIN_ROUTE_NOT_FOUND_TEXT;
+    if (status == 401) {
+        send_http_route_auth_challenge(fd);
+    } else if (status == 503) {
+        send_http_route_policy_unavailable(fd);
+    } else {
+        send_http_route_not_found(fd);
+    }
+    record_direct_http_refusal(fd, method, path, NULL, 0U, NULL, 0U, status, message, started_ms);
     return -1;
 }
 
@@ -12397,11 +12554,13 @@ static int send_http_route_not_found(int fd)
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
  * since, so what the client holds never makes a route reachable. The route's target is copied into
- * target_base_url for the browser header rewrite.
+ * target_base_url for the browser header rewrite. Every refusal is recorded like Java's.
  */
 static int authorize_direct_http_route(int fd,
+                                       const char *method,
                                        const char *path,
                                        const char *raw_request,
+                                       long long started_ms,
                                        char *target_base_url,
                                        size_t target_base_url_len)
 {
@@ -12434,8 +12593,7 @@ static int authorize_direct_http_route(int fd,
     if (lookup_rc != 0) {
         free(client_name);
         free(route_name);
-        send_http_route_policy_unavailable(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
     /* Unknown and disabled clients have no reachable routes, environment ones included: with a
      * database a client cannot log in without an enabled account either. */
@@ -12445,21 +12603,20 @@ static int authorize_direct_http_route(int fd,
     free(client_name);
     free(route_name);
     if (!client_enabled) {
-        return send_http_route_not_found(fd);
+        return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
     if (!found) {
         return env_configured ? 0 : send_http_route_not_found(fd);
     }
     if (!route.enabled) {
-        return send_http_route_not_found(fd);
+        return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
     snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
     }
     if (route.auth_username[0] == '\0' || route.auth_password_hash[0] == '\0') {
-        send_http_route_policy_unavailable(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
 
     char *authorization = admin_extract_header_value(raw_request, "Authorization");
@@ -12492,8 +12649,7 @@ static int authorize_direct_http_route(int fd,
     memset(decoded, 0, sizeof(decoded));
     free(authorization);
     if (!valid) {
-        send_http_route_auth_challenge(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 401, started_ms);
     }
     return 1;
 }
@@ -12518,6 +12674,8 @@ typedef struct {
     const char *share_id;
     const char *rewrite_prefix;
     admin_share_stream *share_stream;
+    /* The client's RST reason, made log-safe, as the failure of the HTTP detail (never public). */
+    char reset_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
 } admin_direct_http_sink_state;
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
@@ -12616,15 +12774,15 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
 
 static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
 {
-    const admin_direct_http_sink_state *state = (const admin_direct_http_sink_state *)ctx;
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
     char safe_client[512];
     char safe_route[512];
     char safe_method[64];
-    char safe_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
+    char *safe_reason = state->reset_reason;
     (void)st_admin_log_safe_reason(state->client_name, safe_client, sizeof(safe_client));
     (void)st_admin_log_safe_reason(state->route, safe_route, sizeof(safe_route));
     (void)st_admin_log_safe_reason(state->method, safe_method, sizeof(safe_method));
-    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(safe_reason));
+    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(state->reset_reason));
     fprintf(stderr,
             "[http-stream-v2] stream reset client=%s route=%s method=%s status=502 errorCode=%u reason=%s\n",
             safe_client,
@@ -15470,18 +15628,28 @@ static void admin_forward_direct_http(st_admin_server *server,
                                     sink_state.response_bytes, remote_address, elapsed_ms);
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
         /* The share ended mid-exchange: the public connection was already shut down. */
-    } else if (!sink_state.started && rc == -2) {
-        send_text_http_error(fd, 504, "direct http response timeout");
-    } else if (!sink_state.started && rc == -3) {
-        send_text_http_error(fd, 404, "direct http route is not configured");
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
-        /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
-        send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
-        /* The stream could not be created, answered as Java HttpSpecusController does. */
-        send_text_http_error(fd, 502, "HTTP 流创建失败");
-    } else if (!sink_state.started) {
-        send_text_http_error(fd, 502, ADMIN_ROUTE_CLIENT_OFFLINE_TEXT);
+    } else {
+        int status = rc == -2 ? 504 : rc == -3 ? 404 : 502;
+        const char *message = rc == -2 ? "direct http response timeout"
+            : rc == -3 ? "direct http route is not configured"
+            : rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET ? ST_ADMIN_DIRECT_HTTP_RESET_BODY
+            /* The stream could not be created, answered as Java HttpSpecusController does. */
+            : rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT ? "HTTP 流创建失败"
+            : ADMIN_ROUTE_CLIENT_OFFLINE_TEXT;
+        /* direct_sink_on_reset logged the client's RST reason; it is never echoed to the caller. */
+        const char *failure = rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET && sink_state.reset_reason[0] != '\0'
+            ? sink_state.reset_reason : message;
+        if (!sink_state.started) {
+            send_text_http_error(fd, status, message);
+            record_direct_http_failure(client_name, route, &direct, status, message, failure, remote_address,
+                                       started_ms);
+        } else {
+            /* Cut short after its head went out: recorded with what was relayed, and why it ended. */
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(failure);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, remote_address, elapsed_ms);
+        }
     }
 
     if (rc != 0) {
@@ -16120,11 +16288,59 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     return 1;
 }
 
+/* Java HttpSpecusBodyLimitFilter keeps this much of a refused body for the HTTP detail. */
+#define ADMIN_REFUSED_BODY_CAPTURE (64U * 1024U)
+
+/* What a 413 of admin_read_request_body leaves for the record of the refused request. */
+typedef struct {
+    int capture;       /* in: keep the refused body's first ADMIN_REFUSED_BODY_CAPTURE bytes */
+    int too_large;     /* out: the body was refused for its size */
+    char *prefix;      /* out: the kept bytes, the caller's to free */
+    size_t prefix_len;
+} admin_body_refusal;
+
+/*
+ * The first bytes of a body whose Content-Length is over the limit, as Java
+ * HttpSpecusBodyLimitFilter reads them before it answers: what came with the header block, then
+ * what the socket brings within two seconds, up to ADMIN_REFUSED_BODY_CAPTURE bytes in all.
+ */
+static void admin_capture_refused_body(int fd, const char *received, size_t received_len,
+                                       size_t declared_len, admin_body_refusal *refusal)
+{
+    size_t wanted = declared_len < ADMIN_REFUSED_BODY_CAPTURE ? declared_len : ADMIN_REFUSED_BODY_CAPTURE;
+    char *prefix = (char *)malloc(wanted + 1U);
+    if (prefix == NULL) {
+        return;
+    }
+    size_t used = received_len < wanted ? received_len : wanted;
+    memcpy(prefix, received, used);
+    long long deadline = admin_now_ms() + 2000LL;
+    while (used < wanted) {
+        long long remaining = deadline - admin_now_ms();
+        struct pollfd ready = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (remaining <= 0 || poll(&ready, 1, (int)remaining) <= 0) {
+            break;
+        }
+        ssize_t got = recv(fd, prefix + used, wanted - used, 0);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            break;
+        }
+        used += (size_t)got;
+    }
+    prefix[used] = '\0';
+    refusal->prefix = prefix;
+    refusal->prefix_len = used;
+}
+
 /*
  * Reads the body that follows the header block in request (len bytes received so far), by
  * Content-Length or chunked and within the limit of the path. 0 with the body (in request or in
  * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out. A chunked
- * body's trailer fields come back in *trailers_out, the caller's to free.
+ * body's trailer fields come back in *trailers_out, the caller's to free. When refusal is given, a
+ * 413 is reported there with the refused body's first bytes if refusal->capture asks for them.
  */
 static int admin_read_request_body(int fd,
                                    const char *request,
@@ -16134,7 +16350,8 @@ static int admin_read_request_body(int fd,
                                    size_t *body_len_out,
                                    char **body_buffer_out,
                                    char ***trailers_out,
-                                   size_t *trailers_len_out)
+                                   size_t *trailers_len_out,
+                                   admin_body_refusal *refusal)
 {
     const char *body = strstr(request, "\r\n\r\n");
     size_t available_body_len = 0;
@@ -16166,10 +16383,18 @@ static int admin_read_request_body(int fd,
                                                : "仅支持 chunked Transfer-Encoding");
                 return -1;
             }
+            size_t refused_capture = refusal != NULL && refusal->capture ? ADMIN_REFUSED_BODY_CAPTURE : 0U;
             int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
-                                                     &body_buffer, &content_length,
+                                                     refused_capture, &body_buffer, &content_length,
                                                      trailers_out, trailers_len_out);
             if (chunked_rc != 0) {
+                if (chunked_rc == -2 && refusal != NULL) {
+                    refusal->too_large = 1;
+                    refusal->prefix = body_buffer;
+                    refusal->prefix_len = content_length;
+                } else {
+                    free(body_buffer);
+                }
                 send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
                                      chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
                 return -1;
@@ -16179,6 +16404,17 @@ static int admin_read_request_body(int fd,
         } else {
             int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
             if (length_rc == -2) {
+                if (refusal != NULL) {
+                    refusal->too_large = 1;
+                    if (refusal->capture) {
+                        char *declared = admin_extract_header_value(request, "Content-Length");
+                        unsigned long long declared_len = declared == NULL ? 0ULL : strtoull(declared, NULL, 10);
+                        free(declared);
+                        admin_capture_refused_body(fd, body, available_body_len,
+                                                   declared_len > SIZE_MAX ? SIZE_MAX : (size_t)declared_len,
+                                                   refusal);
+                    }
+                }
                 send_text_http_error(fd, 413, "HTTP 请求体超过限制");
                 return -1;
             }
@@ -16244,7 +16480,7 @@ static void handle_http_share_client(st_admin_server *server,
         admin_request_trailers trailers;
         memset(&trailers, 0, sizeof(trailers));
         if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer,
-                                    &received_trailers, &received_trailers_len) == 0) {
+                                    &received_trailers, &received_trailers_len, NULL) == 0) {
             /* No Basic gate on a share: an Authorization trailer belongs to the target as well. */
             if (admin_request_trailers_collect(request, 0, received_trailers, received_trailers_len,
                                                &trailers) != 0) {
@@ -16264,6 +16500,7 @@ static void handle_http_share_client(st_admin_server *server,
 
 static void handle_client(st_admin_server *server, int fd)
 {
+    long long started_ms = admin_now_ms();
     char request[8192];
     ssize_t len = recv(fd, request, sizeof(request) - 1U, 0);
     if (len <= 0) {
@@ -16302,8 +16539,9 @@ static void handle_client(st_admin_server *server, int fd)
     }
     int strip_direct_authorization = 0;
     char direct_target_base_url[512] = "";
-    if (strncmp(path, "/http/", 6) == 0) {
-        int auth_result = authorize_direct_http_route(fd, path, request, direct_target_base_url,
+    int direct_path = strncmp(path, "/http/", 6) == 0;
+    if (direct_path) {
+        int auth_result = authorize_direct_http_route(fd, method, path, request, started_ms, direct_target_base_url,
                                                       sizeof(direct_target_base_url));
         if (auth_result < 0) {
             close(fd);
@@ -16316,8 +16554,22 @@ static void handle_client(st_admin_server *server, int fd)
     char *body_buffer = NULL;
     char **received_trailers = NULL;
     size_t received_trailers_len = 0U;
+    admin_body_refusal refusal;
+    memset(&refusal, 0, sizeof(refusal));
+    refusal.capture = direct_path && admin_direct_route_captured(path);
     if (admin_read_request_body(fd, request, (size_t)len, path, &body, &available_body_len,
-                                &body_buffer, &received_trailers, &received_trailers_len) != 0) {
+                                &body_buffer, &received_trailers, &received_trailers_len, &refusal) != 0) {
+        if (direct_path && refusal.too_large) {
+            /* Java HttpSpecusBodyLimitFilter records the refusal with the headers and the body's start. */
+            char **headers = NULL;
+            size_t headers_len = 0U;
+            if (admin_collect_headers(request, strip_direct_authorization, &headers, &headers_len) == 0) {
+                record_direct_http_refusal(fd, method, path, headers, headers_len, (const uint8_t *)refusal.prefix,
+                                           refusal.prefix_len, 413, "HTTP 请求体超过限制", started_ms);
+            }
+            free_header_array(headers, headers_len);
+        }
+        free(refusal.prefix);
         close(fd);
         return;
     }
