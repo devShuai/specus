@@ -1292,6 +1292,24 @@ static EVP_PKEY *att_callback_key(char **pem_out)
     return key;
 }
 
+/* Stands in for gosspublic.alicdn.com: serves one PEM key and records the URLs requested. */
+typedef struct {
+    const char *pem;
+    int calls;
+    char last_url[256];
+} att_key_server;
+
+static char *att_fetch_callback_key(const char *url, void *context)
+{
+    att_key_server *server = (att_key_server *)context;
+    ++server->calls;
+    snprintf(server->last_url, sizeof(server->last_url), "%s", url);
+    if (server->pem == NULL) return NULL;
+    char *copy = (char *)malloc(strlen(server->pem) + 1U);
+    if (copy != NULL) memcpy(copy, server->pem, strlen(server->pem) + 1U);
+    return copy;
+}
+
 /* OSS callback signature: base64(RSA-MD5(url_decode(path) + query + "\n" + body)). */
 static char *att_sign_callback(EVP_PKEY *key, const char *body)
 {
@@ -1373,7 +1391,7 @@ static void att_unconfigure(void)
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) unsetenv(names[i]);
     cap_set_limits(NULL, NULL, NULL, NULL);
-    (void)st_object_storage_set_callback_key_for_tests(NULL);
+    st_object_storage_set_callback_key_fetcher_for_tests(NULL, NULL);
     st_object_storage_reset_for_tests();
     unlink(att_db_path);
     (void)configure();
@@ -1548,8 +1566,9 @@ static int att_callback_paths(void)
     char *foreign_url = att_base64((const unsigned char *)foreign_location, strlen(foreign_location));
     char response[16384], key1[256], key2[256], body[512];
     long long id1 = 0, id2 = 0;
-    int failed = key == NULL || key_url == NULL || foreign_url == NULL
-        || st_object_storage_set_callback_key_for_tests(pem) != 0;
+    att_key_server key_server = {pem, 0, ""};
+    int failed = key == NULL || key_url == NULL || foreign_url == NULL;
+    st_object_storage_set_callback_key_fetcher_for_tests(att_fetch_callback_key, &key_server);
     ATT_STEP(att_public_upload(&alice, ATT_CALLBACK_ROOM, ATT_CALLBACK_TOKEN, 10, 200, NULL, &id1, key1,
                                "callback upload"));
     ATT_STEP(att_public_upload(&alice, ATT_CALLBACK_ROOM, ATT_CALLBACK_TOKEN, 10, 200, NULL, &id2, key2,
@@ -1592,6 +1611,7 @@ static int att_callback_paths(void)
     /* Without a configured callback URL every callback is refused. */
     unsetenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL");
     ATT_STEP(att_callback(body, signature, key_url, 403, "signature", "callback with callbacks disabled"));
+    st_object_storage_set_callback_key_fetcher_for_tests(NULL, NULL);
     free(signature);
     free(foreign_url);
     free(key_url);

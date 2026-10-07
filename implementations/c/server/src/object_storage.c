@@ -1873,11 +1873,16 @@ static uint8_t *object_base64_decode(const char *value, size_t *out_len)
 
 static char *object_callback_key_url(const char *encoded)
 {
-    if (!object_text_present(encoded)) return NULL;
+    /* Java trims the x-oss-pub-key-url header and the decoded URL before checking them. */
+    char trimmed[1024];
+    if (!object_text_present(encoded) || object_copy_trimmed(trimmed, sizeof(trimmed), encoded) != 0)
+        return NULL;
     size_t decoded_len = 0U;
-    uint8_t *decoded = object_base64_decode(encoded, &decoded_len);
+    uint8_t *decoded = object_base64_decode(trimmed, &decoded_len);
     if (decoded == NULL || memchr(decoded, '\0', decoded_len) != NULL) { free(decoded); return NULL; }
-    const char *url = (const char *)decoded;
+    char *url = (char *)decoded;
+    while (isspace((unsigned char)*url)) ++url;
+    for (size_t len = strlen(url); len > 0U && isspace((unsigned char)url[len - 1U]); --len) url[len - 1U] = '\0';
     const char *path = NULL;
     static const char http_prefix[] = "http://gosspublic.alicdn.com";
     static const char https_prefix[] = "https://gosspublic.alicdn.com";
@@ -1892,8 +1897,19 @@ static char *object_callback_key_url(const char *encoded)
     return secure;
 }
 
+/*
+ * Parsed OSS callback public keys by pinned https URL, as Java's callbackPublicKeys map: a key URL is
+ * fetched once per process. Only keys that were fetched and parsed are kept, and at most
+ * ST_OBJECT_CALLBACK_KEY_CACHE of them (the URL pinning admits only gosspublic /callback_pub_key*).
+ */
+#define ST_OBJECT_CALLBACK_KEY_CACHE 16U
+
 static pthread_mutex_t object_callback_key_lock = PTHREAD_MUTEX_INITIALIZER;
-static char *object_callback_key_for_tests = NULL;
+static char *object_callback_key_urls[ST_OBJECT_CALLBACK_KEY_CACHE];
+static EVP_PKEY *object_callback_keys[ST_OBJECT_CALLBACK_KEY_CACHE];
+static size_t object_callback_key_count = 0U;
+static st_object_callback_key_fetcher object_callback_key_fetcher = NULL;
+static void *object_callback_key_fetcher_context = NULL;
 
 static EVP_PKEY *object_parse_callback_key(const char *pem, size_t len)
 {
@@ -1903,24 +1919,35 @@ static EVP_PKEY *object_parse_callback_key(const char *pem, size_t len)
     return key;
 }
 
-static EVP_PKEY *object_load_callback_key(const char *encoded_url)
+/* Returns a new reference to the cached key for url, or NULL. Caller holds the lock. */
+static EVP_PKEY *object_cached_callback_key_locked(const char *url)
 {
-    char *url = object_callback_key_url(encoded_url);
-    if (url == NULL) return NULL;
-    /* Test seam: the URL is still validated, only the HTTPS fetch is replaced. */
-    pthread_mutex_lock(&object_callback_key_lock);
-    EVP_PKEY *pinned = object_callback_key_for_tests == NULL ? NULL
-        : object_parse_callback_key(object_callback_key_for_tests, strlen(object_callback_key_for_tests));
-    int use_pinned = object_callback_key_for_tests != NULL;
-    pthread_mutex_unlock(&object_callback_key_lock);
-    if (use_pinned) {
-        free(url);
-        return pinned;
+    for (size_t i = 0U; i < object_callback_key_count; ++i) {
+        if (strcmp(object_callback_key_urls[i], url) == 0) {
+            return EVP_PKEY_up_ref(object_callback_keys[i]) == 1 ? object_callback_keys[i] : NULL;
+        }
     }
+    return NULL;
+}
+
+static void object_clear_callback_keys_locked(void)
+{
+    for (size_t i = 0U; i < object_callback_key_count; ++i) {
+        free(object_callback_key_urls[i]);
+        EVP_PKEY_free(object_callback_keys[i]);
+        object_callback_key_urls[i] = NULL;
+        object_callback_keys[i] = NULL;
+    }
+    object_callback_key_count = 0U;
+}
+
+/* GET of the pinned key URL: the PEM body of a 200 response of at most 64 KiB, or NULL. */
+static char *object_fetch_callback_key(const char *url)
+{
     (void)pthread_once(&object_curl_once, object_curl_init);
     CURL *curl = object_curl_init_result == CURLE_OK ? curl_easy_init() : NULL;
     st_object_bytes pem = {0};
-    if (curl == NULL) { free(url); return NULL; }
+    if (curl == NULL) return NULL;
     CURLcode rc = curl_easy_setopt(curl, CURLOPT_URL, url);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
@@ -1930,10 +1957,48 @@ static EVP_PKEY *object_load_callback_key(const char *encoded_url)
     long status = 0;
     if (rc == CURLE_OK) rc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_cleanup(curl);
+    if (rc != CURLE_OK || status != 200 || pem.data == NULL) {
+        free(pem.data);
+        return NULL;
+    }
+    return (char *)pem.data;
+}
+
+static EVP_PKEY *object_load_callback_key(const char *encoded_url)
+{
+    char *url = object_callback_key_url(encoded_url);
+    if (url == NULL) return NULL;
+    pthread_mutex_lock(&object_callback_key_lock);
+    EVP_PKEY *cached = object_cached_callback_key_locked(url);
+    st_object_callback_key_fetcher fetcher = object_callback_key_fetcher;
+    void *fetcher_context = object_callback_key_fetcher_context;
+    pthread_mutex_unlock(&object_callback_key_lock);
+    if (cached != NULL) {
+        free(url);
+        return cached;
+    }
+    /* Test seam: the URL is validated and pinned as always, only the HTTPS GET is replaced. */
+    char *pem = fetcher != NULL ? fetcher(url, fetcher_context) : object_fetch_callback_key(url);
+    EVP_PKEY *key = pem == NULL || strlen(pem) > 64U * 1024U ? NULL : object_parse_callback_key(pem, strlen(pem));
+    free(pem);
+    if (key == NULL) {
+        free(url);
+        return NULL;
+    }
+    pthread_mutex_lock(&object_callback_key_lock);
+    cached = object_cached_callback_key_locked(url);
+    if (cached != NULL) {
+        EVP_PKEY_free(key);
+        key = cached;
+    } else if (object_callback_key_count < ST_OBJECT_CALLBACK_KEY_CACHE
+               && EVP_PKEY_up_ref(key) == 1) {
+        object_callback_key_urls[object_callback_key_count] = url;
+        object_callback_keys[object_callback_key_count] = key;
+        ++object_callback_key_count;
+        url = NULL;
+    }
+    pthread_mutex_unlock(&object_callback_key_lock);
     free(url);
-    if (rc != CURLE_OK || status != 200 || pem.data == NULL) { free(pem.data); return NULL; }
-    EVP_PKEY *key = object_parse_callback_key((const char *)pem.data, pem.len);
-    free(pem.data);
     return key;
 }
 
@@ -2266,16 +2331,14 @@ void st_object_storage_reset_for_tests(void)
     pthread_mutex_unlock(&object_rate_lock);
 }
 
-int st_object_storage_set_callback_key_for_tests(const char *pem)
+void st_object_storage_set_callback_key_fetcher_for_tests(st_object_callback_key_fetcher fetcher,
+                                                          void *context)
 {
-    char *copy = NULL;
-    if (pem != NULL && (copy = (char *)malloc(strlen(pem) + 1U)) == NULL) return -1;
-    if (copy != NULL) memcpy(copy, pem, strlen(pem) + 1U);
     pthread_mutex_lock(&object_callback_key_lock);
-    free(object_callback_key_for_tests);
-    object_callback_key_for_tests = copy;
+    object_clear_callback_keys_locked();
+    object_callback_key_fetcher = fetcher;
+    object_callback_key_fetcher_context = context;
     pthread_mutex_unlock(&object_callback_key_lock);
-    return 0;
 }
 
 int st_object_storage_capabilities_for_tests(const st_object_storage_identity *identity,

@@ -36,11 +36,14 @@ int st_object_storage_capabilities_for_tests(const st_object_storage_identity *i
                                              size_t out_len);
 
 /*
- * Serves this PEM public key for every valid OSS callback key URL instead of fetching it from
- * gosspublic.alicdn.com, so callback signature verification can be tested offline. NULL restores
- * the real fetch.
+ * Replaces the HTTPS GET of the OSS callback public key, so callback signature verification can be
+ * tested offline. The fetcher receives the pinned https://gosspublic.alicdn.com/callback_pub_key*
+ * URL the server would request and returns the PEM body (malloc'ed, freed by the server) or NULL
+ * for a failed fetch. NULL restores the real fetch; either call empties the key cache.
  */
-int st_object_storage_set_callback_key_for_tests(const char *pem);
+typedef char *(*st_object_callback_key_fetcher)(const char *url, void *context);
+void st_object_storage_set_callback_key_fetcher_for_tests(st_object_callback_key_fetcher fetcher,
+                                                          void *context);
 
 /* Deterministic OSS V4 vector hook. Returned strings are owned by the caller. */
 char *st_object_storage_presign_for_tests(const char *method,
