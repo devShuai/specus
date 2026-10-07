@@ -4057,6 +4057,29 @@ static int test_peer_mesh_egress_admin_only(int egress_client_id)
         return 1;
     }
 
+    /*
+     * aSwitchRequestWithoutEnabledIsRefused and aBodyThatCannotBeParsedIsABadRequest: a switch
+     * request without enabled, or with it null, used to read as off and could stop egress for the
+     * whole tenant; a port range that is not a list is not a policy either.
+     */
+    static const char *const switch_bodies[] = {"{}", "{\"enabled\":null}"};
+    for (size_t i = 0U; i < sizeof(switch_bodies) / sizeof(switch_bodies[0]); ++i) {
+        len = st_admin_build_response_with_body("PUT", switch_path, switch_bodies[i], response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")
+            || !contains(response, "{\"error\":\"enabled is required\"}")) {
+            fprintf(stderr, "egress switch %s was not refused: %s\n", switch_bodies[i], response);
+            return 1;
+        }
+    }
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"destinationRules\":[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":\"443\"}]}",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", policies_path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "a policy with portRanges \"443\" was accepted: %s\n", response);
+        return 1;
+    }
+
     /* Peer Mesh is off in this deployment: switching egress on is a bad request, off is allowed. */
     const char *peer_mesh = getenv("SPECUS_PEER_MESH_ENABLED");
     char saved_peer_mesh[16] = "";

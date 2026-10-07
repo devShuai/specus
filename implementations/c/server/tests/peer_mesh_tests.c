@@ -425,6 +425,108 @@ static int test_egress_config_domain_rules(void)
     return 0;
 }
 
+static int any_signal_of_type(const peer_test_context *ctx, const char *target, const char *type)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"type\":\"%s\"", type);
+    for (size_t i = 0; i < ctx->count; ++i) {
+        if (strcmp(ctx->signals[i].target, target) == 0 && contains(ctx->signals[i].message, needle)) return 1;
+    }
+    return 0;
+}
+
+static int gates_online(void *raw, long long client_id, const char *client_name)
+{
+    (void)raw;
+    (void)client_id;
+    (void)client_name;
+    return 1;
+}
+
+/*
+ * PeerEgressServiceTests theTenantSwitchGatesEveryPolicy, aConsumerOutsideTheAllowlistDoesNotSeeTheEgress
+ * and clientsThatCannotDoEgressAreNeverPushedAPolicy, as the pushes leave the server: the tenant
+ * switch is off by default and gates an enabled policy; a consumer missing from the allowlist does
+ * not see the egress in its catalogue; a client that announced no egress capability is sent neither
+ * an egress-config nor an egress-catalog.
+ */
+static int test_egress_pushes_are_gated(void)
+{
+    char path[] = "/tmp/specus_c_peer_egress_gates.XXXXXX";
+    int temp_fd = mkstemp(path);
+    if (temp_fd < 0) return 1;
+    close(temp_fd);
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) return 1;
+    st_storage_client consumer, outsider, egress, legacy;
+    st_storage_peer_mesh_device device;
+    long long session_id = 0;
+    int failed = st_storage_upsert_client(path, 0, "tenant-gates", "gates-consumer", "owner", 1, 60, &consumer) != 0
+        || st_storage_upsert_client(path, 0, "tenant-gates", "gates-outsider", "owner", 1, 60, &outsider) != 0
+        || st_storage_upsert_client(path, 0, "tenant-gates", "gates-egress", "owner", 1, 60, &egress) != 0
+        || st_storage_upsert_client(path, 0, "tenant-gates", "gates-legacy", "owner", 1, 60, &legacy) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &consumer, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &outsider, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &egress, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &legacy, 1, &device) != 0
+        || add_egress_policy(path, &egress, consumer.id) != 0
+        || add_egress_policy(path, &legacy, consumer.id) != 0
+        || open_egress_session_announcing(path, &consumer, 1, 0, &session_id) != 0
+        || open_egress_session_announcing(path, &outsider, 1, 0, &session_id) != 0
+        || open_egress_session_announcing(path, &egress, 1, 0, &session_id) != 0
+        || open_egress_session_announcing(path, &legacy, 0, 0, &session_id) != 0;
+    if (failed) {
+        fprintf(stderr, "egress gate fixture setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    peer_test_context capture;
+    memset(&capture, 0, sizeof(capture));
+    st_peer_mesh_runtime runtime = {path, capture_signal, gates_online, &capture, 0, 2};
+    char allowed[64];
+    snprintf(allowed, sizeof(allowed), "\"allowedConsumerClientIds\":[%lld]", consumer.id);
+
+    /* No switch row: off by default, so the enabled policy grants nothing. */
+    const char *config = NULL;
+    if (st_peer_mesh_refresh_tenant(&runtime, "tenant-gates") != 0
+        || (config = last_egress_config(&capture, "gates-egress")) == NULL
+        || !contains(config, "\"enabled\":false,\"allowedConsumerClientIds\":[]")) {
+        fprintf(stderr, "an unset tenant switch did not gate the policy: %s\n", config == NULL ? "(none)" : config);
+        failed = 1;
+    }
+    st_storage_peer_mesh_egress_switch egress_switch;
+    memset(&egress_switch, 0, sizeof(egress_switch));
+    snprintf(egress_switch.tenant_id, sizeof(egress_switch.tenant_id), "%s", "tenant-gates");
+    egress_switch.enabled = 1;
+    snprintf(egress_switch.updated_by, sizeof(egress_switch.updated_by), "%s", "admin");
+    capture.count = 0;
+    const char *catalog = NULL;
+    if (!failed && (st_storage_upsert_peer_mesh_egress_switch(path, &egress_switch) != 0
+                    || st_peer_mesh_refresh_tenant(&runtime, "tenant-gates") != 0
+                    || (config = last_egress_config(&capture, "gates-egress")) == NULL
+                    || !contains(config, "\"enabled\":true") || !contains(config, allowed))) {
+        fprintf(stderr, "the tenant switch did not let the policy through: %s\n", config == NULL ? "(none)" : config);
+        failed = 1;
+    }
+    if (!failed && ((catalog = last_egress_catalog(&capture, "gates-consumer")) == NULL
+                    || !contains(catalog, "\"clientName\":\"gates-egress\""))) {
+        fprintf(stderr, "an allowlisted consumer did not see the egress: %s\n", catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    if (!failed && ((catalog = last_egress_catalog(&capture, "gates-outsider")) == NULL
+                    || contains(catalog, "gates-egress"))) {
+        fprintf(stderr, "a consumer outside the allowlist saw the egress: %s\n", catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    if (!failed && (any_signal_of_type(&capture, "gates-legacy", "egress-config")
+                    || any_signal_of_type(&capture, "gates-legacy", "egress-catalog"))) {
+        fprintf(stderr, "a client without egress capability was pushed egress state\n");
+        failed = 1;
+    }
+    unlink(path);
+    return failed;
+}
+
 /* The version fixture: every device is connected except the two whose egress has gone away. */
 static int version_egress_is_online(void *raw, long long client_id, const char *client_name)
 {
@@ -1536,6 +1638,7 @@ int main(void)
     if (test_egress_catalog_domain_targets() != 0) return 1;
     if (test_egress_catalog_egress_version() != 0) return 1;
     if (test_egress_config_domain_rules() != 0) return 1;
+    if (test_egress_pushes_are_gated() != 0) return 1;
     if (test_egress_report() != 0) return 1;
     if (test_session_reuse() != 0) return 1;
     if (test_session_reports() != 0) return 1;
