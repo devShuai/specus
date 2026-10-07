@@ -69,6 +69,14 @@ Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补�
 时间列是 epoch 毫秒，日期列是 UTC `yyyy-MM-dd` 文本，计数表没有任何用户列；表名与列名和 Go、Java、C 服务端一致，
 启动兼容 SQL 也会幂等建表。三套迁移和快照保持同步。
 
+`AddManagementLoginNames` 让管理账号的登录名按租户唯一（protocol/spec/management-accounts.md）：
+`specus_management_user` 增加可空的 `login_name`、`login_name_normalized`（varchar(80)），迁移内用 SQL 把旧行的
+登录名回填为原用户名（主键 `username` 从此只是不透明的账号键，旧行保持原值，新账号用随机 UUID），再建唯一索引
+`uq_management_user_tenant_login_name (tenant_id, login_name_normalized)`；同一租户内大小写重名时建索引失败，迁移
+与启动随之失败。启动时 `DatabaseInitializer` 先于迁移检查重名（MySQL 的 DDL 不回滚，不能留下半套列），迁移后用
+`ToLowerInvariant()` 重算规范登录名（SQLite 的 `LOWER()` 只折叠 ASCII）、幂等补列补索引并校验索引定义。三套迁移和
+快照保持同步。
+
 临时 HTTP 分享由三套 `AddTemporaryHttpShare` migration 新增 `http_share` 与 `http_access_audit`
 （protocol/spec/temporary-http-share.md）。列名与类型和 Go、Java、C 服务端一致，以便共用同一个库：时刻一律是
 整数 epoch 秒，`expiry_recorded` 是 0/1 整数（SQLite INTEGER、PostgreSQL smallint、MySQL tinyint），不是布尔。

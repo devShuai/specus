@@ -133,7 +133,9 @@ public sealed class LocalTokenService
             {
                 return null;
             }
-            var tenantId = TryGetString(payload.RootElement, "tenant_id") ?? _options.TenantId;
+            // Absent from tokens minted before tenant-scoped login names; the principal then has no
+            // tenant_id claim, which tells the account resolution that sub is an account key.
+            var tenantId = TryGetString(payload.RootElement, "tenant_id");
             var role = ParseRole(TryGetString(payload.RootElement, "role"));
             var exp = payload.RootElement.GetProperty("exp").GetInt64();
             if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= exp)
@@ -145,7 +147,10 @@ public sealed class LocalTokenService
             identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, subject));
             identity.AddClaim(new Claim(ClaimTypes.Name, subject));
             identity.AddClaim(new Claim("iss", Issuer));
-            identity.AddClaim(new Claim("tenant_id", NormalizeTenant(tenantId)));
+            if (!string.IsNullOrWhiteSpace(tenantId))
+            {
+                identity.AddClaim(new Claim("tenant_id", NormalizeTenant(tenantId)));
+            }
             identity.AddClaim(new Claim(ClaimTypes.Role, RoleWire(role)));
             identity.AddClaim(new Claim("role", RoleWire(role)));
             return new ClaimsPrincipal(identity);

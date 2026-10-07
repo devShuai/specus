@@ -49,9 +49,7 @@ public sealed class RegistrationService
         var password = RequirePassword(rawPassword);
         var email = NormalizeEmail(rawEmail);
 
-        if (await _db.ManagementUsers.AsNoTracking()
-                .AnyAsync(user => user.Username.ToLower() == username.ToLower(), cancellationToken)
-                .ConfigureAwait(false))
+        if (await LoginNameTakenAsync(username, cancellationToken).ConfigureAwait(false))
         {
             throw new InvalidOperationException("用户名已存在: " + username);
         }
@@ -186,9 +184,7 @@ public sealed class RegistrationService
             throw InvalidCode();
         }
 
-        if (await _db.ManagementUsers.AsNoTracking()
-                .AnyAsync(user => user.Username.ToLower() == challenge.Username.ToLower(), cancellationToken)
-                .ConfigureAwait(false))
+        if (await LoginNameTakenAsync(challenge.Username, cancellationToken).ConfigureAwait(false))
         {
             throw new InvalidOperationException("用户名已存在: " + challenge.Username);
         }
@@ -203,8 +199,10 @@ public sealed class RegistrationService
             .ConfigureAwait(false);
         var user = new ManagementUser
         {
-            Username = challenge.Username,
-            TenantId = ManagementContext.NormalizeTenant(_auth.TenantId),
+            Username = ManagementUserService.NewAccountKey(),
+            LoginName = challenge.Username,
+            LoginNameNormalized = ManagementUser.NormalizeLoginName(challenge.Username),
+            TenantId = DefaultTenant,
             PasswordHash = challenge.PasswordHash,
             Role = ManagementRole.User,
             Enabled = true,
@@ -214,6 +212,7 @@ public sealed class RegistrationService
         _db.ManagementUsers.Add(user);
         _db.ManagementUserEmails.Add(new ManagementUserEmail
         {
+            // The email record points at the account key, not at the login name.
             Username = user.Username,
             Email = challenge.Email,
             VerifiedAt = now,
@@ -232,8 +231,20 @@ public sealed class RegistrationService
             throw new InvalidOperationException("用户名或邮箱已被注册");
         }
 
-        return new LoginUser(user.Username, user.TenantId, user.Role, BuiltInAdmin: false);
+        return ManagementUserService.ToLoginUser(user);
     }
+
+    /// <summary>Registration is open in the default tenant only, so that is the only tenant checked.</summary>
+    private Task<bool> LoginNameTakenAsync(string loginName, CancellationToken cancellationToken)
+    {
+        var tenantId = DefaultTenant;
+        var loginNameNormalized = ManagementUser.NormalizeLoginName(loginName);
+        return _db.ManagementUsers.AsNoTracking()
+            .AnyAsync(user => user.TenantId == tenantId && user.LoginNameNormalized == loginNameNormalized,
+                cancellationToken);
+    }
+
+    private string DefaultTenant => ManagementContext.NormalizeTenant(_auth.TenantId);
 
     public async Task DeleteExpiredChallengesAsync(CancellationToken cancellationToken)
     {
