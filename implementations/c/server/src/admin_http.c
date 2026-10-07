@@ -15013,7 +15013,14 @@ static void *admin_client_message_write_thread(void *arg)
 
 static void admin_handle_client_message_command(st_admin_ws_client *client, const char *json)
 {
-    if (!st_json_is_valid_object(json)) {
+    /*
+     * Java binds the text into ClientMessageCommand(type, messageId, toClientName, message) with a
+     * default ObjectMapper: an unknown member, or an object or array where a string belongs, fails
+     * the mapping just as malformed JSON does.
+     */
+    static const char *const command_fields[] = {"type", "messageId", "toClientName", "message"};
+    if (!st_json_object_has_only_scalar_fields(json, command_fields,
+                                               sizeof(command_fields) / sizeof(command_fields[0]))) {
         (void)admin_ws_send_message_status(client, "error", NULL, NULL, NULL, "invalid-json");
         return;
     }
