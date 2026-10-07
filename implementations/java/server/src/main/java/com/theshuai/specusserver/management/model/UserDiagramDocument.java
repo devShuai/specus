@@ -8,6 +8,7 @@ import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.Length;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
@@ -32,8 +33,9 @@ public class UserDiagramDocument {
     @Column(nullable = false, length = 120)
     private String name;
 
+    // Without a length MySQL makes this varbinary(32600), short of the 3 MiB snapshot limit.
     @JdbcTypeCode(SqlTypes.LONGVARBINARY)
-    @Column(name = "snapshot_data", nullable = false)
+    @Column(name = "snapshot_data", nullable = false, length = Length.LONG32)
     private byte[] snapshotData;
 
     @Column(name = "size_bytes", nullable = false)

@@ -15,6 +15,8 @@
         <java.version>21</java.version>
         <npm.executable>npm</npm.executable>
         <specus.server.web.skip>false</specus.server.web.skip>
+        <mariadb4j.version>3.2.0</mariadb4j.version>
+        <mariadb4j.db.version>11.4.5</mariadb4j.db.version>
     </properties>
     <build>
         <finalName>specus-server</finalName>
@@ -125,6 +127,14 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Embedded MariaDB for the MySQL-dialect schema test. The server binary comes from a
+             per-OS profile below; without one the test is skipped. -->
+        <dependency>
+            <groupId>ch.vorburger.mariaDB4j</groupId>
+            <artifactId>mariaDB4j-core</artifactId>
+            <version>${mariadb4j.version}</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
@@ -163,6 +173,24 @@
             <properties>
                 <npm.executable>npm.cmd</npm.executable>
             </properties>
+        </profile>
+        <profile>
+            <!-- The Windows MariaDB build is ~16 MB. The Linux one is ~150 MB and not verified on
+                 the CI runners, so builds there skip the embedded MariaDB test. -->
+            <id>windows-mariadb4j</id>
+            <activation>
+                <os>
+                    <family>Windows</family>
+                </os>
+            </activation>
+            <dependencies>
+                <dependency>
+                    <groupId>ch.vorburger.mariaDB4j</groupId>
+                    <artifactId>mariaDB4j-db-winx64</artifactId>
+                    <version>${mariadb4j.db.version}</version>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
         </profile>
     </profiles>
 

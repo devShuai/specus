@@ -10,6 +10,7 @@ import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.Length;
 
 @Entity
 @Table(name = "specus_http_traffic_exchange",
@@ -89,32 +90,35 @@ public class HttpTrafficExchange {
     @Column(name = "response_body_type", length = 32)
     private String responseBodyType;
 
-    @Column(name = "request_headers", length = 8192)
+    // Text, not varchar(8192): MySQL counts a varchar at 4 bytes a character against its 65,535-byte
+    // row limit, and these two alone reach it. specus.traffic.capture-header-chars caps the content.
+    @Column(name = "request_headers", length = Length.LONG32)
     private String requestHeaders;
 
-    @Column(name = "response_headers", length = 8192)
+    @Column(name = "response_headers", length = Length.LONG32)
     private String responseHeaders;
 
     @Column(name = "request_preview_hex", length = 4096)
     private String requestPreviewHex;
 
+    // A @Lob column keeps @Column's default length of 255, which MySQL turns into tinyblob/tinytext.
     @Lob
-    @Column(name = "request_body_data")
+    @Column(name = "request_body_data", length = Length.LONG32)
     private byte[] requestBodyData;
 
     @Lob
-    @Column(name = "request_preview_text")
+    @Column(name = "request_preview_text", length = Length.LONG32)
     private String requestPreviewText;
 
     @Column(name = "response_preview_hex", length = 4096)
     private String responsePreviewHex;
 
     @Lob
-    @Column(name = "response_body_data")
+    @Column(name = "response_body_data", length = Length.LONG32)
     private byte[] responseBodyData;
 
     @Lob
-    @Column(name = "response_preview_text")
+    @Column(name = "response_preview_text", length = Length.LONG32)
     private String responsePreviewText;
 
     @Column(name = "request_truncated", nullable = false)
