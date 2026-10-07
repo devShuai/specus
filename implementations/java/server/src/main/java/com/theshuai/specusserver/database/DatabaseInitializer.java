@@ -41,6 +41,7 @@ public class DatabaseInitializer {
     private final ClientDownloadSchemaMigrator clientDownloadSchemaMigrator;
     private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
     private final TransferTimestampMigrator transferTimestampMigrator;
+    private final HttpExchangeLargeObjectMigrator httpExchangeLargeObjectMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
     private final SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator;
     private final boolean seedDemoClient;
@@ -56,6 +57,7 @@ public class DatabaseInitializer {
                                ClientDownloadSchemaMigrator clientDownloadSchemaMigrator,
                                PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
                                TransferTimestampMigrator transferTimestampMigrator,
+                               HttpExchangeLargeObjectMigrator httpExchangeLargeObjectMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
                                SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
@@ -71,6 +73,7 @@ public class DatabaseInitializer {
         this.clientDownloadSchemaMigrator = clientDownloadSchemaMigrator;
         this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
         this.transferTimestampMigrator = transferTimestampMigrator;
+        this.httpExchangeLargeObjectMigrator = httpExchangeLargeObjectMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
         this.sqliteUniqueIndexMigrator = sqliteUniqueIndexMigrator;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
@@ -97,6 +100,7 @@ public class DatabaseInitializer {
         clientDownloadSchemaMigrator.migrate();
         peerServiceDiscoverySchemaMigrator.migrate();
         transferTimestampMigrator.migrate();
+        httpExchangeLargeObjectMigrator.migrate();
         widenHttpBodyTextColumns();
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();

@@ -1,9 +1,11 @@
 package com.theshuai.specusserver.database;
 
 import com.theshuai.specusserver.SpecusServerApplication;
+import com.theshuai.specusserver.management.model.HttpBodyDataCodec;
 import com.theshuai.specusserver.management.model.HttpTrafficExchange;
 import com.theshuai.specusserver.management.model.HttpTrafficExchangeView;
 import com.theshuai.specusserver.management.repository.HttpTrafficExchangeRepository;
+import com.theshuai.specusserver.management.service.TrafficViewService;
 import com.theshuai.specusserver.management.storage.HttpTrafficExchangeStore;
 import com.theshuai.specusserver.management.storage.HttpTrafficSearchField;
 import com.theshuai.specusserver.management.tenant.TenantContext;
@@ -17,6 +19,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -25,6 +28,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,6 +45,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class PostgresSchemaMigrationTests {
     private static final AtomicInteger DATABASES = new AtomicInteger();
+    private static final Map<String, String> BYTES_AND_TEXT = Map.of(
+            "request_body_data", "bytea",
+            "response_body_data", "bytea",
+            "request_preview_text", "text",
+            "response_preview_text", "text");
     private static EmbeddedPostgres postgres;
 
     @TempDir
@@ -107,6 +116,127 @@ class PostgresSchemaMigrationTests {
                     .extracting(HttpTrafficExchangeView::id)
                     .containsExactly(exchange.getId().toString());
         }
+    }
+
+    /** The search and the detail were called without a transaction when they failed. */
+    @Test
+    void httpExchangeBodiesAreBytesAndTextSearchedAndReadWithoutATransaction() {
+        try (ConfigurableApplicationContext context = start(createDatabase())) {
+            JdbcTemplate jdbc = context.getBean(JdbcTemplate.class);
+            assertThat(httpBodyColumnTypes(jdbc)).isEqualTo(BYTES_AND_TEXT);
+            HttpTrafficExchange exchange = context.getBean(HttpTrafficExchangeRepository.class)
+                    .save(widestExchangeWithBodyWords());
+
+            // The search that failed: ALL takes in the previews.
+            assertThat(context.getBean(HttpTrafficExchangeStore.class)
+                    .search(TenantContext.defaultTenant(), null, null, null, null,
+                            HttpTrafficSearchField.ALL, "x-request", PageRequest.of(0, 20))
+                    .getContent())
+                    .extracting(HttpTrafficExchangeView::id)
+                    .containsExactly(exchange.getId().toString());
+            assertBodiesSearchableAndReadable(context, exchange);
+            assertThat(largeObjects(jdbc)).isEmpty();
+        }
+    }
+
+    /**
+     * The @Lob mapping made all four columns oid and wrote each body and preview as a large object,
+     * a preview in UTF-8. The widening of the preview columns then made them text, which turned the
+     * large objects' numbers into their text, and wrote the previews that way from then on.
+     */
+    @Test
+    void httpExchangeLargeObjectsTheLobMappingWroteMoveIntoTheirRows() {
+        String database = createDatabase();
+        HttpTrafficExchange exchange;
+        HttpTrafficExchange empty;
+        HttpTrafficExchange vacuumed;
+        long unrelated;
+
+        try (ConfigurableApplicationContext first = start(database)) {
+            HttpTrafficExchangeRepository repository = first.getBean(HttpTrafficExchangeRepository.class);
+            exchange = repository.save(widestExchangeWithBodyWords());
+            empty = WidestHttpTrafficExchange.create();
+            empty.setRequestBodyData(null);
+            empty.setResponseBodyData(null);
+            empty.setRequestPreviewText(null);
+            empty.setResponsePreviewText(null);
+            empty = repository.save(empty);
+            vacuumed = repository.save(WidestHttpTrafficExchange.create());
+
+            JdbcTemplate jdbc = first.getBean(JdbcTemplate.class);
+            // The request preview column stays oid, as before the widening ran; Hibernate's update
+            // makes it text, of numbers, before the migration sees it.
+            jdbc.execute("""
+                    alter table specus_http_traffic_exchange
+                      alter column request_body_data type oid using lo_from_bytea(0, request_body_data),
+                      alter column response_body_data type oid using lo_from_bytea(0, response_body_data),
+                      alter column request_preview_text type oid
+                            using lo_from_bytea(0, convert_to(request_preview_text, 'UTF8'))
+                    """);
+            jdbc.update("""
+                    update specus_http_traffic_exchange
+                       set response_preview_text = lo_from_bytea(0, convert_to(response_preview_text, 'UTF8'))::text
+                    """);
+            // vacuumlo removes the large objects no oid column holds, a text column's among them.
+            jdbc.queryForMap("""
+                    select lo_unlink(request_body_data), lo_unlink(response_preview_text::oid)
+                      from specus_http_traffic_exchange where id = ?
+                    """, vacuumed.getId());
+            unrelated = jdbc.queryForObject("select lo_from_bytea(0, '\\x01'::bytea)", Long.class);
+        }
+
+        HttpTrafficExchange digits;
+        try (ConfigurableApplicationContext second = start(database)) {
+            JdbcTemplate jdbc = second.getBean(JdbcTemplate.class);
+            assertThat(httpBodyColumnTypes(jdbc)).isEqualTo(BYTES_AND_TEXT);
+            assertThat(largeObjects(jdbc)).containsExactly(unrelated);
+            HttpTrafficExchangeRepository repository = second.getBean(HttpTrafficExchangeRepository.class);
+            assertThat(read(repository, empty)).usingRecursiveComparison().isEqualTo(empty);
+            // A body number with nothing behind it is gone; a preview one may be text, so it stays.
+            HttpTrafficExchange vacuumedRead = read(repository, vacuumed);
+            assertThat(vacuumedRead.getRequestBodyData()).isNull();
+            assertThat(vacuumedRead.getResponsePreviewText()).matches("[1-9][0-9]*");
+            assertThat(vacuumedRead).usingRecursiveComparison()
+                    .ignoringFields("requestBodyData", "responsePreviewText")
+                    .isEqualTo(vacuumed);
+            assertBodiesSearchableAndReadable(second, exchange);
+
+            digits = WidestHttpTrafficExchange.create();
+            digits.setRequestPreviewText(Long.toString(unrelated));
+            digits = repository.save(digits);
+        }
+
+        // No oid column is left to mark the table, so the next start converts nothing.
+        try (ConfigurableApplicationContext third = start(database)) {
+            assertThat(read(third.getBean(HttpTrafficExchangeRepository.class), digits))
+                    .usingRecursiveComparison()
+                    .isEqualTo(digits);
+            assertThat(largeObjects(third.getBean(JdbcTemplate.class))).containsExactly(unrelated);
+        }
+    }
+
+    /** Without Hibernate's update first, as with ddl-auto none, every column is still oid. */
+    @Test
+    void httpExchangeLargeObjectMigrationConvertsOidPreviewColumnsToo() {
+        DataSource dataSource = newDatabase();
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("create table specus_http_traffic_exchange (id bigint primary key,"
+                + " request_body_data oid, response_body_data oid, request_preview_text oid, response_preview_text oid)");
+        jdbc.update("""
+                insert into specus_http_traffic_exchange values
+                  (1, lo_from_bytea(0, '\\x00ff'::bytea), null,
+                      lo_from_bytea(0, convert_to('Request 界', 'UTF8')), null)
+                """);
+
+        migrateTwice(dataSource, () -> new HttpExchangeLargeObjectMigrator(jdbc).migrate());
+
+        assertThat(httpBodyColumnTypes(jdbc)).isEqualTo(BYTES_AND_TEXT);
+        assertThat(jdbc.queryForMap("select * from specus_http_traffic_exchange"))
+                .containsEntry("request_body_data", new byte[]{0x00, (byte) 0xff})
+                .containsEntry("response_body_data", null)
+                .containsEntry("request_preview_text", "Request 界")
+                .containsEntry("response_preview_text", null);
+        assertThat(largeObjects(jdbc)).isEmpty();
     }
 
     /** The reported failure: Hibernate's update has already created the index. */
@@ -240,6 +370,71 @@ class PostgresSchemaMigrationTests {
                  where table_schema = current_schema() and table_name = 'specus_http_traffic_exchange'
                    and column_name in ('request_headers', 'response_headers')
                 """, String.class);
+    }
+
+    private static HttpTrafficExchange widestExchangeWithBodyWords() {
+        HttpTrafficExchange exchange = WidestHttpTrafficExchange.create();
+        exchange.setRequestPreviewText(exchange.getRequestPreviewText() + " request-body");
+        exchange.setResponsePreviewText(exchange.getResponsePreviewText() + " response-body");
+        return exchange;
+    }
+
+    /** The store's search and detail without a transaction, and the admin console's search in its own. */
+    private static void assertBodiesSearchableAndReadable(ConfigurableApplicationContext context,
+                                                          HttpTrafficExchange exchange) {
+        HttpTrafficExchangeStore store = context.getBean(HttpTrafficExchangeStore.class);
+        String id = exchange.getId().toString();
+        for (Map.Entry<HttpTrafficSearchField, String> search : List.of(
+                Map.entry(HttpTrafficSearchField.ALL, "request-body"),
+                Map.entry(HttpTrafficSearchField.REQUEST_BODY, "request-body"),
+                Map.entry(HttpTrafficSearchField.RESPONSE_BODY, "response-body"))) {
+            assertThat(store.search(TenantContext.defaultTenant(), null, null, null, null,
+                            search.getKey(), search.getValue(), PageRequest.of(0, 20))
+                    .getContent())
+                    .as("search %s", search)
+                    .extracting(HttpTrafficExchangeView::id)
+                    .containsExactly(id);
+        }
+        // The admin console's, in a read-only transaction.
+        assertThat(context.getBean(TrafficViewService.class)
+                .listHttpExchanges(TenantContext.defaultTenant(), null, null, null,
+                        HttpTrafficSearchField.ALL, "response-body", PageRequest.of(0, 20))
+                .getContent())
+                .extracting(HttpTrafficExchangeView::id)
+                .containsExactly(id);
+        assertThat(store.findById(TenantContext.defaultTenant(), exchange.getId(), null))
+                .hasValueSatisfying(view -> {
+                    assertThat(view.requestPreviewText()).isEqualTo(HttpBodyDataCodec.toDisplayText(
+                            exchange.getRequestBodyData(), exchange.getRequestContentType(),
+                            exchange.getRequestHeaders(), exchange.getRequestPreviewText()));
+                    assertThat(view.responsePreviewText()).isEqualTo(HttpBodyDataCodec.toDisplayText(
+                            exchange.getResponseBodyData(), exchange.getResponseContentType(),
+                            exchange.getResponseHeaders(), exchange.getResponsePreviewText()));
+                });
+        assertThat(read(context.getBean(HttpTrafficExchangeRepository.class), exchange))
+                .usingRecursiveComparison()
+                .isEqualTo(exchange);
+    }
+
+    /** Through a query method, which has no transaction of its own as findById does. */
+    private static HttpTrafficExchange read(HttpTrafficExchangeRepository repository, HttpTrafficExchange exchange) {
+        return repository.findByTenantIdAndId(exchange.getTenantId(), exchange.getId()).orElseThrow();
+    }
+
+    private static Map<String, String> httpBodyColumnTypes(JdbcTemplate jdbc) {
+        Map<String, String> types = new TreeMap<>();
+        jdbc.query("""
+                select column_name, data_type
+                  from information_schema.columns
+                 where table_schema = current_schema() and table_name = 'specus_http_traffic_exchange'
+                   and column_name in ('request_body_data', 'response_body_data',
+                                       'request_preview_text', 'response_preview_text')
+                """, (RowCallbackHandler) row -> types.put(row.getString(1), row.getString(2)));
+        return types;
+    }
+
+    private static List<Long> largeObjects(JdbcTemplate jdbc) {
+        return jdbc.queryForList("select oid::bigint from pg_largeobject_metadata order by oid", Long.class);
     }
 
     private static void migrateTwice(DataSource dataSource, Runnable migration) {

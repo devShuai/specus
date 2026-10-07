@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.database;
 
 import jakarta.persistence.Entity;
+import org.hibernate.Length;
 import org.hibernate.boot.Metadata;
 import org.hibernate.boot.MetadataSources;
 import org.hibernate.boot.registry.StandardServiceRegistry;
@@ -87,12 +88,15 @@ class MySqlColumnTypeTests {
     @Test
     void lobColumnsGetMySqlsUnboundedTypes() {
         // Without a length of its own, a @Lob column keeps @Column's default of 255 and becomes
-        // tinyblob or tinytext, and a LONGVARBINARY one becomes varbinary(32600).
+        // tinyblob or tinytext, and a LONGVARBINARY one becomes varbinary(32600). A plain string or
+        // byte[] column declared Length.LONG32 is a LOB on MySQL alone, by its length.
         List<String> bounded = new ArrayList<>();
         for (Table table : metadata.collectTableMappings()) {
             for (Column column : table.getColumns()) {
                 String sqlType = column.getSqlType(metadata);
-                if (LOB_TYPE_CODES.contains(column.getSqlTypeCode(metadata)) && !UNBOUNDED_LOB.matcher(sqlType).matches()) {
+                boolean lob = LOB_TYPE_CODES.contains(column.getSqlTypeCode(metadata))
+                        || Long.valueOf(Length.LONG32).equals(column.getLength());
+                if (lob && !UNBOUNDED_LOB.matcher(sqlType).matches()) {
                     bounded.add(table.getName() + "." + column.getName() + " " + sqlType);
                 }
             }
