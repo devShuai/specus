@@ -227,6 +227,16 @@ function cutAfterAcks(limit: number): Tap {
   };
 }
 
+/** Sender side: cuts the channel instead of sending the first frame of chunk `index`. */
+function cutAtChunk(index: number): Tap {
+  return (data) => {
+    if (typeof data === "string") return data;
+    const decoded = decodeFrame(data);
+    const first = decoded.ok && decoded.frame.type === "DATA" && decoded.frame.index === index && decoded.frame.offset === 0;
+    return first ? "cut" : data;
+  };
+}
+
 /** The first channel is cut after `limit` stored chunks; every later channel dies at once. */
 function interruptAfter(limit: number): () => Taps {
   let channels = 0;
@@ -374,12 +384,15 @@ describe("chunked resume between two pages", { timeout: 30_000 }, () => {
     const source = new Blob([pattern(0, size)]);
     let cuts = 0;
     const result = await sender.send(source, {
-      tapForNewChannels: () => (cuts++ === 0 ? { receiver: cutAfterAcks(9) } : undefined),
+      // Cut on the sender's frame, not on an ack: an ack can come while nothing beyond the acked
+      // chunk is in flight yet, and then there is nothing to repeat. Chunk 12 always goes out twice.
+      tapForNewChannels: () => (cuts++ === 0 ? { sender: cutAtChunk(12) } : undefined),
     });
     await settle();
     expect(result.kind).toBe("complete");
     expect(sender.sleeps).toEqual([1000]);
     expect(await bytesOf(receiver.completed[0].blob)).toEqual(pattern(0, size));
+    expect(sender.dataFrames.get(12)).toBe(2);
     const repeated = [...sender.dataFrames.values()].filter((count) => count > 1).length;
     expect(repeated).toBeGreaterThan(0);
     expect(repeated).toBeLessThanOrEqual(UNACKED_WINDOW_CHUNKS + 1);
