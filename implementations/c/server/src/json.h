@@ -21,6 +21,12 @@ char *st_json_decode_string(const char *raw, size_t *out_len);
  * claims repeat a name is ambiguous, so a verifier refuses it instead of picking one.
  */
 int st_json_object_keys_unique(const char *json);
+/*
+ * 1 when json is a valid object whose top-level members all have one of the allowed names and a
+ * scalar value (string, number, true, false or null), 0 otherwise: what a strict object mapper
+ * binds into a record of string fields.
+ */
+int st_json_object_has_only_scalar_fields(const char *json, const char *const *allowed, size_t allowed_count);
 int st_json_get_i64(const char *json, const char *key, long long *out);
 int st_json_get_int(const char *json, const char *key, int *out);
 int st_json_get_bool(const char *json, const char *key, int *out);

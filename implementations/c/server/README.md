@@ -427,6 +427,13 @@ field aliases such as `responseDataType`, `contentType`, `requestHeaders`, and `
 accepted. The default summary search does not scan headers or body; `field=all` includes those
 large text fields. When `SPECUS_ELASTICSEARCH_URIS` is configured, the same management queries use the optional
 Elasticsearch HTTP/TCP indices and configured retention caps; otherwise SQLite remains authoritative.
+With Elasticsearch, search follows Java's `HttpTrafficSearchField` query (text fields by `multi_match`, keyword
+fields by a case-insensitive substring, numbers by id/client/status), an administrator sees the whole tenant
+including deleted clients, and captured documents go through Java's write queue
+(`SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS`, `SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE`,
+`SPECUS_TRAFFIC_CAPTURE_MAX_PENDING`; `flush=true` and shutdown write it out) instead of blocking the relay.
+`tcp-streams` returns Java's page (`page`, `size`, `limit`, `total`, `totalPages`, `truncated`) in capture order.
+See `docs/cross-language/alignment/c-server-api-inventory.md`.
 The client auth-login endpoint returns `tenantId`, runtime client identity, control-channel token,
 Java-shaped `peerMesh`, TCP `specusConfigList`, and `httpSpecusConfigList`. In SQLite mode it first
 looks up `specus_client_credential` by `apiKey`, verifies the same canonical HMAC signature
@@ -462,8 +469,10 @@ is configured), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
 `Referrer-Policy: strict-origin-when-cross-origin`. `/http/` and `/http-share/` answers never carry
 them. JSON API answers carry `nosniff` only (Java adds the whole set there as well, but a policy on a
 JSON answer is never applied as a page).
-`/api/admin/overview` and `/api/admin/metrics` use the same SQLite plus environment mapping snapshot
-as client auth login, and count only the current management context's visible TCP mappings.
+`/api/admin/overview` returns Java `OverviewService`'s fields (clients, online clients, login counts,
+traffic, and for administrators the tenant's open and refused public connections) followed by C's
+`server`, `status` and `tcpMappings`; `/api/admin/metrics` uses the same SQLite plus environment mapping
+snapshot as client auth login, and both count only the current management context's visible TCP mappings.
 
 Requests under `/http/{clientName}/{route}/...` are recognized by the management listener and are
 forwarded to the active runtime session whose `clientName` matches the path and whose `route`

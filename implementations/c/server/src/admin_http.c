@@ -7,6 +7,7 @@
 #include "client_package.h"
 #include "crypto.h"
 #include "decompression_limits.h"
+#include "elasticsearch_traffic.h"
 #include "github_release.h"
 #include "http_client.h"
 #include "http_share.h"
@@ -52,8 +53,6 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#define ST_ADMIN_MAX_CLIENTS 128U
-#define ST_ADMIN_MAX_CLIENT_DOWNLOADS 128U
 #define ST_ADMIN_MAX_CONNECTIONS_PAGE 500U
 #define ST_ADMIN_MAX_TRAFFIC_ITEMS 1000U
 #define ST_ADMIN_MAX_PEER_ACLS 256U
@@ -321,6 +320,33 @@ void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler h
     admin_client_disconnect_handler = handler;
     admin_client_disconnect_ctx = ctx;
     pthread_mutex_unlock(&admin_client_disconnect_lock);
+}
+
+static pthread_mutex_t admin_external_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_external_connection_stats_handler admin_external_stats_handler = NULL;
+static void *admin_external_stats_ctx = NULL;
+
+void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,
+                                                    void *ctx)
+{
+    pthread_mutex_lock(&admin_external_stats_lock);
+    admin_external_stats_handler = handler;
+    admin_external_stats_ctx = ctx;
+    pthread_mutex_unlock(&admin_external_stats_lock);
+}
+
+/* Without a runtime (the management API on its own) there are no public connections. */
+static void admin_external_connection_stats(const char *tenant_id, long long *active, long long *rejected)
+{
+    *active = 0;
+    *rejected = 0;
+    pthread_mutex_lock(&admin_external_stats_lock);
+    st_admin_external_connection_stats_handler handler = admin_external_stats_handler;
+    void *ctx = admin_external_stats_ctx;
+    pthread_mutex_unlock(&admin_external_stats_lock);
+    if (handler != NULL) {
+        handler(ctx, tenant_id, active, rejected);
+    }
 }
 
 static pthread_mutex_t admin_connectivity_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2851,6 +2877,99 @@ static int build_client_auth_login_response(const char *body, char *out, size_t 
     return build_client_auth_login_success_response(out, out_len);
 }
 
+/*
+ * Java's management lists have no row bound, but the storage lists fill a caller's array and fail
+ * once there are more rows than it holds (that used to turn 129 clients, or 65 TCP mappings in the
+ * whole database, into a 500 for every tenant), or quietly stop there (credentials and the client
+ * catalogue were cut at 128 rows). These read every row into a heap array that grows until it
+ * fits; the caller frees it. NULL on a database error.
+ */
+#define ST_ADMIN_LIST_INITIAL 64U
+#define ST_ADMIN_LIST_MAX (1024U * 1024U)
+
+typedef struct {
+    const char *path;
+    const char *text;
+    long long id;
+} admin_list_args;
+
+typedef int (*admin_list_fn)(const admin_list_args *args, void *items, size_t capacity, size_t *count);
+
+static void *admin_list_all(admin_list_fn list, const admin_list_args *args, size_t item_size, size_t *count)
+{
+    *count = 0U;
+    for (size_t capacity = ST_ADMIN_LIST_INITIAL; capacity <= ST_ADMIN_LIST_MAX; capacity *= 4U) {
+        void *items = calloc(capacity, item_size);
+        if (items == NULL) {
+            return NULL;
+        }
+        size_t listed = 0U;
+        int rc = list(args, items, capacity, &listed);
+        /* A full array may hide more rows: some lists fail then, others stop there silently. */
+        if (rc == 0 && listed < capacity) {
+            *count = listed;
+            return items;
+        }
+        free(items);
+        if (listed < capacity) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int admin_list_client_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_clients(args->path, (st_storage_client *)items, capacity, count);
+}
+
+static int admin_list_credential_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_client_credentials(args->path, args->text, (st_storage_client_credential *)items,
+                                              capacity, count);
+}
+
+static int admin_list_user_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_management_users(args->path, args->text, (st_storage_management_user *)items,
+                                            capacity, count);
+}
+
+static int admin_list_download_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_client_download_links(args->path, (int)args->id,
+                                                 (st_storage_client_download_link *)items, capacity, count);
+}
+
+static st_storage_client *admin_list_all_clients(const char *path, size_t *count)
+{
+    admin_list_args args = {path, NULL, 0};
+    return (st_storage_client *)admin_list_all(admin_list_client_rows, &args, sizeof(st_storage_client), count);
+}
+
+static st_storage_client_credential *admin_list_all_credentials(const char *path, const char *tenant_id,
+                                                                size_t *count)
+{
+    admin_list_args args = {path, tenant_id, 0};
+    return (st_storage_client_credential *)admin_list_all(admin_list_credential_rows, &args,
+                                                          sizeof(st_storage_client_credential), count);
+}
+
+static st_storage_management_user *admin_list_all_users(const char *path, const char *tenant_id, size_t *count)
+{
+    admin_list_args args = {path, tenant_id, 0};
+    return (st_storage_management_user *)admin_list_all(admin_list_user_rows, &args,
+                                                        sizeof(st_storage_management_user), count);
+}
+
+static st_storage_client_download_link *admin_list_all_download_links(const char *path, int enabled_only,
+                                                                      size_t *count)
+{
+    admin_list_args args = {path, NULL, enabled_only};
+    return (st_storage_client_download_link *)admin_list_all(admin_list_download_rows, &args,
+                                                             sizeof(st_storage_client_download_link), count);
+}
+
 static int load_visible_tcp_mapping_count(const st_admin_context *context, size_t *mapping_count)
 {
     *mapping_count = 0;
@@ -2859,9 +2978,9 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
         if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             return -1;
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             return -1;
         }
         for (size_t i = 0; i < client_count; ++i) {
@@ -2871,11 +2990,13 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
             st_storage_mapping *mappings = NULL;
             size_t client_mapping_count = 0;
             if (st_storage_list_mappings(database_path, clients[i].id, &mappings, &client_mapping_count) != 0) {
+                free(clients);
                 return -1;
             }
             free(mappings);
             *mapping_count += client_mapping_count;
         }
+        free(clients);
         return 0;
     }
 
@@ -2895,16 +3016,95 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
     return rc;
 }
 
+/* How many of the caller's connection records have this outcome (Java countBy...AndSuccess). */
+static int admin_count_connections(const char *database_path,
+                                   const st_admin_context *context,
+                                   int success,
+                                   long long *count)
+{
+    st_storage_connection first;
+    size_t listed = 0U;
+    return st_storage_list_connections_visible(database_path, 0, success, NULL, NULL, context->tenant_id,
+                                               context->username, context->admin, 0, 1, &first, 1U, &listed,
+                                               count);
+}
+
+/*
+ * GET /api/admin/overview as Java OverviewService: the caller's clients (an administrator's whole
+ * tenant), how many are online, their traffic, the successful and failed logins of the tenant (of
+ * the caller's clients for anyone else) and, for an administrator only, the tenant's open and
+ * refused public connections. C adds its server name, a status and the visible TCP mapping count.
+ */
 static int build_overview_response(const st_admin_context *context, char *out, size_t out_len)
 {
     size_t mapping_count = 0;
     if (load_visible_tcp_mapping_count(context, &mapping_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
     }
-    char body[256];
+    long long clients = 0;
+    long long online_clients = 0;
+    long long upload_bytes = 0;
+    long long download_bytes = 0;
+    long long successful_connections = 0;
+    long long failed_connections = 0;
+    const char *database_path = admin_database_path();
+    if (database_path != NULL) {
+        size_t client_count = 0U;
+        st_storage_client *all = admin_list_all_clients(database_path, &client_count);
+        if (all == NULL) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
+        }
+        for (size_t i = 0; i < client_count; ++i) {
+            if (!admin_can_access_client(context, &all[i])) {
+                continue;
+            }
+            st_admin_client_runtime_status runtime_status;
+            admin_get_client_runtime_status(all[i].id, all[i].client_name, &runtime_status);
+            ++clients;
+            online_clients += runtime_status.online ? 1 : 0;
+            upload_bytes += all[i].upload_bytes;
+            download_bytes += all[i].download_bytes;
+        }
+        free(all);
+        /* Someone without clients has no logins to count (Java answers 0 without asking). */
+        if ((context->admin || clients > 0)
+            && (admin_count_connections(database_path, context, 1, &successful_connections) != 0
+                || admin_count_connections(database_path, context, 0, &failed_connections) != 0)) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
+        }
+    } else {
+        st_storage_client client = {0};
+        client.id = env_i64("SPECUS_CLIENT_ID", 1);
+        snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+        snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("SPECUS_CLIENT_NAME", "Demo client"));
+        snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+        if (admin_can_access_client(context, &client)) {
+            st_admin_client_runtime_status runtime_status;
+            admin_get_client_runtime_status(client.id, client.client_name, &runtime_status);
+            clients = 1;
+            online_clients = runtime_status.online ? 1 : 0;
+        }
+    }
+    long long external_connections = 0;
+    long long rejected_external_connections = 0;
+    if (context->admin) {
+        admin_external_connection_stats(context->tenant_id, &external_connections, &rejected_external_connections);
+    }
+    char body[512];
     int written = snprintf(body,
                            sizeof(body),
-                           "{\"server\":\"c\",\"status\":\"ok\",\"onlineClients\":0,\"tcpMappings\":%zu}",
+                           "{\"clients\":%lld,\"onlineClients\":%lld,\"successfulConnections\":%lld,"
+                           "\"failedConnections\":%lld,\"uploadBytes\":%lld,\"downloadBytes\":%lld,"
+                           "\"externalConnections\":%lld,\"rejectedExternalConnections\":%lld,"
+                           "\"server\":\"c\",\"status\":\"ok\",\"tcpMappings\":%zu}",
+                           clients,
+                           online_clients,
+                           successful_connections,
+                           failed_connections,
+                           upload_bytes,
+                           download_bytes,
+                           external_connections,
+                           rejected_external_connections,
                            mapping_count);
     if (written < 0 || (size_t)written >= sizeof(body)) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response too large\"}");
@@ -4359,9 +4559,9 @@ static int build_clients_response(const st_admin_context *context, char *out, si
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
@@ -4376,6 +4576,7 @@ static int build_clients_response(const st_admin_context *context, char *out, si
             }
             ++visible_count;
         }
+        free(clients);
     } else if (rc == 0) {
         st_storage_client client = {0};
         client.id = env_i64("SPECUS_CLIENT_ID", 1);
@@ -4506,9 +4707,9 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
         }
@@ -4519,6 +4720,7 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
             }
             st_storage_peer_mesh_device device;
             if (st_storage_ensure_peer_mesh_device(database_path, &clients[i], &device) != 0) {
+                free(clients);
                 free(builder.data);
                 return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
             }
@@ -4528,6 +4730,7 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
             }
             ++visible_count;
         }
+        free(clients);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -6620,10 +6823,11 @@ static int build_traffic_usage_response(const st_admin_context *context, const c
     int limit = 100;
     (void)admin_query_i64(path, "clientId", &filter_client_id);
     (void)admin_query_int_any(path, "limit", &limit);
+    /* Java TrafficViewService: Math.clamp(limit, 1, 500). */
     if (limit < 1) {
         limit = 1;
-    } else if (limit > (int)ST_ADMIN_MAX_TRAFFIC_ITEMS) {
-        limit = 100;
+    } else if (limit > 500) {
+        limit = 500;
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
@@ -6672,10 +6876,11 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
     int limit = 200;
     (void)admin_query_i64(path, "clientId", &filter_client_id);
     (void)admin_query_int_any(path, "limit", &limit);
+    /* Java TrafficViewService: Math.clamp(limit, 1, 500). */
     if (limit < 1) {
         limit = 1;
-    } else if (limit > (int)ST_ADMIN_MAX_TRAFFIC_ITEMS) {
-        limit = 200;
+    } else if (limit > 500) {
+        limit = 500;
     }
     char *type = admin_query_string(path, "type");
     const char *database_path = admin_database_path();
@@ -6723,6 +6928,29 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
     return response_len;
 }
 
+static int admin_text_is_blank(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * flush=true on the traffic detail endpoints (Java TrafficInspectionService.flush): what the
+ * Elasticsearch writer still holds is sent before the query. The SQLite store writes as it
+ * captures, so there is nothing to send there.
+ */
+static void admin_traffic_flush_if_asked(const char *path)
+{
+    int flush = 0;
+    if (admin_query_bool(path, "flush", &flush) == 0 && flush && st_elasticsearch_traffic_enabled_current()) {
+        st_elasticsearch_traffic_flush();
+    }
+}
+
 static int build_http_exchanges_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     int page = 0;
@@ -6734,9 +6962,11 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     if (page < 0) page = 0;
     if (size < 1) size = 1;
     if (size > 500) size = 500;
+    admin_traffic_flush_if_asked(path);
     char *route = admin_query_string(path, "route");
     char *response_body_type = admin_query_string(path, "responseBodyType");
-    if (response_body_type == NULL || *response_body_type == '\0') {
+    /* Java firstText(responseBodyType, responseDataType): the first one that is not blank. */
+    if (response_body_type == NULL || admin_text_is_blank(response_body_type)) {
         free(response_body_type);
         response_body_type = admin_query_string(path, "responseDataType");
     }
@@ -6859,17 +7089,38 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
     return len;
 }
 
+/*
+ * Java TrafficInspectionService.Snapshot. With Elasticsearch the counters are those of its write
+ * queue; the SQLite store writes as it captures, so nothing is ever pending or dropped there.
+ */
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
     int enabled = st_traffic_capture_enabled();
-    return write_response(out, out_len, 200, "OK",
-        enabled
-            ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
-            : "{\"enabled\":false,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}");
+    st_elasticsearch_traffic_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (st_elasticsearch_traffic_enabled_current()) {
+        st_elasticsearch_traffic_snapshot_current(&snapshot);
+    }
+    char last_flushed_at[48] = "null";
+    if (snapshot.last_flushed_at[0] != '\0') {
+        snprintf(last_flushed_at, sizeof(last_flushed_at), "\"%s\"", snapshot.last_flushed_at);
+    }
+    char body[256];
+    int written = snprintf(body, sizeof(body),
+                           "{\"enabled\":%s,\"pendingHttp\":%d,\"pendingTcp\":%d,\"droppedHttp\":%lld,"
+                           "\"droppedTcp\":%lld,\"lastFlushedAt\":%s}",
+                           enabled ? "true" : "false", snapshot.pending_http, snapshot.pending_tcp,
+                           snapshot.dropped_http, snapshot.dropped_tcp, last_flushed_at);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"inspection status failed\"}");
+    }
+    return write_response(out, out_len, 200, "OK", body);
 }
 
 static int build_tcp_frames_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
+    admin_traffic_flush_if_asked(path);
     int page = 0;
     int size = 50;
     int limit = 0;
@@ -6891,23 +7142,24 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
-    st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
-    memset(items, 0, sizeof(items));
+    /* Each frame carries its previews (about 8 KiB); a full page stays off the thread's stack. */
+    st_storage_tcp_frame *items = (st_storage_tcp_frame *)calloc(ST_ADMIN_MAX_CONNECTIONS_PAGE, sizeof(*items));
     size_t item_count = 0;
     long long total_count = 0;
-    int rc = st_storage_list_tcp_frames_visible(database_path,
-                                                client_id,
-                                                listen_port,
-                                                context->tenant_id,
-                                                context->username,
-                                                context->admin,
-                                                page,
-                                                size,
-                                                items,
-                                                ST_ADMIN_MAX_CONNECTIONS_PAGE,
-                                                &item_count,
-                                                &total_count);
+    int rc = items == NULL ? -1 : st_storage_list_tcp_frames_visible(database_path,
+                                                                     client_id,
+                                                                     listen_port,
+                                                                     context->tenant_id,
+                                                                     context->username,
+                                                                     context->admin,
+                                                                     page,
+                                                                     size,
+                                                                     items,
+                                                                     ST_ADMIN_MAX_CONNECTIONS_PAGE,
+                                                                     &item_count,
+                                                                     &total_count);
     if (rc != 0) {
+        free(items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
     long long total_pages = total_count <= 0 ? 0 : (total_count + size - 1) / size;
@@ -6919,6 +7171,7 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
             rc = append_tcp_frame_view(&builder, &items[i], 0);
         }
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_appendf(&builder,
                               "],\"total\":%lld,\"page\":%d,\"size\":%d,\"totalPages\":%lld}",
@@ -6967,79 +7220,61 @@ static int build_tcp_frame_detail_response(const st_admin_context *context, long
     return response_len;
 }
 
-static int build_empty_tcp_stream_response(const char *path, char *out, size_t out_len)
-{
-    char *channel_id = admin_query_string(path, "channelId");
-    if (channel_id == NULL || *channel_id == '\0') {
-        free(channel_id);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"channelId is required\"}");
-    }
-    int limit = 500;
-    (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > 1000) {
-        limit = 1000;
-    }
-    st_admin_string_builder builder = {0};
-    int rc = admin_sb_append(&builder, "{\"channelId\":");
-    if (rc == 0) {
-        rc = admin_sb_append_json_string(&builder, channel_id);
-    }
-    if (rc == 0) {
-        rc = admin_sb_appendf(&builder,
-                              ",\"items\":[],\"total\":0,\"limit\":%d,\"truncated\":false}",
-                              limit);
-    }
-    free(channel_id);
-    if (rc != 0 || builder.data == NULL) {
-        free(builder.data);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream response failed\"}");
-    }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
-    free(builder.data);
-    return response_len;
-}
+/* The most frames one tcp-streams page holds (Java clamps size and limit to 1..1000). */
+#define ST_ADMIN_MAX_TCP_STREAM_PAGE 1000
 
+/*
+ * GET /api/admin/traffic/tcp-streams as Java TrafficResource.getTcpStream: page (default 0) and
+ * size (default limit, default 500, both clamped to 1..1000) select one page of the channel's
+ * frames in capture order, each with its payload; limit repeats the size, totalPages is at least
+ * 1 and truncated says a later page exists.
+ */
 static int build_tcp_stream_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     char *channel_id = admin_query_string(path, "channelId");
-    if (channel_id == NULL || *channel_id == '\0') {
-        free(channel_id);
+    if (channel_id == NULL) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"channelId is required\"}");
     }
+    admin_traffic_flush_if_asked(path);
+    int page = 0;
     int limit = 500;
+    int size = 0;
+    (void)admin_query_int_any(path, "page", &page);
     (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) limit = 1;
-    if (limit > 1000) limit = 1000;
+    if (admin_query_int_any(path, "size", &size) != 0) {
+        size = limit;
+    }
+    if (page < 0) page = 0;
+    if (size < 1) size = 1;
+    if (size > ST_ADMIN_MAX_TCP_STREAM_PAGE) size = ST_ADMIN_MAX_TCP_STREAM_PAGE;
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        int response_len = build_empty_tcp_stream_response(path, out, out_len);
-        free(channel_id);
-        return response_len;
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        free(channel_id);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
-    }
-    st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
-    memset(items, 0, sizeof(items));
+    st_storage_tcp_frame *items = NULL;
     size_t item_count = 0;
-    int rc = st_storage_list_tcp_stream_visible(database_path,
-                                                channel_id,
-                                                context->tenant_id,
-                                                context->username,
-                                                context->admin,
-                                                limit,
-                                                items,
-                                                ST_ADMIN_MAX_CONNECTIONS_PAGE,
-                                                &item_count);
-    if (rc != 0) {
-        free(channel_id);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
+    long long total = 0;
+    if (database_path != NULL) {
+        items = (st_storage_tcp_frame *)calloc((size_t)size, sizeof(*items));
+        if (items == NULL
+            || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+            || st_storage_list_tcp_stream_visible(database_path,
+                                                  channel_id,
+                                                  context->tenant_id,
+                                                  context->username,
+                                                  context->admin,
+                                                  page,
+                                                  size,
+                                                  items,
+                                                  (size_t)size,
+                                                  &item_count,
+                                                  &total) != 0) {
+            free(items);
+            free(channel_id);
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
+        }
     }
+    long long total_pages = total <= 0 ? 0 : (total + size - 1) / size;
+    if (total_pages < 1) total_pages = 1;
     st_admin_string_builder builder = {0};
-    rc = admin_sb_append(&builder, "{\"channelId\":");
+    int rc = admin_sb_append(&builder, "{\"channelId\":");
     if (rc == 0) rc = admin_sb_append_json_string(&builder, channel_id);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"items\":[");
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
@@ -7047,14 +7282,21 @@ static int build_tcp_stream_response(const st_admin_context *context, const char
         if (rc == 0) {
             rc = append_tcp_frame_view(&builder, &items[i], 1);
         }
+    }
+    for (size_t i = 0; i < item_count; ++i) {
         st_storage_tcp_frame_free(&items[i]);
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_appendf(&builder,
-                              "],\"total\":%zu,\"limit\":%d,\"truncated\":%s}",
-                              item_count,
-                              limit,
-                              item_count >= (size_t)limit ? "true" : "false");
+                              "],\"total\":%lld,\"page\":%d,\"size\":%d,\"limit\":%d,\"totalPages\":%lld,"
+                              "\"truncated\":%s}",
+                              total,
+                              page,
+                              size,
+                              size,
+                              total_pages,
+                              (long long)page + 1 < total_pages ? "true" : "false");
     }
     free(channel_id);
     if (rc != 0 || builder.data == NULL) {
@@ -9210,13 +9452,10 @@ static int build_credentials_response(const st_admin_context *context, char *out
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
-        st_storage_client_credential credentials[ST_ADMIN_MAX_CLIENTS];
         size_t credential_count = 0;
-        if (st_storage_list_client_credentials(database_path,
-                                               context->tenant_id,
-                                               credentials,
-                                               ST_ADMIN_MAX_CLIENTS,
-                                               &credential_count) != 0) {
+        st_storage_client_credential *credentials =
+            admin_list_all_credentials(database_path, context->tenant_id, &credential_count);
+        if (credentials == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
@@ -9231,6 +9470,7 @@ static int build_credentials_response(const st_admin_context *context, char *out
             }
             ++visible_count;
         }
+        free(credentials);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -9984,16 +10224,19 @@ static int build_client_downloads_response(const st_admin_context *context,
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link catalogue[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
+        /* Every version of every target stays in the catalogue, so it grows with each release. */
         size_t catalogue_count = 0U;
-        if (st_storage_list_client_download_links(database_path, 0, catalogue,
-                ST_ADMIN_MAX_CLIENT_DOWNLOADS, &catalogue_count) != 0) {
+        st_storage_client_download_link *catalogue =
+            admin_list_all_download_links(database_path, 0, &catalogue_count);
+        size_t link_capacity = catalogue_count + ST_GITHUB_RELEASE_MAX_PACKAGES;
+        st_storage_client_download_link *links = catalogue == NULL
+            ? NULL : (st_storage_client_download_link *)calloc(link_capacity, sizeof(*links));
+        if (links == NULL) {
+            free(catalogue);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link links[
-            ST_ADMIN_MAX_CLIENT_DOWNLOADS + ST_GITHUB_RELEASE_MAX_PACKAGES];
         size_t link_count = 0U;
         if (!enabled_only) {
             memcpy(links, catalogue, catalogue_count * sizeof(*links));
@@ -10035,7 +10278,7 @@ static int build_client_downloads_response(const st_admin_context *context,
                                 break;
                             }
                         }
-                        if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
+                        if (!configured && link_count < link_capacity) {
                             links[link_count++] = fallback[i];
                         }
                     }
@@ -10047,6 +10290,8 @@ static int build_client_downloads_response(const st_admin_context *context,
             rc = admin_sb_append(&builder, i == 0U ? "" : ",");
             if (rc == 0) rc = append_client_download_link_view(&builder, &links[i]);
         }
+        free(links);
+        free(catalogue);
     }
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
@@ -10276,10 +10521,10 @@ static int build_client_version_check_response(const char *path, char *out, size
         return write_response(out, out_len, 400, "Bad Request", target_error);
     }
     const char *database_path = admin_database_path();
-    st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
     size_t count = 0U;
-    if (database_path == NULL || st_storage_list_client_download_links(database_path, 0, links,
-            ST_ADMIN_MAX_CLIENT_DOWNLOADS, &count) != 0) {
+    st_storage_client_download_link *links = database_path == NULL
+        ? NULL : admin_list_all_download_links(database_path, 0, &count);
+    if (links == NULL) {
         return write_response(out, out_len, 200, "OK",
             "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
             "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
@@ -10349,6 +10594,7 @@ static int build_client_version_check_response(const char *path, char *out, size
             }
         }
         if (best == NULL) {
+            free(links);
             return write_response(out, out_len, 200, "OK",
                 "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
                 "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
@@ -10377,6 +10623,7 @@ static int build_client_version_check_response(const char *path, char *out, size
     if (rc == 0) rc = best->hosted
         ? admin_sb_appendf(&builder, "%lld", best->id) : admin_sb_append(&builder, "null");
     if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(links);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -10707,9 +10954,9 @@ static int build_management_users_response(const st_admin_context *context, char
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
-        st_storage_management_user users[ST_ADMIN_MAX_CLIENTS];
         size_t user_count = 0;
-        if (st_storage_list_management_users(database_path, tenant_id, users, ST_ADMIN_MAX_CLIENTS, &user_count) != 0) {
+        st_storage_management_user *users = admin_list_all_users(database_path, tenant_id, &user_count);
+        if (users == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
@@ -10719,6 +10966,7 @@ static int build_management_users_response(const st_admin_context *context, char
                 rc = append_stored_management_user_view(&builder, &users[i]);
             }
         }
+        free(users);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -15308,6 +15556,14 @@ static void admin_drain_websocket(st_admin_ws_client *client)
                 }
             }
         }
+        /* A browser masks every frame (RFC 6455 5.1); Java's container closes 1002 otherwise. The
+         * frame is read first so that the close is not cut off by unread input. */
+        if (!masked) {
+            uint8_t close_payload[2] = {0x03U, 0xeaU};
+            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            free(payload);
+            return;
+        }
         if (opcode == 0x8U) {
             admin_ws_send_frame(client, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
             free(payload);
@@ -15317,6 +15573,12 @@ static void admin_drain_websocket(st_admin_ws_client *client)
             admin_ws_send_frame(client, 0xAU, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
         }
         free(payload);
+        /* Java's TextWebSocketHandler refuses binary messages with 1003; text is ignored. */
+        if (opcode == 0x2U) {
+            uint8_t close_payload[2] = {0x03U, 0xebU};
+            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            return;
+        }
     }
 }
 
@@ -15391,14 +15653,14 @@ static void *admin_client_message_write_thread(void *arg)
                                                write->message,
                                                NULL);
         } else {
+            /* Java reports any failed write to the target channel as target-write-failed, also
+             * when the control connection went away after the online check. */
             (void)admin_ws_send_message_status(write->client,
-                                               send_rc == -1 ? "error" : "failed",
+                                               "failed",
                                                write->message_id,
                                                NULL,
                                                NULL,
-                                               send_rc == -1
-                                                   ? "target-offline"
-                                                   : "target-write-failed");
+                                               "target-write-failed");
         }
     }
     admin_ws_release_client_message_write(write->client);
@@ -15408,7 +15670,14 @@ static void *admin_client_message_write_thread(void *arg)
 
 static void admin_handle_client_message_command(st_admin_ws_client *client, const char *json)
 {
-    if (!st_json_is_valid_object(json)) {
+    /*
+     * Java binds the text into ClientMessageCommand(type, messageId, toClientName, message) with a
+     * default ObjectMapper: an unknown member, or an object or array where a string belongs, fails
+     * the mapping just as malformed JSON does.
+     */
+    static const char *const command_fields[] = {"type", "messageId", "toClientName", "message"};
+    if (!st_json_object_has_only_scalar_fields(json, command_fields,
+                                               sizeof(command_fields) / sizeof(command_fields[0]))) {
         (void)admin_ws_send_message_status(client, "error", NULL, NULL, NULL, "invalid-json");
         return;
     }
@@ -17914,11 +18183,50 @@ static void handle_client(st_admin_server *server, int fd)
                                                         response,
                                                         response_capacity);
     admin_armed_heap_response = NULL;
+    /*
+     * A management read can answer more than the buffer chosen above: a page of traffic detail, a
+     * TCP stream with its payloads, a long list. Java has no such bound, so a GET under /api/admin/
+     * that did not fit is built again in a larger buffer; a read is safe to repeat.
+     */
+    static const size_t larger_capacities[] = {1024U * 1024U, 16U * 1024U * 1024U, 128U * 1024U * 1024U};
+    for (size_t attempt = 0;
+         response_len < 0 && strcmp(method, "GET") == 0 && strncmp(path, "/api/admin/", 11U) == 0
+             && attempt < sizeof(larger_capacities) / sizeof(larger_capacities[0]);
+         ++attempt) {
+        if (larger_capacities[attempt] <= response_capacity) {
+            continue;
+        }
+        char *grown = (char *)malloc(larger_capacities[attempt]);
+        if (grown == NULL) {
+            break;
+        }
+        if (response != response_stack) {
+            free(response);
+        }
+        response = grown;
+        response_capacity = larger_capacities[attempt];
+        response_len = st_admin_build_response_internal(method,
+                                                        path,
+                                                        authorization,
+                                                        oss_public_key_url,
+                                                        range_header,
+                                                        host_header,
+                                                        content_type,
+                                                        body,
+                                                        available_body_len,
+                                                        request_remote_address,
+                                                        0,
+                                                        response,
+                                                        response_capacity);
+    }
     if (heap_response.data != NULL) {
         send_all(fd, heap_response.data, heap_response.len);
         free(heap_response.data);
     } else if (response_len > 0) {
         send_all(fd, response, (size_t)response_len);
+    } else if (response_len < 0) {
+        /* Better a status than a connection closed without any answer. */
+        send_text_http_error(fd, 500, "response too large");
     }
     if (response != response_stack) {
         free(response);

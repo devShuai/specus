@@ -2162,7 +2162,7 @@ static int test_client_messages_websocket(void)
         goto cleanup;
     }
     static const char boundary_prefix[] =
-        "{\"type\":\"unsupported\",\"messageId\":\"m-limit\",\"padding\":\"";
+        "{\"type\":\"unsupported\",\"messageId\":\"m-limit\",\"message\":\"";
     static const char boundary_suffix[] = "\"}";
     size_t boundary_len = 65536U;
     char *boundary = (char *)malloc(boundary_len + 2U);

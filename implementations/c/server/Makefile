@@ -40,6 +40,10 @@ HTTP_ROUTE_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_http_route_lifecycle_tests
 CLIENT_ROUTE_SCALE_TESTS := $(BUILD_DIR)/specus_c_client_route_scale_tests
 NAT_STREAM_TESTS := $(BUILD_DIR)/specus_c_nat_stream_tests
 CONNECTION_ARCHIVE_TESTS := $(BUILD_DIR)/specus_c_connection_archive_tests
+TRAFFIC_DETAIL_API_TESTS := $(BUILD_DIR)/specus_c_traffic_detail_api_tests
+CLIENT_MESSAGES_TESTS := $(BUILD_DIR)/specus_c_client_messages_tests
+MANAGEMENT_LISTS_TESTS := $(BUILD_DIR)/specus_c_management_lists_tests
+MANAGEMENT_OVERVIEW_TESTS := $(BUILD_DIR)/specus_c_management_overview_tests
 HTTP_WEBSOCKET_ROUTING_TESTS := $(BUILD_DIR)/specus_c_http_websocket_routing_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 STUN_TURN_TESTS := $(BUILD_DIR)/specus_c_stun_turn_tests
@@ -50,7 +54,7 @@ TURNSTILE_VERIFIER_TESTS := $(BUILD_DIR)/specus_c_turnstile_verifier_tests
 UPSTREAM_BROWSER_HEADERS_TESTS := $(BUILD_DIR)/specus_c_upstream_browser_headers_tests
 WORKBENCH_TESTS := $(BUILD_DIR)/specus_c_workbench_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIENT_AUTH_NONCE_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(OIDC_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS) $(WORKBENCH_TESTS) $(HTTP_SHARE_TESTS) $(SEMANTIC_VERSION_TESTS) $(TRAFFIC_CAPTURE_TESTS) $(TURNSTILE_VERIFIER_TESTS) $(UPSTREAM_BROWSER_HEADERS_TESTS) $(CLIENT_PACKAGE_TESTS) $(PUBLIC_CLUSTER_CODEC_TESTS) $(PUBLIC_TRANSFER_TESTS)
-ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS)
+ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 
 .PHONY: all test release clean
@@ -168,6 +172,18 @@ $(PRODUCT_METRICS_TESTS): $(CORE_OBJS) tests/product_metrics_tests.c tests/serve
 $(CONNECTION_ARCHIVE_TESTS): $(CORE_OBJS) tests/connection_archive_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connection_archive_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(TRAFFIC_DETAIL_API_TESTS): $(CORE_OBJS) tests/traffic_detail_api_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/traffic_detail_api_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CLIENT_MESSAGES_TESTS): $(CORE_OBJS) tests/client_messages_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_messages_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(MANAGEMENT_LISTS_TESTS): $(CORE_OBJS) tests/management_lists_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_lists_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_overview_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(HTTP_WEBSOCKET_ROUTING_TESTS): $(CORE_OBJS) tests/http_websocket_routing_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/http_websocket_routing_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -202,6 +218,7 @@ test: all
 	bash scripts/object_storage_e2e.sh $(SERVER)
 	bash scripts/tls_deployment_e2e.sh $(SERVER)
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
+	bash scripts/elasticsearch_traffic_test.sh $(TRAFFIC_DETAIL_API_TESTS) $(SERVER)
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
 	$(SESSION_LIFECYCLE_TESTS) $(SERVER)
 	$(SECURITY_RULES_TESTS) $(SERVER)
@@ -210,6 +227,9 @@ test: all
 	$(NAT_STREAM_TESTS) $(SERVER)
 	$(PRODUCT_METRICS_TESTS) $(SERVER)
 	$(CONNECTION_ARCHIVE_TESTS) $(SERVER)
+	$(CLIENT_MESSAGES_TESTS) $(SERVER)
+	$(MANAGEMENT_LISTS_TESTS)
+	$(MANAGEMENT_OVERVIEW_TESTS) $(SERVER)
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)
 

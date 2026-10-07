@@ -84,19 +84,34 @@ const char *st_traffic_body_type(const char *content_type, long long body_bytes)
     return "binary";
 }
 
+static const char *const traffic_supported_body_types[] = {
+    "empty", "json", "html", "xml", "image", "video", "audio", "form", "script", "text", "binary"
+};
+
 const char *st_traffic_body_type_or_classify(const char *stored, const char *content_type, long long body_bytes)
 {
-    static const char *const supported[] = {
-        "empty", "json", "html", "xml", "image", "video", "audio", "form", "script", "text", "binary"
-    };
     if (stored != NULL) {
         char normalized[32];
         media_type(stored, normalized, sizeof(normalized));
-        for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); ++i) {
-            if (strcmp(normalized, supported[i]) == 0) return supported[i];
+        for (size_t i = 0; i < sizeof(traffic_supported_body_types) / sizeof(traffic_supported_body_types[0]); ++i) {
+            if (strcmp(normalized, traffic_supported_body_types[i]) == 0) return traffic_supported_body_types[i];
         }
     }
     return st_traffic_body_type(content_type, body_bytes);
+}
+
+const char *st_traffic_body_type_normalize(const char *value)
+{
+    if (value == NULL) return NULL;
+    while (isspace((unsigned char)*value)) ++value;
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) --len;
+    for (size_t i = 0; i < sizeof(traffic_supported_body_types) / sizeof(traffic_supported_body_types[0]); ++i) {
+        if (strlen(traffic_supported_body_types[i]) == len && strncasecmp(value, traffic_supported_body_types[i], len) == 0) {
+            return traffic_supported_body_types[i];
+        }
+    }
+    return NULL;
 }
 
 void st_traffic_hex_preview(const uint8_t *data, size_t len, size_t preview_bytes, char *out, size_t out_len)
