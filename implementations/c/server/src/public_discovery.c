@@ -1822,7 +1822,7 @@ int st_public_discovery_handle_websocket(int fd,
     if (registered != 0) {
         if (registered == -2) (void)public_peer_send_error(peer, "peer id is already connected");
         else if (registered == -3) (void)public_peer_send_error(peer, "room is full");
-        else if (registered == -4) (void)public_peer_send_error(peer, "display name is already connected");
+        else if (registered == -4) (void)public_peer_send_error(peer, "client name is already in use");
         if (registered != -1) public_peer_close(peer, 1008U);
         pthread_mutex_destroy(&peer->send_lock);
         free(peer);
