@@ -125,9 +125,17 @@ int st_client_package_rate_limit(const char *remote_address,
         "SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_PER_IP", 120ULL, 1ULL, UINT_MAX);
     time_t window_seconds = (time_t)package_env_u64(
         "SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_WINDOW_SECONDS", 60ULL, 1ULL, INT_MAX);
-    const char *source = remote_address;
-    if (source == NULL || *source == '\0' || strlen(source) > ST_PACKAGE_RATE_SOURCE_MAX) {
-        source = "unknown";
+    /* Java ClientPackageRateLimiter: the trimmed address, or "unknown" when there is none. */
+    char source[ST_PACKAGE_RATE_SOURCE_MAX + 1U];
+    const char *address = remote_address == NULL ? "" : remote_address;
+    while (*address != '\0' && (unsigned char)*address <= ' ') ++address;
+    size_t source_len = strlen(address);
+    while (source_len > 0U && (unsigned char)address[source_len - 1U] <= ' ') --source_len;
+    if (source_len == 0U || source_len > ST_PACKAGE_RATE_SOURCE_MAX) {
+        snprintf(source, sizeof(source), "%s", "unknown");
+    } else {
+        memcpy(source, address, source_len);
+        source[source_len] = '\0';
     }
     time_t now = time(NULL);
     if (retry_after_seconds != NULL) *retry_after_seconds = 1;
@@ -546,7 +554,7 @@ static int package_validate_form(st_package_form *form,
     unsigned int required = ST_PACKAGE_SEEN_IMPLEMENTATION | ST_PACKAGE_SEEN_PLATFORM
         | ST_PACKAGE_SEEN_ARCH | ST_PACKAGE_SEEN_VERSION | ST_PACKAGE_SEEN_DISPLAY_NAME
         | ST_PACKAGE_SEEN_FILE;
-    if ((form->seen & required) != required || form->file_len == 0U) {
+    if ((form->seen & required) != required) {
         package_error(error, error_len, "file and required package metadata are required");
         return -1;
     }
@@ -781,9 +789,16 @@ int st_client_package_upload(const char *database_path,
     st_storage_client_download_link metadata;
     int latest = 0;
     if (package_validate_form(&form, &metadata, &latest, error, error_len) != 0) return -1;
+    /* Java ClientPackageStorage.stage: the bytes actually received are what the limit applies to. */
     if (form.file_len > package_max_bytes()) {
         if (http_status != NULL) *http_status = 413;
-        package_error(error, error_len, "file exceeds max package size");
+        char message[96];
+        snprintf(message, sizeof(message), "file exceeds max package size of %zu bytes", package_max_bytes());
+        package_error(error, error_len, message);
+        return -1;
+    }
+    if (form.file_len == 0U) {
+        package_error(error, error_len, "file cannot be empty");
         return -1;
     }
     if (database_path == NULL || st_storage_init(database_path, 0) != 0) {
@@ -791,27 +806,31 @@ int st_client_package_upload(const char *database_path,
         package_error(error, error_len, "client package database unavailable");
         return -1;
     }
+    /*
+     * Java wraps every staging and publishing I/O failure in IllegalStateException, which its
+     * GlobalExceptionHandler answers with 409.
+     */
     char root[PATH_MAX];
-    if (package_root(root) != 0) {
-        if (http_status != NULL) *http_status = 500;
-        package_error(error, error_len, "cannot prepare client package directory");
+    char temporary[PATH_MAX];
+    int temp_written = package_root(root) == 0
+        ? snprintf(temporary, sizeof(temporary), "%s/.upload-XXXXXX", root) : -1;
+    if (temp_written <= 0 || (size_t)temp_written >= sizeof(temporary)) {
+        if (http_status != NULL) *http_status = 409;
+        package_error(error, error_len, "cannot stage client package");
         return -1;
     }
-    char temporary[PATH_MAX];
-    int temp_written = snprintf(temporary, sizeof(temporary), "%s/.upload-XXXXXX", root);
-    if (temp_written <= 0 || (size_t)temp_written >= sizeof(temporary)) return -1;
     int file_fd = mkstemp(temporary);
     if (file_fd < 0 || fchmod(file_fd, 0600) != 0
         || package_write_all(file_fd, form.file, form.file_len) != 0 || fsync(file_fd) != 0) {
         if (file_fd >= 0) close(file_fd);
         unlink(temporary);
-        if (http_status != NULL) *http_status = 500;
+        if (http_status != NULL) *http_status = 409;
         package_error(error, error_len, "cannot stage client package");
         return -1;
     }
     if (close(file_fd) != 0) {
         unlink(temporary);
-        if (http_status != NULL) *http_status = 500;
+        if (http_status != NULL) *http_status = 409;
         package_error(error, error_len, "cannot stage client package");
         return -1;
     }
@@ -837,14 +856,22 @@ int st_client_package_upload(const char *database_path,
     int url_written = snprintf(download_url, sizeof(download_url),
                                "/api/public/client-packages/%lld/download", pending.id);
     struct stat existing;
+    int already_exists = final_written > 0 && (size_t)final_written < sizeof(final_path)
+        && lstat(final_path, &existing) == 0;
     if (final_written <= 0 || (size_t)final_written >= sizeof(final_path)
         || url_written <= 0 || (size_t)url_written >= sizeof(download_url)
-        || (lstat(final_path, &existing) == 0 || errno != ENOENT)
+        || already_exists || errno != ENOENT
         || rename(temporary, final_path) != 0) {
         unlink(temporary);
         (void)st_storage_delete_client_download_link(database_path, pending.id);
-        if (http_status != NULL) *http_status = 500;
-        package_error(error, error_len, "cannot publish client package");
+        if (http_status != NULL) *http_status = 409;
+        if (already_exists) {
+            char message[96];
+            snprintf(message, sizeof(message), "package file already exists: %lld", pending.id);
+            package_error(error, error_len, message);
+        } else {
+            package_error(error, error_len, "cannot publish client package");
+        }
         return -1;
     }
     st_storage_client_download_link published;
