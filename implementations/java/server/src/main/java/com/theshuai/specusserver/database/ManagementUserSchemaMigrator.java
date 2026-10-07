@@ -1,9 +1,7 @@
 package com.theshuai.specusserver.database;
 
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -11,7 +9,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.TreeMap;
 
 /** Compatibility migration for tenant-scoped management login names. */
 @Component
@@ -19,6 +16,7 @@ import java.util.TreeMap;
 public class ManagementUserSchemaMigrator {
     static final String TABLE = "specus_management_user";
     static final String UNIQUE_INDEX = "uq_management_user_tenant_login_name";
+    private static final List<String> UNIQUE_INDEX_COLUMNS = List.of("tenant_id", "login_name_normalized");
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -28,12 +26,18 @@ public class ManagementUserSchemaMigrator {
 
     /**
      * Runs through a separate Spring bean so the backfill is actually transactional when invoked
-     * by {@link DatabaseInitializer}'s startup callback.
+     * by {@link DatabaseInitializer}'s startup callback. Every statement in it is expected to
+     * succeed: the schema is read from {@link SchemaMetadata}, never probed with a statement that
+     * may fail, because on PostgreSQL that failure aborts the transaction.
      */
     @Transactional
     public void migrate() {
-        ensureColumn("login_name", "varchar(80)");
-        ensureColumn("login_name_normalized", "varchar(80)");
+        SchemaMetadata.Table table = SchemaMetadata.table(jdbcTemplate, TABLE);
+        if (table == null) {
+            throw new IllegalStateException("table " + TABLE + " does not exist");
+        }
+        ensureColumn(table, "login_name", "varchar(80)");
+        ensureColumn(table, "login_name_normalized", "varchar(80)");
 
         List<LoginNameRow> rows = jdbcTemplate.query(
                 "select username, tenant_id, login_name from " + TABLE,
@@ -63,60 +67,34 @@ public class ManagementUserSchemaMigrator {
                     normalize(loginName),
                     row.accountKey());
         }
-        ensureUniqueIndex();
+        ensureUniqueIndex(table);
         log.info("[schema] management login-name migration verified for {} row(s)", rows.size());
     }
 
-    private void ensureColumn(String name, String type) {
-        try {
-            jdbcTemplate.query("select " + name + " from " + TABLE + " where 1 = 0", rs -> null);
-        } catch (DataAccessException missingColumn) {
+    private void ensureColumn(SchemaMetadata.Table table, String name, String type) {
+        if (!table.hasColumn(name)) {
             jdbcTemplate.execute("alter table " + TABLE + " add column " + name + " " + type);
             log.info("[schema] added {}.{}", TABLE, name);
         }
     }
 
-    private void ensureUniqueIndex() {
-        try {
+    /**
+     * On MySQL and PostgreSQL Hibernate has already created the index from the {@code @Index} of
+     * {@code ManagementUser}; the SQLite dialect leaves unique indexes out, so there it is created
+     * here on the first start.
+     */
+    private void ensureUniqueIndex(SchemaMetadata.Table table) {
+        if (table.index(UNIQUE_INDEX) == null) {
             jdbcTemplate.execute("create unique index " + UNIQUE_INDEX + " on " + TABLE
-                    + " (tenant_id, login_name_normalized)");
-        } catch (DataAccessException exception) {
-            String message = fullMessage(exception).toLowerCase(Locale.ROOT);
-            if (message.contains("already exists")
-                    || message.contains("duplicate key name")
-                    || message.contains("relation \"" + UNIQUE_INDEX.toLowerCase(Locale.ROOT) + "\" already exists")) {
-                verifyUniqueIndexDefinition();
-                return;
-            }
-            throw exception;
+                    + " (" + String.join(", ", UNIQUE_INDEX_COLUMNS) + ")");
         }
         verifyUniqueIndexDefinition();
     }
 
     private void verifyUniqueIndexDefinition() {
-        IndexDefinition definition = jdbcTemplate.execute((ConnectionCallback<IndexDefinition>) connection -> {
-            TreeMap<Short, String> columns = new TreeMap<>();
-            Boolean unique = null;
-            try (var indexes = connection.getMetaData().getIndexInfo(
-                    connection.getCatalog(), null, TABLE, false, false)) {
-                while (indexes.next()) {
-                    String indexName = indexes.getString("INDEX_NAME");
-                    if (indexName == null || !UNIQUE_INDEX.equalsIgnoreCase(indexName)) {
-                        continue;
-                    }
-                    unique = !indexes.getBoolean("NON_UNIQUE");
-                    String columnName = indexes.getString("COLUMN_NAME");
-                    short ordinal = indexes.getShort("ORDINAL_POSITION");
-                    if (columnName != null && ordinal > 0) {
-                        columns.put(ordinal, columnName.toLowerCase(Locale.ROOT));
-                    }
-                }
-            }
-            return unique == null ? null : new IndexDefinition(unique, List.copyOf(columns.values()));
-        });
-        if (definition == null
-                || !definition.unique()
-                || !definition.columns().equals(List.of("tenant_id", "login_name_normalized"))) {
+        SchemaMetadata.Table table = SchemaMetadata.table(jdbcTemplate, TABLE);
+        SchemaMetadata.Index index = table == null ? null : table.index(UNIQUE_INDEX);
+        if (index == null || !index.unique() || !index.columns().equals(UNIQUE_INDEX_COLUMNS)) {
             throw new IllegalStateException(
                     "index " + UNIQUE_INDEX + " must be unique on (tenant_id, login_name_normalized)");
         }
@@ -130,19 +108,6 @@ public class ManagementUserSchemaMigrator {
         return value != null && !value.trim().isEmpty();
     }
 
-    private static String fullMessage(Throwable throwable) {
-        StringBuilder result = new StringBuilder();
-        for (Throwable current = throwable; current != null; current = current.getCause()) {
-            if (current.getMessage() != null) {
-                result.append(' ').append(current.getMessage());
-            }
-        }
-        return result.toString();
-    }
-
     private record LoginNameRow(String accountKey, String tenantId, String loginName) {
-    }
-
-    private record IndexDefinition(boolean unique, List<String> columns) {
     }
 }

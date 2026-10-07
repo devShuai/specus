@@ -16,6 +16,18 @@
         <npm.executable>npm</npm.executable>
         <specus.server.web.skip>false</specus.server.web.skip>
     </properties>
+    <dependencyManagement>
+        <dependencies>
+            <!-- The PostgreSQL the schema tests run on; embedded-postgres alone would bring 14. -->
+            <dependency>
+                <groupId>io.zonky.test.postgres</groupId>
+                <artifactId>embedded-postgres-binaries-bom</artifactId>
+                <version>17.11.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
     <build>
         <finalName>specus-server</finalName>
         <plugins>
@@ -123,6 +135,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test</groupId>
+            <artifactId>embedded-postgres</artifactId>
+            <version>2.2.2</version>
             <scope>test</scope>
         </dependency>
         <dependency>
