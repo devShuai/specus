@@ -64,13 +64,12 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
                 } else {
                     natClientHandler.applyConfig(specusBean);
                 }
-                // HTTP 路由热更新：服务端权威全集（管理态时才下发该字段）。null 表示本次
-                // NAT_CONTROL 不更新 HTTP 路由，此时客户端继续使用 HTTP 登录时拿到的初始快照。
-                if (specusBean.getHttpSpecusConfigList() != null) {
-                    NatClientHandler nat = ctx.pipeline().get(NatClientHandler.class);
-                    if (nat != null) {
-                        nat.applyHttpRoutes(specusBean.getHttpSpecusConfigList());
-                    }
+                // Every NAT_CONTROL is the client's full snapshot: routes only ever come from the
+                // HTTP login and NAT_CONTROL, so a missing or null list means "no routes", never
+                // "keep the old ones" (an older server left the field out after the last delete).
+                NatClientHandler nat = ctx.pipeline().get(NatClientHandler.class);
+                if (nat != null) {
+                    nat.applyHttpRoutes(specusBean.getHttpSpecusConfigList());
                 }
                 break;
             }

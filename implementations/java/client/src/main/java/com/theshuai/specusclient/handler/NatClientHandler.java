@@ -122,7 +122,8 @@ public class NatClientHandler extends NatCommonHandler {
 
     /**
      * 服务端通过 NAT_CONTROL 下发新 HTTP 路由全集时，由 {@link MessageResponseHandler} 调用，
-     * 该快照同时用于 HTTP 和 WebSocket 路由，空列表表示清空全部路由。
+     * 该快照同时用于 HTTP 和 WebSocket 路由。The list replaces the whole table: empty or
+     * {@code null} clears every route, since the client defines none locally.
      */
     public void applyHttpRoutes(List<HttpSpecusConfig> next) {
         this.httpRoutes = toHttpRouteMap(next);
