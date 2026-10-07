@@ -79,7 +79,7 @@ class SqliteSchemaUpdateRestartTests {
                     .containsExactlyInAnyOrderElementsOf(lobTypes.values());
             HttpTrafficExchangeRepository repository = second.getBean(HttpTrafficExchangeRepository.class);
             HttpTrafficExchange exchange = WidestHttpTrafficExchange.create();
-            exchange.setRequestPreviewText(exchange.getRequestPreviewText() + " request-body");
+            exchange.setRequestPreviewText(exchange.getRequestPreviewText() + " Request-Body");
             exchange = repository.save(exchange);
 
             assertThat(repository.findByTenantIdAndId(exchange.getTenantId(), exchange.getId()).orElseThrow())

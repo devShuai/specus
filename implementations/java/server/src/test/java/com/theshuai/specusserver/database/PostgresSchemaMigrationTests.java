@@ -374,8 +374,8 @@ class PostgresSchemaMigrationTests {
 
     private static HttpTrafficExchange widestExchangeWithBodyWords() {
         HttpTrafficExchange exchange = WidestHttpTrafficExchange.create();
-        exchange.setRequestPreviewText(exchange.getRequestPreviewText() + " request-body");
-        exchange.setResponsePreviewText(exchange.getResponsePreviewText() + " response-body");
+        exchange.setRequestPreviewText(exchange.getRequestPreviewText() + " Request-Body");
+        exchange.setResponsePreviewText(exchange.getResponsePreviewText() + " Response-Body");
         return exchange;
     }
 
@@ -384,10 +384,11 @@ class PostgresSchemaMigrationTests {
                                                           HttpTrafficExchange exchange) {
         HttpTrafficExchangeStore store = context.getBean(HttpTrafficExchangeStore.class);
         String id = exchange.getId().toString();
+        // The keyword is lower-cased, and the previews now are too, as every other field is.
         for (Map.Entry<HttpTrafficSearchField, String> search : List.of(
                 Map.entry(HttpTrafficSearchField.ALL, "request-body"),
                 Map.entry(HttpTrafficSearchField.REQUEST_BODY, "request-body"),
-                Map.entry(HttpTrafficSearchField.RESPONSE_BODY, "response-body"))) {
+                Map.entry(HttpTrafficSearchField.RESPONSE_BODY, "RESPONSE-BODY"))) {
             assertThat(store.search(TenantContext.defaultTenant(), null, null, null, null,
                             search.getKey(), search.getValue(), PageRequest.of(0, 20))
                     .getContent())
