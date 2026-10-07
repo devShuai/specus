@@ -269,6 +269,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
+	api.SetClientTokenSessions(clientSessions)
 	api.ProductMetrics().SetAllowed(cfg.ProductMetrics.Allowed)
 	directHTTP.SetHTTPShares(api.HTTPShares())
 	api.SetConnectivityChecker(connectivity.NewChecker(

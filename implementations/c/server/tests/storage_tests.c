@@ -860,8 +860,135 @@ static int test_connection_archive_window(void)
     return failures;
 }
 
+/* The first column of the first row of sql as text ("" when there is none). */
+static void query_text(const char *path, const char *sql, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL) {
+        snprintf(out, out_len, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+/*
+ * client_account used to be keyed by client_name with the rowid as account id, and SQLite gives a
+ * freed newest rowid to the next account. The migration keeps every id, retires the ids other
+ * tables still refer to, and from then on no id is handed out twice. A rename carries the account's
+ * identity and session names along; a delete ends its runtime tokens.
+ */
+static int test_client_account_id_migration(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-client-account-ids-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "client account id: init failed\n");
+        unlink(path);
+        return 1;
+    }
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    const char *legacy =
+        "DROP TABLE client_account;"
+        "DELETE FROM sqlite_sequence WHERE name = 'client_account';"
+        "CREATE TABLE client_account ("
+        "tenant_id TEXT NOT NULL DEFAULT 'default',"
+        "client_name TEXT PRIMARY KEY,"
+        "owner_username TEXT NOT NULL DEFAULT 'admin',"
+        "enabled INTEGER NOT NULL DEFAULT 1,"
+        "connection_limit_per_minute INTEGER NOT NULL DEFAULT 30,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+        "INSERT INTO client_account(client_name) VALUES('alpha'),('beta'),('gamma'),('delta'),('epsilon');"
+        /* epsilon (5) is gone, but an identity still names it; gamma (3) is gone without a trace. */
+        "DELETE FROM client_account WHERE client_name IN ('gamma', 'epsilon');"
+        "INSERT INTO specus_client_identity(credential_id, client_id, client_name, machine_fingerprint, os_user) "
+        "VALUES(1, 5, 'epsilon', 'machine-epsilon', 'user');"
+        "INSERT INTO specus_client_identity(credential_id, client_id, client_name, machine_fingerprint, os_user) "
+        "VALUES(1, 2, 'beta', 'machine-beta', 'user');"
+        "INSERT INTO specus_client_session(credential_id, identity_id, client_id, client_name, token_hash, status, "
+        "machine_fingerprint, os_user, expires_at) "
+        "VALUES(1, 2, 2, 'beta', 'hash', 'NETTY_ONLINE', 'machine-beta', 'user', '2999-01-01T00:00:00Z');";
+    if (sqlite3_open(path, &db) != SQLITE_OK || sqlite3_exec(db, legacy, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "client account id: legacy schema setup failed: %s\n", error == NULL ? "sqlite error" : error);
+        sqlite3_free(error);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_close(db);
+
+    int failures = 0;
+    char text[256];
+    for (int pass = 0; pass < 2; ++pass) {
+        /* The second init finds the migrated table and leaves it alone. */
+        if (st_storage_init(path, 0) != 0) {
+            fprintf(stderr, "client account id: migration %d failed\n", pass);
+            unlink(path);
+            return 1;
+        }
+    }
+    query_text(path, "SELECT group_concat(id || ':' || client_name, ',') FROM "
+                     "(SELECT id, client_name FROM client_account ORDER BY id)", text, sizeof(text));
+    if (strcmp(text, "1:alpha,2:beta,4:delta") != 0) {
+        fprintf(stderr, "client account id: migrated accounts %s, expected their old rowids\n", text);
+        ++failures;
+    }
+    st_storage_client created;
+    if (st_storage_upsert_client(path, 0, "default", "zeta", "admin", 1, 30, &created) != 0 || created.id != 6) {
+        fprintf(stderr, "client account id: first new account got id %lld, expected 6 (5 is still referenced)\n",
+                created.id);
+        ++failures;
+    }
+    st_storage_client again;
+    if (st_storage_delete_client(path, created.id) != 0
+        || st_storage_upsert_client(path, 0, "default", "zeta", "admin", 1, 30, &again) != 0
+        || again.id != 7) {
+        fprintf(stderr, "client account id: re-created newest account got id %lld, expected 7, not the deleted 6\n",
+                again.id);
+        ++failures;
+    }
+    if (st_storage_upsert_client(path, 0, "default", "alpha", "admin", 1, 30, &created) == 0) {
+        fprintf(stderr, "client account id: a second account named alpha was created\n");
+        ++failures;
+    }
+
+    st_storage_client renamed;
+    if (st_storage_upsert_client(path, 2, "default", "beta-renamed", "admin", 1, 30, &renamed) != 0) {
+        fprintf(stderr, "client account id: rename failed\n");
+        ++failures;
+    }
+    query_text(path, "SELECT (SELECT client_name FROM specus_client_identity WHERE client_id = 2) || '|' || "
+                     "(SELECT client_name FROM specus_client_session WHERE client_id = 2) || '|' || "
+                     "(SELECT client_name FROM specus_client_identity WHERE client_id = 5)", text, sizeof(text));
+    if (strcmp(text, "beta-renamed|beta-renamed|epsilon") != 0) {
+        fprintf(stderr, "client account id: identity|session|other names after the rename: %s\n", text);
+        ++failures;
+    }
+    if (st_storage_delete_client(path, 2) != 0) {
+        fprintf(stderr, "client account id: delete failed\n");
+        ++failures;
+    }
+    query_text(path, "SELECT status || '|' || (expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) "
+                     "FROM specus_client_session WHERE client_id = 2", text, sizeof(text));
+    if (strcmp(text, "DISCONNECTED|1") != 0) {
+        fprintf(stderr, "client account id: session of the deleted account is %s, expected DISCONNECTED|1 "
+                        "(status|expired)\n", text);
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
 int main(void)
 {
+    if (test_client_account_id_migration() != 0) {
+        return 1;
+    }
     if (test_peer_mesh_acl_direction_migration() != 0) {
         return 1;
     }

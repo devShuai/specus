@@ -598,9 +598,11 @@ OpenResty 终止，而 `7010/TCP` 仍为明文。旧服务端未返回该字段�
 ```bash
 SPECUS_DB_URL=jdbc:sqlite:./specus.db \
 SPECUS_DB_DRIVER=org.sqlite.JDBC \
-SPECUS_DB_DIALECT=org.hibernate.community.dialect.SQLiteDialect \
+SPECUS_DB_DIALECT=com.theshuai.specusserver.database.SpecusSqliteDialect \
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
+
+`SpecusSqliteDialect` 是 Hibernate 社区 `SQLiteDialect` 的子类，额外把 SQLite 的约束冲突（`SQLITE_CONSTRAINT`）翻译为 `DataIntegrityViolationException`，与 MySQL/PostgreSQL 一致。仍配置为 `org.hibernate.community.dialect.SQLiteDialect` 的部署会在启动时自动换成它。
 
 切换至 MySQL：
 
