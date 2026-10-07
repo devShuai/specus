@@ -134,6 +134,61 @@ jobs:
         working-directory: implementations/go/server
         run: go test ./... -count=1
 
+  # The Java and .NET suites ran only in the release, so a pull request could break either server
+  # with every check here green. Both run whole, with the management page built as the release
+  # builds it: a few tests fetch its real assets.
+  java-server:
+    name: Java server
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+
+      - name: Build admin web into Java server resources
+        run: |
+          npm --prefix apps/admin-web ci
+          npm --prefix apps/admin-web run deploy:java
+
+      - name: Test Java modules
+        run: >-
+          mvn -B -pl implementations/java/server,implementations/java/client,implementations/java/stun-server -am
+          -Dspecus.server.web.skip=true test
+
+  dotnet-server:
+    name: .NET server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+
+      - name: Build admin web into .NET server wwwroot
+        run: |
+          npm --prefix apps/admin-web ci
+          npm --prefix apps/admin-web run deploy:csharp
+
+      - name: Test .NET server
+        run: >-
+          dotnet test implementations/csharp/server/Specus.slnx
+          -p:SpecusServerWebSkip=true
+
   c-linux:
     name: C server (Linux)
     runs-on: ubuntu-latest
