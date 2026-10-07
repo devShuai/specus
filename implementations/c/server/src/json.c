@@ -330,6 +330,8 @@ char *st_json_escape(const char *value)
     return out;
 }
 
+static int append_bytes(char **out, size_t *len, size_t *cap, const unsigned char *bytes, size_t need);
+
 static int append_utf8(char **out, size_t *len, size_t *cap, unsigned int codepoint)
 {
     unsigned char bytes[4];
@@ -353,6 +355,11 @@ static int append_utf8(char **out, size_t *len, size_t *cap, unsigned int codepo
         bytes[3] = (unsigned char)(0x80U | (codepoint & 0x3fU));
         need = 4;
     }
+    return append_bytes(out, len, cap, bytes, need);
+}
+
+static int append_bytes(char **out, size_t *len, size_t *cap, const unsigned char *bytes, size_t need)
+{
     if (*len + need + 1U > *cap) {
         size_t next = *cap == 0 ? 32U : *cap;
         while (next < *len + need + 1U) {
@@ -482,7 +489,12 @@ static char *parse_json_string_value_len(const char **cursor, size_t *out_len)
                     return NULL;
             }
         }
-        if (append_utf8(&out, &len, &cap, ch) != 0) {
+        /*
+         * An unescaped character is copied byte for byte: the body is UTF-8 already, and taking
+         * each byte of a multi-byte character for a code point of its own turned "架" into "æ¶".
+         * (The escapes above all yield ASCII.)
+         */
+        if (append_bytes(&out, &len, &cap, &ch, 1U) != 0) {
             free(out);
             return NULL;
         }

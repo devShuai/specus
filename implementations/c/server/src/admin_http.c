@@ -8802,6 +8802,121 @@ static int valid_sha256_text(const char *value)
     return 1;
 }
 
+/* Java's "[0-9a-f]{64}": the digest form a publishable row must carry. */
+static int canonical_sha256_text(const char *value)
+{
+    if (value == NULL || strlen(value) != 64U) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isdigit(*cursor) && (*cursor < 'a' || *cursor > 'f')) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Java ClientDownloadLinkService.isSafeExternalPackageUrl over java.net.URI: an absolute https URL
+ * with a server-based host, no user information, no query and no fragment. Characters URI refuses
+ * (whitespace, controls, "<>\^`{|} and the double quote) make it unsafe, and so does a host of
+ * anything but letters, digits, '-' and '.' or a port that is not a number: URI reads such an
+ * authority as registry-based, and getHost() is then null.
+ */
+static int client_download_safe_external_url(const char *value)
+{
+    if (value == NULL) return 0;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+    const char *end = value + strlen(value);
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
+    if ((size_t)(end - value) < 9U || admin_ascii_ncasecmp(value, "https://", 8U) != 0) return 0;
+    for (const char *p = value; p < end; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= ' ' || c == 0x7fU || strchr("\"<>\\^`{|}?#", (int)c) != NULL) return 0;
+    }
+    const char *authority = value + 8U;
+    const char *authority_end = authority;
+    while (authority_end < end && *authority_end != '/') ++authority_end;
+    if (authority_end == authority || memchr(authority, '@', (size_t)(authority_end - authority)) != NULL) {
+        return 0;
+    }
+    const char *host_end = authority_end;
+    if (*authority == '[') {
+        const char *close = memchr(authority, ']', (size_t)(authority_end - authority));
+        if (close == NULL || close == authority + 1) return 0;
+        host_end = close + 1;
+    } else {
+        const char *colon = memchr(authority, ':', (size_t)(authority_end - authority));
+        if (colon != NULL) host_end = colon;
+        if (host_end == authority || *authority == '.' || *authority == '-'
+            || host_end[-1] == '-') return 0;
+        for (const char *p = authority; p < host_end; ++p) {
+            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return 0;
+        }
+    }
+    if (host_end < authority_end) {
+        if (*host_end != ':') return 0;
+        for (const char *p = host_end + 1; p < authority_end; ++p) {
+            if (!isdigit((unsigned char)*p)) return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Java hasAuthoritativeDistributionMetadata: a positive size and a lowercase SHA-256, and either
+ * this server's own download path for a hosted package or a safe external HTTPS URL.
+ */
+static int client_download_has_authoritative_metadata(long long id,
+                                                      int hosted,
+                                                      const char *download_url,
+                                                      const char *sha256,
+                                                      long long file_size)
+{
+    if (file_size <= 0 || !canonical_sha256_text(sha256)) return 0;
+    if (hosted) {
+        char expected[96];
+        snprintf(expected, sizeof(expected), "/api/public/client-packages/%lld/download", id);
+        return id > 0 && download_url != NULL && strcmp(download_url, expected) == 0;
+    }
+    return client_download_safe_external_url(download_url);
+}
+
+/* Java SemanticVersion.normalize: trimmed, at most one leading lowercase "v" removed. */
+static void admin_normalize_semver_text(const char *value, char *out, size_t out_len)
+{
+    if (out_len == 0U) return;
+    out[0] = '\0';
+    if (value == NULL) return;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+    if (*value == 'v') ++value;
+    size_t len = strlen(value);
+    while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+    if (len >= out_len) len = out_len - 1U;
+    memcpy(out, value, len);
+    out[len] = '\0';
+}
+
+/* Java answers an unknown catalogue id with IllegalArgumentException, i.e. 400. */
+static int write_client_download_not_found(long long id, char *out, size_t out_len)
+{
+    char body[128];
+    snprintf(body, sizeof(body), "{\"error\":\"client download link not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/* Java validateTargetCoordinates; NULL when the target may exist. */
+static const char *client_download_target_error(const char *implementation,
+                                                const char *platform,
+                                                const char *arch)
+{
+    if (strcmp(implementation, "android") == 0
+        && (strcmp(platform, "android") != 0 || strcmp(arch, "any") != 0)) {
+        return "{\"error\":\"android packages must use platform=android and arch=any\"}";
+    }
+    if (strcmp(platform, "android") == 0
+        && (strcmp(implementation, "android") != 0 || strcmp(arch, "any") != 0)) {
+        return "{\"error\":\"platform=android is reserved for android/any packages\"}";
+    }
+    return NULL;
+}
+
 typedef struct {
     char major[33];
     char minor[33];
@@ -9049,13 +9164,10 @@ static int read_client_download_mutation(const char *body,
     (void)st_json_get_bool(body, "enabled", &mutation->enabled);
     (void)st_json_get_i64(body, "fileSize", &mutation->file_size);
     (void)st_json_get_bool(body, "isLatest", &mutation->is_latest);
-    if ((strcmp(mutation->implementation, "android") == 0
-         && (strcmp(mutation->platform, "android") != 0 || strcmp(mutation->arch, "any") != 0))
-        || (strcmp(mutation->platform, "android") == 0
-            && (strcmp(mutation->implementation, "android") != 0
-                || strcmp(mutation->arch, "any") != 0))) {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"android packages require android/any\"}");
+    const char *target_error = client_download_target_error(mutation->implementation,
+                                                            mutation->platform, mutation->arch);
+    if (target_error != NULL) {
+        response = write_response(out, out_len, 400, "Bad Request", target_error);
         goto done;
     }
     st_admin_semver release_version;
@@ -9075,14 +9187,19 @@ static int read_client_download_mutation(const char *body,
                                   "{\"error\":\"invalid fileSize or sha256\"}");
         goto done;
     }
-    if (mutation->is_latest && (!mutation->enabled || mutation->version[0] == '\0')) {
+    if (mutation->is_latest && mutation->version[0] == '\0') {
         response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"an enabled version is required for latest\"}");
+                                  "{\"error\":\"isLatest requires a versioned catalogue entry\"}");
+        goto done;
+    }
+    if (mutation->is_latest && !mutation->enabled) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"a disabled client download cannot be latest\"}");
         goto done;
     }
     if (mutation->is_latest && (existing == NULL || !existing->hosted)
-        && (admin_ascii_ncasecmp(mutation->download_url, "https://", 8U) != 0
-            || !valid_sha256_text(mutation->sha256) || mutation->file_size <= 0)) {
+        && !client_download_has_authoritative_metadata(0, 0, mutation->download_url,
+                                                       mutation->sha256, mutation->file_size)) {
         response = write_response(out, out_len, 400, "Bad Request",
             "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
         goto done;
@@ -9117,6 +9234,16 @@ static int compare_client_download_order(const void *left_raw, const void *right
         return left->display_order < right->display_order ? -1 : 1;
     }
     return left->id < right->id ? -1 : (left->id > right->id ? 1 : 0);
+}
+
+/* Java findAllByOrderByImplementationAscDisplayOrderAscIdAsc. */
+static int compare_client_download_public_order(const void *left_raw, const void *right_raw)
+{
+    const st_storage_client_download_link *left = left_raw;
+    const st_storage_client_download_link *right = right_raw;
+    int compared = strcmp(left->implementation, right->implementation);
+    if (compared != 0) return compared < 0 ? -1 : 1;
+    return compare_client_download_order(left_raw, right_raw);
 }
 
 static int build_client_downloads_response(const st_admin_context *context,
@@ -9164,24 +9291,34 @@ static int build_client_downloads_response(const st_admin_context *context,
                     links[link_count++] = catalogue[i];
                 }
             }
-            st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
-            size_t fallback_count = 0U;
-            if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
-                                         &fallback_count) == 0) {
-                for (size_t i = 0U; i < fallback_count; ++i) {
-                    int configured = 0;
-                    for (size_t j = 0U; j < catalogue_count; ++j) {
-                        if (client_download_same_target(&fallback[i], &catalogue[j])) {
-                            configured = 1;
-                            break;
+            /*
+             * Java listEnabled: when no release target is left unconfigured (or the fallback is
+             * off) the catalogue is returned in its implementation, displayOrder, id order and
+             * GitHub is not asked; otherwise release assets fill the unconfigured targets and the
+             * merged list is ordered by displayOrder, id.
+             */
+            if (!st_github_release_may_supply_missing_target(catalogue, catalogue_count)) {
+                qsort(links, link_count, sizeof(*links), compare_client_download_public_order);
+            } else {
+                st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
+                size_t fallback_count = 0U;
+                if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
+                                             &fallback_count) == 0) {
+                    for (size_t i = 0U; i < fallback_count; ++i) {
+                        int configured = 0;
+                        for (size_t j = 0U; j < catalogue_count; ++j) {
+                            if (client_download_same_target(&fallback[i], &catalogue[j])) {
+                                configured = 1;
+                                break;
+                            }
+                        }
+                        if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
+                            links[link_count++] = fallback[i];
                         }
                     }
-                    if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
-                        links[link_count++] = fallback[i];
-                    }
                 }
+                qsort(links, link_count, sizeof(*links), compare_client_download_order);
             }
-            qsort(links, link_count, sizeof(*links), compare_client_download_order);
         }
         for (size_t i = 0U; rc == 0 && i < link_count; ++i) {
             rc = admin_sb_append(&builder, i == 0U ? "" : ",");
@@ -9299,7 +9436,7 @@ static int handle_client_download_update(const st_admin_context *context,
     }
     st_storage_client_download_link existing;
     if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+        return write_client_download_not_found(id, out, out_len);
     }
     st_admin_client_download_mutation mutation;
     int validation_response = read_client_download_mutation(body, &existing, &mutation, out, out_len);
@@ -9329,19 +9466,56 @@ static int handle_client_download_mark_latest(const st_admin_context *context,
     if (init_response != 0) return init_response;
     st_storage_client_download_link existing;
     if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
-        return write_response(out, out_len, 404, "Not Found",
-                              "{\"error\":\"client download not found\"}");
+        return write_client_download_not_found(id, out, out_len);
     }
-    st_admin_semver parsed;
-    if (!existing.enabled || parse_admin_semver(existing.version, &parsed) != 0
-        || (existing.hosted && !st_client_package_is_readable(&existing))
-        || (!existing.hosted && (admin_ascii_ncasecmp(existing.download_url, "https://", 8U) != 0
-            || !valid_sha256_text(existing.sha256) || existing.file_size <= 0))) {
+    /*
+     * Java markLatest: a version is required and must be SemVer, a minimum must not be newer, the
+     * row must be enabled and an external one must carry verified HTTPS metadata. The stored
+     * version and minimum are rewritten in canonical form (one leading "v" removed).
+     */
+    char version[sizeof(existing.version)];
+    char minimum[sizeof(existing.min_supported_version)];
+    admin_normalize_semver_text(existing.version, version, sizeof(version));
+    admin_normalize_semver_text(existing.min_supported_version, minimum, sizeof(minimum));
+    st_admin_semver parsed_version;
+    st_admin_semver parsed_minimum;
+    if (version[0] == '\0') {
         return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"download is not publishable as latest\"}");
+                              "{\"error\":\"client download link has no version\"}");
+    }
+    if (parse_admin_semver(version, &parsed_version) != 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"version must be a valid SemVer 2.0 version\"}");
+    }
+    if (minimum[0] != '\0' && parse_admin_semver(minimum, &parsed_minimum) != 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"minSupportedVersion must be a valid SemVer 2.0 version\"}");
+    }
+    if (minimum[0] != '\0' && compare_admin_semver(&parsed_minimum, &parsed_version) > 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"minSupportedVersion cannot be newer than version\"}");
+    }
+    if (!existing.enabled) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"a disabled client download cannot be latest\"}");
+    }
+    if (!existing.hosted
+        && !client_download_has_authoritative_metadata(existing.id, 0, existing.download_url,
+                                                       existing.sha256, existing.file_size)) {
+        return write_response(out, out_len, 400, "Bad Request",
+            "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
+    }
+    if (existing.hosted && !st_client_package_is_readable(&existing)) {
+        /* C only: never publish a hosted row whose bytes are missing or no longer match. */
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"client package is not readable\"}");
     }
     st_storage_client_download_link updated;
-    if (st_storage_mark_client_download_latest(database_path, id, &updated) != 0) {
+    if (st_storage_upsert_client_download_link_extended(database_path, id, existing.implementation,
+            existing.platform, existing.arch, existing.display_name, existing.download_url,
+            existing.description, existing.display_order, existing.enabled, version, existing.sha256,
+            existing.file_size, 1, existing.changelog_url, minimum, existing.hosted,
+            existing.package_path, existing.package_file_name, &updated) != 0) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"client download latest update failed\"}");
     }
@@ -9373,6 +9547,11 @@ static int build_client_version_check_response(const char *path, char *out, size
         return write_response(out, out_len, 400, "Bad Request",
                               "{\"error\":\"invalid client version target\"}");
     }
+    const char *target_error = client_download_target_error(normalized_implementation,
+                                                            normalized_platform, normalized_arch);
+    if (target_error != NULL) {
+        return write_response(out, out_len, 400, "Bad Request", target_error);
+    }
     const char *database_path = admin_database_path();
     st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
     size_t count = 0U;
@@ -9394,10 +9573,10 @@ static int build_client_version_check_response(const char *path, char *out, size
             || (strcmp(candidate->platform, normalized_platform) != 0
                 && strcmp(candidate->platform, "any") != 0)
             || (strcmp(candidate->arch, normalized_arch) != 0 && strcmp(candidate->arch, "any") != 0)
-            || candidate->file_size <= 0 || !valid_sha256_text(candidate->sha256)
-            || parse_admin_semver(candidate->version, &candidate_version) != 0
-            || (!candidate->hosted
-                && admin_ascii_ncasecmp(candidate->download_url, "https://", 8U) != 0)) continue;
+            || !client_download_has_authoritative_metadata(candidate->id, candidate->hosted,
+                                                           candidate->download_url, candidate->sha256,
+                                                           candidate->file_size)
+            || parse_admin_semver(candidate->version, &candidate_version) != 0) continue;
         int specificity = (strcmp(candidate->platform, normalized_platform) == 0 ? 2 : 0)
             + (strcmp(candidate->arch, normalized_arch) == 0 ? 1 : 0);
         if (best == NULL || specificity > best_specificity
@@ -9459,10 +9638,12 @@ static int build_client_version_check_response(const char *path, char *out, size
     if (update_available && parse_admin_semver(best->min_supported_version, &minimum) == 0) {
         mandatory = compare_admin_semver(&current, &minimum) < 0;
     }
+    char latest_version[sizeof(best->version)];
+    admin_normalize_semver_text(best->version, latest_version, sizeof(latest_version));
     st_admin_string_builder builder = {0};
     int rc = admin_sb_appendf(&builder, "{\"updateAvailable\":%s,\"mandatory\":%s,\"latestVersion\":",
                               update_available ? "true" : "false", mandatory ? "true" : "false");
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, best->version);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, latest_version);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"downloadUrl\":");
     if (rc == 0) rc = admin_sb_append_json_string(&builder, best->download_url);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"sha256\":");
@@ -9496,8 +9677,19 @@ static int handle_client_download_delete(const st_admin_context *context,
     if (init_response != 0) {
         return init_response;
     }
-    if (st_client_package_delete(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+    st_storage_client_download_link existing;
+    if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
+        return write_client_download_not_found(id, out, out_len);
+    }
+    int deleted = st_client_package_delete(database_path, id);
+    if (deleted == -2) {
+        /* Java storage.quarantine throws IllegalStateException: 409, the row stays. */
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"cannot quarantine client package\"}");
+    }
+    if (deleted != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client download delete failed\"}");
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -9637,8 +9829,21 @@ static int handle_user_diagram_update(const st_admin_context *context,
                                       char *out,
                                       size_t out_len)
 {
+    /*
+     * Java UserDiagramDocumentService.update: the document must belong to the caller (404) before
+     * its revision is compared (409) and the new content is read (400), so another account learns
+     * nothing from the body it sends.
+     */
+    const char *database_path = admin_database_path();
+    st_storage_user_diagram existing;
+    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
+            context->tenant_id, context->username, &existing) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
+    }
+    long long current_revision = existing.revision;
+    st_storage_user_diagram_free(&existing);
     long long revision = -1;
-    if (st_json_get_i64(body, "revision", &revision) != 0 || revision < 0) {
+    if (st_json_get_i64(body, "revision", &revision) != 0 || revision != current_revision) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"diagram revision conflict\"}");
     }
@@ -9647,14 +9852,6 @@ static int handle_user_diagram_update(const st_admin_context *context,
     size_t snapshot_len = 0U;
     int validation = read_user_diagram_mutation(body, name, &snapshot, &snapshot_len, out, out_len);
     if (validation != 0) return validation;
-    const char *database_path = admin_database_path();
-    st_storage_user_diagram existing;
-    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
-            context->tenant_id, context->username, &existing) != 0) {
-        free(snapshot);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
-    }
-    st_storage_user_diagram_free(&existing);
     st_storage_user_diagram updated;
     int rc = st_storage_update_user_diagram(database_path, id, context->tenant_id, context->username,
                                             revision, name, snapshot, snapshot_len, &updated);
@@ -16239,8 +16436,12 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     const char *database_path = admin_database_path();
+    char *package_range = admin_extract_header_value(request, "Range");
+    char *package_if_none_match = admin_extract_header_value(request, "If-None-Match");
     int package_download_response = st_client_package_send_download(
-        fd, method, path, database_path, request_remote_address);
+        fd, method, path, database_path, request_remote_address, package_range, package_if_none_match);
+    free(package_range);
+    free(package_if_none_match);
     if (package_download_response != 0) {
         free(body_buffer);
         close(fd);
