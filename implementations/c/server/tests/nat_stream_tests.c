@@ -35,6 +35,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -854,6 +855,70 @@ static int check_upstream_browser_headers(test_server *server, client_pair *pair
 }
 
 /*
+ * Turns on the mapping's detailCaptureEnabled, logs the data connection in again so its runtime
+ * mapping carries the switch, relays one TCP payload each way and counts the captured frames.
+ */
+static int relay_with_capture_enabled_on_mapping(test_server *server, client_pair *pair, long long *frames)
+{
+    sqlite3 *db = NULL;
+    int updated = sqlite3_open(server->db_path, &db) == SQLITE_OK
+        && sqlite3_busy_timeout(db, 5000) == SQLITE_OK
+        && sqlite3_exec(db, "UPDATE specus_mapping SET detail_capture_enabled = 1", NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    CHECK(updated, "mapping detail capture update");
+    close_fd(&pair->data);
+    CHECK(login_data(server, pair) == 0, "data re-login");
+    int public_fd = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
+    CHECK(send_all(public_fd, (const uint8_t *)"from-public", 11U) == 0, "public write");
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "ping", 4U) == 0, "DATA");
+    CHECK(expect_public_bytes(public_fd, "ping") == 0, "DATA not relayed to the public peer");
+    char count[32];
+    long long deadline = monotonic_ms() + 2000;
+    *frames = 0;
+    do {
+        sleep_ms(100);
+        CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_tcp_traffic_frame", NULL, 0, count,
+                        sizeof(count)) == 0, "frame count");
+        *frames = strtoll(count, NULL, 10);
+    } while (*frames < 2 && monotonic_ms() < deadline);
+    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "RST");
+    CHECK(drain_until_eof(public_fd, IO_TIMEOUT_MS) == 0, "RST did not close the public peer");
+    close_fd(&public_fd);
+    return 0;
+}
+
+/* TrafficInspectionServiceTests: no TCP capture without SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED. */
+static int check_tcp_capture_off_by_default(test_server *server, client_pair *pair)
+{
+    long long frames = -1;
+    CHECK(relay_with_capture_enabled_on_mapping(server, pair, &frames) == 0, "relay");
+    CHECK(frames == 0, "%lld TCP frames captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset", frames);
+    return 0;
+}
+
+/* With the server switch on, both directions are stored whole with their short preview. */
+static int check_tcp_capture_enabled(test_server *server, client_pair *pair)
+{
+    long long frames = -1;
+    CHECK(relay_with_capture_enabled_on_mapping(server, pair, &frames) == 0, "relay");
+    CHECK(frames >= 2, "%lld TCP frames captured, expected both directions", frames);
+    char preview[64];
+    CHECK(db_scalar(server->db_path,
+                    "SELECT payload_preview_hex FROM specus_tcp_traffic_frame WHERE frame_direction = ?",
+                    "CLIENT_TO_PUBLIC", 0, preview, sizeof(preview)) == 0
+              && strcmp(preview, "70 69 6E 67") == 0,
+          "client-to-public frame preview %s", preview);
+    CHECK(db_scalar(server->db_path,
+                    "SELECT payload_preview_text FROM specus_tcp_traffic_frame WHERE frame_direction = ?",
+                    "PUBLIC_TO_CLIENT", 0, preview, sizeof(preview)) == 0
+              && strcmp(preview, "from-public") == 0,
+          "public-to-client frame preview %s", preview);
+    return 0;
+}
+
+/*
  * HEARTBEAT_RESPONSE is a heartbeat and allowed on both roles; it needs no answer. A NAT KEEPALIVE
  * on the data connection is accepted as well.
  */
@@ -1112,6 +1177,10 @@ static int run_check(const char *name, pair_check check)
     return run_on_fresh_server(name, run_current_check, long_idle);
 }
 
+static const char *const long_idle_with_capture[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
+};
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1141,6 +1210,11 @@ int main(int argc, char **argv)
     failures += run_check("HEARTBEAT_RESPONSE is accepted on both roles", check_heartbeat_response);
     failures += run_check("request OPEN carries browser headers moved onto the route target",
                           check_upstream_browser_headers);
+    failures += run_check("TCP detail capture is off without SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED",
+                          check_tcp_capture_off_by_default);
+    current_check = check_tcp_capture_enabled;
+    failures += run_on_fresh_server("TCP detail capture with the server switch and the mapping's switch",
+                                    run_current_check, long_idle_with_capture);
     failures += run_check("4 MiB client-to-public queue overflow resets only that stream", check_tcp_queue_overflow);
     failures += run_on_fresh_server("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
     if (raise_descriptor_limit(4096) == 0) {

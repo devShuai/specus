@@ -24,6 +24,7 @@
 #include "security_baseline.h"
 #include "storage.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "turn_auth.h"
 #include "upstream_browser_headers.h"
 #include "workbench.h"
@@ -2760,7 +2761,9 @@ static void record_direct_http_exchange(const char *client_name,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
-    if (client_name == NULL || route == NULL || request == NULL || response == NULL) {
+    /* Java captures only with specus.traffic.capture-detail-enabled and the route's own switch. */
+    if (client_name == NULL || route == NULL || request == NULL || response == NULL
+        || !st_traffic_capture_enabled()) {
         return;
     }
     const char *database_path = admin_database_path();
@@ -2792,11 +2795,17 @@ static void record_direct_http_exchange(const char *client_name,
     char *response_headers = admin_join_headers(response->headers, response->headers_len);
     char *request_content_type = admin_header_array_value(request->headers, request->headers_len, "Content-Type");
     char *response_content_type = admin_header_array_value(response->headers, response->headers_len, "Content-Type");
+    char *request_content_encoding = admin_header_array_value(request->headers, request->headers_len,
+                                                              "Content-Encoding");
+    char *response_content_encoding = admin_header_array_value(response->headers, response->headers_len,
+                                                               "Content-Encoding");
     if (request_headers == NULL || response_headers == NULL) {
         free(request_headers);
         free(response_headers);
         free(request_content_type);
         free(response_content_type);
+        free(request_content_encoding);
+        free(response_content_encoding);
         return;
     }
     st_storage_http_exchange_record record = {
@@ -2825,6 +2834,8 @@ static void record_direct_http_exchange(const char *client_name,
         .request_body_len = request->body_len,
         .response_body = response->body,
         .response_body_len = response->body_len,
+        .request_content_encoding = request_content_encoding,
+        .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
     };
     (void)st_storage_record_http_exchange(database_path, &record);
@@ -2832,6 +2843,8 @@ static void record_direct_http_exchange(const char *client_name,
     free(response_headers);
     free(request_content_type);
     free(response_content_type);
+    free(request_content_encoding);
+    free(response_content_encoding);
 }
 
 static int ensure_admin_database(const char **path, char *out, size_t out_len)
@@ -3710,7 +3723,13 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
     return response_len;
 }
 
-static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
+/*
+ * HttpTrafficExchangeView. A summary (detail 0, the list) carries null headers and previews, as
+ * Java's summary views do; the detail of one exchange carries them.
+ */
+static int append_http_exchange_view(st_admin_string_builder *builder,
+                                     const st_storage_http_exchange *item,
+                                     int detail)
 {
     /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
@@ -3751,19 +3770,24 @@ static int append_http_exchange_view(st_admin_string_builder *builder, const st_
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseContentType\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_content_type);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseBodyType\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_body_type);
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(builder,
+                                         st_traffic_body_type_or_classify(item->response_body_type,
+                                                                          item->response_content_type,
+                                                                          item->response_bytes));
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_text : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_text : NULL);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -6032,7 +6056,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
         rc = admin_sb_append(&builder, i == 0 ? "" : ",");
         if (rc == 0) {
-            rc = append_http_exchange_view(&builder, &items[i]);
+            rc = append_http_exchange_view(&builder, &items[i], 0);
         }
     }
     if (rc == 0) {
@@ -6064,41 +6088,25 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
-    const int page_size = 100;
-    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(
-        (size_t)page_size, sizeof(*items));
-    if (items == NULL) {
+    /* One row by id with its headers and previews, under the same visibility as the list. */
+    st_storage_http_exchange *match = (st_storage_http_exchange *)calloc(1U, sizeof(*match));
+    int found = 0;
+    if (match == NULL
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_get_http_exchange_visible(database_path, exchange_id, context->tenant_id, context->username,
+                                                context->admin, match, &found) != 0) {
+        free(match);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"http exchange lookup failed\"}");
     }
-    long long total = 0;
-    int found = 0;
-    st_storage_http_exchange match;
-    for (int page = 0; !found; ++page) {
-        size_t count = 0U;
-        if (st_storage_list_http_exchanges_visible(database_path, 0, NULL, NULL, NULL, NULL,
-                context->tenant_id, context->username, context->admin, page, page_size,
-                items, (size_t)page_size, &count, &total) != 0) {
-            free(items);
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"http exchange lookup failed\"}");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (items[i].id == exchange_id) {
-                match = items[i];
-                found = 1;
-                break;
-            }
-        }
-        if (found || count == 0U || (long long)(page + 1) * page_size >= total) break;
-    }
-    free(items);
     if (!found) {
+        free(match);
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
     st_admin_string_builder builder = {0};
-    int rc = append_http_exchange_view(&builder, &match);
+    int rc = append_http_exchange_view(&builder, match, 1);
+    free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -6111,7 +6119,7 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
 
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", 0);
+    int enabled = st_traffic_capture_enabled();
     return write_response(out, out_len, 200, "OK",
         enabled
             ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"

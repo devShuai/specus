@@ -3207,6 +3207,22 @@ static int test_connectivity_check_endpoint(void)
     return failed ? 1 : 0;
 }
 
+static long long route_auth_exchange_count(const char *database_path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long count = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = 'api'", -1,
+                              &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return count;
+}
+
 static int route_auth_detail_is_sanitized(const char *database_path)
 {
     sqlite3 *db = NULL;
@@ -3421,6 +3437,26 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* TrafficInspectionServiceTests: the route's detailCaptureEnabled is on, but without
+     * SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED (Java's capture-detail-enabled, default false) nothing
+     * is captured. */
+    long long captured_before = route_auth_exchange_count(database_path);
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    int uncaptured = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    if (uncaptured != 0 || !contains(response, "200 OK") || captured_before < 0
+        || route_auth_exchange_count(database_path) != captured_before) {
+        fprintf(stderr, "HTTP detail captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
     snprintf(request,
              sizeof(request),
              "GET %s HTTP/1.1\r\nHost: localhost\r\n"
@@ -3433,6 +3469,7 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !contains(response, "forwarded")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
         || context.normalized_accept_encoding_headers != 1
+        || route_auth_exchange_count(database_path) != captured_before + 1
         || route_auth_detail_is_sanitized(database_path) != 0) {
         fprintf(stderr, "protected route successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
@@ -5765,7 +5802,10 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
+    int route_authentication_failed = test_log_safe_reason() != 0
+        || test_direct_http_route_authentication(db_path) != 0;
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    if (route_authentication_failed) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -6227,15 +6267,45 @@ int main(void)
         fprintf(stderr, "traffic detail seed failed\n");
         return 1;
     }
+    /* HttpTrafficExchangeStoreTests: a page of summaries carries no headers and no previews. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"method\":\"POST\"")
         || !contains(response, "\"statusCode\":201")
         || !contains(response, "\"responseBodyType\":\"json\"")
-        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"requestHeaders\":null,\"responseHeaders\":null,\"requestPreviewHex\":null,"
+                               "\"requestPreviewText\":null,\"responsePreviewHex\":null,\"responsePreviewText\":null")
+        || contains(response, "\"requestHeaders\":\"") || contains(response, "\"responseHeaders\":\"")
+        || contains(response, "\"requestPreviewHex\":\"") || contains(response, "\"requestPreviewText\":\"")
+        || contains(response, "\"responsePreviewHex\":\"") || contains(response, "\"responsePreviewText\":\"")
         || !contains(response, "\"size\":20")
         || !contains(response, "\"totalPages\":1")) {
-        fprintf(stderr, "http exchange page response mismatch\n");
+        fprintf(stderr, "http exchange page response mismatch: %.2000s\n", response);
+        return 1;
+    }
+    /* The detail of one exchange carries them, with Java's uppercase spaced hex. */
+    long long post_exchange_id = 0;
+    {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT id FROM specus_http_traffic_exchange WHERE method='POST'", -1, &stmt,
+                                  NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            post_exchange_id = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/traffic/http-exchanges/%lld", post_exchange_id);
+    len = st_admin_build_response("GET", request_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"requestHeaders\":\"Content-Type: application/json\"")
+        || !contains(response, "\"requestPreviewHex\":\"7B 22 68 65 6C 6C 6F 22 3A 74 72 75 65 7D\"")
+        || !contains(response, "\"requestPreviewText\":\"{\\\"hello\\\":true}\"")
+        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"responseTruncated\":false")) {
+        fprintf(stderr, "http exchange detail response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=method&q=POST&page=0&size=20", response, sizeof(response));

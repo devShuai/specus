@@ -44,6 +44,7 @@ add_library(specus_c_core
     src/stream_tombstones.c
     src/stun_turn.c
     src/tls_transport.c
+    src/traffic_capture.c
     src/turn_auth.c
     src/upstream_browser_headers.c
     src/workbench.c
@@ -84,6 +85,11 @@ add_executable(specus_c_semantic_version_tests tests/semantic_version_tests.c)
 target_link_libraries(specus_c_semantic_version_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_semantic_version_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME semantic_version_tests COMMAND specus_c_semantic_version_tests)
+
+add_executable(specus_c_traffic_capture_tests tests/traffic_capture_tests.c)
+target_link_libraries(specus_c_traffic_capture_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_capture_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_capture_tests COMMAND specus_c_traffic_capture_tests)
 
 add_executable(specus_c_turnstile_verifier_tests tests/turnstile_verifier_tests.c)
 target_link_libraries(specus_c_turnstile_verifier_tests PRIVATE specus_c_core)

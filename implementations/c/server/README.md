@@ -376,12 +376,19 @@ C server records successful TCP specus bytes as `TCP_SPECUS` resources with keys
 `tcp:18080`, and successful Direct HTTP body bytes as `HTTP_ROUTE` resources with keys such as
 `http:api`.
 
-SQLite traffic detail capture is available when the corresponding TCP mapping or HTTP route has
-`detailCaptureEnabled=true`. TCP frames are written to `specus_tcp_traffic_frame` with the full
+SQLite traffic detail capture runs only when `SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true` (default
+`false`, as Java's `specus.traffic.capture-detail-enabled`) and the corresponding TCP mapping or
+HTTP route has `detailCaptureEnabled=true`. TCP frames are written to `specus_tcp_traffic_frame` with the full
 binary payload, canonical directions `PUBLIC_TO_CLIENT` / `CLIENT_TO_PUBLIC`, source and
 destination endpoint fields, per-channel stream offsets, and preview text/hex. HTTP exchanges are
 written to `specus_http_traffic_exchange` with request/response headers, body previews, status,
-content types, response body type, and elapsed time. The management endpoints
+content types, response body type, and elapsed time. Previews follow Java's
+`TrafficInspectionService`: `SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES` (default `256`, capped at
+`1024`) bytes as uppercase spaced hex, and for HTTP a text preview of the body decoded per
+`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. Unlike Java,
+the C server stores HTTP previews rather than whole bodies, so `requestTruncated` /
+`responseTruncated` say whether the preview holds the whole body. The exchange list returns
+summaries without headers or previews; `GET /api/admin/traffic/http-exchanges/{id}` returns them. The management endpoints
 `GET /api/admin/traffic/http-exchanges`, `GET /api/admin/traffic/tcp-frames`,
 `GET /api/admin/traffic/tcp-frames/{id}`, and `GET /api/admin/traffic/tcp-streams` now query these
 SQLite tables with the same basic tenant/owner visibility rule as other management APIs. HTTP

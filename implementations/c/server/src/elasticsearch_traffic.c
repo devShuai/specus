@@ -3,6 +3,7 @@
 #include "elasticsearch_traffic.h"
 
 #include "json.h"
+#include "traffic_capture.h"
 
 #include <ctype.h>
 #include <curl/curl.h>
@@ -21,7 +22,6 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define ST_ES_PREVIEW_BYTES 1024U
 #define ST_ES_MAX_RESPONSE (32U * 1024U * 1024U)
 
 typedef struct {
@@ -457,46 +457,6 @@ static void es_trim_if_needed(const st_es_config *config,
     }
 }
 
-static void es_hex_preview(const uint8_t *data, size_t len, char *out, size_t out_len)
-{
-    static const char hex[] = "0123456789abcdef";
-    size_t count = len < ST_ES_PREVIEW_BYTES ? len : ST_ES_PREVIEW_BYTES;
-    size_t max = out_len > 0U ? (out_len - 1U) / 2U : 0U;
-    if (count > max) count = max;
-    for (size_t i = 0; i < count; ++i) {
-        out[i * 2U] = hex[data[i] >> 4U];
-        out[i * 2U + 1U] = hex[data[i] & 15U];
-    }
-    if (out_len > 0U) out[count * 2U] = '\0';
-}
-
-static void es_text_preview(const uint8_t *data, size_t len, char *out, size_t out_len)
-{
-    size_t count = len < ST_ES_PREVIEW_BYTES ? len : ST_ES_PREVIEW_BYTES, offset = 0U;
-    for (size_t i = 0; i < count && offset + 1U < out_len; ++i) {
-        unsigned char ch = data[i];
-        out[offset++] = ch == '\r' || ch == '\n' || ch == '\t' || (ch >= 32U && ch < 127U) ? (char)ch : '.';
-    }
-    if (out_len > 0U) out[offset] = '\0';
-}
-
-static const char *es_body_type(const char *explicit_type, const char *content_type, long long bytes)
-{
-    if (explicit_type != NULL && *explicit_type != '\0') return explicit_type;
-    if (bytes == 0) return "empty";
-    if (content_type == NULL) return "binary";
-    if (strstr(content_type, "json") != NULL) return "json";
-    if (strstr(content_type, "html") != NULL) return "html";
-    if (strstr(content_type, "xml") != NULL) return "xml";
-    if (strstr(content_type, "image/") != NULL) return "image";
-    if (strstr(content_type, "video/") != NULL) return "video";
-    if (strstr(content_type, "audio/") != NULL) return "audio";
-    if (strstr(content_type, "form") != NULL) return "form";
-    if (strstr(content_type, "javascript") != NULL || strstr(content_type, "ecmascript") != NULL) return "script";
-    if (strstr(content_type, "text/") != NULL) return "text";
-    return "binary";
-}
-
 static int es_json_key(st_es_buffer *json, const char *key, int *first)
 {
     if (!*first && es_buffer_append(json, ",") != 0) return -1;
@@ -542,11 +502,20 @@ int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
         || es_ensure_index(&config, config.http_index, es_http_mapping, &es_http_ready) != 0) return -1;
     long long id = es_new_id();
     if (id <= 0) return -1;
-    char request_hex[4096], request_text[8192], response_hex[4096], response_text[8192];
-    es_hex_preview(record->request_body, record->request_body_len, request_hex, sizeof(request_hex));
-    es_text_preview(record->request_body, record->request_body_len, request_text, sizeof(request_text));
-    es_hex_preview(record->response_body, record->response_body_len, response_hex, sizeof(response_hex));
-    es_text_preview(record->response_body, record->response_body_len, response_text, sizeof(response_text));
+    /* The same previews as the SQLite store (traffic_capture.c, Java TrafficInspectionService). */
+    size_t preview_bytes = st_traffic_preview_bytes();
+    char request_hex[ST_TRAFFIC_PREVIEW_HEX_CAP], request_text[ST_TRAFFIC_PREVIEW_TEXT_CAP];
+    char response_hex[ST_TRAFFIC_PREVIEW_HEX_CAP], response_text[ST_TRAFFIC_PREVIEW_TEXT_CAP];
+    st_traffic_hex_preview(record->request_body, record->request_body_len, preview_bytes,
+                           request_hex, sizeof(request_hex));
+    st_traffic_http_text_preview(record->request_body, record->request_body_len, record->request_content_type,
+                                 record->request_content_encoding, preview_bytes,
+                                 request_text, sizeof(request_text));
+    st_traffic_hex_preview(record->response_body, record->response_body_len, preview_bytes,
+                           response_hex, sizeof(response_hex));
+    st_traffic_http_text_preview(record->response_body, record->response_body_len, record->response_content_type,
+                                 record->response_content_encoding, preview_bytes,
+                                 response_text, sizeof(response_text));
     st_es_buffer json = {0};
     int first = 1;
     int rc = es_buffer_append(&json, "{")
@@ -569,17 +538,18 @@ int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
         || es_json_i64_field(&json, "elapsedMs", record->elapsed_ms, &first)
         || es_json_string_field(&json, "requestContentType", record->request_content_type, &first)
         || es_json_string_field(&json, "responseContentType", record->response_content_type, &first)
-        || es_json_string_field(&json, "responseBodyType", es_body_type(record->response_body_type,
-                                                                         record->response_content_type,
-                                                                         record->response_bytes), &first)
+        || es_json_string_field(&json, "responseBodyType",
+                                st_traffic_body_type_or_classify(record->response_body_type,
+                                                                 record->response_content_type,
+                                                                 record->response_bytes), &first)
         || es_json_string_field(&json, "requestHeaders", record->request_headers, &first)
         || es_json_string_field(&json, "responseHeaders", record->response_headers, &first)
         || es_json_string_field(&json, "requestPreviewHex", request_hex, &first)
         || es_json_string_field(&json, "requestPreviewText", request_text, &first)
         || es_json_string_field(&json, "responsePreviewHex", response_hex, &first)
         || es_json_string_field(&json, "responsePreviewText", response_text, &first)
-        || es_json_bool_field(&json, "requestTruncated", record->request_body_len > ST_ES_PREVIEW_BYTES, &first)
-        || es_json_bool_field(&json, "responseTruncated", record->response_body_len > ST_ES_PREVIEW_BYTES, &first)
+        || es_json_bool_field(&json, "requestTruncated", record->request_body_len > preview_bytes, &first)
+        || es_json_bool_field(&json, "responseTruncated", record->response_body_len > preview_bytes, &first)
         || es_json_string_field(&json, "capturedAt", record->captured_at, &first)
         || es_buffer_append(&json, "}");
     if (rc) { free(json.data); return -1; }
@@ -613,9 +583,12 @@ int st_elasticsearch_record_tcp(const st_storage_tcp_frame_record *record)
     long long id = es_new_id();
     char *payload = es_base64(record->payload_data, record->payload_data_len);
     if (id <= 0 || payload == NULL) { free(payload); return -1; }
-    char preview_hex[4096], preview_text[4096];
-    es_hex_preview(record->payload_data, record->payload_data_len, preview_hex, sizeof(preview_hex));
-    es_text_preview(record->payload_data, record->payload_data_len, preview_text, sizeof(preview_text));
+    size_t preview_bytes = st_traffic_preview_bytes();
+    char preview_hex[ST_TRAFFIC_PREVIEW_HEX_CAP], preview_text[ST_TRAFFIC_PREVIEW_TEXT_CAP];
+    st_traffic_hex_preview(record->payload_data, record->payload_data_len, preview_bytes,
+                           preview_hex, sizeof(preview_hex));
+    st_traffic_tcp_text_preview(record->payload_data, record->payload_data_len, preview_bytes,
+                                preview_text, sizeof(preview_text));
     st_es_buffer json = {0};
     int first = 1;
     long long end_offset = record->payload_data_len > (size_t)LLONG_MAX
@@ -808,7 +781,9 @@ static int es_build_query(st_es_buffer *json,
             "{\"frameIndex\":{\"order\":\"asc\"}},{\"id\":{\"order\":\"asc\"}}]");
         else rc = es_buffer_append(json, "{\"id\":{\"order\":\"desc\"}}]");
     }
-    if (!rc && !tcp) rc = es_buffer_append(json,
+    /* A summary (Java summarySourceFilter) leaves the large fields out; one exchange by id is a
+     * detail and reads them. */
+    if (!rc && !tcp && document_id <= 0) rc = es_buffer_append(json,
         ",\"_source\":{\"excludes\":[\"requestHeaders\",\"responseHeaders\","
         "\"requestPreviewHex\",\"requestPreviewText\",\"responsePreviewHex\",\"responsePreviewText\"]}");
     if (!rc) rc = es_buffer_append(json, "}");
@@ -949,21 +924,22 @@ static int es_parse_hit_source(const char *hit, char **source)
     return *source != NULL && st_json_is_valid_object(*source) ? 0 : -1;
 }
 
-int st_elasticsearch_list_http(const char *database_path,
-                               long long client_id,
-                               const char *route,
-                               const char *response_body_type,
-                               const char *field,
-                               const char *query,
-                               const char *tenant_id,
-                               const char *owner_username,
-                               int include_all_clients,
-                               int page,
-                               int size,
-                               st_storage_http_exchange *items,
-                               size_t max_items,
-                               size_t *item_count,
-                               long long *total_count)
+static int es_query_http(const char *database_path,
+                         long long document_id,
+                         long long client_id,
+                         const char *route,
+                         const char *response_body_type,
+                         const char *field,
+                         const char *query,
+                         const char *tenant_id,
+                         const char *owner_username,
+                         int include_all_clients,
+                         int page,
+                         int size,
+                         st_storage_http_exchange *items,
+                         size_t max_items,
+                         size_t *item_count,
+                         long long *total_count)
 {
     *item_count = 0U;
     *total_count = 0;
@@ -986,7 +962,7 @@ int st_elasticsearch_list_http(const char *database_path,
     }
     st_es_buffer request = {0};
     if (es_build_query(&request, tenant_id, visible, visible_count, client_id, route,
-                       response_body_type, 0, NULL, 0, field, query, page, size, 0, 0) != 0) {
+                       response_body_type, 0, NULL, document_id, field, query, page, size, 0, 0) != 0) {
         free(visible); free(request.data); return -1;
     }
     free(visible);
@@ -1010,6 +986,45 @@ int st_elasticsearch_list_http(const char *database_path,
     }
     st_json_free_string_array(hits, hit_count);
     return 0;
+}
+
+int st_elasticsearch_list_http(const char *database_path,
+                               long long client_id,
+                               const char *route,
+                               const char *response_body_type,
+                               const char *field,
+                               const char *query,
+                               const char *tenant_id,
+                               const char *owner_username,
+                               int include_all_clients,
+                               int page,
+                               int size,
+                               st_storage_http_exchange *items,
+                               size_t max_items,
+                               size_t *item_count,
+                               long long *total_count)
+{
+    return es_query_http(database_path, 0, client_id, route, response_body_type, field, query, tenant_id,
+                         owner_username, include_all_clients, page, size, items, max_items, item_count,
+                         total_count);
+}
+
+int st_elasticsearch_get_http(const char *database_path,
+                              long long exchange_id,
+                              const char *tenant_id,
+                              const char *owner_username,
+                              int include_all_clients,
+                              st_storage_http_exchange *item,
+                              int *found)
+{
+    size_t count = 0U;
+    long long total = 0;
+    *found = 0;
+    if (exchange_id <= 0) return 0;
+    int rc = es_query_http(database_path, exchange_id, 0, NULL, NULL, NULL, NULL, tenant_id, owner_username,
+                           include_all_clients, 0, 1, item, 1U, &count, &total);
+    *found = rc == 0 && count == 1U;
+    return rc;
 }
 
 static int es_list_tcp_internal(const char *database_path,
