@@ -605,6 +605,17 @@ int st_storage_update_registration_attempts(const char *path,
                                             const char *updated_at);
 int st_storage_delete_registration_challenge(const char *path, const char *registration_id);
 int st_storage_delete_expired_registration_challenges(const char *path, const char *expires_before);
+/*
+ * Java ClientAuthNonceService.consume on specus_client_auth_nonce, in one write transaction:
+ * deletes the rows that expired before now_ms, then inserts (nonce_id, api_key_hash) to expire at
+ * now_ms + ttl_ms unless the id is already there. 0 = consumed, 1 = already consumed (a replay),
+ * -1 = the database failed.
+ */
+int st_storage_consume_client_auth_nonce(const char *path,
+                                         const char *nonce_id,
+                                         const char *api_key_hash,
+                                         long long now_ms,
+                                         long long ttl_ms);
 int st_storage_complete_registration(const char *path,
                                      const st_storage_registration_challenge *challenge,
                                      const char *tenant_id,

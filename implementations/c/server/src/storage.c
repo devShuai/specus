@@ -882,6 +882,19 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         /*
+         * Consumed client-login nonces (protocol/spec/client-auth.md), Java's table and columns:
+         * the id is SHA-256(hex(SHA-256(apiKey)) + "\n" + nonce), expires_at UTC ISO-8601 text.
+         */
+        rc = exec_sql(db,
+            "CREATE TABLE IF NOT EXISTS specus_client_auth_nonce ("
+            "id VARCHAR(64) NOT NULL PRIMARY KEY,"
+            "api_key_hash VARCHAR(64) NOT NULL,"
+            "expires_at VARCHAR(40) NOT NULL"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expires ON specus_client_auth_nonce(expires_at);");
+    }
+    if (rc == 0) {
+        /*
          * Opt-in product metrics (protocol/spec/product-metrics.md section 6), the same four tables
          * as the Go, Java and .NET servers: the per-tenant switch, onboarding progress per account
          * (only for the 14-day window) and two daily counters without any user column. Times are
@@ -2254,6 +2267,57 @@ int st_storage_delete_expired_registration_challenges(const char *path, const ch
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return rc;
+}
+
+int st_storage_consume_client_auth_nonce(const char *path,
+                                         const char *nonce_id,
+                                         const char *api_key_hash,
+                                         long long now_ms,
+                                         long long ttl_ms)
+{
+    if (path == NULL || nonce_id == NULL || api_key_hash == NULL || now_ms < 0 || ttl_ms <= 0
+        || now_ms > LLONG_MAX - ttl_ms) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    /*
+     * Java ClientAuthNonceService: drop what expired, then insert-if-absent decides. expires_at is
+     * Java's text form, "2026-10-07T01:02:03.004Z" here: fixed width, so text order is time order.
+     */
+    sqlite3_stmt *stmt = NULL;
+    int result = -1;
+    int rc = sqlite3_prepare_v2(db,
+        "DELETE FROM specus_client_auth_nonce "
+        "WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%S', ?1 / 1000, 'unixepoch') || printf('.%03dZ', ?1 % 1000)",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, now_ms);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (rc == SQLITE_OK
+        && sqlite3_prepare_v2(db,
+               "INSERT OR IGNORE INTO specus_client_auth_nonce(id, api_key_hash, expires_at) "
+               "VALUES(?1, ?2, strftime('%Y-%m-%dT%H:%M:%S', ?3 / 1000, 'unixepoch') || printf('.%03dZ', ?3 % 1000))",
+               -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, nonce_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, api_key_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, now_ms + ttl_ms);
+        if (sqlite3_step(stmt) == SQLITE_DONE) {
+            result = sqlite3_changes(db) == 1 ? 0 : 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (result >= 0 && exec_sql(db, "COMMIT") != 0) result = -1;
+    if (result < 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    return result;
 }
 
 int st_storage_complete_registration(const char *path,

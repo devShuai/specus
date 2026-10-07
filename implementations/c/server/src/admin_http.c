@@ -1348,16 +1348,21 @@ static int load_client_api_key(uint8_t key[ST_SHA256_LEN])
 /*
  * protocol/spec/client-auth.md: a login whose signature verified consumes its (apiKey, nonce)
  * pair, and the pair again within 120 s is refused. Java answers a replay with 400 and this body;
- * a full in-memory store answers 503 with Retry-After so the client retries rather than gives up.
- * Returns 0 when the pair was fresh, else the length of the response written to out.
+ * a full in-memory store or a failing database answers 503 with Retry-After so the client retries
+ * rather than gives up. The pairs live in the database when there is one (database_path), as in
+ * Java, so a restart does not forget them. Returns 0 when the pair was fresh, else the length of
+ * the response written to out.
  */
-static int consume_client_auth_nonce(const char *api_key, const char *nonce, char *out, size_t out_len)
+static int consume_client_auth_nonce(const char *database_path,
+                                     const char *api_key,
+                                     const char *nonce,
+                                     char *out,
+                                     size_t out_len)
 {
-    int64_t retry_after_seconds = 0;
-    st_client_auth_nonce_result result = st_client_auth_nonce_consume(api_key,
-                                                                      nonce,
-                                                                      current_time_millis(),
-                                                                      &retry_after_seconds);
+    int64_t retry_after_seconds = 1;
+    st_client_auth_nonce_result result = database_path != NULL
+        ? st_client_auth_nonce_consume_stored(database_path, api_key, nonce, current_time_millis())
+        : st_client_auth_nonce_consume(api_key, nonce, current_time_millis(), &retry_after_seconds);
     if (result == ST_CLIENT_AUTH_NONCE_ACCEPTED) {
         return 0;
     }
@@ -1393,7 +1398,7 @@ static int client_auth_netty_tls(void)
     return tls.mode != ST_TLS_DISABLED || tls.terminated_upstream;
 }
 
-static int validate_client_api_login(const char *body, char *out, size_t out_len)
+static int validate_client_api_login(const char *database_path, const char *body, char *out, size_t out_len)
 {
     if (body == NULL || *body == '\0') {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"client auth request body is required\"}");
@@ -1485,7 +1490,7 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     memset(actual_signature, 0, sizeof(actual_signature));
     memset(expected_signature, 0, sizeof(expected_signature));
     /* Only a request whose signature verified may consume its nonce. */
-    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(api_key, nonce, out, out_len);
+    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(database_path, api_key, nonce, out, out_len);
     free(api_key);
     free(timestamp);
     free(nonce);
@@ -2498,7 +2503,7 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(java_version);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
     }
-    int nonce_rc = consume_client_auth_nonce(api_key, nonce, out, out_len);
+    int nonce_rc = consume_client_auth_nonce(database_path, api_key, nonce, out, out_len);
     if (nonce_rc != 0) {
         free(api_key);
         free(timestamp);
@@ -2638,14 +2643,17 @@ static int build_client_auth_login_response(const char *body, char *out, size_t 
 {
     const char *database_path = admin_database_path();
     if (database_path != NULL
-        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
+        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        database_path = NULL;
+    }
+    if (database_path != NULL) {
         int db_response = build_database_client_auth_login_response(database_path, body, out, out_len);
         if (db_response != 0) {
             return db_response;
         }
     }
     if (client_api_auth_required()) {
-        int auth_rc = validate_client_api_login(body, out, out_len);
+        int auth_rc = validate_client_api_login(database_path, body, out, out_len);
         if (auth_rc != 0) {
             return auth_rc;
         }
