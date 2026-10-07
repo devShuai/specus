@@ -535,9 +535,13 @@ type HTTPTrafficExchange struct {
 	RequestPreviewText  string
 	ResponsePreviewHex  string
 	ResponsePreviewText string
-	RequestTruncated    bool
-	ResponseTruncated   bool
-	CapturedAt          time.Time
+	// RequestBodyData and ResponseBodyData are the bodies as captured (Java's requestBodyData and
+	// responseBodyData). Only the detail of one exchange reads them back.
+	RequestBodyData   []byte
+	ResponseBodyData  []byte
+	RequestTruncated  bool
+	ResponseTruncated bool
+	CapturedAt        time.Time
 }
 
 // TCPTrafficFrame mirrors specus_tcp_traffic_frame.
