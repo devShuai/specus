@@ -78,6 +78,12 @@ target_link_libraries(specus_c_github_release_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_github_release_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME github_release_tests COMMAND specus_c_github_release_tests)
 
+# The client catalogue and hosted packages against the Java ClientDownloadLink*/ClientPackage* tests.
+add_executable(specus_c_client_package_tests tests/client_package_tests.c)
+target_link_libraries(specus_c_client_package_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_package_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_package_tests COMMAND specus_c_client_package_tests)
+
 add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
