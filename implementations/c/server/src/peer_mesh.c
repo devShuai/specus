@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <limits.h>
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -24,6 +25,40 @@
 #define ST_PEER_MESH_MAX_CATALOGS 4096U
 #define ST_PEER_MESH_MAX_CATALOG_SERVICES 32U
 #define ST_PEER_MESH_CATALOG_TTL_SECONDS 300
+/* service-report and egress-report: each at most 20 per control session per minute. */
+#define ST_PEER_REPORT_RATE_LIMIT 20U
+
+/*
+ * A sliding one-minute window, as Java keeps one per session: a report is admitted while fewer
+ * than the limit were admitted in the last window. A window that restarts every minute would let
+ * twice the limit through around each restart.
+ */
+typedef struct {
+    long long stamps[ST_PEER_REPORT_RATE_LIMIT];
+    unsigned int head;
+    unsigned int count;
+} pm_rate_window;
+
+static long long pm_monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static int pm_rate_window_admit(pm_rate_window *window, long long now_ms, unsigned int limit,
+                                long long window_ms)
+{
+    if (limit > ST_PEER_REPORT_RATE_LIMIT) limit = ST_PEER_REPORT_RATE_LIMIT;
+    while (window->count > 0U && window->stamps[window->head] < now_ms - window_ms) {
+        window->head = (window->head + 1U) % ST_PEER_REPORT_RATE_LIMIT;
+        --window->count;
+    }
+    if (window->count >= limit) return 0;
+    window->stamps[(window->head + window->count) % ST_PEER_REPORT_RATE_LIMIT] = now_ms;
+    ++window->count;
+    return 1;
+}
 
 typedef struct {
     char service_id[65];
@@ -45,8 +80,7 @@ typedef struct {
     char instance_id[65];
     time_t generated_at;
     time_t expires_at;
-    time_t rate_window_started_at;
-    unsigned int rate_count;
+    pm_rate_window rate;
     char service_ids[ST_PEER_MESH_MAX_CATALOG_SERVICES][65];
     size_t service_count;
     pm_service_stats stats[ST_PEER_MESH_MAX_CATALOG_SERVICES];
@@ -174,6 +208,92 @@ static int pm_generate_token(char out[64])
     uint8_t random[32];
     return RAND_bytes(random, sizeof(random)) == 1
         && pm_base64url(random, sizeof(random), out, 64U) == 0 ? 0 : -1;
+}
+
+/*
+ * Session tokens this process granted, by session id (Java PeerMeshService.sessionTokenCache).
+ * The database keeps only the token's hash, so a session can be handed out again only while its
+ * token is held here; a session whose token was evicted, or granted before a restart, is simply
+ * not reused and the pair gets a new one.
+ */
+#define ST_PEER_MESH_TOKEN_CACHE 1024U
+
+typedef struct {
+    long long session_id;
+    unsigned long long stored;
+    char token[64];
+} pm_session_token;
+
+static pm_session_token peer_session_tokens[ST_PEER_MESH_TOKEN_CACHE];
+static unsigned long long peer_session_token_clock;
+static pthread_mutex_t peer_session_token_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pm_remember_session_token(long long session_id, const char *token)
+{
+    pthread_mutex_lock(&peer_session_token_lock);
+    pm_session_token *slot = &peer_session_tokens[0];
+    for (size_t i = 0U; i < ST_PEER_MESH_TOKEN_CACHE; ++i) {
+        pm_session_token *candidate = &peer_session_tokens[i];
+        if (candidate->session_id == session_id || candidate->session_id == 0) {
+            slot = candidate;
+            break;
+        }
+        if (candidate->stored < slot->stored) slot = candidate;
+    }
+    slot->session_id = session_id;
+    slot->stored = ++peer_session_token_clock;
+    snprintf(slot->token, sizeof(slot->token), "%s", token);
+    pthread_mutex_unlock(&peer_session_token_lock);
+}
+
+static int pm_session_token_for(long long session_id, char out[64])
+{
+    int found = 0;
+    pthread_mutex_lock(&peer_session_token_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_TOKEN_CACHE && !found; ++i) {
+        if (peer_session_tokens[i].session_id == session_id && session_id > 0) {
+            snprintf(out, 64U, "%s", peer_session_tokens[i].token);
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&peer_session_token_lock);
+    return found;
+}
+
+static void pm_forget_session_token(long long session_id)
+{
+    pthread_mutex_lock(&peer_session_token_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_TOKEN_CACHE; ++i) {
+        if (peer_session_tokens[i].session_id == session_id) {
+            memset(&peer_session_tokens[i], 0, sizeof(peer_session_tokens[i]));
+        }
+    }
+    pthread_mutex_unlock(&peer_session_token_lock);
+}
+
+/*
+ * Java reusableSessionGrant: an open, unexpired session between the two clients, in either
+ * direction, whose token is still held is granted again with that token. Without it, two peers
+ * whose offers cross would each open a session and negotiate on different ones.
+ */
+static int pm_reusable_session(const st_peer_mesh_runtime *runtime,
+                               const st_storage_client *source,
+                               const st_storage_client *target,
+                               st_storage_peer_mesh_session *session,
+                               char token[64])
+{
+    st_storage_peer_mesh_session open_sessions[16];
+    size_t count = 0U;
+    if (st_storage_open_peer_mesh_sessions_between(runtime->database_path, source->tenant_id,
+                                                   source->id, target->id,
+                                                   open_sessions, 16U, &count) != 0) return 0;
+    for (size_t i = 0U; i < count; ++i) {
+        if (pm_session_token_for(open_sessions[i].id, token)) {
+            *session = open_sessions[i];
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int pm_has_text(const char *value)
@@ -364,27 +484,32 @@ static int pm_handle_report(const st_peer_mesh_runtime *runtime,
     }
     long long session_id = 0;
     if (st_json_get_i64(message, "sessionId", &session_id) != 0 || session_id <= 0) return -1;
+    /*
+     * Each type records only its own fields, as Java PeerMeshService does: a close only closes, a
+     * traffic report only counts bytes (the storage derives the path type from the counters), and
+     * a path-report carries the path but no bytes.
+     */
+    if (strcmp(type, "close") == 0) {
+        pm_forget_session_token(session_id);
+        return st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
+            NULL, NULL, -1, NULL, NULL, 0, 0, 1, NULL);
+    }
+    if (strcmp(type, "traffic-report") == 0) {
+        long long direct = 0;
+        long long relay = 0;
+        (void)st_json_get_i64(message, "directBytes", &direct);
+        (void)st_json_get_i64(message, "relayBytes", &relay);
+        return st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
+            NULL, NULL, -1, NULL, NULL, direct, relay, 0, NULL);
+    }
     char *path_type = st_json_get_top_level_string(message, "pathType");
     char *status = st_json_get_top_level_string(message, "status");
     char *local = st_json_get_top_level_string(message, "localEndpoint");
     char *remote = st_json_get_top_level_string(message, "remoteEndpoint");
     long long rtt = -1;
-    long long direct = 0;
-    long long relay = 0;
     (void)st_json_get_i64(message, "rttMillis", &rtt);
-    (void)st_json_get_i64(message, "directBytes", &direct);
-    (void)st_json_get_i64(message, "relayBytes", &relay);
-    int close_session = strcmp(type, "close") == 0;
-    if (strcmp(type, "path-report") == 0 && !pm_has_text(status)) {
-        free(status);
-        status = strdup("ACTIVE");
-    }
-    if (strcmp(type, "traffic-report") == 0) {
-        free(path_type);
-        path_type = strdup(relay > 0 ? "RELAY" : (direct > 0 ? "DIRECT" : ""));
-    }
     int rc = st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
-        path_type, status, rtt, local, remote, direct, relay, close_session, NULL);
+        path_type, pm_has_text(status) ? status : "ACTIVE", rtt, local, remote, 0, 0, 0, NULL);
     free(path_type); free(status); free(local); free(remote);
     return rc;
 }
@@ -461,7 +586,7 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
     long long existing_session_id = 0;
     int opens = (strcmp(type, "candidates") == 0 || strcmp(type, "offer") == 0)
         && st_json_get_i64(message, "sessionId", &existing_session_id) != 0;
-    if (opens) {
+    if (opens && !pm_reusable_session(runtime, &source, &target, &opened, token)) {
         uint8_t token_hash_bytes[ST_SHA256_LEN];
         char token_hash[ST_SHA256_HEX_LEN + 1U];
         long long ttl = pm_env_i64("SPECUS_PEER_MESH_SESSION_TTL_SECONDS", 3600);
@@ -477,6 +602,9 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
             free(type);
             return -1;
         }
+        pm_remember_session_token(opened.id, token);
+    }
+    if (opens) {
         opened_ptr = &opened;
         token_ptr = token;
         char *grant = pm_build_grant(&source, &source_device, &target, &target_device, &opened, token);
@@ -496,23 +624,93 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
     return rc;
 }
 
+/* A port setting as Java binds it: the default when unset; 0 (or anything unusable) turns it off. */
+static int pm_env_port(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return default_value;
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= 65535 ? (int)parsed : 0;
+}
+
+/* value with surrounding whitespace removed, or "" when it does not fit. */
+static void pm_trim_copy(const char *value, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (value == NULL) return;
+    while (isspace((unsigned char)*value)) ++value;
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) --len;
+    if (len < out_len) {
+        memcpy(out, value, len);
+        out[len] = '\0';
+    }
+}
+
+/*
+ * The STUN endpoint Peer Mesh clients probe (Java PeerMeshService.resolveStunHost and
+ * resolveStunPort): a standalone STUN server when both its address and port are configured,
+ * otherwise the embedded STUN/TURN listener at the relay address. An incomplete standalone setting
+ * falls back rather than sending clients to a STUN server that is not there.
+ */
+static int pm_standalone_stun(char host[256], int *port)
+{
+    pm_trim_copy(getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS"), host, 256U);
+    *port = pm_env_port("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
+    return host[0] != '\0' && *port > 0;
+}
+
+static int pm_stun_port(void)
+{
+    char host[256];
+    int port = 0;
+    return pm_standalone_stun(host, &port) ? port : (int)pm_env_i64("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+}
+
+static int pm_append_stun_entry(pm_builder *builder, char seen[][320], size_t *count, const char *entry)
+{
+    if (*entry == '\0' || *count >= 16U || strlen(entry) >= 320U) return 0;
+    for (size_t i = 0U; i < *count; ++i) {
+        if (strcmp(seen[i], entry) == 0) return 0;
+    }
+    snprintf(seen[*count], 320U, "%s", entry);
+    if ((*count > 0U && pm_append(builder, ",") != 0) || pm_append_json_string(builder, entry) != 0) return -1;
+    ++*count;
+    return 0;
+}
+
+/*
+ * publicStunServers (Java PeerMeshService.publicStunServers): the standalone alternate STUN
+ * address on the primary STUN port first, then the configured public servers, trimmed, without
+ * repeats and at most 16.
+ */
 static int pm_append_public_stun_servers(pm_builder *builder)
 {
-    const char *configured = getenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
+    char seen[16][320];
+    size_t count = 0U;
     if (pm_append(builder, "[") != 0) return -1;
+    char alternate[256];
+    pm_trim_copy(getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS"), alternate, sizeof(alternate));
+    int port = pm_stun_port();
+    if (alternate[0] != '\0' && port > 0) {
+        char entry[320];
+        int bracket = strchr(alternate, ':') != NULL && alternate[0] != '[';
+        snprintf(entry, sizeof(entry), "stun:%s%s%s:%d", bracket ? "[" : "", alternate, bracket ? "]" : "", port);
+        if (pm_append_stun_entry(builder, seen, &count, entry) != 0) return -1;
+    }
+    const char *configured = getenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
     if (configured != NULL && *configured != '\0') {
         char *copy = strdup(configured);
         if (copy == NULL) return -1;
         char *save = NULL;
-        int first = 1;
         for (char *item = strtok_r(copy, ",", &save); item != NULL; item = strtok_r(NULL, ",", &save)) {
-            while (isspace((unsigned char)*item)) ++item;
-            if (*item == '\0') continue;
-            if ((!first && pm_append(builder, ",") != 0) || pm_append_json_string(builder, item) != 0) {
+            char entry[320];
+            pm_trim_copy(item, entry, sizeof(entry));
+            if (pm_append_stun_entry(builder, seen, &count, entry) != 0) {
                 free(copy);
                 return -1;
             }
-            first = 0;
         }
         free(copy);
     }
@@ -791,10 +989,17 @@ static int pm_normalize_local_host(const char *value, char out[256])
     const unsigned char *bytes = ipv6.s6_addr;
     int loopback = IN6_IS_ADDR_LOOPBACK(&ipv6);
     int link_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0x80U;
+    /* fec0::/10, which Java's isSiteLocalAddress still counts as local. */
+    int site_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0xc0U;
     int unique_local = (bytes[0] & 0xfeU) == 0xfcU;
-    if ((!loopback && !link_local && !unique_local) || IN6_IS_ADDR_UNSPECIFIED(&ipv6)
+    if ((!loopback && !link_local && !site_local && !unique_local) || IN6_IS_ADDR_UNSPECIFIED(&ipv6)
         || IN6_IS_ADDR_MULTICAST(&ipv6)) return -1;
     return inet_ntop(AF_INET6, &ipv6, out, 256U) == NULL ? -1 : 0;
+}
+
+int st_peer_mesh_normalize_local_host(const char *value, char out[256])
+{
+    return pm_normalize_local_host(value, out);
 }
 
 static int pm_read_mdns_candidates(const char *message,
@@ -1016,6 +1221,40 @@ static pm_catalog *pm_find_or_allocate_catalog_locked(const st_storage_client *s
     return free_slot;
 }
 
+/*
+ * Placeholder catalogues belong to no tenant and no client, and never expire. They take the slots a
+ * new session could have: free ones and those whose catalogue has expired.
+ */
+int st_peer_mesh_catalogs_occupy_for_testing(size_t count)
+{
+    size_t occupied = 0U;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&peer_catalog_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS && occupied < count; ++i) {
+        pm_catalog *catalog = &peer_catalogs[i];
+        if (catalog->in_use && catalog->expires_at >= now) continue;
+        free(catalog->mdns_candidates);
+        memset(catalog, 0, sizeof(*catalog));
+        catalog->in_use = 1;
+        catalog->publisher_client_id = -1;
+        catalog->expires_at = (time_t)INT_MAX;
+        ++occupied;
+    }
+    pthread_mutex_unlock(&peer_catalog_lock);
+    return occupied == count ? 0 : -1;
+}
+
+void st_peer_mesh_catalogs_release_for_testing(void)
+{
+    pthread_mutex_lock(&peer_catalog_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
+        if (peer_catalogs[i].in_use && peer_catalogs[i].publisher_client_id == -1) {
+            memset(&peer_catalogs[i], 0, sizeof(peer_catalogs[i]));
+        }
+    }
+    pthread_mutex_unlock(&peer_catalog_lock);
+}
+
 static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
                                     const st_storage_client *source,
                                     const st_storage_peer_mesh_device *source_device,
@@ -1076,11 +1315,7 @@ static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
         free(instance_id);
         return -1;
     }
-    if (catalog->rate_window_started_at == 0 || now - catalog->rate_window_started_at >= 60) {
-        catalog->rate_window_started_at = now;
-        catalog->rate_count = 0U;
-    }
-    if (catalog->rate_count >= 20U) {
+    if (!pm_rate_window_admit(&catalog->rate, pm_monotonic_ms(), ST_PEER_REPORT_RATE_LIMIT, 60000LL)) {
         pthread_mutex_unlock(&peer_catalog_lock);
         free(mdns_copy);
         free(instance_id);
@@ -1089,7 +1324,6 @@ static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
             runtime->publisher_session_id, NULL, "rate-limited");
         return -1;
     }
-    ++catalog->rate_count;
     if (revision <= catalog->report_revision) {
         pthread_mutex_unlock(&peer_catalog_lock);
         free(mdns_copy);
@@ -1311,9 +1545,21 @@ static char *pm_runtime_config(const char *database_path,
 {
     int deployment_enabled = pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     int enabled = deployment_enabled && device != NULL && device->enabled;
-    int port = (int)pm_env_i64("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
-    const char *host = pm_env_text("SPECUS_PEER_MESH_PUBLIC_ADDRESS",
-                                   pm_env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
+    /*
+     * As in Java PeerMeshService.buildConfig, the endpoints and the TURN credential go to every
+     * device of an enabled deployment, also one not yet switched on: enabling it later then needs
+     * only the peer-config push, not a new login.
+     */
+    int endpoints = deployment_enabled && device != NULL;
+    int turn_port = (int)pm_env_i64("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+    const char *turn_host = pm_env_text("SPECUS_PEER_MESH_PUBLIC_ADDRESS",
+                                        pm_env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
+    char stun_host[256];
+    int stun_port = 0;
+    if (!pm_standalone_stun(stun_host, &stun_port)) {
+        snprintf(stun_host, sizeof(stun_host), "%s", turn_host);
+        stun_port = turn_port;
+    }
     const char *cidr = device != NULL && device->cidr[0] != '\0'
         ? device->cidr : pm_env_text("SPECUS_PEER_MESH_CIDR", "100.96.0.0/11");
     long long ttl = pm_env_i64("SPECUS_PEER_MESH_SESSION_TTL_SECONDS", 3600);
@@ -1324,8 +1570,8 @@ static char *pm_runtime_config(const char *database_path,
     (void)st_storage_get_peer_mesh_service_sharing(database_path, client->tenant_id, &sharing);
     int effective_sharing = deployment_enabled && sharing.enabled && enabled;
     snprintf(subject, sizeof(subject), "pm-%lld", client->id);
-    if (enabled) (void)st_turn_auth_issue(subject, ice_username, sizeof(ice_username),
-                                          ice_credential, sizeof(ice_credential));
+    if (endpoints) (void)st_turn_auth_issue(subject, ice_username, sizeof(ice_username),
+                                            ice_credential, sizeof(ice_credential));
     pm_builder builder = {0};
     if (pm_appendf(&builder, "{\"enabled\":%s,\"clientId\":%lld,\"clientName\":",
                    enabled ? "true" : "false", client->id) != 0
@@ -1333,10 +1579,11 @@ static char *pm_runtime_config(const char *database_path,
         || pm_append(&builder, ",\"virtualIp\":") != 0
         || pm_append_json_string(&builder, device == NULL ? "" : device->virtual_ip) != 0
         || pm_append(&builder, ",\"cidr\":") != 0 || pm_append_json_string(&builder, cidr) != 0
-        || pm_append(&builder, ",\"stunHost\":") != 0 || pm_append_json_string(&builder, enabled ? host : "") != 0
-        || pm_appendf(&builder, ",\"stunPort\":%d,\"turnHost\":", enabled ? port : 0) != 0
-        || pm_append_json_string(&builder, enabled ? host : "") != 0
-        || pm_appendf(&builder, ",\"turnPort\":%d,\"publicStunServers\":", enabled ? port : 0) != 0
+        || pm_append(&builder, ",\"stunHost\":") != 0
+        || pm_append_json_string(&builder, endpoints ? stun_host : "") != 0
+        || pm_appendf(&builder, ",\"stunPort\":%d,\"turnHost\":", endpoints ? stun_port : 0) != 0
+        || pm_append_json_string(&builder, endpoints ? turn_host : "") != 0
+        || pm_appendf(&builder, ",\"turnPort\":%d,\"publicStunServers\":", endpoints ? turn_port : 0) != 0
         || pm_append_public_stun_servers(&builder) != 0
         || pm_append(&builder, ",\"iceUsername\":") != 0
         || pm_append_json_string(&builder, ice_username) != 0
@@ -1345,7 +1592,7 @@ static char *pm_runtime_config(const char *database_path,
         || pm_append(&builder, ",\"iceRealm\":") != 0
         || pm_append_json_string(&builder, st_turn_auth_realm()) != 0
         || pm_append(&builder, ",\"iceNonce\":") != 0
-        || pm_append_json_string(&builder, enabled ? st_turn_auth_nonce() : "") != 0
+        || pm_append_json_string(&builder, endpoints ? st_turn_auth_nonce() : "") != 0
         || pm_append(&builder, ",\"serverPublicKey\":") != 0
         || pm_append_json_string(&builder, pm_env_text("SPECUS_PEER_MESH_SERVER_PUBLIC_KEY", "")) != 0
         || pm_append(&builder, ",\"clientPublicKey\":") != 0
@@ -1777,14 +2024,13 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
 
 /* Cap on one envelope. Counters only, so this is far above what a well-formed report needs. */
 #define ST_PEER_EGRESS_MAX_REPORT_BYTES (8U * 1024U)
-#define ST_PEER_EGRESS_REPORT_RATE_LIMIT 20U
+#define ST_PEER_EGRESS_REPORT_RATE_LIMIT ST_PEER_REPORT_RATE_LIMIT
 #define ST_PEER_EGRESS_REPORT_RATE_WINDOW 60
 #define ST_PEER_EGRESS_MAX_RATE_SESSIONS 4096U
 
 typedef struct {
     long long session_id;
-    time_t window_started_at;
-    unsigned int count;
+    pm_rate_window window;
 } pm_egress_rate_slot;
 
 static pm_egress_rate_slot peer_egress_rate_slots[ST_PEER_EGRESS_MAX_RATE_SESSIONS];
@@ -1798,7 +2044,7 @@ static pthread_mutex_t peer_egress_rate_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 static int pm_enforce_egress_report_rate(long long session_id)
 {
-    time_t now = time(NULL);
+    long long now = pm_monotonic_ms();
     int allowed = 0;
     pthread_mutex_lock(&peer_egress_rate_lock);
     pm_egress_rate_slot *slot = NULL;
@@ -1810,23 +2056,52 @@ static int pm_enforce_egress_report_rate(long long session_id)
     }
     if (slot == NULL && peer_egress_rate_used < ST_PEER_EGRESS_MAX_RATE_SESSIONS) {
         slot = &peer_egress_rate_slots[peer_egress_rate_used++];
+        memset(slot, 0, sizeof(*slot));
         slot->session_id = session_id;
-        slot->window_started_at = 0;
-        slot->count = 0U;
     }
     if (slot != NULL) {
-        if (slot->window_started_at == 0
-            || now - slot->window_started_at >= ST_PEER_EGRESS_REPORT_RATE_WINDOW) {
-            slot->window_started_at = now;
-            slot->count = 0U;
-        }
-        if (slot->count < ST_PEER_EGRESS_REPORT_RATE_LIMIT) {
-            ++slot->count;
-            allowed = 1;
-        }
+        allowed = pm_rate_window_admit(&slot->window, now, ST_PEER_EGRESS_REPORT_RATE_LIMIT,
+                                       ST_PEER_EGRESS_REPORT_RATE_WINDOW * 1000LL);
     }
     pthread_mutex_unlock(&peer_egress_rate_lock);
     return allowed ? 0 : -1;
+}
+
+/* Placeholder sessions take negative ids, which no control session has. */
+int st_peer_mesh_egress_report_rate_occupy_for_testing(size_t count)
+{
+    int rc = 0;
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    for (size_t i = 0U; i < count; ++i) {
+        if (peer_egress_rate_used >= ST_PEER_EGRESS_MAX_RATE_SESSIONS) {
+            rc = -1;
+            break;
+        }
+        pm_egress_rate_slot *slot = &peer_egress_rate_slots[peer_egress_rate_used++];
+        memset(slot, 0, sizeof(*slot));
+        slot->session_id = -(long long)peer_egress_rate_used;
+    }
+    pthread_mutex_unlock(&peer_egress_rate_lock);
+    return rc;
+}
+
+size_t st_peer_mesh_egress_report_rate_sessions_for_testing(void)
+{
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    size_t used = peer_egress_rate_used;
+    pthread_mutex_unlock(&peer_egress_rate_lock);
+    return used;
+}
+
+void st_peer_mesh_egress_report_rate_release_for_testing(void)
+{
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    size_t kept = 0U;
+    for (size_t i = 0U; i < peer_egress_rate_used; ++i) {
+        if (peer_egress_rate_slots[i].session_id >= 0) peer_egress_rate_slots[kept++] = peer_egress_rate_slots[i];
+    }
+    peer_egress_rate_used = kept;
+    pthread_mutex_unlock(&peer_egress_rate_lock);
 }
 
 static long long pm_report_counter(const char *message, const char *field)

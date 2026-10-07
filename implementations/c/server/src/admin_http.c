@@ -1939,34 +1939,74 @@ static int normalize_public_host(const char *value, char *out, size_t out_len)
     return 0;
 }
 
+/*
+ * A port setting as Java binds it: the default when unset, otherwise the configured number, where
+ * 0 (or anything that is not a port) means the endpoint it names is not configured.
+ */
+static int env_port(const char *name, int fallback)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return fallback;
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= 65535 ? (int)parsed : 0;
+}
+
+static int has_text(const char *value)
+{
+    if (value == NULL) return 0;
+    while (*value != '\0') {
+        if (!isspace((unsigned char)*value)) return 1;
+        ++value;
+    }
+    return 0;
+}
+
+/*
+ * The self-hosted STUN endpoint (Java PublicPeerMeshResource.selfHostedStunHost and
+ * selfHostedStunPort): a standalone STUN server when both its address and port are configured,
+ * otherwise the embedded listener at the public address. A standalone address without a port
+ * falls back instead of publishing an endpoint nobody listens on.
+ */
 static int public_primary_stun(const char *host_hint,
                                char host[384],
                                int *port,
                                int *standalone)
 {
     const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS");
-    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
-    *standalone = configured != NULL && *configured != '\0' && configured_port > 0;
+    int configured_port = env_port("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
+    *standalone = has_text(configured) && configured_port > 0;
     if (*standalone) {
         *port = configured_port;
         return normalize_public_host(configured, host, 384U);
     }
     configured = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    if (configured == NULL || *configured == '\0') configured = host_hint;
+    if (!has_text(configured)) configured = host_hint;
     *port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
     return *port > 0 ? normalize_public_host(configured, host, 384U) : -1;
 }
 
-static int public_alternate_stun(char host[384], int *port)
+/*
+ * The alternate STUN address (Java standaloneAlternateStunHost): the standalone alternate address,
+ * else the RFC 5780 alternate public address.
+ */
+static int public_alternate_stun_host(char host[384])
 {
     const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
-    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
-    if (configured == NULL || *configured == '\0') {
-        configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
-        configured_port = env_int("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
-    }
-    *port = configured_port;
-    return configured_port > 0 ? normalize_public_host(configured, host, 384U) : -1;
+    if (!has_text(configured)) configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
+    return has_text(configured) ? normalize_public_host(configured, host, 384U) : -1;
+}
+
+/*
+ * The alternate address with the second port, for RFC 5780 (Java standaloneAlternateStunPort): the
+ * standalone alternate port, else the NAT probe alternate port.
+ */
+static int public_alternate_stun(char host[384], int *port)
+{
+    int configured_port = env_port("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
+    *port = configured_port > 0 ? configured_port
+        : env_port("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
+    return *port > 0 ? public_alternate_stun_host(host) : -1;
 }
 
 static int normalize_public_stun_url(const char *value, char *out, size_t out_len)
@@ -2023,11 +2063,15 @@ static size_t collect_public_stun_urls(char urls[][512], size_t max_urls,
                                 urls[count], sizeof(urls[count])) == 0) {
         ++count;
     }
+    /*
+     * The alternate address goes in on the primary STUN port (Java standaloneAlternateStunServer),
+     * whether or not a second port is configured: that one is only for RFC 5780 probing. Unlike
+     * Java it is listed only beside a published self-hosted server, never alone for a deployment
+     * whose STUN is off.
+     */
     char alternate_host[384];
-    int alternate_port = 0;
-    if (count < max_urls && standalone
-        && public_alternate_stun(alternate_host, &alternate_port) == 0) {
-        (void)alternate_port;
+    if (count < max_urls && (peer_mesh_enabled || standalone) && primary_port > 0
+        && public_alternate_stun_host(alternate_host) == 0) {
         char normalized[512];
         if (build_public_ice_url("stun", alternate_host, primary_port, "",
                                  normalized, sizeof(normalized)) == 0
@@ -2075,7 +2119,9 @@ static int build_public_stun_config_response(const char *host_hint, char *out, s
         if (i > 0) rc = admin_sb_append(&builder, ",");
         if (rc == 0) rc = admin_sb_append_json_string(&builder, urls[i]);
     }
-    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}", port);
+    /* The embedded STUN/TURN port, also when a standalone STUN server is the one published. */
+    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}",
+                                       env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478));
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"stun config response failed\"}");
@@ -5221,7 +5267,10 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
     st_storage_client egress;
     if (st_storage_get_client(database_path, egress_client_id, &egress) != 0
         || strcmp(egress.tenant_id, context->tenant_id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+        /* Named as Java PeerEgressService names it. */
+        char missing[96];
+        snprintf(missing, sizeof(missing), "{\"error\":\"client not found: %lld\"}", egress_client_id);
+        return write_response(out, out_len, 404, "Not Found", missing);
     }
 
     st_storage_peer_mesh_egress_policy policy;
@@ -5373,7 +5422,9 @@ static int handle_peer_mesh_egress_policy_delete(const st_admin_context *context
     st_storage_peer_mesh_egress_policy policy;
     int found = st_storage_get_peer_mesh_egress_policy(database_path, id, context->tenant_id, &policy);
     if (found != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"egress policy not found\"}");
+        char missing[96];
+        snprintf(missing, sizeof(missing), "{\"error\":\"egress policy not found: %lld\"}", id);
+        return write_response(out, out_len, 404, "Not Found", missing);
     }
     if (st_storage_delete_peer_mesh_egress_policy(database_path, id, context->tenant_id) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -5454,8 +5505,9 @@ static int handle_peer_mesh_sharing_update(const st_admin_context *context,
     int has_enabled = st_json_get_bool(body, "enabled", &enabled) == 0;
     int has_mdns = st_json_get_bool(body, "mdnsImportEnabled", &mdns) == 0;
     if (!has_enabled && !has_mdns) return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled or mdnsImportEnabled is required\"}");
+    /* A request the deployment cannot honour: 400, as Java's IllegalArgumentException maps it. */
     if (has_enabled && enabled && !env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
@@ -5518,6 +5570,108 @@ static int peer_service_allowed_ids(const char *body, char out[512], int preserv
     return 0;
 }
 
+/* value without surrounding whitespace; 0 when it does not fit out. */
+static int peer_service_trimmed(const char *value, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (value == NULL) return 1;
+    while (isspace((unsigned char)*value)) ++value;
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) --len;
+    if (len >= out_len) return 0;
+    memcpy(out, value, len);
+    out[len] = '\0';
+    return 1;
+}
+
+/*
+ * A name or description (Java requireName / normalizeDescription): trimmed, no control characters,
+ * at most max characters. A value longer than the stored field is refused, never cut short.
+ */
+static int peer_service_text_field(const char *raw, size_t min_len, size_t max_len, char *out, size_t out_len)
+{
+    char value[1024];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    size_t len = strlen(value);
+    if (len < min_len || len > max_len || len >= out_len) return 0;
+    for (size_t i = 0U; i < len; ++i) {
+        if ((unsigned char)value[i] < 32U) return 0;
+    }
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
+static void peer_service_lower(char *value)
+{
+    for (; *value != '\0'; ++value) *value = (char)tolower((unsigned char)*value);
+}
+
+/* Java requireApplication: one of http, https, ssh, tcp, udp, in any case. */
+static int peer_service_application(const char *raw, char *out, size_t out_len)
+{
+    char value[16];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    peer_service_lower(value);
+    if (strcmp(value, "http") != 0 && strcmp(value, "https") != 0 && strcmp(value, "ssh") != 0
+        && strcmp(value, "tcp") != 0 && strcmp(value, "udp") != 0) return 0;
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
+/*
+ * Java requireTransportForApplication: tcp or udp, defaulting by application, and udp exactly for
+ * the udp application. An http, https, ssh or tcp service on udp, or a udp service on tcp, is
+ * refused rather than published with a transport its client cannot use.
+ */
+static int peer_service_transport(const char *raw, const char *application, char *out, size_t out_len)
+{
+    char value[16];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    peer_service_lower(value);
+    int udp_application = strcmp(application, "udp") == 0;
+    if (value[0] == '\0') snprintf(value, sizeof(value), "%s", udp_application ? "udp" : "tcp");
+    if (strcmp(value, "tcp") != 0 && strcmp(value, "udp") != 0) return 0;
+    if (udp_application != (strcmp(value, "udp") == 0)) return 0;
+    snprintf(out, out_len, "%s", udp_application ? "udp" : "tcp");
+    return 1;
+}
+
+/*
+ * Java normalizePath: "/" for http and https and empty otherwise when absent; else a relative HTTP
+ * path of at most 128 characters from [A-Za-z0-9._~/-] that starts with "/" and has no "..": a
+ * URL, a backslash or a script scheme is refused.
+ */
+static int peer_service_path(const char *raw, const char *application, char *out, size_t out_len)
+{
+    char value[256];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    if (value[0] == '\0') {
+        snprintf(out, out_len, "%s",
+                 strcmp(application, "http") == 0 || strcmp(application, "https") == 0 ? "/" : "");
+        return 1;
+    }
+    size_t len = strlen(value);
+    if (value[0] != '/' || len > 128U || len >= out_len || strstr(value, "..") != NULL) return 0;
+    for (size_t i = 0U; i < len; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (!isalnum(c) && strchr("._~/-", c) == NULL) return 0;
+    }
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
+/* Java requireVisibility: OWNER when absent, otherwise OWNER or ACL in any case. */
+static int peer_service_visibility(const char *raw, char *out, size_t out_len)
+{
+    char value[16];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    for (char *cursor = value; *cursor != '\0'; ++cursor) *cursor = (char)toupper((unsigned char)*cursor);
+    if (value[0] == '\0') snprintf(value, sizeof(value), "OWNER");
+    if (strcmp(value, "OWNER") != 0 && strcmp(value, "ACL") != 0) return 0;
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
 static int handle_peer_mesh_service_mutation(const st_admin_context *context,
                                              long long id,
                                              const char *body,
@@ -5564,35 +5718,48 @@ static int handle_peer_mesh_service_mutation(const st_admin_context *context,
                                          "svc-%lld-%lld", service.client_id, current_time_millis());
         else snprintf(service.service_id, sizeof(service.service_id), "%s", service_id);
     }
-    if (name != NULL) snprintf(service.name, sizeof(service.name), "%s", name);
-    if (description != NULL) snprintf(service.description, sizeof(service.description), "%s", description);
-    if (application != NULL) snprintf(service.application, sizeof(service.application), "%s", application);
-    if (transport != NULL) snprintf(service.transport, sizeof(service.transport), "%s", transport);
-    if (target_host != NULL) snprintf(service.target_host, sizeof(service.target_host), "%s",
-                                      strcmp(target_host, "localhost") == 0 ? "127.0.0.1" : target_host);
-    if (path != NULL) snprintf(service.path, sizeof(service.path), "%s", path);
-    if (visibility != NULL) snprintf(service.visibility, sizeof(service.visibility), "%s",
-                                     strcmp(visibility, "ACL") == 0 ? "ACL" : "OWNER");
-    if (creating && service.path[0] == '\0'
-        && (strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0)) snprintf(service.path, sizeof(service.path), "/");
-    if (creating && service.transport[0] == '\0') snprintf(service.transport, sizeof(service.transport),
-                                                            "%s", strcmp(service.application, "udp") == 0 ? "udp" : "tcp");
+    /*
+     * Each field is checked as given, before it is stored, with Java PeerServiceDiscovery's rules:
+     * a value is never truncated into a field it would not fit, and a field the request leaves out
+     * keeps its stored value.
+     */
+    int fields_ok = 1;
+    if (creating || name != NULL) {
+        fields_ok = peer_service_text_field(name, 1U, sizeof(service.name) - 1U,
+                                            service.name, sizeof(service.name));
+    }
+    if (fields_ok && (creating || description != NULL)) {
+        fields_ok = peer_service_text_field(description, 0U, sizeof(service.description) - 1U,
+                                            service.description, sizeof(service.description));
+    }
+    if (fields_ok && (creating || application != NULL)) {
+        fields_ok = peer_service_application(application, service.application, sizeof(service.application));
+    }
+    if (fields_ok) {
+        fields_ok = peer_service_transport(transport == NULL ? service.transport : transport,
+                                           service.application, service.transport, sizeof(service.transport));
+    }
+    if (fields_ok && (creating || target_host != NULL)) {
+        char normalized[256];
+        fields_ok = st_peer_mesh_normalize_local_host(target_host, normalized) == 0
+            && strlen(normalized) < sizeof(service.target_host);
+        if (fields_ok) snprintf(service.target_host, sizeof(service.target_host), "%s", normalized);
+    }
+    if (fields_ok && (creating || path != NULL)) {
+        fields_ok = peer_service_path(path, service.application, service.path, sizeof(service.path));
+    }
+    if (fields_ok && (creating || visibility != NULL)) {
+        fields_ok = peer_service_visibility(visibility, service.visibility, sizeof(service.visibility));
+    }
     int target_port = 0, published_port = 0, enabled = 0;
     if (st_json_get_int(body, "targetPort", &target_port) == 0) service.target_port = target_port;
     if (st_json_get_int(body, "publishedPort", &published_port) == 0) service.published_port = published_port;
     if (st_json_get_bool(body, "enabled", &enabled) == 0) service.enabled = enabled;
     int ids_rc = peer_service_allowed_ids(body, service.allowed_client_ids, !creating);
-    int app_ok = strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0
-        || strcmp(service.application, "ssh") == 0 || strcmp(service.application, "tcp") == 0
-        || strcmp(service.application, "udp") == 0;
-    int transport_ok = strcmp(service.transport, "tcp") == 0 || strcmp(service.transport, "udp") == 0;
-    if (!peer_service_id_valid(service.service_id) || !peer_service_string_valid(service.name, 1U, 80U)
-        || strlen(service.description) > 200U || !app_ok || !transport_ok
-        || (strcmp(service.application, "udp") == 0) != (strcmp(service.transport, "udp") == 0)
-        || !peer_service_string_valid(service.target_host, 1U, 127U)
+    if (!fields_ok || !peer_service_id_valid(service.service_id)
         || service.target_port < 1 || service.target_port > 65535
         || service.published_port < 1 || service.published_port > 65535
-        || strstr(service.path, "..") != NULL || ids_rc < 0) {
+        || ids_rc < 0) {
         free(service_id); free(name); free(description); free(transport); free(application);
         free(target_host); free(path); free(visibility);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid peer service definition\"}");

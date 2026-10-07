@@ -5,6 +5,7 @@
 #include "crypto.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <pthread.h>
@@ -146,6 +147,53 @@ int st_turn_auth_username_valid(const char *username)
     long long now = (long long)time(NULL);
     long long remaining = expires - now;
     return remaining > 0 && remaining <= turn_auth_ttl() + 60;
+}
+
+/* The subject field of "<expiry>:<subject>:<rest>"; a username without both colons has none. */
+static int turn_auth_subject(const char *username, const char **subject, size_t *subject_len)
+{
+    const char *first = username == NULL ? NULL : strchr(username, ':');
+    const char *second = first == NULL ? NULL : strchr(first + 1, ':');
+    if (second == NULL) return -1;
+    *subject = first + 1;
+    *subject_len = (size_t)(second - *subject);
+    return 0;
+}
+
+long long st_turn_auth_peer_mesh_client_id(const char *username)
+{
+    const char *subject = NULL;
+    size_t len = 0U;
+    if (turn_auth_subject(username, &subject, &len) != 0 || len < 3U
+        || strncmp(subject, "pm-", 3U) != 0) {
+        return 0;
+    }
+    /* Long.parseLong: an optional sign, then decimal digits only, and nothing that overflows. */
+    size_t i = 3U;
+    int negative = 0;
+    if (i < len && (subject[i] == '+' || subject[i] == '-')) {
+        negative = subject[i] == '-';
+        ++i;
+    }
+    if (i == len) return 0;
+    long long value = 0;
+    for (; i < len; ++i) {
+        if (!isdigit((unsigned char)subject[i])) return 0;
+        int digit = subject[i] - '0';
+        if (value > (LLONG_MAX - digit) / 10) return 0;
+        value = value * 10 + digit;
+    }
+    return negative || value <= 0 ? 0 : value;
+}
+
+int st_turn_auth_is_general_relay_subject(const char *username)
+{
+    static const char prefix[] = "public-transfer";
+    const char *subject = NULL;
+    size_t len = 0U;
+    return turn_auth_subject(username, &subject, &len) == 0
+        && len >= sizeof(prefix) - 1U
+        && strncmp(subject, prefix, sizeof(prefix) - 1U) == 0;
 }
 
 int st_turn_auth_long_term_key(const char *username, uint8_t out[16])

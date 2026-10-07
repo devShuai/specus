@@ -7019,6 +7019,112 @@ int st_storage_get_peer_mesh_session(const char *path,
     return rc;
 }
 
+/*
+ * A peer session as the report and relay paths judge it (Java PeerMeshService). expired follows
+ * isExpired there: an expiry that is missing or does not parse never expires.
+ */
+typedef struct {
+    long long source_client_id;
+    long long target_client_id;
+    char status[41];
+    int expired;
+    char token_hash[ST_SHA256_HEX_LEN + 1U];
+} peer_session_state;
+
+#define PEER_SESSION_EXPIRED_SQL \
+    "(datetime(expires_at) IS NOT NULL AND datetime(expires_at) <= CURRENT_TIMESTAMP)"
+
+/* 1 when found, 0 when there is no such session (in the tenant, when one is given), -1 on error. */
+static int read_peer_session_state(sqlite3 *db,
+                                   long long id,
+                                   const char *tenant_id,
+                                   peer_session_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        tenant_id == NULL
+            ? "SELECT source_client_id,target_client_id,status," PEER_SESSION_EXPIRED_SQL ","
+              "COALESCE(token_hash,'') FROM peer_mesh_session WHERE id=?"
+            : "SELECT source_client_id,target_client_id,status," PEER_SESSION_EXPIRED_SQL ","
+              "COALESCE(token_hash,'') FROM peer_mesh_session WHERE id=? AND tenant_id=?",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_int64(stmt, 1, id);
+    if (tenant_id != NULL) sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    int found = rc == SQLITE_ROW ? 1 : (rc == SQLITE_DONE ? 0 : -1);
+    if (found == 1) {
+        state->source_client_id = sqlite3_column_int64(stmt, 0);
+        state->target_client_id = sqlite3_column_int64(stmt, 1);
+        const unsigned char *status = sqlite3_column_text(stmt, 2);
+        snprintf(state->status, sizeof(state->status), "%s", status == NULL ? "" : (const char *)status);
+        state->expired = sqlite3_column_int(stmt, 3) != 0;
+        const unsigned char *hash = sqlite3_column_text(stmt, 4);
+        snprintf(state->token_hash, sizeof(state->token_hash), "%s", hash == NULL ? "" : (const char *)hash);
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* Java markClosed: the first close keeps its time. */
+static int close_peer_session(sqlite3 *db, long long id)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE peer_mesh_session SET status='CLOSED',"
+        "closed_at=COALESCE(NULLIF(closed_at,''),CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP "
+        "WHERE id=? AND status<>'CLOSED'",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/*
+ * Java closeIfExpired: 1 when the session is closed, either already or because it has expired and
+ * is closed now; 0 when it is still open; -1 on error. Nothing is recorded on a closed session.
+ */
+static int peer_session_closed_or_expire(sqlite3 *db, long long id, const peer_session_state *state)
+{
+    if (strcmp(state->status, "CLOSED") == 0) return 1;
+    if (!state->expired) return 0;
+    return close_peer_session(db, id) == 0 ? 1 : -1;
+}
+
+static int peer_session_pair_matches(const peer_session_state *state, long long from, long long to)
+{
+    return (from == state->source_client_id && to == state->target_client_id)
+        || (from == state->target_client_id && to == state->source_client_id);
+}
+
+/*
+ * The path type a session shows once its byte counters are what they are (Java
+ * effectivePathType): whichever path carried more, the current one on a tie.
+ */
+#define PEER_SESSION_EFFECTIVE_PATH_SQL(direct, relay, tie) \
+    "CASE WHEN " relay " > " direct " THEN 'RELAY' WHEN " direct " > " relay " THEN 'DIRECT' " \
+    "ELSE " tie " END"
+#define PEER_SESSION_CURRENT_PATH_SQL "COALESCE(NULLIF(path_type,''),'DIRECT')"
+#define PEER_SESSION_ADD_DIRECT_SQL \
+    "(CASE WHEN direct_bytes>9223372036854775807-?1 THEN 9223372036854775807 ELSE direct_bytes+?1 END)"
+#define PEER_SESSION_ADD_RELAY_SQL \
+    "(CASE WHEN relay_bytes>9223372036854775807-?2 THEN 9223372036854775807 ELSE relay_bytes+?2 END)"
+
+/*
+ * A path-report, traffic-report or close from one of the session's two clients, with Java
+ * PeerMeshService's rules (reportPath, reportTraffic, closeSession):
+ *
+ * - a close only closes; the report's other fields are not recorded;
+ * - a session that is closed, or has expired (which closes it now), records nothing more: a
+ *   path-report cannot reopen it and a traffic report adds no bytes;
+ * - traffic adds to the counters and sets the effective path type;
+ * - a reported path type is taken as is only while nothing has been counted, and is the effective
+ *   one after that.
+ */
 int st_storage_report_peer_mesh_session(const char *path,
                                         const st_storage_client *reporter,
                                         long long id,
@@ -7037,75 +7143,69 @@ int st_storage_report_peer_mesh_session(const char *path,
     if (relay_bytes < 0) relay_bytes = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "UPDATE peer_mesh_session SET path_type=CASE WHEN ?='' THEN path_type ELSE ? END,"
-        "status=CASE WHEN ? THEN 'CLOSED' WHEN ?='' THEN status ELSE ? END,"
-        "rtt_millis=CASE WHEN ?<0 THEN rtt_millis ELSE ? END,"
-        "local_endpoint=COALESCE(?,local_endpoint),remote_endpoint=COALESCE(?,remote_endpoint),"
-        "direct_bytes=direct_bytes+?,relay_bytes=relay_bytes+?,"
-        "last_traffic_at=CASE WHEN ?>0 OR ?>0 THEN CURRENT_TIMESTAMP ELSE last_traffic_at END,"
-        "closed_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE closed_at END,updated_at=CURRENT_TIMESTAMP "
-        "WHERE id=? AND tenant_id=? AND (source_client_id=? OR target_client_id=?)",
-        -1, &stmt, NULL);
-    const char *next_path = path_type == NULL ? "" : path_type;
-    const char *next_status = status == NULL ? "" : status;
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, next_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, next_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 3, close_session ? 1 : 0);
-        sqlite3_bind_text(stmt, 4, next_status, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, next_status, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 6, rtt_millis);
-        sqlite3_bind_int64(stmt, 7, rtt_millis);
-        bind_nullable_text_limit(stmt, 8, local_endpoint, 255);
-        bind_nullable_text_limit(stmt, 9, remote_endpoint, 255);
-        sqlite3_bind_int64(stmt, 10, direct_bytes);
-        sqlite3_bind_int64(stmt, 11, relay_bytes);
-        sqlite3_bind_int64(stmt, 12, direct_bytes);
-        sqlite3_bind_int64(stmt, 13, relay_bytes);
-        sqlite3_bind_int(stmt, 14, close_session ? 1 : 0);
-        sqlite3_bind_int64(stmt, 15, id);
-        sqlite3_bind_text(stmt, 16, reporter->tenant_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 17, reporter->id);
-        sqlite3_bind_int64(stmt, 18, reporter->id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
-    } else rc = -1;
-    sqlite3_finalize(stmt);
+    peer_session_state state;
+    int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
+    int rc = found == 1
+        && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    if (rc == 0 && close_session) {
+        rc = close_peer_session(db, id);
+    } else if (rc == 0) {
+        int closed = peer_session_closed_or_expire(db, id, &state);
+        if (closed < 0) rc = -1;
+        if (closed == 0) {
+            char next_path[41];
+            char next_status[41];
+            snprintf(next_path, sizeof(next_path), "%s", path_type == NULL ? "" : path_type);
+            snprintf(next_status, sizeof(next_status), "%s", status == NULL ? "" : status);
+            sqlite3_stmt *stmt = NULL;
+            rc = sqlite3_prepare_v2(db,
+                "UPDATE peer_mesh_session SET path_type=CASE "
+                "WHEN ?1>0 OR ?2>0 THEN "
+                PEER_SESSION_EFFECTIVE_PATH_SQL(PEER_SESSION_ADD_DIRECT_SQL, PEER_SESSION_ADD_RELAY_SQL,
+                                                PEER_SESSION_CURRENT_PATH_SQL) " "
+                "WHEN ?3='' THEN path_type "
+                "WHEN direct_bytes<=0 AND relay_bytes<=0 THEN ?3 "
+                "ELSE " PEER_SESSION_EFFECTIVE_PATH_SQL("direct_bytes", "relay_bytes",
+                                                        PEER_SESSION_CURRENT_PATH_SQL) " END,"
+                "status=CASE WHEN ?4='' THEN status ELSE ?4 END,"
+                "rtt_millis=CASE WHEN ?5<0 THEN rtt_millis ELSE ?5 END,"
+                "local_endpoint=COALESCE(?6,local_endpoint),remote_endpoint=COALESCE(?7,remote_endpoint),"
+                "direct_bytes=" PEER_SESSION_ADD_DIRECT_SQL ",relay_bytes=" PEER_SESSION_ADD_RELAY_SQL ","
+                "last_traffic_at=CASE WHEN ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP ELSE last_traffic_at END,"
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=?8 AND status<>'CLOSED' AND NOT " PEER_SESSION_EXPIRED_SQL,
+                -1, &stmt, NULL);
+            if (rc == SQLITE_OK) {
+                sqlite3_bind_int64(stmt, 1, direct_bytes);
+                sqlite3_bind_int64(stmt, 2, relay_bytes);
+                sqlite3_bind_text(stmt, 3, next_path, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 4, next_status, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(stmt, 5, rtt_millis);
+                bind_nullable_text_limit(stmt, 6, local_endpoint, 255);
+                bind_nullable_text_limit(stmt, 7, remote_endpoint, 255);
+                sqlite3_bind_int64(stmt, 8, id);
+                rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+            } else rc = -1;
+            sqlite3_finalize(stmt);
+        }
+    }
     if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, out_session);
     sqlite3_close(db);
     return rc;
 }
 
-static int peer_mesh_session_authorized(sqlite3 *db,
-                                        long long session_id,
-                                        long long from_client_id,
-                                        long long to_client_id,
-                                        char *token_hash,
-                                        size_t token_hash_len)
-{
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "SELECT token_hash FROM peer_mesh_session WHERE id=? AND status<>'CLOSED' "
-        "AND datetime(expires_at)>CURRENT_TIMESTAMP AND ((source_client_id=? AND target_client_id=?) "
-        "OR (source_client_id=? AND target_client_id=?))",
-        -1, &stmt, NULL);
-    if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_int64(stmt, 1, session_id);
-    sqlite3_bind_int64(stmt, 2, from_client_id);
-    sqlite3_bind_int64(stmt, 3, to_client_id);
-    sqlite3_bind_int64(stmt, 4, to_client_id);
-    sqlite3_bind_int64(stmt, 5, from_client_id);
-    rc = sqlite3_step(stmt);
-    int allowed = rc == SQLITE_ROW;
-    if (allowed && token_hash != NULL && token_hash_len > 0U) {
-        const unsigned char *value = sqlite3_column_text(stmt, 0);
-        snprintf(token_hash, token_hash_len, "%s", value == NULL ? "" : (const char *)value);
-    }
-    sqlite3_finalize(stmt);
-    return allowed ? 1 : (rc == SQLITE_DONE ? 0 : -1);
-}
-
+/*
+ * Authorizes one relayed SPM2 frame against its session (Java PeerMeshService
+ * authorizeRelayFrameForRelay and validateRelayFrameForRelay): the session must be open and not
+ * expired, and the two clients must be its two ends. An expired session is closed here.
+ *
+ * Both client ids are 0 when TURN authentication is off and the allocations carry no identity:
+ * then only the session itself is checked. One id alone is a caller error.
+ *
+ * The first frame through a NEGOTIATING session activates it on the relay path: probes cross while
+ * it negotiates, and a client flushes its first data frames as soon as a probe succeeds, before
+ * its path-report can arrive. With account_traffic the frame's bytes are counted too.
+ */
 int st_storage_authorize_peer_mesh_relay(const char *path,
                                          long long session_id,
                                          long long from_client_id,
@@ -7113,51 +7213,125 @@ int st_storage_authorize_peer_mesh_relay(const char *path,
                                          long long relay_bytes,
                                          int account_traffic)
 {
-    if (session_id <= 0 || from_client_id <= 0 || to_client_id <= 0
-        || from_client_id == to_client_id || relay_bytes < 0) return 0;
+    int identified = from_client_id > 0 && to_client_id > 0;
+    if (session_id <= 0 || relay_bytes < 0
+        || (!identified && (from_client_id != 0 || to_client_id != 0))
+        || (identified && from_client_id == to_client_id)) return 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
-    int allowed = peer_mesh_session_authorized(db, session_id, from_client_id,
-                                               to_client_id, NULL, 0U);
-    if (allowed == 1 && account_traffic) {
+    peer_session_state state;
+    int allowed = read_peer_session_state(db, session_id, NULL, &state);
+    if (allowed == 1) {
+        int closed = peer_session_closed_or_expire(db, session_id, &state);
+        allowed = closed < 0 ? -1
+            : (closed == 0 && (!identified || peer_session_pair_matches(&state, from_client_id, to_client_id)));
+    }
+    if (allowed == 1 && (account_traffic || strcmp(state.status, "ACTIVE") != 0)) {
         sqlite3_stmt *stmt = NULL;
         int rc = sqlite3_prepare_v2(db,
-            "UPDATE peer_mesh_session SET status='ACTIVE',path_type='RELAY',"
-            "relay_bytes=CASE WHEN relay_bytes>? THEN 9223372036854775807 ELSE relay_bytes+? END,"
-            "last_traffic_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            account_traffic
+                ? "UPDATE peer_mesh_session SET path_type="
+                  PEER_SESSION_EFFECTIVE_PATH_SQL("direct_bytes", PEER_SESSION_ADD_RELAY_SQL,
+                      "CASE WHEN status<>'ACTIVE' THEN 'RELAY' ELSE " PEER_SESSION_CURRENT_PATH_SQL " END") ","
+                  "status='ACTIVE',relay_bytes=" PEER_SESSION_ADD_RELAY_SQL ","
+                  "last_traffic_at=CASE WHEN ?2>0 THEN CURRENT_TIMESTAMP ELSE last_traffic_at END,"
+                  "updated_at=CURRENT_TIMESTAMP "
+                  "WHERE id=?3 AND status<>'CLOSED' AND NOT " PEER_SESSION_EXPIRED_SQL
+                : "UPDATE peer_mesh_session SET path_type='RELAY',status='ACTIVE',updated_at=CURRENT_TIMESTAMP "
+                  "WHERE id=?3 AND status<>'CLOSED' AND status<>'ACTIVE' AND NOT " PEER_SESSION_EXPIRED_SQL,
             -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(stmt, 1, 9223372036854775807LL - relay_bytes);
-            sqlite3_bind_int64(stmt, 2, relay_bytes);
+            if (account_traffic) sqlite3_bind_int64(stmt, 2, relay_bytes);
             sqlite3_bind_int64(stmt, 3, session_id);
             rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
         } else rc = -1;
         sqlite3_finalize(stmt);
         if (rc != 0) allowed = -1;
+        /* Closed or expired between the read and this write: the frame is not covered any more. */
+        else if (account_traffic && sqlite3_changes(db) != 1) allowed = 0;
     }
     sqlite3_close(db);
     return allowed;
 }
 
+/*
+ * A connectivity check relayed while the session negotiates (Java authorizeRelayProbe): both ids
+ * are named in the probe and must be the session's ends, the session must be open and not expired
+ * (an expired one is closed here), and the token must be the session's.
+ */
 int st_storage_verify_peer_mesh_probe(const char *path,
                                       long long session_id,
                                       long long from_client_id,
                                       long long to_client_id,
                                       const char *token)
 {
-    if (token == NULL || *token == '\0') return 0;
+    if (token == NULL || *token == '\0' || session_id <= 0
+        || from_client_id <= 0 || to_client_id <= 0) return 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
-    char expected_hex[ST_SHA256_HEX_LEN + 1U];
-    int allowed = peer_mesh_session_authorized(db, session_id, from_client_id,
-                                               to_client_id, expected_hex, sizeof(expected_hex));
+    peer_session_state state;
+    int allowed = read_peer_session_state(db, session_id, NULL, &state);
+    if (allowed == 1) {
+        int closed = peer_session_closed_or_expire(db, session_id, &state);
+        allowed = closed < 0 ? -1
+            : (closed == 0 && peer_session_pair_matches(&state, from_client_id, to_client_id));
+    }
     sqlite3_close(db);
-    if (allowed != 1 || strlen(expected_hex) != ST_SHA256_HEX_LEN) return allowed < 0 ? -1 : 0;
+    if (allowed != 1 || strlen(state.token_hash) != ST_SHA256_HEX_LEN) return allowed < 0 ? -1 : 0;
     uint8_t actual[ST_SHA256_LEN];
     uint8_t expected[ST_SHA256_LEN];
     st_sha256((const uint8_t *)token, strlen(token), actual);
-    if (st_hex_decode_32(expected_hex, expected) != 0) return 0;
+    if (st_hex_decode_32(state.token_hash, expected) != 0) return 0;
     return st_constant_time_eq(actual, expected, sizeof(actual)) ? 1 : 0;
+}
+
+/*
+ * The open sessions between two clients, in either direction, most recently updated first, as
+ * Java reusableSessionGrant reads them; the expired ones met on the way are closed and left out.
+ */
+int st_storage_open_peer_mesh_sessions_between(const char *path,
+                                               const char *tenant_id,
+                                               long long first_client_id,
+                                               long long second_client_id,
+                                               st_storage_peer_mesh_session *sessions,
+                                               size_t max_sessions,
+                                               size_t *session_count)
+{
+    if (sessions == NULL || session_count == NULL) return -1;
+    *session_count = 0U;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    long long ids[64];
+    int expired[64];
+    size_t found = 0U;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT id," PEER_SESSION_EXPIRED_SQL " FROM peer_mesh_session WHERE tenant_id=? "
+        "AND status<>'CLOSED' AND ((source_client_id=? AND target_client_id=?) "
+        "OR (source_client_id=? AND target_client_id=?)) ORDER BY updated_at DESC, id DESC LIMIT 64",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, first_client_id);
+        sqlite3_bind_int64(stmt, 3, second_client_id);
+        sqlite3_bind_int64(stmt, 4, second_client_id);
+        sqlite3_bind_int64(stmt, 5, first_client_id);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && found < 64U) {
+            ids[found] = sqlite3_column_int64(stmt, 0);
+            expired[found++] = sqlite3_column_int(stmt, 1) != 0;
+        }
+        rc = rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    for (size_t i = 0U; rc == 0 && i < found; ++i) {
+        if (expired[i]) rc = close_peer_session(db, ids[i]);
+        else if (*session_count < max_sessions) {
+            rc = read_peer_mesh_session(db, tenant_id, ids[i], &sessions[*session_count]);
+            if (rc == 0) ++*session_count;
+        }
+    }
+    sqlite3_close(db);
+    return rc;
 }
 
 int st_storage_get_peer_mesh_service_sharing(const char *path,
