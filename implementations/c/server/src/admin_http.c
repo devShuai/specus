@@ -4155,6 +4155,9 @@ static int build_clients_response(const st_admin_context *context, char *out, si
     return response_len;
 }
 
+static size_t http_route_text_length(const char *text);
+static void http_route_trim_in_place(char *value);
+
 static int build_client_name_availability_response(const st_admin_context *context,
                                                    const char *path,
                                                    char *out,
@@ -4165,6 +4168,12 @@ static int build_client_name_availability_response(const st_admin_context *conte
         free(client_name);
         return write_response(out, out_len, 400, "Bad Request",
                               "{\"error\":\"clientName is required\"}");
+    }
+    /* The name as a create or update would store it (Java requireClientName). */
+    http_route_trim_in_place(client_name);
+    if (http_route_text_length(client_name) > 120U) {
+        free(client_name);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is too long\"}");
     }
     long long exclude_id = 0;
     (void)admin_query_i64(path, "excludeClientId", &exclude_id);
@@ -6768,6 +6777,138 @@ int st_admin_http_share_sweep(void)
     return rc;
 }
 
+/* Characters of UTF-8 text, as Java counts a String's length for these limits. */
+static size_t http_route_text_length(const char *text)
+{
+    size_t count = 0U;
+    for (const unsigned char *cursor = (const unsigned char *)text; *cursor != '\0'; ++cursor) {
+        count += (*cursor & 0xc0U) != 0x80U;
+    }
+    return count;
+}
+
+/* Trims value in place (spaces and control characters, as Java String.trim). */
+static void http_route_trim_in_place(char *value)
+{
+    if (value == NULL) {
+        return;
+    }
+    size_t len = strlen(value);
+    size_t start = 0U;
+    while (start < len && (unsigned char)value[start] <= ' ') ++start;
+    while (len > start && (unsigned char)value[len - 1U] <= ' ') --len;
+    memmove(value, value + start, len - start);
+    value[len - start] = '\0';
+}
+
+/*
+ * Java HttpRouteService.requireRoute and requireTargetBaseUrl on the trimmed values (trimmed in
+ * place): the route is not blank, at most 60 characters and without '/'; the target is not blank,
+ * at most 512 characters, an absolute http(s) URL and has a host. NULL when both are valid, else
+ * the message Java answers 400 with.
+ */
+static const char *http_route_mutation_error(char *route, char *target_base_url)
+{
+    http_route_trim_in_place(route);
+    http_route_trim_in_place(target_base_url);
+    if (route == NULL || *route == '\0') {
+        return "route cannot be blank";
+    }
+    if (http_route_text_length(route) > 60U) {
+        return "route is too long (max 60)";
+    }
+    if (strchr(route, '/') != NULL) {
+        return "route must not contain '/'";
+    }
+    if (target_base_url == NULL || *target_base_url == '\0') {
+        return "targetBaseUrl cannot be blank";
+    }
+    if (http_route_text_length(target_base_url) > 512U) {
+        return "targetBaseUrl is too long (max 512)";
+    }
+    for (const unsigned char *cursor = (const unsigned char *)target_base_url; *cursor != '\0'; ++cursor) {
+        if (*cursor <= ' ' || *cursor == 0x7fU) {
+            return "targetBaseUrl is not a valid URI";
+        }
+    }
+    const char *authority = NULL;
+    if (admin_ascii_ncasecmp(target_base_url, "http://", 7U) == 0) {
+        authority = target_base_url + 7;
+    } else if (admin_ascii_ncasecmp(target_base_url, "https://", 8U) == 0) {
+        authority = target_base_url + 8;
+    } else {
+        return "targetBaseUrl must be an absolute http(s) URL";
+    }
+    size_t authority_len = strcspn(authority, "/?#");
+    const char *at = NULL;
+    for (size_t i = 0; i < authority_len; ++i) {
+        if (authority[i] == '@') {
+            at = authority + i;
+        }
+    }
+    const char *host = at == NULL ? authority : at + 1;
+    size_t host_len = authority_len - (size_t)(host - authority);
+    if (host_len > 0U && host[0] == '[') {
+        const char *close = memchr(host, ']', host_len);
+        host_len = close == NULL ? 0U : (size_t)(close - host) - 1U;
+    } else {
+        const char *port = memchr(host, ':', host_len);
+        if (port != NULL) {
+            host_len = (size_t)(port - host);
+        }
+    }
+    return host_len == 0U ? "targetBaseUrl must contain a host" : NULL;
+}
+
+/* Java HttpRouteService's answer for a route name the client already has. */
+static int write_http_route_exists(const char *route, char *out, size_t out_len)
+{
+    char *escaped = st_json_escape(route == NULL ? "" : route);
+    char body[512];
+    int written = escaped == NULL ? -1
+        : snprintf(body, sizeof(body), "{\"error\":\"route %.300s 已存在于该客户端下\"}", escaped);
+    free(escaped);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"route 已存在于该客户端下\"}");
+    }
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/* write_response with {"error":message}, message being one of the validation texts above. */
+static int write_http_route_invalid(const char *message, char *out, size_t out_len)
+{
+    char body[256];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/*
+ * Java ClientAccountService.requireClientName on a value trimmed in place: not blank and at most
+ * 120 characters. NULL when valid, else the message Java answers 400 with.
+ */
+static const char *client_name_error(char *client_name)
+{
+    http_route_trim_in_place(client_name);
+    if (client_name == NULL || *client_name == '\0') {
+        return "clientName cannot be blank";
+    }
+    return http_route_text_length(client_name) > 120U ? "clientName is too long" : NULL;
+}
+
+/* Java's 400 for a client name that is taken: names are unique across all tenants. */
+static int write_client_name_exists(const char *client_name, char *out, size_t out_len)
+{
+    char *escaped = st_json_escape(client_name == NULL ? "" : client_name);
+    char body[768];
+    int written = escaped == NULL ? -1
+        : snprintf(body, sizeof(body), "{\"error\":\"clientName %.600s 已存在\"}", escaped);
+    free(escaped);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName 已存在\"}");
+    }
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
 static int handle_client_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
@@ -6779,15 +6920,21 @@ static int handle_client_create(const st_admin_context *context, const char *bod
         return init_response;
     }
     char *client_name = st_json_get_string(body, "clientName");
-    if (client_name == NULL || *client_name == '\0') {
+    const char *invalid = client_name_error(client_name);
+    if (invalid != NULL) {
         free(client_name);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is required\"}");
+        return write_http_route_invalid(invalid, out, out_len);
     }
     int enabled = 1;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int rate_limit = 30;
     (void)st_json_get_int(body, "connectionRateLimitPerMinute", &rate_limit);
     st_storage_client client;
+    if (st_storage_get_client_by_name(database_path, client_name, &client) == 0) {
+        int len = write_client_name_exists(client_name, out, out_len);
+        free(client_name);
+        return len;
+    }
     int rc = st_storage_upsert_client(database_path,
                                       0,
                                       context->tenant_id,
@@ -6818,8 +6965,23 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     if (st_storage_get_client(database_path, id, &existing) != 0 || !admin_can_access_client(context, &existing)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    /* A blank or missing name keeps the current one (Java StringUtils.hasText). */
     char *client_name = st_json_get_string(body, "clientName");
-    const char *next_client_name = client_name != NULL && *client_name != '\0' ? client_name : existing.client_name;
+    http_route_trim_in_place(client_name);
+    int name_given = client_name != NULL && *client_name != '\0';
+    const char *invalid = name_given ? client_name_error(client_name) : NULL;
+    if (invalid != NULL) {
+        free(client_name);
+        return write_http_route_invalid(invalid, out, out_len);
+    }
+    const char *next_client_name = name_given ? client_name : existing.client_name;
+    st_storage_client taken;
+    if (strcmp(next_client_name, existing.client_name) != 0
+        && st_storage_get_client_by_name(database_path, next_client_name, &taken) == 0) {
+        int len = write_client_name_exists(next_client_name, out, out_len);
+        free(client_name);
+        return len;
+    }
     int enabled = existing.enabled;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int rate_limit = existing.connection_rate_limit_per_minute;
@@ -7194,10 +7356,11 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     }
     char *route_name = st_json_get_string(body, "route");
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
-    if (route_name == NULL || *route_name == '\0' || target_base_url == NULL || *target_base_url == '\0') {
+    const char *invalid = http_route_mutation_error(route_name, target_base_url);
+    if (invalid != NULL) {
         free(route_name);
         free(target_base_url);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"route and targetBaseUrl are required\"}");
+        return write_http_route_invalid(invalid, out, out_len);
     }
     int enabled = 1;
     (void)st_json_get_bool(body, "enabled", &enabled);
@@ -7231,7 +7394,7 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     }
     st_storage_http_route route;
     st_storage_share_ids revoked = {0};
-    /* route.created (or, for a name that exists, the update's audit and share hooks) in one go. */
+    /* route.created in the same transaction; a name the client already has is refused. */
     int rc = st_storage_create_http_route_audited(database_path,
                                                   client_id,
                                                   route_name,
@@ -7249,12 +7412,16 @@ static int handle_http_route_create(const st_admin_context *context, long long c
                                                   st_http_share_now_ms(),
                                                   &route,
                                                   &revoked);
+    int exists_len = rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? write_http_route_exists(route_name, out, out_len) : 0;
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_HTTP_ROUTE_EXISTS) {
+        return exists_len;
+    }
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
@@ -7279,12 +7446,24 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
     }
+    /* A field left out keeps its value; one that is given is validated as on creation. */
     char *route_name = st_json_get_string(body, "route");
-    const char *next_route = route_name != NULL && *route_name != '\0' ? route_name : existing.route;
+    if (route_name == NULL) {
+        route_name = admin_dup_string(existing.route);
+    }
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
-    const char *next_target = target_base_url != NULL && *target_base_url != '\0'
-        ? target_base_url
-        : existing.target_base_url;
+    if (target_base_url == NULL) {
+        target_base_url = admin_dup_string(existing.target_base_url);
+    }
+    const char *invalid = route_name == NULL || target_base_url == NULL ? "route update failed"
+        : http_route_mutation_error(route_name, target_base_url);
+    if (invalid != NULL) {
+        free(route_name);
+        free(target_base_url);
+        return write_http_route_invalid(invalid, out, out_len);
+    }
+    const char *next_route = route_name;
+    const char *next_target = target_base_url;
     int enabled = existing.enabled;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = existing.detail_capture_enabled;
@@ -7339,12 +7518,16 @@ static int handle_http_route_update(const st_admin_context *context, long long i
                                                   st_http_share_now_ms(),
                                                   &route,
                                                   &revoked);
+    int exists_len = rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? write_http_route_exists(next_route, out, out_len) : 0;
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_HTTP_ROUTE_EXISTS) {
+        return exists_len;
+    }
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"http route update failed\"}");
     }
