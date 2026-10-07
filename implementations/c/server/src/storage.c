@@ -755,6 +755,23 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "peer_mesh_egress_policy", "domain_rules",
                                    "TEXT NOT NULL DEFAULT '[]'");
     }
+    /*
+     * Java PeerServiceDiscoverySchemaMigrator: sharing tables written before mDNS import and the
+     * per-service allow list gain both columns switched off, and a row whose enabled flag is NULL
+     * (an older schema without the NOT NULL default) is forced off rather than read as on.
+     */
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "peer_mesh_service_sharing", "mdns_import_enabled",
+                                   "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "peer_mesh_shared_service", "allowed_client_ids", "TEXT");
+    }
+    if (rc == 0) {
+        rc = exec_sql(db,
+            "UPDATE peer_mesh_service_sharing SET enabled = 0 WHERE enabled IS NULL;"
+            "UPDATE peer_mesh_shared_service SET enabled = 0 WHERE enabled IS NULL;");
+    }
     if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
     }
