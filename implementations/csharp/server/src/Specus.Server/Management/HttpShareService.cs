@@ -3,6 +3,9 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Options;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
@@ -333,6 +336,7 @@ public sealed class HttpShareService
         {
             await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
                 .ConfigureAwait(false);
+            await LockRouteForCreationAsync(routeId, cancellationToken).ConfigureAwait(false);
             var active = await _db.HttpShares.AsNoTracking()
                 .CountAsync(s => s.RouteId == routeId && s.RevokedAt == null && s.ExpiresAt > nowSeconds,
                     cancellationToken)
@@ -376,6 +380,44 @@ public sealed class HttpShareService
         catch (Exception error) when (IsStoreFailure(error, cancellationToken))
         {
             return Unavailable(error);
+        }
+    }
+
+    /// <summary>
+    /// The statement that holds a route row until the end of the transaction, with the route id as
+    /// its only parameter, or null where none is taken: SQLite has no <c>FOR UPDATE</c>, and its
+    /// single writer already serializes the creation. Table and column names come from the model,
+    /// quoted as the provider quotes them.
+    /// </summary>
+    internal static string? RouteLockSql(DbContext db)
+    {
+        var provider = db.Database.ProviderName ?? string.Empty;
+        if (!provider.Contains("MySql", StringComparison.OrdinalIgnoreCase)
+            && !provider.Contains("Npgsql", StringComparison.OrdinalIgnoreCase)
+            && !provider.Contains("PostgreSQL", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        var entity = db.Model.FindEntityType(typeof(HttpRouteMapping))!;
+        var table = StoreObjectIdentifier.Table(entity.GetTableName()!, entity.GetSchema());
+        var sql = db.GetService<ISqlGenerationHelper>();
+        var id = sql.DelimitIdentifier(entity.FindProperty(nameof(HttpRouteMapping.Id))!.GetColumnName(table)!);
+        return $"SELECT {id} FROM {sql.DelimitIdentifier(table.Name, table.Schema)} WHERE {id} = {{0}} FOR UPDATE";
+    }
+
+    /// <summary>
+    /// Serializes the share creations of one route, on every instance, so that two of them cannot
+    /// both count the same number of active shares. It must be the transaction's first statement:
+    /// MySQL's REPEATABLE READ snapshot then starts only after the lock is granted, so the count
+    /// sees the share committed by the creation that held it. A route that is gone has no row to
+    /// lock, and the creation goes on as it would without the lock.
+    /// </summary>
+    private async Task LockRouteForCreationAsync(long routeId, CancellationToken cancellationToken)
+    {
+        var sql = RouteLockSql(_db);
+        if (sql is not null)
+        {
+            await _db.Database.ExecuteSqlRawAsync(sql, [routeId], cancellationToken).ConfigureAwait(false);
         }
     }
 
