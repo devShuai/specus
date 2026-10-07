@@ -4,6 +4,8 @@
 
 #include "crypto.h"
 #include "json.h"
+#include "public_coordination.h"
+#include "public_discovery.h"
 #include "public_room.h"
 #include "storage.h"
 
@@ -863,9 +865,12 @@ static int object_pending_count(sqlite3 *db, long long room_id, long long *count
     return 0;
 }
 
+/* 1 allowed, 0 rate limited, -1 the cluster's shared window is unavailable (fails closed). */
 static int object_rate_allow(const char *address, int limit, int window_seconds)
 {
     if (address == NULL || *address == '\0') address = "unknown";
+    if (st_public_coordination_enabled())
+        return st_public_discovery_shared_rate_allow("presign-upload", address, limit, window_seconds);
     time_t now = time(NULL);
     pthread_mutex_lock(&object_rate_lock);
     st_object_rate_window **cursor = &object_rate_windows;
@@ -1436,9 +1441,12 @@ static int object_create_upload(const st_object_config *config,
         return object_error(out, out_len, 400, public_scope
             ? "invalid attachment request or room credential" : "target client is not accessible or attachment request is invalid");
     }
-    if (public_scope && !object_rate_allow(remote_address, config->presign_rate_limit, config->presign_rate_window)) {
+    int rate = public_scope
+        ? object_rate_allow(remote_address, config->presign_rate_limit, config->presign_rate_window) : 1;
+    if (rate <= 0) {
         free(room_token);
-        return object_error(out, out_len, 429, "presign upload rate limit exceeded");
+        return object_error(out, out_len, 429, rate < 0 ? "presign upload rate limit is unavailable"
+                                                        : "presign upload rate limit exceeded");
     }
     free(room_token);
     sqlite3 *db = NULL;

@@ -739,6 +739,19 @@ int st_public_discovery_name_availability_response(const char *path,
     return public_write_response(out, out_len, 200, "OK", response);
 }
 
+int st_public_discovery_shared_rate_allow(const char *bucket,
+                                          const char *identity,
+                                          long limit,
+                                          long window_seconds)
+{
+    int allowed = 0;
+    if (!st_public_coordination_enabled() || st_public_discovery_initialize() != 0
+        || st_public_coordination_allow_rate(bucket, identity, limit, window_seconds, &allowed) != 0) {
+        return -1;
+    }
+    return allowed ? 1 : 0;
+}
+
 static int public_builder_reserve(st_public_builder *builder, size_t extra)
 {
     if (builder == NULL || extra > SIZE_MAX - builder->len - 1U) return -1;
