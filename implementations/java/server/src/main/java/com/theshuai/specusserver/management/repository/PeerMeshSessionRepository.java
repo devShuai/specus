@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.management.repository;
 
 import com.theshuai.specusserver.management.model.PeerMeshSession;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -40,6 +41,7 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
             Long targetClientId,
             String closedStatus);
 
+    /** {@code expiresAt} and the column are {@link SortableInstant} text, so the string order is the time order. */
     List<PeerMeshSession> findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(
             String status,
             String expiresAt,

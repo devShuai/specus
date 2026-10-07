@@ -4,6 +4,7 @@ import com.theshuai.specusserver.config.MediaCaptureProperties;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.model.HttpMediaCapture;
 import com.theshuai.specusserver.management.model.HttpRouteMapping;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.HttpMediaCaptureRepository;
 import com.theshuai.specusserver.management.repository.HttpMediaReferenceRepository;
@@ -22,6 +23,7 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
@@ -293,6 +295,10 @@ class HttpMediaCaptureServiceTests {
             fixture.service.cleanupExpired();
 
             assertThat(Instant.parse(capture.getExpiresAt())).isAfter(now.plusSeconds(4L * 24L * 60L * 60L));
+            // The sweep compares the stored expiry with a fixed-width now as text.
+            assertThat(capture.getExpiresAt()).hasSize(SortableInstant.LENGTH);
+            verify(fixture.captureRepository).findTop200ByStateInAndExpiresAtBeforeOrderByIdAsc(
+                    any(), argThat(cutoff -> cutoff.length() == SortableInstant.LENGTH));
             verify(fixture.captureRepository).save(capture);
             verify(fixture.captureRepository, never()).delete(capture);
             verify(fixture.storage, never()).delete(any());

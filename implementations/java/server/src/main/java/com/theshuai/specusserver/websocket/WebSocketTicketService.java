@@ -3,6 +3,7 @@ package com.theshuai.specusserver.websocket;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.theshuai.common.security.HmacSigner;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.WebSocketTicket;
 import com.theshuai.specusserver.management.repository.WebSocketTicketRepository;
 import org.springframework.stereotype.Service;
@@ -33,7 +34,7 @@ public class WebSocketTicketService {
     @Transactional
     public IssuedTicket issue(Scope scope, Map<String, Object> attributes, String remoteAddress) {
         Instant now = Instant.now();
-        repository.deleteExpired(now.toString());
+        repository.deleteExpired(SortableInstant.format(now));
         byte[] random = new byte[32];
         secureRandom.nextBytes(random);
         String rawTicket = Base64.getUrlEncoder().withoutPadding().encodeToString(random);
@@ -43,9 +44,10 @@ public class WebSocketTicketService {
         entity.setAttributesJson(writeAttributes(attributes));
         entity.setRemoteAddressHash(StringUtils.hasText(remoteAddress) ? hash(remoteAddress.trim()) : null);
         entity.setCreatedAt(now.toString());
-        entity.setExpiresAt(now.plusSeconds(TTL_SECONDS).toString());
+        Instant expiresAt = now.plusSeconds(TTL_SECONDS);
+        entity.setExpiresAt(SortableInstant.format(expiresAt));
         repository.save(entity);
-        return new IssuedTicket(rawTicket, entity.getExpiresAt());
+        return new IssuedTicket(rawTicket, expiresAt.toString());
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -64,7 +66,7 @@ public class WebSocketTicketService {
                 return Optional.empty();
             }
         }
-        if (repository.consume(tokenHash, scope.wireName(), Instant.now().toString()) != 1) {
+        if (repository.consume(tokenHash, scope.wireName(), SortableInstant.format(Instant.now())) != 1) {
             return Optional.empty();
         }
         return Optional.of(readAttributes(entity.getAttributesJson()));

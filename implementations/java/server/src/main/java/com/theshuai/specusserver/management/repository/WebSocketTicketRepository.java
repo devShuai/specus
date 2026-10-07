@@ -1,11 +1,13 @@
 package com.theshuai.specusserver.management.repository;
 
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.WebSocketTicket;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+/** Every {@code now} and {@code expiresAt} is {@link SortableInstant} text, so the string order is the time order. */
 public interface WebSocketTicketRepository extends JpaRepository<WebSocketTicket, String> {
     @Modifying
     @Query("""

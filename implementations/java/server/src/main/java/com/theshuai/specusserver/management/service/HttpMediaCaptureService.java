@@ -7,6 +7,7 @@ import com.theshuai.specusserver.management.model.HttpMediaCapture;
 import com.theshuai.specusserver.management.model.HttpMediaCaptureView;
 import com.theshuai.specusserver.management.model.HttpMediaReference;
 import com.theshuai.specusserver.management.model.HttpRouteMapping;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.HttpMediaCaptureRepository;
 import com.theshuai.specusserver.management.repository.HttpMediaReferenceRepository;
@@ -202,7 +203,8 @@ public class HttpMediaCaptureService {
         capture.setState(STATE_STARTING);
         capture.setResponseHeaders(joinHeaders(responseHeaders));
         capture.setCapturedAt(now.toString());
-        capture.setExpiresAt(now.plusSeconds(Math.max(60, properties.getRetentionSeconds())).toString());
+        capture.setExpiresAt(SortableInstant.format(
+                now.plusSeconds(Math.max(60, properties.getRetentionSeconds()))));
         HttpMediaCapture saved;
         try {
             saved = captureRepository.saveAndFlush(capture);
@@ -338,7 +340,7 @@ public class HttpMediaCaptureService {
         List<HttpMediaCapture> expired = captureRepository
                 .findTop200ByStateInAndExpiresAtBeforeOrderByIdAsc(
                         List.of(STATE_STARTING, STATE_CAPTURING, STATE_COMPLETE, STATE_INCOMPLETE, STATE_FAILED),
-                        now.toString());
+                        SortableInstant.format(now));
         int extended = 0;
         int deleted = 0;
         for (HttpMediaCapture capture : expired) {
@@ -381,7 +383,7 @@ public class HttpMediaCaptureService {
             if (!configuredExpiry.isAfter(now) || !configuredExpiry.isAfter(storedExpiry)) {
                 return false;
             }
-            capture.setExpiresAt(configuredExpiry.toString());
+            capture.setExpiresAt(SortableInstant.format(configuredExpiry));
             captureRepository.save(capture);
             return true;
         } catch (RuntimeException invalidTimestamp) {
@@ -449,7 +451,8 @@ public class HttpMediaCaptureService {
                     capture.getMediaKind(), capture.getSourceUrl(), text);
             capture.setLiveStream(parsed.live());
             if (parsed.live()) {
-                capture.setExpiresAt(now.plusSeconds(Math.max(60, properties.getLiveWindowSeconds())).toString());
+                capture.setExpiresAt(SortableInstant.format(
+                        now.plusSeconds(Math.max(60, properties.getLiveWindowSeconds()))));
                 markLiveWindow(capture, parsed, now);
             }
             saveManifestReferences(capture, parsed);
@@ -463,7 +466,8 @@ public class HttpMediaCaptureService {
     private void markLiveWindow(HttpMediaCapture manifest,
                                 HttpMediaManifestSupport.ParsedManifest parsed,
                                 Instant now) {
-        String expiresAt = now.plusSeconds(Math.max(60, properties.getLiveWindowSeconds())).toString();
+        String expiresAt = SortableInstant.format(
+                now.plusSeconds(Math.max(60, properties.getLiveWindowSeconds())));
         Instant recentCutoff = now.minusSeconds(Math.max(60, properties.getLiveWindowSeconds()));
         Map<Long, HttpMediaCapture> related = new java.util.LinkedHashMap<>();
         for (HttpMediaManifestSupport.ManifestReference reference : parsed.references()) {
@@ -571,7 +575,7 @@ public class HttpMediaCaptureService {
                 playback.message(),
                 row.getCapturedAt(),
                 row.getCompletedAt(),
-                row.getExpiresAt());
+                SortableInstant.toInstantString(row.getExpiresAt()));
     }
 
     private PlaybackStatus playbackStatus(HttpMediaCapture row) {
@@ -705,7 +709,7 @@ public class HttpMediaCaptureService {
                         expectedResponseBytes,
                         contentEncoding,
                         STATE_COMPLETE,
-                        now.toString())
+                        SortableInstant.format(now))
                 .isPresent();
     }
 
