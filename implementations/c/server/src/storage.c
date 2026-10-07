@@ -573,7 +573,9 @@ int st_storage_init(const char *path, int seed_demo_client)
         "response_preview_text TEXT,"
         "request_truncated INTEGER NOT NULL DEFAULT 0,"
         "response_truncated INTEGER NOT NULL DEFAULT 0,"
-        "captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        "captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "request_body_data BLOB,"
+        "response_body_data BLOB"
         ");"
         "CREATE TABLE IF NOT EXISTS specus_tcp_traffic_frame ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -786,6 +788,12 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "disconnect_reason", "TEXT");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_http_traffic_exchange", "request_body_data", "BLOB");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_http_traffic_exchange", "response_body_data", "BLOB");
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "connection_stat", "client_id", "INTEGER");
@@ -1397,6 +1405,10 @@ static void bind_nullable_text_limit(sqlite3_stmt *stmt, int index, const char *
 
 static int scan_http_exchange(sqlite3_stmt *stmt, st_storage_http_exchange *item)
 {
+    item->request_body_data = NULL;
+    item->request_body_data_len = 0U;
+    item->response_body_data = NULL;
+    item->response_body_data_len = 0U;
     item->id = sqlite3_column_int64(stmt, 0);
     if (copy_text_column(stmt, 1, item->tenant_id, sizeof(item->tenant_id)) != 0
         || copy_text_column(stmt, 3, item->client_name, sizeof(item->client_name)) != 0
@@ -1429,6 +1441,32 @@ static int scan_http_exchange(sqlite3_stmt *stmt, st_storage_http_exchange *item
     item->request_truncated = sqlite3_column_int(stmt, 26) != 0;
     item->response_truncated = sqlite3_column_int(stmt, 27) != 0;
     return 0;
+}
+
+/* Copies a BLOB column into *out (NULL when empty or NULL); -1 when out of memory. */
+static int copy_blob_column(sqlite3_stmt *stmt, int column, uint8_t **out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    const void *blob = sqlite3_column_blob(stmt, column);
+    int len = sqlite3_column_bytes(stmt, column);
+    if (blob == NULL || len <= 0) return 0;
+    *out = (uint8_t *)malloc((size_t)len);
+    if (*out == NULL) return -1;
+    memcpy(*out, blob, (size_t)len);
+    *out_len = (size_t)len;
+    return 0;
+}
+
+void st_storage_http_exchange_free_bodies(st_storage_http_exchange *item)
+{
+    if (item == NULL) return;
+    free(item->request_body_data);
+    free(item->response_body_data);
+    item->request_body_data = NULL;
+    item->request_body_data_len = 0U;
+    item->response_body_data = NULL;
+    item->response_body_data_len = 0U;
 }
 
 static int scan_tcp_frame(sqlite3_stmt *stmt, st_storage_tcp_frame *frame, int include_payload)
@@ -6715,8 +6753,8 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
         "status_code, success, error, remote_address, request_bytes, response_bytes, elapsed_ms, "
         "request_content_type, response_content_type, response_body_type, request_headers, response_headers, "
         "request_preview_hex, request_preview_text, response_preview_hex, response_preview_text, "
-        "request_truncated, response_truncated, captured_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "request_truncated, response_truncated, captured_at, request_body_data, response_body_data) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -6750,10 +6788,27 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
         bind_nullable_text(stmt, 23, request_text);
         bind_nullable_text(stmt, 24, response_hex);
         bind_nullable_text(stmt, 25, response_text);
-        /* C keeps previews, not bodies: truncated says the preview holds less than the body. */
-        sqlite3_bind_int(stmt, 26, record->request_body_len > preview_bytes ? 1 : 0);
-        sqlite3_bind_int(stmt, 27, record->response_body_len > preview_bytes ? 1 : 0);
+        /*
+         * The first ST_TRAFFIC_BODY_CAPTURE_BYTES of each body; truncated says the body was longer
+         * than what was kept. A body handed over as nothing (one media capture took) is not.
+         */
+        size_t request_kept = record->request_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+            ? record->request_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+        size_t response_kept = record->response_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+            ? record->response_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+        sqlite3_bind_int(stmt, 26, request_kept > 0U && record->request_bytes > (long long)request_kept ? 1 : 0);
+        sqlite3_bind_int(stmt, 27, response_kept > 0U && record->response_bytes > (long long)response_kept ? 1 : 0);
         sqlite3_bind_text(stmt, 28, record->captured_at == NULL ? "" : record->captured_at, -1, SQLITE_TRANSIENT);
+        if (request_kept > 0U) {
+            sqlite3_bind_blob(stmt, 29, record->request_body, (int)request_kept, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 29);
+        }
+        if (response_kept > 0U) {
+            sqlite3_bind_blob(stmt, 30, record->response_body, (int)response_kept, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 30);
+        }
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -8067,7 +8122,7 @@ int st_storage_get_http_exchange_visible(const char *path,
               "h.request_content_type, h.response_content_type, h.response_body_type, "
               "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
               "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
-              "h.response_truncated, h.captured_at "
+              "h.response_truncated, h.captured_at, h.request_body_data, h.response_body_data "
               "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id "
               "WHERE h.id = ? AND c.tenant_id = ?"
             : "SELECT h.id, h.tenant_id, h.client_id, h.client_name, h.route, h.resource_id, "
@@ -8076,7 +8131,7 @@ int st_storage_get_http_exchange_visible(const char *path,
               "h.request_content_type, h.response_content_type, h.response_body_type, "
               "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
               "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
-              "h.response_truncated, h.captured_at "
+              "h.response_truncated, h.captured_at, h.request_body_data, h.response_body_data "
               "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id "
               "WHERE h.id = ? AND c.tenant_id = ? AND c.owner_username = ?",
         -1,
@@ -8094,7 +8149,11 @@ int st_storage_get_http_exchange_visible(const char *path,
     rc = sqlite3_step(stmt);
     int result = 0;
     if (rc == SQLITE_ROW) {
-        result = scan_http_exchange(stmt, item) == 0 ? 0 : -1;
+        result = scan_http_exchange(stmt, item) == 0
+            && copy_blob_column(stmt, 29, &item->request_body_data, &item->request_body_data_len) == 0
+            && copy_blob_column(stmt, 30, &item->response_body_data, &item->response_body_data_len) == 0
+            ? 0 : -1;
+        if (result != 0) st_storage_http_exchange_free_bodies(item);
         *found = result == 0;
     } else if (rc != SQLITE_DONE) {
         result = -1;

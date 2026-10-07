@@ -436,6 +436,14 @@ typedef struct {
     int request_truncated;
     int response_truncated;
     char captured_at[64];
+    /*
+     * The stored bodies (at most ST_TRAFFIC_BODY_CAPTURE_BYTES each), read only by the detail
+     * lookup; NULL in a list. Freed by st_storage_http_exchange_free_bodies.
+     */
+    uint8_t *request_body_data;
+    size_t request_body_data_len;
+    uint8_t *response_body_data;
+    size_t response_body_data_len;
 } st_storage_http_exchange;
 
 typedef struct {
@@ -1265,9 +1273,9 @@ int st_storage_list_peer_mesh_service_audits(const char *path,
                                              size_t *event_count);
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record);
 /*
- * A page of exchange summaries: as Java's summary views, the headers and the request/response
- * previews are neither read nor returned (left empty); st_storage_get_http_exchange_visible
- * reads one exchange with them.
+ * A page of exchange summaries: as Java's summary views, the headers, the request/response
+ * previews and the stored bodies are neither read nor returned (left empty);
+ * st_storage_get_http_exchange_visible reads one exchange with them.
  */
 int st_storage_list_http_exchanges_visible(const char *path,
                                            long long client_id,
@@ -1291,6 +1299,8 @@ int st_storage_get_http_exchange_visible(const char *path,
                                          int include_all_clients,
                                          st_storage_http_exchange *item,
                                          int *found);
+/* Frees the bodies a detail lookup read into item; item itself stays the caller's. */
+void st_storage_http_exchange_free_bodies(st_storage_http_exchange *item);
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record);
 int st_storage_list_tcp_frames_visible(const char *path,
                                        long long client_id,

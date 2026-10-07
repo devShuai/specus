@@ -297,8 +297,9 @@ static void test_store(void)
                    detail->response_preview_text);
             EXPECT(strncmp(detail->response_preview_hex, "1F 8B 08", 8U) == 0, "gzip hex %s",
                    detail->response_preview_hex);
+            /* Both bodies were kept whole, so neither is truncated, however short the previews. */
             EXPECT(strcmp(detail->request_preview_text, "ping") == 0 && !detail->request_truncated
-                       && detail->response_truncated,
+                       && !detail->response_truncated,
                    "request preview %s, truncated %d/%d", detail->request_preview_text, detail->request_truncated,
                    detail->response_truncated);
             EXPECT(strstr(detail->response_headers, "Content-Encoding: gzip") != NULL, "detail headers %s",

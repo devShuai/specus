@@ -2832,11 +2832,16 @@ static void record_direct_http_traffic(const char *client_name,
                                              download_bytes);
 }
 
+/*
+ * response_externalized: media capture stored the response body, so the record keeps its size
+ * but not its bytes (Java TrafficInspectionService, externalizedMediaKeepsActualSizeWithout...).
+ */
 static void record_direct_http_exchange(const char *client_name,
                                         const char *route,
                                         const st_direct_http_request *request,
                                         const st_direct_http_response *response,
                                         size_t response_bytes,
+                                        int response_externalized,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
@@ -2911,8 +2916,8 @@ static void record_direct_http_exchange(const char *client_name,
         .response_headers = response_headers,
         .request_body = request->body,
         .request_body_len = request->body_len,
-        .response_body = response->body,
-        .response_body_len = response->body_len,
+        .response_body = response_externalized ? NULL : response->body,
+        .response_body_len = response_externalized ? 0U : response->body_len,
         .request_content_encoding = request_content_encoding,
         .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
@@ -4009,12 +4014,29 @@ static int append_http_exchange_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
+    /*
+     * The detail's preview texts are the stored bodies as Java's HttpBodyDataCodec shows them: the
+     * decoded text, or data:<type>;base64,... for a binary body.
+     */
+    char *request_text = NULL;
+    char *response_text = NULL;
+    if (rc == 0 && detail) {
+        request_text = st_traffic_body_display_text(item->request_body_data, item->request_body_data_len,
+                                                    item->request_content_type, item->request_headers,
+                                                    item->request_preview_text);
+        response_text = st_traffic_body_display_text(item->response_body_data, item->response_body_data_len,
+                                                     item->response_content_type, item->response_headers,
+                                                     item->response_preview_text);
+        rc = request_text != NULL && response_text != NULL ? 0 : -1;
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_text : NULL);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, request_text);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_text : NULL);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, response_text);
+    free(request_text);
+    free(response_text);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -6509,6 +6531,7 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
     }
     st_admin_string_builder builder = {0};
     int rc = append_http_exchange_view(&builder, match, 1);
+    st_storage_http_exchange_free_bodies(match);
     free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -13040,7 +13063,7 @@ static void record_direct_http_failure(const char *client_name,
             .error = (char *)(failure == NULL ? public_message : failure)
         };
         long long elapsed_ms = admin_now_ms() - started_ms;
-        record_direct_http_exchange(client_name, route, request, &response, body_len, remote_address,
+        record_direct_http_exchange(client_name, route, request, &response, body_len, 0, remote_address,
                                     elapsed_ms < 0 ? 0 : elapsed_ms);
     }
     free(body);
@@ -13272,6 +13295,8 @@ typedef struct {
     const char *method;
     const char *source_url;
     st_media_capture_session *media_capture;
+    /* Media capture took the response body (Java responseBodyExternalized): the detail keeps none. */
+    int response_externalized;
     st_direct_http_response response;
     char **trailer_names;
     size_t trailer_names_len;
@@ -13737,6 +13762,7 @@ static int direct_sink_on_headers(void *ctx,
                                                 status_code,
                                                 state->response.headers,
                                                 state->response.headers_len);
+    state->response_externalized = st_media_capture_externalized(state->media_capture);
     state->buffer_for_rewrite = state->trailer_names_len == 0U
         && direct_should_buffer_rewrite(
             state->client_name, state->route, state->response.headers,
@@ -16268,7 +16294,8 @@ static void admin_forward_direct_http(st_admin_server *server,
         record_direct_http_traffic(client_name, route, (long long)body_len,
                                    (long long)sink_state.response_bytes);
         record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                    sink_state.response_bytes, remote_address, elapsed_ms);
+                                    sink_state.response_bytes, sink_state.response_externalized,
+                                    remote_address, elapsed_ms);
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
         /* The share ended mid-exchange: the public connection was already shut down. */
     } else {
@@ -16291,7 +16318,8 @@ static void admin_forward_direct_http(st_admin_server *server,
             free(sink_state.response.error);
             sink_state.response.error = admin_dup_string(failure);
             record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                        sink_state.response_bytes, remote_address, elapsed_ms);
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
         }
     }
 
@@ -17354,8 +17382,12 @@ static void handle_client(st_admin_server *server, int fd)
         }
     }
     if (strncmp(path, "/api/admin/http-routes/", strlen("/api/admin/http-routes/")) == 0
-        || admin_path_equals(path, "/api/admin/http-access-audit")) {
-        /* A route keeps its ended shares for 30 days and an audit page holds up to 200 entries. */
+        || admin_path_equals(path, "/api/admin/http-access-audit")
+        || strncmp(path, "/api/admin/traffic/http-exchanges/", strlen("/api/admin/traffic/http-exchanges/")) == 0) {
+        /*
+         * A route keeps its ended shares for 30 days and an audit page holds up to 200 entries; an
+         * exchange's detail carries both stored bodies, up to 64 KiB each, as text or data: URLs.
+         */
         response_capacity = 2U * 1024U * 1024U;
         response = (char *)malloc(response_capacity);
         if (response == NULL) {

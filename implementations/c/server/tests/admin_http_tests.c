@@ -2726,7 +2726,8 @@ static int test_admin_endpoint_contracts(void)
             "\"responseBytes\":34", "\"elapsedMs\":5", "\"requestContentType\":", "\"responseContentType\":",
             "\"responseBodyType\":\"json\"", "\"requestHeaders\":", "\"responseHeaders\":", "\"requestPreviewHex\":",
             "\"requestPreviewText\":", "\"responsePreviewHex\":", "\"responsePreviewText\":",
-            "\"requestTruncated\":false", "\"responseTruncated\":false", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
+            /* The fixture hands over 11 of its 34 response bytes, so the kept response is truncated. */
+            "\"requestTruncated\":false", "\"responseTruncated\":true", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
         };
         len = endpoint_call("GET", path, "alice", "tenant-a", "USER", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", expected_id, "exchange detail for its owner") != 0;
