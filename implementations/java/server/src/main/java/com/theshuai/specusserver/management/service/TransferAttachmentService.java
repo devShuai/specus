@@ -3,6 +3,7 @@ package com.theshuai.specusserver.management.service;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.config.ObjectStorageProperties;
 import com.theshuai.specusserver.config.PublicTransferProperties;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.TransferAttachment;
 import com.theshuai.specusserver.management.model.TransferAttachmentDownloadGrant;
 import com.theshuai.specusserver.management.model.TransferAttachmentDownloadUsage;
@@ -111,7 +112,7 @@ public class TransferAttachmentService {
             Instant now = clock.instant();
             YearMonth month = YearMonth.from(now.atOffset(ZoneOffset.UTC));
             long used = Math.max(0L, repository.sumActiveStorageBytes(tenant, username, Long.MIN_VALUE,
-                    STATUS_PENDING, STATUS_UPLOADED, now.toString()));
+                    STATUS_PENDING, STATUS_UPLOADED, SortableInstant.format(now)));
             long downloaded = Math.max(0L, downloadUsageRepository.sumBytesByAccountAndMonth(
                     tenant, username, month.toString()));
             long storageLimit = properties.getPerUserStorageQuotaBytes() > 0
@@ -243,8 +244,8 @@ public class TransferAttachmentService {
                     properties.getPerUserMonthlyDownloadQuotaBytes(),
                     "本月 OSS 下载流量额度不足");
 
-            String consumedAt = now.toString();
-            if (downloadGrantRepository.consume(grant.getId(), tokenHash, consumedAt, consumedAt) != 1) {
+            if (downloadGrantRepository.consume(grant.getId(), tokenHash, SortableInstant.format(now),
+                    now.toString()) != 1) {
                 return Optional.empty();
             }
             PresignedObjectUrl direct = objectStorageService.presignDownload(
@@ -298,10 +299,11 @@ public class TransferAttachmentService {
     @Scheduled(fixedDelayString = "${specus.object-storage.expiration-scan-interval-ms:3600000}")
     @Transactional
     public void expireOldAttachments() {
-        String now = Instant.now().toString();
+        Instant now = Instant.now();
+        String cutoff = SortableInstant.format(now);
         while (true) {
             List<TransferAttachment> expired = repository.findTop100ByExpiresAtBeforeAndStatusNotOrderByExpiresAtAsc(
-                    now, STATUS_EXPIRED);
+                    cutoff, STATUS_EXPIRED);
             if (expired.isEmpty()) {
                 return;
             }
@@ -310,7 +312,7 @@ public class TransferAttachmentService {
                     objectStorageService.deleteObject(attachment.getObjectKey());
                 }
                 attachment.setStatus(STATUS_EXPIRED);
-                attachment.setUpdatedAt(now);
+                attachment.setUpdatedAt(now.toString());
                 repository.save(attachment);
             }
             repository.flush();
@@ -354,7 +356,7 @@ public class TransferAttachmentService {
             attachment.setStatus(STATUS_PENDING);
             attachment.setCreatedAt(now.toString());
             attachment.setUpdatedAt(now.toString());
-            attachment.setExpiresAt(expiresAt.toString());
+            attachment.setExpiresAt(SortableInstant.format(expiresAt));
 
             objectStorageService.validateObjectKey(attachment.getObjectKey());
             PresignedObjectUrl upload = objectStorageService.presignUpload(
@@ -362,7 +364,7 @@ public class TransferAttachmentService {
                     mimeType,
                     Duration.ofSeconds(properties.getUploadUrlTtlSeconds())
             );
-            attachment.setUploadExpiresAt(upload.expiresAt());
+            attachment.setUploadExpiresAt(SortableInstant.normalize(upload.expiresAt()));
             try {
                 repository.saveAndFlush(attachment);
                 return new PresignUploadResponse(
@@ -407,7 +409,7 @@ public class TransferAttachmentService {
     @Scheduled(fixedDelayString = "${specus.object-storage.expiration-scan-interval-ms:3600000}")
     @Transactional
     public void purgeExpiredDownloadGrants() {
-        downloadGrantRepository.deleteByExpiresAtBefore(Instant.now().toString());
+        downloadGrantRepository.deleteByExpiresAtBefore(SortableInstant.format(Instant.now()));
     }
 
     private TransferAttachmentView complete(TransferAttachment attachment,
@@ -510,10 +512,10 @@ public class TransferAttachmentService {
             grant.setUsername(username);
             grant.setAttachmentId(attachment.getId());
             grant.setCreatedAt(now.toString());
-            grant.setExpiresAt(expiresAt.toString());
+            grant.setExpiresAt(SortableInstant.format(expiresAt));
             try {
                 downloadGrantRepository.saveAndFlush(grant);
-                return new DownloadGrantValue(grant.getId(), token, grant.getExpiresAt());
+                return new DownloadGrantValue(grant.getId(), token, expiresAt.toString());
             } catch (DataIntegrityViolationException exception) {
                 if (attempt == 7) {
                     throw exception;
@@ -533,7 +535,7 @@ public class TransferAttachmentService {
                 excludedAttachmentId,
                 STATUS_PENDING,
                 STATUS_UPLOADED,
-                Instant.now().toString()
+                SortableInstant.format(Instant.now())
         );
         ensureWithinQuota(usedBytes, requestedBytes, properties.getPerUserStorageQuotaBytes(),
                 "OSS 存储额度不足");
@@ -624,7 +626,8 @@ public class TransferAttachmentService {
                 attachment.getSizeBytes(),
                 attachment.getSha256(),
                 attachment.getStatus(),
-                attachment.getExpiresAt()
+                // Stored fixed-width for the queries; the API keeps the Instant.toString() form.
+                Instant.parse(attachment.getExpiresAt()).toString()
         );
     }
 
