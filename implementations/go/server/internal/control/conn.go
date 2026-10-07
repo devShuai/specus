@@ -194,13 +194,26 @@ func (c *Conn) Close(reason string) {
 // Send serializes and writes a packet, updating the write-idle timestamp. It is safe to call
 // from multiple goroutines.
 func (c *Conn) Send(packet protocol.Packet) error {
+	return c.CommitAndSend(nil, packet)
+}
+
+// CommitAndSend runs commit and then writes packet while holding the write lock across both,
+// so a frame another goroutine sends because of what commit published (such as a stream OPEN
+// on a connection commit just registered) always follows packet on the wire. commit must not
+// write to c. When packet cannot be encoded, commit does not run.
+func (c *Conn) CommitAndSend(commit func(), packet protocol.Packet) error {
 	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
 	if err != nil {
 		return err
 	}
 	trackedBytes := c.WriteBackpressure.AddPending(len(frame))
 	defer c.WriteBackpressure.ReleasePending(trackedBytes)
-	return c.writeFrame(frame)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if commit != nil {
+		commit()
+	}
+	return c.writeFrameLocked(frame)
 }
 
 // SendPriority queues a small flow-control packet without blocking the read loop on a
@@ -224,6 +237,10 @@ func (c *Conn) SendPriority(packet protocol.Packet) error {
 func (c *Conn) writeFrame(frame []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeFrameLocked(frame)
+}
+
+func (c *Conn) writeFrameLocked(frame []byte) error {
 	if _, err := c.writer.Write(frame); err != nil {
 		return err
 	}
