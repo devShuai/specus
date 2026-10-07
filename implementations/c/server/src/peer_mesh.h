@@ -72,4 +72,11 @@ char *st_peer_mesh_build_login_config(const char *database_path,
                                       const char *client_name,
                                       int client_peer_service_version);
 
+/*
+ * Normalises a peer service target to a numeric local address, as Java
+ * PeerServiceDiscovery.requireTargetHost does: localhost, or a loopback, private, link-local or
+ * unique-local unicast IP. 0 with the address in out, -1 when the host is anything else.
+ */
+int st_peer_mesh_normalize_local_host(const char *value, char out[256]);
+
 #endif

@@ -955,10 +955,17 @@ static int pm_normalize_local_host(const char *value, char out[256])
     const unsigned char *bytes = ipv6.s6_addr;
     int loopback = IN6_IS_ADDR_LOOPBACK(&ipv6);
     int link_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0x80U;
+    /* fec0::/10, which Java's isSiteLocalAddress still counts as local. */
+    int site_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0xc0U;
     int unique_local = (bytes[0] & 0xfeU) == 0xfcU;
-    if ((!loopback && !link_local && !unique_local) || IN6_IS_ADDR_UNSPECIFIED(&ipv6)
+    if ((!loopback && !link_local && !site_local && !unique_local) || IN6_IS_ADDR_UNSPECIFIED(&ipv6)
         || IN6_IS_ADDR_MULTICAST(&ipv6)) return -1;
     return inet_ntop(AF_INET6, &ipv6, out, 256U) == NULL ? -1 : 0;
+}
+
+int st_peer_mesh_normalize_local_host(const char *value, char out[256])
+{
+    return pm_normalize_local_host(value, out);
 }
 
 static int pm_read_mdns_candidates(const char *message,

@@ -5329,6 +5329,108 @@ static int peer_service_allowed_ids(const char *body, char out[512], int preserv
     return 0;
 }
 
+/* value without surrounding whitespace; 0 when it does not fit out. */
+static int peer_service_trimmed(const char *value, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (value == NULL) return 1;
+    while (isspace((unsigned char)*value)) ++value;
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) --len;
+    if (len >= out_len) return 0;
+    memcpy(out, value, len);
+    out[len] = '\0';
+    return 1;
+}
+
+/*
+ * A name or description (Java requireName / normalizeDescription): trimmed, no control characters,
+ * at most max characters. A value longer than the stored field is refused, never cut short.
+ */
+static int peer_service_text_field(const char *raw, size_t min_len, size_t max_len, char *out, size_t out_len)
+{
+    char value[1024];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    size_t len = strlen(value);
+    if (len < min_len || len > max_len || len >= out_len) return 0;
+    for (size_t i = 0U; i < len; ++i) {
+        if ((unsigned char)value[i] < 32U) return 0;
+    }
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
+static void peer_service_lower(char *value)
+{
+    for (; *value != '\0'; ++value) *value = (char)tolower((unsigned char)*value);
+}
+
+/* Java requireApplication: one of http, https, ssh, tcp, udp, in any case. */
+static int peer_service_application(const char *raw, char *out, size_t out_len)
+{
+    char value[16];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    peer_service_lower(value);
+    if (strcmp(value, "http") != 0 && strcmp(value, "https") != 0 && strcmp(value, "ssh") != 0
+        && strcmp(value, "tcp") != 0 && strcmp(value, "udp") != 0) return 0;
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
+/*
+ * Java requireTransportForApplication: tcp or udp, defaulting by application, and udp exactly for
+ * the udp application. An http, https, ssh or tcp service on udp, or a udp service on tcp, is
+ * refused rather than published with a transport its client cannot use.
+ */
+static int peer_service_transport(const char *raw, const char *application, char *out, size_t out_len)
+{
+    char value[16];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    peer_service_lower(value);
+    int udp_application = strcmp(application, "udp") == 0;
+    if (value[0] == '\0') snprintf(value, sizeof(value), "%s", udp_application ? "udp" : "tcp");
+    if (strcmp(value, "tcp") != 0 && strcmp(value, "udp") != 0) return 0;
+    if (udp_application != (strcmp(value, "udp") == 0)) return 0;
+    snprintf(out, out_len, "%s", udp_application ? "udp" : "tcp");
+    return 1;
+}
+
+/*
+ * Java normalizePath: "/" for http and https and empty otherwise when absent; else a relative HTTP
+ * path of at most 128 characters from [A-Za-z0-9._~/-] that starts with "/" and has no "..": a
+ * URL, a backslash or a script scheme is refused.
+ */
+static int peer_service_path(const char *raw, const char *application, char *out, size_t out_len)
+{
+    char value[256];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    if (value[0] == '\0') {
+        snprintf(out, out_len, "%s",
+                 strcmp(application, "http") == 0 || strcmp(application, "https") == 0 ? "/" : "");
+        return 1;
+    }
+    size_t len = strlen(value);
+    if (value[0] != '/' || len > 128U || len >= out_len || strstr(value, "..") != NULL) return 0;
+    for (size_t i = 0U; i < len; ++i) {
+        unsigned char c = (unsigned char)value[i];
+        if (!isalnum(c) && strchr("._~/-", c) == NULL) return 0;
+    }
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
+/* Java requireVisibility: OWNER when absent, otherwise OWNER or ACL in any case. */
+static int peer_service_visibility(const char *raw, char *out, size_t out_len)
+{
+    char value[16];
+    if (!peer_service_trimmed(raw, value, sizeof(value))) return 0;
+    for (char *cursor = value; *cursor != '\0'; ++cursor) *cursor = (char)toupper((unsigned char)*cursor);
+    if (value[0] == '\0') snprintf(value, sizeof(value), "OWNER");
+    if (strcmp(value, "OWNER") != 0 && strcmp(value, "ACL") != 0) return 0;
+    snprintf(out, out_len, "%s", value);
+    return 1;
+}
+
 static int handle_peer_mesh_service_mutation(const st_admin_context *context,
                                              long long id,
                                              const char *body,
@@ -5375,35 +5477,48 @@ static int handle_peer_mesh_service_mutation(const st_admin_context *context,
                                          "svc-%lld-%lld", service.client_id, current_time_millis());
         else snprintf(service.service_id, sizeof(service.service_id), "%s", service_id);
     }
-    if (name != NULL) snprintf(service.name, sizeof(service.name), "%s", name);
-    if (description != NULL) snprintf(service.description, sizeof(service.description), "%s", description);
-    if (application != NULL) snprintf(service.application, sizeof(service.application), "%s", application);
-    if (transport != NULL) snprintf(service.transport, sizeof(service.transport), "%s", transport);
-    if (target_host != NULL) snprintf(service.target_host, sizeof(service.target_host), "%s",
-                                      strcmp(target_host, "localhost") == 0 ? "127.0.0.1" : target_host);
-    if (path != NULL) snprintf(service.path, sizeof(service.path), "%s", path);
-    if (visibility != NULL) snprintf(service.visibility, sizeof(service.visibility), "%s",
-                                     strcmp(visibility, "ACL") == 0 ? "ACL" : "OWNER");
-    if (creating && service.path[0] == '\0'
-        && (strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0)) snprintf(service.path, sizeof(service.path), "/");
-    if (creating && service.transport[0] == '\0') snprintf(service.transport, sizeof(service.transport),
-                                                            "%s", strcmp(service.application, "udp") == 0 ? "udp" : "tcp");
+    /*
+     * Each field is checked as given, before it is stored, with Java PeerServiceDiscovery's rules:
+     * a value is never truncated into a field it would not fit, and a field the request leaves out
+     * keeps its stored value.
+     */
+    int fields_ok = 1;
+    if (creating || name != NULL) {
+        fields_ok = peer_service_text_field(name, 1U, sizeof(service.name) - 1U,
+                                            service.name, sizeof(service.name));
+    }
+    if (fields_ok && (creating || description != NULL)) {
+        fields_ok = peer_service_text_field(description, 0U, sizeof(service.description) - 1U,
+                                            service.description, sizeof(service.description));
+    }
+    if (fields_ok && (creating || application != NULL)) {
+        fields_ok = peer_service_application(application, service.application, sizeof(service.application));
+    }
+    if (fields_ok) {
+        fields_ok = peer_service_transport(transport == NULL ? service.transport : transport,
+                                           service.application, service.transport, sizeof(service.transport));
+    }
+    if (fields_ok && (creating || target_host != NULL)) {
+        char normalized[256];
+        fields_ok = st_peer_mesh_normalize_local_host(target_host, normalized) == 0
+            && strlen(normalized) < sizeof(service.target_host);
+        if (fields_ok) snprintf(service.target_host, sizeof(service.target_host), "%s", normalized);
+    }
+    if (fields_ok && (creating || path != NULL)) {
+        fields_ok = peer_service_path(path, service.application, service.path, sizeof(service.path));
+    }
+    if (fields_ok && (creating || visibility != NULL)) {
+        fields_ok = peer_service_visibility(visibility, service.visibility, sizeof(service.visibility));
+    }
     int target_port = 0, published_port = 0, enabled = 0;
     if (st_json_get_int(body, "targetPort", &target_port) == 0) service.target_port = target_port;
     if (st_json_get_int(body, "publishedPort", &published_port) == 0) service.published_port = published_port;
     if (st_json_get_bool(body, "enabled", &enabled) == 0) service.enabled = enabled;
     int ids_rc = peer_service_allowed_ids(body, service.allowed_client_ids, !creating);
-    int app_ok = strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0
-        || strcmp(service.application, "ssh") == 0 || strcmp(service.application, "tcp") == 0
-        || strcmp(service.application, "udp") == 0;
-    int transport_ok = strcmp(service.transport, "tcp") == 0 || strcmp(service.transport, "udp") == 0;
-    if (!peer_service_id_valid(service.service_id) || !peer_service_string_valid(service.name, 1U, 80U)
-        || strlen(service.description) > 200U || !app_ok || !transport_ok
-        || (strcmp(service.application, "udp") == 0) != (strcmp(service.transport, "udp") == 0)
-        || !peer_service_string_valid(service.target_host, 1U, 127U)
+    if (!fields_ok || !peer_service_id_valid(service.service_id)
         || service.target_port < 1 || service.target_port > 65535
         || service.published_port < 1 || service.published_port > 65535
-        || strstr(service.path, "..") != NULL || ids_rc < 0) {
+        || ids_rc < 0) {
         free(service_id); free(name); free(description); free(transport); free(application);
         free(target_host); free(path); free(visibility);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid peer service definition\"}");
