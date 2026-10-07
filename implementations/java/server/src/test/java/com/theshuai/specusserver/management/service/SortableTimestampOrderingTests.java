@@ -243,7 +243,7 @@ class SortableTimestampOrderingTests {
     @MethodSource("cases")
     void mediaCaptureRetentionSweepAndReuse(Rows rows, Instant now) {
         for (int id = 1; id <= 7; id++) {
-            insertCapture(id, stored(rows, at(now, id)));
+            saveCapture(id, stored(rows, at(now, id)));
         }
         settle(rows, "specus_http_media_capture", "expires_at");
         String cutoff = SortableInstant.format(now);
@@ -287,21 +287,27 @@ class SortableTimestampOrderingTests {
         return session;
     }
 
-    /**
-     * Written with an explicit id: Hibernate's SQLite DDL gives this table's IDENTITY id no type, so
-     * it is no rowid alias and a row saved through JPA keeps a NULL id.
-     */
-    private void insertCapture(int id, String expiresAt) {
-        jdbcTemplate.update("""
-                insert into specus_http_media_capture(
-                    id, tenant_id, client_id, client_name, route, source_url, resource_key, method,
-                    status_code, content_encoding, media_kind, content_range_start, content_range_end,
-                    total_bytes, captured_bytes, initialization_segment, live_stream, object_key, state,
-                    captured_at, expires_at)
-                values (?, ?, 42, 'client-a', 'media', ?, ?, 'GET', 200, 'identity', 'MEDIA_SEGMENT',
-                        0, 9, 10, 10, false, false, ?, ?, ?, ?)
-                """, id, TENANT, "https://media.example.test/" + id + ".ts", "res-" + id, "ordering/" + id,
-                HttpMediaCaptureService.STATE_COMPLETE, LONG_AGO, expiresAt);
+    private void saveCapture(int id, String expiresAt) {
+        HttpMediaCapture capture = new HttpMediaCapture();
+        capture.setTenantId(TENANT);
+        capture.setClientId(42L);
+        capture.setClientName("client-a");
+        capture.setRoute("media");
+        capture.setSourceUrl("https://media.example.test/" + id + ".ts");
+        capture.setResourceKey("res-" + id);
+        capture.setMethod("GET");
+        capture.setStatusCode(200);
+        capture.setContentEncoding("identity");
+        capture.setMediaKind("MEDIA_SEGMENT");
+        capture.setContentRangeStart(0L);
+        capture.setContentRangeEnd(9L);
+        capture.setTotalBytes(10L);
+        capture.setCapturedBytes(10);
+        capture.setObjectKey("ordering/" + id);
+        capture.setState(HttpMediaCaptureService.STATE_COMPLETE);
+        capture.setCapturedAt(LONG_AGO);
+        capture.setExpiresAt(expiresAt);
+        assertThat(captureRepository.saveAndFlush(capture).getId()).isEqualTo(id);
     }
 
     /** The instant stored under {@code id}: ids 1 to 3 are before now, 4 is now, 5 to 7 are after it. */
