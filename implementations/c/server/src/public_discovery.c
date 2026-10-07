@@ -1871,6 +1871,14 @@ int st_public_discovery_handle_websocket(int fd,
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
     pthread_mutex_init(&peer->send_lock, NULL);
     free(ticket);
+    /* Java normalizeDisplayName refuses ISO control characters when the connection joins. */
+    if (public_has_iso_control((const uint8_t *)peer->display_name, strlen(peer->display_name))) {
+        (void)public_peer_send_error(peer, "client name contains invalid characters");
+        public_peer_close(peer, 1008U);
+        pthread_mutex_destroy(&peer->send_lock);
+        free(peer);
+        return 1;
+    }
     int registered = public_register_peer(peer);
     if (registered != 0) {
         if (registered == -2) (void)public_peer_send_error(peer, "peer id is already connected");
