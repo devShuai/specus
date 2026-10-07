@@ -244,6 +244,14 @@ add_test(NAME session_lifecycle_tests
     COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
 
+# Java ConnectionArchiveServiceTests on a real server process: the scheduled monthly archive.
+add_executable(specus_c_connection_archive_tests tests/connection_archive_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connection_archive_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connection_archive_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connection_archive_tests
+    COMMAND specus_c_connection_archive_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connection_archive_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_nat_stream_tests PRIVATE -Wall -Wextra -Wpedantic)
