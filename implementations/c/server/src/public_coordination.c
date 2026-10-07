@@ -1063,9 +1063,16 @@ static int cluster_net_groups(const st_public_cluster_participant *recipient,
     return 0;
 }
 
+/*
+ * Java PublicTransferCoordinationService.sameNetAddress: an empty, blank or "unknown" address is
+ * not identifiable, so two such participants never share a net even when the strings are equal.
+ */
 static int cluster_address_known(const char *address)
 {
-    return address != NULL && *address != '\0' && strcasecmp(address, "unknown") != 0;
+    if (address == NULL || strcasecmp(address, "unknown") == 0) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)address; *cursor != '\0'; ++cursor)
+        if (!isspace(*cursor)) return 1;
+    return 0;
 }
 
 static int cluster_visible(const st_public_cluster_participant *recipient,

@@ -889,9 +889,16 @@ static int public_same_group(const st_public_peer *left, const st_public_peer *r
         && strcmp(left->room_key, right->room_key) == 0;
 }
 
+/*
+ * Java PublicTransferCoordinationService.sameNetAddress: an empty, blank or "unknown" address is
+ * not identifiable, so two such participants never share a net even when the strings are equal.
+ */
 static int public_address_known(const char *address)
 {
-    return address != NULL && *address != '\0' && strcasecmp(address, "unknown") != 0;
+    if (address == NULL || strcasecmp(address, "unknown") == 0) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)address; *cursor != '\0'; ++cursor)
+        if (!isspace(*cursor)) return 1;
+    return 0;
 }
 
 static int public_same_net(const st_public_peer *left, const st_public_peer *right)
