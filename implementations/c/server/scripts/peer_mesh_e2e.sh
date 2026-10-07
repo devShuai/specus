@@ -286,13 +286,6 @@ def session(port, token, name_a, name_b, path_type, min_id):
     print(json.dumps(item, sort_keys=True))
 
 
-def max_session(port, token):
-    status, sessions = request(port, "GET", "/api/admin/peer-mesh/sessions?limit=100", token=token)
-    if status != 200:
-        raise SystemExit(f"session list failed: {status}")
-    print(max([item["id"] for item in sessions] or [0]))
-
-
 def relay_sockets(low, high):
     """Counts the UDP sockets bound in the relay port range in this namespace: the server's TURN
     allocations, one per client."""
@@ -314,7 +307,7 @@ SERVER_IP = sys.argv[1]
 KNOWN = set(filter(None, sys.argv[2].split(",")))
 commands = {"provision": provision, "wait-client": wait_client, "enable-device": enable_device,
             "roster": roster,
-            "session": session, "max-session": max_session, "relay-sockets": relay_sockets}
+            "session": session, "relay-sockets": relay_sockets}
 commands[sys.argv[3]](*sys.argv[4:])
 PY
 
@@ -522,7 +515,6 @@ PY
 echo "namespaces ready: A=$NET_A_IP B=$NET_B_IP reach $SERVER_IP and not each other"
 
 PHASE_TWO_LOG_START="$(wc -l <"$TMP_DIR/server.log")"
-LAST_SESSION="$(check max-session "$ADMIN_PORT" "$ADMIN_TOKEN")"
 # Phase one's allocations outlive its clients until their lifetime ends, so phase two counts its own.
 RELAY_SOCKETS_BEFORE="$(check relay-sockets "$RELAY_MIN_PORT" "$RELAY_MAX_PORT")"
 KNOWN_CLIENTS=""
@@ -536,7 +528,12 @@ check wait-client "$ADMIN_PORT" "$ADMIN_TOKEN" "$CLIENT_B" online >/dev/null \
 roster_of a "$CLIENT_B" online || fail "A's roster never listed B online in phase two"
 roster_of b "$CLIENT_A" online || fail "B's roster never listed A online in phase two"
 
-RELAY_SESSION="$(check session "$ADMIN_PORT" "$ADMIN_TOKEN" "$CLIENT_A" "$CLIENT_B" RELAY "$LAST_SESSION")" \
+# Phase one's session between A and B is still open, and the server grants an open session between
+# the same pair again while it holds its token (Java PeerMeshService.reusableSessionGrant), so phase
+# two may run on that session rather than a new one. Its state is what proves phase two: phase one
+# left the pair DIRECT over loopback, and only phase two's clients can report it RELAY through a TURN
+# relay address.
+RELAY_SESSION="$(check session "$ADMIN_PORT" "$ADMIN_TOKEN" "$CLIENT_A" "$CLIENT_B" RELAY 0)" \
   || fail "no RELAY session between A and B"
 echo "relay session: $RELAY_SESSION"
 

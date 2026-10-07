@@ -561,17 +561,12 @@ static turn_allocation *find_allocation_by_relay(st_stun_turn_server *server,
 
 static long long username_client_id(const char *username)
 {
-    const char *first = username == NULL ? NULL : strchr(username, ':');
-    if (first == NULL || strncmp(first + 1, "pm-", 3U) != 0) return 0;
-    char *end = NULL;
-    long long id = strtoll(first + 4, &end, 10);
-    return id > 0 && end != first + 4 && *end == ':' ? id : 0;
+    return st_turn_auth_peer_mesh_client_id(username);
 }
 
 static int username_is_general(const char *username)
 {
-    const char *first = username == NULL ? NULL : strchr(username, ':');
-    return first != NULL && strncmp(first + 1, "public-transfer", 15U) == 0;
+    return st_turn_auth_is_general_relay_subject(username);
 }
 
 static long long allocation_client_id(const turn_allocation *allocation)
@@ -640,16 +635,24 @@ static uint64_t read_u64(const uint8_t *data)
     return ((uint64_t)read_u32(data) << 32U) | read_u32(data + 4U);
 }
 
+/*
+ * identified is whether TURN authentication is on. With it off an allocation carries no client id
+ * (the credential has none), so, as in Java StunTurnServer.authorizeRelayPayload, both sides go to
+ * the session check as 0 and only the session itself is checked: insisting on ids there would
+ * drop every Peer Mesh datagram, probes included, and leave the relay unusable.
+ */
 static int authorize_relay_payload(const uint8_t *payload,
                                    size_t payload_len,
                                    const turn_allocation *source,
                                    const turn_allocation *target,
-                                   int account_traffic)
+                                   int account_traffic,
+                                   int identified)
 {
     if (allocation_is_general(source) || allocation_is_general(target)) return 1;
-    long long source_id = allocation_client_id(source);
-    long long target_id = allocation_client_id(target);
-    if (source_id <= 0 || target_id <= 0) return 0;
+    if (source == NULL || target == NULL) return 0;
+    long long source_id = identified ? allocation_client_id(source) : 0;
+    long long target_id = identified ? allocation_client_id(target) : 0;
+    if (identified && (source_id <= 0 || target_id <= 0)) return 0;
     /* The same database the control channel grants sessions in. Reading any other variable here
      * leaves Peer Mesh relaying with no session to check against, so every relayed datagram is
      * dropped while allocations, permissions and channel binds all still succeed. */
@@ -681,7 +684,7 @@ static int authorize_relay_payload(const uint8_t *payload,
         && st_json_get_i64(json, "sessionId", &session_id) == 0
         && st_json_get_i64(json, "fromClientId", &from_id) == 0
         && st_json_get_i64(json, "toClientId", &to_id) == 0
-        && from_id == source_id && to_id == target_id
+        && (!identified || (from_id == source_id && to_id == target_id))
         && st_storage_verify_peer_mesh_probe(database_path, session_id, from_id, to_id, token) == 1;
     free(json); free(magic); free(type); free(token);
     return valid;
@@ -1208,7 +1211,8 @@ static void handle_send_indication(st_stun_turn_server *server,
         || decode_xor_address(&peer_attr, packet + 8U, &peer, &peer_len) != 0
         || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(data.value, data.length, allocation, target, 1)) return;
+    if (!authorize_relay_payload(data.value, data.length, allocation, target, 1,
+                                 server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data.length)) return;
     (void)sendto(allocation->relay_fd, data.value, data.length, 0,
                  (struct sockaddr *)&peer, peer_len);
@@ -1226,7 +1230,8 @@ static void handle_channel_data(st_stun_turn_server *server,
     turn_channel *channel = allocation == NULL ? NULL : find_channel_by_number(allocation, number);
     if (channel == NULL || 4U + data_len > len || !allocation_has_permission(allocation, &channel->peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &channel->peer);
-    if (!authorize_relay_payload(packet + 4U, data_len, allocation, target, 1)) return;
+    if (!authorize_relay_payload(packet + 4U, data_len, allocation, target, 1,
+                                 server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data_len)) return;
     (void)sendto(allocation->relay_fd, packet + 4U, data_len, 0,
                  (struct sockaddr *)&channel->peer, channel->peer_len);
@@ -1267,7 +1272,8 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
                                 (struct sockaddr *)&peer, &peer_len);
     if (received <= 0 || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *source = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(packet, (size_t)received, source, allocation, 0)) return;
+    if (!authorize_relay_payload(packet, (size_t)received, source, allocation, 0,
+                                 server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, (size_t)received)) return;
     turn_channel *channel = find_channel_by_peer(allocation, &peer);
     if (channel != NULL) {

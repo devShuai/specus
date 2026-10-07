@@ -202,7 +202,17 @@ add_test(NAME peer_egress_tests COMMAND specus_c_peer_egress_tests)
 add_executable(specus_c_peer_mesh_tests tests/peer_mesh_tests.c)
 target_link_libraries(specus_c_peer_mesh_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_peer_mesh_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_peer_mesh_tests PRIVATE
+    ST_EGRESS_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME peer_mesh_tests COMMAND specus_c_peer_mesh_tests)
+
+# Peer Mesh control messages (egress-report) over a real control connection of a real server process.
+add_executable(specus_c_peer_mesh_e2e_tests tests/peer_mesh_e2e_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_peer_mesh_e2e_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_peer_mesh_e2e_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME peer_mesh_e2e_tests
+    COMMAND specus_c_peer_mesh_e2e_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(peer_mesh_e2e_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_public_coordination_tests tests/public_coordination_tests.c)
 target_link_libraries(specus_c_public_coordination_tests PRIVATE specus_c_core)
