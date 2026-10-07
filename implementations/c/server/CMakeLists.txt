@@ -166,6 +166,14 @@ target_compile_options(specus_c_management_lists_tests PRIVATE -Wall -Wextra -Wp
 add_test(NAME management_lists_tests COMMAND specus_c_management_lists_tests)
 set_tests_properties(management_lists_tests PROPERTIES TIMEOUT 180)
 
+# Java OverviewService on a real server process: clients, logins and public connection counters.
+add_executable(specus_c_management_overview_tests tests/management_overview_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_overview_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_overview_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_overview_tests
+    COMMAND specus_c_management_overview_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(management_overview_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_http_share_tests tests/http_share_tests.c)
 target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_share_tests PRIVATE -Wall -Wextra -Wpedantic)
