@@ -1838,6 +1838,36 @@ static int att_callback_paths(void)
     return failed ? -1 : 0;
 }
 
+/*
+ * Java expireOldAttachmentsLoopsUntilNoMoreExpiredRows: 205 expired rows take three batches of at
+ * most 100; each object is deleted from object storage before its row is marked EXPIRED.
+ */
+static int att_expiration_batches(void)
+{
+    if (cap_exec(att_db_path,
+                 "INSERT INTO transfer_attachment(id,tenant_id,scope,owner_username,object_key,file_name,"
+                 "mime_type,size_bytes,status,created_at,updated_at,upload_expires_at,expires_at) "
+                 "WITH RECURSIVE n(i) AS (SELECT 880000 UNION ALL SELECT i+1 FROM n WHERE i<880204) "
+                 "SELECT i,'t1','PUBLIC_TRANSFER','gina','prefix/expire/'||i||'.bin','expire.bin',"
+                 "'application/octet-stream',1,CASE WHEN i%2=0 THEN 'UPLOADED' ELSE 'PENDING' END,"
+                 "'2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z',"
+                 "'2000-01-01T00:00:00Z' FROM n") != 0) {
+        return -1;
+    }
+    int requests = att_oss_requests();
+    if (st_object_storage_cleanup_expired() != 0
+        || att_count("SELECT COUNT(*) FROM transfer_attachment WHERE owner_username='gina' "
+                     "AND status='EXPIRED'") != 205
+        || att_count("SELECT COUNT(*) FROM transfer_attachment WHERE status='EXPIRED' "
+                     "AND owner_username<>'gina'") != 0
+        || att_oss_requests() - requests != 205) {
+        fprintf(stderr, "expiration did not delete and expire every batch (%d object requests)\n",
+                att_oss_requests() - requests);
+        return -1;
+    }
+    return 0;
+}
+
 static int test_attachment_negative_paths(void)
 {
     int port = 0;
@@ -1846,7 +1876,7 @@ static int test_attachment_negative_paths(void)
     if (failed) fprintf(stderr, "attachment fixture setup failed\n");
     failed = failed || att_public_paths() != 0 || att_admin_paths() != 0 || att_callback_paths() != 0
         || att_upload_normalization() != 0 || att_filename_normalization() != 0 || att_id_collision() != 0
-        || att_pending_download() != 0;
+        || att_pending_download() != 0 || att_expiration_batches() != 0;
     att_oss_stop();
     att_unconfigure();
     return failed ? -1 : 0;

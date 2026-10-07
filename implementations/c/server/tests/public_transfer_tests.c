@@ -1153,12 +1153,27 @@ static int test_room_credentials(void)
         }
     }
 
-    /* redeemingPairingCodeAtomicallyMintsTwentyFourHourRoleToken. */
+    /*
+     * pairingCodeIsEightDigitsAndOnlyHmacIsPersisted (one use by default, expiring after creation),
+     * then redeemingPairingCodeAtomicallyMintsTwentyFourHourRoleToken.
+     */
     CHECK(http_call("POST", "/api/public/transfer/rooms/pairing-codes", NULL,
                     "{\"roomId\":\"svc-room\",\"roomToken\":\"svc-owner-secret\",\"peerId\":\"o\","
                     "\"role\":\"EDITOR\",\"label\":\"svc-guest\"}", response, sizeof(response)) == 200,
           "pairing code: %s", response);
     char *code = st_json_get_top_level_string(http_body(response), "code");
+    char *created_text = st_json_get_top_level_string(http_body(response), "createdAt");
+    char *expiry_text = st_json_get_top_level_string(http_body(response), "expiresAt");
+    long long created_at = -1;
+    long long expires_at = -1;
+    int code_ok = code != NULL && strlen(code) == 8U && strspn(code, "0123456789") == 8U
+        && contains(http_body(response), "\"maxUses\":1") && iso_seconds(created_text, &created_at) == 0
+        && iso_seconds(expiry_text, &expires_at) == 0 && expires_at > created_at
+        && db_count("SELECT COUNT(*) FROM public_transfer_room_pairing_code WHERE label='svc-guest' "
+                    "AND length(code_hash)=64 AND code_hash<>?", code) == 1;
+    free(created_text);
+    free(expiry_text);
+    CHECK(code_ok, "pairing code shape or persisted digest mismatch: %s", http_body(response));
     char body[128];
     snprintf(body, sizeof(body), "{\"code\":\"%s\",\"peerId\":\"guest\"}", code == NULL ? "" : code);
     free(code);
