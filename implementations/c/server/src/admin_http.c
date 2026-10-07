@@ -1934,34 +1934,74 @@ static int normalize_public_host(const char *value, char *out, size_t out_len)
     return 0;
 }
 
+/*
+ * A port setting as Java binds it: the default when unset, otherwise the configured number, where
+ * 0 (or anything that is not a port) means the endpoint it names is not configured.
+ */
+static int env_port(const char *name, int fallback)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return fallback;
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= 65535 ? (int)parsed : 0;
+}
+
+static int has_text(const char *value)
+{
+    if (value == NULL) return 0;
+    while (*value != '\0') {
+        if (!isspace((unsigned char)*value)) return 1;
+        ++value;
+    }
+    return 0;
+}
+
+/*
+ * The self-hosted STUN endpoint (Java PublicPeerMeshResource.selfHostedStunHost and
+ * selfHostedStunPort): a standalone STUN server when both its address and port are configured,
+ * otherwise the embedded listener at the public address. A standalone address without a port
+ * falls back instead of publishing an endpoint nobody listens on.
+ */
 static int public_primary_stun(const char *host_hint,
                                char host[384],
                                int *port,
                                int *standalone)
 {
     const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS");
-    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
-    *standalone = configured != NULL && *configured != '\0' && configured_port > 0;
+    int configured_port = env_port("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
+    *standalone = has_text(configured) && configured_port > 0;
     if (*standalone) {
         *port = configured_port;
         return normalize_public_host(configured, host, 384U);
     }
     configured = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    if (configured == NULL || *configured == '\0') configured = host_hint;
+    if (!has_text(configured)) configured = host_hint;
     *port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
     return *port > 0 ? normalize_public_host(configured, host, 384U) : -1;
 }
 
-static int public_alternate_stun(char host[384], int *port)
+/*
+ * The alternate STUN address (Java standaloneAlternateStunHost): the standalone alternate address,
+ * else the RFC 5780 alternate public address.
+ */
+static int public_alternate_stun_host(char host[384])
 {
     const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
-    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
-    if (configured == NULL || *configured == '\0') {
-        configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
-        configured_port = env_int("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
-    }
-    *port = configured_port;
-    return configured_port > 0 ? normalize_public_host(configured, host, 384U) : -1;
+    if (!has_text(configured)) configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
+    return has_text(configured) ? normalize_public_host(configured, host, 384U) : -1;
+}
+
+/*
+ * The alternate address with the second port, for RFC 5780 (Java standaloneAlternateStunPort): the
+ * standalone alternate port, else the NAT probe alternate port.
+ */
+static int public_alternate_stun(char host[384], int *port)
+{
+    int configured_port = env_port("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
+    *port = configured_port > 0 ? configured_port
+        : env_port("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
+    return *port > 0 ? public_alternate_stun_host(host) : -1;
 }
 
 static int normalize_public_stun_url(const char *value, char *out, size_t out_len)
@@ -2018,11 +2058,15 @@ static size_t collect_public_stun_urls(char urls[][512], size_t max_urls,
                                 urls[count], sizeof(urls[count])) == 0) {
         ++count;
     }
+    /*
+     * The alternate address goes in on the primary STUN port (Java standaloneAlternateStunServer),
+     * whether or not a second port is configured: that one is only for RFC 5780 probing. Unlike
+     * Java it is listed only beside a published self-hosted server, never alone for a deployment
+     * whose STUN is off.
+     */
     char alternate_host[384];
-    int alternate_port = 0;
-    if (count < max_urls && standalone
-        && public_alternate_stun(alternate_host, &alternate_port) == 0) {
-        (void)alternate_port;
+    if (count < max_urls && (peer_mesh_enabled || standalone) && primary_port > 0
+        && public_alternate_stun_host(alternate_host) == 0) {
         char normalized[512];
         if (build_public_ice_url("stun", alternate_host, primary_port, "",
                                  normalized, sizeof(normalized)) == 0
@@ -2070,7 +2114,9 @@ static int build_public_stun_config_response(const char *host_hint, char *out, s
         if (i > 0) rc = admin_sb_append(&builder, ",");
         if (rc == 0) rc = admin_sb_append_json_string(&builder, urls[i]);
     }
-    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}", port);
+    /* The embedded STUN/TURN port, also when a standalone STUN server is the one published. */
+    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}",
+                                       env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478));
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"stun config response failed\"}");

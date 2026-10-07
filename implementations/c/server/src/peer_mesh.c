@@ -590,23 +590,93 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
     return rc;
 }
 
+/* A port setting as Java binds it: the default when unset; 0 (or anything unusable) turns it off. */
+static int pm_env_port(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return default_value;
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= 65535 ? (int)parsed : 0;
+}
+
+/* value with surrounding whitespace removed, or "" when it does not fit. */
+static void pm_trim_copy(const char *value, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (value == NULL) return;
+    while (isspace((unsigned char)*value)) ++value;
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) --len;
+    if (len < out_len) {
+        memcpy(out, value, len);
+        out[len] = '\0';
+    }
+}
+
+/*
+ * The STUN endpoint Peer Mesh clients probe (Java PeerMeshService.resolveStunHost and
+ * resolveStunPort): a standalone STUN server when both its address and port are configured,
+ * otherwise the embedded STUN/TURN listener at the relay address. An incomplete standalone setting
+ * falls back rather than sending clients to a STUN server that is not there.
+ */
+static int pm_standalone_stun(char host[256], int *port)
+{
+    pm_trim_copy(getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS"), host, 256U);
+    *port = pm_env_port("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
+    return host[0] != '\0' && *port > 0;
+}
+
+static int pm_stun_port(void)
+{
+    char host[256];
+    int port = 0;
+    return pm_standalone_stun(host, &port) ? port : (int)pm_env_i64("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+}
+
+static int pm_append_stun_entry(pm_builder *builder, char seen[][320], size_t *count, const char *entry)
+{
+    if (*entry == '\0' || *count >= 16U || strlen(entry) >= 320U) return 0;
+    for (size_t i = 0U; i < *count; ++i) {
+        if (strcmp(seen[i], entry) == 0) return 0;
+    }
+    snprintf(seen[*count], 320U, "%s", entry);
+    if ((*count > 0U && pm_append(builder, ",") != 0) || pm_append_json_string(builder, entry) != 0) return -1;
+    ++*count;
+    return 0;
+}
+
+/*
+ * publicStunServers (Java PeerMeshService.publicStunServers): the standalone alternate STUN
+ * address on the primary STUN port first, then the configured public servers, trimmed, without
+ * repeats and at most 16.
+ */
 static int pm_append_public_stun_servers(pm_builder *builder)
 {
-    const char *configured = getenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
+    char seen[16][320];
+    size_t count = 0U;
     if (pm_append(builder, "[") != 0) return -1;
+    char alternate[256];
+    pm_trim_copy(getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS"), alternate, sizeof(alternate));
+    int port = pm_stun_port();
+    if (alternate[0] != '\0' && port > 0) {
+        char entry[320];
+        int bracket = strchr(alternate, ':') != NULL && alternate[0] != '[';
+        snprintf(entry, sizeof(entry), "stun:%s%s%s:%d", bracket ? "[" : "", alternate, bracket ? "]" : "", port);
+        if (pm_append_stun_entry(builder, seen, &count, entry) != 0) return -1;
+    }
+    const char *configured = getenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
     if (configured != NULL && *configured != '\0') {
         char *copy = strdup(configured);
         if (copy == NULL) return -1;
         char *save = NULL;
-        int first = 1;
         for (char *item = strtok_r(copy, ",", &save); item != NULL; item = strtok_r(NULL, ",", &save)) {
-            while (isspace((unsigned char)*item)) ++item;
-            if (*item == '\0') continue;
-            if ((!first && pm_append(builder, ",") != 0) || pm_append_json_string(builder, item) != 0) {
+            char entry[320];
+            pm_trim_copy(item, entry, sizeof(entry));
+            if (pm_append_stun_entry(builder, seen, &count, entry) != 0) {
                 free(copy);
                 return -1;
             }
-            first = 0;
         }
         free(copy);
     }
@@ -1405,9 +1475,21 @@ static char *pm_runtime_config(const char *database_path,
 {
     int deployment_enabled = pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     int enabled = deployment_enabled && device != NULL && device->enabled;
-    int port = (int)pm_env_i64("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
-    const char *host = pm_env_text("SPECUS_PEER_MESH_PUBLIC_ADDRESS",
-                                   pm_env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
+    /*
+     * As in Java PeerMeshService.buildConfig, the endpoints and the TURN credential go to every
+     * device of an enabled deployment, also one not yet switched on: enabling it later then needs
+     * only the peer-config push, not a new login.
+     */
+    int endpoints = deployment_enabled && device != NULL;
+    int turn_port = (int)pm_env_i64("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+    const char *turn_host = pm_env_text("SPECUS_PEER_MESH_PUBLIC_ADDRESS",
+                                        pm_env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
+    char stun_host[256];
+    int stun_port = 0;
+    if (!pm_standalone_stun(stun_host, &stun_port)) {
+        snprintf(stun_host, sizeof(stun_host), "%s", turn_host);
+        stun_port = turn_port;
+    }
     const char *cidr = device != NULL && device->cidr[0] != '\0'
         ? device->cidr : pm_env_text("SPECUS_PEER_MESH_CIDR", "100.96.0.0/11");
     long long ttl = pm_env_i64("SPECUS_PEER_MESH_SESSION_TTL_SECONDS", 3600);
@@ -1418,8 +1500,8 @@ static char *pm_runtime_config(const char *database_path,
     (void)st_storage_get_peer_mesh_service_sharing(database_path, client->tenant_id, &sharing);
     int effective_sharing = deployment_enabled && sharing.enabled && enabled;
     snprintf(subject, sizeof(subject), "pm-%lld", client->id);
-    if (enabled) (void)st_turn_auth_issue(subject, ice_username, sizeof(ice_username),
-                                          ice_credential, sizeof(ice_credential));
+    if (endpoints) (void)st_turn_auth_issue(subject, ice_username, sizeof(ice_username),
+                                            ice_credential, sizeof(ice_credential));
     pm_builder builder = {0};
     if (pm_appendf(&builder, "{\"enabled\":%s,\"clientId\":%lld,\"clientName\":",
                    enabled ? "true" : "false", client->id) != 0
@@ -1427,10 +1509,11 @@ static char *pm_runtime_config(const char *database_path,
         || pm_append(&builder, ",\"virtualIp\":") != 0
         || pm_append_json_string(&builder, device == NULL ? "" : device->virtual_ip) != 0
         || pm_append(&builder, ",\"cidr\":") != 0 || pm_append_json_string(&builder, cidr) != 0
-        || pm_append(&builder, ",\"stunHost\":") != 0 || pm_append_json_string(&builder, enabled ? host : "") != 0
-        || pm_appendf(&builder, ",\"stunPort\":%d,\"turnHost\":", enabled ? port : 0) != 0
-        || pm_append_json_string(&builder, enabled ? host : "") != 0
-        || pm_appendf(&builder, ",\"turnPort\":%d,\"publicStunServers\":", enabled ? port : 0) != 0
+        || pm_append(&builder, ",\"stunHost\":") != 0
+        || pm_append_json_string(&builder, endpoints ? stun_host : "") != 0
+        || pm_appendf(&builder, ",\"stunPort\":%d,\"turnHost\":", endpoints ? stun_port : 0) != 0
+        || pm_append_json_string(&builder, endpoints ? turn_host : "") != 0
+        || pm_appendf(&builder, ",\"turnPort\":%d,\"publicStunServers\":", endpoints ? turn_port : 0) != 0
         || pm_append_public_stun_servers(&builder) != 0
         || pm_append(&builder, ",\"iceUsername\":") != 0
         || pm_append_json_string(&builder, ice_username) != 0
@@ -1439,7 +1522,7 @@ static char *pm_runtime_config(const char *database_path,
         || pm_append(&builder, ",\"iceRealm\":") != 0
         || pm_append_json_string(&builder, st_turn_auth_realm()) != 0
         || pm_append(&builder, ",\"iceNonce\":") != 0
-        || pm_append_json_string(&builder, enabled ? st_turn_auth_nonce() : "") != 0
+        || pm_append_json_string(&builder, endpoints ? st_turn_auth_nonce() : "") != 0
         || pm_append(&builder, ",\"serverPublicKey\":") != 0
         || pm_append_json_string(&builder, pm_env_text("SPECUS_PEER_MESH_SERVER_PUBLIC_KEY", "")) != 0
         || pm_append(&builder, ",\"clientPublicKey\":") != 0
