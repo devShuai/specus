@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -500,6 +501,9 @@ typedef struct {
     char http_relative_path[256];
     char ws_relative_path[256];
     char http_body[256];
+    /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
+    char http_browser_headers[512];
+    char ws_browser_headers[512];
 } route_auth_test_context;
 
 #define ROUTE_RESET_REASON \
@@ -548,7 +552,30 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->http_relative_path[0] = '\0';
     context->ws_relative_path[0] = '\0';
     context->http_body[0] = '\0';
+    context->http_browser_headers[0] = '\0';
+    context->ws_browser_headers[0] = '\0';
     pthread_mutex_unlock(&context->lock);
+}
+
+static void route_auth_test_capture_browser_headers(char *const *headers,
+                                                    size_t headers_len,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    size_t used = 0U;
+    out[0] = '\0';
+    for (size_t i = 0; i < headers_len; ++i) {
+        if (headers[i] == NULL
+            || (strncasecmp(headers[i], "Origin:", 7U) != 0 && strncasecmp(headers[i], "Referer:", 8U) != 0
+                && strncasecmp(headers[i], "Sec-Fetch-Site:", 15U) != 0)) {
+            continue;
+        }
+        int written = snprintf(out + used, out_len - used, "%s%s", used == 0U ? "" : "|", headers[i]);
+        if (written < 0 || (size_t)written >= out_len - used) {
+            return;
+        }
+        used += (size_t)written;
+    }
 }
 
 static int route_auth_test_context_matches(route_auth_test_context *context,
@@ -632,6 +659,9 @@ static int route_auth_http_forwarder(void *ctx,
              "%.*s",
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->http_browser_headers,
+                                            sizeof(context->http_browser_headers));
     pthread_mutex_unlock(&context->lock);
     if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
         /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
@@ -664,6 +694,9 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_relative_path),
              "%s",
              request->relative_path == NULL ? "" : request->relative_path);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->ws_browser_headers,
+                                            sizeof(context->ws_browser_headers));
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -3427,6 +3460,34 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* Java UpstreamBrowserHeaders: the device sees the browser's Origin and Referer moved onto the
+     * route target's origin (https://example.com here) and cross-site fetch metadata as
+     * same-origin, so the target's own CSRF fences accept the request. */
+    static const char browser_headers[] =
+        "Origin: https://specus.example\r\n"
+        "Referer: https://specus.example/http/C%20managed%202/api/page?x=1\r\n"
+        "Sec-Fetch-Site: cross-site\r\n";
+    static const char rewritten_browser_headers[] =
+        "Origin:https://example.com|Referer:https://example.com/http/C%20managed%202/api/page?x=1"
+        "|Sec-Fetch-Site:same-origin";
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)
+        || strcmp(context.http_browser_headers, rewritten_browser_headers) != 0) {
+        fprintf(stderr, "direct HTTP browser headers were not moved onto the route target: %s\n",
+                context.http_browser_headers);
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
     /* A chunked body reaches the target decoded (extensions and trailers dropped); a chunked
      * body that also declares a length, or that ends early, never reaches it. */
     static const char *const chunked_requests[][2] = {
@@ -3519,14 +3580,16 @@ static int test_direct_http_route_authentication(const char *database_path)
              "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
-             protected_path);
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
         || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
-        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")
+        || strcmp(context.ws_browser_headers, rewritten_browser_headers) != 0) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);

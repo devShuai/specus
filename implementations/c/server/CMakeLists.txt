@@ -45,6 +45,7 @@ add_library(specus_c_core
     src/stun_turn.c
     src/tls_transport.c
     src/turn_auth.c
+    src/upstream_browser_headers.c
     src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
@@ -78,6 +79,11 @@ add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_address_tests COMMAND specus_c_client_address_tests)
+
+add_executable(specus_c_upstream_browser_headers_tests tests/upstream_browser_headers_tests.c)
+target_link_libraries(specus_c_upstream_browser_headers_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_upstream_browser_headers_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME upstream_browser_headers_tests COMMAND specus_c_upstream_browser_headers_tests)
 
 add_executable(specus_c_client_auth_nonce_tests tests/client_auth_nonce_tests.c)
 target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)

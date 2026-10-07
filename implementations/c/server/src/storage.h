@@ -1331,6 +1331,8 @@ typedef struct {
     long long client_id;
     char client_name[256];
     char route_name[128];
+    /* The route's target; the browser headers relayed through the share take its origin. */
+    char target_base_url[512];
     int path_rewrite_enabled;
     /* Only for an active share: why its route, client or creator no longer allows it, else NULL. */
     const char *lapse_reason;

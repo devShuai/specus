@@ -25,6 +25,7 @@
 #include "storage.h"
 #include "tls_transport.h"
 #include "turn_auth.h"
+#include "upstream_browser_headers.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -217,6 +218,8 @@ typedef struct {
     char client_name[256];
     char route[128];
     char rewrite_prefix[64];
+    /* The route's target, whose origin the relayed browser headers take (UpstreamBrowserHeaders). */
+    char target_base_url[512];
     char *relative_path;
     const char *raw_query;
     int upgrade;
@@ -11972,7 +11975,8 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
 }
 
 /* Whether route_name is one of the SPECUS_HTTP_ROUTES routes every client is given. */
-static int admin_env_http_route_configured(const char *route_name)
+/* Whether SPECUS_HTTP_ROUTES defines route_name; its target is copied into target when it does. */
+static int admin_env_http_route_configured(const char *route_name, char *target, size_t target_len)
 {
     st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
     size_t route_count = 0;
@@ -11980,6 +11984,9 @@ static int admin_env_http_route_configured(const char *route_name)
     if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
         for (size_t i = 0; i < route_count && !configured; ++i) {
             configured = strcmp(routes[i].route, route_name) == 0;
+            if (configured && target != NULL) {
+                snprintf(target, target_len, "%s", routes[i].target_base_url);
+            }
         }
     }
     free(routes);
@@ -11997,18 +12004,24 @@ static int send_http_route_not_found(int fd)
  * response. It fails closed: a request enters the tunnel only for a route the server itself
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
- * since, so what the client holds never makes a route reachable.
+ * since, so what the client holds never makes a route reachable. The route's target is copied into
+ * target_base_url for the browser header rewrite.
  */
-static int authorize_direct_http_route(int fd, const char *path, const char *raw_request)
+static int authorize_direct_http_route(int fd,
+                                       const char *path,
+                                       const char *raw_request,
+                                       char *target_base_url,
+                                       size_t target_base_url_len)
 {
     char *client_name = NULL;
     char *route_name = NULL;
+    target_base_url[0] = '\0';
     if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
         return send_http_route_not_found(fd);
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
-        int configured = admin_env_http_route_configured(route_name);
+        int configured = admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
         free(client_name);
         free(route_name);
         return configured ? 0 : send_http_route_not_found(fd);
@@ -12035,7 +12048,8 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     /* Unknown and disabled clients have no reachable routes, environment ones included: with a
      * database a client cannot log in without an enabled account either. */
     int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
-    int env_configured = !found && client_enabled && admin_env_http_route_configured(route_name);
+    int env_configured = !found && client_enabled
+        && admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
     free(client_name);
     free(route_name);
     if (!client_enabled) {
@@ -12047,6 +12061,7 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     if (!route.enabled) {
         return send_http_route_not_found(fd);
     }
+    snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
     }
@@ -14741,7 +14756,8 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  const char *method,
                                                  const char *path,
                                                  const char *raw_request,
-                                                 int strip_authorization)
+                                                 int strip_authorization,
+                                                 const char *target_base_url)
 {
     if (strncmp(path, "/http/", 6) != 0
         || !admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
@@ -14809,7 +14825,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(client_name);
         free(route);
@@ -14929,7 +14947,8 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const char *raw_request,
                                       const uint8_t *body,
                                       size_t body_len,
-                                      int strip_authorization)
+                                      int strip_authorization,
+                                      const char *target_base_url)
 {
     if (strncmp(path, "/http/", 6) != 0) {
         return 0;
@@ -14979,7 +14998,9 @@ static int handle_direct_http_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(client_name);
         free(route);
         free(relative_path);
@@ -15281,6 +15302,7 @@ static int admit_http_share_request(int fd,
     }
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
     snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
+    snprintf(admission->target_base_url, sizeof(admission->target_base_url), "%s", resolution.target_base_url);
     return 1;
 }
 
@@ -15310,7 +15332,9 @@ static void forward_http_share_websocket(st_admin_server *server,
     char **headers = NULL;
     size_t headers_len = 0U;
     if (accept_key == NULL || raw_query == NULL
-        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(raw_query);
         send_text_http_error(fd, 500, "direct websocket request build failed");
@@ -15337,7 +15361,9 @@ static void forward_http_share_request(st_admin_server *server,
     char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
     char **headers = NULL;
     size_t headers_len = 0U;
-    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(raw_query);
         send_text_http_error(fd, 500, "direct http request build failed");
         return;
@@ -15559,8 +15585,10 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     int strip_direct_authorization = 0;
+    char direct_target_base_url[512] = "";
     if (strncmp(path, "/http/", 6) == 0) {
-        int auth_result = authorize_direct_http_route(fd, path, request);
+        int auth_result = authorize_direct_http_route(fd, path, request, direct_target_base_url,
+                                                      sizeof(direct_target_base_url));
         if (auth_result < 0) {
             close(fd);
             return;
@@ -15604,7 +15632,8 @@ static void handle_client(st_admin_server *server, int fd)
                                              method,
                                              path,
                                              request,
-                                             strip_direct_authorization)) {
+                                             strip_direct_authorization,
+                                             direct_target_base_url)) {
         free(body_buffer);
         close(fd);
         return;
@@ -15616,7 +15645,8 @@ static void handle_client(st_admin_server *server, int fd)
                                    request,
                                    (const uint8_t *)body,
                                    available_body_len,
-                                   strip_direct_authorization)) {
+                                   strip_direct_authorization,
+                                   direct_target_base_url)) {
         free(body_buffer);
         close(fd);
         return;

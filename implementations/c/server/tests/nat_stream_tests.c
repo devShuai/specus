@@ -764,6 +764,95 @@ static int check_window_overflow(test_server *server, client_pair *pair)
     return expect_data_connection_served(server, pair);
 }
 
+/* Sends one raw browser request for the client's route and returns the browser socket. */
+static int browser_send(const test_server *server, const client_pair *pair, const char *path,
+                        const char *extra_headers)
+{
+    char client[768];
+    char request[2048];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(request, sizeof(request), "GET /http/%s/%s%s HTTP/1.1\r\nHost: 127.0.0.1\r\n%s\r\n",
+                       client, ROUTE, path, extra_headers);
+    int fd = connect_local(server->admin_port);
+    if (fd >= 0 && (len <= 0 || (size_t)len >= sizeof(request)
+                    || send_all(fd, (const uint8_t *)request, (size_t)len) != 0)) {
+        close_fd(&fd);
+    }
+    return fd;
+}
+
+/* The request OPEN of the next stream; *meta is the caller's to free. */
+static int expect_open_meta(int data_fd, uint32_t *stream_id, char **meta)
+{
+    st_nat_message open;
+    if (expect_nat_frame(data_fd, ST_NAT_OPEN, &open) != 0) {
+        return -1;
+    }
+    *stream_id = open.stream_id;
+    *meta = open.meta_json;
+    open.meta_json = NULL;
+    st_nat_message_free(&open);
+    return *meta == NULL ? -1 : 0;
+}
+
+/*
+ * Java UpstreamBrowserHeaders on the wire: the request OPEN the client receives, for HTTP and for a
+ * WebSocket upgrade, carries the browser's Origin and Referer moved onto the route target's origin
+ * (http://127.0.0.1:9) and cross-site fetch metadata as same-origin; other headers are untouched.
+ */
+static int check_upstream_browser_headers(test_server *server, client_pair *pair)
+{
+    char client[768];
+    char browser_headers[1024];
+    char expected_referer[1024];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    snprintf(browser_headers, sizeof(browser_headers),
+             "Origin: https://specus.example\r\nReferer: https://specus.example/http/%s/%s/page?x=1\r\n"
+             "Sec-Fetch-Site: cross-site\r\nX-Kept: https://specus.example\r\n",
+             client, ROUTE);
+    snprintf(expected_referer, sizeof(expected_referer), "\"Referer:http://127.0.0.1:9/http/%s/%s/page?x=1\"",
+             client, ROUTE);
+
+    uint32_t stream_id = 0U;
+    char *meta = NULL;
+    int browser = browser_send(server, pair, "/page", browser_headers);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &meta) == 0, "no HTTP request OPEN");
+    int http_ok = strstr(meta, "\"Origin:http://127.0.0.1:9\"") != NULL && strstr(meta, expected_referer) != NULL
+        && strstr(meta, "\"Sec-Fetch-Site:same-origin\"") != NULL
+        && strstr(meta, "\"X-Kept:https://specus.example\"") != NULL
+        && strstr(meta, "\"Origin:https://specus.example\"") == NULL && strstr(meta, "cross-site") == NULL;
+    if (!http_ok) {
+        fprintf(stderr, "HTTP OPEN metadata: %s\n", meta);
+    }
+    free(meta);
+    CHECK(http_ok, "the HTTP request OPEN must carry the browser headers moved onto the route target");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0,
+          "response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "HTTP response");
+    close_fd(&browser);
+
+    char upgrade[1536];
+    snprintf(upgrade, sizeof(upgrade),
+             "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n%s", browser_headers);
+    browser = browser_send(server, pair, "/socket", upgrade);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &meta) == 0, "no WebSocket OPEN");
+    int ws_ok = strstr(meta, "\"source\":\"ws\"") != NULL && strstr(meta, "\"Origin:http://127.0.0.1:9\"") != NULL
+        && strstr(meta, expected_referer) != NULL && strstr(meta, "\"Sec-Fetch-Site:same-origin\"") != NULL
+        && strstr(meta, "\"Origin:https://specus.example\"") == NULL && strstr(meta, "cross-site") == NULL;
+    if (!ws_ok) {
+        fprintf(stderr, "WebSocket OPEN metadata: %s\n", meta);
+    }
+    free(meta);
+    CHECK(ws_ok, "the WebSocket OPEN must carry the browser headers moved onto the route target");
+    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "RST of the WebSocket stream");
+    close_fd(&browser);
+    return expect_http_stream_served(server, pair);
+}
+
 /*
  * HEARTBEAT_RESPONSE is a heartbeat and allowed on both roles; it needs no answer. A NAT KEEPALIVE
  * on the data connection is accepted as well.
@@ -1050,6 +1139,8 @@ int main(int argc, char **argv)
                           check_rst_for_never_opened_stream);
     failures += run_check("WINDOW_UPDATE overflow closes the data connection", check_window_overflow);
     failures += run_check("HEARTBEAT_RESPONSE is accepted on both roles", check_heartbeat_response);
+    failures += run_check("request OPEN carries browser headers moved onto the route target",
+                          check_upstream_browser_headers);
     failures += run_check("4 MiB client-to-public queue overflow resets only that stream", check_tcp_queue_overflow);
     failures += run_on_fresh_server("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
     if (raise_descriptor_limit(4096) == 0) {

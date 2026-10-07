@@ -8513,6 +8513,7 @@ typedef struct {
     char tenant_id[128];
     char owner_username[128];
     int client_enabled;
+    char target_base_url[512];
 } share_target;
 
 /* The route by id with its client, which a route reaches by name and may have lost. */
@@ -8522,7 +8523,7 @@ static int share_load_target(sqlite3 *db, long long route_id, share_target *targ
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT r.id, r.route, r.client_name, r.enabled, r.auth_enabled, r.path_rewrite_enabled, "
-            "c.rowid, c.tenant_id, c.owner_username, c.enabled "
+            "c.rowid, c.tenant_id, c.owner_username, c.enabled, r.target_base_url "
             "FROM http_route_mapping r LEFT JOIN client_account c ON c.client_name = r.client_name "
             "WHERE r.id = ?",
             -1, &stmt, NULL) != SQLITE_OK) {
@@ -8536,7 +8537,8 @@ static int share_load_target(sqlite3 *db, long long route_id, share_target *targ
         target->route_found = 1;
         target->route_id = sqlite3_column_int64(stmt, 0);
         if (copy_text_column(stmt, 1, target->route_name, sizeof(target->route_name)) != 0
-            || copy_text_column(stmt, 2, target->client_name, sizeof(target->client_name)) != 0) {
+            || copy_text_column(stmt, 2, target->client_name, sizeof(target->client_name)) != 0
+            || copy_text_column(stmt, 10, target->target_base_url, sizeof(target->target_base_url)) != 0) {
             result = -1;
         }
         target->route_enabled = sqlite3_column_int(stmt, 3) != 0;
@@ -9053,6 +9055,7 @@ int st_storage_http_share_resolve(const char *path,
             out->path_rewrite_enabled = target.path_rewrite_enabled;
             snprintf(out->client_name, sizeof(out->client_name), "%s", target.client_name);
             snprintf(out->route_name, sizeof(out->route_name), "%s", target.route_name);
+            snprintf(out->target_base_url, sizeof(out->target_base_url), "%s", target.target_base_url);
             if (share_is_active(&out->share, now_ms)) {
                 rc = share_lapse_reason(db, builtin, &out->share, &target, &out->lapse_reason);
             }
