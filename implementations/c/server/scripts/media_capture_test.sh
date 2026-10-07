@@ -23,6 +23,11 @@ parts = {}
 objects = {}
 next_upload = 0
 
+def record(name, line):
+    # The test binary reads these logs to see which uploads began and which objects were deleted.
+    with open(os.path.join(root, name), "a", encoding="utf-8") as output:
+        output.write(line + "\n")
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -56,6 +61,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             next_upload += 1
             upload_id = "upload-" + str(next_upload)
             uploads[upload_id] = parsed.path
+            record("initiated.log", parsed.path)
             body = ("<InitiateMultipartUploadResult><UploadId>" + upload_id + "</UploadId></InitiateMultipartUploadResult>").encode()
             self.reply(200, body)
             return
@@ -120,7 +126,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(200, body)
 
     def do_DELETE(self):
-        self.reply(204 if self.authorized() else 403)
+        if not self.authorized():
+            self.reply(403)
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if "uploadId" in query:
+            record("aborted.log", parsed.path)
+        else:
+            objects.pop(parsed.path, None)
+            record("deleted.log", parsed.path)
+        self.reply(204)
 
     def log_message(self, *_):
         pass
@@ -137,6 +153,7 @@ for _ in $(seq 1 100); do [[ -f "$tmp_dir/port" ]] && break; sleep 0.05; done
 port="$(cat "$tmp_dir/port")"
 SPECUS_MEDIA_CAPTURE_TEST_ENDPOINT="http://media.test:$port" \
 SPECUS_MEDIA_CAPTURE_TEST_RESOLVE_ADDRESS="127.0.0.1" \
+SPECUS_MEDIA_CAPTURE_TEST_STATE_DIR="$tmp_dir" \
   "$test_binary"
 
 find "$tmp_dir" -name 'upload-*-part-1' -size 5242880c | grep -q .
