@@ -181,3 +181,75 @@ func TestLegacyAccountKeyLookupFailsClosedWhenAmbiguous(t *testing.T) {
 		t.Fatalf("unique legacy key: user=%+v err=%v", user, err)
 	}
 }
+
+func insertManagementEmail(t *testing.T, db *DB, accountKey, email string) {
+	t.Helper()
+	if _, err := db.sql.Exec(`INSERT INTO specus_management_user_email (username, email, verified_at, created_at,
+		updated_at) VALUES (?, ?, '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z')`,
+		accountKey, email); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Java ManagementAccountsHttpTests.deletingAnAccountReleasesItsEmail: the email row is keyed by the
+// account key and goes in the delete's transaction; other accounts keep theirs.
+func TestDeletingAnAccountReleasesItsEmail(t *testing.T) {
+	db, err := Open("sqlite", filepath.Join(t.TempDir(), "emails.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	now := time.Now()
+	var accounts []ManagementUser
+	for _, name := range []string{"frank", "grace"} {
+		user, err := db.InsertManagementUser(ctx, ManagementUser{Username: name, TenantID: "default",
+			PasswordHash: "hash", Role: ManagementRoleUser, Enabled: true, CreatedAt: now, UpdatedAt: now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		insertManagementEmail(t, db, user.AccountKey, name+"@example.com")
+		accounts = append(accounts, user)
+	}
+	if _, err := db.DeleteManagementUserAudited(ctx, accounts[0], "admin", now.UnixMilli(),
+		func(HTTPShareSnapshot) string { return "" }); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := db.ManagementEmailExists(ctx, "FRANK@example.com"); err != nil || exists {
+		t.Fatalf("frank's email after the delete: exists=%v err=%v", exists, err)
+	}
+	if exists, err := db.ManagementEmailExists(ctx, "grace@example.com"); err != nil || !exists {
+		t.Fatalf("grace's email: exists=%v err=%v", exists, err)
+	}
+}
+
+// Java ManagementUserSchemaMigratorTests.removesEmailRecordsOfAccountsThatNoLongerExist.
+func TestLoginNameMigrationRemovesEmailRecordsOfDeletedAccounts(t *testing.T) {
+	path := legacyManagementUserDatabase(t, legacyUserRow("kept-key", "default"))
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertManagementEmail(t, db, "kept-key", "kept@example.com")
+	insertManagementEmail(t, db, "deleted-key", "released@example.com")
+	db.Close()
+	for i := 0; i < 2; i++ { // the migration runs on every start
+		db, err = Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		db.Close()
+	}
+	db, err = Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if exists, err := db.ManagementEmailExists(ctx, "released@example.com"); err != nil || exists {
+		t.Fatalf("orphaned email: exists=%v err=%v", exists, err)
+	}
+	if exists, err := db.ManagementEmailExists(ctx, "kept@example.com"); err != nil || !exists {
+		t.Fatalf("kept email: exists=%v err=%v", exists, err)
+	}
+}

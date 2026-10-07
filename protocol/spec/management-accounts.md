@@ -2,7 +2,7 @@
 
 本文规定管理后台账号（`specus_management_user`）的身份模型：登录名在租户内唯一，不同租户可以有同名账号；登录、token、每次请求的身份解析、OIDC 绑定和所有以账号为键的数据都以 **（租户，登录名）** 为身份。四个服务端按本文实现。
 
-关联 [issue #183](https://github.com/devShuai/specus/issues/183)。参考实现是 Java server：`ManagementUser`、`ManagementUserService`、`ManagementUserSchemaMigrator`、`AuthController`、`ManagementContextResolver`、`LocalTokenService`，测试 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`。
+关联 [issue #183](https://github.com/devShuai/specus/issues/183)；账号删除与 token 的账号键声明见 [issue #199](https://github.com/devShuai/specus/issues/199)。参考实现是 Java server：`ManagementUser`、`ManagementUserService`、`ManagementUserSchemaMigrator`、`AuthController`、`ManagementContextResolver`、`LocalTokenService`，测试 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`。
 
 **状态：四个服务端已实现。** 第 11 节列出各端的书面差异。
 
@@ -37,7 +37,7 @@
 
 `username` 不再要求全局唯一的「名字」语义，只是主键。任何地方都不得再用「`lower(username) = lower(?)`」按名字找账号；按账号键查找的只有两处：第 4.1 节不带租户的兼容登录，与第 6 节不带 `tenant_id` 的旧 token。
 
-邮件注册表 `specus_management_user_email` 的主键 `username` 存账号键（Java `RegistrationService` 写 `user.accountKey()`）。
+邮件注册表 `specus_management_user_email` 的主键 `username` 存账号键（Java `RegistrationService` 写 `user.accountKey()`）。它是唯一按账号键引用账号的表：账号删除时它的邮箱记录在同一事务里删除（第 7 节），迁移清理指向已不存在账号的邮箱记录（第 3 节第 6 步）。其他以账号为键的数据按（租户，登录名）记录，见第 10 节。
 
 ## 3. 迁移
 
@@ -48,6 +48,7 @@
 3. 任一（租户，规范登录名）出现两次，**启动失败**，错误信息含 `duplicate management login name` 与租户名。这一步在回填之前：失败时不写入任何行。
 4. 回填：每行写入 `login_name` 与 `login_name_normalized`。
 5. 缺唯一索引时创建；随后读回索引定义，名字对但不是唯一索引、或列不是恰好 `(tenant_id, login_name_normalized)` 的，**启动失败**，错误信息含 `must be unique on (tenant_id, login_name_normalized)`。
+6. 邮件注册表存在时，删除 `username` 不是任何账号键的邮箱记录（`delete from specus_management_user_email where username not in (select username from specus_management_user)`）。在第 7 节的删除规则之前删掉的账号会留下这样的记录，它们让该邮箱一直无法再注册；本步骤把它们放出来。表不存在（尚未建表的新库）时跳过。
 
 结果：旧账号的登录名就是原来的用户名，账号键不变，所以旧库里所有以用户名记录的归属（第 10 节）不需要改写，原账号照常登录。旧库里大小写不同的两个同名账号只要分属不同租户就能通过迁移；在同一租户则迁移拒绝启动，由运维先处理。
 
@@ -90,20 +91,29 @@
 | --- | --- |
 | `sub` | 账号的**登录名**（内置管理员为配置中的写法） |
 | `tenant_id` | 账号的租户 |
+| `uid` | 账号的**账号键**，字符串，不透明；客户端不得解析或展示。内置管理员没有账号行，它的 token **不带** `uid` |
 | `role` | `ADMIN` 或 `USER` |
 | `iat`、`exp` | 不变 |
 
-签发（登录、注册验证、OIDC 换取本地 token、续期）一律按上表。
+签发（登录、注册验证、OIDC 换取本地 token、续期）一律按上表：账号的 token 都带 `uid`，内置管理员的都不带。
+
+`uid` 把 token 钉在签发时的那一行账号上。登录名可以复用：删除 tenant-a 的 `alice` 后再建一个 `alice`，新账号的账号键是新的 UUID，旧 `alice` 的 token 因 `uid` 不符而解析不到任何人（第 6 节），不会落到新账号上。
+
+`uid` 缺失或是空字符串，视为不带该声明。
 
 ## 6. 每次请求与续期的身份解析
 
-每个需要鉴权的管理请求和 `POST /auth/refresh` 都按 token 重新读取账号（Java `ManagementUserService.resolveLocalTokenUser(sub, tenant_id)`）：
+每个需要鉴权的管理请求和 `POST /auth/refresh` 都按 token 重新读取账号（Java `ManagementUserService.resolveLocalTokenUser(sub, tenant_id, uid)`）：
 
 | token | 解析 |
 | --- | --- |
-| `sub` 与内置管理员不区分大小写相等，且 `tenant_id` 缺失或等于默认租户 | 内置管理员；关闭密码登录后不再解析 |
+| 不带 `uid`，`sub` 与内置管理员不区分大小写相等，且 `tenant_id` 缺失或等于默认租户 | 内置管理员；关闭密码登录后不再解析 |
 | 带 `tenant_id` | 在该租户按规范登录名查找 |
 | 不带 `tenant_id`（只可能是更早版本签发的旧 token） | 按账号键**精确**查找 |
+
+带 `uid` 的 token 跳过第一行，只解析为账号行：按后两行找到账号后，账号键必须与 `uid` **逐字相等**（区分大小写），否则视为解析不到。所以带 `uid` 的 token 永远不是内置管理员。
+
+不带 `uid` 的 token 按上表照旧解析，**直到过期**。这样的 token 只能是本版本之前签发的；升级时不让所有人重新登录，代价是：升级前签发、在过期前其账号被删除且同租户又建了同名账号的 token，仍会解析到新账号，与升级前相同。续期用读到的记录重新签发，新 token 带上 `uid`，所以升级后至多一个 token 有效期，所有在用的 token 都带 `uid`。
 
 账号必须存在且已启用；租户、角色、是否管理员一律取自账号记录，不取 token 的声明。续期用读到的记录重新签发。解析不到时：普通请求按各端现状拒绝（Java `403`），续期 `401`。
 
@@ -118,17 +128,19 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 | 接口 | 规则 |
 | --- | --- |
 | `GET /api/admin/me` | `username` 为登录名，`tenantId` 为账号的租户 |
-| `GET /api/admin/users` | 只列调用者租户的账号，按登录名排序，`username` 字段是登录名；内置管理员一行照旧排在最前 |
+| `GET /api/admin/users` | 只列调用者租户的账号，按登录名排序，`username` 字段是登录名。内置管理员只属于默认租户：**只有调用者租户是默认租户时**列出它的一行（`builtIn: true`，`tenantId` 为默认租户），排在最前；其他租户的列表里没有这一行 |
 | `POST /api/admin/users` | 只在调用者租户检查规范登录名冲突。**其他租户已有同名账号不算冲突**，照常创建，账号键为新的 UUID。本租户冲突的状态码沿用各端现状（Java、Go、.NET `400`，C `409`），错误信息不含其他租户的任何信息。与内置管理员同名一律拒绝 |
 | `PUT/DELETE /api/admin/users/{username}` | 路径参数是登录名，只在调用者租户按规范登录名查找；其他租户的账号与不存在的账号答复相同 |
 
 创建冲突与跨租户目标都不能透露其他租户里是否存在该名字。
 
-删除账号时，按（账号的租户，账号记录里的登录名）清理该身份的工作台行、产品指标进度与 HTTP 分享，时机与事务边界见各自的契约（[service-workbench.md](service-workbench.md)、[product-metrics.md](product-metrics.md)、[temporary-http-share.md](temporary-http-share.md)）。
+删除账号时，按（账号的租户，账号记录里的登录名）清理该身份的工作台行、产品指标进度与 HTTP 分享，时机与事务边界见各自的契约（[service-workbench.md](service-workbench.md)、[product-metrics.md](product-metrics.md)、[temporary-http-share.md](temporary-http-share.md)）。账号的邮箱记录（`specus_management_user_email` 中 `username` 等于该账号键的行）与账号行在**同一事务**里删除：删除提交后该邮箱可以再注册，删除失败则两者都保留。
+
+列表里的内置管理员一行是配置的写照，不是账号：其他租户的管理员看不到它，也不能创建、修改或删除与它同名的账号（这三项照旧拒绝，不论调用者在哪个租户）。
 
 ## 8. 邮件注册
 
-注册只开在默认租户：冲突检查是「默认租户里已有该规范登录名」，新账号的账号键是 UUID，邮箱记录指向账号键。注册挑战表的用户名唯一性不变。
+注册只开在默认租户：冲突检查是「默认租户里已有该规范登录名」，新账号的账号键是 UUID，邮箱记录指向账号键。注册挑战表的用户名唯一性不变。账号删除后它的邮箱不再算「已注册」（第 7 节）。
 
 ## 9. OIDC 绑定
 
@@ -174,3 +186,11 @@ MySQL 上（Java、Go、.NET）：库的默认排序规则（如 `utf8mb4_0900_a
 - `tenantQualifiedLoginAndRefreshResolveOnlyTheMatchingTenant`：两个租户各有 `alice`，各自带 `tenantId` 登录得到各自租户的 token，续期仍在本租户；用错租户或不带租户（`alice` 不在默认租户、也不是旧账号）登录失败；一方的 token 看不到另一方的数据。
 - `bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous`。
 - `ManagementUserSchemaMigratorTests` 的三项：回填并强制租户内唯一（可重复运行）；同租户重名在回填前失败；同名但定义不对的索引被拒绝。另外，**旧库升级后原账号照常可以登录**。
+
+[issue #199](https://github.com/devShuai/specus/issues/199) 起另有：
+
+- 共享向量 [`management-accounts-v1.json`](../test-vectors/management-accounts-v1.json)：按其中的账号键建好账号，把每个 `claims` 签成本地 token，逐条经 `GET /api/admin/me` 与 `POST /auth/refresh` 重放 `tokenResolution`（`expect` 为 `null` 时前者被拒、后者 `401`；否则前者答复 `username`、`tenantId`、`builtIn`，后者签发的新 token 的 `uid` 等于 `expect.uid`，`null` 表示不带），经 `GET /api/admin/users` 重放 `userLists`（逐项、按顺序比较 `username`、`tenantId`、`builtIn`）。Java `ManagementAccountsHttpTests.replaysTheTokenResolutionVector`、`replaysTheUserListVector`。
+- 删除后重建同名账号：登录得到的 token 带 `uid`；删除该账号、在同一租户再建同名账号后，旧 token 的请求被拒、续期 `401`，新账号登录正常（Java `ManagementAccountsHttpTests.deletedAccountTokensDoNotResolveToARecreatedAccountOfTheSameName`）。
+- 删除账号时邮箱记录同事务删除，删除后同一邮箱可以再注册；迁移清理指向不存在账号的邮箱记录且不动其他记录（Java `ManagementAccountsHttpTests.deletingAnAccountReleasesItsEmail`、`ManagementUserSchemaMigratorTests.removesEmailRecordsOfAccountsThatNoLongerExist`）。
+
+其他三端的对应：Go `internal/management/management_accounts_test.go` 与 `internal/store/management_user_schema_test.go`；.NET `ManagementAccountLifecycleTests` 与 `ManagementLoginNameMigrationTests.StartupStepRemovesEmailRecordsOfDeletedAccounts`；C ctest `management_accounts_tests`（`tests/management_accounts_tests.c`）。

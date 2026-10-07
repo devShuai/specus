@@ -118,6 +118,9 @@ typedef struct {
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
+    /* The key of the account row a bearer resolved to; empty for the built-in admin. A token issued
+     * for this context carries it as uid. */
+    char account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1];
     int admin;
     int authenticated;
     /* The bearer was a valid token of the identity provider, whether or not it resolved. */
@@ -878,7 +881,10 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
     const char *builtin_username = env_text("SPECUS_AUTH_USERNAME", "admin");
     const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
     const char *token_tenant = claims->has_tenant ? claims->tenant_id : "";
-    if (admin_ascii_casecmp(claims->username, builtin_username) == 0
+    /* A token with uid names an account row and is never the built-in admin's (section 6). */
+    int bound_to_account = claims->account_key[0] != '\0';
+    if (!bound_to_account
+        && admin_ascii_casecmp(claims->username, builtin_username) == 0
         && (token_tenant[0] == '\0' || strcmp(token_tenant, default_tenant) == 0)) {
         if (!management_password_login_enabled()) {
             return -1;
@@ -905,9 +911,14 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
     if (found != 0 || !user.enabled) {
         return -1;
     }
+    /* The token of a deleted account does not pass to a later account of the same login name. */
+    if (bound_to_account && strcmp(user.account_key, claims->account_key) != 0) {
+        return -1;
+    }
     snprintf(context->username, sizeof(context->username), "%s", user.username);
     snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
     snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+    snprintf(context->account_key, sizeof(context->account_key), "%s", user.account_key);
     context->admin = strcmp(context->role, "ADMIN") == 0;
     context->authenticated = 1;
     return 0;
@@ -4221,13 +4232,14 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     }
     long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char access_token[2048];
-    if (st_security_issue_local_token(user.username,
-                                      user.tenant_id,
-                                      normalize_management_role(user.role),
-                                      getenv("SPECUS_AUTH_JWT_SECRET"),
-                                      ttl,
-                                      access_token,
-                                      sizeof(access_token)) != 0) {
+    if (st_security_issue_local_token_for_account(user.username,
+                                                  user.tenant_id,
+                                                  normalize_management_role(user.role),
+                                                  user.account_key,
+                                                  getenv("SPECUS_AUTH_JWT_SECRET"),
+                                                  ttl,
+                                                  access_token,
+                                                  sizeof(access_token)) != 0) {
         free(id_token);
         free(token_type);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
@@ -10651,16 +10663,21 @@ static int build_management_users_response(const st_admin_context *context, char
     }
     st_admin_string_builder builder = {0};
     const char *tenant_id = context->tenant_id;
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
+    /* The built-in admin belongs to the default tenant only: it signs in there and its tokens resolve
+     * there, so another tenant's list does not show it as one of its accounts. */
+    int listed = 0;
     int rc = admin_sb_append(&builder, "[");
-    if (rc == 0) {
+    if (rc == 0 && strcmp(tenant_id, default_tenant) == 0) {
         rc = append_management_user_view(&builder,
                                          env_text("SPECUS_AUTH_USERNAME", "admin"),
-                                         tenant_id,
+                                         default_tenant,
                                          "ADMIN",
                                          1,
                                          1,
                                          "",
                                          "");
+        listed = 1;
     }
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
@@ -10675,7 +10692,9 @@ static int build_management_users_response(const st_admin_context *context, char
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
         for (size_t i = 0; rc == 0 && i < user_count; ++i) {
-            rc = admin_sb_append(&builder, ",");
+            if (listed++ > 0) {
+                rc = admin_sb_append(&builder, ",");
+            }
             if (rc == 0) {
                 rc = append_stored_management_user_view(&builder, &users[i]);
             }
@@ -11100,21 +11119,24 @@ static int handle_workbench_request(const st_admin_context *context,
     return response_len;
 }
 
+/* account_key is the uid claim of the token: the account row's key, NULL for the built-in admin. */
 static int write_management_token_response(const char *username,
                                            const char *tenant_id,
                                            const char *role,
+                                           const char *account_key,
                                            char *out,
                                            size_t out_len)
 {
     long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char token[2048];
-    if (st_security_issue_local_token(username,
-                                      tenant_id,
-                                      role,
-                                      getenv("SPECUS_AUTH_JWT_SECRET"),
-                                      ttl,
-                                      token,
-                                      sizeof(token)) != 0) {
+    if (st_security_issue_local_token_for_account(username,
+                                                  tenant_id,
+                                                  role,
+                                                  account_key,
+                                                  getenv("SPECUS_AUTH_JWT_SECRET"),
+                                                  ttl,
+                                                  token,
+                                                  sizeof(token)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
     }
     char *escaped_token = st_json_escape(token);
@@ -11220,6 +11242,7 @@ static int handle_management_auth_login(const char *body,
     char token_username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
+    char token_account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1] = "";
     snprintf(token_username, sizeof(token_username), "%s", username);
     snprintf(token_tenant, sizeof(token_tenant), "%s", default_tenant);
     snprintf(token_role, sizeof(token_role), "%s", "USER");
@@ -11269,6 +11292,7 @@ static int handle_management_auth_login(const char *body,
                 snprintf(token_username, sizeof(token_username), "%s", user.username);
                 snprintf(token_tenant, sizeof(token_tenant), "%s", user.tenant_id);
                 snprintf(token_role, sizeof(token_role), "%s", normalize_management_role(user.role));
+                snprintf(token_account_key, sizeof(token_account_key), "%s", user.account_key);
                 database_user = 1;
             }
         }
@@ -11283,7 +11307,8 @@ static int handle_management_auth_login(const char *body,
     if (!ok) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
-    int response_len = write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    int response_len = write_management_token_response(token_username, token_tenant, token_role,
+                                                       database_user ? token_account_key : NULL, out, out_len);
     /* The built-in admin is no user row and never enters the onboarding cohort. */
     if (database_user && admin_token_response_issued(out, response_len)) {
         admin_product_metrics_milestone(token_tenant, token_username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
@@ -11291,13 +11316,16 @@ static int handle_management_auth_login(const char *body,
     return response_len;
 }
 
-/* The context was re-read from the user record, so the new token carries today's tenant and role. */
+/* The context was re-read from the user record, so the new token carries today's tenant and role,
+ * and names the account row it resolved to whether or not the old token did. */
 static int handle_management_auth_refresh(const st_admin_context *context, char *out, size_t out_len)
 {
     if (context == NULL || !context->authenticated) {
         return write_admin_unauthorized(out, out_len);
     }
-    return write_management_token_response(context->username, context->tenant_id, context->role, out, out_len);
+    return write_management_token_response(context->username, context->tenant_id, context->role,
+                                           context->account_key[0] == '\0' ? NULL : context->account_key,
+                                           out, out_len);
 }
 
 static int write_registration_error_response(int status,
@@ -11360,7 +11388,8 @@ static int handle_management_registration_verify(const char *body, char *out, si
     }
     /* Verification created the account and signs it in at once: two milestones, in step order. */
     admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
-    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, user.account_key,
+                                                       out, out_len);
     if (admin_token_response_issued(out, response_len)) {
         admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
     }
