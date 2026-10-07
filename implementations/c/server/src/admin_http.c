@@ -8409,13 +8409,40 @@ static int semver_numeric_part(const char *value)
     return 1;
 }
 
+/*
+ * Dot-separated SemVer identifiers: none may be empty ("a..b", a leading or trailing dot), each is
+ * [0-9A-Za-z-]+, and a numeric pre-release identifier has no leading zero (build metadata may).
+ */
+static int semver_identifiers_valid(const char *text, int prerelease)
+{
+    const char *part = text;
+    for (;;) {
+        const char *end = strchr(part, '.');
+        size_t len = end == NULL ? strlen(part) : (size_t)(end - part);
+        if (len == 0U) return 0;
+        int all_numeric = 1;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = (unsigned char)part[i];
+            if (!isalnum(c) && c != '-') return 0;
+            if (!isdigit(c)) all_numeric = 0;
+        }
+        if (prerelease && all_numeric && len > 1U && part[0] == '0') return 0;
+        if (end == NULL) return 1;
+        part = end + 1;
+    }
+}
+
+/*
+ * Java SemanticVersion.parse: trimmed (every character up to and including space, as String.trim
+ * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0.
+ */
 static int parse_admin_semver(const char *value, st_admin_semver *out)
 {
     if (value == NULL || out == NULL) return -1;
-    while (isspace((unsigned char)*value)) ++value;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
     if (*value == 'v') ++value;
     const char *end = value + strlen(value);
-    while (end > value && isspace((unsigned char)end[-1])) --end;
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
     size_t len = (size_t)(end - value);
     if (len == 0U || len > 32U) return -1;
     char copy[33];
@@ -8423,37 +8450,24 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     copy[len] = '\0';
     char *build = strchr(copy, '+');
     if (build != NULL) {
-        if (build[1] == '\0') return -1;
-        for (char *p = build + 1; *p != '\0'; ++p) {
-            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return -1;
-        }
+        if (!semver_identifiers_valid(build + 1, 0)) return -1;
         *build = '\0';
     }
     char *prerelease = strchr(copy, '-');
     memset(out, 0, sizeof(*out));
     if (prerelease != NULL) {
         *prerelease++ = '\0';
-        if (*prerelease == '\0' || strlen(prerelease) >= sizeof(out->prerelease)) return -1;
-        char validation[33];
-        snprintf(validation, sizeof(validation), "%s", prerelease);
-        char *save = NULL;
-        for (char *part = strtok_r(validation, ".", &save); part != NULL;
-             part = strtok_r(NULL, ".", &save)) {
-            int all_numeric = *part != '\0';
-            for (char *p = part; *p != '\0'; ++p) if (!isdigit((unsigned char)*p)) all_numeric = 0;
-            if (*part == '\0' || (all_numeric && semver_numeric_part(part) == 0)) return -1;
-            for (char *p = part; *p != '\0'; ++p) {
-                if (!isalnum((unsigned char)*p) && *p != '-') return -1;
-            }
-        }
+        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, 1)) return -1;
         snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
     }
-    char *save = NULL;
-    char *major = strtok_r(copy, ".", &save);
-    char *minor = strtok_r(NULL, ".", &save);
-    char *patch = strtok_r(NULL, ".", &save);
-    if (!semver_numeric_part(major) || !semver_numeric_part(minor)
-        || !semver_numeric_part(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+    /* Exactly three parts: strtok_r would skip the empty one in "1..0.0" or ".1.0.0". */
+    char *major = copy;
+    char *minor = strchr(major, '.');
+    char *patch = minor == NULL ? NULL : strchr(minor + 1, '.');
+    if (minor == NULL || patch == NULL || strchr(patch + 1, '.') != NULL) return -1;
+    *minor++ = '\0';
+    *patch++ = '\0';
+    if (!semver_numeric_part(major) || !semver_numeric_part(minor) || !semver_numeric_part(patch)) return -1;
     snprintf(out->major, sizeof(out->major), "%s", major);
     snprintf(out->minor, sizeof(out->minor), "%s", minor);
     snprintf(out->patch, sizeof(out->patch), "%s", patch);
@@ -8499,6 +8513,16 @@ static int compare_admin_semver(const st_admin_semver *left, const st_admin_semv
         right_part = strtok_r(NULL, ".", &right_save);
     }
     return left_part == right_part ? 0 : (left_part == NULL ? -1 : 1);
+}
+
+int st_admin_semver_compare_for_testing(const char *left, const char *right, int *result)
+{
+    st_admin_semver parsed_left;
+    st_admin_semver parsed_right;
+    if (result == NULL || parse_admin_semver(left, &parsed_left) != 0
+        || parse_admin_semver(right, &parsed_right) != 0) return -1;
+    *result = compare_admin_semver(&parsed_left, &parsed_right);
+    return 0;
 }
 
 static int read_client_download_mutation(const char *body,

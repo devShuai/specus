@@ -80,6 +80,16 @@ target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_address_tests COMMAND specus_c_client_address_tests)
 
+add_executable(specus_c_semantic_version_tests tests/semantic_version_tests.c)
+target_link_libraries(specus_c_semantic_version_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_semantic_version_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME semantic_version_tests COMMAND specus_c_semantic_version_tests)
+
+add_executable(specus_c_turnstile_verifier_tests tests/turnstile_verifier_tests.c)
+target_link_libraries(specus_c_turnstile_verifier_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_turnstile_verifier_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME turnstile_verifier_tests COMMAND specus_c_turnstile_verifier_tests)
+
 add_executable(specus_c_upstream_browser_headers_tests tests/upstream_browser_headers_tests.c)
 target_link_libraries(specus_c_upstream_browser_headers_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_upstream_browser_headers_tests PRIVATE -Wall -Wextra -Wpedantic)
