@@ -3200,6 +3200,115 @@ static int connectivity_call(const char *path, const char *username, const char 
  * answer the same 404, the body is checked first, every answer is private and uncacheable, and a
  * result never names the target.
  */
+/*
+ * Java UserDiagramDocumentServiceTests: a cloud diagram is stored under the creating account's
+ * tenant and username, the list is scoped to the caller, and another account (another user of
+ * the same tenant, that tenant's administrator, another tenant's administrator) cannot read,
+ * overwrite or delete it: each attempt answers exactly like a document that does not exist, in
+ * whatever shape the request body comes.
+ */
+static int test_user_diagram_owner_scope(void)
+{
+    char db_path[256];
+    char path[96];
+    char response[32768];
+    char missing[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-diagram-scope-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-diagram-scope-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("alice", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("bob", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "diagram scope fixture setup failed\n");
+    /* "yjs-cloud-state", base64 */
+    int len = failed ? -1 : tenant_scope_call("POST", "/api/admin/diagrams", "alice", "tenant-a", "USER",
+                                              "{\"name\":\"架构图\",\"update\":\"eWpzLWNsb3VkLXN0YXRl\"}",
+                                              response, sizeof(response));
+    long long id = 0;
+    if (!failed) {
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"name\":\"架构图\"", "diagram create") != 0
+            || st_json_get_i64(strstr(response, "\r\n\r\n") + 4, "id", &id) != 0 || id <= 0;
+    }
+    if (!failed) {
+        st_storage_user_diagram stored;
+        failed = st_storage_get_user_diagram(db_path, id, "tenant-a", "alice", &stored) != 0;
+        if (!failed) {
+            failed = strcmp(stored.tenant_id, "tenant-a") != 0 || strcmp(stored.owner_username, "alice") != 0
+                || stored.snapshot_len != 15U || memcmp(stored.snapshot_data, "yjs-cloud-state", 15U) != 0;
+            st_storage_user_diagram_free(&stored);
+        }
+        if (failed) fprintf(stderr, "the diagram was not stored under the creating account\n");
+    }
+    static const struct {
+        const char *username;
+        const char *tenant;
+        const char *role;
+    } others[] = {
+        {"bob", "tenant-a", "USER"}, {"root-a", "tenant-a", "ADMIN"}, {"root-b", "tenant-b", "ADMIN"}
+    };
+    static const struct {
+        const char *method;
+        const char *body;
+    } attempts[] = {
+        {"GET", NULL},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\",\"revision\":0}"},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\"}"},
+        {"PUT", "{\"name\":\"\",\"update\":\"not base64\",\"revision\":0}"},
+        {"DELETE", NULL},
+    };
+    for (size_t who = 0; !failed && who < sizeof(others) / sizeof(others[0]); ++who) {
+        for (size_t i = 0; !failed && i < sizeof(attempts) / sizeof(attempts[0]); ++i) {
+            char label[160];
+            snprintf(label, sizeof(label), "%s %s of another account's diagram as %s/%s",
+                     attempts[i].method, attempts[i].body == NULL ? "" : attempts[i].body,
+                     others[who].tenant, others[who].username);
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+            len = tenant_scope_call(attempts[i].method, path, others[who].username, others[who].tenant,
+                                    others[who].role, attempts[i].body, response, sizeof(response));
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id + 1000);
+            int missing_len = tenant_scope_call(attempts[i].method, path, others[who].username,
+                                                others[who].tenant, others[who].role, attempts[i].body,
+                                                missing, sizeof(missing));
+            failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "{\"error\":\"diagram not found\"}", label) != 0
+                || missing_len != len || strcmp(response, missing) != 0;
+            if (failed) fprintf(stderr, "%s: did not answer like a missing diagram: %s\n", label, missing);
+        }
+        if (!failed) {
+            len = tenant_scope_call("GET", "/api/admin/diagrams", others[who].username, others[who].tenant,
+                                    others[who].role, NULL, response, sizeof(response));
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "another account's diagram list") != 0
+                || strcmp(strstr(response, "\r\n\r\n") + 4, "[]") != 0;
+            if (failed) fprintf(stderr, "another account listed a diagram: %s\n", response);
+        }
+    }
+    /* The owner still has the untouched document, and a stale revision cannot overwrite it. */
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+        len = tenant_scope_call("GET", path, "alice", "tenant-a", "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"update\":\"eWpzLWNsb3VkLXN0YXRl\"",
+                                 "owner diagram detail") != 0
+            || !contains(response, "\"name\":\"架构图\"") || !contains(response, "\"revision\":0");
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/diagrams", "alice", "tenant-a", "USER", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"name\":\"架构图\"", "owner diagram list") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "alice", "tenant-a", "USER",
+                                "{\"name\":\"架构图\",\"update\":\"AQ==\",\"revision\":2}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "stale diagram revision") != 0;
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 static int test_connectivity_check_endpoint(void)
 {
     char db_path[256];
@@ -4992,7 +5101,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/public/client-packages/%d/download", hosted_package_id);
     int download_handled = st_client_package_send_download(
-        package_sockets[0], "GET", request_path, db_path, "198.51.100.40");
+        package_sockets[0], "GET", request_path, db_path, "198.51.100.40", NULL, NULL);
     shutdown(package_sockets[0], SHUT_WR);
     char package_response[4096];
     ssize_t package_response_len = recv(package_sockets[1], package_response,
@@ -5997,7 +6106,7 @@ int main(void)
                                   sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed 2\"")
-        || !contains(response, "\"month\":\"2026-06-20\"")
+        || !contains(response, "\"month\":\"2026-06\"")
         || !contains(response, "\"total\":1")
         || !contains(response, "\"success\":1")
         || !contains(response, "\"failure\":0")
@@ -6610,6 +6719,9 @@ int main(void)
         return 1;
     }
     if (test_tenant_scoped_admin_mutations() != 0) {
+        return 1;
+    }
+    if (test_user_diagram_owner_scope() != 0) {
         return 1;
     }
     if (test_client_mutations_close_connections() != 0) {

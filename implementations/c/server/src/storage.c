@@ -755,6 +755,23 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "peer_mesh_egress_policy", "domain_rules",
                                    "TEXT NOT NULL DEFAULT '[]'");
     }
+    /*
+     * Java PeerServiceDiscoverySchemaMigrator: sharing tables written before mDNS import and the
+     * per-service allow list gain both columns switched off, and a row whose enabled flag is NULL
+     * (an older schema without the NOT NULL default) is forced off rather than read as on.
+     */
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "peer_mesh_service_sharing", "mdns_import_enabled",
+                                   "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "peer_mesh_shared_service", "allowed_client_ids", "TEXT");
+    }
+    if (rc == 0) {
+        rc = exec_sql(db,
+            "UPDATE peer_mesh_service_sharing SET enabled = 0 WHERE enabled IS NULL;"
+            "UPDATE peer_mesh_shared_service SET enabled = 0 WHERE enabled IS NULL;");
+    }
     if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
     }
@@ -4961,21 +4978,30 @@ int st_storage_list_connections_visible(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/*
+ * Java ConnectionArchiveService.archive: detail rows older than the cutoff are rolled up into one
+ * row per client and natural month (stat_date holds "yyyy-MM"), added to what earlier runs
+ * archived, and deleted, all in one transaction so a month is never counted twice.
+ */
 int st_storage_archive_connections(const char *path, const char *before_timestamp)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
     }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO connection_stat(client_id, client_name, stat_date, success_count, failure_count, updated_at) "
-        "SELECT MAX(client_id), client_name, substr(connected_at, 1, 10), "
+        "SELECT MAX(client_id), client_name, substr(connected_at, 1, 7), "
         "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), "
         "SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), "
         "CURRENT_TIMESTAMP "
         "FROM connection_record WHERE connected_at < ? "
-        "GROUP BY client_name, substr(connected_at, 1, 10) "
+        "GROUP BY client_name, substr(connected_at, 1, 7) "
         "ON CONFLICT(client_name, stat_date) DO UPDATE SET "
         "client_id = COALESCE(connection_stat.client_id, excluded.client_id), "
         "success_count = success_count + excluded.success_count, "
@@ -5005,8 +5031,50 @@ int st_storage_archive_connections(const char *path, const char *before_timestam
         }
         sqlite3_finalize(stmt);
     }
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    else (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
+}
+
+int st_storage_connection_archive_cutoff(int retention_days, long long now_epoch_seconds, char out[11])
+{
+    if (retention_days <= 0 || out == NULL) return -1;
+    /* LocalDate.now(UTC).minusDays(retention_days), converted with the civil-from-days algorithm. */
+    long long day = now_epoch_seconds / 86400LL - (now_epoch_seconds % 86400LL < 0 ? 1 : 0)
+        - (long long)retention_days + 719468LL;
+    long long era = (day >= 0 ? day : day - 146096LL) / 146097LL;
+    long long day_of_era = day - era * 146097LL;
+    long long year_of_era = (day_of_era - day_of_era / 1460LL + day_of_era / 36524LL
+                             - day_of_era / 146096LL) / 365LL;
+    long long day_of_year = day_of_era - (365LL * year_of_era + year_of_era / 4LL - year_of_era / 100LL);
+    long long month_index = (5LL * day_of_year + 2LL) / 153LL;
+    long long day_of_month = day_of_year - (153LL * month_index + 2LL) / 5LL + 1LL;
+    long long month = month_index < 10LL ? month_index + 3LL : month_index - 9LL;
+    long long year = year_of_era + era * 400LL + (month <= 2LL ? 1LL : 0LL);
+    if (year < 0 || year > 9999) return -1;
+    const long long fields[3] = {year, month, day_of_month};
+    const int widths[3] = {4, 2, 2};
+    size_t position = 0U;
+    for (int field = 0; field < 3; ++field) {
+        if (field > 0) out[position++] = '-';
+        long long value = fields[field];
+        for (int digit = widths[field] - 1; digit >= 0; --digit) {
+            out[position + (size_t)digit] = (char)('0' + value % 10LL);
+            value /= 10LL;
+        }
+        position += (size_t)widths[field];
+    }
+    out[position] = '\0';
+    return 0;
+}
+
+int st_storage_archive_expired_connections(const char *path, int retention_days, long long now)
+{
+    char cutoff[11];
+    if (retention_days <= 0) return 0;
+    if (st_storage_connection_archive_cutoff(retention_days, now, cutoff) != 0) return -1;
+    return st_storage_archive_connections(path, cutoff);
 }
 
 int st_storage_load_connection_stat(const char *path,
