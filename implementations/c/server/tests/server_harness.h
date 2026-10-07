@@ -74,6 +74,9 @@ int send_login_request(int fd, const runtime_session *runtime, const char *role)
  */
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len);
+/* channel_login that also copies the client name the LOGIN_RESPONSE carries into answered_name. */
+int channel_login_answer(int port, const runtime_session *runtime, const char *role, int *fd_out,
+                         char *answered_name, size_t answered_name_len, char *reason, size_t reason_len);
 /* Reads and discards frames until the server closes the connection. */
 int expect_channel_closed(int fd, int timeout_ms);
 /* A heartbeat answered proves the channel is still bound and served. */
