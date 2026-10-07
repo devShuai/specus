@@ -24,6 +24,12 @@ typedef struct {
     size_t trailer_names_len;
     char **trailers;
     size_t trailers_len;
+    /*
+     * The client account whose record let the request in (http-route.md section 1), or 0 when no
+     * account record was involved. The forwarder only uses a data connection that logged in as
+     * this account; one still bound under the name for another account is treated as offline.
+     */
+    long long client_id;
 } st_direct_http_request;
 
 typedef struct {
@@ -106,6 +112,8 @@ typedef struct {
     const uint8_t *body;
     size_t body_len;
     st_admin_direct_ws_stream *stream;
+    /* As st_direct_http_request.client_id. */
+    long long client_id;
 } st_admin_direct_ws_request;
 
 /*
@@ -149,6 +157,15 @@ typedef int (*st_admin_client_message_handler)(void *ctx,
                                                const char *message);
 typedef int (*st_admin_peer_mesh_refresh_handler)(void *ctx,
                                                   const char *tenant_id);
+/*
+ * Closes the online control and data connections of a client account an admin disabled, renamed
+ * or deleted. client_name is the name they logged in with (the account's name before the change)
+ * and reason the disconnect reason they are recorded with: ADMIN_DISABLED, ADMIN_RENAMED or
+ * ADMIN_DELETED. Returns how many connections it closed.
+ */
+typedef int (*st_admin_client_disconnect_handler)(void *ctx,
+                                                  const char *client_name,
+                                                  const char *reason);
 
 typedef struct {
     int port;
@@ -218,6 +235,7 @@ void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_h
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
 void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx);
+void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx);
 /*
  * The device side of POST /api/admin/http-routes/{id}/connectivity-check: presence and the probe
  * through the client's data connection (service-connectivity-check.md). Without it the endpoint

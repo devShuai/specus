@@ -3536,6 +3536,99 @@ static int test_client_account_service_rules(void)
     return failed ? 1 : 0;
 }
 
+/* "name|reason" of each client the management API asked to close in the last call. */
+static char client_close_calls[4][160];
+static size_t client_close_call_count = 0U;
+
+static int record_client_close(void *ctx, const char *client_name, const char *reason)
+{
+    (void)ctx;
+    if (client_close_call_count < sizeof(client_close_calls) / sizeof(client_close_calls[0])) {
+        snprintf(client_close_calls[client_close_call_count], sizeof(client_close_calls[0]), "%s|%s",
+                 client_name, reason);
+    }
+    ++client_close_call_count;
+    return 0;
+}
+
+/* One client mutation by tenant-a's administrator: its status and the one close it asks for, or none. */
+static int client_mutation_closes(const char *method, const char *path, const char *body, const char *status,
+                                  const char *expected_close, const char *label)
+{
+    char response[16384];
+    client_close_call_count = 0U;
+    int len = tenant_scope_call(method, path, "root-a", "tenant-a", "ADMIN", body, response, sizeof(response));
+    if (endpoint_expect(len, response, status, NULL, label) != 0) {
+        return -1;
+    }
+    int ok = expected_close == NULL
+        ? client_close_call_count == 0U
+        : client_close_call_count == 1U && strcmp(client_close_calls[0], expected_close) == 0;
+    if (!ok) {
+        fprintf(stderr, "%s: %zu close(s), the first %s; expected %s\n", label, client_close_call_count,
+                client_close_call_count > 0U ? client_close_calls[0] : "(none)",
+                expected_close == NULL ? "none" : expected_close);
+    }
+    return ok ? 0 : -1;
+}
+
+/*
+ * Disabling, renaming or deleting a client closes its online connections on the transitions Go's
+ * management API kicks on, with Go's reasons: disabled from enabled, or renamed while disabled
+ * (ADMIN_DISABLED), renamed (ADMIN_RENAMED), deleted (ADMIN_DELETED). The connections are named
+ * by the client's name before the change. Other updates and refused mutations close nothing.
+ */
+static int test_client_mutations_close_connections(void)
+{
+    char db_path[256];
+    char path[160];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-client-close-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-client-close-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client alpha;
+    st_storage_client foreign;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "close-alpha", "root-a", 1, 30, &alpha) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-b", "close-foreign", "root-b", 1, 30, &foreign) != 0;
+    if (failed) fprintf(stderr, "client close fixture setup failed\n");
+    st_admin_set_client_disconnect_handler(record_client_close, NULL);
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"connectionRateLimitPerMinute\":40}", "HTTP/1.1 200 ", NULL,
+                                  "rate limit change") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_DISABLED", "disable") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ", NULL,
+                                  "disable an already disabled client") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":true}", "HTTP/1.1 200 ", NULL, "enable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-2\"}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_RENAMED", "rename") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-3\",\"enabled\":false}",
+                                  "HTTP/1.1 200 ", "close-alpha-2|ADMIN_DISABLED", "rename and disable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-4\"}", "HTTP/1.1 200 ",
+                                  "close-alpha-3|ADMIN_DISABLED", "rename while disabled") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", foreign.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 404 ", NULL,
+                                  "disable another tenant's client") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete another tenant's client") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 204 ", "close-alpha-4|ADMIN_DELETED", "delete") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete a deleted client") != 0;
+    st_admin_set_client_disconnect_handler(NULL, NULL);
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 /* The connectivity check device for the endpoint test: online and refused by its target, or offline. */
 static int connectivity_test_online;
 
@@ -7011,6 +7104,9 @@ int main(void)
     }
     if (test_client_account_service_rules() != 0) {
         fprintf(stderr, "ClientAccountServiceTests rules mismatch\n");
+        return 1;
+    }
+    if (test_client_mutations_close_connections() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");

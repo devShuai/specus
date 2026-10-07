@@ -421,7 +421,10 @@ user instance limit, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`
   connection carries. A newer control or data login of the same client replaces the older
   connection instead of being refused (`REPLACED_BY_NEW_LOGIN`): a control login also closes the
   previous data connection, its NAT streams, pending Direct HTTP requests and public listeners, and
-  the previous session can no longer attach a data connection. A control connection that goes
+  the previous session can no longer attach a data connection. Disabling, renaming or deleting a
+  client through the management API closes its online control and data connections the same way,
+  recorded as `ADMIN_DISABLED`, `ADMIN_RENAMED` or `ADMIN_DELETED` as in Go, so no session keeps
+  serving a name or route set the server no longer has. A control connection that goes
   away closes the data connection of the same session; a data connection that goes away leaves its
   control alone, as in Java and Go. A dead peer is closed by
   `SPECUS_CONTROL_READ_IDLE_SECONDS` and stops counting as online. On `SIGTERM`/`SIGINT` the server
@@ -444,7 +447,11 @@ as client auth login, and count only the current management context's visible TC
 Requests under `/http/{clientName}/{route}/...` are recognized by the management listener and are
 forwarded to the active runtime session whose `clientName` matches the path and whose `route`
 exists in the configured HTTP route snapshot. Runtime sessions are indexed by client name, and
-each binds one control connection plus one data connection. Ordinary HTTP requests use NAT stream v2 on the authenticated
+each binds one control connection plus one data connection; a data connection that logged in as
+another account than the one whose route record let the request in (an account renamed away
+from that name, for instance) is answered as offline rather than used.
+`tests/http_route_lifecycle_tests.c` replays every server scenario of
+`protocol/test-vectors/http-route-lifecycle-v1.json` against a real server process. Ordinary HTTP requests use NAT stream v2 on the authenticated
 data connection: request/response metadata is carried once in `OPEN`, body bytes are streamed with
 `DATA`, and `FIN`, `RST`, and `WINDOW_UPDATE` propagate half-close, cancellation, and flow control.
 WebSocket upgrades use the same NAT stream and preserve frame semantics in the mandatory 12-byte

@@ -369,16 +369,26 @@ public sealed class AdvertisedService
     public string? Path { get; set; }
 }
 
+/// <summary>A NAT_CONTROL body: the client's full TCP mapping and HTTP route snapshot.</summary>
 public sealed class SpecusConfigSnapshot
 {
+    private List<HttpSpecusConfigEntry> _httpSpecusConfigList = new();
+
     [JsonPropertyName("specusConfigList")]
     public List<SpecusConfigEntry> SpecusConfigList { get; set; } = new();
 
     /// <summary>
-    /// Null means the server did not take over HTTP routes. Empty list means clear routes.
+    /// The full HTTP route list, which replaces the client's whole route table. A missing or null
+    /// list reads as empty, i.e. no routes: routes come only from the HTTP login snapshot and
+    /// NAT_CONTROL, so there is nothing a missing list could keep, and an older server that
+    /// omitted the field after the last route was deleted must not leave that route forwarding.
     /// </summary>
     [JsonPropertyName("httpSpecusConfigList")]
-    public List<HttpSpecusConfigEntry>? HttpSpecusConfigList { get; set; }
+    public List<HttpSpecusConfigEntry> HttpSpecusConfigList
+    {
+        get => _httpSpecusConfigList;
+        set => _httpSpecusConfigList = value ?? new();
+    }
 }
 
 /// <summary>A single TCP NAT specus registration entry.</summary>

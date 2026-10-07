@@ -222,6 +222,8 @@ typedef struct admin_share_stream {
 typedef struct {
     char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
     char client_name[256];
+    /* The account owning the share's route, as st_direct_http_request.client_id. */
+    long long client_id;
     char route[128];
     char rewrite_prefix[64];
     /* The route's target, whose origin the relayed browser headers take (UpstreamBrowserHeaders). */
@@ -256,6 +258,9 @@ static size_t admin_pending_client_message_writes = 0U;
 static pthread_mutex_t admin_peer_mesh_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_mesh_refresh_handler admin_peer_mesh_refresh_handler = NULL;
 static void *admin_peer_mesh_refresh_ctx = NULL;
+static pthread_mutex_t admin_client_disconnect_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_client_disconnect_handler admin_client_disconnect_handler = NULL;
+static void *admin_client_disconnect_ctx = NULL;
 
 static char *admin_url_decode(const char *value, size_t len);
 static const char *admin_database_path(void);
@@ -296,6 +301,14 @@ void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler h
     admin_peer_mesh_refresh_handler = handler;
     admin_peer_mesh_refresh_ctx = ctx;
     pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+}
+
+void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_client_disconnect_lock);
+    admin_client_disconnect_handler = handler;
+    admin_client_disconnect_ctx = ctx;
+    pthread_mutex_unlock(&admin_client_disconnect_lock);
 }
 
 static pthread_mutex_t admin_connectivity_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -373,6 +386,18 @@ static void admin_notify_nat_control(const st_storage_client *client)
 {
     if (client != NULL) {
         (void)admin_push_nat_control(client->id, client->client_name);
+    }
+}
+
+/* Closes the online connections of a client an admin disabled, renamed or deleted. */
+static void admin_close_client_connections(const char *client_name, const char *reason)
+{
+    pthread_mutex_lock(&admin_client_disconnect_lock);
+    st_admin_client_disconnect_handler handler = admin_client_disconnect_handler;
+    void *ctx = admin_client_disconnect_ctx;
+    pthread_mutex_unlock(&admin_client_disconnect_lock);
+    if (handler != NULL) {
+        (void)handler(ctx, client_name, reason);
     }
 }
 
@@ -7004,6 +7029,16 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
     }
+    /*
+     * As Go's management API: the online connections of a disabled or renamed client are closed,
+     * so none keeps serving under a name or route set the server no longer has.
+     */
+    int renamed = strcmp(existing.client_name, updated.client_name) != 0;
+    if (!updated.enabled && (existing.enabled || renamed)) {
+        admin_close_client_connections(existing.client_name, "ADMIN_DISABLED");
+    } else if (renamed) {
+        admin_close_client_connections(existing.client_name, "ADMIN_RENAMED");
+    }
     admin_notify_peer_mesh_refresh(updated.tenant_id);
     return build_client_result_response(&updated, 200, "OK", out, out_len);
 }
@@ -7028,6 +7063,7 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    admin_close_client_connections(existing.client_name, "ADMIN_DELETED");
     admin_notify_peer_mesh_refresh(existing.tenant_id);
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -12737,7 +12773,9 @@ static int refuse_direct_http_route(int fd, const char *method, const char *path
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
  * since, so what the client holds never makes a route reachable. The route's target is copied into
- * target_base_url for the browser header rewrite. Every refusal is recorded like Java's.
+ * target_base_url for the browser header rewrite. *client_id is the account the request was let in
+ * for (0 without a database), so that only a data connection of that account, not one of a former
+ * account of the same name, can serve it. Every refusal is recorded like Java's.
  */
 static int authorize_direct_http_route(int fd,
                                        const char *method,
@@ -12745,8 +12783,10 @@ static int authorize_direct_http_route(int fd,
                                        const char *raw_request,
                                        long long started_ms,
                                        char *target_base_url,
-                                       size_t target_base_url_len)
+                                       size_t target_base_url_len,
+                                       long long *client_id)
 {
+    *client_id = 0;
     char *client_name = NULL;
     char *route_name = NULL;
     target_base_url[0] = '\0';
@@ -12783,17 +12823,27 @@ static int authorize_direct_http_route(int fd,
     int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
     int env_configured = !found && client_enabled
         && admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
+    long long env_client_id = 0;
+    if (env_configured) {
+        /* A SPECUS_HTTP_ROUTES route has no row of its own: it belongs to the account named. */
+        st_storage_client account;
+        env_configured = st_storage_get_client_by_name(database_path, client_name, &account) == 0
+            && account.enabled;
+        env_client_id = env_configured ? account.id : 0;
+    }
     free(client_name);
     free(route_name);
     if (!client_enabled) {
         return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
     if (!found) {
+        *client_id = env_client_id;
         return env_configured ? 0 : send_http_route_not_found(fd);
     }
     if (!route.enabled) {
         return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
+    *client_id = route.client_id;
     snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
@@ -15519,6 +15569,7 @@ static void admin_direct_ws_run(st_admin_server *server,
                                 int fd,
                                 char *accept_key,
                                 const char *client_name,
+                                long long client_id,
                                 const char *route,
                                 const char *relative_path,
                                 const char *raw_query,
@@ -15560,7 +15611,8 @@ static void admin_direct_ws_run(st_admin_server *server,
         .headers_len = headers_len,
         .body = empty_body,
         .body_len = 0,
-        .stream = stream
+        .stream = stream,
+        .client_id = client_id
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
     if (open_rc != 0) {
@@ -15632,7 +15684,8 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  const char *path,
                                                  const char *raw_request,
                                                  int strip_authorization,
-                                                 const char *target_base_url)
+                                                 const char *target_base_url,
+                                                 long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0
         || !admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
@@ -15711,7 +15764,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct websocket header capture failed");
         return 1;
     }
-    admin_direct_ws_run(server, fd, accept_key, client_name, route, relative_path, raw_query,
+    admin_direct_ws_run(server, fd, accept_key, client_name, client_id, route, relative_path, raw_query,
                         headers, headers_len, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
@@ -15745,6 +15798,7 @@ static void admin_forward_direct_http(st_admin_server *server,
                                       int fd,
                                       const char *method,
                                       const char *client_name,
+                                      long long client_id,
                                       const char *route,
                                       const char *relative_path,
                                       const char *raw_query,
@@ -15767,7 +15821,8 @@ static void admin_forward_direct_http(st_admin_server *server,
         .trailer_names = trailers->names,
         .trailer_names_len = trailers->names_len,
         .trailers = trailers->fields,
-        .trailers_len = trailers->fields_len
+        .trailers_len = trailers->fields_len,
+        .client_id = client_id
     };
     size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
     char *source_url = (char *)malloc(source_len);
@@ -15854,7 +15909,8 @@ static int handle_direct_http_request(st_admin_server *server,
                                       size_t body_len,
                                       const admin_request_trailers *trailers,
                                       int strip_authorization,
-                                      const char *target_base_url)
+                                      const char *target_base_url,
+                                      long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0) {
         return 0;
@@ -15914,7 +15970,7 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct http header capture failed");
         return 1;
     }
-    admin_forward_direct_http(server, fd, method, client_name, route, relative_path, raw_query,
+    admin_forward_direct_http(server, fd, method, client_name, client_id, route, relative_path, raw_query,
                               headers, headers_len, body, body_len, trailers, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
@@ -16266,6 +16322,7 @@ static int admit_http_share_request(int fd,
         return 0;
     }
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
+    admission->client_id = resolution.client_id;
     snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
     snprintf(admission->target_base_url, sizeof(admission->target_base_url), "%s", resolution.target_base_url);
     return 1;
@@ -16305,8 +16362,9 @@ static void forward_http_share_websocket(st_admin_server *server,
         send_text_http_error(fd, 500, "direct websocket request build failed");
         return;
     }
-    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->route,
-                        admission->relative_path, raw_query, headers, headers_len, &admission->stream);
+    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->client_id,
+                        admission->route, admission->relative_path, raw_query, headers, headers_len,
+                        &admission->stream);
     free_header_array(headers, headers_len);
     free(raw_query);
 }
@@ -16335,9 +16393,9 @@ static void forward_http_share_request(st_admin_server *server,
         return;
     }
     /* No Basic gate: Authorization belongs to the target and is relayed as it came. */
-    admin_forward_direct_http(server, fd, method, admission->client_name, admission->route,
-                              admission->relative_path, raw_query, headers, headers_len, body, body_len,
-                              trailers, admission);
+    admin_forward_direct_http(server, fd, method, admission->client_name, admission->client_id,
+                              admission->route, admission->relative_path, raw_query, headers, headers_len,
+                              body, body_len, trailers, admission);
     free_header_array(headers, headers_len);
     free(raw_query);
 }
@@ -16722,10 +16780,11 @@ static void handle_client(st_admin_server *server, int fd)
     }
     int strip_direct_authorization = 0;
     char direct_target_base_url[512] = "";
+    long long direct_client_id = 0;
     int direct_path = strncmp(path, "/http/", 6) == 0;
     if (direct_path) {
         int auth_result = authorize_direct_http_route(fd, method, path, request, started_ms, direct_target_base_url,
-                                                      sizeof(direct_target_base_url));
+                                                      sizeof(direct_target_base_url), &direct_client_id);
         if (auth_result < 0) {
             close(fd);
             return;
@@ -16801,7 +16860,8 @@ static void handle_client(st_admin_server *server, int fd)
                                              path,
                                              request,
                                              strip_direct_authorization,
-                                             direct_target_base_url)) {
+                                             direct_target_base_url,
+                                             direct_client_id)) {
         admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
@@ -16816,7 +16876,8 @@ static void handle_client(st_admin_server *server, int fd)
                                                     available_body_len,
                                                     &direct_trailers,
                                                     strip_direct_authorization,
-                                                    direct_target_base_url);
+                                                    direct_target_base_url,
+                                                    direct_client_id);
     admin_request_trailers_free(&direct_trailers);
     if (direct_handled) {
         free(body_buffer);

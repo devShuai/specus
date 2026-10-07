@@ -49,15 +49,12 @@ internal sealed class DirectHttpHandler
         string.Join(", ", _routes.Keys.Order(StringComparer.Ordinal));
 
     /// <summary>
-    /// Replaces the route map with a server-pushed snapshot. A <c>null</c> argument keeps the
-    /// current local fallback (matching the Java handler's "未接管" semantics).
+    /// Replaces the whole route map with a server-pushed snapshot. A <c>null</c> snapshot is the
+    /// empty one: the client defines no routes of its own, so there is nothing to keep, and a
+    /// route the server no longer lists must stop forwarding.
     /// </summary>
     public void ApplyRoutes(IEnumerable<HttpSpecusConfigEntry>? next)
     {
-        if (next is null)
-        {
-            return;
-        }
         var routes = BuildMap(next);
         _routes = routes;
         LogSnapshot("applied", routes);

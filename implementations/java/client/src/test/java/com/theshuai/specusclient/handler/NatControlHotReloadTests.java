@@ -22,8 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * NAT_CONTROL 到 client 的整合契约测试。覆盖：
  * <ul>
  *   <li>{@code httpSpecusConfigList} 出现时替换 {@link NatClientHandler} 的 HTTP/WS 路由快照</li>
- *   <li>{@code httpSpecusConfigList} 缺省时**保留** HTTP 登录初始快照，不要误清空</li>
- *   <li>{@code httpSpecusConfigList} 为空数组时整体清空（接管态全部禁用/删除）</li>
+ *   <li>{@code httpSpecusConfigList} 为空数组、{@code null} 或缺省时都整体清空：NAT_CONTROL 是完整快照</li>
  * </ul>
  *
  * <p>这里直接拼装 NAT_CONTROL JSON，避开 server 端依赖；这是与 server
@@ -70,11 +69,12 @@ class NatControlHotReloadTests {
     }
 
     @Test
-    void natControlWithoutHttpListPreservesInitialRoutes() {
+    void natControlWithoutHttpListClearsRoutes() {
         NatClientHandler nat = natHandlerWithInitialRoute();
         EmbeddedChannel channel = new EmbeddedChannel(nat, new MessageResponseHandler(new TcpConnection()));
         try {
-            // 本次 NAT_CONTROL 不下发 httpSpecusConfigList 字段；客户端必须保留初始快照
+            // A server from before every push carried the list left it out once the client had no
+            // route row; keeping the old list there kept a deleted route forwarding.
             String json = """
                     {
                       "clientName":"unit",
@@ -85,7 +85,23 @@ class NatControlHotReloadTests {
                     """;
             channel.writeInbound(natControl(json));
 
-            assertEquals(Map.of("initial", "http://127.0.0.1:9999"), nat.getCurrentHttpRoutes());
+            assertTrue(nat.getCurrentHttpRoutes().isEmpty());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void natControlWithNullHttpListClearsRoutes() {
+        NatClientHandler nat = natHandlerWithInitialRoute();
+        EmbeddedChannel channel = new EmbeddedChannel(nat, new MessageResponseHandler(new TcpConnection()));
+        try {
+            String json = """
+                    {"clientName":"unit","specusConfigList":[],"httpSpecusConfigList":null}
+                    """;
+            channel.writeInbound(natControl(json));
+
+            assertTrue(nat.getCurrentHttpRoutes().isEmpty());
         } finally {
             channel.finishAndReleaseAll();
         }

@@ -118,8 +118,9 @@ public class ProductMetricsService {
     }
 
     /**
-     * PUT /settings. Switching off drops the tenant's progress rows without folding them; switching
-     * on clears the purge mark; an unchanged state keeps updatedAt/updatedBy.
+     * PUT /settings. Switching off drops the tenant's progress rows without folding them. Any change
+     * of state clears the purge mark, so while the switch is off the mark only stands for a purge
+     * made after switching off; an unchanged state keeps updatedAt/updatedBy and the mark.
      */
     public Response putSettings(ManagementContext context, byte[] body) {
         if (!context.isAdmin()) {
@@ -142,8 +143,7 @@ public class ProductMetricsService {
             SwitchRow saved = transactions.execute(status -> {
                 SwitchRow row = store.findSwitch(tenant).orElse(new SwitchRow(tenant, false, null, null, null));
                 if (row.enabled() != update.enabled()) {
-                    row = new SwitchRow(tenant, update.enabled(), context.username(), now,
-                            update.enabled() ? null : row.purgedAt());
+                    row = new SwitchRow(tenant, update.enabled(), context.username(), now, null);
                 }
                 store.saveSwitch(row);
                 if (!update.enabled()) {
@@ -369,7 +369,11 @@ public class ProductMetricsService {
         }
     }
 
-    /** The four retention steps of section 9; idempotent and independent of when it runs. */
+    /**
+     * The four retention steps of section 9; idempotent and independent of when it runs. Step 4 only
+     * reaches tenants purged since they switched off: switching off clears the mark a purge made
+     * while collecting.
+     */
     public void sweep() {
         long now = clock.millis();
         List<SwitchRow> switches = store.switches();

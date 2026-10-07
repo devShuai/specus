@@ -97,8 +97,9 @@ public sealed class ProductMetricsService
     }
 
     /// <summary>
-    /// PUT /settings. Switching off drops the tenant's progress rows without folding them; switching
-    /// on clears the purge mark; an unchanged state keeps updatedAt/updatedBy.
+    /// PUT /settings. Switching off drops the tenant's progress rows without folding them. Any change
+    /// of state clears the purge mark, so while the switch is off the mark only stands for a purge
+    /// made after switching off; an unchanged state keeps updatedAt/updatedBy and the mark.
     /// </summary>
     public async Task<ProductMetricsResult> PutSettingsAsync(ManagementContext context, ReadOnlyMemory<byte> body,
         CancellationToken cancellationToken)
@@ -140,10 +141,7 @@ public sealed class ProductMetricsService
                     row.Enabled = update.Enabled;
                     row.UpdatedBy = context.Username;
                     row.UpdatedAt = now;
-                    if (update.Enabled)
-                    {
-                        row.PurgedAt = null;
-                    }
+                    row.PurgedAt = null;
                 }
                 await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
                 if (!update.Enabled)
@@ -450,7 +448,11 @@ public sealed class ProductMetricsService
 
     // -- retention (9) ------------------------------------------------------------------------------
 
-    /// <summary>The four retention steps of section 9; idempotent and independent of when it runs.</summary>
+    /// <summary>
+    /// The four retention steps of section 9; idempotent and independent of when it runs. Step 4 only
+    /// reaches tenants purged since they switched off: switching off clears the mark a purge made
+    /// while collecting.
+    /// </summary>
     public Task SweepAsync(CancellationToken cancellationToken) => WithDbAsync(async db =>
     {
         var now = _clock.NowMs();
