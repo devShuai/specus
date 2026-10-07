@@ -139,6 +139,17 @@ add_test(NAME elasticsearch_traffic_tests
                  $<TARGET_FILE:specus_c_elasticsearch_traffic_tests>)
 set_tests_properties(elasticsearch_traffic_tests PROPERTIES TIMEOUT 45)
 
+# The traffic detail API against Java's semantics: search over Elasticsearch through an in-process
+# admin listener, TCP capture from a real server process through the write queue, and the stream
+# contract and large pages on SQLite. Runs against the same fake Elasticsearch.
+add_executable(specus_c_traffic_detail_api_tests tests/traffic_detail_api_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_traffic_detail_api_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_detail_api_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_detail_api_tests
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/elasticsearch_traffic_test.sh
+                 $<TARGET_FILE:specus_c_traffic_detail_api_tests> $<TARGET_FILE:specus-server-c>)
+set_tests_properties(traffic_detail_api_tests PROPERTIES TIMEOUT 180)
+
 add_executable(specus_c_http_share_tests tests/http_share_tests.c)
 target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_share_tests PRIVATE -Wall -Wextra -Wpedantic)
