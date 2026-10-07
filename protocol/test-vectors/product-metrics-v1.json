@@ -3797,6 +3797,13 @@
             "updatedBy": "root",
             "updatedAt": "2026-03-01T00:00:00Z",
             "purgedAt": "2026-09-20T23:00:00Z"
+          },
+          {
+            "tenantId": "t4",
+            "enabled": true,
+            "updatedBy": "root",
+            "updatedAt": "2026-03-01T00:00:00Z",
+            "purgedAt": null
           }
         ],
         "progress": [
@@ -3905,6 +3912,16 @@
             "attempt": "first",
             "outcome": "success",
             "count": 9
+          },
+          {
+            "tenantId": "t4",
+            "day": "2026-09-20",
+            "mode": "device",
+            "path": "direct",
+            "sizeBucket": "lt1m",
+            "attempt": "first",
+            "outcome": "success",
+            "count": 4
           }
         ]
       },
@@ -3940,6 +3957,13 @@
                   "updatedBy": "root",
                   "updatedAt": "2026-03-01T00:00:00Z",
                   "purgedAt": "2026-09-20T23:00:00Z"
+                },
+                {
+                  "tenantId": "t4",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
                 }
               ],
               "progress": [
@@ -3964,6 +3988,598 @@
                   "tenantId": "t1",
                   "cohortDay": "2026-09-07",
                   "reachedStep": "credential_created",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t2",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 4
+                }
+              ],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-03-26",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 5
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-21",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t2",
+                  "day": "2026-09-20",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 6
+                },
+                {
+                  "tenantId": "t4",
+                  "day": "2026-09-20",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 4
+                }
+              ]
+            }
+          }
+        },
+        {
+          "op": "purge",
+          "at": "2026-09-21T01:00:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "purged": true,
+              "enabled": true
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-21T02:00:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "uma",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"link\",\"path\":\"cloud\",\"sizeBucket\":\"gt512m\",\"attempt\":\"first\",\"outcome\":\"failure\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 2
+            }
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-21T02:10:00Z",
+          "tenantId": "t4",
+          "username": "vera",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-21T02:25:00Z",
+          "tenantId": "t4",
+          "username": "vera",
+          "step": "service_published",
+          "expect": {
+            "effect": "completed"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-21T02:30:00Z",
+          "tenantId": "t4",
+          "username": "walt",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-21T03:00:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-21T03:00:00Z",
+              "updatedBy": "root4"
+            }
+          }
+        },
+        {
+          "op": "sweep",
+          "at": "2026-09-21T03:30:00Z",
+          "expect": {}
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T03:30:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-21",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "from": "2026-09-21",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T03:30:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 1,
+                "pendingUsers": 0,
+                "final": true,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 1,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 1,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 1,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 1,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 1,
+                    "fromPreviousRateBp": 10000
+                  }
+                ],
+                "completed": 1,
+                "completionRateBp": 10000,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 0
+                  }
+                ],
+                "medianDurationBucket": "10m-30m"
+              },
+              "transfers": {
+                "cells": [
+                  {
+                    "path": "direct",
+                    "sizeBucket": "lt1m",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "path": "cloud",
+                    "sizeBucket": "gt512m",
+                    "success": 0,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 0
+                  }
+                ],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 0
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 1,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 5000
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 1,
+                  "failure": 1,
+                  "cancelled": 0,
+                  "successRateBp": 5000
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-21T03:30:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t2",
+                  "enabled": false,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": false,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": "2026-09-20T23:00:00Z"
+                },
+                {
+                  "tenantId": "t4",
+                  "enabled": false,
+                  "updatedBy": "root4",
+                  "updatedAt": "2026-09-21T03:00:00Z",
+                  "purgedAt": null
+                }
+              ],
+              "progress": [],
+              "onboardingDaily": [
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-03-26",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-07",
+                  "reachedStep": "credential_created",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-07",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t2",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 4
+                },
+                {
+                  "tenantId": "t4",
+                  "cohortDay": "2026-09-21",
+                  "reachedStep": "service_published",
+                  "durationBucket": "10m-30m",
+                  "users": 1
+                }
+              ],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-03-26",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 5
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-21",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t2",
+                  "day": "2026-09-20",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 6
+                },
+                {
+                  "tenantId": "t4",
+                  "day": "2026-09-21",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t4",
+                  "day": "2026-09-21",
+                  "mode": "link",
+                  "path": "cloud",
+                  "sizeBucket": "gt512m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                }
+              ]
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-21T04:00:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-21T04:00:00Z",
+              "updatedBy": "root4"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-21T04:00:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "uma",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 1
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-21T04:10:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-21T04:10:00Z",
+              "updatedBy": "root4"
+            }
+          }
+        },
+        {
+          "op": "purge",
+          "at": "2026-09-21T04:10:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "purged": true,
+              "enabled": false
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-21T04:15:00Z",
+          "actor": {
+            "tenantId": "t4",
+            "username": "root4",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-21T04:10:00Z",
+              "updatedBy": "root4"
+            }
+          }
+        },
+        {
+          "op": "sweep",
+          "at": "2026-09-21T04:30:00Z",
+          "expect": {}
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-21T04:30:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t2",
+                  "enabled": false,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": false,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": "2026-09-20T23:00:00Z"
+                },
+                {
+                  "tenantId": "t4",
+                  "enabled": false,
+                  "updatedBy": "root4",
+                  "updatedAt": "2026-09-21T04:10:00Z",
+                  "purgedAt": "2026-09-21T04:10:00Z"
+                }
+              ],
+              "progress": [],
+              "onboardingDaily": [
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-03-26",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-07",
+                  "reachedStep": "credential_created",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-07",
+                  "reachedStep": "signed_in",
                   "durationBucket": "none",
                   "users": 1
                 },
