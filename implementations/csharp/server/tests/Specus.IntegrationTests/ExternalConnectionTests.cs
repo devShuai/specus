@@ -321,6 +321,109 @@ public sealed class ExternalConnectionTests
         Assert.Null(end.Data);
     }
 
+    /// <summary>
+    /// Frames the client sent before it learned that the server closed an HTTP stream (a browser
+    /// that left, a probe that has its answer) are late, not a protocol violation. Whether they
+    /// land while Close() is still taking the stream out of the session or after its tombstone is
+    /// in place, each is answered with RST 7 for that stream alone and the data connection stays.
+    /// </summary>
+    [Fact]
+    public async Task LateHttpFramesForAClosedStreamKeepTheDataConnection()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var services = new TestServices();
+        var options = Options.Create(new NettyServerOptions());
+        await using var remotePorts = new RemotePortServerManager(
+            options, NullLoggerFactory.Instance, NullLogger<RemotePortServerManager>.Instance);
+        var writer = new CapturingFrameWriter();
+        var closeCount = 0;
+        var context = new SpecusConnectionContext(
+            "late-http-test", "127.0.0.1", writer, timeout.Token,
+            () => Interlocked.Increment(ref closeCount),
+            new ReadGate(timeout.Token),
+            new WriteBackpressureGate(32 * 1024, 64 * 1024));
+        context.OnLoginSuccess("server-test", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            1, ConnectionRole.Data);
+        await using var session = new NatClientSession(
+            context, remotePorts, services.Traffic, services.Inspection, options,
+            NullLoggerFactory.Instance, NullLogger<NatClientSession>.Instance);
+
+        // Close() marks the stream closed first and only then takes it out of the session's
+        // table. Nothing outside the stream can hold it between the two, so the flag is set here.
+        var closing = await session.OpenHttpStreamAsync(HttpRequestMetadata(), timeout.Token);
+        var closingOpen = await writer.WaitAsync(timeout.Token);
+        var closedFlag = typeof(HttpSpecusStream).GetField("_closed",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(closedFlag);
+        closedFlag.SetValue(closing, 1);
+        Assert.False(session.IsClosedStream(closingOpen.StreamId));
+        await AssertLateHttpFramesAnsweredAsync(session, writer, closingOpen.StreamId,
+            () => Volatile.Read(ref closeCount), timeout.Token);
+
+        // Closed and gone from the table: its tombstone answers the same frames the same way.
+        var closed = await session.OpenHttpStreamAsync(HttpRequestMetadata(), timeout.Token);
+        var closedOpen = await writer.WaitAsync(timeout.Token);
+        await closed.DisposeAsync();
+        Assert.True(session.IsClosedStream(closedOpen.StreamId));
+        await AssertLateHttpFramesAnsweredAsync(session, writer, closedOpen.StreamId,
+            () => Volatile.Read(ref closeCount), timeout.Token);
+
+        Assert.Equal(0, Volatile.Read(ref closeCount));
+        Assert.Null(context.ReadDisconnectReason());
+    }
+
+    private static async Task AssertLateHttpFramesAnsweredAsync(NatClientSession session,
+        CapturingFrameWriter writer, uint streamId, Func<int> closeCount,
+        CancellationToken cancellationToken)
+    {
+        var late = new[]
+        {
+            new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Open,
+                StreamId = streamId,
+                MetaData = new Dictionary<string, object?>
+                {
+                    ["source"] = "http",
+                    ["phase"] = "response",
+                    ["statusCode"] = 200,
+                },
+            },
+            new NatMessagePacket { NatMessageType = NatMessageType.Data, StreamId = streamId, Data = [1] },
+            new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Data,
+                StreamId = streamId,
+                Data = [2],
+                Flags = NatMessagePacket.FlagEndStream,
+            },
+            new NatMessagePacket { NatMessageType = NatMessageType.Fin, StreamId = streamId },
+        };
+        foreach (var frame in late)
+        {
+            await session.HandleAsync(frame);
+            Assert.Equal(0, closeCount());
+            var reset = await writer.WaitAsync(cancellationToken);
+            Assert.Equal(NatMessageType.Rst, reset.NatMessageType);
+            Assert.Equal(streamId, reset.StreamId);
+            Assert.Equal(7U, reset.Value);
+        }
+        // A late RST needs no answer at all.
+        await session.HandleAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Rst,
+            StreamId = streamId,
+            Value = 1,
+        });
+        Assert.Equal(0, closeCount());
+    }
+
+    private static Dictionary<string, object?> HttpRequestMetadata() => new()
+    {
+        ["source"] = "http",
+        ["phase"] = "request",
+    };
+
     private static SpecusConnectionContext CreateContext(
         IFrameWriter writer, CancellationToken lifetime) => new(
         "external-test",
