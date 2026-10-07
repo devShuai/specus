@@ -409,6 +409,28 @@ static int public_has_iso_control(const uint8_t *data, size_t len)
     return 0;
 }
 
+/* Java Character.isWhitespace: separators other than the no-break spaces, plus TAB..CR and FS..US. */
+static int public_java_whitespace(uint32_t codepoint)
+{
+    if ((codepoint >= 0x09U && codepoint <= 0x0dU) || (codepoint >= 0x1cU && codepoint <= 0x1fU)) return 1;
+    if (codepoint == 0xa0U || codepoint == 0x2007U || codepoint == 0x202fU) return 0;
+    utf8proc_category_t category = utf8proc_category((utf8proc_int32_t)codepoint);
+    return category == UTF8PROC_CATEGORY_ZS || category == UTF8PROC_CATEGORY_ZL
+        || category == UTF8PROC_CATEGORY_ZP;
+}
+
+/* Java String.isBlank of valid UTF-8 text: empty or whitespace only. */
+static int public_text_blank(const uint8_t *data, size_t len)
+{
+    size_t offset = 0U;
+    while (offset < len) {
+        uint32_t codepoint = 0U;
+        if (public_utf8_next(data, len, &offset, &codepoint, NULL) < 0) return 0;
+        if (!public_java_whitespace(codepoint)) return 0;
+    }
+    return 1;
+}
+
 /*
  * Java String.equalsIgnoreCase for the in-process name checks: code point by code point, two code
  * points match when equal, when their simple upper-case mappings are equal, or when the lower-case
@@ -1565,7 +1587,8 @@ static int public_route_binary(st_public_peer *source, const uint8_t *frame, siz
     if (target_len == 0U || target_len > 512U || source_len != 0U
         || (size_t)app_len != len - 14U - target_len
         || public_utf8_units(frame + 14U, target_len, 512U, NULL) != 0
-        || memchr(frame + 14U, '\0', target_len) != NULL
+        || public_has_iso_control(frame + 14U, target_len)
+        || public_text_blank(frame + 14U, target_len)
         || public_validate_stap2(frame + 14U + target_len, app_len) != 0) {
         (void)public_peer_send_error(source, "invalid binary relay frame");
         public_peer_close(source, 1008U);
