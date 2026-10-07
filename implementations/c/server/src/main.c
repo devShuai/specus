@@ -584,13 +584,27 @@ static int load_database_config(server_config *config, const char *database_path
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return -1;
     }
+    /*
+     * A logged-in session names its account by id: the name it logged in under may since have
+     * passed to another account by a rename or a delete and re-create. Only the static startup
+     * configuration names its account by name.
+     */
     st_storage_client client;
-    if (st_storage_get_client_by_name(database_path, config->client_name, &client) != 0 || !client.enabled) {
-        fprintf(stderr, "client not found or disabled in database: %s\n", config->client_name);
+    int by_id = config->client_session_db_backed && config->client_id > 0;
+    if ((by_id ? st_storage_get_client(database_path, config->client_id, &client)
+               : st_storage_get_client_by_name(database_path, config->client_name, &client)) != 0
+        || !client.enabled) {
+        if (by_id) {
+            fprintf(stderr, "client not found or disabled in database: id=%lld\n", (long long)config->client_id);
+        } else {
+            fprintf(stderr, "client not found or disabled in database: %s\n", config->client_name);
+        }
         return -1;
     }
     config->client_id = client.id;
-    if (copy_config_string(config->tenant_id,
+    if (copy_config_string(config->client_name, sizeof(config->client_name), "client_account.client_name",
+                           client.client_name) != 0
+        || copy_config_string(config->tenant_id,
                            sizeof(config->tenant_id),
                            "client_account.tenant_id",
                            client.tenant_id[0] == '\0' ? "default" : client.tenant_id) != 0) {
@@ -1493,9 +1507,8 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
  * Whether a data connection may serve a request the public entry let in for client_id (0 when no
  * account record was involved). Connections are found by name, and a name can pass to another
  * account by a rename or a delete and re-create. The admin's change closes the old account's
- * connections (close_client_connections); this refuses one that outlived it, as far as the ids
- * tell the accounts apart: client_account ids are SQLite rowids, which a deleted newest account
- * hands on to the next one created.
+ * connections (close_client_connections); this refuses one that outlived it. client_account ids
+ * are never handed out twice (AUTOINCREMENT), so two accounts of one name never share an id.
  */
 static int config_serves_account(const server_config *config, long long client_id)
 {
@@ -1747,8 +1760,9 @@ static int activate_session(specus_session *session, const char **reason)
  * name is displaced with that reason, so no session keeps serving TCP mappings or HTTP routes
  * under a name or a route set the server no longer has. It runs under the control admission lock:
  * a control login verified against the account before the change is published before this looks,
- * and one verified after it is refused by the account check, so none slips through. A data login
- * re-checks its control when it is published and finds it gone.
+ * and one verified after it is refused by the account check or, after a rename, bound under the new
+ * name, so none slips through under the old one. A data login re-checks its control when it is
+ * published and finds it gone.
  */
 static int close_client_connections(void *ctx, const char *client_name, const char *reason)
 {
@@ -2453,9 +2467,15 @@ static int read_frame(specus_session *session,
     return 1;
 }
 
-static int reload_config_for_client_session(server_config *config, const st_storage_client_session *client_session)
+/*
+ * Loads the configuration of the account the session's token was issued for, under the account's
+ * current name: the name the session was created under may since belong to another account.
+ */
+static int reload_config_for_client_session(server_config *config,
+                                            const st_storage_client_session *client_session,
+                                            const st_storage_client *client)
 {
-    if (config == NULL || client_session == NULL || config->database_path[0] == '\0') {
+    if (config == NULL || client_session == NULL || client == NULL || config->database_path[0] == '\0') {
         return -1;
     }
     char database_path[sizeof(config->database_path)];
@@ -2469,15 +2489,15 @@ static int reload_config_for_client_session(server_config *config, const st_stor
     config->http_route_count = 0;
     if (copy_config_string(config->client_name,
                            sizeof(config->client_name),
-                           "client_session.client_name",
-                           client_session->client_name) != 0
+                           "client_account.client_name",
+                           client->client_name) != 0
         || copy_config_string(config->tenant_id,
                               sizeof(config->tenant_id),
-                              "client_session.tenant_id",
-                              client_session->tenant_id[0] == '\0' ? "default" : client_session->tenant_id) != 0) {
+                              "client_account.tenant_id",
+                              client->tenant_id[0] == '\0' ? "default" : client->tenant_id) != 0) {
         return -1;
     }
-    config->client_id = client_session->client_id;
+    config->client_id = client->id;
     config->client_session_id = client_session->id;
     config->peer_service_discovery_version = client_session->peer_service_discovery_version;
     config->client_http_route_version = client_session->client_http_route_version;
@@ -3058,8 +3078,18 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "客户端认证存储暂不可用";
         return 0;
     }
-    if (strcmp(request->client_name, client_session.client_name) != 0) {
-        *reason = "客户端访问令牌无效";
+    /*
+     * The token belongs to the account it was issued for, never to a name: a name passes to another
+     * account when the admin renames or deletes this one and creates a new account under it. The
+     * account is resolved by id and tenant, as Java and .NET resolve it, and the connection is bound
+     * under the account's current name whatever name the request carries
+     * (protocol/spec/client-auth.md).
+     */
+    st_storage_client client;
+    if (st_storage_get_client(config->database_path, client_session.client_id, &client) != 0
+        || strcmp(client.tenant_id[0] == '\0' ? "default" : client.tenant_id,
+                  client_session.tenant_id[0] == '\0' ? "default" : client_session.tenant_id) != 0) {
+        *reason = "客户端不存在";
         return 0;
     }
     if (session->is_data_connection) {
@@ -3068,7 +3098,7 @@ static int verify_database_login(specus_session *session, const st_login_request
             return 0;
         }
         pthread_mutex_lock(&active_session_lock);
-        specus_session *control = active_session_find_role_locked(request->client_name, 0);
+        specus_session *control = active_session_find_role_locked(client.client_name, 0);
         int matching_control = control != NULL
             && control->config.client_session_id == client_session.id;
         pthread_mutex_unlock(&active_session_lock);
@@ -3111,10 +3141,8 @@ static int verify_database_login(specus_session *session, const st_login_request
         }
     }
 
-    st_storage_client client;
     st_storage_client_credential credential;
-    if (st_storage_get_client(config->database_path, client_session.client_id, &client) != 0
-        || st_storage_get_client_credential(config->database_path, client_session.credential_id, &credential) != 0) {
+    if (st_storage_get_client_credential(config->database_path, client_session.credential_id, &credential) != 0) {
         *reason = "客户端不存在";
         return 0;
     }
@@ -3166,7 +3194,7 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "客户端会话状态更新失败";
         return 0;
     }
-    if (reload_config_for_client_session(config, &client_session) != 0) {
+    if (reload_config_for_client_session(config, &client_session, &client) != 0) {
         /* A failed re-login must not take a session offline that an older control still carries. */
         if (!session->is_data_connection && !control_session_live(client_session.id)) {
             (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
@@ -4672,8 +4700,9 @@ static void *client_thread(void *arg)
             if (control_login) {
                 pthread_mutex_unlock(&control_admission_lock);
             }
+            /* An accepted login answers with the name it is bound under: the account's current name. */
             st_buffer response = st_protocol_encode_login_response(
-                request.client_name == NULL ? "" : request.client_name,
+                logged_in ? session->config.client_name : (request.client_name == NULL ? "" : request.client_name),
                 logged_in,
                 reason);
             if (session_send_packet(session, &response) != 0) {
@@ -4694,7 +4723,7 @@ static void *client_thread(void *arg)
             }
             printf("[%s] login ok client=%s remote=%s\n",
                    session->is_data_connection ? "data" : "control",
-                   request.client_name, session->remote);
+                   session->config.client_name, session->remote);
             if (!session->is_data_connection) {
                 record_login_success_event(session);
                 record_client_online_milestone(session);

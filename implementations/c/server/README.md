@@ -38,6 +38,13 @@ login (see below). With `SPECUS_DATABASE_PATH` configured,
 `/api/client/auth/login` can authenticate rows in `specus_client_credential`, create or reuse a
 machine/user-bound client identity, write a `HTTP_AUTHENTICATED` row to `specus_client_session`,
 and issue a runtime `cs_` token that the control-channel login later promotes to `NETTY_ONLINE`.
+The token belongs to the account it was issued for, not to its name (`protocol/spec/client-auth.md`):
+both logins load the account by id, refuse a deleted or disabled one, and answer and bind under its
+current name, so a renamed account's machine logs in under the new name and an account created
+later under the old name never receives its login or its traffic. Deleting an account ends its
+sessions. `client_account.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so no id is handed out twice;
+a database from before that column is migrated once at startup, keeping every account's rowid as its
+id and retiring freed ids other tables still refer to.
 The environment-token mode is a local smoke-test fixture, not an alternate wire protocol.
 In both modes a login whose signature verifies consumes its `(apiKey, nonce)` pair, as
 `protocol/spec/client-auth.md` requires: the same pair again within 120 s gets Java's
