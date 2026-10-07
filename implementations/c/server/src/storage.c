@@ -4,6 +4,7 @@
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
+#include "traffic_capture.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -14,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ST_STORAGE_PREVIEW_BYTES 1024U
 
 static int exec_sql(sqlite3 *db, const char *sql)
 {
@@ -1363,67 +1363,6 @@ static void bind_nullable_text_limit(sqlite3_stmt *stmt, int index, const char *
         len = max_len;
     }
     sqlite3_bind_text(stmt, index, value, len, SQLITE_TRANSIENT);
-}
-
-static void build_hex_preview(const uint8_t *data, size_t len, char *out, size_t out_len)
-{
-    static const char hex[] = "0123456789abcdef";
-    size_t preview_len = len < ST_STORAGE_PREVIEW_BYTES ? len : ST_STORAGE_PREVIEW_BYTES;
-    size_t max_bytes = out_len > 0 ? (out_len - 1U) / 2U : 0U;
-    if (preview_len > max_bytes) {
-        preview_len = max_bytes;
-    }
-    for (size_t i = 0; i < preview_len; ++i) {
-        out[i * 2U] = hex[(data[i] >> 4U) & 0x0fU];
-        out[i * 2U + 1U] = hex[data[i] & 0x0fU];
-    }
-    if (out_len > 0) {
-        out[preview_len * 2U] = '\0';
-    }
-}
-
-static void build_text_preview(const uint8_t *data, size_t len, char *out, size_t out_len)
-{
-    size_t preview_len = len < ST_STORAGE_PREVIEW_BYTES ? len : ST_STORAGE_PREVIEW_BYTES;
-    size_t w = 0;
-    for (size_t i = 0; i < preview_len && w + 1U < out_len; ++i) {
-        unsigned char ch = data[i];
-        if (ch == '\r' || ch == '\n' || ch == '\t' || (ch >= 32U && ch < 127U)) {
-            out[w++] = (char)ch;
-        } else {
-            out[w++] = '.';
-        }
-    }
-    if (out_len > 0) {
-        out[w] = '\0';
-    }
-}
-
-static const char *classify_body_type(const char *content_type)
-{
-    if (content_type == NULL || *content_type == '\0') {
-        return "unknown";
-    }
-    if (strstr(content_type, "json") != NULL) {
-        return "json";
-    }
-    if (strstr(content_type, "text/") != NULL
-        || strstr(content_type, "javascript") != NULL
-        || strstr(content_type, "xml") != NULL
-        || strstr(content_type, "css") != NULL
-        || strstr(content_type, "html") != NULL) {
-        return "text";
-    }
-    if (strstr(content_type, "image/") != NULL) {
-        return "image";
-    }
-    if (strstr(content_type, "audio/") != NULL) {
-        return "audio";
-    }
-    if (strstr(content_type, "video/") != NULL) {
-        return "video";
-    }
-    return "binary";
 }
 
 static int scan_http_exchange(sqlite3_stmt *stmt, st_storage_http_exchange *item)
@@ -6354,17 +6293,25 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
     if (record == NULL || record->client_id <= 0 || record->client_name == NULL || record->route == NULL) {
         return -1;
     }
-    char request_hex[4096];
-    char request_text[8192];
-    char response_hex[4096];
-    char response_text[8192];
-    build_hex_preview(record->request_body, record->request_body_len, request_hex, sizeof(request_hex));
-    build_text_preview(record->request_body, record->request_body_len, request_text, sizeof(request_text));
-    build_hex_preview(record->response_body, record->response_body_len, response_hex, sizeof(response_hex));
-    build_text_preview(record->response_body, record->response_body_len, response_text, sizeof(response_text));
-    const char *body_type = record->response_body_type != NULL && *record->response_body_type != '\0'
-        ? record->response_body_type
-        : classify_body_type(record->response_content_type);
+    /* Previews as Java TrafficInspectionService builds them (traffic_capture.c). */
+    size_t preview_bytes = st_traffic_preview_bytes();
+    char request_hex[ST_TRAFFIC_PREVIEW_HEX_CAP];
+    char request_text[ST_TRAFFIC_PREVIEW_TEXT_CAP];
+    char response_hex[ST_TRAFFIC_PREVIEW_HEX_CAP];
+    char response_text[ST_TRAFFIC_PREVIEW_TEXT_CAP];
+    st_traffic_hex_preview(record->request_body, record->request_body_len, preview_bytes,
+                           request_hex, sizeof(request_hex));
+    st_traffic_http_text_preview(record->request_body, record->request_body_len, record->request_content_type,
+                                 record->request_content_encoding, preview_bytes,
+                                 request_text, sizeof(request_text));
+    st_traffic_hex_preview(record->response_body, record->response_body_len, preview_bytes,
+                           response_hex, sizeof(response_hex));
+    st_traffic_http_text_preview(record->response_body, record->response_body_len, record->response_content_type,
+                                 record->response_content_encoding, preview_bytes,
+                                 response_text, sizeof(response_text));
+    const char *body_type = st_traffic_body_type_or_classify(record->response_body_type,
+                                                             record->response_content_type,
+                                                             record->response_bytes);
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -6411,8 +6358,9 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
         bind_nullable_text(stmt, 23, request_text);
         bind_nullable_text(stmt, 24, response_hex);
         bind_nullable_text(stmt, 25, response_text);
-        sqlite3_bind_int(stmt, 26, record->request_body_len > ST_STORAGE_PREVIEW_BYTES ? 1 : 0);
-        sqlite3_bind_int(stmt, 27, record->response_body_len > ST_STORAGE_PREVIEW_BYTES ? 1 : 0);
+        /* C keeps previews, not bodies: truncated says the preview holds less than the body. */
+        sqlite3_bind_int(stmt, 26, record->request_body_len > preview_bytes ? 1 : 0);
+        sqlite3_bind_int(stmt, 27, record->response_body_len > preview_bytes ? 1 : 0);
         sqlite3_bind_text(stmt, 28, record->captured_at == NULL ? "" : record->captured_at, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
@@ -7659,14 +7607,14 @@ int st_storage_list_http_exchanges_visible(const char *path,
         sqlite3_close(db);
         return -1;
     }
+    /* Summary projection: the headers and previews stay unread (Java summarySourceFilter). */
     written = snprintf(sql,
                        sizeof(sql),
                        "SELECT h.id, h.tenant_id, h.client_id, h.client_name, h.route, h.resource_id, "
                        "h.resource_name, h.method, h.relative_path, h.raw_query, h.status_code, h.success, "
                        "h.error, h.remote_address, h.request_bytes, h.response_bytes, h.elapsed_ms, "
                        "h.request_content_type, h.response_content_type, h.response_body_type, "
-                       "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
-                       "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
+                       "NULL, NULL, NULL, NULL, NULL, NULL, h.request_truncated, "
                        "h.response_truncated, h.captured_at "
                        "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id%s "
                        "ORDER BY h.id DESC LIMIT ? OFFSET ?",
@@ -7698,6 +7646,72 @@ int st_storage_list_http_exchanges_visible(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+int st_storage_get_http_exchange_visible(const char *path,
+                                         long long exchange_id,
+                                         const char *tenant_id,
+                                         const char *owner_username,
+                                         int include_all_clients,
+                                         st_storage_http_exchange *item,
+                                         int *found)
+{
+    if (st_elasticsearch_traffic_enabled_current()) {
+        return st_elasticsearch_get_http(path, exchange_id, tenant_id, owner_username, include_all_clients,
+                                         item, found);
+    }
+    *found = 0;
+    if (exchange_id <= 0) {
+        return 0;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        include_all_clients
+            ? "SELECT h.id, h.tenant_id, h.client_id, h.client_name, h.route, h.resource_id, "
+              "h.resource_name, h.method, h.relative_path, h.raw_query, h.status_code, h.success, "
+              "h.error, h.remote_address, h.request_bytes, h.response_bytes, h.elapsed_ms, "
+              "h.request_content_type, h.response_content_type, h.response_body_type, "
+              "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
+              "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
+              "h.response_truncated, h.captured_at "
+              "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id "
+              "WHERE h.id = ? AND c.tenant_id = ?"
+            : "SELECT h.id, h.tenant_id, h.client_id, h.client_name, h.route, h.resource_id, "
+              "h.resource_name, h.method, h.relative_path, h.raw_query, h.status_code, h.success, "
+              "h.error, h.remote_address, h.request_bytes, h.response_bytes, h.elapsed_ms, "
+              "h.request_content_type, h.response_content_type, h.response_body_type, "
+              "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
+              "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
+              "h.response_truncated, h.captured_at "
+              "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id "
+              "WHERE h.id = ? AND c.tenant_id = ? AND c.owner_username = ?",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, exchange_id);
+    sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    if (!include_all_clients) {
+        sqlite3_bind_text(stmt, 3, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
+    }
+    rc = sqlite3_step(stmt);
+    int result = 0;
+    if (rc == SQLITE_ROW) {
+        result = scan_http_exchange(stmt, item) == 0 ? 0 : -1;
+        *found = result == 0;
+    } else if (rc != SQLITE_DONE) {
+        result = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record)
 {
     if (st_elasticsearch_traffic_enabled_current()) {
@@ -7707,10 +7721,13 @@ int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_rec
         || record->channel_id == NULL || record->direction == NULL) {
         return -1;
     }
-    char payload_hex[4096];
-    char payload_text[4096];
-    build_hex_preview(record->payload_data, record->payload_data_len, payload_hex, sizeof(payload_hex));
-    build_text_preview(record->payload_data, record->payload_data_len, payload_text, sizeof(payload_text));
+    size_t preview_bytes = st_traffic_preview_bytes();
+    char payload_hex[ST_TRAFFIC_PREVIEW_HEX_CAP];
+    char payload_text[ST_TRAFFIC_PREVIEW_TEXT_CAP];
+    st_traffic_hex_preview(record->payload_data, record->payload_data_len, preview_bytes,
+                           payload_hex, sizeof(payload_hex));
+    st_traffic_tcp_text_preview(record->payload_data, record->payload_data_len, preview_bytes,
+                                payload_text, sizeof(payload_text));
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -8767,6 +8784,7 @@ typedef struct {
     char tenant_id[128];
     char owner_username[128];
     int client_enabled;
+    char target_base_url[512];
 } share_target;
 
 /* The route by id with its client, which a route reaches by name and may have lost. */
@@ -8776,7 +8794,7 @@ static int share_load_target(sqlite3 *db, long long route_id, share_target *targ
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT r.id, r.route, r.client_name, r.enabled, r.auth_enabled, r.path_rewrite_enabled, "
-            "c.rowid, c.tenant_id, c.owner_username, c.enabled "
+            "c.rowid, c.tenant_id, c.owner_username, c.enabled, r.target_base_url "
             "FROM http_route_mapping r LEFT JOIN client_account c ON c.client_name = r.client_name "
             "WHERE r.id = ?",
             -1, &stmt, NULL) != SQLITE_OK) {
@@ -8790,7 +8808,8 @@ static int share_load_target(sqlite3 *db, long long route_id, share_target *targ
         target->route_found = 1;
         target->route_id = sqlite3_column_int64(stmt, 0);
         if (copy_text_column(stmt, 1, target->route_name, sizeof(target->route_name)) != 0
-            || copy_text_column(stmt, 2, target->client_name, sizeof(target->client_name)) != 0) {
+            || copy_text_column(stmt, 2, target->client_name, sizeof(target->client_name)) != 0
+            || copy_text_column(stmt, 10, target->target_base_url, sizeof(target->target_base_url)) != 0) {
             result = -1;
         }
         target->route_enabled = sqlite3_column_int(stmt, 3) != 0;
@@ -9307,6 +9326,7 @@ int st_storage_http_share_resolve(const char *path,
             out->path_rewrite_enabled = target.path_rewrite_enabled;
             snprintf(out->client_name, sizeof(out->client_name), "%s", target.client_name);
             snprintf(out->route_name, sizeof(out->route_name), "%s", target.route_name);
+            snprintf(out->target_base_url, sizeof(out->target_base_url), "%s", target.target_base_url);
             if (share_is_active(&out->share, now_ms)) {
                 rc = share_lapse_reason(db, builtin, &out->share, &target, &out->lapse_reason);
             }

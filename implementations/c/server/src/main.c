@@ -16,6 +16,7 @@
 #include "stream_tombstones.h"
 #include "stun_turn.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -1091,8 +1092,9 @@ static void record_tcp_frame(specus_session *session,
                              const uint8_t *data,
                              size_t data_len)
 {
+    /* As Java: SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED and the mapping's own switch, both. */
     if (session == NULL || conn == NULL || data == NULL || data_len == 0
-        || session->config.database_path[0] == '\0') {
+        || session->config.database_path[0] == '\0' || !st_traffic_capture_enabled()) {
         return;
     }
     tcp_mapping mapping_copy;
