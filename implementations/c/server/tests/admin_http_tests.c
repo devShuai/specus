@@ -3079,6 +3079,85 @@ static int test_tenant_scoped_admin_mutations(void)
 }
 
 /*
+ * HttpTrafficExchangeStoreTests through GET /api/admin/traffic/http-exchanges: the summary list
+ * carries no headers, previews or body, the detail of one exchange shows the stored bodies the way
+ * Java's HttpBodyDataCodec does: a PNG response as data:image/png;base64,... and the request text
+ * whole although the preview is cut at 8 bytes.
+ */
+static int test_http_exchange_body_detail(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-exchange-bodies-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-exchange-bodies-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    static const char request_body[] = "{\"order\":\"0123456789\"}";
+    st_storage_client client;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("bodies-owner", "tenant-bodies", "USER") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-bodies", "bodies-client", "bodies-owner", 1, 60,
+                                    &client) != 0;
+    if (!failed) {
+        st_storage_http_exchange_record record;
+        memset(&record, 0, sizeof(record));
+        record.tenant_id = "tenant-bodies";
+        record.client_id = client.id;
+        record.client_name = client.client_name;
+        record.route = "images";
+        record.method = "POST";
+        record.relative_path = "/logo.png";
+        record.status_code = 200;
+        record.success = 1;
+        record.request_bytes = (long long)strlen(request_body);
+        record.response_bytes = (long long)sizeof(png);
+        record.request_content_type = "application/json";
+        record.response_content_type = "image/png";
+        record.request_headers = "Content-Type: application/json";
+        record.response_headers = "Content-Type: image/png";
+        record.request_body = (const uint8_t *)request_body;
+        record.request_body_len = strlen(request_body);
+        record.response_body = png;
+        record.response_body_len = sizeof(png);
+        record.captured_at = "2026-10-07T00:00:00Z";
+        setenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES", "8", 1);
+        failed = st_storage_record_http_exchange(db_path, &record) != 0;
+        unsetenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES");
+    }
+    long long id = failed ? -1 : endpoint_exchange_id(db_path, "bodies-client");
+    failed = failed || id <= 0;
+    if (failed) fprintf(stderr, "exchange body fixture setup failed\n");
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/traffic/http-exchanges", "bodies-owner", "tenant-bodies",
+                                    "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"requestPreviewText\":null", "exchange list") != 0
+            || !contains(response, "\"responsePreviewText\":null") || contains(response, "data:")
+            || contains(response, "0123456789");
+        if (failed && len > 0) fprintf(stderr, "the exchange list carried a body: %s\n", response);
+    }
+    if (!failed) {
+        char path[96];
+        snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%lld", id);
+        int len = tenant_scope_call("GET", path, "bodies-owner", "tenant-bodies", "USER", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ",
+                                 "\"requestPreviewText\":\"{\\\"order\\\":\\\"0123456789\\\"}\"",
+                                 "exchange detail request body") != 0
+            || !contains(response, "\"responsePreviewHex\":\"89 50 4E 47 0D 0A 1A 0A\"")
+            || !contains(response, "\"responsePreviewText\":\"data:image/png;base64,iVBORw0KGgo=\"")
+            || !contains(response, "\"responseBodyType\":\"image\"")
+            || !contains(response, "\"requestTruncated\":false,\"responseTruncated\":false");
+        if (failed && len > 0) fprintf(stderr, "exchange detail bodies: %s\n", response);
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
  * Java PeerMeshServiceTests.pathStatsAggregatesDirectRatioAndNatTypes through GET
  * /api/admin/peer-mesh/stats. Sessions group by the path that carried more bytes (RELAY stored but
  * DIRECT-heavy counts as DIRECT) and status, with the reported (RTT) count, mean RTT and bytes, and
@@ -7454,6 +7533,9 @@ int main(void)
         return 1;
     }
     if (test_peer_mesh_path_stats() != 0) {
+        return 1;
+    }
+    if (test_http_exchange_body_detail() != 0) {
         return 1;
     }
     if (test_http_route_service_rules() != 0) {

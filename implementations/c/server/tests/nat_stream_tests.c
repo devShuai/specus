@@ -1573,6 +1573,56 @@ static int check_tcp_capture_off_by_default(test_server *server, client_pair *pa
     return 0;
 }
 
+/*
+ * HttpTrafficExchangeStoreTests and TrafficInspectionServiceTests.binaryHttpBodyIsStoredAsBinary...
+ * on the real process: with the server switch and the route's switch on, a PNG relayed through the
+ * client is kept, and the exchange's detail from the management API shows it as a data: URL.
+ */
+static int check_http_detail_bodies(test_server *server, client_pair *pair)
+{
+    char ignored[8];
+    (void)db_scalar(server->db_path, "UPDATE http_route_mapping SET detail_capture_enabled = 1 WHERE route = ?",
+                    ROUTE, 0, ignored, sizeof(ignored));
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    int browser = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_http_stream(server, pair, "/logo.png", &browser, &stream_id) == 0, "request");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U,
+                   "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":200,"
+                   "\"headers\":[\"Content-Type: image/png\"],\"trailerNames\":[]}", NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, png, sizeof(png)) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0,
+          "PNG response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "the PNG response");
+    close_fd(&browser);
+
+    /* The exchange is written once the answer went out. */
+    char id[32] = "";
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    while (db_scalar(server->db_path, "SELECT id FROM specus_http_traffic_exchange WHERE relative_path = ?",
+                     "/logo.png", 0, id, sizeof(id)) != 0 && monotonic_ms() < deadline) {
+        sleep_ms(50);
+    }
+    CHECK(id[0] != '\0', "no exchange recorded for /logo.png");
+    char token[1024];
+    char path[96];
+    CHECK(st_security_issue_local_token(ADMIN_USERNAME, "default", "ADMIN", ADMIN_JWT_SECRET, 600,
+                                        token, sizeof(token)) == 0, "token");
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%s", id);
+    int status = 0;
+    char *body = NULL;
+    int ok = http_request(server->admin_port, "GET", path, NULL, token, &status, &body) == 0 && status == 200
+        && body != NULL && strstr(body, "\"responsePreviewText\":\"data:image/png;base64,iVBORw0KGgo=\"") != NULL
+        && strstr(body, "\"responsePreviewHex\":\"89 50 4E 47 0D 0A 1A 0A\"") != NULL
+        && strstr(body, "\"responseBodyType\":\"image\"") != NULL;
+    if (!ok) {
+        fprintf(stderr, "exchange detail %d: %s\n", status, body == NULL ? "" : body);
+    }
+    free(body);
+    CHECK(ok, "the exchange detail does not show the PNG body as a data: URL");
+    return 0;
+}
+
 /* With the server switch on, both directions are stored whole with their short preview. */
 static int check_tcp_capture_enabled(test_server *server, client_pair *pair)
 {
@@ -2143,6 +2193,9 @@ int main(int argc, char **argv)
                           check_tcp_capture_off_by_default);
     current_check = check_tcp_capture_enabled;
     failures += run_scenario("TCP detail capture with the server switch and the mapping's switch",
+                             run_current_check, long_idle_with_capture);
+    current_check = check_http_detail_bodies;
+    failures += run_scenario("HTTP detail keeps a binary body and shows it as a data: URL",
                              run_current_check, long_idle_with_capture);
     failures += run_check("4 MiB client-to-public queue overflow resets only that stream", check_tcp_queue_overflow);
     failures += run_scenario("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
