@@ -150,6 +150,15 @@ add_test(NAME traffic_detail_api_tests
                  $<TARGET_FILE:specus_c_traffic_detail_api_tests> $<TARGET_FILE:specus-server-c>)
 set_tests_properties(traffic_detail_api_tests PROPERTIES TIMEOUT 180)
 
+# protocol/spec/client-messages.md on a real server process (admin to client, client to every
+# session of an administrator, a disabled sender) and a failed write on an in-process listener.
+add_executable(specus_c_client_messages_tests tests/client_messages_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_client_messages_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_messages_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_messages_tests
+    COMMAND specus_c_client_messages_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(client_messages_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_http_share_tests tests/http_share_tests.c)
 target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_share_tests PRIVATE -Wall -Wextra -Wpedantic)
