@@ -23,6 +23,14 @@ int st_elasticsearch_list_http(const char *database_path,
                                size_t max_items,
                                size_t *item_count,
                                long long *total_count);
+/* One visible exchange with its headers and previews (the list leaves them out). */
+int st_elasticsearch_get_http(const char *database_path,
+                              long long exchange_id,
+                              const char *tenant_id,
+                              const char *owner_username,
+                              int include_all_clients,
+                              st_storage_http_exchange *item,
+                              int *found);
 int st_elasticsearch_record_tcp(const st_storage_tcp_frame_record *record);
 int st_elasticsearch_list_tcp(const char *database_path,
                               long long client_id,

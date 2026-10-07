@@ -128,6 +128,7 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_STUN_TURN_PORT` | `3478` | Built-in STUN/TURN UDP listen port and published URL port. |
 | `SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS` | unset | Optional comma-separated public STUN URLs appended to the discovery response; missing ports default to `3478` and duplicates are removed. |
 | `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | Whether the built-in TURN listener requires long-term credentials; also returned as `turnAuthRequired` by the public ICE response. |
+| `SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS` | `false` | C-only. By default general (public-transfer) TURN allocations may only reach public unicast peers, as Java/Go/.NET enforce: CreatePermission and ChannelBind to loopback, unspecified, link-local, private/site-local, multicast or IPv6 ULA addresses (IPv4-mapped forms included) or to port 0 get `403` and a `[peer-mesh][audit]` line on stderr. `true` lifts that policy for loopback or single-host test setups; never enable it on a public listener. Peer Mesh allocations are not subject to it. |
 | `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | unset | Shared secret used for temporary TURN HMAC-SHA1 credentials. When unset the process generates a random secret at startup, as Java does, so credentials issued before a restart stop working. |
 | `SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | Temporary public-transfer TURN credential lifetime, clamped to at least 60 seconds. |
 | `SPECUS_PEER_MESH_CIDR` | `100.96.0.0/11` | Virtual address pool advertised to Peer Mesh clients. |
@@ -383,12 +384,19 @@ C server records successful TCP specus bytes as `TCP_SPECUS` resources with keys
 `tcp:18080`, and successful Direct HTTP body bytes as `HTTP_ROUTE` resources with keys such as
 `http:api`.
 
-SQLite traffic detail capture is available when the corresponding TCP mapping or HTTP route has
-`detailCaptureEnabled=true`. TCP frames are written to `specus_tcp_traffic_frame` with the full
+SQLite traffic detail capture runs only when `SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true` (default
+`false`, as Java's `specus.traffic.capture-detail-enabled`) and the corresponding TCP mapping or
+HTTP route has `detailCaptureEnabled=true`. TCP frames are written to `specus_tcp_traffic_frame` with the full
 binary payload, canonical directions `PUBLIC_TO_CLIENT` / `CLIENT_TO_PUBLIC`, source and
 destination endpoint fields, per-channel stream offsets, and preview text/hex. HTTP exchanges are
 written to `specus_http_traffic_exchange` with request/response headers, body previews, status,
-content types, response body type, and elapsed time. The management endpoints
+content types, response body type, and elapsed time. Previews follow Java's
+`TrafficInspectionService`: `SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES` (default `256`, capped at
+`1024`) bytes as uppercase spaced hex, and for HTTP a text preview of the body decoded per
+`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. Unlike Java,
+the C server stores HTTP previews rather than whole bodies, so `requestTruncated` /
+`responseTruncated` say whether the preview holds the whole body. The exchange list returns
+summaries without headers or previews; `GET /api/admin/traffic/http-exchanges/{id}` returns them. The management endpoints
 `GET /api/admin/traffic/http-exchanges`, `GET /api/admin/traffic/tcp-frames`,
 `GET /api/admin/traffic/tcp-frames/{id}`, and `GET /api/admin/traffic/tcp-streams` now query these
 SQLite tables with the same basic tenant/owner visibility rule as other management APIs. HTTP
