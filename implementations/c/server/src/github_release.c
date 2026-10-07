@@ -33,6 +33,7 @@ static pthread_mutex_t release_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_storage_client_download_link release_cache[ST_GITHUB_RELEASE_MAX_PACKAGES];
 static size_t release_cache_count = 0U;
 static time_t release_refresh_after = 0;
+static st_github_release_fetcher release_fetcher = NULL;
 
 static long long release_env_i64(const char *name, long long fallback)
 {
@@ -311,6 +312,13 @@ int st_github_release_may_supply_missing_target(const st_storage_client_download
     return 0;
 }
 
+void st_github_release_set_fetcher_for_testing(st_github_release_fetcher fetcher)
+{
+    pthread_mutex_lock(&release_cache_lock);
+    release_fetcher = fetcher;
+    pthread_mutex_unlock(&release_cache_lock);
+}
+
 void st_github_release_cache_reset(void)
 {
     pthread_mutex_lock(&release_cache_lock);
@@ -349,7 +357,8 @@ int st_github_release_latest(st_storage_client_download_link *out,
     char *body = NULL;
     st_storage_client_download_link fetched[ST_GITHUB_RELEASE_MAX_PACKAGES];
     size_t fetched_count = 0U;
-    int fetch_ok = st_http_get_json(ST_GITHUB_RELEASE_URI, &options, &status, &body) == 0
+    st_github_release_fetcher fetch = release_fetcher != NULL ? release_fetcher : st_http_get_json;
+    int fetch_ok = fetch(ST_GITHUB_RELEASE_URI, &options, &status, &body) == 0
         && status >= 200L && status < 300L && body != NULL && *body != '\0'
         && st_github_release_map(body, fetched, ST_GITHUB_RELEASE_MAX_PACKAGES, &fetched_count) == 0
         && fetched_count > 0U;
