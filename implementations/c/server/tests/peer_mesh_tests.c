@@ -1188,6 +1188,53 @@ static int test_login_config_stun(void)
     return failed;
 }
 
+/*
+ * aclVisibilityHidesServiceFromClientsNotOnAllowList: an ACL-visible service reaches only the
+ * clients on its allowlist, here as the peers the publisher's data plane lets in.
+ */
+static int test_acl_visibility(void)
+{
+    char path[64];
+    if (temp_database(path, "peer_acl_visibility") != 0) return 1;
+    st_storage_client publisher, allowed, other;
+    st_storage_peer_mesh_device publisher_device, allowed_device, other_device;
+    st_storage_peer_mesh_service service;
+    memset(&service, 0, sizeof(service));
+    int failed = st_storage_upsert_client(path, 0, "tenant-acl", "acl-publisher", "owner", 1, 60, &publisher) != 0
+        || st_storage_upsert_client(path, 0, "tenant-acl", "acl-allowed", "owner", 1, 60, &allowed) != 0
+        || st_storage_upsert_client(path, 0, "tenant-acl", "acl-other", "owner", 1, 60, &other) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &publisher, 1, &publisher_device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &allowed, 1, &allowed_device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &other, 1, &other_device) != 0;
+    snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", publisher.tenant_id);
+    service.client_id = publisher.id;
+    snprintf(service.client_name, sizeof(service.client_name), "%s", publisher.client_name);
+    snprintf(service.service_id, sizeof(service.service_id), "svc-acl0001");
+    snprintf(service.name, sizeof(service.name), "acl ssh");
+    snprintf(service.transport, sizeof(service.transport), "tcp");
+    snprintf(service.application, sizeof(service.application), "ssh");
+    snprintf(service.target_host, sizeof(service.target_host), "127.0.0.1");
+    service.target_port = 22;
+    service.published_port = 2222;
+    service.enabled = 1;
+    snprintf(service.visibility, sizeof(service.visibility), "ACL");
+    snprintf(service.allowed_client_ids, sizeof(service.allowed_client_ids), "%lld", allowed.id);
+    failed = failed
+        || st_storage_upsert_peer_mesh_service_sharing(path, publisher.tenant_id, 1, 0, "admin", NULL) != 0
+        || st_storage_upsert_peer_mesh_service(path, &service, NULL) != 0;
+    char *config = failed ? NULL : st_peer_mesh_build_login_config(path, publisher.client_name, 2);
+    char expected[128];
+    snprintf(expected, sizeof(expected), "\"allowedPeerVirtualIps\":[\"%s\"]", allowed_device.virtual_ip);
+    if (failed || !contains(config, "\"serviceId\":\"svc-acl0001\"") || !contains(config, expected)
+        || contains(config, other_device.virtual_ip)) {
+        fprintf(stderr, "an ACL service reached clients off its allowlist: %s\n", config == NULL ? "(none)" : config);
+        failed = 1;
+    }
+    free(config);
+    unlink(path);
+    return failed;
+}
+
 /* ---- service-report bounds (PeerServiceDiscoveryServiceTests, PeerSignalServiceEnvelopeTests) -- */
 
 static int service_report(const char *path, peer_test_context *ctx, long long session_id, const char *client,
@@ -1403,6 +1450,24 @@ int main(void)
         fprintf(stderr, "peer mesh login config/roster push mismatch\n");
         return 1;
     }
+    /*
+     * loginConfigOnlyPublishesServicesToAclCapableClientAndIncludesAuthorizedPeerIps: a v1 client
+     * gets no local services; a v2 one gets them with exactly the authorised peers' virtual IPs
+     * (peer-denied belongs to another owner and the service is OWNER-visible).
+     */
+    char allowed_ips[128];
+    snprintf(allowed_ips, sizeof(allowed_ips), "\"allowedPeerVirtualIps\":[\"%s\"]", target_device.virtual_ip);
+    char *v1_config = st_peer_mesh_build_login_config(path, source.client_name, 1);
+    char *v2_config = st_peer_mesh_build_login_config(path, source.client_name, 2);
+    int services_ok = contains(v1_config, "\"localServices\":[]")
+        && contains(v2_config, "\"serviceId\":\"service-http-1\"") && contains(v2_config, allowed_ips);
+    if (!services_ok) {
+        fprintf(stderr, "login config local services mismatch: v1 %s | v2 %s\n",
+                v1_config == NULL ? "(none)" : v1_config, v2_config == NULL ? "(none)" : v2_config);
+    }
+    free(v1_config);
+    free(v2_config);
+    if (!services_ok) return 1;
 
     context.count = 0;
     const char *service_report =
@@ -1644,6 +1709,7 @@ int main(void)
     if (test_session_reports() != 0) return 1;
     if (test_login_config_stun() != 0) return 1;
     if (test_service_report_bounds() != 0) return 1;
+    if (test_acl_visibility() != 0) return 1;
     printf("peer mesh tests passed\n");
     return 0;
 }

@@ -4212,6 +4212,62 @@ static int test_peer_service_definition_validation(int client_id)
 }
 
 /*
+ * PeerServiceDiscoveryServiceTests sharingDefaultsToOffWhenTableEmpty,
+ * nonAdminCannotToggleSharingOrMutateServices and cannotEnableSharingWhenDeploymentDisabled:
+ * nothing stored means sharing is off; a tenant USER may neither switch it nor define services;
+ * with Peer Mesh off the deployment refuses to switch it on.
+ */
+static int test_peer_service_sharing_rules(int client_id)
+{
+    static const char *const sharing_path = "/api/admin/peer-mesh/service-sharing";
+    char response[16384];
+    int len = st_admin_build_response("GET", sharing_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"deploymentEnabled\":true,\"configuredEnabled\":false,"
+                                        "\"effectiveEnabled\":false")
+        || !contains(response, "\"enabledServiceCount\":0") || !contains(response, "\"mdnsImportEnabled\":false")) {
+        fprintf(stderr, "peer service sharing did not default to off: %s\n", response);
+        return 1;
+    }
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-member01\",\"name\":\"ssh\",\"application\":\"ssh\","
+             "\"targetHost\":\"127.0.0.1\",\"targetPort\":22,\"publishedPort\":2222}", client_id);
+    if (tenant == NULL || connection_events_ensure_user("sharing-member", tenant, "USER") != 0) {
+        fprintf(stderr, "sharing member fixture setup failed\n");
+        return 1;
+    }
+    len = tenant_scope_call("PUT", sharing_path, "sharing-member", tenant, "USER", "{\"enabled\":true}",
+                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "403 Forbidden")) {
+        fprintf(stderr, "a USER switched peer service sharing: %s\n", response);
+        return 1;
+    }
+    len = tenant_scope_call("POST", "/api/admin/peer-mesh/services", "sharing-member", tenant, "USER", body,
+                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "403 Forbidden")) {
+        fprintf(stderr, "a USER defined a peer service: %s\n", response);
+        return 1;
+    }
+    const char *peer_mesh = getenv("SPECUS_PEER_MESH_ENABLED");
+    char saved[16] = "";
+    if (peer_mesh != NULL) snprintf(saved, sizeof(saved), "%s", peer_mesh);
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    len = st_admin_build_response_with_body("PUT", sharing_path, "{\"enabled\":true}", response, sizeof(response));
+    if (saved[0] != '\0') setenv("SPECUS_PEER_MESH_ENABLED", saved, 1);
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "部署端未启用")) {
+        fprintf(stderr, "enabling sharing without Peer Mesh was not 400: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", sharing_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"configuredEnabled\":false")) {
+        fprintf(stderr, "a refused sharing request switched sharing on: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * serviceReportRateAndStateTablesAreBounded (its audit half): however many audit events a tenant
  * collects, the management API lists the latest 50.
  */
@@ -5901,6 +5957,9 @@ int main(void)
         || !contains(response, "\"deploymentEnabled\":true")
         || !contains(response, "\"peerServiceDiscoveryVersion\":2")) {
         fprintf(stderr, "peer service sharing status mismatch\n");
+        return 1;
+    }
+    if (test_peer_service_sharing_rules(created_client_id) != 0) {
         return 1;
     }
     len = st_admin_build_response_with_body("PUT", "/api/admin/peer-mesh/service-sharing",
