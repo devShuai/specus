@@ -16011,8 +16011,12 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     const char *database_path = admin_database_path();
+    char *package_range = admin_extract_header_value(request, "Range");
+    char *package_if_none_match = admin_extract_header_value(request, "If-None-Match");
     int package_download_response = st_client_package_send_download(
-        fd, method, path, database_path, request_remote_address);
+        fd, method, path, database_path, request_remote_address, package_range, package_if_none_match);
+    free(package_range);
+    free(package_if_none_match);
     if (package_download_response != 0) {
         free(body_buffer);
         close(fd);

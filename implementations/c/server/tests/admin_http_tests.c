@@ -4899,7 +4899,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/public/client-packages/%d/download", hosted_package_id);
     int download_handled = st_client_package_send_download(
-        package_sockets[0], "GET", request_path, db_path, "198.51.100.40");
+        package_sockets[0], "GET", request_path, db_path, "198.51.100.40", NULL, NULL);
     shutdown(package_sockets[0], SHUT_WR);
     char package_response[4096];
     ssize_t package_response_len = recv(package_sockets[1], package_response,
