@@ -1431,8 +1431,9 @@ static void pm_get_settings(const char *database_path,
 }
 
 /*
- * Switching off drops the tenant's progress rows (they are not folded into counts); switching on
- * clears the purge mark. An unchanged state keeps updatedAt and updatedBy.
+ * Switching off drops the tenant's progress rows (they are not folded into counts). Any change of
+ * state clears the purge mark, so while the switch is off the mark only stands for a purge made
+ * after switching off. An unchanged state keeps updatedAt, updatedBy and the mark.
  */
 static void pm_put_settings(const char *database_path,
                             const st_product_metrics_actor *actor,
@@ -1472,10 +1473,8 @@ static void pm_put_settings(const char *database_path,
             snprintf(row.updated_by, sizeof(row.updated_by), "%s", actor->username == NULL ? "" : actor->username);
             row.has_updated_at = 1;
             row.updated_at_ms = now;
-            if (update.enabled) {
-                row.has_purged_at = 0;
-                row.purged_at_ms = 0;
-            }
+            row.has_purged_at = 0;
+            row.purged_at_ms = 0;
         }
         rc = pm_save_switch(db, &row);
     }
@@ -1782,9 +1781,73 @@ static int pm_list_switches(sqlite3 *db, pm_switch **rows, size_t *count)
 }
 
 /*
+ * Step 1 for one row of a tenant that was not collecting when the sweep read the switches. The
+ * delete checks the switch again, so a tenant switched on since keeps the row; when the deployment
+ * does not allow metrics no tenant collects and the row goes regardless.
+ */
+static int pm_drop_progress(sqlite3 *db, const pm_progress *row)
+{
+    if (!st_product_metrics_allowed()) {
+        return pm_run(db, "DELETE FROM product_metrics_onboarding_progress WHERE tenant_id = ? AND username = ?",
+                      row->tenant_id, row->username, NULL, NULL);
+    }
+    return pm_run(db,
+                  "DELETE FROM product_metrics_onboarding_progress WHERE tenant_id = ?1 AND username = ?2 "
+                  "AND NOT EXISTS (SELECT 1 FROM product_metrics_switch WHERE tenant_id = ?1 AND enabled <> 0)",
+                  row->tenant_id, row->username, NULL, NULL);
+}
+
+/*
+ * Step 4: deletes both daily tables' rows and the progress rows of a tenant, each table only while
+ * the tenant's switch is off with a purge mark when that statement runs. Switching on clears the
+ * mark, so a tenant switched back on since the sweep read the switches keeps what it collected.
+ */
+#define PM_PURGED_WHILE_OFF \
+    " AND EXISTS (SELECT 1 FROM product_metrics_switch WHERE tenant_id = ?1 AND enabled = 0 AND purged_at IS NOT NULL)"
+
+static int pm_delete_purged_tenant_rows(sqlite3 *db, const char *tenant_id)
+{
+    static const char *const statements[] = {
+        "DELETE FROM product_metrics_onboarding_daily WHERE tenant_id = ?1" PM_PURGED_WHILE_OFF,
+        "DELETE FROM product_metrics_transfer_daily WHERE tenant_id = ?1" PM_PURGED_WHILE_OFF,
+        "DELETE FROM product_metrics_onboarding_progress WHERE tenant_id = ?1" PM_PURGED_WHILE_OFF
+    };
+    for (size_t i = 0; i < sizeof(statements) / sizeof(statements[0]); ++i) {
+        if (pm_run(db, statements[i], tenant_id, NULL, NULL, NULL) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static pthread_mutex_t pm_sweep_hook_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_product_metrics_sweep_hook pm_sweep_hook = NULL;
+static void *pm_sweep_hook_context = NULL;
+
+void st_product_metrics_set_sweep_hook_for_testing(st_product_metrics_sweep_hook hook, void *context)
+{
+    pthread_mutex_lock(&pm_sweep_hook_lock);
+    pm_sweep_hook = hook;
+    pm_sweep_hook_context = context;
+    pthread_mutex_unlock(&pm_sweep_hook_lock);
+}
+
+static void pm_run_sweep_hook(void)
+{
+    pthread_mutex_lock(&pm_sweep_hook_lock);
+    st_product_metrics_sweep_hook hook = pm_sweep_hook;
+    void *context = pm_sweep_hook_context;
+    pthread_mutex_unlock(&pm_sweep_hook_lock);
+    if (hook != NULL) {
+        hook(context);
+    }
+}
+
+/*
  * The four steps of section 9: progress of tenants that are off goes (no fold); progress past the
  * window closes as expired; daily rows older than the retention go; tenants that are off and were
- * purged lose every daily and progress row (stragglers written within the switch cache period).
+ * purged since switching off lose every daily and progress row (stragglers written within the
+ * switch cache period). Switching off clears the mark a purge made while collecting.
  * Idempotent, independent of when it runs, safe on any number of instances.
  */
 int st_product_metrics_sweep(const char *database_path)
@@ -1800,6 +1863,7 @@ int st_product_metrics_sweep(const char *database_path)
         rc = pm_list_switches(db, &switches, &switch_count);
     }
     if (rc == 0) {
+        pm_run_sweep_hook();
         rc = pm_list_progress(db, NULL, &progress, &progress_count);
     }
     for (size_t i = 0; rc == 0 && i < progress_count; ++i) {
@@ -1812,8 +1876,7 @@ int st_product_metrics_sweep(const char *database_path)
             }
         }
         if (!collecting) {
-            rc = pm_run(db, "DELETE FROM product_metrics_onboarding_progress WHERE tenant_id = ? AND username = ?",
-                        row->tenant_id, row->username, NULL, NULL);
+            rc = pm_drop_progress(db, row);
         } else if (now >= row->started_at_ms + PM_WINDOW_MS) {
             rc = pm_close_progress(db, row->tenant_id, row->username, 0, 0) < 0 ? -1 : 0;
         }
@@ -1827,8 +1890,7 @@ int st_product_metrics_sweep(const char *database_path)
     }
     for (size_t s = 0; rc == 0 && s < switch_count; ++s) {
         if (!switches[s].enabled && switches[s].has_purged_at) {
-            rc = pm_delete_tenant_counts(db, switches[s].tenant_id) == 0
-                && pm_delete_tenant_progress(db, switches[s].tenant_id) == 0 ? 0 : -1;
+            rc = pm_delete_purged_tenant_rows(db, switches[s].tenant_id);
         }
     }
     free(switches);

@@ -68,12 +68,21 @@ void close_fd(int *fd);
 /* Control and data connections */
 int send_login_request(int fd, const runtime_session *runtime, const char *role);
 /*
+ * Reads the next frame as the answer to a LOGIN_REQUEST: 1 when it is a LOGIN_RESPONSE, with
+ * *success and the server's reason filled; 0 when another frame came first (its command in
+ * *command); -1 on I/O failure, a timeout or a malformed response. reason describes the failure.
+ */
+int read_login_response(int fd, int timeout_ms, int *command, int *success, char *reason, size_t reason_len);
+/*
  * Logs a connection in with the given role. Returns 1 and keeps the socket in *fd_out when the
  * server accepts, 0 with the server's reason when it refuses (the socket is closed), -1 on I/O
  * failure.
  */
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len);
+/* channel_login that also copies the client name the LOGIN_RESPONSE carries into answered_name. */
+int channel_login_answer(int port, const runtime_session *runtime, const char *role, int *fd_out,
+                         char *answered_name, size_t answered_name_len, char *reason, size_t reason_len);
 /* Reads and discards frames until the server closes the connection. */
 int expect_channel_closed(int fd, int timeout_ms);
 /* A heartbeat answered proves the channel is still bound and served. */
@@ -89,6 +98,11 @@ int expect_socket_eof(int fd, int timeout_ms);
 /* HTTP */
 int http_request(int port, const char *method, const char *path, const char *body,
                  const char *bearer, int *status, char **response_body);
+/*
+ * Extra members appended to the login body's environment object, each with its leading comma (for
+ * example ",\"clientHttpRouteCapabilities\":{\"version\":1}"); empty by default.
+ */
+extern const char *harness_login_environment_extra;
 /* A POST /api/client/auth/login body, signed exactly as protocol/spec/client-auth.md describes. */
 void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
                        const char *os_user, char *body, size_t body_len);

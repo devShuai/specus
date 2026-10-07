@@ -22,6 +22,7 @@ python tools/protocol/verify_peer_egress_vectors.py
 | `generate_service_connectivity_vectors.py` | `protocol/test-vectors/service-connectivity-check-v1.json`（服务连通性检查草案的四阶段状态机与限流；见 [`service-connectivity-check.md`](../../protocol/spec/service-connectivity-check.md)） |
 | `generate_service_workbench_vectors.py` | `protocol/test-vectors/service-workbench-v1.json`（服务工作台：收藏与最近打开的上限、保留期、排序、隔离与级联；见 [`service-workbench.md`](../../protocol/spec/service-workbench.md)） |
 | `generate_product_metrics_vectors.py` | `protocol/test-vectors/product-metrics-v1.json`（产品指标的上报校验、分桶、接入队列、计数、限流、保存期与汇总；见 [`product-metrics.md`](../../protocol/spec/product-metrics.md)） |
+| `generate_http_route_lifecycle_vectors.py` | `protocol/test-vectors/http-route-lifecycle-v1.json`（HTTP route 生命周期：入口 fail closed、每条 `NAT_CONTROL` 含登录推送都带完整 route 列表、停用 / 改名 / 删除客户端断开连接、旧 token 只登录签发它的账户、客户端整体替换 route 表；见 [`http-route.md`](../../protocol/spec/http-route.md)） |
 
 两个生成器各自带一份参考实现（规则匹配器、授权判定器），写文件前会用它断言每条期望，
 因此向量不会带着自相矛盾的用例发布。

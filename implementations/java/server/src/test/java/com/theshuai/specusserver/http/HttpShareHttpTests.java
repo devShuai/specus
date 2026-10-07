@@ -88,6 +88,34 @@ class HttpShareHttpTests {
         devices.clear();
     }
 
+    /**
+     * The share, workbench and connectivity-check contracts make every answer private, Spring
+     * Security's 401 included; other admin endpoints keep the portal's no-cache set.
+     */
+    @Test
+    void refusalsBeforeAnyControllerArePrivateOnPrivateEndpoints() throws Exception {
+        for (String[] call : new String[][] {
+                {"POST", "/api/admin/http-routes/1/shares"},
+                {"GET", "/api/admin/http-routes/1/shares"},
+                {"GET", "/api/admin/http-routes/1/shares/abc"},
+                {"POST", "/api/admin/http-routes/1/shares/abc/revoke"},
+                {"GET", "/api/admin/http-routes/1/access-audit"},
+                {"GET", "/api/admin/http-access-audit"},
+                {"GET", "/api/admin/workbench"},
+                {"POST", "/api/admin/http-routes/1/connectivity-check"}}) {
+            for (String bearer : new String[] {null, "not-a-token"}) {
+                HttpResponse<String> refused = send(call[0], call[1], call[0].equals("POST") ? "{}" : null, bearer);
+                assertThat(refused.statusCode()).as("%s %s", call[0], call[1]).isEqualTo(401);
+                assertThat(refused.headers().allValues("Cache-Control")).as("%s %s", call[0], call[1])
+                        .containsExactly("private, no-store");
+            }
+        }
+        HttpResponse<String> other = send("GET", "/api/admin/clients", null, null);
+        assertThat(other.statusCode()).isEqualTo(401);
+        assertThat(other.headers().firstValue("Cache-Control"))
+                .hasValue("no-cache, no-store, max-age=0, must-revalidate");
+    }
+
     @Test
     void exchangeSetsOnlyTheScopedHttpOnlyCookie() throws Exception {
         Fixture fixture = fixture("exchange");

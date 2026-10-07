@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { ChunkBitmap } from "./bitmap";
-import { randomHex128, sha256, type Bytes } from "./bytes";
+import { randomHex128, sha256, toHex, type Bytes } from "./bytes";
 import type { BulkChannel } from "./channel";
 import { hashChunksOnCurrentThread } from "./chunkHashes";
-import { GIB, KIB, RESUME_TTL_SECONDS, UNACKED_WINDOW_CHUNKS } from "./constants";
-import { decodeFrame } from "./frames";
-import { manifestFromHashes, type Manifest } from "./manifest";
+import { GIB, KIB, MAX_STORED_PARTIALS, RESUME_TTL_SECONDS, UNACKED_WINDOW_CHUNKS } from "./constants";
+import { decodeFrame, encodeChunkFrames, encodeHashFrames } from "./frames";
+import { chunkLengthOf, fileMetaMessage, manifestFromHashes, type Manifest } from "./manifest";
 import { ReceiverController, type ReceivedFile } from "./receiverController";
 import { sendResumable, type OpenedChannel } from "./resumableSend";
 import { SenderError, SenderRouter, type OutgoingTransfer } from "./senderController";
@@ -234,6 +234,94 @@ function interruptAfter(limit: number): () => Taps {
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+/** Polls until `condition` holds; real SHA-256 and timer-driven delivery make fixed waits flaky. */
+async function eventually(condition: () => boolean, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("condition not reached in time");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+type Json = Record<string, unknown>;
+
+/**
+ * A hand-driven sending page on its own channel pair: the test decides every message, so orders a
+ * real sender would only produce by chance (a resume-offer while an offer waits for its click) are
+ * reproducible. Records everything the receiver answers.
+ */
+class ScriptedPeer {
+  readonly tx = new FakeChannel();
+  readonly rx = new FakeChannel();
+  readonly inbox: Json[] = [];
+
+  constructor(receiver: ReceiverPage, peerId = "sender-peer") {
+    this.tx.peer = this.rx;
+    this.rx.peer = this.tx;
+    this.tx.onmessage = (data) => {
+      if (typeof data === "string") this.inbox.push(JSON.parse(data) as Json);
+    };
+    receiver.attach(this.rx, peerId);
+  }
+
+  json(message: Json) {
+    this.tx.send(JSON.stringify(message));
+  }
+
+  answers(transferId: string, kind?: string): Json[] {
+    return this.inbox.filter((message) => message.transferId === transferId && (!kind || message.kind === kind));
+  }
+
+  /** What a sender does after file-accept or resume-state: the hash list if asked, then every missing chunk. */
+  sendContent(transferId: string, manifest: Manifest, bytes: Bytes, answer: Json) {
+    const have = ChunkBitmap.decode(manifest.chunkCount, answer.have as string) as ChunkBitmap;
+    if (answer.needHashes) {
+      for (const frame of encodeHashFrames(transferId, manifest.hashes, FRAME)) this.tx.send(frame);
+    }
+    for (const index of have.missing()) {
+      const start = index * manifest.chunkSize;
+      const chunk = bytes.subarray(start, start + chunkLengthOf(manifest.sizeBytes, manifest.chunkSize, index));
+      for (const frame of encodeChunkFrames(transferId, index, chunk, FRAME)) this.tx.send(frame);
+    }
+  }
+}
+
+function resumeOfferFor(transfer: OutgoingTransfer): Json {
+  return {
+    kind: "resume-offer",
+    transferId: transfer.transferId,
+    manifestDigest: toHex(transfer.manifest.manifestDigest),
+    resumeToken: transfer.resumeToken,
+  };
+}
+
+/**
+ * X1 is a persistent receive cut after two chunks; X2 is a new offer that is waiting for the
+ * receiving user's click on a fresh channel when X1's sender comes back on that same channel.
+ */
+async function pendingOfferAndInterruptedResume() {
+  const env = setup();
+  const { receiver, sender } = env;
+  receiver.autoAccept = false;
+  const x1Bytes = pattern(0, 6 * CHUNK);
+  await sender.send(new Blob([x1Bytes]), { tapForNewChannels: interruptAfter(2) }).catch(() => undefined);
+  await settle();
+  const x1 = sender.transfers[0];
+  expect(receiver.controller.snapshot().entries.map((entry) => [entry.transferId, entry.state, entry.active]))
+    .toEqual([[x1.transferId, "INTERRUPTED", false]]);
+  receiver.clickAccept = false; // the click on X2 comes when the test says so
+  const peer = new ScriptedPeer(receiver);
+  const x2Bytes = pattern(9, 3 * CHUNK + 77);
+  const x2Manifest = await buildManifest(new Blob([x2Bytes]), "second.bin");
+  const x2 = randomHex128();
+  peer.json(fileMetaMessage(x2, x2Manifest));
+  await eventually(() => receiver.controller.snapshot().pending.length === 1);
+  return { ...env, peer, x1, x1Bytes, x2, x2Bytes, x2Manifest };
+}
+
+const activeTransfers = (receiver: ReceiverPage) =>
+  receiver.controller.snapshot().entries.filter((entry) => entry.active).map((entry) => entry.transferId);
 
 // Real SHA-256 over megabytes and real timers: a loaded CI runner needs more than the default 5 s.
 describe("chunked resume between two pages", { timeout: 30_000 }, () => {
@@ -568,5 +656,159 @@ describe("chunked resume between two pages", { timeout: 30_000 }, () => {
     await settle();
     expect(result.kind).toBe("complete");
     expect(receiver.completed[0].storage).toBe("memory");
+  });
+
+  it("answers BUSY to a resume-offer on a channel whose offer awaits a click, then resumes it there", async () => {
+    const { receiver, peer, x1, x1Bytes, x2, x2Bytes, x2Manifest } = await pendingOfferAndInterruptedResume();
+    peer.json(resumeOfferFor(x1));
+    await eventually(() => peer.answers(x1.transferId).length === 1);
+    const [first] = peer.answers(x1.transferId);
+    await receiver.controller.accept(x2);
+    await eventually(() => peer.answers(x2, "file-accept").length === 1);
+    if (first.kind === "resume-state") {
+      // A sender told to go on streams X1's missing chunks on this channel.
+      peer.sendContent(x1.transferId, x1.manifest, x1Bytes, first);
+    }
+    peer.sendContent(x2, x2Manifest, x2Bytes, peer.answers(x2, "file-accept")[0]);
+    await eventually(() => receiver.completed.length === 1 || peer.inbox.some((message) => message.kind === "transfer-error"));
+    expect(peer.inbox.filter((message) => message.kind === "transfer-error")).toEqual([]);
+    expect(first).toEqual({ kind: "resume-reject", transferId: x1.transferId, code: "BUSY" });
+    expect(peer.answers(x2).map((message) => message.kind)).toContain("transfer-complete");
+    expect(await bytesOf(receiver.completed[0].blob)).toEqual(x2Bytes);
+    expect(activeTransfers(receiver)).toEqual([]);
+
+    // The channel is free again: X1 resumes on it without a new consent and completes.
+    peer.json(resumeOfferFor(x1));
+    await eventually(() => peer.answers(x1.transferId, "resume-state").length === 1);
+    peer.sendContent(x1.transferId, x1.manifest, x1Bytes, peer.answers(x1.transferId, "resume-state")[0]);
+    await eventually(() => receiver.completed.length === 2 || peer.inbox.some((message) => message.kind === "transfer-error"));
+    expect(peer.inbox.filter((message) => message.kind === "transfer-error")).toEqual([]);
+    expect(await bytesOf(receiver.completed[1].blob)).toEqual(x1Bytes);
+    expect(receiver.controller.snapshot().pending).toEqual([]);
+    expect(activeTransfers(receiver)).toEqual([]);
+  });
+
+  it("leaves no session bound after that channel closes, so the interrupted partial still expires", async () => {
+    const { receiver, peer, clock, persistentStore, x1, x2, x2Bytes, x2Manifest } = await pendingOfferAndInterruptedResume();
+    peer.json(resumeOfferFor(x1));
+    await eventually(() => peer.answers(x1.transferId).length === 1);
+    await receiver.controller.accept(x2);
+    await eventually(() => peer.answers(x2, "file-accept").length === 1);
+    peer.sendContent(x2, x2Manifest, x2Bytes, peer.answers(x2, "file-accept")[0]);
+    await eventually(() => receiver.completed.length === 1);
+    peer.tx.close();
+    await settle();
+    // Nothing still counts against maxActiveReceives once the only channel is gone.
+    expect(activeTransfers(receiver)).toEqual([]);
+    expect(receiver.controller.snapshot().entries.find((entry) => entry.transferId === x1.transferId)?.state)
+      .toBe("INTERRUPTED");
+
+    clock.now += RESUME_TTL_SECONDS * 1000;
+    await receiver.controller.cleanup();
+    expect(receiver.controller.snapshot().entries).toEqual([]);
+    expect(await persistentStore!.listReceives()).toEqual([]);
+    expect(await persistentStore!.listChunkTransferIds()).toEqual([]);
+  });
+
+  it("keeps the channel reserved for a clicked offer while its record is being written", async () => {
+    const { receiver, peer, x1, x2, x2Bytes, x2Manifest } = await pendingOfferAndInterruptedResume();
+    // The click and X1's resume-offer race; neither waits for the other.
+    await Promise.all([
+      receiver.controller.accept(x2),
+      receiver.controller.handleResumeOffer("sender-peer", peer.rx, resumeOfferFor(x1)),
+    ]);
+    await eventually(() => peer.answers(x1.transferId).length === 1 && peer.answers(x2).length === 1);
+    expect(peer.answers(x1.transferId)).toEqual([{ kind: "resume-reject", transferId: x1.transferId, code: "BUSY" }]);
+    expect(peer.answers(x2).map((message) => message.kind)).toEqual(["file-accept"]);
+    peer.sendContent(x2, x2Manifest, x2Bytes, peer.answers(x2)[0]);
+    await eventually(() => receiver.completed.length === 1 || peer.inbox.some((message) => message.kind === "transfer-error"));
+    expect(peer.inbox.filter((message) => message.kind === "transfer-error")).toEqual([]);
+    expect(await bytesOf(receiver.completed[0].blob)).toEqual(x2Bytes);
+    expect(activeTransfers(receiver)).toEqual([]);
+  });
+
+  it("does not bind a clicked offer to a channel that closed while its record was written", async () => {
+    const { receiver, persistentStore, peer, x1, x2 } = await pendingOfferAndInterruptedResume();
+    const store = persistentStore!;
+    const put = store.putReceive.bind(store);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    store.putReceive = async (record) => {
+      await gate;
+      return put(record);
+    };
+    const click = receiver.controller.accept(x2);
+    await settle();
+    peer.tx.close();
+    release();
+    await click;
+    await settle();
+    expect(activeTransfers(receiver)).toEqual([]);
+    // Never announced, so not kept as a partial either.
+    expect((await store.listReceives()).map((record) => record.transferId)).toEqual([x1.transferId]);
+    expect(receiver.errors.at(-1)).toContain("直连通道已断开");
+  });
+
+  it("resumes a memory-mode receive in-session after a cut without a second consent", async () => {
+    const { receiver, sender, persistentStore } = setup(); // auto-accept: memory mode
+    const size = 12 * CHUNK + 99;
+    let cuts = 0;
+    const result = await sender.send(new Blob([pattern(3, size)]), {
+      tapForNewChannels: () => (cuts++ === 0 ? { receiver: cutAfterAcks(5) } : undefined),
+    });
+    await settle();
+    expect(result.kind).toBe("complete");
+    expect(sender.sleeps).toEqual([1000]);
+    expect(sender.transfers).toHaveLength(1);
+    expect(receiver.completed[0].storage).toBe("memory");
+    expect(await bytesOf(receiver.completed[0].blob)).toEqual(pattern(3, size));
+    expect(await persistentStore!.listReceives()).toEqual([]);
+    // Delivered: the Blob holds the bytes, the memory store no longer does.
+    expect(await receiver.memory.listChunkTransferIds()).toEqual([]);
+  });
+
+  it("keeps at most maxStoredPartials unfinished memory-mode receives and refuses more with TOO_MANY_PARTIALS", async () => {
+    const { receiver, clock, persistentStore } = setup(); // auto-accept: memory mode
+    const size = 6 * CHUNK;
+    const senders: SenderPage[] = [];
+    const outcomes: string[] = [];
+    const rounds = MAX_STORED_PARTIALS + 3;
+    for (let round = 0; round < rounds; round += 1) {
+      const sender = new SenderPage(receiver, clock);
+      senders.push(sender);
+      // Most of the file, then the connection dies and every reconnect fails.
+      const failure = await sender.send(new Blob([pattern(round, size)]), { tapForNewChannels: interruptAfter(4) })
+        .catch((error: unknown) => error);
+      outcomes.push(failure instanceof SenderError ? failure.code ?? failure.failure : String(failure));
+      await settle();
+      expect((await receiver.memory.listReceives()).length).toBeLessThanOrEqual(MAX_STORED_PARTIALS);
+      expect((await receiver.memory.listChunkTransferIds()).length).toBeLessThanOrEqual(MAX_STORED_PARTIALS);
+    }
+    expect(outcomes).toEqual([
+      ...Array<string>(MAX_STORED_PARTIALS).fill("retry"),
+      ...Array<string>(rounds - MAX_STORED_PARTIALS).fill("TOO_MANY_PARTIALS"),
+    ]);
+    expect((await receiver.memory.listReceives()).map((record) => record.state))
+      .toEqual(Array<string>(MAX_STORED_PARTIALS).fill("INTERRUPTED"));
+    expect(receiver.errors.filter((message) => message.includes("本机未完成的接收已达 4 个")))
+      .toHaveLength(rounds - MAX_STORED_PARTIALS);
+    expect(await persistentStore!.listReceives()).toEqual([]); // auto-accept never writes to disk
+
+    // The limit does not touch in-session retry: the first sender comes back and finishes.
+    const first = senders[0];
+    const resumed = await first.send(new Blob([pattern(0, size)]), { existing: first.transfers[0] });
+    await settle();
+    expect(resumed.kind).toBe("complete");
+    expect(resumed.transfer.transferId).toBe(first.transfers[0].transferId);
+    expect(await bytesOf(receiver.completed[0].blob)).toEqual(pattern(0, size));
+    // A completed memory record keeps no chunks and stops counting: a new file fits again.
+    const fresh = new SenderPage(receiver, clock);
+    const next = await fresh.send(new Blob([pattern(50, 2 * CHUNK)]));
+    await settle();
+    expect(next.kind).toBe("complete");
+    expect(await bytesOf(receiver.completed[1].blob)).toEqual(pattern(50, 2 * CHUNK));
+    expect((await receiver.memory.listChunkTransferIds()).length).toBe(MAX_STORED_PARTIALS - 1);
   });
 });

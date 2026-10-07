@@ -12,7 +12,10 @@
  *   - DATA|END_STREAM is DATA followed by FIN, a response head may leave out trailerNames, a TCP
  *     stream half-closes in either order, a port that cannot be bound is answered with
  *     success=false, HEARTBEAT_RESPONSE and KEEPALIVE are accepted, request bodies over 16 MiB get
- *     413 and the 1025th pending HTTP stream gets 502.
+ *     413 and the 1025th pending HTTP stream gets 502;
+ *   - only declared, valid trailers cross in either direction, the full window may arrive in small
+ *     fragments while DATA beyond the granted window resets the stream, the query is forwarded with
+ *     only its braces encoded, and refused /http/ requests are recorded like Java's.
  *
  * The test plays the client on real control/data sockets and the browser and the public peer on
  * real HTTP and TCP sockets. Every check runs on its own server, so each one shows on its own
@@ -24,8 +27,10 @@
 
 #include "server_harness.h"
 
+#include "crypto.h"
 #include "json.h"
 #include "protocol.h"
+#include "security.h"
 #include "storage.h"
 #include "stream_tombstones.h"
 
@@ -35,6 +40,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -280,11 +286,11 @@ typedef struct {
     size_t total;
     char head[4096];
     size_t head_len;
-    char tail[8];
+    char tail[64];
     size_t tail_len;
 } browser_response;
 
-/* Reads a browser response to EOF, keeping its first 4 KiB and its last bytes. */
+/* Reads a browser response to EOF, keeping its first 4 KiB and its last 64 bytes. */
 static void read_browser_response(browser_response *response)
 {
     long long deadline = monotonic_ms() + response->timeout_ms;
@@ -581,6 +587,541 @@ static int check_http_response_limit(test_server *server, client_pair *pair)
     return expect_data_connection_served(server, pair);
 }
 
+static int expect_open_meta(int data_fd, uint32_t *stream_id, char **meta);
+
+/* Sends a raw browser request (head and body as given) to the admin port; returns the socket. */
+static int browser_raw(const test_server *server, const char *request, size_t request_len)
+{
+    int fd = connect_local(server->admin_port);
+    if (fd >= 0 && send_all(fd, (const uint8_t *)request, request_len) != 0) {
+        close_fd(&fd);
+    }
+    return fd;
+}
+
+/*
+ * Reads the request DATA of a stream into body (NUL-terminated) until its FIN, whose metadata comes
+ * back in *fin_meta (NULL when it has none; the caller frees it).
+ */
+static int expect_request_fin(int data_fd, uint32_t stream_id, char *body, size_t body_cap, char **fin_meta)
+{
+    size_t used = 0U;
+    *fin_meta = NULL;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        st_nat_message message;
+        if (next_nat_frame(data_fd, deadline, &message) != 1) {
+            fprintf(stderr, "no request FIN for stream %u\n", stream_id);
+            return -1;
+        }
+        int done = 0;
+        if (message.stream_id == stream_id && message.type == ST_NAT_DATA && used + message.data_len < body_cap) {
+            memcpy(body + used, message.data, message.data_len);
+            used += message.data_len;
+        } else if (message.stream_id == stream_id && message.type == ST_NAT_FIN) {
+            *fin_meta = message.meta_json;
+            message.meta_json = NULL;
+            done = 1;
+        }
+        st_nat_message_free(&message);
+        if (done) {
+            body[used] = '\0';
+            return 0;
+        }
+    }
+}
+
+/* Answers a request stream with 200 and an empty body. */
+static int answer_empty(int data_fd, uint32_t stream_id)
+{
+    return send_nat(data_fd, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0
+        && send_nat(data_fd, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0 ? 0 : -1;
+}
+
+/* The JSON metadata of a frame carries exactly this top-level array (compared as raw JSON). */
+static int meta_array_is(const char *meta, const char *key, const char *expected)
+{
+    char *raw = meta == NULL ? NULL : st_json_get_top_level_raw(meta, key);
+    int matches = expected == NULL ? raw == NULL : raw != NULL && strcmp(raw, expected) == 0;
+    if (!matches) {
+        fprintf(stderr, "%s: %s, expected %s (metadata %s)\n", key, raw == NULL ? "absent" : raw,
+                expected == NULL ? "absent" : expected, meta == NULL ? "(none)" : meta);
+    }
+    free(raw);
+    return matches ? 0 : -1;
+}
+
+/*
+ * HttpSpecusControllerAuthenticationTests, the request trailers (http-route.md section 3): the
+ * Trailer headers' names are declared trimmed, each once, without hop-by-hop or malformed names,
+ * and without Authorization on a protected route, whose gate consumed it; only declared trailer
+ * fields reach the client in FIN.metadata.trailers. A public route forwards an Authorization
+ * trailer it declared. A request without a Trailer header declares nothing.
+ */
+static int check_http_request_trailers(test_server *server, client_pair *pair)
+{
+    uint8_t digest[ST_SHA256_LEN];
+    char password_hash[ST_SHA256_HEX_LEN + 1];
+    st_sha256((const uint8_t *)"s3cret", 6U, digest);
+    st_hex_encode(digest, sizeof(digest), password_hash);
+    st_storage_http_route private_route;
+    CHECK(st_storage_create_http_route_for_client(server->db_path, pair->runtime.client_id, "private",
+                                                  "http://127.0.0.1:9", 1, 0, 0, 0, 0, 1, "viewer", password_hash,
+                                                  &private_route) == 0,
+          "protected route");
+    /* The data connection reads the client's routes when it logs in. */
+    close_fd(&pair->data);
+    CHECK(login_data(server, pair) == 0, "data re-login");
+
+    char client[768];
+    char request[2048];
+    char body[64];
+    char *fin_meta = NULL;
+    char *open_meta = NULL;
+    uint32_t stream_id = 0U;
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(request, sizeof(request),
+                       "POST /http/%s/private/upload HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                       "Authorization: Basic dmlld2VyOnMzY3JldA==\r\nTransfer-Encoding: chunked\r\n"
+                       "Trailer: Digest, Authorization, Content-Length\r\nTrailer: X-Trace, bad name, digest\r\n"
+                       "Connection: close\r\n\r\n"
+                       "5\r\nhello\r\n0\r\nDigest: sha-256=valid\r\naUtHoRiZaTiOn: Basic consumed\r\n"
+                       "X-Undeclared: must-not-cross\r\nContent-Length: 999\r\n\r\n",
+                       client);
+    int browser = browser_raw(server, request, (size_t)len);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &open_meta) == 0, "no request OPEN on the protected route");
+    int names_ok = meta_array_is(open_meta, "trailerNames", "[\"Digest\",\"X-Trace\"]") == 0;
+    free(open_meta);
+    CHECK(names_ok, "the protected route must declare Digest and X-Trace only");
+    CHECK(expect_request_fin(pair->data, stream_id, body, sizeof(body), &fin_meta) == 0, "request FIN");
+    int fields_ok = strcmp(body, "hello") == 0
+        && meta_array_is(fin_meta, "trailers", "[\"Digest:sha-256=valid\"]") == 0;
+    free(fin_meta);
+    CHECK(fields_ok, "only the declared Digest trailer may cross, Authorization never on a protected route");
+    CHECK(answer_empty(pair->data, stream_id) == 0, "response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "protected route response");
+    close_fd(&browser);
+
+    len = snprintf(request, sizeof(request),
+                   "POST /http/%s/%s/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n"
+                   "Trailer: X-Checksum, aUtHoRiZaTiOn\r\nConnection: close\r\n\r\n"
+                   "3\r\nabc\r\n0\r\nX-Checksum: kept\r\naUtHoRiZaTiOn: Basic consumed\r\n\r\n",
+                   client, ROUTE);
+    browser = browser_raw(server, request, (size_t)len);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &open_meta) == 0, "no request OPEN on the public route");
+    names_ok = meta_array_is(open_meta, "trailerNames", "[\"X-Checksum\",\"aUtHoRiZaTiOn\"]") == 0;
+    free(open_meta);
+    CHECK(names_ok, "the public route must declare both names");
+    CHECK(expect_request_fin(pair->data, stream_id, body, sizeof(body), &fin_meta) == 0, "request FIN");
+    fields_ok = strcmp(body, "abc") == 0
+        && meta_array_is(fin_meta, "trailers", "[\"X-Checksum:kept\",\"aUtHoRiZaTiOn:Basic consumed\"]") == 0;
+    free(fin_meta);
+    CHECK(fields_ok, "a public route must forward its declared Authorization trailer");
+    CHECK(answer_empty(pair->data, stream_id) == 0, "response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "public route response");
+    close_fd(&browser);
+
+    len = snprintf(request, sizeof(request),
+                   "POST /http/%s/%s/plain HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\n"
+                   "Connection: close\r\n\r\nbody",
+                   client, ROUTE);
+    browser = browser_raw(server, request, (size_t)len);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &open_meta) == 0, "no request OPEN without trailers");
+    names_ok = meta_array_is(open_meta, "trailerNames", NULL) == 0;
+    free(open_meta);
+    CHECK(names_ok, "a request without a Trailer header must not declare trailerNames");
+    CHECK(expect_request_fin(pair->data, stream_id, body, sizeof(body), &fin_meta) == 0, "request FIN");
+    fields_ok = strcmp(body, "body") == 0 && meta_array_is(fin_meta, "trailers", NULL) == 0;
+    free(fin_meta);
+    CHECK(fields_ok, "a request without trailers must end with a bare FIN");
+    CHECK(answer_empty(pair->data, stream_id) == 0, "response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "response without trailers");
+    close_fd(&browser);
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * HttpStreamExchangeTests and HttpSpecusControllerAuthenticationTests, the response trailers
+ * (http-route.md section 4): the head's trailerNames are declared to the browser without
+ * hop-by-hop or repeated names, and of the FIN's trailers only declared fields without CR/LF
+ * reach it; undeclared, hop-by-hop and injected ones are dropped.
+ */
+static int check_http_response_trailers(test_server *server, client_pair *pair)
+{
+    int browser = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_http_stream(server, pair, "/trailers", &browser, &stream_id) == 0, "request");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U,
+                   "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":200,"
+                   "\"headers\":[\"Content-Type: text/plain\"],"
+                   "\"trailerNames\":[\"Digest\",\"Content-Length\",\"X-Injected\",\"digest\"]}",
+                   NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "body", 4U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U,
+                          "{\"trailers\":[\"Digest:sha-256=valid\",\"X-Undeclared:must-not-cross\","
+                          "\"Content-Length:999\",\"X-Injected:ok\\r\\nX-Evil: yes\"]}",
+                          NULL, 0U) == 0,
+          "response with trailers");
+    browser_response response;
+    memset(&response, 0, sizeof(response));
+    response.fd = browser;
+    response.timeout_ms = IO_TIMEOUT_MS;
+    read_browser_response(&response);
+    close_fd(&browser);
+    static const char end[] = "\r\n4\r\nbody\r\n0\r\nDigest:sha-256=valid\r\n\r\n";
+    int ok = response.eof && response.status == 200
+        && strstr(response.head, "\r\nTrailer: Digest, X-Injected\r\n") != NULL
+        && response.head_len >= sizeof(end) - 1U
+        && strcmp(response.head + response.head_len - (sizeof(end) - 1U), end) == 0
+        && strstr(response.head, "X-Undeclared") == NULL && strstr(response.head, "Content-Length:999") == NULL
+        && strstr(response.head, "X-Evil") == NULL && strstr(response.head, "X-Injected:") == NULL;
+    if (!ok) {
+        fprintf(stderr, "browser response:\n%s\n", response.head);
+    }
+    CHECK(ok, "only the declared, valid trailer fields may reach the browser");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * HttpStreamExchangeTests.buffersFragmentedResponseWithinFlowControlWindowAndPreservesFin: the whole
+ * 1 MiB window in 4 KiB fragments, sent without waiting for credit, is accepted and relayed, then
+ * the FIN with its declared trailer; a second FIN is refused.
+ */
+static int check_http_fragmented_response(test_server *server, client_pair *pair)
+{
+    int browser = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_http_stream(server, pair, "/fragments", &browser, &stream_id) == 0, "request");
+    browser_response response;
+    memset(&response, 0, sizeof(response));
+    response.fd = browser;
+    response.timeout_ms = 30000;
+    pthread_t reader;
+    CHECK(pthread_create(&reader, NULL, read_browser_response_thread, &response) == 0, "browser reader");
+    uint8_t fragment[4096];
+    memset(fragment, 'f', sizeof(fragment));
+    int sent = send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U,
+                        "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":200,"
+                        "\"headers\":[\"Content-Type: application/octet-stream\"],\"trailerNames\":[\"x-checksum\"]}",
+                        NULL, 0U) == 0;
+    for (size_t i = 0U; sent && i < INITIAL_WINDOW / sizeof(fragment); ++i) {
+        sent = send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, fragment, sizeof(fragment)) == 0;
+    }
+    sent = sent
+        && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, "{\"trailers\":[\"x-checksum:ok\"]}", NULL, 0U) == 0
+        && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0;
+    uint32_t code = 0U;
+    int reset = sent && wait_rst(pair->data, stream_id, &code) == 0 && (code == 8U || code == 7U);
+    if (!sent) {
+        shutdown(browser, SHUT_RDWR);
+    }
+    pthread_join(reader, NULL);
+    close_fd(&browser);
+    CHECK(sent, "the 1 MiB window in 4 KiB fragments could not be sent");
+    CHECK(reset, "a second FIN must reset the stream (code %u)", code);
+    static const char trailer_end[] = "0\r\nx-checksum:ok\r\n\r\n";
+    CHECK(response.eof && response.status == 200 && response.total > (size_t)INITIAL_WINDOW
+              && response.tail_len >= sizeof(trailer_end) - 1U
+              && memcmp(response.tail + response.tail_len - (sizeof(trailer_end) - 1U), trailer_end,
+                        sizeof(trailer_end) - 1U) == 0
+              && strstr(response.head, "\r\nTrailer: x-checksum\r\n") != NULL,
+          "the browser must get the whole window and then the FIN's trailer (eof=%d status=%d total=%zu)",
+          response.eof, response.status, response.total);
+    return expect_data_connection_served(server, pair);
+}
+
+/* Reads frames until the deadline; adds the stream's WINDOW_UPDATE credit. -1 once the stream was reset. */
+static int collect_credit(int data_fd, uint32_t stream_id, int quiet_ms, uint64_t *credit, int *updates)
+{
+    *updates = 0;
+    long long deadline = monotonic_ms() + quiet_ms;
+    for (;;) {
+        st_nat_message message;
+        int rc = next_nat_frame(data_fd, deadline, &message);
+        if (rc != 1) {
+            return rc == 0 ? -1 : 0;
+        }
+        int reset = message.stream_id == stream_id && message.type == ST_NAT_RST;
+        if (message.stream_id == stream_id && message.type == ST_NAT_WINDOW_UPDATE) {
+            *credit += message.value;
+            ++*updates;
+            /* More credit may follow at once; keep listening a little longer. */
+            deadline = monotonic_ms() + quiet_ms;
+        }
+        st_nat_message_free(&message);
+        if (reset) {
+            fprintf(stderr, "stream %u was reset\n", stream_id);
+            return -1;
+        }
+    }
+}
+
+/*
+ * A heartbeat answered on the data connection with no RST for the stream before it; credit for the
+ * stream that arrives meanwhile is added and counted in *updates.
+ */
+static int alive_counting_credit(int data_fd, uint32_t stream_id, uint64_t *credit, int *updates)
+{
+    st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
+    if (send_buffer(data_fd, &heartbeat) != 0) {
+        return -1;
+    }
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        if (remaining <= 0 || read_frame(data_fd, (int)remaining, &header, &body) != 1) {
+            fprintf(stderr, "data connection closed or silent\n");
+            return -1;
+        }
+        int reset = 0;
+        if (header.command == ST_CMD_NAT_MESSAGE) {
+            st_nat_message message;
+            if (st_protocol_decode_nat_message(body, header.length, &message) == 0) {
+                reset = message.stream_id == stream_id && message.type == ST_NAT_RST;
+                if (message.stream_id == stream_id && message.type == ST_NAT_WINDOW_UPDATE) {
+                    *credit += message.value;
+                    ++*updates;
+                }
+                st_nat_message_free(&message);
+            }
+        }
+        free(body);
+        if (reset) {
+            fprintf(stderr, "stream %u was reset\n", stream_id);
+            return -1;
+        }
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
+            return 0;
+        }
+    }
+}
+
+/* Sends length bytes of DATA in frames of at most 64 KiB. */
+static int send_data_bytes(int data_fd, uint32_t stream_id, const uint8_t *chunk, uint64_t length)
+{
+    while (length > 0U) {
+        size_t frame = length < DATA_CHUNK ? (size_t)length : DATA_CHUNK;
+        if (send_nat(data_fd, ST_NAT_DATA, 0U, stream_id, 0U, NULL, chunk, frame) != 0) {
+            return -1;
+        }
+        length -= frame;
+    }
+    return 0;
+}
+
+/*
+ * HttpStreamExchangeTests.rejectsDataBeyondUnconsumedFlowControlWindow, made deterministic: the
+ * browser never reads, so the server's forwarder stalls writing to it and stops granting credit.
+ * Once no credit comes any more, exactly the credit left is accepted and one byte more resets the
+ * stream with RST 8; the data connection and its other streams carry on.
+ */
+static int check_http_window_exceeded(test_server *server, client_pair *pair)
+{
+    char client[768];
+    char request[1024];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(request, sizeof(request),
+                       "GET /http/%s/%s/stalled HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                       client, ROUTE);
+    int browser = socket(AF_INET, SOCK_STREAM, 0);
+    int small = 4096;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)server->admin_port);
+    int connected = browser >= 0 && setsockopt(browser, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0
+        && connect(browser, (struct sockaddr *)&address, sizeof(address)) == 0
+        && send_all(browser, (const uint8_t *)request, (size_t)len) == 0;
+    if (!connected) {
+        close_fd(&browser);
+    }
+    CHECK(connected, "stalled browser");
+    uint32_t stream_id = 0U;
+    CHECK(expect_http_open(pair->data, &stream_id) == 0, "no request OPEN");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0, "head");
+
+    uint8_t *chunk = (uint8_t *)calloc(1U, DATA_CHUNK);
+    uint64_t credit = INITIAL_WINDOW;
+    uint64_t sent = 0U;
+    int failed = chunk == NULL;
+    int stalled = 0;
+    while (!failed && !stalled) {
+        /* Whole frames while the credit lasts, then wait for more: none means the forwarder stalled. */
+        while (!failed && credit >= DATA_CHUNK) {
+            failed = send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, chunk, DATA_CHUNK) != 0;
+            credit -= DATA_CHUNK;
+            sent += DATA_CHUNK;
+        }
+        int updates = 0;
+        failed = failed || collect_credit(pair->data, stream_id, 1500, &credit, &updates) != 0;
+        stalled = updates == 0;
+        if (!failed && sent > 48U * 1024U * 1024U) {
+            fprintf(stderr, "the forwarder never stalled after %llu bytes\n", (unsigned long long)sent);
+            failed = 1;
+        }
+    }
+    /*
+     * The rest of the credit is accepted: a heartbeat answered after it proves no RST came. Credit
+     * that still arrives (the forwarder had not stalled after all) is spent the same way first.
+     */
+    int confirmed = 0;
+    while (!failed && !confirmed) {
+        failed = send_data_bytes(pair->data, stream_id, chunk, credit) != 0;
+        credit = 0U;
+        int updates = 0;
+        int late_updates = 0;
+        failed = failed || alive_counting_credit(pair->data, stream_id, &credit, &updates) != 0
+            || collect_credit(pair->data, stream_id, 500, &credit, &late_updates) != 0;
+        confirmed = updates == 0 && late_updates == 0;
+    }
+    printf("     the forwarder stalled after %llu bytes\n", (unsigned long long)sent);
+    int reset_rc = failed ? -1
+        : send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, chunk, 1U) == 0
+            ? expect_rst(pair->data, stream_id, 8U) : -1;
+    free(chunk);
+    close_fd(&browser);
+    CHECK(!failed, "the credit the server granted must be accepted");
+    CHECK(reset_rc == 0, "DATA beyond the granted credit must reset the stream with RST 8");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * HttpStreamExchangeTests.requiresExactlyOneResponseHeadBeforeBodyAndTerminalFrames, the frames
+ * the other checks leave out: a FIN before the head, and DATA or a head after the FIN, reset that
+ * stream; the response the FIN ended stays complete.
+ */
+static int check_http_terminal_frames(test_server *server, client_pair *pair)
+{
+    int browser = -1;
+    uint32_t stream_id = 0U;
+    uint32_t code = 0U;
+    CHECK(open_http_stream(server, pair, "/fin-before-head", &browser, &stream_id) == 0, "request");
+    CHECK(send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "FIN before head");
+    CHECK(expect_rst(pair->data, stream_id, 8U) == 0, "a FIN before the response head must reset the stream");
+    CHECK(expect_browser_status(browser, 502, NULL, -1) == 0, "browser of the reset stream");
+    close_fd(&browser);
+
+    CHECK(open_http_stream(server, pair, "/data-after-fin", &browser, &stream_id) == 0, "request");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "x", 1U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "late", 4U) == 0,
+          "head, DATA, FIN, DATA");
+    /* RST 8 while the stream is still pending, RST 7 once it already finished. */
+    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && (code == 8U || code == 7U),
+          "DATA after the FIN must reset the stream (code %u)", code);
+    CHECK(expect_browser_status(browser, 200, "\r\n1\r\nx\r\n0\r\n\r\n", 1) == 0, "the response the FIN ended");
+    close_fd(&browser);
+
+    CHECK(open_http_stream(server, pair, "/head-after-fin", &browser, &stream_id) == 0, "request");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0,
+          "head, FIN, head");
+    CHECK(wait_rst(pair->data, stream_id, &code) == 0 && (code == 8U || code == 7U),
+          "a head after the FIN must reset the stream (code %u)", code);
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "the response the FIN ended");
+    close_fd(&browser);
+    return expect_data_connection_served(server, pair);
+}
+
+/* The rawQuery of the next request OPEN for path, compared with expected. */
+static int expect_forwarded_query(const test_server *server, client_pair *pair, const char *path,
+                                  const char *expected_path, const char *expected_query)
+{
+    uint32_t stream_id = 0U;
+    char *meta = NULL;
+    int browser = browser_get(server, pair, path);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &meta) == 0, "no request OPEN for %s", path);
+    char *relative_path = st_json_get_string(meta, "relativePath");
+    char *raw_query = st_json_get_string(meta, "rawQuery");
+    int ok = relative_path != NULL && strcmp(relative_path, expected_path) == 0
+        && raw_query != NULL && strcmp(raw_query, expected_query) == 0;
+    if (!ok) {
+        fprintf(stderr, "%s forwarded as %s ? %s (metadata %s)\n", path, relative_path == NULL ? "-" : relative_path,
+                raw_query == NULL ? "-" : raw_query, meta);
+    }
+    free(relative_path);
+    free(raw_query);
+    free(meta);
+    CHECK(answer_empty(pair->data, stream_id) == 0, "response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "response for %s", path);
+    close_fd(&browser);
+    CHECK(ok, "query of %s", path);
+    return 0;
+}
+
+/*
+ * HttpQueryStringCodecTests on the wire: only raw braces of the query are encoded, existing escapes
+ * and the '/' and '?' inside the query stay as they are. No query and an empty query both forward
+ * an empty rawQuery, which every client takes as no query (Java sends null for the first one).
+ */
+static int check_http_query_forwarding(test_server *server, client_pair *pair)
+{
+    CHECK(expect_forwarded_query(server, pair, "/q?path=icon_{0}.png&encoded=%7B1%7D&separator=a/b?c", "/q",
+                                 "path=icon_%7B0%7D.png&encoded=%7B1%7D&separator=a/b?c") == 0,
+          "braces encoded, '/' and '?' kept");
+    CHECK(expect_forwarded_query(server, pair, "/q", "/q", "") == 0, "no query");
+    CHECK(expect_forwarded_query(server, pair, "/q?", "/q", "") == 0, "empty query");
+    return 0;
+}
+
+/*
+ * ResponseRewriterTests through a route with pathRewriteEnabled: the HTML's root-relative URL gets
+ * the route prefix, protocol-relative and absolute URLs stay as they are, and the runtime is
+ * injected as the external same-origin script, never inline.
+ */
+static int check_http_path_rewrite(test_server *server, client_pair *pair)
+{
+    sqlite3 *db = NULL;
+    int updated = sqlite3_open(server->db_path, &db) == SQLITE_OK
+        && sqlite3_busy_timeout(db, 5000) == SQLITE_OK
+        && sqlite3_exec(db, "UPDATE http_route_mapping SET path_rewrite_enabled = 1", NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    CHECK(updated, "path rewrite switch");
+    static const char html[] =
+        "<html><head></head><body>\n<img src=\"/img/logo.png\">\n<img src=\"//cdn.example.com/logo.png\">\n"
+        "<img src=\"https://cdn.example.com/external.png\">\n</body></html>\n";
+    int browser = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_http_stream(server, pair, "/page", &browser, &stream_id) == 0, "request");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U,
+                   "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":200,"
+                   "\"headers\":[\"Content-Type:text/html;charset=UTF-8\"],\"trailerNames\":[]}",
+                   NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, html, sizeof(html) - 1U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0,
+          "HTML response");
+    browser_response response;
+    memset(&response, 0, sizeof(response));
+    response.fd = browser;
+    response.timeout_ms = IO_TIMEOUT_MS;
+    read_browser_response(&response);
+    close_fd(&browser);
+    char rewritten[512];
+    char script[512];
+    snprintf(rewritten, sizeof(rewritten), "src=\"/http/%s/%s/img/logo.png\"", pair->runtime.client_name, ROUTE);
+    snprintf(script, sizeof(script),
+             "<script src=\"/specus-http-route-runtime.js?v=4\" data-specus-prefix=\"/http/%s/%s\"></script>",
+             pair->runtime.client_name, ROUTE);
+    int ok = response.eof && response.status == 200 && strstr(response.head, rewritten) != NULL
+        && strstr(response.head, "src=\"//cdn.example.com/logo.png\"") != NULL
+        && strstr(response.head, "src=\"https://cdn.example.com/external.png\"") != NULL
+        && strstr(response.head, script) != NULL && strstr(response.head, "<script>") == NULL;
+    if (!ok) {
+        fprintf(stderr, "rewritten response:\n%s\n", response.head);
+    }
+    CHECK(ok, "only the root-relative URL may be rewritten");
+    return 0;
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* TCP stream checks                                                                             */
 
@@ -741,6 +1282,108 @@ static int check_rst_for_never_opened_stream(test_server *server, client_pair *p
     return expect_data_connection_served(server, pair);
 }
 
+typedef struct {
+    const test_server *server;
+    long long route_id;
+    int status;
+    char *body;
+} connectivity_call;
+
+static void *run_connectivity_check(void *arg)
+{
+    connectivity_call *call = (connectivity_call *)arg;
+    char token[1024];
+    char path[128];
+    call->status = 0;
+    if (st_security_issue_local_token(ADMIN_USERNAME, "default", "ADMIN", ADMIN_JWT_SECRET, 600,
+                                      token, sizeof(token)) != 0) {
+        return NULL;
+    }
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/connectivity-check", call->route_id);
+    (void)http_request(call->server->admin_port, "POST", path, "{}", token, &call->status, &call->body);
+    return NULL;
+}
+
+/*
+ * A connectivity check (service-connectivity-check.md) ends its probe streams with RST, and the
+ * device may RST them too: the Go client does after its request was cancelled, and the device's
+ * own failure can cross the server's reset. Those late RSTs are stale frames for tombstoned
+ * streams; they used to look like RSTs for never-opened streams and close the whole data
+ * connection, taking every stream of the device down with it.
+ */
+static int check_connectivity_probe_late_rst(test_server *server, client_pair *pair)
+{
+    char route_id[32];
+    CHECK(db_scalar(server->db_path, "SELECT id FROM http_route_mapping WHERE route = ?", ROUTE, 0,
+                    route_id, sizeof(route_id)) == 0,
+          "route id");
+    connectivity_call call = {server, atoll(route_id), 0, NULL};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, run_connectivity_check, &call) == 0, "check thread");
+
+    /* HEAD answered 405: the check falls back to one GET, and resets the HEAD stream. */
+    uint32_t head_stream = 0U;
+    uint32_t get_stream = 0U;
+    uint32_t code = 0U;
+    int failed = expect_http_open(pair->data, &head_stream) != 0
+        || send_nat(pair->data, ST_NAT_OPEN, 0U, head_stream, 0U,
+                    "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":405,"
+                    "\"headers\":[],\"trailerNames\":[]}",
+                    NULL, 0U) != 0
+        || wait_rst(pair->data, head_stream, &code) != 0
+        || send_nat(pair->data, ST_NAT_RST, 0U, head_stream, 28U, NULL, NULL, 0U) != 0
+        /* The GET's head arrives with its body still to come: the server resets it. */
+        || expect_http_open(pair->data, &get_stream) != 0
+        || send_nat(pair->data, ST_NAT_OPEN, 0U, get_stream, 0U, RESPONSE_HEAD, NULL, 0U) != 0
+        || wait_rst(pair->data, get_stream, &code) != 0
+        || send_nat(pair->data, ST_NAT_RST, 0U, get_stream, 28U, NULL, NULL, 0U) != 0;
+    pthread_join(thread, NULL);
+    CHECK(!failed, "the probe exchange did not run as scripted");
+    CHECK(call.status == 200 && call.body != NULL && strstr(call.body, "\"ACCESS_OK\"") != NULL,
+          "check answer %d %s", call.status, call.body == NULL ? "" : call.body);
+    free(call.body);
+    CHECK(expect_alive_without_rst(pair->data, get_stream) == 0,
+          "a late RST for a finished probe stream closed the data connection");
+    /* DATA after the reset is a frame for a closed stream: RST 7, as for a public stream. */
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, get_stream, 0U, NULL, "late", 4U) == 0, "late DATA");
+    CHECK(expect_rst(pair->data, get_stream, 7U) == 0, "late DATA on a probe stream did not get RST 7");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
+ * HttpStreamExchangeTests.aClientResetCarriesItsFailureToTheHeadWaiter through the connectivity
+ * check of a client that classifies its resets (clientHttpRouteCapabilities version 1): the
+ * client's RST before any head hands its metadata.failure to the waiting check, which reports the
+ * refused target; the RST's free-text reason is not echoed.
+ */
+static int check_connectivity_client_reset_failure(test_server *server, client_pair *pair)
+{
+    char route_id[32];
+    CHECK(db_scalar(server->db_path, "SELECT id FROM http_route_mapping WHERE route = ?", ROUTE, 0,
+                    route_id, sizeof(route_id)) == 0,
+          "route id");
+    connectivity_call call = {server, atoll(route_id), 0, NULL};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, run_connectivity_check, &call) == 0, "check thread");
+    uint32_t head_stream = 0U;
+    int failed = expect_http_open(pair->data, &head_stream) != 0
+        || send_nat(pair->data, ST_NAT_RST, 0U, head_stream, 26U,
+                    "{\"reason\":\"dial tcp 10.0.0.1:80: connection refused\",\"failure\":\"connect-refused\"}",
+                    NULL, 0U) != 0;
+    pthread_join(thread, NULL);
+    CHECK(!failed, "the probe exchange did not run as scripted");
+    int classified = call.status == 200 && call.body != NULL
+        && strstr(call.body, "\"code\":\"TARGET_CONNECT_REFUSED\"") != NULL
+        && strstr(call.body, "10.0.0.1") == NULL;
+    if (!classified) {
+        fprintf(stderr, "check answer %d %s\n", call.status, call.body == NULL ? "" : call.body);
+    }
+    free(call.body);
+    CHECK(classified, "the client's RST failure must reach the check that waits for the head");
+    CHECK(expect_alive_without_rst(pair->data, head_stream) == 0, "the data connection after the probe");
+    return expect_data_connection_served(server, pair);
+}
+
 /*
  * Credit up to the 16 MiB window is accepted; a WINDOW_UPDATE beyond it closes the data connection
  * and its streams, as Java StreamFlowController and Go do (it used to only stop routing to it).
@@ -762,6 +1405,159 @@ static int check_window_overflow(test_server *server, client_pair *pair)
     CHECK(expect_channel_alive(pair->control) == 0, "the control connection must stay");
     CHECK(login_data(server, pair) == 0, "data re-login");
     return expect_data_connection_served(server, pair);
+}
+
+/* Sends one raw browser request for the client's route and returns the browser socket. */
+static int browser_send(const test_server *server, const client_pair *pair, const char *path,
+                        const char *extra_headers)
+{
+    char client[768];
+    char request[2048];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    int len = snprintf(request, sizeof(request), "GET /http/%s/%s%s HTTP/1.1\r\nHost: 127.0.0.1\r\n%s\r\n",
+                       client, ROUTE, path, extra_headers);
+    int fd = connect_local(server->admin_port);
+    if (fd >= 0 && (len <= 0 || (size_t)len >= sizeof(request)
+                    || send_all(fd, (const uint8_t *)request, (size_t)len) != 0)) {
+        close_fd(&fd);
+    }
+    return fd;
+}
+
+/* The request OPEN of the next stream; *meta is the caller's to free. */
+static int expect_open_meta(int data_fd, uint32_t *stream_id, char **meta)
+{
+    st_nat_message open;
+    if (expect_nat_frame(data_fd, ST_NAT_OPEN, &open) != 0) {
+        return -1;
+    }
+    *stream_id = open.stream_id;
+    *meta = open.meta_json;
+    open.meta_json = NULL;
+    st_nat_message_free(&open);
+    return *meta == NULL ? -1 : 0;
+}
+
+/*
+ * Java UpstreamBrowserHeaders on the wire: the request OPEN the client receives, for HTTP and for a
+ * WebSocket upgrade, carries the browser's Origin and Referer moved onto the route target's origin
+ * (http://127.0.0.1:9) and cross-site fetch metadata as same-origin; other headers are untouched.
+ */
+static int check_upstream_browser_headers(test_server *server, client_pair *pair)
+{
+    char client[768];
+    char browser_headers[1024];
+    char expected_referer[1024];
+    url_encode(pair->runtime.client_name, client, sizeof(client));
+    snprintf(browser_headers, sizeof(browser_headers),
+             "Origin: https://specus.example\r\nReferer: https://specus.example/http/%s/%s/page?x=1\r\n"
+             "Sec-Fetch-Site: cross-site\r\nX-Kept: https://specus.example\r\n",
+             client, ROUTE);
+    snprintf(expected_referer, sizeof(expected_referer), "\"Referer:http://127.0.0.1:9/http/%s/%s/page?x=1\"",
+             client, ROUTE);
+
+    uint32_t stream_id = 0U;
+    char *meta = NULL;
+    int browser = browser_send(server, pair, "/page", browser_headers);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &meta) == 0, "no HTTP request OPEN");
+    int http_ok = strstr(meta, "\"Origin:http://127.0.0.1:9\"") != NULL && strstr(meta, expected_referer) != NULL
+        && strstr(meta, "\"Sec-Fetch-Site:same-origin\"") != NULL
+        && strstr(meta, "\"X-Kept:https://specus.example\"") != NULL
+        && strstr(meta, "\"Origin:https://specus.example\"") == NULL && strstr(meta, "cross-site") == NULL;
+    if (!http_ok) {
+        fprintf(stderr, "HTTP OPEN metadata: %s\n", meta);
+    }
+    free(meta);
+    CHECK(http_ok, "the HTTP request OPEN must carry the browser headers moved onto the route target");
+    CHECK(send_nat(pair->data, ST_NAT_OPEN, 0U, stream_id, 0U, RESPONSE_HEAD, NULL, 0U) == 0
+              && send_nat(pair->data, ST_NAT_FIN, 0U, stream_id, 0U, NULL, NULL, 0U) == 0,
+          "response");
+    CHECK(expect_browser_status(browser, 200, NULL, 1) == 0, "HTTP response");
+    close_fd(&browser);
+
+    char upgrade[1536];
+    snprintf(upgrade, sizeof(upgrade),
+             "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n%s", browser_headers);
+    browser = browser_send(server, pair, "/socket", upgrade);
+    CHECK(browser >= 0, "browser connect");
+    CHECK(expect_open_meta(pair->data, &stream_id, &meta) == 0, "no WebSocket OPEN");
+    int ws_ok = strstr(meta, "\"source\":\"ws\"") != NULL && strstr(meta, "\"Origin:http://127.0.0.1:9\"") != NULL
+        && strstr(meta, expected_referer) != NULL && strstr(meta, "\"Sec-Fetch-Site:same-origin\"") != NULL
+        && strstr(meta, "\"Origin:https://specus.example\"") == NULL && strstr(meta, "cross-site") == NULL;
+    if (!ws_ok) {
+        fprintf(stderr, "WebSocket OPEN metadata: %s\n", meta);
+    }
+    free(meta);
+    CHECK(ws_ok, "the WebSocket OPEN must carry the browser headers moved onto the route target");
+    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "RST of the WebSocket stream");
+    close_fd(&browser);
+    return expect_http_stream_served(server, pair);
+}
+
+/*
+ * Turns on the mapping's detailCaptureEnabled, logs the data connection in again so its runtime
+ * mapping carries the switch, relays one TCP payload each way and counts the captured frames.
+ */
+static int relay_with_capture_enabled_on_mapping(test_server *server, client_pair *pair, long long *frames)
+{
+    sqlite3 *db = NULL;
+    int updated = sqlite3_open(server->db_path, &db) == SQLITE_OK
+        && sqlite3_busy_timeout(db, 5000) == SQLITE_OK
+        && sqlite3_exec(db, "UPDATE specus_mapping SET detail_capture_enabled = 1", NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    CHECK(updated, "mapping detail capture update");
+    close_fd(&pair->data);
+    CHECK(login_data(server, pair) == 0, "data re-login");
+    int public_fd = -1;
+    uint32_t stream_id = 0U;
+    CHECK(open_public_stream_id(pair->data, pair->public_port, &public_fd, &stream_id) == 0, "public OPEN");
+    CHECK(send_all(public_fd, (const uint8_t *)"from-public", 11U) == 0, "public write");
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, stream_id, 0U, NULL, "ping", 4U) == 0, "DATA");
+    CHECK(expect_public_bytes(public_fd, "ping") == 0, "DATA not relayed to the public peer");
+    char count[32];
+    long long deadline = monotonic_ms() + 2000;
+    *frames = 0;
+    do {
+        sleep_ms(100);
+        CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_tcp_traffic_frame", NULL, 0, count,
+                        sizeof(count)) == 0, "frame count");
+        *frames = strtoll(count, NULL, 10);
+    } while (*frames < 2 && monotonic_ms() < deadline);
+    CHECK(send_nat(pair->data, ST_NAT_RST, 0U, stream_id, 0U, NULL, NULL, 0U) == 0, "RST");
+    CHECK(drain_until_eof(public_fd, IO_TIMEOUT_MS) == 0, "RST did not close the public peer");
+    close_fd(&public_fd);
+    return 0;
+}
+
+/* TrafficInspectionServiceTests: no TCP capture without SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED. */
+static int check_tcp_capture_off_by_default(test_server *server, client_pair *pair)
+{
+    long long frames = -1;
+    CHECK(relay_with_capture_enabled_on_mapping(server, pair, &frames) == 0, "relay");
+    CHECK(frames == 0, "%lld TCP frames captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset", frames);
+    return 0;
+}
+
+/* With the server switch on, both directions are stored whole with their short preview. */
+static int check_tcp_capture_enabled(test_server *server, client_pair *pair)
+{
+    long long frames = -1;
+    CHECK(relay_with_capture_enabled_on_mapping(server, pair, &frames) == 0, "relay");
+    CHECK(frames >= 2, "%lld TCP frames captured, expected both directions", frames);
+    char preview[64];
+    CHECK(db_scalar(server->db_path,
+                    "SELECT payload_preview_hex FROM specus_tcp_traffic_frame WHERE frame_direction = ?",
+                    "CLIENT_TO_PUBLIC", 0, preview, sizeof(preview)) == 0
+              && strcmp(preview, "70 69 6E 67") == 0,
+          "client-to-public frame preview %s", preview);
+    CHECK(db_scalar(server->db_path,
+                    "SELECT payload_preview_text FROM specus_tcp_traffic_frame WHERE frame_direction = ?",
+                    "PUBLIC_TO_CLIENT", 0, preview, sizeof(preview)) == 0
+              && strcmp(preview, "from-public") == 0,
+          "public-to-client frame preview %s", preview);
+    return 0;
 }
 
 /*
@@ -949,6 +1745,213 @@ static int test_request_body_limit(test_server *server)
     return 0;
 }
 
+/* Waits until the HTTP detail holds count exchanges, the server records them after answering. */
+static int wait_exchange_count(const test_server *server, long long count)
+{
+    char value[32] = "";
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        if (db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_http_traffic_exchange", NULL, 0, value,
+                      sizeof(value)) == 0 && atoll(value) == count) {
+            return 0;
+        }
+        if (monotonic_ms() >= deadline) {
+            fprintf(stderr, "%s HTTP exchanges recorded, expected %lld\n", value, count);
+            return -1;
+        }
+        sleep_ms(50);
+    }
+}
+
+/* The one exchange recorded for route and status: field equals expected, or contains it with '~'. */
+static int exchange_field(const test_server *server, const char *route, int status, const char *field,
+                          const char *expected)
+{
+    char sql[256];
+    char value[2048] = "";
+    snprintf(sql, sizeof(sql),
+             "SELECT COALESCE(%s, '') FROM specus_http_traffic_exchange WHERE route = ? AND status_code = %d "
+             "ORDER BY id LIMIT 1",
+             field, status);
+    if (db_scalar(server->db_path, sql, route, 0, value, sizeof(value)) != 0) {
+        fprintf(stderr, "no %d exchange recorded for route %s\n", status, route);
+        return -1;
+    }
+    int contains_only = expected[0] == '~';
+    int matches = contains_only ? strstr(value, expected + 1) != NULL : strcmp(value, expected) == 0;
+    if (!matches) {
+        fprintf(stderr, "route %s status %d: %s is \"%s\", expected %s\"%s\"\n", route, status, field, value,
+                contains_only ? "it to contain " : "", expected + contains_only);
+    }
+    return matches ? 0 : -1;
+}
+
+/* Sends a request and checks the answer's status line and that it carries every needle. */
+static int expect_answer(const test_server *server, const char *request, size_t request_len, int status,
+                         const char *const *needles)
+{
+    int fd = browser_raw(server, request, request_len);
+    if (fd < 0) {
+        return -1;
+    }
+    browser_response response;
+    memset(&response, 0, sizeof(response));
+    response.fd = fd;
+    response.timeout_ms = IO_TIMEOUT_MS;
+    read_browser_response(&response);
+    close_fd(&fd);
+    int ok = response.status == status;
+    for (size_t i = 0; ok && needles != NULL && needles[i] != NULL; ++i) {
+        ok = strstr(response.head, needles[i]) != NULL;
+    }
+    if (!ok) {
+        fprintf(stderr, "expected %d with every needle, got:\n%s\n", status, response.head);
+    }
+    return ok ? 0 : -1;
+}
+
+/*
+ * Java HttpSpecusBodyLimitFilterTests and HttpSpecusControllerAuthenticationTests with detail
+ * capture on: a body over 16 MiB is refused with 413 and recorded with the request headers (no
+ * Content-Length) and the body's first 64 KiB, by Content-Length and chunked; a body within the
+ * limit is forwarded and only its own outcome is recorded. The route gate's 401, 503 and 404 carry
+ * Java's texts and no-store and are recorded without request headers; an authenticated request to
+ * an offline client is recorded without the Authorization it consumed. The C limit also covers the
+ * rest of the management listener, where nothing is recorded.
+ */
+static int test_refusals_recorded(test_server *server)
+{
+    uint8_t digest[ST_SHA256_LEN];
+    char password_hash[ST_SHA256_HEX_LEN + 1];
+    st_sha256((const uint8_t *)"s3cret", 6U, digest);
+    st_hex_encode(digest, sizeof(digest), password_hash);
+    st_storage_client offline;
+    st_storage_http_route route;
+    CHECK(st_storage_upsert_client(server->db_path, 0, "default", "offline-client", ADMIN_USERNAME, 1, 60,
+                                   &offline) == 0
+              && st_storage_create_http_route_for_client(server->db_path, offline.id, ROUTE, "http://127.0.0.1:9", 1,
+                                                         1, 0, 0, 0, 0, NULL, NULL, &route) == 0
+              && st_storage_create_http_route_for_client(server->db_path, offline.id, "private", "http://127.0.0.1:9",
+                                                         1, 1, 0, 0, 0, 1, "viewer", password_hash, &route) == 0
+              && st_storage_create_http_route_for_client(server->db_path, offline.id, "broken", "http://127.0.0.1:9",
+                                                         1, 1, 0, 0, 0, 1, "viewer", "", &route) == 0
+              && st_storage_create_http_route_for_client(server->db_path, offline.id, "off", "http://127.0.0.1:9", 0,
+                                                         1, 0, 0, 0, 0, NULL, NULL, &route) == 0,
+          "offline client with recorded routes");
+
+    /*
+     * Content-Length over the limit: 413, recorded with the headers and the body's first 64 KiB.
+     * Exactly that much is sent, so the server reads all of it and its close is no reset.
+     */
+    size_t head_cap = 512U + 64U * 1024U;
+    char *request = (char *)malloc(head_cap);
+    CHECK(request != NULL, "request buffer");
+    int head_len = snprintf(request, head_cap,
+                            "POST /http/offline-client/%s/api/data?a=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                            "X-Test: foo\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                            ROUTE, REQUEST_BODY_LIMIT + 1U);
+    memset(request + head_len, 'b', 64U * 1024U);
+    const char *const too_large[] = {"HTTP 请求体超过限制", NULL};
+    int answered = expect_answer(server, request, (size_t)head_len + 64U * 1024U, 413, too_large);
+    free(request);
+    CHECK(answered == 0, "Content-Length over 16 MiB");
+    CHECK(wait_exchange_count(server, 1) == 0, "the 413 by Content-Length was not recorded");
+    CHECK(exchange_field(server, ROUTE, 413, "method", "POST") == 0
+              && exchange_field(server, ROUTE, 413, "relative_path", "/api/data") == 0
+              && exchange_field(server, ROUTE, 413, "raw_query", "a=1") == 0
+              && exchange_field(server, ROUTE, 413, "request_headers", "~X-Test:foo") == 0
+              && exchange_field(server, ROUTE, 413, "request_bytes", "65536") == 0
+              && exchange_field(server, ROUTE, 413, "request_preview_text", "~bbbb") == 0
+              && exchange_field(server, ROUTE, 413, "success", "0") == 0
+              && exchange_field(server, ROUTE, 413, "error", "HTTP 请求体超过限制") == 0
+              && exchange_field(server, ROUTE, 413, "response_headers", "Content-Type:application/json") == 0
+              && exchange_field(server, ROUTE, 413, "response_preview_text", "~HTTP 请求体超过限制") == 0
+              && exchange_field(server, ROUTE, 413, "remote_address", "~127.0.0.1:") == 0,
+          "the recorded 413");
+    char value[256] = "";
+    CHECK(db_scalar(server->db_path,
+                    "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE request_headers LIKE ?",
+                    "%Content-Length%", 0, value, sizeof(value)) == 0 && strcmp(value, "0") == 0,
+          "a recorded request must not carry Content-Length");
+
+    /* Chunked over the limit: the same refusal and record. */
+    int fd = send_direct_post(server, "Transfer-Encoding: chunked\r\n", REQUEST_BODY_LIMIT, 1, 1);
+    CHECK(fd >= 0, "oversized chunked request");
+    CHECK(expect_browser_status(fd, 413, "HTTP 请求体超过限制", -1) == 0, "chunked body over 16 MiB");
+    close_fd(&fd);
+    CHECK(wait_exchange_count(server, 2) == 0, "the chunked 413 was not recorded");
+    CHECK(db_scalar(server->db_path,
+                    "SELECT request_bytes FROM specus_http_traffic_exchange WHERE status_code = 413 ORDER BY id DESC",
+                    NULL, 0, value, sizeof(value)) == 0 && strcmp(value, "65536") == 0,
+          "the chunked 413 keeps the body's first 64 KiB, got %s", value);
+
+    /* Within the limit: forwarded, so the outcome (the client is offline) is what gets recorded. */
+    static const char small[] =
+        "POST /http/offline-client/app/small HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n"
+        "Connection: close\r\n\r\nsmall";
+    const char *const offline_answer[] = {"客户端不在线", NULL};
+    CHECK(expect_answer(server, small, sizeof(small) - 1U, 502, offline_answer) == 0, "a body within the limit");
+    CHECK(wait_exchange_count(server, 3) == 0, "the forwarded request was not recorded");
+    CHECK(exchange_field(server, ROUTE, 502, "error", "客户端不在线") == 0
+              && exchange_field(server, ROUTE, 502, "request_bytes", "5") == 0,
+          "the forwarded request's record");
+    CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE status_code = ?",
+                    NULL, 413, value, sizeof(value)) == 0 && strcmp(value, "2") == 0,
+          "a body within the limit must not be recorded as a 413");
+
+    /* The route gate: 401, 503 and 404 with Java's texts, no-store, recorded without headers. */
+    static const char missing_credentials[] =
+        "GET /http/offline-client/private/ HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic invalid\r\n"
+        "X-Test: kept\r\nConnection: close\r\n\r\n";
+    const char *const challenge[] = {"WWW-Authenticate: Basic realm=\"Specus HTTP Route\", charset=\"UTF-8\"",
+                                     "Cache-Control: no-store", "需要 HTTP Basic 认证", NULL};
+    CHECK(expect_answer(server, missing_credentials, sizeof(missing_credentials) - 1U, 401, challenge) == 0,
+          "invalid credentials");
+    static const char broken[] =
+        "GET /http/offline-client/broken/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    const char *const unavailable[] = {"Cache-Control: no-store", "HTTP 路由认证暂不可用", NULL};
+    CHECK(expect_answer(server, broken, sizeof(broken) - 1U, 503, unavailable) == 0, "unusable route credentials");
+    static const char disabled[] =
+        "GET /http/offline-client/off/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    const char *const not_found[] = {"Cache-Control: no-store", "HTTP 路由不存在或未启用", NULL};
+    CHECK(expect_answer(server, disabled, sizeof(disabled) - 1U, 404, not_found) == 0, "disabled route");
+    CHECK(wait_exchange_count(server, 6) == 0, "the gate's refusals were not recorded");
+    CHECK(exchange_field(server, "private", 401, "request_headers", "") == 0
+              && exchange_field(server, "private", 401, "error", "需要 HTTP Basic 认证") == 0
+              && exchange_field(server, "private", 401, "method", "GET") == 0
+              && exchange_field(server, "private", 401, "relative_path", "/") == 0
+              && exchange_field(server, "broken", 503, "request_headers", "") == 0
+              && exchange_field(server, "broken", 503, "error", "HTTP 路由认证暂不可用") == 0
+              && exchange_field(server, "off", 404, "request_headers", "") == 0
+              && exchange_field(server, "off", 404, "error", "HTTP 路由不存在或未启用") == 0,
+          "the gate's records");
+
+    /* Authenticated, the client offline: recorded with X-Test but without the consumed Authorization. */
+    static const char authenticated[] =
+        "GET /http/offline-client/private/ HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "Authorization: Basic dmlld2VyOnMzY3JldA==\r\nX-Test: kept\r\nConnection: close\r\n\r\n";
+    CHECK(expect_answer(server, authenticated, sizeof(authenticated) - 1U, 502, offline_answer) == 0,
+          "valid credentials pass the gate before the offline client");
+    CHECK(wait_exchange_count(server, 7) == 0, "the authenticated request was not recorded");
+    CHECK(exchange_field(server, "private", 502, "request_headers", "~X-Test:kept") == 0, "the forwarded headers");
+    CHECK(db_scalar(server->db_path,
+                    "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE request_headers LIKE ?",
+                    "%Authorization%", 0, value, sizeof(value)) == 0 && strcmp(value, "0") == 0,
+          "the consumed Authorization must not be recorded");
+
+    /* The limit holds on the whole management listener here; such a refusal is no HTTP exchange. */
+    char admin_request[256];
+    head_len = snprintf(admin_request, sizeof(admin_request),
+                        "POST /api/admin/clients HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %u\r\n"
+                        "Connection: close\r\n\r\n",
+                        REQUEST_BODY_LIMIT + 1U);
+    CHECK(expect_answer(server, admin_request, (size_t)head_len, 413, too_large) == 0,
+          "a management body over 16 MiB");
+    sleep_ms(200);
+    CHECK(wait_exchange_count(server, 7) == 0, "a refused management request must not be recorded");
+    return 0;
+}
+
 /* ------------------------------------------------------------------------------------------- */
 
 static int test_tombstones(void)
@@ -1017,11 +2020,40 @@ static int run_current_check(test_server *server)
  */
 static const char *const long_idle[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900", NULL};
 
+/* SPECUS_NAT_STREAM_ONLY=<text> runs only the checks whose name contains it. */
+static int selected(const char *name)
+{
+    const char *only = getenv("SPECUS_NAT_STREAM_ONLY");
+    return only == NULL || *only == '\0' || strstr(name, only) != NULL;
+}
+
 static int run_check(const char *name, pair_check check)
 {
+    if (!selected(name)) {
+        return 0;
+    }
     current_check = check;
     return run_on_fresh_server(name, run_current_check, long_idle);
 }
+
+/* A scenario that needs no client of its own, under the same filter. */
+static int run_scenario(const char *name, server_scenario scenario, const char *const *extra_env)
+{
+    return selected(name) ? run_on_fresh_server(name, scenario, extra_env) : 0;
+}
+
+/* Runs current_check on a pair whose client announced clientHttpRouteCapabilities version 1. */
+static int run_current_check_capable(test_server *server)
+{
+    harness_login_environment_extra = ",\"clientHttpRouteCapabilities\":{\"version\":1}";
+    int rc = run_current_check(server);
+    harness_login_environment_extra = "";
+    return rc;
+}
+
+static const char *const long_idle_with_capture[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
+};
 
 int main(int argc, char **argv)
 {
@@ -1039,6 +2071,16 @@ int main(int argc, char **argv)
     failures += run_check("HTTP DATA|END_STREAM is DATA then FIN", check_http_end_stream);
     failures += run_check("HTTP response head without trailerNames", check_http_head_without_trailer_names);
     failures += run_check("HTTP response beyond 64 MiB resets only that stream", check_http_response_limit);
+    failures += run_check("HTTP request trailers: declared names only, Authorization consumed on a protected route",
+                          check_http_request_trailers);
+    failures += run_check("HTTP response trailers: declared, valid fields only", check_http_response_trailers);
+    failures += run_check("HTTP 1 MiB window in 4 KiB fragments, then FIN with its trailer",
+                          check_http_fragmented_response);
+    failures += run_check("HTTP DATA beyond the granted window gets RST 8", check_http_window_exceeded);
+    failures += run_check("HTTP FIN before the head, DATA and head after FIN reset the stream",
+                          check_http_terminal_frames);
+    failures += run_check("HTTP query forwarding keeps '/' and '?' and encodes braces", check_http_query_forwarding);
+    failures += run_check("HTTP path rewrite leaves protocol-relative and absolute URLs", check_http_path_rewrite);
     failures += run_check("TCP DATA after FIN gets RST 7", check_tcp_data_after_fin);
     failures += run_check("TCP empty DATA|END_STREAM is a FIN; a second FIN gets RST 7",
                           check_tcp_end_stream_and_duplicate_fin);
@@ -1049,9 +2091,23 @@ int main(int argc, char **argv)
     failures += run_check("RST for a never-opened stream closes the data connection",
                           check_rst_for_never_opened_stream);
     failures += run_check("WINDOW_UPDATE overflow closes the data connection", check_window_overflow);
+    failures += run_check("late RSTs for connectivity probe streams are stale frames",
+                          check_connectivity_probe_late_rst);
+    current_check = check_connectivity_client_reset_failure;
+    failures += run_scenario("a client RST hands its failure to the connectivity check",
+                             run_current_check_capable, long_idle);
     failures += run_check("HEARTBEAT_RESPONSE is accepted on both roles", check_heartbeat_response);
+    failures += run_check("request OPEN carries browser headers moved onto the route target",
+                          check_upstream_browser_headers);
+    failures += run_check("TCP detail capture is off without SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED",
+                          check_tcp_capture_off_by_default);
+    current_check = check_tcp_capture_enabled;
+    failures += run_scenario("TCP detail capture with the server switch and the mapping's switch",
+                             run_current_check, long_idle_with_capture);
     failures += run_check("4 MiB client-to-public queue overflow resets only that stream", check_tcp_queue_overflow);
-    failures += run_on_fresh_server("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
+    failures += run_scenario("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
+    failures += run_scenario("413 and route gate refusals are recorded like Java's", test_refusals_recorded,
+                             long_idle_with_capture);
     if (raise_descriptor_limit(4096) == 0) {
         failures += run_check("1025th pending HTTP stream gets 502", check_pending_stream_limit);
     } else {

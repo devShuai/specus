@@ -118,8 +118,9 @@ public class ProductMetricsService {
     }
 
     /**
-     * PUT /settings. Switching off drops the tenant's progress rows without folding them; switching
-     * on clears the purge mark; an unchanged state keeps updatedAt/updatedBy.
+     * PUT /settings. Switching off drops the tenant's progress rows without folding them. Any change
+     * of state clears the purge mark, so while the switch is off the mark only stands for a purge
+     * made after switching off; an unchanged state keeps updatedAt/updatedBy and the mark.
      */
     public Response putSettings(ManagementContext context, byte[] body) {
         if (!context.isAdmin()) {
@@ -142,8 +143,7 @@ public class ProductMetricsService {
             SwitchRow saved = transactions.execute(status -> {
                 SwitchRow row = store.findSwitch(tenant).orElse(new SwitchRow(tenant, false, null, null, null));
                 if (row.enabled() != update.enabled()) {
-                    row = new SwitchRow(tenant, update.enabled(), context.username(), now,
-                            update.enabled() ? null : row.purgedAt());
+                    row = new SwitchRow(tenant, update.enabled(), context.username(), now, null);
                 }
                 store.saveSwitch(row);
                 if (!update.enabled()) {
@@ -369,17 +369,29 @@ public class ProductMetricsService {
         }
     }
 
-    /** The four retention steps of section 9; idempotent and independent of when it runs. */
+    /**
+     * The four retention steps of section 9; idempotent and independent of when it runs. Step 4 only
+     * reaches tenants purged since they switched off: switching off clears the mark a purge made
+     * while collecting.
+     */
     public void sweep() {
+        sweep(store.switches());
+    }
+
+    /**
+     * Runs the four steps on switches read beforehand. They only pick the candidates of steps 1 and
+     * 4: each delete checks the switch again when it runs, so a tenant switched back on since the
+     * read keeps what it collects from then on.
+     */
+    void sweep(List<SwitchRow> switches) {
         long now = clock.millis();
-        List<SwitchRow> switches = store.switches();
         Map<String, Boolean> enabled = new HashMap<>();
         switches.forEach(row -> enabled.put(row.tenantId(), collecting(row)));
         List<ProgressRow> progress = new ArrayList<>(store.progressRows(null));
         progress.sort(Comparator.comparing(ProgressRow::tenantId).thenComparing(ProgressRow::username));
         for (ProgressRow row : progress) {
             if (!enabled.getOrDefault(row.tenantId(), false)) {
-                store.deleteProgress(row.tenantId(), row.username());
+                dropProgress(row);
             } else if (now >= row.startedAt() + WINDOW_MS) {
                 close(row.tenantId(), row.username(), null);
             }
@@ -387,9 +399,21 @@ public class ProductMetricsService {
         store.deleteCountsBefore(dayOf(now - (RETENTION_DAYS - 1) * DAY_MS));
         for (SwitchRow row : switches) {
             if (!row.enabled() && row.purgedAt() != null) {
-                store.deleteTenantCounts(row.tenantId());
-                store.deleteTenantProgress(row.tenantId());
+                store.deletePurgedTenantRows(row.tenantId());
             }
+        }
+    }
+
+    /**
+     * Step 1 for one row of a tenant that was not collecting when the sweep read the switches. The
+     * delete checks the switch again, so a tenant switched on since keeps the row; when the
+     * deployment does not allow metrics no tenant collects and the row goes regardless.
+     */
+    private void dropProgress(ProgressRow row) {
+        if (properties.isAllowed()) {
+            store.deleteProgressUnlessEnabled(row.tenantId(), row.username());
+        } else {
+            store.deleteProgress(row.tenantId(), row.username());
         }
     }
 

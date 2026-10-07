@@ -17,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -27,8 +28,9 @@ import static org.mockito.Mockito.when;
 class NatControlServiceHttpRoutesTests {
     private final SpecusMappingRepository specusMappingRepository = mock(SpecusMappingRepository.class);
     private final HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
+    private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
     private final NatControlService service = new NatControlService(
-            specusMappingRepository, httpRouteMappingRepository, mock(ClientAccountRepository.class),
+            specusMappingRepository, httpRouteMappingRepository, clientAccountRepository,
             mock(WorkbenchReferences.class), 7010, "");
 
     private final ClientAccount account = new ClientAccount();
@@ -72,8 +74,32 @@ class NatControlServiceHttpRoutesTests {
         assertThat(afterDelete).isEmpty();
     }
 
+    @Test
+    void loginPushCarriesTheEmptySnapshotOfAClientWithNothingLeft() throws Exception {
+        // The client knew "web" before it went offline; the route was deleted while it was away, so
+        // nothing was pushed. It reconnects with its access token, without a new HTTP login, so the
+        // NAT_CONTROL sent on login is the only way it learns the route is gone.
+        when(clientAccountRepository.findByClientName(account.getClientName())).thenReturn(Optional.of(account));
+        when(httpRouteMappingRepository.findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc("tenant-a", 42L))
+                .thenReturn(List.of());
+
+        service.pushOnLogin(account.getClientName());
+
+        JsonNode pushed = lastPushed();
+        assertThat(pushed.get("specusConfigList").isArray()).isTrue();
+        assertThat(pushed.get("specusConfigList")).isEmpty();
+        assertThat(pushed.get("httpSpecusConfigList")).isNotNull();
+        assertThat(pushed.get("httpSpecusConfigList").isArray()).isTrue();
+        assertThat(pushed.get("httpSpecusConfigList")).isEmpty();
+    }
+
     /** The httpSpecusConfigList of the last NAT_CONTROL written since the previous call, or null. */
     private JsonNode lastPushedHttpRoutes() throws Exception {
+        return lastPushed().get("httpSpecusConfigList");
+    }
+
+    /** The last NAT_CONTROL body written since the previous call; fails when nothing was pushed. */
+    private JsonNode lastPushed() throws Exception {
         JsonNode last = null;
         Object outbound;
         while ((outbound = control.readOutbound()) != null) {
@@ -82,6 +108,6 @@ class NatControlServiceHttpRoutesTests {
             last = new ObjectMapper().readTree(packet.getMessage());
         }
         assertThat(last).as("a NAT_CONTROL push").isNotNull();
-        return last.get("httpSpecusConfigList");
+        return last;
     }
 }

@@ -90,6 +90,11 @@ class WorkbenchCascadeTests extends WorkbenchHttpTestSupport {
         var orphan = send("PUT", BASE + "/favorites/http-route/11", root);
         assertThat(orphan.statusCode()).isEqualTo(404);
         assertThat(json(orphan).path("code").asText()).isEqualTo("WORKBENCH_TARGET_NOT_FOUND");
+        // Its Peer service row stays and the Peer service list still shows it to an administrator,
+        // so an administrator may add it, as on the other servers; its former owner may not.
+        assertThat(send("PUT", BASE + "/favorites/peer-service/13", root).statusCode()).isEqualTo(200);
+        assertThat(send("POST", BASE + "/recents/peer-service/13", root).statusCode()).isEqualTo(200);
+        assertThat(send("PUT", BASE + "/favorites/peer-service/13", alice).statusCode()).isEqualTo(404);
     }
 
     @Test

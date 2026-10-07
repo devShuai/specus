@@ -88,6 +88,8 @@ public class HttpShareService {
     private final HttpShareStreamRegistry streams;
     private final TransactionTemplate transactions;
     private final boolean backgroundEnabled;
+    /** Locks a route row for a share creation, or {@code null} where no lock is taken. */
+    private final String routeLockSql;
     private ScheduledExecutorService streamTicker;
     private long lastRecheckNanos = System.nanoTime();
 
@@ -103,7 +105,8 @@ public class HttpShareService {
                             HttpShareRuntime runtime,
                             HttpShareStreamRegistry streams,
                             PlatformTransactionManager transactionManager,
-                            @Value("${specus.http-share.background-enabled:true}") boolean backgroundEnabled) {
+                            @Value("${specus.http-share.background-enabled:true}") boolean backgroundEnabled,
+                            @Value("${spring.jpa.database-platform:auto}") String databasePlatform) {
         this.shares = shares;
         this.audits = audits;
         this.routes = routes;
@@ -114,6 +117,7 @@ public class HttpShareService {
         this.streams = streams;
         this.transactions = new TransactionTemplate(transactionManager);
         this.backgroundEnabled = backgroundEnabled;
+        this.routeLockSql = routeLockSql(databasePlatform);
     }
 
     // =============================================================================================
@@ -197,6 +201,9 @@ public class HttpShareService {
             Actor actor;
             long active;
             try {
+                if (routeId != null) {
+                    lockRouteForCreation(routeId);
+                }
                 route = routeId == null ? null : routes.findById(routeId).orElse(null);
                 client = route == null ? null : clients.findById(route.getClientId()).orElse(null);
                 actor = lookupActor(context);
@@ -247,6 +254,34 @@ public class HttpShareService {
             response.put("linkPath", credentials.linkPath());
             return new ApiResult(201, response, Map.of());
         }));
+    }
+
+    /**
+     * The statement that holds a route row until the end of the transaction, or {@code null}
+     * where none is taken: SQLite has no {@code FOR UPDATE}, and its single writer already
+     * serializes the creation.
+     */
+    static String routeLockSql(String databasePlatform) {
+        String platform = databasePlatform == null ? "" : databasePlatform.toLowerCase(Locale.ROOT);
+        if (platform.contains("mysql") || platform.contains("mariadb") || platform.contains("postgres")) {
+            return "SELECT id FROM http_route_mapping WHERE id = :routeId FOR UPDATE";
+        }
+        return null;
+    }
+
+    /**
+     * Serializes the share creations of one route, on every instance, so that two of them cannot
+     * both count the same number of active shares. It must be the transaction's first statement:
+     * MySQL's REPEATABLE READ snapshot then starts only after the lock is granted, so the count
+     * sees the share committed by the creation that held it. A route that is gone has no row to
+     * lock, and the creation goes on to answer exactly as it would without the lock.
+     */
+    private void lockRouteForCreation(long routeId) {
+        if (routeLockSql != null) {
+            entityManager.createNativeQuery(routeLockSql)
+                    .setParameter("routeId", routeId)
+                    .getResultList();
+        }
     }
 
     public ApiResult list(ManagementContext context, String routeIdText) {

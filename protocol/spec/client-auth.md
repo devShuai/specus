@@ -250,6 +250,29 @@ control 登录成功后，客户端使用相同的 `clientName/clientSessionId/a
 
 登录失败后服务端会主动关闭连接。客户端会按失败原因决定重试、刷新 token 或停止重连。
 
+### token 属于签发时的账户，不属于名字
+
+`clientSessionId + accessToken` 绑定的是 HTTP 登录时签发它的那个客户端账户（账户 id + 租户），不是账户名。
+客户端名可以被管理员改掉，也可以在删除账户后被新建的另一个账户重新占用；登录包里的 `clientName` 只是客户端
+自己记得的名字，服务端不据此查找账户。四个服务端都按以下规则处理 control/data 登录：
+
+- 按 session 记录的账户 id 和租户加载账户；账户已删除（或不在该租户）时拒绝（“客户端不存在”），已停用时拒绝
+  （“客户端已停用”）。拒绝原因文案各实现可以不同，但都必须是 `success=false` 并关闭连接。
+- 登录成功后，连接绑定在账户**当前**的名字下：`LOGIN_RESPONSE.clientName`、`NAT_CONTROL.clientName`、
+  公网入口 `/http/{clientName}/...` 的转发目标都用当前名字。管理员改名会断开在线连接；客户端凭旧 token 重连时
+  仍以旧名发起登录，但会登录成改名后的账户，并收到它的 route 与 TCP 映射。
+- 删除账户后，同名新建的账户与旧账户无关：旧机器的 token 不能登录成新账户，新账户 route 的公网流量也不会转发到
+  旧机器。各实现还在删除账户时让它已签发的 token 失效（Go 从内存中吊销，C 把 session 置为已断开并过期），作为
+  纵深防御。
+- 账户 id 不得复用。Java、Go、.NET 使用随机 id；C 的 `client_account` 使用 `id INTEGER PRIMARY KEY AUTOINCREMENT`，
+  旧库启动时迁移为该结构并保留原有 id，且把仍被其他表引用的已释放 id 一并退役。
+
+HTTP 登录同样按 identity 记录的账户 id 加载账户：账户已停用时返回“客户端已停用”，返回的 `clientName` 是账户当前名字。
+
+`protocol/test-vectors/http-route-lifecycle-v1.json` 的 `disabled-client`、`deleted-client-token-refused` 与
+`renamed-client-token-follows-account` 场景用 `reconnect`（凭上次 connect 的 token、旧名、不重新 HTTP 登录）固定上述行为，
+Java、Go、.NET 与 C 服务端都重放。
+
 ### runtime token 的重放与传输边界
 
 `accessToken` 是在过期前可复用的 bearer token，不是一次性 token。control/data 建连和普通断线重连使用同一

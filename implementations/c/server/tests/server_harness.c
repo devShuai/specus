@@ -243,11 +243,66 @@ static int read_string_field(const uint8_t *body, size_t body_len, size_t *pos, 
     return 0;
 }
 
+/* read_login_response that also copies the client name the response carries into name, unless NULL. */
+static int read_named_login_response(int fd, int timeout_ms, int *command, int *success,
+                                     char *name, size_t name_len, char *reason, size_t reason_len)
+{
+    *command = 0;
+    *success = 0;
+    reason[0] = '\0';
+    st_frame_header header;
+    uint8_t *body = NULL;
+    int rc = read_frame(fd, timeout_ms, &header, &body);
+    if (rc != 1) {
+        snprintf(reason, reason_len, "no login response (rc=%d)", rc);
+        return -1;
+    }
+    *command = header.command;
+    if (header.command != ST_CMD_LOGIN_RESPONSE) {
+        free(body);
+        snprintf(reason, reason_len, "command %d came before the login response", header.command);
+        return 0;
+    }
+    char client_name[256];
+    size_t pos = 0U;
+    if (read_string_field(body, header.length, &pos, client_name, sizeof(client_name)) != 0
+        || pos >= header.length) {
+        free(body);
+        snprintf(reason, reason_len, "malformed login response");
+        return -1;
+    }
+    *success = body[pos++] == 1U;
+    if (name != NULL && name_len > 0U) {
+        snprintf(name, name_len, "%s", client_name);
+    }
+    if (read_string_field(body, header.length, &pos, reason, reason_len) != 0) {
+        free(body);
+        snprintf(reason, reason_len, "malformed login response reason");
+        return -1;
+    }
+    free(body);
+    return 1;
+}
+
+int read_login_response(int fd, int timeout_ms, int *command, int *success, char *reason, size_t reason_len)
+{
+    return read_named_login_response(fd, timeout_ms, command, success, NULL, 0U, reason, reason_len);
+}
+
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len)
 {
+    return channel_login_answer(port, runtime, role, fd_out, NULL, 0U, reason, reason_len);
+}
+
+int channel_login_answer(int port, const runtime_session *runtime, const char *role, int *fd_out,
+                         char *answered_name, size_t answered_name_len, char *reason, size_t reason_len)
+{
     *fd_out = -1;
     reason[0] = '\0';
+    if (answered_name != NULL && answered_name_len > 0U) {
+        answered_name[0] = '\0';
+    }
     int fd = connect_local(port);
     if (fd < 0 || send_login_request(fd, runtime, role) != 0) {
         if (fd >= 0) {
@@ -256,35 +311,13 @@ int channel_login(int port, const runtime_session *runtime, const char *role,
         snprintf(reason, reason_len, "connect/send failed");
         return -1;
     }
-    st_frame_header header;
-    uint8_t *body = NULL;
-    int rc = read_frame(fd, IO_TIMEOUT_MS, &header, &body);
-    if (rc != 1 || header.command != ST_CMD_LOGIN_RESPONSE) {
-        if (rc == 1) {
-            free(body);
-        }
-        close(fd);
-        snprintf(reason, reason_len, "no login response (rc=%d)", rc);
-        return -1;
-    }
-    char client_name[256];
-    size_t pos = 0U;
+    int command = 0;
     int success = 0;
-    if (read_string_field(body, header.length, &pos, client_name, sizeof(client_name)) != 0
-        || pos >= header.length) {
-        free(body);
+    if (read_named_login_response(fd, IO_TIMEOUT_MS, &command, &success, answered_name, answered_name_len,
+                                  reason, reason_len) != 1) {
         close(fd);
-        snprintf(reason, reason_len, "malformed login response");
         return -1;
     }
-    success = body[pos++] == 1U;
-    if (read_string_field(body, header.length, &pos, reason, reason_len) != 0) {
-        free(body);
-        close(fd);
-        snprintf(reason, reason_len, "malformed login response reason");
-        return -1;
-    }
-    free(body);
     if (!success) {
         close(fd);
         return 0;
@@ -526,6 +559,8 @@ static void random_hex(char *out, size_t bytes)
     st_hex_encode(buffer, bytes, out);
 }
 
+const char *harness_login_environment_extra = "";
+
 void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
                        const char *os_user, char *body, size_t body_len)
 {
@@ -545,8 +580,9 @@ void signed_login_body(const char *api_key, const char *secret, const char *fing
              "{\"apiKey\":\"%s\",\"timestamp\":\"%s\",\"nonce\":\"%s\",\"signature\":\"%s\","
              "\"environment\":{\"machineFingerprint\":\"%s\",\"hostname\":\"lifecycle-host\","
              "\"osUser\":\"%s\",\"osName\":\"Linux\",\"osVersion\":\"test\",\"osArch\":\"amd64\","
-             "\"clientVersion\":\"session-lifecycle-test\"}}",
-             api_key, timestamp, nonce, signature, fingerprint, os_user);
+             "\"clientVersion\":\"session-lifecycle-test\"%s}}",
+             api_key, timestamp, nonce, signature, fingerprint, os_user,
+             harness_login_environment_extra == NULL ? "" : harness_login_environment_extra);
 }
 
 int http_client_login(const test_server *server, const char *api_key, const char *secret,

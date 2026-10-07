@@ -105,7 +105,7 @@ class ProductMetricsVectorTests extends ProductMetricsHttpTestSupport {
             scenarios++;
         }
         assertThat(scenarios).isEqualTo(5);
-        assertThat(ops).isEqualTo(112);
+        assertThat(ops).isEqualTo(128);
     }
 
     private int replay(JsonNode scenario) {

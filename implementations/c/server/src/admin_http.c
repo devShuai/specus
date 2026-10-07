@@ -26,7 +26,9 @@
 #include "security_baseline.h"
 #include "storage.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "turn_auth.h"
+#include "upstream_browser_headers.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -220,8 +222,12 @@ typedef struct admin_share_stream {
 typedef struct {
     char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
     char client_name[256];
+    /* The account owning the share's route, as st_direct_http_request.client_id. */
+    long long client_id;
     char route[128];
     char rewrite_prefix[64];
+    /* The route's target, whose origin the relayed browser headers take (UpstreamBrowserHeaders). */
+    char target_base_url[512];
     char *relative_path;
     const char *raw_query;
     int upgrade;
@@ -252,6 +258,9 @@ static size_t admin_pending_client_message_writes = 0U;
 static pthread_mutex_t admin_peer_mesh_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_mesh_refresh_handler admin_peer_mesh_refresh_handler = NULL;
 static void *admin_peer_mesh_refresh_ctx = NULL;
+static pthread_mutex_t admin_client_disconnect_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_client_disconnect_handler admin_client_disconnect_handler = NULL;
+static void *admin_client_disconnect_ctx = NULL;
 
 static char *admin_url_decode(const char *value, size_t len);
 static const char *admin_database_path(void);
@@ -292,6 +301,14 @@ void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler h
     admin_peer_mesh_refresh_handler = handler;
     admin_peer_mesh_refresh_ctx = ctx;
     pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+}
+
+void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_client_disconnect_lock);
+    admin_client_disconnect_handler = handler;
+    admin_client_disconnect_ctx = ctx;
+    pthread_mutex_unlock(&admin_client_disconnect_lock);
 }
 
 static pthread_mutex_t admin_connectivity_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -369,6 +386,18 @@ static void admin_notify_nat_control(const st_storage_client *client)
 {
     if (client != NULL) {
         (void)admin_push_nat_control(client->id, client->client_name);
+    }
+}
+
+/* Closes the online connections of a client an admin disabled, renamed or deleted. */
+static void admin_close_client_connections(const char *client_name, const char *reason)
+{
+    pthread_mutex_lock(&admin_client_disconnect_lock);
+    st_admin_client_disconnect_handler handler = admin_client_disconnect_handler;
+    void *ctx = admin_client_disconnect_ctx;
+    pthread_mutex_unlock(&admin_client_disconnect_lock);
+    if (handler != NULL) {
+        (void)handler(ctx, client_name, reason);
     }
 }
 
@@ -2508,6 +2537,35 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(java_version);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client identity build failed\"}");
     }
+    /*
+     * The identity names its account by id; the name it recorded may since belong to another
+     * account. As Java and Go do, the account is loaded by id within the credential's tenant, and its
+     * current name is what the session, the route snapshot and the response carry.
+     */
+    st_storage_client account;
+    int account_state = st_storage_get_client(database_path, identity.client_id, &account) != 0
+        || strcmp(account.tenant_id[0] == '\0' ? "default" : account.tenant_id,
+                  credential.tenant_id[0] == '\0' ? "default" : credential.tenant_id) != 0
+        ? -1
+        : (account.enabled ? 0 : 1);
+    if (account_state != 0) {
+        free(api_key);
+        free(timestamp);
+        free(nonce);
+        free(signature);
+        free(machine_fingerprint);
+        free(os_user);
+        free(hostname);
+        free(os_name);
+        free(os_version);
+        free(os_arch);
+        free(client_version);
+        free(java_version);
+        return account_state > 0
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端已停用\"}")
+            : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client account missing\"}");
+    }
+    snprintf(identity.client_name, sizeof(identity.client_name), "%s", account.client_name);
 
     char *peer_public_key = st_json_get_string(body, "peerPublicKey");
     if (peer_public_key != NULL && *peer_public_key != '\0'
@@ -2803,7 +2861,9 @@ static void record_direct_http_exchange(const char *client_name,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
-    if (client_name == NULL || route == NULL || request == NULL || response == NULL) {
+    /* Java captures only with specus.traffic.capture-detail-enabled and the route's own switch. */
+    if (client_name == NULL || route == NULL || request == NULL || response == NULL
+        || !st_traffic_capture_enabled()) {
         return;
     }
     const char *database_path = admin_database_path();
@@ -2815,8 +2875,8 @@ static void record_direct_http_exchange(const char *client_name,
     }
     st_storage_client client;
     st_storage_http_route http_route;
+    /* As in Java, the route's switch decides, also for the refusal of a disabled client or route. */
     if (st_storage_get_client_by_name(database_path, client_name, &client) != 0
-        || !client.enabled
         || st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) != 0
         || !http_route.detail_capture_enabled) {
         return;
@@ -2835,11 +2895,17 @@ static void record_direct_http_exchange(const char *client_name,
     char *response_headers = admin_join_headers(response->headers, response->headers_len);
     char *request_content_type = admin_header_array_value(request->headers, request->headers_len, "Content-Type");
     char *response_content_type = admin_header_array_value(response->headers, response->headers_len, "Content-Type");
+    char *request_content_encoding = admin_header_array_value(request->headers, request->headers_len,
+                                                              "Content-Encoding");
+    char *response_content_encoding = admin_header_array_value(response->headers, response->headers_len,
+                                                               "Content-Encoding");
     if (request_headers == NULL || response_headers == NULL) {
         free(request_headers);
         free(response_headers);
         free(request_content_type);
         free(response_content_type);
+        free(request_content_encoding);
+        free(response_content_encoding);
         return;
     }
     st_storage_http_exchange_record record = {
@@ -2868,6 +2934,8 @@ static void record_direct_http_exchange(const char *client_name,
         .request_body_len = request->body_len,
         .response_body = response->body,
         .response_body_len = response->body_len,
+        .request_content_encoding = request_content_encoding,
+        .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
     };
     (void)st_storage_record_http_exchange(database_path, &record);
@@ -2875,6 +2943,8 @@ static void record_direct_http_exchange(const char *client_name,
     free(response_headers);
     free(request_content_type);
     free(response_content_type);
+    free(request_content_encoding);
+    free(response_content_encoding);
 }
 
 static int ensure_admin_database(const char **path, char *out, size_t out_len)
@@ -3901,7 +3971,13 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     return response_len;
 }
 
-static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
+/*
+ * HttpTrafficExchangeView. A summary (detail 0, the list) carries null headers and previews, as
+ * Java's summary views do; the detail of one exchange carries them.
+ */
+static int append_http_exchange_view(st_admin_string_builder *builder,
+                                     const st_storage_http_exchange *item,
+                                     int detail)
 {
     /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
@@ -3942,19 +4018,24 @@ static int append_http_exchange_view(st_admin_string_builder *builder, const st_
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseContentType\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_content_type);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseBodyType\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_body_type);
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(builder,
+                                         st_traffic_body_type_or_classify(item->response_body_type,
+                                                                          item->response_content_type,
+                                                                          item->response_bytes));
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_text : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_text : NULL);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -4128,6 +4209,9 @@ static int build_clients_response(const st_admin_context *context, char *out, si
     return response_len;
 }
 
+static size_t http_route_text_length(const char *text);
+static void http_route_trim_in_place(char *value);
+
 static int build_client_name_availability_response(const st_admin_context *context,
                                                    const char *path,
                                                    char *out,
@@ -4138,6 +4222,12 @@ static int build_client_name_availability_response(const st_admin_context *conte
         free(client_name);
         return write_response(out, out_len, 400, "Bad Request",
                               "{\"error\":\"clientName is required\"}");
+    }
+    /* The name as a create or update would store it (Java requireClientName). */
+    http_route_trim_in_place(client_name);
+    if (http_route_text_length(client_name) > 120U) {
+        free(client_name);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is too long\"}");
     }
     long long exclude_id = 0;
     (void)admin_query_i64(path, "excludeClientId", &exclude_id);
@@ -6223,7 +6313,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
         rc = admin_sb_append(&builder, i == 0 ? "" : ",");
         if (rc == 0) {
-            rc = append_http_exchange_view(&builder, &items[i]);
+            rc = append_http_exchange_view(&builder, &items[i], 0);
         }
     }
     if (rc == 0) {
@@ -6255,41 +6345,25 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
-    const int page_size = 100;
-    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(
-        (size_t)page_size, sizeof(*items));
-    if (items == NULL) {
+    /* One row by id with its headers and previews, under the same visibility as the list. */
+    st_storage_http_exchange *match = (st_storage_http_exchange *)calloc(1U, sizeof(*match));
+    int found = 0;
+    if (match == NULL
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_get_http_exchange_visible(database_path, exchange_id, context->tenant_id, context->username,
+                                                context->admin, match, &found) != 0) {
+        free(match);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"http exchange lookup failed\"}");
     }
-    long long total = 0;
-    int found = 0;
-    st_storage_http_exchange match;
-    for (int page = 0; !found; ++page) {
-        size_t count = 0U;
-        if (st_storage_list_http_exchanges_visible(database_path, 0, NULL, NULL, NULL, NULL,
-                context->tenant_id, context->username, context->admin, page, page_size,
-                items, (size_t)page_size, &count, &total) != 0) {
-            free(items);
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"http exchange lookup failed\"}");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (items[i].id == exchange_id) {
-                match = items[i];
-                found = 1;
-                break;
-            }
-        }
-        if (found || count == 0U || (long long)(page + 1) * page_size >= total) break;
-    }
-    free(items);
     if (!found) {
+        free(match);
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
     st_admin_string_builder builder = {0};
-    int rc = append_http_exchange_view(&builder, &match);
+    int rc = append_http_exchange_view(&builder, match, 1);
+    free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -6302,7 +6376,7 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
 
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", 0);
+    int enabled = st_traffic_capture_enabled();
     return write_response(out, out_len, 200, "OK",
         enabled
             ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
@@ -6757,6 +6831,138 @@ int st_admin_http_share_sweep(void)
     return rc;
 }
 
+/* Characters of UTF-8 text, as Java counts a String's length for these limits. */
+static size_t http_route_text_length(const char *text)
+{
+    size_t count = 0U;
+    for (const unsigned char *cursor = (const unsigned char *)text; *cursor != '\0'; ++cursor) {
+        count += (*cursor & 0xc0U) != 0x80U;
+    }
+    return count;
+}
+
+/* Trims value in place (spaces and control characters, as Java String.trim). */
+static void http_route_trim_in_place(char *value)
+{
+    if (value == NULL) {
+        return;
+    }
+    size_t len = strlen(value);
+    size_t start = 0U;
+    while (start < len && (unsigned char)value[start] <= ' ') ++start;
+    while (len > start && (unsigned char)value[len - 1U] <= ' ') --len;
+    memmove(value, value + start, len - start);
+    value[len - start] = '\0';
+}
+
+/*
+ * Java HttpRouteService.requireRoute and requireTargetBaseUrl on the trimmed values (trimmed in
+ * place): the route is not blank, at most 60 characters and without '/'; the target is not blank,
+ * at most 512 characters, an absolute http(s) URL and has a host. NULL when both are valid, else
+ * the message Java answers 400 with.
+ */
+static const char *http_route_mutation_error(char *route, char *target_base_url)
+{
+    http_route_trim_in_place(route);
+    http_route_trim_in_place(target_base_url);
+    if (route == NULL || *route == '\0') {
+        return "route cannot be blank";
+    }
+    if (http_route_text_length(route) > 60U) {
+        return "route is too long (max 60)";
+    }
+    if (strchr(route, '/') != NULL) {
+        return "route must not contain '/'";
+    }
+    if (target_base_url == NULL || *target_base_url == '\0') {
+        return "targetBaseUrl cannot be blank";
+    }
+    if (http_route_text_length(target_base_url) > 512U) {
+        return "targetBaseUrl is too long (max 512)";
+    }
+    for (const unsigned char *cursor = (const unsigned char *)target_base_url; *cursor != '\0'; ++cursor) {
+        if (*cursor <= ' ' || *cursor == 0x7fU) {
+            return "targetBaseUrl is not a valid URI";
+        }
+    }
+    const char *authority = NULL;
+    if (admin_ascii_ncasecmp(target_base_url, "http://", 7U) == 0) {
+        authority = target_base_url + 7;
+    } else if (admin_ascii_ncasecmp(target_base_url, "https://", 8U) == 0) {
+        authority = target_base_url + 8;
+    } else {
+        return "targetBaseUrl must be an absolute http(s) URL";
+    }
+    size_t authority_len = strcspn(authority, "/?#");
+    const char *at = NULL;
+    for (size_t i = 0; i < authority_len; ++i) {
+        if (authority[i] == '@') {
+            at = authority + i;
+        }
+    }
+    const char *host = at == NULL ? authority : at + 1;
+    size_t host_len = authority_len - (size_t)(host - authority);
+    if (host_len > 0U && host[0] == '[') {
+        const char *close = memchr(host, ']', host_len);
+        host_len = close == NULL ? 0U : (size_t)(close - host) - 1U;
+    } else {
+        const char *port = memchr(host, ':', host_len);
+        if (port != NULL) {
+            host_len = (size_t)(port - host);
+        }
+    }
+    return host_len == 0U ? "targetBaseUrl must contain a host" : NULL;
+}
+
+/* Java HttpRouteService's answer for a route name the client already has. */
+static int write_http_route_exists(const char *route, char *out, size_t out_len)
+{
+    char *escaped = st_json_escape(route == NULL ? "" : route);
+    char body[512];
+    int written = escaped == NULL ? -1
+        : snprintf(body, sizeof(body), "{\"error\":\"route %.300s 已存在于该客户端下\"}", escaped);
+    free(escaped);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"route 已存在于该客户端下\"}");
+    }
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/* write_response with {"error":message}, message being one of the validation texts above. */
+static int write_http_route_invalid(const char *message, char *out, size_t out_len)
+{
+    char body[256];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/*
+ * Java ClientAccountService.requireClientName on a value trimmed in place: not blank and at most
+ * 120 characters. NULL when valid, else the message Java answers 400 with.
+ */
+static const char *client_name_error(char *client_name)
+{
+    http_route_trim_in_place(client_name);
+    if (client_name == NULL || *client_name == '\0') {
+        return "clientName cannot be blank";
+    }
+    return http_route_text_length(client_name) > 120U ? "clientName is too long" : NULL;
+}
+
+/* Java's 400 for a client name that is taken: names are unique across all tenants. */
+static int write_client_name_exists(const char *client_name, char *out, size_t out_len)
+{
+    char *escaped = st_json_escape(client_name == NULL ? "" : client_name);
+    char body[768];
+    int written = escaped == NULL ? -1
+        : snprintf(body, sizeof(body), "{\"error\":\"clientName %.600s 已存在\"}", escaped);
+    free(escaped);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName 已存在\"}");
+    }
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
 static int handle_client_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
@@ -6768,15 +6974,21 @@ static int handle_client_create(const st_admin_context *context, const char *bod
         return init_response;
     }
     char *client_name = st_json_get_string(body, "clientName");
-    if (client_name == NULL || *client_name == '\0') {
+    const char *invalid = client_name_error(client_name);
+    if (invalid != NULL) {
         free(client_name);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is required\"}");
+        return write_http_route_invalid(invalid, out, out_len);
     }
     int enabled = 1;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int rate_limit = 30;
     (void)st_json_get_int(body, "connectionRateLimitPerMinute", &rate_limit);
     st_storage_client client;
+    if (st_storage_get_client_by_name(database_path, client_name, &client) == 0) {
+        int len = write_client_name_exists(client_name, out, out_len);
+        free(client_name);
+        return len;
+    }
     int rc = st_storage_upsert_client(database_path,
                                       0,
                                       context->tenant_id,
@@ -6807,8 +7019,23 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     if (st_storage_get_client(database_path, id, &existing) != 0 || !admin_can_access_client(context, &existing)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    /* A blank or missing name keeps the current one (Java StringUtils.hasText). */
     char *client_name = st_json_get_string(body, "clientName");
-    const char *next_client_name = client_name != NULL && *client_name != '\0' ? client_name : existing.client_name;
+    http_route_trim_in_place(client_name);
+    int name_given = client_name != NULL && *client_name != '\0';
+    const char *invalid = name_given ? client_name_error(client_name) : NULL;
+    if (invalid != NULL) {
+        free(client_name);
+        return write_http_route_invalid(invalid, out, out_len);
+    }
+    const char *next_client_name = name_given ? client_name : existing.client_name;
+    st_storage_client taken;
+    if (strcmp(next_client_name, existing.client_name) != 0
+        && st_storage_get_client_by_name(database_path, next_client_name, &taken) == 0) {
+        int len = write_client_name_exists(next_client_name, out, out_len);
+        free(client_name);
+        return len;
+    }
     int enabled = existing.enabled;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int rate_limit = existing.connection_rate_limit_per_minute;
@@ -6830,6 +7057,16 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
+    }
+    /*
+     * As Go's management API: the online connections of a disabled or renamed client are closed,
+     * so none keeps serving under a name or route set the server no longer has.
+     */
+    int renamed = strcmp(existing.client_name, updated.client_name) != 0;
+    if (!updated.enabled && (existing.enabled || renamed)) {
+        admin_close_client_connections(existing.client_name, "ADMIN_DISABLED");
+    } else if (renamed) {
+        admin_close_client_connections(existing.client_name, "ADMIN_RENAMED");
     }
     admin_notify_peer_mesh_refresh(updated.tenant_id);
     return build_client_result_response(&updated, 200, "OK", out, out_len);
@@ -6855,6 +7092,7 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    admin_close_client_connections(existing.client_name, "ADMIN_DELETED");
     admin_notify_peer_mesh_refresh(existing.tenant_id);
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -7183,10 +7421,11 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     }
     char *route_name = st_json_get_string(body, "route");
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
-    if (route_name == NULL || *route_name == '\0' || target_base_url == NULL || *target_base_url == '\0') {
+    const char *invalid = http_route_mutation_error(route_name, target_base_url);
+    if (invalid != NULL) {
         free(route_name);
         free(target_base_url);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"route and targetBaseUrl are required\"}");
+        return write_http_route_invalid(invalid, out, out_len);
     }
     int enabled = 1;
     (void)st_json_get_bool(body, "enabled", &enabled);
@@ -7220,7 +7459,7 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     }
     st_storage_http_route route;
     st_storage_share_ids revoked = {0};
-    /* route.created (or, for a name that exists, the update's audit and share hooks) in one go. */
+    /* route.created in the same transaction; a name the client already has is refused. */
     int rc = st_storage_create_http_route_audited(database_path,
                                                   client_id,
                                                   route_name,
@@ -7238,12 +7477,16 @@ static int handle_http_route_create(const st_admin_context *context, long long c
                                                   st_http_share_now_ms(),
                                                   &route,
                                                   &revoked);
+    int exists_len = rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? write_http_route_exists(route_name, out, out_len) : 0;
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_HTTP_ROUTE_EXISTS) {
+        return exists_len;
+    }
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
@@ -7268,12 +7511,24 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
     }
+    /* A field left out keeps its value; one that is given is validated as on creation. */
     char *route_name = st_json_get_string(body, "route");
-    const char *next_route = route_name != NULL && *route_name != '\0' ? route_name : existing.route;
+    if (route_name == NULL) {
+        route_name = admin_dup_string(existing.route);
+    }
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
-    const char *next_target = target_base_url != NULL && *target_base_url != '\0'
-        ? target_base_url
-        : existing.target_base_url;
+    if (target_base_url == NULL) {
+        target_base_url = admin_dup_string(existing.target_base_url);
+    }
+    const char *invalid = route_name == NULL || target_base_url == NULL ? "route update failed"
+        : http_route_mutation_error(route_name, target_base_url);
+    if (invalid != NULL) {
+        free(route_name);
+        free(target_base_url);
+        return write_http_route_invalid(invalid, out, out_len);
+    }
+    const char *next_route = route_name;
+    const char *next_target = target_base_url;
     int enabled = existing.enabled;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = existing.detail_capture_enabled;
@@ -7328,12 +7583,16 @@ static int handle_http_route_update(const st_admin_context *context, long long i
                                                   st_http_share_now_ms(),
                                                   &route,
                                                   &revoked);
+    int exists_len = rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? write_http_route_exists(next_route, out, out_len) : 0;
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_HTTP_ROUTE_EXISTS) {
+        return exists_len;
+    }
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"http route update failed\"}");
     }
@@ -8588,6 +8847,121 @@ static int valid_sha256_text(const char *value)
     return 1;
 }
 
+/* Java's "[0-9a-f]{64}": the digest form a publishable row must carry. */
+static int canonical_sha256_text(const char *value)
+{
+    if (value == NULL || strlen(value) != 64U) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isdigit(*cursor) && (*cursor < 'a' || *cursor > 'f')) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Java ClientDownloadLinkService.isSafeExternalPackageUrl over java.net.URI: an absolute https URL
+ * with a server-based host, no user information, no query and no fragment. Characters URI refuses
+ * (whitespace, controls, "<>\^`{|} and the double quote) make it unsafe, and so does a host of
+ * anything but letters, digits, '-' and '.' or a port that is not a number: URI reads such an
+ * authority as registry-based, and getHost() is then null.
+ */
+static int client_download_safe_external_url(const char *value)
+{
+    if (value == NULL) return 0;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+    const char *end = value + strlen(value);
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
+    if ((size_t)(end - value) < 9U || admin_ascii_ncasecmp(value, "https://", 8U) != 0) return 0;
+    for (const char *p = value; p < end; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= ' ' || c == 0x7fU || strchr("\"<>\\^`{|}?#", (int)c) != NULL) return 0;
+    }
+    const char *authority = value + 8U;
+    const char *authority_end = authority;
+    while (authority_end < end && *authority_end != '/') ++authority_end;
+    if (authority_end == authority || memchr(authority, '@', (size_t)(authority_end - authority)) != NULL) {
+        return 0;
+    }
+    const char *host_end = authority_end;
+    if (*authority == '[') {
+        const char *close = memchr(authority, ']', (size_t)(authority_end - authority));
+        if (close == NULL || close == authority + 1) return 0;
+        host_end = close + 1;
+    } else {
+        const char *colon = memchr(authority, ':', (size_t)(authority_end - authority));
+        if (colon != NULL) host_end = colon;
+        if (host_end == authority || *authority == '.' || *authority == '-'
+            || host_end[-1] == '-') return 0;
+        for (const char *p = authority; p < host_end; ++p) {
+            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return 0;
+        }
+    }
+    if (host_end < authority_end) {
+        if (*host_end != ':') return 0;
+        for (const char *p = host_end + 1; p < authority_end; ++p) {
+            if (!isdigit((unsigned char)*p)) return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Java hasAuthoritativeDistributionMetadata: a positive size and a lowercase SHA-256, and either
+ * this server's own download path for a hosted package or a safe external HTTPS URL.
+ */
+static int client_download_has_authoritative_metadata(long long id,
+                                                      int hosted,
+                                                      const char *download_url,
+                                                      const char *sha256,
+                                                      long long file_size)
+{
+    if (file_size <= 0 || !canonical_sha256_text(sha256)) return 0;
+    if (hosted) {
+        char expected[96];
+        snprintf(expected, sizeof(expected), "/api/public/client-packages/%lld/download", id);
+        return id > 0 && download_url != NULL && strcmp(download_url, expected) == 0;
+    }
+    return client_download_safe_external_url(download_url);
+}
+
+/* Java SemanticVersion.normalize: trimmed, at most one leading lowercase "v" removed. */
+static void admin_normalize_semver_text(const char *value, char *out, size_t out_len)
+{
+    if (out_len == 0U) return;
+    out[0] = '\0';
+    if (value == NULL) return;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+    if (*value == 'v') ++value;
+    size_t len = strlen(value);
+    while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+    if (len >= out_len) len = out_len - 1U;
+    memcpy(out, value, len);
+    out[len] = '\0';
+}
+
+/* Java answers an unknown catalogue id with IllegalArgumentException, i.e. 400. */
+static int write_client_download_not_found(long long id, char *out, size_t out_len)
+{
+    char body[128];
+    snprintf(body, sizeof(body), "{\"error\":\"client download link not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/* Java validateTargetCoordinates; NULL when the target may exist. */
+static const char *client_download_target_error(const char *implementation,
+                                                const char *platform,
+                                                const char *arch)
+{
+    if (strcmp(implementation, "android") == 0
+        && (strcmp(platform, "android") != 0 || strcmp(arch, "any") != 0)) {
+        return "{\"error\":\"android packages must use platform=android and arch=any\"}";
+    }
+    if (strcmp(platform, "android") == 0
+        && (strcmp(implementation, "android") != 0 || strcmp(arch, "any") != 0)) {
+        return "{\"error\":\"platform=android is reserved for android/any packages\"}";
+    }
+    return NULL;
+}
+
 typedef struct {
     char major[33];
     char minor[33];
@@ -8604,13 +8978,40 @@ static int semver_numeric_part(const char *value)
     return 1;
 }
 
+/*
+ * Dot-separated SemVer identifiers: none may be empty ("a..b", a leading or trailing dot), each is
+ * [0-9A-Za-z-]+, and a numeric pre-release identifier has no leading zero (build metadata may).
+ */
+static int semver_identifiers_valid(const char *text, int prerelease)
+{
+    const char *part = text;
+    for (;;) {
+        const char *end = strchr(part, '.');
+        size_t len = end == NULL ? strlen(part) : (size_t)(end - part);
+        if (len == 0U) return 0;
+        int all_numeric = 1;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = (unsigned char)part[i];
+            if (!isalnum(c) && c != '-') return 0;
+            if (!isdigit(c)) all_numeric = 0;
+        }
+        if (prerelease && all_numeric && len > 1U && part[0] == '0') return 0;
+        if (end == NULL) return 1;
+        part = end + 1;
+    }
+}
+
+/*
+ * Java SemanticVersion.parse: trimmed (every character up to and including space, as String.trim
+ * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0.
+ */
 static int parse_admin_semver(const char *value, st_admin_semver *out)
 {
     if (value == NULL || out == NULL) return -1;
-    while (isspace((unsigned char)*value)) ++value;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
     if (*value == 'v') ++value;
     const char *end = value + strlen(value);
-    while (end > value && isspace((unsigned char)end[-1])) --end;
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
     size_t len = (size_t)(end - value);
     if (len == 0U || len > 32U) return -1;
     char copy[33];
@@ -8618,37 +9019,24 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     copy[len] = '\0';
     char *build = strchr(copy, '+');
     if (build != NULL) {
-        if (build[1] == '\0') return -1;
-        for (char *p = build + 1; *p != '\0'; ++p) {
-            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return -1;
-        }
+        if (!semver_identifiers_valid(build + 1, 0)) return -1;
         *build = '\0';
     }
     char *prerelease = strchr(copy, '-');
     memset(out, 0, sizeof(*out));
     if (prerelease != NULL) {
         *prerelease++ = '\0';
-        if (*prerelease == '\0' || strlen(prerelease) >= sizeof(out->prerelease)) return -1;
-        char validation[33];
-        snprintf(validation, sizeof(validation), "%s", prerelease);
-        char *save = NULL;
-        for (char *part = strtok_r(validation, ".", &save); part != NULL;
-             part = strtok_r(NULL, ".", &save)) {
-            int all_numeric = *part != '\0';
-            for (char *p = part; *p != '\0'; ++p) if (!isdigit((unsigned char)*p)) all_numeric = 0;
-            if (*part == '\0' || (all_numeric && semver_numeric_part(part) == 0)) return -1;
-            for (char *p = part; *p != '\0'; ++p) {
-                if (!isalnum((unsigned char)*p) && *p != '-') return -1;
-            }
-        }
+        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, 1)) return -1;
         snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
     }
-    char *save = NULL;
-    char *major = strtok_r(copy, ".", &save);
-    char *minor = strtok_r(NULL, ".", &save);
-    char *patch = strtok_r(NULL, ".", &save);
-    if (!semver_numeric_part(major) || !semver_numeric_part(minor)
-        || !semver_numeric_part(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+    /* Exactly three parts: strtok_r would skip the empty one in "1..0.0" or ".1.0.0". */
+    char *major = copy;
+    char *minor = strchr(major, '.');
+    char *patch = minor == NULL ? NULL : strchr(minor + 1, '.');
+    if (minor == NULL || patch == NULL || strchr(patch + 1, '.') != NULL) return -1;
+    *minor++ = '\0';
+    *patch++ = '\0';
+    if (!semver_numeric_part(major) || !semver_numeric_part(minor) || !semver_numeric_part(patch)) return -1;
     snprintf(out->major, sizeof(out->major), "%s", major);
     snprintf(out->minor, sizeof(out->minor), "%s", minor);
     snprintf(out->patch, sizeof(out->patch), "%s", patch);
@@ -8694,6 +9082,16 @@ static int compare_admin_semver(const st_admin_semver *left, const st_admin_semv
         right_part = strtok_r(NULL, ".", &right_save);
     }
     return left_part == right_part ? 0 : (left_part == NULL ? -1 : 1);
+}
+
+int st_admin_semver_compare_for_testing(const char *left, const char *right, int *result)
+{
+    st_admin_semver parsed_left;
+    st_admin_semver parsed_right;
+    if (result == NULL || parse_admin_semver(left, &parsed_left) != 0
+        || parse_admin_semver(right, &parsed_right) != 0) return -1;
+    *result = compare_admin_semver(&parsed_left, &parsed_right);
+    return 0;
 }
 
 static int read_client_download_mutation(const char *body,
@@ -8811,13 +9209,10 @@ static int read_client_download_mutation(const char *body,
     (void)st_json_get_bool(body, "enabled", &mutation->enabled);
     (void)st_json_get_i64(body, "fileSize", &mutation->file_size);
     (void)st_json_get_bool(body, "isLatest", &mutation->is_latest);
-    if ((strcmp(mutation->implementation, "android") == 0
-         && (strcmp(mutation->platform, "android") != 0 || strcmp(mutation->arch, "any") != 0))
-        || (strcmp(mutation->platform, "android") == 0
-            && (strcmp(mutation->implementation, "android") != 0
-                || strcmp(mutation->arch, "any") != 0))) {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"android packages require android/any\"}");
+    const char *target_error = client_download_target_error(mutation->implementation,
+                                                            mutation->platform, mutation->arch);
+    if (target_error != NULL) {
+        response = write_response(out, out_len, 400, "Bad Request", target_error);
         goto done;
     }
     st_admin_semver release_version;
@@ -8837,14 +9232,19 @@ static int read_client_download_mutation(const char *body,
                                   "{\"error\":\"invalid fileSize or sha256\"}");
         goto done;
     }
-    if (mutation->is_latest && (!mutation->enabled || mutation->version[0] == '\0')) {
+    if (mutation->is_latest && mutation->version[0] == '\0') {
         response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"an enabled version is required for latest\"}");
+                                  "{\"error\":\"isLatest requires a versioned catalogue entry\"}");
+        goto done;
+    }
+    if (mutation->is_latest && !mutation->enabled) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"a disabled client download cannot be latest\"}");
         goto done;
     }
     if (mutation->is_latest && (existing == NULL || !existing->hosted)
-        && (admin_ascii_ncasecmp(mutation->download_url, "https://", 8U) != 0
-            || !valid_sha256_text(mutation->sha256) || mutation->file_size <= 0)) {
+        && !client_download_has_authoritative_metadata(0, 0, mutation->download_url,
+                                                       mutation->sha256, mutation->file_size)) {
         response = write_response(out, out_len, 400, "Bad Request",
             "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
         goto done;
@@ -8879,6 +9279,16 @@ static int compare_client_download_order(const void *left_raw, const void *right
         return left->display_order < right->display_order ? -1 : 1;
     }
     return left->id < right->id ? -1 : (left->id > right->id ? 1 : 0);
+}
+
+/* Java findAllByOrderByImplementationAscDisplayOrderAscIdAsc. */
+static int compare_client_download_public_order(const void *left_raw, const void *right_raw)
+{
+    const st_storage_client_download_link *left = left_raw;
+    const st_storage_client_download_link *right = right_raw;
+    int compared = strcmp(left->implementation, right->implementation);
+    if (compared != 0) return compared < 0 ? -1 : 1;
+    return compare_client_download_order(left_raw, right_raw);
 }
 
 static int build_client_downloads_response(const st_admin_context *context,
@@ -8926,24 +9336,34 @@ static int build_client_downloads_response(const st_admin_context *context,
                     links[link_count++] = catalogue[i];
                 }
             }
-            st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
-            size_t fallback_count = 0U;
-            if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
-                                         &fallback_count) == 0) {
-                for (size_t i = 0U; i < fallback_count; ++i) {
-                    int configured = 0;
-                    for (size_t j = 0U; j < catalogue_count; ++j) {
-                        if (client_download_same_target(&fallback[i], &catalogue[j])) {
-                            configured = 1;
-                            break;
+            /*
+             * Java listEnabled: when no release target is left unconfigured (or the fallback is
+             * off) the catalogue is returned in its implementation, displayOrder, id order and
+             * GitHub is not asked; otherwise release assets fill the unconfigured targets and the
+             * merged list is ordered by displayOrder, id.
+             */
+            if (!st_github_release_may_supply_missing_target(catalogue, catalogue_count)) {
+                qsort(links, link_count, sizeof(*links), compare_client_download_public_order);
+            } else {
+                st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
+                size_t fallback_count = 0U;
+                if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
+                                             &fallback_count) == 0) {
+                    for (size_t i = 0U; i < fallback_count; ++i) {
+                        int configured = 0;
+                        for (size_t j = 0U; j < catalogue_count; ++j) {
+                            if (client_download_same_target(&fallback[i], &catalogue[j])) {
+                                configured = 1;
+                                break;
+                            }
+                        }
+                        if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
+                            links[link_count++] = fallback[i];
                         }
                     }
-                    if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
-                        links[link_count++] = fallback[i];
-                    }
                 }
+                qsort(links, link_count, sizeof(*links), compare_client_download_order);
             }
-            qsort(links, link_count, sizeof(*links), compare_client_download_order);
         }
         for (size_t i = 0U; rc == 0 && i < link_count; ++i) {
             rc = admin_sb_append(&builder, i == 0U ? "" : ",");
@@ -9061,7 +9481,7 @@ static int handle_client_download_update(const st_admin_context *context,
     }
     st_storage_client_download_link existing;
     if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+        return write_client_download_not_found(id, out, out_len);
     }
     st_admin_client_download_mutation mutation;
     int validation_response = read_client_download_mutation(body, &existing, &mutation, out, out_len);
@@ -9091,19 +9511,56 @@ static int handle_client_download_mark_latest(const st_admin_context *context,
     if (init_response != 0) return init_response;
     st_storage_client_download_link existing;
     if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
-        return write_response(out, out_len, 404, "Not Found",
-                              "{\"error\":\"client download not found\"}");
+        return write_client_download_not_found(id, out, out_len);
     }
-    st_admin_semver parsed;
-    if (!existing.enabled || parse_admin_semver(existing.version, &parsed) != 0
-        || (existing.hosted && !st_client_package_is_readable(&existing))
-        || (!existing.hosted && (admin_ascii_ncasecmp(existing.download_url, "https://", 8U) != 0
-            || !valid_sha256_text(existing.sha256) || existing.file_size <= 0))) {
+    /*
+     * Java markLatest: a version is required and must be SemVer, a minimum must not be newer, the
+     * row must be enabled and an external one must carry verified HTTPS metadata. The stored
+     * version and minimum are rewritten in canonical form (one leading "v" removed).
+     */
+    char version[sizeof(existing.version)];
+    char minimum[sizeof(existing.min_supported_version)];
+    admin_normalize_semver_text(existing.version, version, sizeof(version));
+    admin_normalize_semver_text(existing.min_supported_version, minimum, sizeof(minimum));
+    st_admin_semver parsed_version;
+    st_admin_semver parsed_minimum;
+    if (version[0] == '\0') {
         return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"download is not publishable as latest\"}");
+                              "{\"error\":\"client download link has no version\"}");
+    }
+    if (parse_admin_semver(version, &parsed_version) != 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"version must be a valid SemVer 2.0 version\"}");
+    }
+    if (minimum[0] != '\0' && parse_admin_semver(minimum, &parsed_minimum) != 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"minSupportedVersion must be a valid SemVer 2.0 version\"}");
+    }
+    if (minimum[0] != '\0' && compare_admin_semver(&parsed_minimum, &parsed_version) > 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"minSupportedVersion cannot be newer than version\"}");
+    }
+    if (!existing.enabled) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"a disabled client download cannot be latest\"}");
+    }
+    if (!existing.hosted
+        && !client_download_has_authoritative_metadata(existing.id, 0, existing.download_url,
+                                                       existing.sha256, existing.file_size)) {
+        return write_response(out, out_len, 400, "Bad Request",
+            "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
+    }
+    if (existing.hosted && !st_client_package_is_readable(&existing)) {
+        /* C only: never publish a hosted row whose bytes are missing or no longer match. */
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"client package is not readable\"}");
     }
     st_storage_client_download_link updated;
-    if (st_storage_mark_client_download_latest(database_path, id, &updated) != 0) {
+    if (st_storage_upsert_client_download_link_extended(database_path, id, existing.implementation,
+            existing.platform, existing.arch, existing.display_name, existing.download_url,
+            existing.description, existing.display_order, existing.enabled, version, existing.sha256,
+            existing.file_size, 1, existing.changelog_url, minimum, existing.hosted,
+            existing.package_path, existing.package_file_name, &updated) != 0) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"client download latest update failed\"}");
     }
@@ -9135,6 +9592,11 @@ static int build_client_version_check_response(const char *path, char *out, size
         return write_response(out, out_len, 400, "Bad Request",
                               "{\"error\":\"invalid client version target\"}");
     }
+    const char *target_error = client_download_target_error(normalized_implementation,
+                                                            normalized_platform, normalized_arch);
+    if (target_error != NULL) {
+        return write_response(out, out_len, 400, "Bad Request", target_error);
+    }
     const char *database_path = admin_database_path();
     st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
     size_t count = 0U;
@@ -9156,10 +9618,10 @@ static int build_client_version_check_response(const char *path, char *out, size
             || (strcmp(candidate->platform, normalized_platform) != 0
                 && strcmp(candidate->platform, "any") != 0)
             || (strcmp(candidate->arch, normalized_arch) != 0 && strcmp(candidate->arch, "any") != 0)
-            || candidate->file_size <= 0 || !valid_sha256_text(candidate->sha256)
-            || parse_admin_semver(candidate->version, &candidate_version) != 0
-            || (!candidate->hosted
-                && admin_ascii_ncasecmp(candidate->download_url, "https://", 8U) != 0)) continue;
+            || !client_download_has_authoritative_metadata(candidate->id, candidate->hosted,
+                                                           candidate->download_url, candidate->sha256,
+                                                           candidate->file_size)
+            || parse_admin_semver(candidate->version, &candidate_version) != 0) continue;
         int specificity = (strcmp(candidate->platform, normalized_platform) == 0 ? 2 : 0)
             + (strcmp(candidate->arch, normalized_arch) == 0 ? 1 : 0);
         if (best == NULL || specificity > best_specificity
@@ -9221,10 +9683,12 @@ static int build_client_version_check_response(const char *path, char *out, size
     if (update_available && parse_admin_semver(best->min_supported_version, &minimum) == 0) {
         mandatory = compare_admin_semver(&current, &minimum) < 0;
     }
+    char latest_version[sizeof(best->version)];
+    admin_normalize_semver_text(best->version, latest_version, sizeof(latest_version));
     st_admin_string_builder builder = {0};
     int rc = admin_sb_appendf(&builder, "{\"updateAvailable\":%s,\"mandatory\":%s,\"latestVersion\":",
                               update_available ? "true" : "false", mandatory ? "true" : "false");
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, best->version);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, latest_version);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"downloadUrl\":");
     if (rc == 0) rc = admin_sb_append_json_string(&builder, best->download_url);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"sha256\":");
@@ -9258,8 +9722,19 @@ static int handle_client_download_delete(const st_admin_context *context,
     if (init_response != 0) {
         return init_response;
     }
-    if (st_client_package_delete(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+    st_storage_client_download_link existing;
+    if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
+        return write_client_download_not_found(id, out, out_len);
+    }
+    int deleted = st_client_package_delete(database_path, id);
+    if (deleted == -2) {
+        /* Java storage.quarantine throws IllegalStateException: 409, the row stays. */
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"cannot quarantine client package\"}");
+    }
+    if (deleted != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client download delete failed\"}");
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -9399,8 +9874,21 @@ static int handle_user_diagram_update(const st_admin_context *context,
                                       char *out,
                                       size_t out_len)
 {
+    /*
+     * Java UserDiagramDocumentService.update: the document must belong to the caller (404) before
+     * its revision is compared (409) and the new content is read (400), so another account learns
+     * nothing from the body it sends.
+     */
+    const char *database_path = admin_database_path();
+    st_storage_user_diagram existing;
+    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
+            context->tenant_id, context->username, &existing) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
+    }
+    long long current_revision = existing.revision;
+    st_storage_user_diagram_free(&existing);
     long long revision = -1;
-    if (st_json_get_i64(body, "revision", &revision) != 0 || revision < 0) {
+    if (st_json_get_i64(body, "revision", &revision) != 0 || revision != current_revision) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"diagram revision conflict\"}");
     }
@@ -9409,14 +9897,6 @@ static int handle_user_diagram_update(const st_admin_context *context,
     size_t snapshot_len = 0U;
     int validation = read_user_diagram_mutation(body, name, &snapshot, &snapshot_len, out, out_len);
     if (validation != 0) return validation;
-    const char *database_path = admin_database_path();
-    st_storage_user_diagram existing;
-    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
-            context->tenant_id, context->username, &existing) != 0) {
-        free(snapshot);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
-    }
-    st_storage_user_diagram_free(&existing);
     st_storage_user_diagram updated;
     int rc = st_storage_update_user_diagram(database_path, id, context->tenant_id, context->username,
                                             revision, name, snapshot, snapshot_len, &updated);
@@ -9880,15 +10360,15 @@ static int write_workbench_error(char *out,
     return write_workbench_response(out, out_len, status, body, retry_after_seconds);
 }
 
-/* A refusal of the shared authentication layer, with the workbench's header on a workbench path. */
+/* A refusal of the shared authentication layer, private on a path whose every answer is private. */
 static int write_auth_refusal(char *out,
                               size_t out_len,
-                              int workbench_path,
+                              int private_path,
                               int status,
                               const char *reason,
                               const char *body)
 {
-    return workbench_path
+    return private_path
         ? write_workbench_response(out, out_len, status, body, 0)
         : write_response(out, out_len, status, reason, body);
 }
@@ -10294,8 +10774,15 @@ static int st_admin_build_response_internal(const char *method,
     /* Product metrics answers are private, the shared layer's refusals included. */
     int product_metrics_path = st_product_metrics_path(path);
     if (admin_path_requires_auth(method, path)) {
-        /* Workbench answers are private, the shared layer's refusals included. */
-        int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
+        /*
+         * Workbench and temporary-share management answers are private, the shared layer's refusals
+         * included (service-workbench.md, temporary-http-share.md section 4).
+         */
+        admin_share_path share_path;
+        admin_parse_share_path(path, &share_path);
+        int private_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0
+            || share_path.kind != ADMIN_SHARE_PATH_NONE
+            || admin_path_equals(path, "/api/admin/http-access-audit");
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
@@ -10315,7 +10802,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 403,
                                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
+                    : write_auth_refusal(out, out_len, private_path, 403, "Forbidden",
                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
@@ -10323,7 +10810,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 500,
                                                      "{\"error\":\"management user store unavailable\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
+                    : write_auth_refusal(out, out_len, private_path, 500, "Internal Server Error",
                                          "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
@@ -10339,7 +10826,7 @@ static int st_admin_build_response_internal(const char *method,
             if (admin_connectivity_check_path(path, NULL, 0U)) {
                 return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
             }
-            return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
+            return write_auth_refusal(out, out_len, private_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
     }
@@ -11140,18 +11627,25 @@ static int admin_wire_read(admin_wire_reader *reader, char *out, size_t len)
 
 /*
  * Reads a chunked request body (RFC 9112 section 7.1) into one malloc'd, NUL-terminated buffer,
- * the way a Content-Length body is read. Chunk extensions and trailer fields are read and
- * dropped. Returns 0, -1 for a malformed or truncated body, or -2 once it outgrows max_len.
+ * the way a Content-Length body is read. Chunk extensions are dropped; the trailer fields come back
+ * in *trailers as they arrived (the caller keeps only declared ones). Returns 0, -1 for a malformed
+ * or truncated body, or -2 once it outgrows max_len; then *out keeps the first refused_capture
+ * bytes of the body for the record of the refused request.
  */
 static int admin_read_chunked_body(int fd,
                                    const char *received,
                                    size_t received_len,
                                    size_t max_len,
+                                   size_t refused_capture,
                                    char **out,
-                                   size_t *out_len)
+                                   size_t *out_len,
+                                   char ***trailers,
+                                   size_t *trailers_len)
 {
     *out = NULL;
     *out_len = 0;
+    *trailers = NULL;
+    *trailers_len = 0U;
     admin_wire_reader *reader = (admin_wire_reader *)malloc(sizeof(*reader));
     if (reader == NULL || received_len > sizeof(reader->buffer)) {
         free(reader);
@@ -11191,6 +11685,16 @@ static int admin_read_chunked_body(int fd,
             break;
         }
         if (size > max_len - len) {
+            /* What arrives of this chunk still belongs to the capture of the refused body. */
+            size_t wanted = len < refused_capture ? refused_capture - len : 0U;
+            size_t take = size < wanted ? size : wanted;
+            char *grown = take == 0U ? body : (char *)realloc(body, len + take + 1U);
+            if (grown != NULL) {
+                body = grown;
+                if (take > 0U && admin_wire_read(reader, body + len, take) == 0) {
+                    len += take;
+                }
+            }
             rc = -2;
             break;
         }
@@ -11210,21 +11714,52 @@ static int admin_read_chunked_body(int fd,
         len += size;
     }
     /* The trailer section ends at an empty line. */
-    for (int fields = 0; rc == 0; ++fields) {
-        if (fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
+    char **fields = NULL;
+    size_t field_count = 0U;
+    for (int read_fields = 0; rc == 0; ++read_fields) {
+        if (read_fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
             rc = -1;
         } else if (line[0] == '\0') {
             break;
+        } else if (strchr(line, ':') != NULL) {
+            char **grown = (char **)realloc(fields, (field_count + 1U) * sizeof(*grown));
+            char *copy = grown == NULL ? NULL : admin_dup_string(line);
+            if (grown != NULL) {
+                fields = grown;
+            }
+            if (copy == NULL) {
+                rc = -1;
+            } else {
+                fields[field_count++] = copy;
+            }
         }
     }
     free(reader);
     if (rc != 0) {
+        for (size_t i = 0; i < field_count; ++i) {
+            free(fields[i]);
+        }
+        free(fields);
+        if (rc == -2 && refused_capture > 0U && body != NULL) {
+            /* Only the first bytes stay, for the record of the refusal. */
+            size_t kept = len < refused_capture ? len : refused_capture;
+            char *shrunk = (char *)realloc(body, kept + 1U);
+            if (shrunk != NULL) {
+                body = shrunk;
+            }
+            body[kept] = '\0';
+            *out = body;
+            *out_len = kept;
+            return rc;
+        }
         free(body);
         return rc;
     }
     body[len] = '\0';
     *out = body;
     *out_len = len;
+    *trailers = fields;
+    *trailers_len = field_count;
     return 0;
 }
 
@@ -12157,9 +12692,18 @@ static int send_text_http_error(int fd, int status, const char *message)
         && send_all(fd, body, (size_t)body_len) == 0;
 }
 
+/*
+ * The texts of Java HttpSpecusController for the route gate and an offline client, carried in this
+ * server's {"error":"..."} envelope (http-route.md section 1).
+ */
+#define ADMIN_ROUTE_NOT_FOUND_TEXT "HTTP 路由不存在或未启用"
+#define ADMIN_ROUTE_AUTH_REQUIRED_TEXT "需要 HTTP Basic 认证"
+#define ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT "HTTP 路由认证暂不可用"
+#define ADMIN_ROUTE_CLIENT_OFFLINE_TEXT "客户端不在线"
+
 static int send_http_route_auth_challenge(int fd)
 {
-    static const char body[] = "{\"error\":\"HTTP route authentication required\"}";
+    static const char body[] = "{\"error\":\"" ADMIN_ROUTE_AUTH_REQUIRED_TEXT "\"}";
     char header[384];
     int header_len = snprintf(header,
                               sizeof(header),
@@ -12181,7 +12725,7 @@ static int send_http_route_auth_challenge(int fd)
 
 static int send_http_route_policy_unavailable(int fd)
 {
-    static const char body[] = "{\"error\":\"HTTP route authentication is temporarily unavailable\"}";
+    static const char body[] = "{\"error\":\"" ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT "\"}";
     char header[384];
     int header_len = snprintf(header,
                               sizeof(header),
@@ -12292,7 +12836,8 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
 }
 
 /* Whether route_name is one of the SPECUS_HTTP_ROUTES routes every client is given. */
-static int admin_env_http_route_configured(const char *route_name)
+/* Whether SPECUS_HTTP_ROUTES defines route_name; its target is copied into target when it does. */
+static int admin_env_http_route_configured(const char *route_name, char *target, size_t target_len)
 {
     st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
     size_t route_count = 0;
@@ -12300,15 +12845,151 @@ static int admin_env_http_route_configured(const char *route_name)
     if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
         for (size_t i = 0; i < route_count && !configured; ++i) {
             configured = strcmp(routes[i].route, route_name) == 0;
+            if (configured && target != NULL) {
+                snprintf(target, target_len, "%s", routes[i].target_base_url);
+            }
         }
     }
     free(routes);
     return configured;
 }
 
+static void admin_fd_remote_text(int fd, char out[128]);
+
+/*
+ * Records a /http/ exchange that ended in an answer of this server instead of a relayed response
+ * (http-route.md section 9: every request is recorded with its failure reason), as Java
+ * HttpSpecusController and HttpSpecusBodyLimitFilter record theirs: the response is the
+ * {"error":"message"} answer that went out, and the record only happens with the server switch
+ * and the route's detailCaptureEnabled, like a relayed exchange.
+ */
+static void record_direct_http_failure(const char *client_name,
+                                       const char *route,
+                                       const st_direct_http_request *request,
+                                       int status,
+                                       const char *public_message,
+                                       const char *failure,
+                                       const char *remote_address,
+                                       long long started_ms)
+{
+    if (!st_traffic_capture_enabled()) {
+        return;
+    }
+    char *escaped = st_json_escape(public_message == NULL ? "" : public_message);
+    if (escaped == NULL) {
+        return;
+    }
+    size_t body_len = strlen("{\"error\":\"\"}") + strlen(escaped);
+    char *body = (char *)malloc(body_len + 1U);
+    char content_type[] = "Content-Type:application/json";
+    char *headers[] = {content_type};
+    if (body != NULL) {
+        snprintf(body, body_len + 1U, "{\"error\":\"%s\"}", escaped);
+        st_direct_http_response response = {
+            .status_code = status,
+            .headers = headers,
+            .headers_len = 1U,
+            .body = (uint8_t *)body,
+            .body_len = body_len,
+            .error = (char *)(failure == NULL ? public_message : failure)
+        };
+        long long elapsed_ms = admin_now_ms() - started_ms;
+        record_direct_http_exchange(client_name, route, request, &response, body_len, remote_address,
+                                    elapsed_ms < 0 ? 0 : elapsed_ms);
+    }
+    free(body);
+    free(escaped);
+}
+
+/*
+ * record_direct_http_failure for a request refused before it was forwarded: its client, route,
+ * relative path and query come from the request path; headers and body are what the refusal may
+ * show of the request (none for a refusal of the route gate, as in Java).
+ */
+static void record_direct_http_refusal(int fd,
+                                       const char *method,
+                                       const char *path,
+                                       char **headers,
+                                       size_t headers_len,
+                                       const uint8_t *body,
+                                       size_t body_len,
+                                       int status,
+                                       const char *message,
+                                       long long started_ms)
+{
+    char *client_name = NULL;
+    char *route = NULL;
+    if (!st_traffic_capture_enabled() || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+        return;
+    }
+    const char *query = strchr(path, '?');
+    size_t path_len = query == NULL ? strlen(path) : (size_t)(query - path);
+    const char *client_end = memchr(path + 6, '/', path_len - 6U);
+    const char *route_end = client_end == NULL ? NULL
+        : memchr(client_end + 1, '/', (size_t)(path + path_len - client_end - 1));
+    char *relative_path = route_end == NULL ? admin_dup_string("/")
+        : admin_dup_range(route_end, (size_t)(path + path_len - route_end));
+    char *raw_query = admin_encode_raw_query_for_forwarding(query == NULL ? "" : query + 1);
+    if (relative_path != NULL && raw_query != NULL) {
+        st_direct_http_request request = {
+            .request_method = (char *)method,
+            .route = route,
+            .relative_path = relative_path,
+            .raw_query = raw_query,
+            .headers = headers,
+            .headers_len = headers_len,
+            .body = body,
+            .body_len = body_len
+        };
+        char remote_address[128];
+        admin_fd_remote_text(fd, remote_address);
+        record_direct_http_failure(client_name, route, &request, status, message, NULL, remote_address,
+                                   started_ms);
+    }
+    free(relative_path);
+    free(raw_query);
+    free(client_name);
+    free(route);
+}
+
+/* Whether a refused request on this /http/ path would be recorded, so its body is worth capturing. */
+static int admin_direct_route_captured(const char *path)
+{
+    char *client_name = NULL;
+    char *route = NULL;
+    const char *database_path = admin_database_path();
+    if (!st_traffic_capture_enabled() || database_path == NULL
+        || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+        return 0;
+    }
+    st_storage_http_route http_route;
+    int captured = st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
+        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
+        && http_route.detail_capture_enabled;
+    free(client_name);
+    free(route);
+    return captured;
+}
+
 static int send_http_route_not_found(int fd)
 {
-    send_text_http_error(fd, 404, "HTTP route is not configured or disabled");
+    send_text_http_error(fd, 404, ADMIN_ROUTE_NOT_FOUND_TEXT);
+    return -1;
+}
+
+/* A refusal of the route gate: the answer, then its record (no request headers or body, as Java). */
+static int refuse_direct_http_route(int fd, const char *method, const char *path, int status, long long started_ms)
+{
+    const char *message = status == 401 ? ADMIN_ROUTE_AUTH_REQUIRED_TEXT
+        : status == 503 ? ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT : ADMIN_ROUTE_NOT_FOUND_TEXT;
+    if (status == 401) {
+        send_http_route_auth_challenge(fd);
+    } else if (status == 503) {
+        send_http_route_policy_unavailable(fd);
+    } else {
+        send_http_route_not_found(fd);
+    }
+    record_direct_http_refusal(fd, method, path, NULL, 0U, NULL, 0U, status, message, started_ms);
     return -1;
 }
 
@@ -12317,18 +12998,30 @@ static int send_http_route_not_found(int fd)
  * response. It fails closed: a request enters the tunnel only for a route the server itself
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
- * since, so what the client holds never makes a route reachable.
+ * since, so what the client holds never makes a route reachable. The route's target is copied into
+ * target_base_url for the browser header rewrite. *client_id is the account the request was let in
+ * for (0 without a database), so that only a data connection of that account, not one of a former
+ * account of the same name, can serve it. Every refusal is recorded like Java's.
  */
-static int authorize_direct_http_route(int fd, const char *path, const char *raw_request)
+static int authorize_direct_http_route(int fd,
+                                       const char *method,
+                                       const char *path,
+                                       const char *raw_request,
+                                       long long started_ms,
+                                       char *target_base_url,
+                                       size_t target_base_url_len,
+                                       long long *client_id)
 {
+    *client_id = 0;
     char *client_name = NULL;
     char *route_name = NULL;
+    target_base_url[0] = '\0';
     if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
         return send_http_route_not_found(fd);
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
-        int configured = admin_env_http_route_configured(route_name);
+        int configured = admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
         free(client_name);
         free(route_name);
         return configured ? 0 : send_http_route_not_found(fd);
@@ -12349,30 +13042,40 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     if (lookup_rc != 0) {
         free(client_name);
         free(route_name);
-        send_http_route_policy_unavailable(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
     /* Unknown and disabled clients have no reachable routes, environment ones included: with a
      * database a client cannot log in without an enabled account either. */
     int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
-    int env_configured = !found && client_enabled && admin_env_http_route_configured(route_name);
+    int env_configured = !found && client_enabled
+        && admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
+    long long env_client_id = 0;
+    if (env_configured) {
+        /* A SPECUS_HTTP_ROUTES route has no row of its own: it belongs to the account named. */
+        st_storage_client account;
+        env_configured = st_storage_get_client_by_name(database_path, client_name, &account) == 0
+            && account.enabled;
+        env_client_id = env_configured ? account.id : 0;
+    }
     free(client_name);
     free(route_name);
     if (!client_enabled) {
-        return send_http_route_not_found(fd);
+        return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
     if (!found) {
+        *client_id = env_client_id;
         return env_configured ? 0 : send_http_route_not_found(fd);
     }
     if (!route.enabled) {
-        return send_http_route_not_found(fd);
+        return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
+    *client_id = route.client_id;
+    snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
     }
     if (route.auth_username[0] == '\0' || route.auth_password_hash[0] == '\0') {
-        send_http_route_policy_unavailable(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
 
     char *authorization = admin_extract_header_value(raw_request, "Authorization");
@@ -12405,8 +13108,7 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     memset(decoded, 0, sizeof(decoded));
     free(authorization);
     if (!valid) {
-        send_http_route_auth_challenge(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 401, started_ms);
     }
     return 1;
 }
@@ -12431,6 +13133,8 @@ typedef struct {
     const char *share_id;
     const char *rewrite_prefix;
     admin_share_stream *share_stream;
+    /* The client's RST reason, made log-safe, as the failure of the HTTP detail (never public). */
+    char reset_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
 } admin_direct_http_sink_state;
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
@@ -12529,15 +13233,15 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
 
 static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
 {
-    const admin_direct_http_sink_state *state = (const admin_direct_http_sink_state *)ctx;
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
     char safe_client[512];
     char safe_route[512];
     char safe_method[64];
-    char safe_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
+    char *safe_reason = state->reset_reason;
     (void)st_admin_log_safe_reason(state->client_name, safe_client, sizeof(safe_client));
     (void)st_admin_log_safe_reason(state->route, safe_route, sizeof(safe_route));
     (void)st_admin_log_safe_reason(state->method, safe_method, sizeof(safe_method));
-    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(safe_reason));
+    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(state->reset_reason));
     fprintf(stderr,
             "[http-stream-v2] stream reset client=%s route=%s method=%s status=502 errorCode=%u reason=%s\n",
             safe_client,
@@ -12594,17 +13298,162 @@ void st_direct_http_response_free(st_direct_http_response *response)
     memset(response, 0, sizeof(*response));
 }
 
-static int direct_valid_trailer_name(const char *name)
+/* An RFC 9110 field-name token of len bytes. */
+static int direct_trailer_token(const char *name, size_t len)
 {
-    if (name == NULL || *name == '\0') {
+    if (len == 0U) {
         return 0;
     }
-    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; ++p) {
-        if (!isalnum(*p) && strchr("!#$%&'*+-.^_`|~", *p) == NULL) {
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '\0' || (!isalnum(c) && strchr("!#$%&'*+-.^_`|~", c) == NULL)) {
             return 0;
         }
     }
     return 1;
+}
+
+/* Java HttpSpecusController.SKIPPED_HEADERS: hop-by-hop or recomputed, so never a trailer either. */
+static int direct_trailer_name_forbidden(const char *name, size_t len)
+{
+    static const char *const forbidden[] = {
+        "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
+    };
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); ++i) {
+        if (strlen(forbidden[i]) == len && admin_ascii_ncasecmp(name, forbidden[i], len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Narrows [*start, *start + *len) to the bytes between leading and trailing spaces and tabs. */
+static void direct_trim_span(const char **start, size_t *len)
+{
+    while (*len > 0U && (**start == ' ' || **start == '\t')) {
+        ++*start;
+        --*len;
+    }
+    while (*len > 0U && ((*start)[*len - 1U] == ' ' || (*start)[*len - 1U] == '\t')) {
+        --*len;
+    }
+}
+
+static int direct_trailer_name_listed(char *const *names, size_t names_len, const char *name, size_t len)
+{
+    for (size_t i = 0; i < names_len; ++i) {
+        if (strlen(names[i]) == len && admin_ascii_ncasecmp(names[i], name, len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The trailer names that may cross (Java HttpSpecusController.validTrailerNames, http-route.md
+ * sections 3 and 4): each candidate trimmed, a token, no hop-by-hop field, not Authorization when
+ * the route gate consumed it, and every name once in its first spelling. *out is the caller's.
+ */
+static int direct_valid_trailer_names(char *const *candidates,
+                                      size_t candidates_len,
+                                      int strip_authorization,
+                                      char ***out,
+                                      size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    if (candidates_len == 0U) {
+        return 0;
+    }
+    char **names = (char **)calloc(candidates_len, sizeof(*names));
+    if (names == NULL) {
+        return -1;
+    }
+    size_t count = 0U;
+    for (size_t i = 0; i < candidates_len; ++i) {
+        const char *name = candidates[i] == NULL ? "" : candidates[i];
+        size_t len = strlen(name);
+        direct_trim_span(&name, &len);
+        if (!direct_trailer_token(name, len) || direct_trailer_name_forbidden(name, len)
+            || (strip_authorization && len == strlen("Authorization")
+                && admin_ascii_ncasecmp(name, "Authorization", len) == 0)
+            || direct_trailer_name_listed(names, count, name, len)) {
+            continue;
+        }
+        names[count] = admin_dup_range(name, len);
+        if (names[count] == NULL) {
+            direct_free_strings(names, count);
+            return -1;
+        }
+        ++count;
+    }
+    if (count == 0U) {
+        free(names);
+        return 0;
+    }
+    *out = names;
+    *out_len = count;
+    return 0;
+}
+
+/*
+ * The trailer fields that may cross (Java HttpSpecusController.validTrailerLines and
+ * flattenTrailers): name:value fields whose trimmed name was declared, is a token and no hop-by-hop
+ * field, and whose value carries no CR or LF. Each comes out as name:value, both sides trimmed.
+ * declared holds names direct_valid_trailer_names already accepted. *out is the caller's.
+ */
+static int direct_declared_trailer_fields(char *const *fields,
+                                          size_t fields_len,
+                                          char *const *declared,
+                                          size_t declared_len,
+                                          char ***out,
+                                          size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    if (fields_len == 0U || declared_len == 0U) {
+        return 0;
+    }
+    char **kept = (char **)calloc(fields_len, sizeof(*kept));
+    if (kept == NULL) {
+        return -1;
+    }
+    size_t count = 0U;
+    for (size_t i = 0; i < fields_len; ++i) {
+        const char *field = fields[i];
+        const char *colon = field == NULL ? NULL : strchr(field, ':');
+        if (colon == NULL || colon == field || strchr(field, '\r') != NULL || strchr(field, '\n') != NULL) {
+            continue;
+        }
+        const char *name = field;
+        size_t name_len = (size_t)(colon - field);
+        const char *value = colon + 1;
+        size_t value_len = strlen(value);
+        direct_trim_span(&name, &name_len);
+        direct_trim_span(&value, &value_len);
+        if (!direct_trailer_token(name, name_len) || direct_trailer_name_forbidden(name, name_len)
+            || !direct_trailer_name_listed(declared, declared_len, name, name_len)) {
+            continue;
+        }
+        kept[count] = (char *)malloc(name_len + value_len + 2U);
+        if (kept[count] == NULL) {
+            direct_free_strings(kept, count);
+            return -1;
+        }
+        memcpy(kept[count], name, name_len);
+        kept[count][name_len] = ':';
+        memcpy(kept[count] + name_len + 1U, value, value_len);
+        kept[count][name_len + 1U + value_len] = '\0';
+        ++count;
+    }
+    if (count == 0U) {
+        free(kept);
+        return 0;
+    }
+    *out = kept;
+    *out_len = count;
+    return 0;
 }
 
 static int direct_should_buffer_rewrite(const char *client_name,
@@ -12649,13 +13498,8 @@ static int direct_sink_start_chunked(admin_direct_http_sink_state *state)
     }
     if (rc == 0 && state->trailer_names_len > 0U) {
         rc = admin_sb_append(&builder, "Trailer: ");
-        int written = 0;
         for (size_t i = 0; rc == 0 && i < state->trailer_names_len; ++i) {
-            if (direct_valid_trailer_name(state->trailer_names[i])) {
-                rc = admin_sb_appendf(&builder, "%s%s", written ? ", " : "",
-                                      state->trailer_names[i]);
-                written = 1;
-            }
+            rc = admin_sb_appendf(&builder, "%s%s", i == 0U ? "" : ", ", state->trailer_names[i]);
         }
         if (rc == 0) {
             rc = admin_sb_append(&builder, "\r\n");
@@ -12717,11 +13561,12 @@ static int direct_sink_on_headers(void *ctx,
                                   size_t trailer_names_len)
 {
     admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    /* Only valid, non-hop-by-hop names are declared, and only their fields cross at the end. */
     if (state->started || state->response.status_code != 0 || status_code < 100 || status_code > 599
         || direct_copy_strings(headers, headers_len,
                                &state->response.headers, &state->response.headers_len) != 0
-        || direct_copy_strings(trailer_names, trailer_names_len,
-                               &state->trailer_names, &state->trailer_names_len) != 0) {
+        || direct_valid_trailer_names(trailer_names, trailer_names_len, 0,
+                                      &state->trailer_names, &state->trailer_names_len) != 0) {
         return -1;
     }
     if (state->share_id != NULL) {
@@ -12746,7 +13591,7 @@ static int direct_sink_on_headers(void *ctx,
                                                 status_code,
                                                 state->response.headers,
                                                 state->response.headers_len);
-    state->buffer_for_rewrite = trailer_names_len == 0U
+    state->buffer_for_rewrite = state->trailer_names_len == 0U
         && direct_should_buffer_rewrite(
             state->client_name, state->route, state->response.headers,
             state->response.headers_len, &state->rewrite_limit);
@@ -12806,19 +13651,20 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
         return -1;
     }
-    for (size_t i = 0; i < trailers_len; ++i) {
-        const char *trailer = trailers[i];
-        const char *colon = trailer == NULL ? NULL : strchr(trailer, ':');
-        if (colon != NULL && colon != trailer && strchr(trailer, '\r') == NULL
-            && strchr(trailer, '\n') == NULL
-            && send_all(state->fd, trailer, strlen(trailer)) != 0) {
-            return -1;
-        }
-        if (colon != NULL && colon != trailer && send_all(state->fd, "\r\n", 2U) != 0) {
-            return -1;
-        }
+    /* Undeclared, hop-by-hop and CR/LF-carrying trailers are dropped (http-route.md section 4). */
+    char **declared = NULL;
+    size_t declared_len = 0U;
+    if (direct_declared_trailer_fields(trailers, trailers_len, state->trailer_names, state->trailer_names_len,
+                                       &declared, &declared_len) != 0) {
+        return -1;
     }
-    if (send_all(state->fd, "\r\n", 2U) != 0) {
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < declared_len; ++i) {
+        rc = send_all(state->fd, declared[i], strlen(declared[i])) == 0
+            && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+    }
+    direct_free_strings(declared, declared_len);
+    if (rc != 0 || send_all(state->fd, "\r\n", 2U) != 0) {
         return -1;
     }
     state->ended = 1;
@@ -14949,6 +15795,7 @@ static void admin_direct_ws_run(st_admin_server *server,
                                 int fd,
                                 char *accept_key,
                                 const char *client_name,
+                                long long client_id,
                                 const char *route,
                                 const char *relative_path,
                                 const char *raw_query,
@@ -14990,7 +15837,8 @@ static void admin_direct_ws_run(st_admin_server *server,
         .headers_len = headers_len,
         .body = empty_body,
         .body_len = 0,
-        .stream = stream
+        .stream = stream,
+        .client_id = client_id
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
     if (open_rc != 0) {
@@ -15061,7 +15909,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  const char *method,
                                                  const char *path,
                                                  const char *raw_request,
-                                                 int strip_authorization)
+                                                 int strip_authorization,
+                                                 const char *target_base_url,
+                                                 long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0
         || !admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
@@ -15129,7 +15979,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(client_name);
         free(route);
@@ -15138,7 +15990,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct websocket header capture failed");
         return 1;
     }
-    admin_direct_ws_run(server, fd, accept_key, client_name, route, relative_path, raw_query,
+    admin_direct_ws_run(server, fd, accept_key, client_name, client_id, route, relative_path, raw_query,
                         headers, headers_len, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
@@ -15153,10 +16005,26 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
  * for a request through a temporary HTTP share: its response headers are rewritten, the path
  * rewrite uses the share prefix, and an ended share can cancel the stream.
  */
+/* A request's declared trailer names and the declared trailer fields of its chunked body. */
+typedef struct {
+    char **names;
+    size_t names_len;
+    char **fields;
+    size_t fields_len;
+} admin_request_trailers;
+
+static void admin_request_trailers_free(admin_request_trailers *trailers)
+{
+    direct_free_strings(trailers->names, trailers->names_len);
+    direct_free_strings(trailers->fields, trailers->fields_len);
+    memset(trailers, 0, sizeof(*trailers));
+}
+
 static void admin_forward_direct_http(st_admin_server *server,
                                       int fd,
                                       const char *method,
                                       const char *client_name,
+                                      long long client_id,
                                       const char *route,
                                       const char *relative_path,
                                       const char *raw_query,
@@ -15164,6 +16032,7 @@ static void admin_forward_direct_http(st_admin_server *server,
                                       size_t headers_len,
                                       const uint8_t *body,
                                       size_t body_len,
+                                      const admin_request_trailers *trailers,
                                       admin_share_admission *share)
 {
     st_direct_http_request direct = {
@@ -15174,7 +16043,12 @@ static void admin_forward_direct_http(st_admin_server *server,
         .headers = headers,
         .headers_len = headers_len,
         .body = body,
-        .body_len = body_len
+        .body_len = body_len,
+        .trailer_names = trailers->names,
+        .trailer_names_len = trailers->names_len,
+        .trailers = trailers->fields,
+        .trailers_len = trailers->fields_len,
+        .client_id = client_id
     };
     size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
     char *source_url = (char *)malloc(source_len);
@@ -15218,18 +16092,28 @@ static void admin_forward_direct_http(st_admin_server *server,
                                     sink_state.response_bytes, remote_address, elapsed_ms);
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
         /* The share ended mid-exchange: the public connection was already shut down. */
-    } else if (!sink_state.started && rc == -2) {
-        send_text_http_error(fd, 504, "direct http response timeout");
-    } else if (!sink_state.started && rc == -3) {
-        send_text_http_error(fd, 404, "direct http route is not configured");
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
-        /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
-        send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
-        /* The stream could not be created, answered as Java HttpSpecusController does. */
-        send_text_http_error(fd, 502, "HTTP 流创建失败");
-    } else if (!sink_state.started) {
-        send_text_http_error(fd, 502, "direct http target client is offline");
+    } else {
+        int status = rc == -2 ? 504 : rc == -3 ? 404 : 502;
+        const char *message = rc == -2 ? "direct http response timeout"
+            : rc == -3 ? "direct http route is not configured"
+            : rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET ? ST_ADMIN_DIRECT_HTTP_RESET_BODY
+            /* The stream could not be created, answered as Java HttpSpecusController does. */
+            : rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT ? "HTTP 流创建失败"
+            : ADMIN_ROUTE_CLIENT_OFFLINE_TEXT;
+        /* direct_sink_on_reset logged the client's RST reason; it is never echoed to the caller. */
+        const char *failure = rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET && sink_state.reset_reason[0] != '\0'
+            ? sink_state.reset_reason : message;
+        if (!sink_state.started) {
+            send_text_http_error(fd, status, message);
+            record_direct_http_failure(client_name, route, &direct, status, message, failure, remote_address,
+                                       started_ms);
+        } else {
+            /* Cut short after its head went out: recorded with what was relayed, and why it ended. */
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(failure);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, remote_address, elapsed_ms);
+        }
     }
 
     if (rc != 0) {
@@ -15249,7 +16133,10 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const char *raw_request,
                                       const uint8_t *body,
                                       size_t body_len,
-                                      int strip_authorization)
+                                      const admin_request_trailers *trailers,
+                                      int strip_authorization,
+                                      const char *target_base_url,
+                                      long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0) {
         return 0;
@@ -15299,7 +16186,9 @@ static int handle_direct_http_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(client_name);
         free(route);
         free(relative_path);
@@ -15307,8 +16196,8 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct http header capture failed");
         return 1;
     }
-    admin_forward_direct_http(server, fd, method, client_name, route, relative_path, raw_query,
-                              headers, headers_len, body, body_len, NULL);
+    admin_forward_direct_http(server, fd, method, client_name, client_id, route, relative_path, raw_query,
+                              headers, headers_len, body, body_len, trailers, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
     free(route);
@@ -15417,6 +16306,65 @@ static int admin_collect_header_values(const char *request, const char *name, ch
         line = next + 2;
     }
     return 0;
+}
+
+/*
+ * The request trailers that cross to the client (http-route.md section 3; Java
+ * HttpSpecusController.declaredTrailerNames and flattenTrailers): the names every Trailer header
+ * declares, without Authorization when the route gate consumed it, and of the chunked body's
+ * trailer fields only the declared ones. Takes over nothing; *out is the caller's to free.
+ */
+static int admin_request_trailers_collect(const char *raw_request,
+                                          int strip_authorization,
+                                          char *const *received,
+                                          size_t received_len,
+                                          admin_request_trailers *out)
+{
+    memset(out, 0, sizeof(*out));
+    char **declarations = NULL;
+    size_t declaration_count = 0U;
+    if (admin_collect_header_values(raw_request, "Trailer", &declarations, &declaration_count) != 0) {
+        return -1;
+    }
+    char **candidates = NULL;
+    size_t candidate_count = 0U;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < declaration_count; ++i) {
+        const char *cursor = declarations[i];
+        for (;;) {
+            size_t len = strcspn(cursor, ",");
+            char **grown = (char **)realloc(candidates, (candidate_count + 1U) * sizeof(*grown));
+            if (grown == NULL) {
+                rc = -1;
+                break;
+            }
+            candidates = grown;
+            candidates[candidate_count] = admin_dup_range(cursor, len);
+            if (candidates[candidate_count] == NULL) {
+                rc = -1;
+                break;
+            }
+            ++candidate_count;
+            if (cursor[len] == '\0') {
+                break;
+            }
+            cursor += len + 1U;
+        }
+    }
+    free_header_array(declarations, declaration_count);
+    if (rc == 0) {
+        rc = direct_valid_trailer_names(candidates, candidate_count, strip_authorization,
+                                        &out->names, &out->names_len);
+    }
+    free_header_array(candidates, candidate_count);
+    if (rc == 0) {
+        rc = direct_declared_trailer_fields(received, received_len, out->names, out->names_len,
+                                            &out->fields, &out->fields_len);
+    }
+    if (rc != 0) {
+        admin_request_trailers_free(out);
+    }
+    return rc;
 }
 
 /*
@@ -15600,7 +16548,9 @@ static int admit_http_share_request(int fd,
         return 0;
     }
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
+    admission->client_id = resolution.client_id;
     snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
+    snprintf(admission->target_base_url, sizeof(admission->target_base_url), "%s", resolution.target_base_url);
     return 1;
 }
 
@@ -15630,14 +16580,17 @@ static void forward_http_share_websocket(st_admin_server *server,
     char **headers = NULL;
     size_t headers_len = 0U;
     if (accept_key == NULL || raw_query == NULL
-        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(raw_query);
         send_text_http_error(fd, 500, "direct websocket request build failed");
         return;
     }
-    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->route,
-                        admission->relative_path, raw_query, headers, headers_len, &admission->stream);
+    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->client_id,
+                        admission->route, admission->relative_path, raw_query, headers, headers_len,
+                        &admission->stream);
     free_header_array(headers, headers_len);
     free(raw_query);
 }
@@ -15648,6 +16601,7 @@ static void forward_http_share_request(st_admin_server *server,
                                        const char *raw_request,
                                        const uint8_t *body,
                                        size_t body_len,
+                                       const admin_request_trailers *trailers,
                                        admin_share_admission *admission)
 {
     if (server->direct_http_forward == NULL) {
@@ -15657,17 +16611,97 @@ static void forward_http_share_request(st_admin_server *server,
     char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
     char **headers = NULL;
     size_t headers_len = 0U;
-    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(raw_query);
         send_text_http_error(fd, 500, "direct http request build failed");
         return;
     }
     /* No Basic gate: Authorization belongs to the target and is relayed as it came. */
-    admin_forward_direct_http(server, fd, method, admission->client_name, admission->route,
-                              admission->relative_path, raw_query, headers, headers_len, body, body_len,
-                              admission);
+    admin_forward_direct_http(server, fd, method, admission->client_name, admission->client_id,
+                              admission->route, admission->relative_path, raw_query, headers, headers_len,
+                              body, body_len, trailers, admission);
     free_header_array(headers, headers_len);
     free(raw_query);
+}
+
+/*
+ * The object-storage bucket origin Java SecurityConfig adds to the portal policy when aliyun-oss is
+ * configured, so the browser may PUT to and preview from the bucket directly; empty otherwise.
+ */
+static void admin_portal_oss_origin(char *out, size_t out_len)
+{
+    out[0] = '\0';
+    const char *provider = getenv("SPECUS_OBJECT_STORAGE_PROVIDER");
+    const char *endpoint = getenv("SPECUS_OBJECT_STORAGE_ENDPOINT");
+    const char *bucket = getenv("SPECUS_OBJECT_STORAGE_BUCKET");
+    if (provider == NULL || endpoint == NULL || bucket == NULL) {
+        return;
+    }
+    while (isspace((unsigned char)*provider)) ++provider;
+    size_t provider_len = strlen(provider);
+    while (provider_len > 0U && isspace((unsigned char)provider[provider_len - 1U])) --provider_len;
+    if (provider_len != strlen("aliyun-oss") || admin_ascii_ncasecmp(provider, "aliyun-oss", provider_len) != 0) {
+        return;
+    }
+    while (isspace((unsigned char)*endpoint)) ++endpoint;
+    if (admin_ascii_ncasecmp(endpoint, "https://", 8U) == 0) {
+        endpoint += 8;
+    } else if (admin_ascii_ncasecmp(endpoint, "http://", 7U) == 0) {
+        endpoint += 7;
+    }
+    size_t host_len = strcspn(endpoint, "/");
+    while (host_len > 0U && isspace((unsigned char)endpoint[host_len - 1U])) --host_len;
+    while (isspace((unsigned char)*bucket)) ++bucket;
+    size_t bucket_len = strlen(bucket);
+    while (bucket_len > 0U && isspace((unsigned char)bucket[bucket_len - 1U])) --bucket_len;
+    if (host_len == 0U || bucket_len == 0U) {
+        return;
+    }
+    int written = snprintf(out, out_len, "https://%.*s.%.*s", (int)bucket_len, bucket, (int)host_len, endpoint);
+    if (written < 0 || (size_t)written >= out_len) {
+        out[0] = '\0';
+    }
+}
+
+/*
+ * The security headers of Java SecurityConfig's portal header writer (and Go securityHeaders) for
+ * the management pages; /http/ and /http-share/ are never served from here, their responses belong
+ * to the target application. Returns the header lines, each ending in CRLF, or NULL.
+ */
+static char *admin_portal_security_headers(void)
+{
+    char oss_origin[384];
+    admin_portal_oss_origin(oss_origin, sizeof(oss_origin));
+    const char *oss_space = oss_origin[0] == '\0' ? "" : " ";
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+                              "Content-Security-Policy: default-src 'self'; "
+                              "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com "
+                              "'sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=' "
+                              "'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
+                              "style-src 'self' 'unsafe-inline'; "
+                              "img-src 'self' blob: data: https://www.google-analytics.com "
+                              "https://*.googletagmanager.com%s%s; "
+                              "media-src 'self' blob: data:%s%s; "
+                              "object-src 'self' blob:; "
+                              "frame-src 'self' blob: https://challenges.cloudflare.com; "
+                              "font-src 'self' data:; "
+                              "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com "
+                              "https://*.analytics.google.com https://*.googletagmanager.com%s%s; "
+                              "form-action 'self'; "
+                              "frame-ancestors 'none'; "
+                              "base-uri 'self'\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "X-Frame-Options: DENY\r\n"
+                              "Referrer-Policy: strict-origin-when-cross-origin\r\n",
+                              oss_space, oss_origin, oss_space, oss_origin, oss_space, oss_origin);
+    if (rc != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
 }
 
 static int send_static_file(int fd, const char *method, const char *path, const char *static_root)
@@ -15688,17 +16722,21 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     if (file == NULL) {
         return 0;
     }
-    char header[512];
-    int header_len = snprintf(header,
-                              sizeof(header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: %s\r\n"
-                              "Cache-Control: no-cache\r\n"
-                              "X-Content-Type-Options: nosniff\r\n"
-                              "Content-Length: %lld\r\n"
-                              "\r\n",
-                              content_type,
-                              (long long)st.st_size);
+    char *security_headers = admin_portal_security_headers();
+    char header[4096];
+    int header_len = security_headers == NULL ? -1
+        : snprintf(header,
+                   sizeof(header),
+                   "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: %s\r\n"
+                   "Cache-Control: no-cache\r\n"
+                   "%s"
+                   "Content-Length: %lld\r\n"
+                   "\r\n",
+                   content_type,
+                   security_headers,
+                   (long long)st.st_size);
+    free(security_headers);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header)
         || send_all(fd, header, (size_t)header_len) != 0) {
         fclose(file);
@@ -15717,10 +16755,59 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     return 1;
 }
 
+/* Java HttpSpecusBodyLimitFilter keeps this much of a refused body for the HTTP detail. */
+#define ADMIN_REFUSED_BODY_CAPTURE (64U * 1024U)
+
+/* What a 413 of admin_read_request_body leaves for the record of the refused request. */
+typedef struct {
+    int capture;       /* in: keep the refused body's first ADMIN_REFUSED_BODY_CAPTURE bytes */
+    int too_large;     /* out: the body was refused for its size */
+    char *prefix;      /* out: the kept bytes, the caller's to free */
+    size_t prefix_len;
+} admin_body_refusal;
+
+/*
+ * The first bytes of a body whose Content-Length is over the limit, as Java
+ * HttpSpecusBodyLimitFilter reads them before it answers: what came with the header block, then
+ * what the socket brings within two seconds, up to ADMIN_REFUSED_BODY_CAPTURE bytes in all.
+ */
+static void admin_capture_refused_body(int fd, const char *received, size_t received_len,
+                                       size_t declared_len, admin_body_refusal *refusal)
+{
+    size_t wanted = declared_len < ADMIN_REFUSED_BODY_CAPTURE ? declared_len : ADMIN_REFUSED_BODY_CAPTURE;
+    char *prefix = (char *)malloc(wanted + 1U);
+    if (prefix == NULL) {
+        return;
+    }
+    size_t used = received_len < wanted ? received_len : wanted;
+    memcpy(prefix, received, used);
+    long long deadline = admin_now_ms() + 2000LL;
+    while (used < wanted) {
+        long long remaining = deadline - admin_now_ms();
+        struct pollfd ready = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (remaining <= 0 || poll(&ready, 1, (int)remaining) <= 0) {
+            break;
+        }
+        ssize_t got = recv(fd, prefix + used, wanted - used, 0);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            break;
+        }
+        used += (size_t)got;
+    }
+    prefix[used] = '\0';
+    refusal->prefix = prefix;
+    refusal->prefix_len = used;
+}
+
 /*
  * Reads the body that follows the header block in request (len bytes received so far), by
  * Content-Length or chunked and within the limit of the path. 0 with the body (in request or in
- * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out.
+ * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out. A chunked
+ * body's trailer fields come back in *trailers_out, the caller's to free. When refusal is given, a
+ * 413 is reported there with the refused body's first bytes if refusal->capture asks for them.
  */
 static int admin_read_request_body(int fd,
                                    const char *request,
@@ -15728,12 +16815,17 @@ static int admin_read_request_body(int fd,
                                    const char *path,
                                    const char **body_out,
                                    size_t *body_len_out,
-                                   char **body_buffer_out)
+                                   char **body_buffer_out,
+                                   char ***trailers_out,
+                                   size_t *trailers_len_out,
+                                   admin_body_refusal *refusal)
 {
     const char *body = strstr(request, "\r\n\r\n");
     size_t available_body_len = 0;
     size_t content_length = 0;
     char *body_buffer = NULL;
+    *trailers_out = NULL;
+    *trailers_len_out = 0U;
     if (body != NULL) {
         body += 4;
         available_body_len = (size_t)(request + len - body);
@@ -15758,9 +16850,18 @@ static int admin_read_request_body(int fd,
                                                : "仅支持 chunked Transfer-Encoding");
                 return -1;
             }
+            size_t refused_capture = refusal != NULL && refusal->capture ? ADMIN_REFUSED_BODY_CAPTURE : 0U;
             int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
-                                                     &body_buffer, &content_length);
+                                                     refused_capture, &body_buffer, &content_length,
+                                                     trailers_out, trailers_len_out);
             if (chunked_rc != 0) {
+                if (chunked_rc == -2 && refusal != NULL) {
+                    refusal->too_large = 1;
+                    refusal->prefix = body_buffer;
+                    refusal->prefix_len = content_length;
+                } else {
+                    free(body_buffer);
+                }
                 send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
                                      chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
                 return -1;
@@ -15770,6 +16871,17 @@ static int admin_read_request_body(int fd,
         } else {
             int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
             if (length_rc == -2) {
+                if (refusal != NULL) {
+                    refusal->too_large = 1;
+                    if (refusal->capture) {
+                        char *declared = admin_extract_header_value(request, "Content-Length");
+                        unsigned long long declared_len = declared == NULL ? 0ULL : strtoull(declared, NULL, 10);
+                        free(declared);
+                        admin_capture_refused_body(fd, body, available_body_len,
+                                                   declared_len > SIZE_MAX ? SIZE_MAX : (size_t)declared_len,
+                                                   refusal);
+                    }
+                }
                 send_text_http_error(fd, 413, "HTTP 请求体超过限制");
                 return -1;
             }
@@ -15830,10 +16942,23 @@ static void handle_http_share_client(st_admin_server *server,
         const char *body = NULL;
         size_t body_len = 0U;
         char *body_buffer = NULL;
-        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer) == 0) {
-            forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
-                                       &admission);
+        char **received_trailers = NULL;
+        size_t received_trailers_len = 0U;
+        admin_request_trailers trailers;
+        memset(&trailers, 0, sizeof(trailers));
+        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer,
+                                    &received_trailers, &received_trailers_len, NULL) == 0) {
+            /* No Basic gate on a share: an Authorization trailer belongs to the target as well. */
+            if (admin_request_trailers_collect(request, 0, received_trailers, received_trailers_len,
+                                               &trailers) != 0) {
+                send_text_http_error(fd, 500, "direct http request build failed");
+            } else {
+                forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
+                                           &trailers, &admission);
+            }
         }
+        admin_request_trailers_free(&trailers);
+        free_header_array(received_trailers, received_trailers_len);
         free(body_buffer);
     }
     admin_share_stream_unregister(&admission.stream);
@@ -15842,6 +16967,7 @@ static void handle_http_share_client(st_admin_server *server,
 
 static void handle_client(st_admin_server *server, int fd)
 {
+    long long started_ms = admin_now_ms();
     char request[8192];
     ssize_t len = recv(fd, request, sizeof(request) - 1U, 0);
     if (len <= 0) {
@@ -15879,8 +17005,12 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     int strip_direct_authorization = 0;
-    if (strncmp(path, "/http/", 6) == 0) {
-        int auth_result = authorize_direct_http_route(fd, path, request);
+    char direct_target_base_url[512] = "";
+    long long direct_client_id = 0;
+    int direct_path = strncmp(path, "/http/", 6) == 0;
+    if (direct_path) {
+        int auth_result = authorize_direct_http_route(fd, method, path, request, started_ms, direct_target_base_url,
+                                                      sizeof(direct_target_base_url), &direct_client_id);
         if (auth_result < 0) {
             close(fd);
             return;
@@ -15890,11 +17020,39 @@ static void handle_client(st_admin_server *server, int fd)
     const char *body = NULL;
     size_t available_body_len = 0;
     char *body_buffer = NULL;
+    char **received_trailers = NULL;
+    size_t received_trailers_len = 0U;
+    admin_body_refusal refusal;
+    memset(&refusal, 0, sizeof(refusal));
+    refusal.capture = direct_path && admin_direct_route_captured(path);
     if (admin_read_request_body(fd, request, (size_t)len, path, &body, &available_body_len,
-                                &body_buffer) != 0) {
+                                &body_buffer, &received_trailers, &received_trailers_len, &refusal) != 0) {
+        if (direct_path && refusal.too_large) {
+            /* Java HttpSpecusBodyLimitFilter records the refusal with the headers and the body's start. */
+            char **headers = NULL;
+            size_t headers_len = 0U;
+            if (admin_collect_headers(request, strip_direct_authorization, &headers, &headers_len) == 0) {
+                record_direct_http_refusal(fd, method, path, headers, headers_len, (const uint8_t *)refusal.prefix,
+                                           refusal.prefix_len, 413, "HTTP 请求体超过限制", started_ms);
+            }
+            free_header_array(headers, headers_len);
+        }
+        free(refusal.prefix);
         close(fd);
         return;
     }
+    admin_request_trailers direct_trailers;
+    memset(&direct_trailers, 0, sizeof(direct_trailers));
+    if (strncmp(path, "/http/", 6) == 0
+        && admin_request_trailers_collect(request, strip_direct_authorization, received_trailers,
+                                          received_trailers_len, &direct_trailers) != 0) {
+        free_header_array(received_trailers, received_trailers_len);
+        free(body_buffer);
+        send_text_http_error(fd, 500, "direct http request build failed");
+        close(fd);
+        return;
+    }
+    free_header_array(received_trailers, received_trailers_len);
 
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, request_remote_address);
@@ -15904,17 +17062,20 @@ static void handle_client(st_admin_server *server, int fd)
                                              path,
                                              request,
                                              request_remote_address)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
 
     if (handle_connection_websocket_request(fd, method, path, request)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
     if (handle_client_messages_websocket_request(fd, method, path, request)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
@@ -15924,26 +17085,38 @@ static void handle_client(st_admin_server *server, int fd)
                                              method,
                                              path,
                                              request,
-                                             strip_direct_authorization)) {
+                                             strip_direct_authorization,
+                                             direct_target_base_url,
+                                             direct_client_id)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
-    if (handle_direct_http_request(server,
-                                   fd,
-                                   method,
-                                   path,
-                                   request,
-                                   (const uint8_t *)body,
-                                   available_body_len,
-                                   strip_direct_authorization)) {
+    int direct_handled = handle_direct_http_request(server,
+                                                    fd,
+                                                    method,
+                                                    path,
+                                                    request,
+                                                    (const uint8_t *)body,
+                                                    available_body_len,
+                                                    &direct_trailers,
+                                                    strip_direct_authorization,
+                                                    direct_target_base_url,
+                                                    direct_client_id);
+    admin_request_trailers_free(&direct_trailers);
+    if (direct_handled) {
         free(body_buffer);
         close(fd);
         return;
     }
     const char *database_path = admin_database_path();
+    char *package_range = admin_extract_header_value(request, "Range");
+    char *package_if_none_match = admin_extract_header_value(request, "If-None-Match");
     int package_download_response = st_client_package_send_download(
-        fd, method, path, database_path, request_remote_address);
+        fd, method, path, database_path, request_remote_address, package_range, package_if_none_match);
+    free(package_range);
+    free(package_if_none_match);
     if (package_download_response != 0) {
         free(body_buffer);
         close(fd);

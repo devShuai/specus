@@ -16,6 +16,7 @@
 #include "stream_tombstones.h"
 #include "stun_turn.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -201,6 +202,12 @@ struct specus_session {
     int control_fd;
     st_tls_connection *tls_connection;
     int is_data_connection;
+    /*
+     * Settled by the login before the connection is published, and fixed from then on but for the
+     * route set a runtime NAT_CONTROL push replaces (apply_runtime_route_config): mappings,
+     * http_routes, their counts and nat_control_json are read and written under map_lock. The
+     * rest, the account (client_id, tenant_id, client_name) included, is read without a lock.
+     */
     server_config config;
     pthread_mutex_t send_lock;
     pthread_mutex_t map_lock;
@@ -211,8 +218,13 @@ struct specus_session {
     specus_listener *listeners;
     direct_http_pending *direct_pending;
     int active;
-    /* Set, under active_session_lock, when a newer login of the same client took this role over. */
-    int replaced;
+    /*
+     * Set, under active_session_lock, when the connection was taken out of service: by a newer
+     * login of the same client (REPLACED_BY_NEW_LOGIN) or by an admin who disabled, renamed or
+     * deleted the client (ADMIN_DISABLED, ADMIN_RENAMED, ADMIN_DELETED). It is the disconnect
+     * reason the connection is recorded with.
+     */
+    const char *displaced_reason;
     size_t references;
     uint32_t next_stream_id;
     /* Recently closed NAT streams of this data connection, guarded by map_lock. */
@@ -224,6 +236,12 @@ struct specus_session {
     struct specus_session *active_next;
     struct specus_session *live_next;
 };
+
+/* The connections a login took out of service, each still referenced by that login. */
+typedef struct {
+    specus_session *sessions[ST_MAX_DISPLACED_SESSIONS];
+    size_t count;
+} displaced_sessions;
 
 typedef struct {
     int fd;
@@ -261,6 +279,7 @@ static size_t live_connection_count = 0U;
 static int server_stopping = 0;
 
 static char *json_http_request(const st_direct_http_request *request);
+static char *json_http_request_fin(const st_direct_http_request *request, int *failed);
 static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason);
 static int send_window_update(specus_session *session, uint32_t stream_id, size_t credit);
@@ -578,13 +597,27 @@ static int load_database_config(server_config *config, const char *database_path
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return -1;
     }
+    /*
+     * A logged-in session names its account by id: the name it logged in under may since have
+     * passed to another account by a rename or a delete and re-create. Only the static startup
+     * configuration names its account by name.
+     */
     st_storage_client client;
-    if (st_storage_get_client_by_name(database_path, config->client_name, &client) != 0 || !client.enabled) {
-        fprintf(stderr, "client not found or disabled in database: %s\n", config->client_name);
+    int by_id = config->client_session_db_backed && config->client_id > 0;
+    if ((by_id ? st_storage_get_client(database_path, config->client_id, &client)
+               : st_storage_get_client_by_name(database_path, config->client_name, &client)) != 0
+        || !client.enabled) {
+        if (by_id) {
+            fprintf(stderr, "client not found or disabled in database: id=%lld\n", (long long)config->client_id);
+        } else {
+            fprintf(stderr, "client not found or disabled in database: %s\n", config->client_name);
+        }
         return -1;
     }
     config->client_id = client.id;
-    if (copy_config_string(config->tenant_id,
+    if (copy_config_string(config->client_name, sizeof(config->client_name), "client_account.client_name",
+                           client.client_name) != 0
+        || copy_config_string(config->tenant_id,
                            sizeof(config->tenant_id),
                            "client_account.tenant_id",
                            client.tenant_id[0] == '\0' ? "default" : client.tenant_id) != 0) {
@@ -1091,8 +1124,9 @@ static void record_tcp_frame(specus_session *session,
                              const uint8_t *data,
                              size_t data_len)
 {
+    /* As Java: SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED and the mapping's own switch, both. */
     if (session == NULL || conn == NULL || data == NULL || data_len == 0
-        || session->config.database_path[0] == '\0') {
+        || session->config.database_path[0] == '\0' || !st_traffic_capture_enabled()) {
         return;
     }
     tcp_mapping mapping_copy;
@@ -1193,19 +1227,28 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
     return 0;
 }
 
-static int session_send_packet(specus_session *session, st_buffer *packet)
+/* Writes a packet on a connection whose send_lock the caller already holds. */
+static int session_send_packet_locked(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
-    if (packet->data != NULL) {
-        pthread_mutex_lock(&session->send_lock);
-        if (session->control_fd >= 0) {
-            rc = session->tls_connection == NULL
-                ? send_all(session->control_fd, packet->data, packet->len)
-                : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
-        }
-        pthread_mutex_unlock(&session->send_lock);
+    if (packet->data != NULL && session->control_fd >= 0) {
+        rc = session->tls_connection == NULL
+            ? send_all(session->control_fd, packet->data, packet->len)
+            : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
     }
     st_buffer_free(packet);
+    return rc;
+}
+
+static int session_send_packet(specus_session *session, st_buffer *packet)
+{
+    if (packet->data == NULL) {
+        st_buffer_free(packet);
+        return -1;
+    }
+    pthread_mutex_lock(&session->send_lock);
+    int rc = session_send_packet_locked(session, packet);
+    pthread_mutex_unlock(&session->send_lock);
     return rc;
 }
 
@@ -1482,6 +1525,18 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     return violation ? -1 : 1;
 }
 
+/*
+ * Whether a data connection may serve a request the public entry let in for client_id (0 when no
+ * account record was involved). Connections are found by name, and a name can pass to another
+ * account by a rename or a delete and re-create. The admin's change closes the old account's
+ * connections (close_client_connections); this refuses one that outlived it. client_account ids
+ * are never handed out twice (AUTOINCREMENT), so two accounts of one name never share an id.
+ */
+static int config_serves_account(const server_config *config, long long client_id)
+{
+    return client_id <= 0 || config->client_id == client_id;
+}
+
 static int config_has_http_route(const server_config *config, const char *route)
 {
     if (config == NULL || route == NULL) {
@@ -1633,14 +1688,15 @@ static int control_session_live(long long client_session_id)
 }
 
 /*
- * Retires a connection a newer login has taken over: it leaves the routing list at once, so no
- * request is routed to it again, and its socket is shut down so its own thread unwinds and frees
- * its NAT streams, pending Direct HTTP requests and listeners. The caller keeps a reference until
- * it is done with the session.
+ * Retires a connection a newer login has taken over, or one of a client an admin disabled,
+ * renamed or deleted: it leaves the routing list at once, so no request is routed to it again,
+ * and its socket is shut down so its own thread unwinds, frees its NAT streams, pending Direct
+ * HTTP requests and listeners, and records reason as its disconnect reason. The caller keeps a
+ * reference until it is done with the session.
  */
-static void displace_session_locked(specus_session *session)
+static void displace_session_locked(specus_session *session, const char *reason)
 {
-    session->replaced = 1;
+    session->displaced_reason = reason;
     ++session->references;
     shutdown(session->control_fd, SHUT_RDWR);
     active_session_remove_locked(session);
@@ -1674,11 +1730,15 @@ static void release_session_listeners(specus_session *session)
  * also retires the client's data connection, which belongs to the pair it just superseded. A data
  * login re-checks its control under the same lock that publishes it, so a control replaced while
  * the data login was being verified cannot leave a data connection bound to a session that is gone.
+ *
+ * The caller holds session->send_lock from before this publishes the connection until its login
+ * response is written (see client_thread). The connections it displaces are handed back, each with
+ * a reference, for release_displaced_sessions once send_lock is let go: dropping a reference takes
+ * active_session_lock, and a published connection's send_lock is never held while taking it.
  */
-static int activate_session(specus_session *session, const char **reason)
+static int activate_session(specus_session *session, displaced_sessions *displaced, const char **reason)
 {
-    specus_session *displaced[ST_MAX_DISPLACED_SESSIONS];
-    size_t displaced_count = 0U;
+    displaced->count = 0U;
     pthread_mutex_lock(&active_session_lock);
     if (session->is_data_connection) {
         specus_session *control = active_session_find_role_locked(session->config.client_name, 0);
@@ -1694,9 +1754,9 @@ static int activate_session(specus_session *session, const char **reason)
         int same_client = strcmp(cursor->config.client_name, session->config.client_name) == 0;
         int same_role = cursor->is_data_connection == session->is_data_connection;
         if (cursor != session && same_client && (same_role || !session->is_data_connection)) {
-            displace_session_locked(cursor);
-            if (displaced_count < ST_MAX_DISPLACED_SESSIONS) {
-                displaced[displaced_count++] = cursor;
+            displace_session_locked(cursor, "REPLACED_BY_NEW_LOGIN");
+            if (displaced->count < ST_MAX_DISPLACED_SESSIONS) {
+                displaced->sessions[displaced->count++] = cursor;
             } else {
                 --cursor->references;
             }
@@ -1706,18 +1766,79 @@ static int activate_session(specus_session *session, const char **reason)
     active_session_add_locked(session);
     pthread_mutex_unlock(&active_session_lock);
 
-    for (size_t i = 0; i < displaced_count; ++i) {
+    for (size_t i = 0; i < displaced->count; ++i) {
+        specus_session *old = displaced->sessions[i];
         printf("[%s] replaced by new login client=%s remote=%s\n",
-               displaced[i]->is_data_connection ? "data" : "control",
-               displaced[i]->config.client_name,
-               displaced[i]->remote);
-        if (displaced[i]->is_data_connection) {
-            release_session_listeners(displaced[i]);
+               old->is_data_connection ? "data" : "control",
+               old->config.client_name,
+               old->remote);
+        /* Under the new connection's send_lock, which is fine: no thread sends while holding a
+         * map_lock, so none can hold this one and wait for that send_lock. */
+        if (old->is_data_connection) {
+            release_session_listeners(old);
         }
-        session_reference_release(displaced[i]);
     }
     *reason = NULL;
     return 0;
+}
+
+/* Drops the references activate_session kept on the connections a login displaced. */
+static void release_displaced_sessions(displaced_sessions *displaced)
+{
+    for (size_t i = 0; i < displaced->count; ++i) {
+        session_reference_release(displaced->sessions[i]);
+    }
+    displaced->count = 0U;
+}
+
+/*
+ * An admin disabled, renamed or deleted the client account, as Go's management kick and Java
+ * ClientAccountService.closeOnlineChannel handle it: every connection that logged in under its
+ * name is displaced with that reason, so no session keeps serving TCP mappings or HTTP routes
+ * under a name or a route set the server no longer has. It runs under the control admission lock:
+ * a control login verified against the account before the change is published before this looks,
+ * and one verified after it is refused by the account check or, after a rename, bound under the new
+ * name, so none slips through under the old one. A data login re-checks its control when it is
+ * published and finds it gone.
+ */
+static int close_client_connections(void *ctx, const char *client_name, const char *reason)
+{
+    (void)ctx;
+    if (client_name == NULL || *client_name == '\0' || reason == NULL) {
+        return 0;
+    }
+    specus_session *closed[ST_MAX_DISPLACED_SESSIONS];
+    size_t closed_count = 0U;
+    pthread_mutex_lock(&control_admission_lock);
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *cursor = active_sessions;
+    while (cursor != NULL) {
+        specus_session *next = cursor->active_next;
+        if (strcmp(cursor->config.client_name, client_name) == 0) {
+            displace_session_locked(cursor, reason);
+            if (closed_count < ST_MAX_DISPLACED_SESSIONS) {
+                closed[closed_count++] = cursor;
+            } else {
+                --cursor->references;
+            }
+        }
+        cursor = next;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    pthread_mutex_unlock(&control_admission_lock);
+
+    for (size_t i = 0; i < closed_count; ++i) {
+        printf("[%s] closed by admin client=%s remote=%s reason=%s\n",
+               closed[i]->is_data_connection ? "data" : "control",
+               closed[i]->config.client_name,
+               closed[i]->remote,
+               reason);
+        if (closed[i]->is_data_connection) {
+            release_session_listeners(closed[i]);
+        }
+        session_reference_release(closed[i]);
+    }
+    return (int)closed_count;
 }
 
 /* Returns -1 once shutdown has begun, so a connection accepted during the drain is refused. */
@@ -1853,8 +1974,17 @@ static int direct_http_forward(void *ctx,
         return -1;
     }
     pthread_mutex_lock(&session->map_lock);
+    int same_account = config_serves_account(&session->config, request->client_id);
+    long long session_client_id = session->config.client_id;
     int route_configured = config_has_http_route(&session->config, request->route);
     pthread_mutex_unlock(&session->map_lock);
+    if (!same_account) {
+        /* Not this account's client: answered as offline, never forwarded. */
+        fprintf(stderr, "[direct-http] data connection of client=%s is account %lld, not %lld\n",
+                client_name, session_client_id, request->client_id);
+        session_reference_release(session);
+        return -1;
+    }
     if (!route_configured) {
         session_reference_release(session);
         return -3;
@@ -1927,9 +2057,15 @@ static int direct_http_forward(void *ctx,
         }
         offset += chunk_len;
     }
+    int fin_failed = 0;
+    char *fin_json = json_http_request_fin(request, &fin_failed);
+    if (fin_failed) {
+        goto failed;
+    }
     packet = st_protocol_encode_nat_message(ST_NAT_FIN, 0U,
                                             pending.stream_id, 0U,
-                                            NULL, NULL, 0U);
+                                            fin_json, NULL, 0U);
+    free(fin_json);
     if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
         goto failed;
     }
@@ -2132,6 +2268,7 @@ static void connectivity_probe(void *ctx,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
+    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -2193,10 +2330,12 @@ static void connectivity_probe(void *ctx,
         }
     }
 
-    pthread_mutex_lock(&session->direct_lock);
-    direct_pending_remove(session, &pending);
-    direct_pending_free_events(&pending);
-    pthread_mutex_unlock(&session->direct_lock);
+    /*
+     * Tombstoned like a public stream: the device's own RST may cross the one sent above, or follow
+     * it when the device fails the request it was told to drop. Either is a stale frame then, not an
+     * RST for a never-opened stream that would close the whole data connection.
+     */
+    direct_pending_retire(session, &pending);
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
@@ -2213,8 +2352,17 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
         return -1;
     }
     pthread_mutex_lock(&session->map_lock);
+    int same_account = config_serves_account(&session->config, request->client_id);
+    long long session_client_id = session->config.client_id;
     int route_configured = config_has_http_route(&session->config, request->route);
     pthread_mutex_unlock(&session->map_lock);
+    if (!same_account) {
+        /* Not this account's client: answered as offline, never upgraded. */
+        fprintf(stderr, "[ws-specus] data connection of client=%s is account %lld, not %lld\n",
+                request->client_name, session_client_id, request->client_id);
+        session_reference_release(session);
+        return -1;
+    }
     if (!route_configured) {
         session_reference_release(session);
         return -3;
@@ -2362,9 +2510,15 @@ static int read_frame(specus_session *session,
     return 1;
 }
 
-static int reload_config_for_client_session(server_config *config, const st_storage_client_session *client_session)
+/*
+ * Loads the configuration of the account the session's token was issued for, under the account's
+ * current name: the name the session was created under may since belong to another account.
+ */
+static int reload_config_for_client_session(server_config *config,
+                                            const st_storage_client_session *client_session,
+                                            const st_storage_client *client)
 {
-    if (config == NULL || client_session == NULL || config->database_path[0] == '\0') {
+    if (config == NULL || client_session == NULL || client == NULL || config->database_path[0] == '\0') {
         return -1;
     }
     char database_path[sizeof(config->database_path)];
@@ -2378,15 +2532,15 @@ static int reload_config_for_client_session(server_config *config, const st_stor
     config->http_route_count = 0;
     if (copy_config_string(config->client_name,
                            sizeof(config->client_name),
-                           "client_session.client_name",
-                           client_session->client_name) != 0
+                           "client_account.client_name",
+                           client->client_name) != 0
         || copy_config_string(config->tenant_id,
                               sizeof(config->tenant_id),
-                              "client_session.tenant_id",
-                              client_session->tenant_id[0] == '\0' ? "default" : client_session->tenant_id) != 0) {
+                              "client_account.tenant_id",
+                              client->tenant_id[0] == '\0' ? "default" : client->tenant_id) != 0) {
         return -1;
     }
-    config->client_id = client_session->client_id;
+    config->client_id = client->id;
     config->client_session_id = client_session->id;
     config->peer_service_discovery_version = client_session->peer_service_discovery_version;
     config->client_http_route_version = client_session->client_http_route_version;
@@ -2413,7 +2567,16 @@ static int prepare_runtime_route_config(const server_config *current, server_con
     refreshed->http_route_count = 0U;
     refreshed->nat_control_json = NULL;
     refreshed->owns_nat_control_json = 0;
+    /*
+     * Reloading resolves the account again: by id for a token login, by name for the static
+     * configuration, and under the account's current name either way. A published connection keeps
+     * the account, tenant and name it logged in with: one whose account was renamed, or whose name
+     * now resolves to another account, is being closed and gets no other name's routes.
+     */
     if (load_database_config(refreshed, refreshed->database_path) != 0
+        || refreshed->client_id != current->client_id
+        || strcmp(refreshed->tenant_id, current->tenant_id) != 0
+        || strcmp(refreshed->client_name, current->client_name) != 0
         || parse_tcp_mappings(refreshed) != 0
         || parse_http_routes(refreshed) != 0
         || build_nat_control_json(refreshed) != 0) {
@@ -2425,6 +2588,7 @@ static int prepare_runtime_route_config(const server_config *current, server_con
     return 0;
 }
 
+/* Replaces a published connection's route set; its account stays as it logged in. */
 static void apply_runtime_route_config(specus_session *session, server_config *refreshed)
 {
     char *old_json = NULL;
@@ -2432,11 +2596,6 @@ static void apply_runtime_route_config(specus_session *session, server_config *r
     if (session->config.owns_nat_control_json) {
         old_json = session->config.nat_control_json;
     }
-    session->config.client_id = refreshed->client_id;
-    snprintf(session->config.tenant_id,
-             sizeof(session->config.tenant_id),
-             "%s",
-             refreshed->tenant_id);
     memcpy(session->config.mappings, refreshed->mappings, sizeof(refreshed->mappings));
     session->config.mapping_count = refreshed->mapping_count;
     memcpy(session->config.http_routes, refreshed->http_routes, sizeof(refreshed->http_routes));
@@ -2451,6 +2610,12 @@ static void apply_runtime_route_config(specus_session *session, server_config *r
 
 static pthread_mutex_t runtime_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Reloads a client's routes into its published control and data connections, then sends the
+ * control the new NAT_CONTROL. The route set is replaced before the send waits for send_lock, so
+ * on a control whose login is still writing its response and first NAT_CONTROL (client_thread)
+ * this one goes out after them.
+ */
 static int push_runtime_nat_control(void *ctx, long long client_id, const char *client_name)
 {
     (void)ctx;
@@ -2510,8 +2675,8 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
         } else {
             printf("[nat-control] runtime push client=%s tcp=%zu http=%zu\n",
                    client_name,
-                   control->config.mapping_count,
-                   control->config.http_route_count);
+                   refreshed_control.mapping_count,
+                   refreshed_control.http_route_count);
         }
     } else {
         st_buffer_free(&packet);
@@ -2730,6 +2895,7 @@ typedef struct {
     time_t next_product_metrics_sweep;
     time_t next_catalog_expiry;
     time_t next_share_sweep;
+    time_t next_connection_archive;
 } peer_mesh_maintenance_state;
 
 /* The workbench retention sweep runs at the first maintenance tick, then hourly. */
@@ -2747,6 +2913,28 @@ static time_t maintenance_interval_seconds(const char *name, long long fallback_
     long long milliseconds = parsed < 1000LL ? 1000LL : (long long)parsed;
     long long seconds = (milliseconds + 999LL) / 1000LL;
     return seconds > (long long)INT_MAX ? (time_t)INT_MAX : (time_t)seconds;
+}
+
+/*
+ * Java ConnectionArchiveService: detail older than SPECUS_CONNECTION_DETAIL_RETENTION_DAYS (60)
+ * UTC days is rolled up into monthly totals every SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS (an hour),
+ * the first run one interval after start; a retention of 0 or less turns the archive off.
+ */
+static time_t connection_archive_interval_seconds(void)
+{
+    return maintenance_interval_seconds("SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS", 3600000LL);
+}
+
+static void run_connection_archive(const char *database_path)
+{
+    int64_t retention_days = 60;
+    if (env_i64_range("SPECUS_CONNECTION_DETAIL_RETENTION_DAYS", 60, INT_MIN, INT_MAX, &retention_days) != 0) {
+        retention_days = 60;
+    }
+    if (st_storage_archive_expired_connections(database_path, (int)retention_days,
+                                               (long long)time(NULL)) != 0) {
+        fprintf(stderr, "[archive] connection archive failed\n");
+    }
 }
 
 static void *peer_mesh_maintenance_thread(void *unused)
@@ -2826,6 +3014,11 @@ static void *peer_mesh_maintenance_thread(void *unused)
             (void)st_product_metrics_sweep(peer_mesh_maintenance.database_path);
             peer_mesh_maintenance.next_product_metrics_sweep = now + ST_PRODUCT_METRICS_SWEEP_INTERVAL_SECONDS;
         }
+        if (now >= peer_mesh_maintenance.next_connection_archive) {
+            run_connection_archive(peer_mesh_maintenance.database_path);
+            /* A fixed delay after the run, as Java's @Scheduled(fixedDelay). */
+            peer_mesh_maintenance.next_connection_archive = time(NULL) + connection_archive_interval_seconds();
+        }
         pthread_mutex_lock(&peer_mesh_maintenance.lock);
     }
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
@@ -2850,6 +3043,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
     peer_mesh_maintenance.next_catalog_expiry = now + 30;
     /* The first share sweep runs right after start, then every 30 seconds. */
     peer_mesh_maintenance.next_share_sweep = now + 1;
+    peer_mesh_maintenance.next_connection_archive = now + connection_archive_interval_seconds();
     snprintf(peer_mesh_maintenance.database_path,
              sizeof(peer_mesh_maintenance.database_path), "%s", database_path);
     if (pthread_create(&peer_mesh_maintenance.thread, NULL,
@@ -2880,6 +3074,7 @@ static void peer_mesh_maintenance_stop(void)
     peer_mesh_maintenance.next_product_metrics_sweep = 0;
     peer_mesh_maintenance.next_catalog_expiry = 0;
     peer_mesh_maintenance.next_share_sweep = 0;
+    peer_mesh_maintenance.next_connection_archive = 0;
     pthread_mutex_unlock(&peer_mesh_maintenance.lock);
 }
 
@@ -2937,8 +3132,18 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "客户端认证存储暂不可用";
         return 0;
     }
-    if (strcmp(request->client_name, client_session.client_name) != 0) {
-        *reason = "客户端访问令牌无效";
+    /*
+     * The token belongs to the account it was issued for, never to a name: a name passes to another
+     * account when the admin renames or deletes this one and creates a new account under it. The
+     * account is resolved by id and tenant, as Java and .NET resolve it, and the connection is bound
+     * under the account's current name whatever name the request carries
+     * (protocol/spec/client-auth.md).
+     */
+    st_storage_client client;
+    if (st_storage_get_client(config->database_path, client_session.client_id, &client) != 0
+        || strcmp(client.tenant_id[0] == '\0' ? "default" : client.tenant_id,
+                  client_session.tenant_id[0] == '\0' ? "default" : client_session.tenant_id) != 0) {
+        *reason = "客户端不存在";
         return 0;
     }
     if (session->is_data_connection) {
@@ -2947,7 +3152,7 @@ static int verify_database_login(specus_session *session, const st_login_request
             return 0;
         }
         pthread_mutex_lock(&active_session_lock);
-        specus_session *control = active_session_find_role_locked(request->client_name, 0);
+        specus_session *control = active_session_find_role_locked(client.client_name, 0);
         int matching_control = control != NULL
             && control->config.client_session_id == client_session.id;
         pthread_mutex_unlock(&active_session_lock);
@@ -2990,10 +3195,8 @@ static int verify_database_login(specus_session *session, const st_login_request
         }
     }
 
-    st_storage_client client;
     st_storage_client_credential credential;
-    if (st_storage_get_client(config->database_path, client_session.client_id, &client) != 0
-        || st_storage_get_client_credential(config->database_path, client_session.credential_id, &credential) != 0) {
+    if (st_storage_get_client_credential(config->database_path, client_session.credential_id, &credential) != 0) {
         *reason = "客户端不存在";
         return 0;
     }
@@ -3045,7 +3248,7 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "客户端会话状态更新失败";
         return 0;
     }
-    if (reload_config_for_client_session(config, &client_session) != 0) {
+    if (reload_config_for_client_session(config, &client_session, &client) != 0) {
         /* A failed re-login must not take a session offline that an older control still carries. */
         if (!session->is_data_connection && !control_session_live(client_session.id)) {
             (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
@@ -3361,11 +3564,42 @@ static char *json_http_request(const st_direct_http_request *request)
                                       request->headers_len, &first);
     }
     if (rc == 0) {
-        rc = sb_appendf(&builder, ",\"contentLength\":%zu,\"trailerNames\":[]}",
-                        request->body_len);
+        rc = sb_appendf(&builder, ",\"contentLength\":%zu", request->body_len);
+    }
+    /* Only when the request declared trailers (http-route.md section 3), as Java sends it. */
+    if (rc == 0 && request->trailer_names_len > 0U) {
+        rc = append_json_string_array(&builder, "trailerNames", request->trailer_names,
+                                      request->trailer_names_len, &first);
+    }
+    if (rc == 0) {
+        rc = sb_append(&builder, "}");
     }
     if (rc != 0) {
         free(builder.data);
+        return NULL;
+    }
+    return sb_finish(&builder);
+}
+
+/* The request FIN's metadata: {"trailers":[...]} with the declared trailer fields, or NULL. */
+static char *json_http_request_fin(const st_direct_http_request *request, int *failed)
+{
+    *failed = 0;
+    if (request->trailers_len == 0U) {
+        return NULL;
+    }
+    string_builder builder = {0};
+    int first = 1;
+    int rc = sb_append(&builder, "{");
+    if (rc == 0) {
+        rc = append_json_string_array(&builder, "trailers", request->trailers, request->trailers_len, &first);
+    }
+    if (rc == 0) {
+        rc = sb_append(&builder, "}");
+    }
+    if (rc != 0) {
+        free(builder.data);
+        *failed = 1;
         return NULL;
     }
     return sb_finish(&builder);
@@ -4434,6 +4668,58 @@ static void session_shutdown(specus_session *session)
     }
 }
 
+/*
+ * SPECUS_LOGIN_TEST_GATE_DIR, honoured outside production only, holds every successful login
+ * between publishing its connection and writing its response, with send_lock held, as a slow
+ * scheduler could: the login creates <dir>/<role>-published, waits for <dir>/<role>-release (at
+ * most LOGIN_TEST_GATE_MAX_WAIT_MS) and removes both, role being "control" or "data". The session
+ * lifecycle tests use it to send on a connection inside that window.
+ */
+#define LOGIN_TEST_GATE_MAX_WAIT_MS 30000
+static char login_test_gate_dir[256];
+
+static int configure_login_test_gate(void)
+{
+    const char *dir = getenv("SPECUS_LOGIN_TEST_GATE_DIR");
+    if (dir == NULL || *dir == '\0') {
+        return 0;
+    }
+    if (!st_deployment_environment_allows_demo_data(getenv("SPECUS_ENV"))) {
+        fprintf(stderr, "SPECUS_LOGIN_TEST_GATE_DIR is ignored in production\n");
+        return 0;
+    }
+    if (copy_config_string(login_test_gate_dir, sizeof(login_test_gate_dir),
+                           "SPECUS_LOGIN_TEST_GATE_DIR", dir) != 0) {
+        return -1;
+    }
+    printf("[test] login gate enabled dir=%s\n", login_test_gate_dir);
+    return 0;
+}
+
+static void login_test_gate_wait(const specus_session *session)
+{
+    if (login_test_gate_dir[0] == '\0') {
+        return;
+    }
+    const char *role = session->is_data_connection ? "data" : "control";
+    char published[320];
+    char release[320];
+    snprintf(published, sizeof(published), "%s/%s-published", login_test_gate_dir, role);
+    snprintf(release, sizeof(release), "%s/%s-release", login_test_gate_dir, role);
+    int fd = open(published, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        close(fd);
+    }
+    const struct timespec poll_interval = {0, 10L * 1000000L};
+    for (int waited_ms = 0;
+         access(release, F_OK) != 0 && waited_ms < LOGIN_TEST_GATE_MAX_WAIT_MS;
+         waited_ms += 10) {
+        nanosleep(&poll_interval, NULL);
+    }
+    unlink(release);
+    unlink(published);
+}
+
 static void *client_thread(void *arg)
 {
     client_args *args = (client_args *)arg;
@@ -4535,27 +4821,61 @@ static void *client_thread(void *arg)
              * spec keeps one control and one data per client and lets the newer connection replace
              * the older one. The session is published before the response is written, so once the
              * client sees success its next frame already finds this connection bound.
+             *
+             * Once published, other threads can send on the connection at once: a NAT OPEN for a
+             * public request on a data connection, a NAT_CONTROL or message push on a control one.
+             * Clients take the first frame after their login request to be its response, so
+             * send_lock is taken before the session can be found and held until the response is
+             * written; whatever those threads send queues behind it.
+             *
+             * A control's first NAT_CONTROL is built from the routes it logged in with before the
+             * session is published, while nothing else can touch its config, and written right
+             * after the response under the same send_lock. A runtime push that finds the session
+             * replaces those routes under map_lock and then waits for send_lock, so its newer
+             * NAT_CONTROL follows and the client ends with the newest routes.
              */
             const char *reason = NULL;
+            displaced_sessions displaced = {.count = 0U};
             int control_login = !session->is_data_connection;
+            st_buffer nat_control = {0};
+            size_t nat_control_tcp_routes = 0U;
             if (control_login) {
                 pthread_mutex_lock(&control_admission_lock);
             }
             logged_in = verify_login(session, &request, &reason);
+            if (logged_in && control_login) {
+                nat_control = st_protocol_encode_nat_control(session->config.client_name,
+                                                             session->config.nat_control_json);
+                nat_control_tcp_routes = session->config.mapping_count;
+            }
+            pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
                 session->connected_since_ms = now_ms();
-                if (activate_session(session, &reason) != 0) {
+                if (activate_session(session, &displaced, &reason) != 0) {
                     logged_in = 0;
                 }
             }
             if (control_login) {
                 pthread_mutex_unlock(&control_admission_lock);
             }
+            if (logged_in) {
+                login_test_gate_wait(session);
+            }
+            /* An accepted login answers with the name it is bound under: the account's current name. */
             st_buffer response = st_protocol_encode_login_response(
-                request.client_name == NULL ? "" : request.client_name,
+                logged_in ? session->config.client_name : (request.client_name == NULL ? "" : request.client_name),
                 logged_in,
                 reason);
-            if (session_send_packet(session, &response) != 0) {
+            int response_rc = session_send_packet_locked(session, &response);
+            int nat_control_rc = 0;
+            if (response_rc == 0 && logged_in && control_login) {
+                nat_control_rc = session_send_packet_locked(session, &nat_control);
+            } else {
+                st_buffer_free(&nat_control);
+            }
+            pthread_mutex_unlock(&session->send_lock);
+            release_displaced_sessions(&displaced);
+            if (response_rc != 0) {
                 st_login_request_free(&request);
                 break;
             }
@@ -4573,19 +4893,17 @@ static void *client_thread(void *arg)
             }
             printf("[%s] login ok client=%s remote=%s\n",
                    session->is_data_connection ? "data" : "control",
-                   request.client_name, session->remote);
+                   session->config.client_name, session->remote);
             if (!session->is_data_connection) {
                 record_login_success_event(session);
                 record_client_online_milestone(session);
-                st_buffer nat_control = st_protocol_encode_nat_control(session->config.client_name,
-                                                                       session->config.nat_control_json);
-                if (session_send_packet(session, &nat_control) != 0) {
+                if (nat_control_rc != 0) {
                     disconnect_reason = "IO_ERROR";
                     st_login_request_free(&request);
                     break;
                 }
                 printf("[nat-control] pushed %zu tcp route(s) to %s\n",
-                       session->config.mapping_count, session->config.client_name);
+                       nat_control_tcp_routes, session->config.client_name);
                 if (session->config.database_path[0] != '\0') {
                     st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
                     if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
@@ -4723,11 +5041,12 @@ static void *client_thread(void *arg)
     direct_pending_fail_all(session, "control connection closed");
 
     pthread_mutex_lock(&active_session_lock);
-    int replaced = session->replaced;
-    /* A replaced control's data connection was retired by the login that replaced it, and
-     * whatever of this client is still bound belongs to the newer pair. A connection that never
-     * logged in owns no pair: its config still names the default client, which it must not touch. */
-    if (logged_in && !replaced) {
+    const char *displaced_reason = session->displaced_reason;
+    /* A displaced control's data connection was retired with it, by the login that replaced it or
+     * the admin who closed the client, and whatever of this client is still bound belongs to a
+     * newer pair. A connection that never logged in owns no pair: its config still names the
+     * default client, which it must not touch. */
+    if (logged_in && displaced_reason == NULL) {
         active_session_close_data_locked(session);
     }
     active_session_remove_locked(session);
@@ -4735,8 +5054,8 @@ static void *client_thread(void *arg)
         pthread_cond_wait(&session->reference_cond, &active_session_lock);
     }
     pthread_mutex_unlock(&active_session_lock);
-    if (replaced) {
-        disconnect_reason = "REPLACED_BY_NEW_LOGIN";
+    if (displaced_reason != NULL) {
+        disconnect_reason = displaced_reason;
     } else if (connection_registry_stopping()) {
         disconnect_reason = "SERVER_SHUTDOWN";
     }
@@ -4888,6 +5207,9 @@ int main(void)
     if (st_media_capture_validate_current() != 0) {
         return 1;
     }
+    if (configure_login_test_gate() != 0) {
+        return 1;
+    }
     if (st_public_discovery_initialize() != 0) {
         fprintf(stderr, "public transfer discovery initialization failed\n");
         return 1;
@@ -4959,6 +5281,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    st_admin_set_client_disconnect_handler(close_client_connections, NULL);
     const st_connectivity_device connectivity_device = {
         .presence = connectivity_presence,
         .probe = connectivity_probe,
@@ -4982,6 +5305,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_client_disconnect_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -4996,6 +5320,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_client_disconnect_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
@@ -5016,6 +5341,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_client_disconnect_handler(NULL, NULL);
         close(listener);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
@@ -5118,6 +5444,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+    st_admin_set_client_disconnect_handler(NULL, NULL);
     st_stun_turn_server_stop(stun_turn_server);
     st_tls_server_context_free(config.tls_context);
     free(config.nat_control_json);

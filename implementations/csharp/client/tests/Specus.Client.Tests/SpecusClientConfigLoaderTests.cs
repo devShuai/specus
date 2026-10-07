@@ -198,20 +198,22 @@ public sealed class SpecusClientConfigLoaderTests
     }
 
     [Fact]
-    public void NatControlSnapshotDistinguishesMissingAndEmptyHttpRoutesLikeJava()
+    public void NatControlSnapshotReadsMissingNullAndEmptyHttpRoutesAsNoRoutes()
     {
-        var missing = JsonSerializer.Deserialize<SpecusConfigSnapshot>(
-            """{"specusConfigList":[]}""",
-            SpecusClientConfigLoader.JsonOptions);
-        var empty = JsonSerializer.Deserialize<SpecusConfigSnapshot>(
-            """{"specusConfigList":[],"httpSpecusConfigList":[]}""",
-            SpecusClientConfigLoader.JsonOptions);
+        foreach (var json in new[]
+                 {
+                     """{"specusConfigList":[]}""",
+                     """{"specusConfigList":[],"httpSpecusConfigList":null}""",
+                     """{"specusConfigList":[],"httpSpecusConfigList":[]}""",
+                 })
+        {
+            var snapshot = JsonSerializer.Deserialize<SpecusConfigSnapshot>(json,
+                SpecusClientConfigLoader.JsonOptions);
 
-        Assert.NotNull(missing);
-        Assert.Null(missing!.HttpSpecusConfigList);
-        Assert.NotNull(empty);
-        Assert.NotNull(empty!.HttpSpecusConfigList);
-        Assert.Empty(empty.HttpSpecusConfigList);
+            Assert.NotNull(snapshot);
+            Assert.NotNull(snapshot!.HttpSpecusConfigList);
+            Assert.Empty(snapshot.HttpSpecusConfigList);
+        }
     }
 
     [Fact]

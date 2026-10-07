@@ -44,7 +44,7 @@ public sealed class ProductMetricsVectorTests
         var scenarios = vector.RootElement.GetProperty("scenarios").EnumerateArray().ToList();
         Assert.Equal(5, scenarios.Count);
         Assert.Equal(scenarios.Count, ScenarioNames().Count);
-        Assert.Equal(112, scenarios.Sum(scenario => scenario.GetProperty("ops").GetArrayLength()));
+        Assert.Equal(128, scenarios.Sum(scenario => scenario.GetProperty("ops").GetArrayLength()));
         Assert.Equal(44, vector.RootElement.GetProperty("ingestValidation").GetProperty("cases").GetArrayLength());
     }
 

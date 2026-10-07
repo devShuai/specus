@@ -8,6 +8,27 @@ namespace Specus.Server.Nat;
 internal readonly record struct HttpStreamReadResult(
     byte[]? Data, Dictionary<string, object?>? Metadata, bool End);
 
+/// <summary>What became of one response frame the client sent on an HTTP stream.</summary>
+internal enum HttpStreamIngestResult
+{
+    Accepted,
+
+    /// <summary>
+    /// The stream is already closed (Close() ran; its removal from the session may still be under
+    /// way): the frame is late and is answered as a closed stream's, not as a protocol violation.
+    /// </summary>
+    Closed,
+
+    /// <summary>The reader fell behind and the event queue is full: only this stream is reset.</summary>
+    QueueFull,
+
+    /// <summary>
+    /// The frame breaks the stream's state machine: DATA before the response head, a frame after
+    /// the response ended, DATA beyond the receive window or a second response head.
+    /// </summary>
+    ProtocolViolation,
+}
+
 /// <summary>
 /// Terminal error of an HTTP stream that was reset. <see cref="Reason"/> is free text, for a
 /// client RST supplied by the client, and can carry the target URL, internal hosts or the raw
@@ -54,19 +75,29 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
         });
     private readonly object _stateLock = new();
 
+    private readonly bool _discardBody;
+
     private long _receiveCredit = StreamSendWindow.InitialBytes;
     private long _receiveOutstanding;
     private bool _responseHead;
     private bool _responseEnded;
-    private bool _discardBody;
+    private HttpStreamResetException? _resetAhead;
     private int _closed;
 
+    /// <param name="discardResponseBody">
+    /// For a reader that only wants the response head (the connectivity check): response DATA and
+    /// FIN are accepted but never queued, so a body relayed before the server's RST lands can
+    /// neither fill the event queue nor earn WINDOW_UPDATE credit. DATA is still charged against
+    /// the receive window, so a peer overrunning it remains a protocol violation. It is fixed
+    /// before the stream is registered, so it already holds for a response that overtakes OPEN.
+    /// </param>
     public HttpSpecusStream(SpecusConnectionContext context, uint streamId,
-        Action<uint, HttpSpecusStream> onClose)
+        Action<uint, HttpSpecusStream> onClose, bool discardResponseBody = false)
     {
         _context = context;
         StreamId = streamId;
         _onClose = onClose;
+        _discardBody = discardResponseBody;
     }
 
     public uint StreamId { get; }
@@ -116,7 +147,7 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
     public async ValueTask<Dictionary<string, object?>> WaitResponseHeadAsync(
         CancellationToken cancellationToken)
     {
-        var item = await _events.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        var item = await ReadEventAsync(cancellationToken).ConfigureAwait(false);
         if (item.Error is not null)
         {
             throw item.Error;
@@ -130,7 +161,7 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
 
     public async ValueTask<HttpStreamReadResult> ReadResponseAsync(CancellationToken cancellationToken)
     {
-        var item = await _events.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        var item = await ReadEventAsync(cancellationToken).ConfigureAwait(false);
         if (item.Error is not null)
         {
             throw item.Error;
@@ -168,7 +199,7 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
 
     public async ValueTask ResetAsync(uint code, string reason, CancellationToken cancellationToken)
     {
-        if (Volatile.Read(ref _closed) != 0)
+        if (IsClosed)
         {
             return;
         }
@@ -188,103 +219,105 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
         }
     }
 
-    public bool OnResponseHead(Dictionary<string, object?>? metadata)
+    /// <summary>
+    /// Resets the stream because its reader fell behind: the event queue is full while the client
+    /// still has window. The RST goes to the client as from <see cref="ResetAsync"/>, and the
+    /// reader meets the same <see cref="HttpStreamResetException"/> a client RST raises on its
+    /// next read, ahead of the events still queued.
+    /// </summary>
+    public ValueTask ResetOverflowAsync(uint code, string reason, CancellationToken cancellationToken)
     {
         lock (_stateLock)
         {
+            if (IsClosed)
+            {
+                return ValueTask.CompletedTask;
+            }
+            _resetAhead ??= new HttpStreamResetException(code, reason);
+        }
+        return ResetAsync(code, reason, cancellationToken);
+    }
+
+    public HttpStreamIngestResult OnResponseHead(Dictionary<string, object?>? metadata)
+    {
+        lock (_stateLock)
+        {
+            if (IsClosed)
+            {
+                return HttpStreamIngestResult.Closed;
+            }
             if (_responseHead || _responseEnded)
             {
-                return false;
+                return HttpStreamIngestResult.ProtocolViolation;
             }
-            _responseHead = true;
-            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.Head, Clone(metadata), null, null)))
-            {
-                return true;
-            }
-            _responseHead = false;
-            return false;
+            var result = Enqueue(new HttpStreamEvent(HttpStreamEventKind.Head, Clone(metadata), null, null));
+            _responseHead = result == HttpStreamIngestResult.Accepted;
+            return result;
         }
     }
 
-    public bool OnResponseData(byte[]? data)
+    public HttpStreamIngestResult OnResponseData(byte[]? data)
     {
-        if (data is not { Length: > 0 })
-        {
-            return false;
-        }
         lock (_stateLock)
         {
-            if (!_responseHead || _responseEnded || data.Length > _receiveCredit)
+            if (IsClosed)
             {
-                return false;
+                return HttpStreamIngestResult.Closed;
+            }
+            if (data is not { Length: > 0 } || !_responseHead || _responseEnded
+                || data.Length > _receiveCredit)
+            {
+                return HttpStreamIngestResult.ProtocolViolation;
             }
             _receiveCredit -= data.Length;
             if (_discardBody)
             {
-                return true;
+                return HttpStreamIngestResult.Accepted;
             }
             _receiveOutstanding += data.Length;
-            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.Data, null, data.ToArray(), null)))
+            var result = Enqueue(new HttpStreamEvent(HttpStreamEventKind.Data, null, data.ToArray(), null));
+            if (result != HttpStreamIngestResult.Accepted)
             {
-                return true;
+                _receiveCredit += data.Length;
+                _receiveOutstanding -= data.Length;
             }
-            _receiveCredit += data.Length;
-            _receiveOutstanding -= data.Length;
-            return false;
+            return result;
         }
     }
 
-    public bool OnResponseEnd(Dictionary<string, object?>? metadata)
+    public HttpStreamIngestResult OnResponseEnd(Dictionary<string, object?>? metadata)
     {
         lock (_stateLock)
         {
+            if (IsClosed)
+            {
+                return HttpStreamIngestResult.Closed;
+            }
             if (!_responseHead || _responseEnded)
             {
-                return false;
+                return HttpStreamIngestResult.ProtocolViolation;
             }
-            _responseEnded = true;
-            if (_discardBody
-                || Enqueue(new HttpStreamEvent(HttpStreamEventKind.End, Clone(metadata), null, null)))
-            {
-                return true;
-            }
-            _responseEnded = false;
-            return false;
+            var result = _discardBody
+                ? HttpStreamIngestResult.Accepted
+                : Enqueue(new HttpStreamEvent(HttpStreamEventKind.End, Clone(metadata), null, null));
+            _responseEnded = result == HttpStreamIngestResult.Accepted;
+            return result;
         }
     }
 
-    public bool OnReset(uint code, string? reason, string? failure = null)
-    {
-        var error = new HttpStreamResetException(code, reason, failure);
-        var written = Enqueue(new HttpStreamEvent(HttpStreamEventKind.Reset, null, null, error));
-        Close();
-        return written;
-    }
+    /// <summary>
+    /// A client RST always ends the stream. One that crosses the server's own close is late and
+    /// changes nothing; one that finds the event queue full reaches the reader ahead of it.
+    /// </summary>
+    public void OnReset(uint code, string? reason, string? failure = null) =>
+        Terminate(new HttpStreamResetException(code, reason, failure));
 
     /// <summary>
     /// Ends the stream because its data connection is gone. Readers see the same reset as before,
     /// marked <see cref="HttpStreamResetException.LinkLost"/> so it is not mistaken for a client RST.
     /// </summary>
-    public void OnLinkLost()
-    {
-        Enqueue(new HttpStreamEvent(HttpStreamEventKind.Reset, null, null,
-            new HttpStreamResetException(0, "control channel closed", linkLost: true)));
-        Close();
-    }
-
-    /// <summary>
-    /// For a reader that only wants the response head (the connectivity check): response DATA and
-    /// FIN are accepted but never queued, so a body relayed before the server's RST lands can
-    /// neither fill the event queue nor earn WINDOW_UPDATE credit. DATA is still charged against
-    /// the receive window, so a peer overrunning it remains a protocol violation.
-    /// </summary>
-    public void DiscardResponseBody()
-    {
-        lock (_stateLock)
-        {
-            _discardBody = true;
-        }
-    }
+    public void OnLinkLost() =>
+        Terminate(new HttpStreamResetException(0, "control channel closed", linkLost: true));
 
     public bool AddSendCredit(uint credit) => _sendWindow.Add(credit);
 
@@ -294,8 +327,63 @@ internal sealed class HttpSpecusStream : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
-    private bool Enqueue(HttpStreamEvent item) =>
-        Volatile.Read(ref _closed) == 0 && _events.Writer.TryWrite(item);
+    private bool IsClosed => Volatile.Read(ref _closed) != 0;
+
+    private HttpStreamIngestResult Enqueue(HttpStreamEvent item)
+    {
+        if (IsClosed)
+        {
+            return HttpStreamIngestResult.Closed;
+        }
+        if (_events.Writer.TryWrite(item))
+        {
+            return HttpStreamIngestResult.Accepted;
+        }
+        // Close() marks the stream before it completes the queue, so a write refused because the
+        // queue was completed already reads as closed here.
+        return IsClosed ? HttpStreamIngestResult.Closed : HttpStreamIngestResult.QueueFull;
+    }
+
+    private void Terminate(HttpStreamResetException error)
+    {
+        lock (_stateLock)
+        {
+            if (Enqueue(new HttpStreamEvent(HttpStreamEventKind.Reset, null, null, error))
+                == HttpStreamIngestResult.QueueFull)
+            {
+                _resetAhead ??= error;
+            }
+        }
+        Close();
+    }
+
+    private async ValueTask<HttpStreamEvent> ReadEventAsync(CancellationToken cancellationToken)
+    {
+        ThrowResetAhead();
+        try
+        {
+            return await _events.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (ChannelClosedException)
+        {
+            ThrowResetAhead();
+            throw;
+        }
+    }
+
+    /// <summary>Throws the reset that could not wait behind the queued events, if there is one.</summary>
+    private void ThrowResetAhead()
+    {
+        HttpStreamResetException? reset;
+        lock (_stateLock)
+        {
+            reset = _resetAhead;
+        }
+        if (reset is not null)
+        {
+            throw reset;
+        }
+    }
 
     private void Close()
     {

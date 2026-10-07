@@ -159,6 +159,50 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ControlLoginWithoutRoutesOrMappingsPushesAnExplicitEmptyRouteList()
+    {
+        // A client that reconnects with its access token gets no new HTTP login snapshot, so if
+        // its last route was deleted while it was offline the login push is the only way it learns.
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var registry = _server!.HostServices.GetRequiredService<SessionRegistry>();
+        using var lifetime = new CancellationTokenSource();
+        var control = new CapturingControlWriter();
+        var context = new SpecusConnectionContext("direct-http-login-push-test", "127.0.0.1:12347", control,
+            lifetime.Token, lifetime.Cancel, new ReadGate(lifetime.Token),
+            new WriteBackpressureGate(64 * 1024, 1024 * 1024));
+        context.OnLoginSuccess(ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            clientSessionId: 1, connectionRole: ConnectionRole.Control);
+        registry.Replace(ClientName, context);
+        try
+        {
+            await using var scope = _server.HostServices.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ClientAccounts.SingleAsync(client => client.ClientName == ClientName,
+                cancellation.Token);
+            db.HttpRouteMappings.RemoveRange(db.HttpRouteMappings.Where(route => route.ClientId == account.Id));
+            db.SpecusMappings.RemoveRange(db.SpecusMappings.Where(mapping => mapping.ClientId == account.Id));
+            await db.SaveChangesAsync(cancellation.Token);
+
+            await scope.ServiceProvider.GetRequiredService<NatControlService>()
+                .PushOnLoginAsync(ClientName, cancellation.Token);
+
+            var pushed = Assert.Single(control.Messages);
+            Assert.Equal(MessageType.NatControl, pushed.MessageType);
+            using var bean = System.Text.Json.JsonDocument.Parse(pushed.Message!);
+            Assert.Equal(0, bean.RootElement.GetProperty("specusConfigList").GetArrayLength());
+            Assert.True(bean.RootElement.TryGetProperty("httpSpecusConfigList", out var routes),
+                "NAT_CONTROL omitted httpSpecusConfigList, so the client keeps its stale routes");
+            Assert.Equal(System.Text.Json.JsonValueKind.Array, routes.ValueKind);
+            Assert.Equal(0, routes.GetArrayLength());
+        }
+        finally
+        {
+            registry.Unbind(ClientName, context);
+            lifetime.Cancel();
+        }
+    }
+
+    [Fact]
     public async Task HttpResponseOnlyPublishesSafeDeclaredPeerTrailers()
     {
         await using var session = BoundNatSession.Bind(_server!);
@@ -583,6 +627,98 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         nextSocket.Abort();
     }
 
+    /// <summary>
+    /// A browser that reads slower than the device sends small DATA frames (SSE, a streaming API)
+    /// fills the HTTP stream's event queue long before the receive window runs out. Only that
+    /// stream is reset, with RST 8 as Java does, and its browser response ends the way a client RST
+    /// ends it; the data connection, another stream on it and its keepalives carry on.
+    /// </summary>
+    [Fact]
+    public async Task FullHttpResponseQueueResetsOnlyThatStreamAndKeepsNatContext()
+    {
+        await using var session = BoundNatSession.Bind(_server!);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var http = _server!.CreateClient();
+        using var slowRequest = AuthorizedHttpGet("events");
+        using var otherRequest = AuthorizedHttpGet("other");
+        var chunk = Encoding.UTF8.GetBytes("data: tick\n\n");
+
+        var slowTask = http.SendAsync(slowRequest, HttpCompletionOption.ResponseHeadersRead,
+            cancellation.Token);
+        var slow = await session.Writer.ReadAsync(IsHttpOpen, cancellation.Token);
+        var otherTask = http.SendAsync(otherRequest, cancellation.Token);
+        var other = await session.Writer.ReadAsync(
+            packet => IsHttpOpen(packet) && packet.StreamId != slow.StreamId, cancellation.Token);
+        await session.Writer.InjectAsync(HttpResponseHead(slow.StreamId));
+
+        session.Writer.BlockPriorityWrites();
+        try
+        {
+            // The first chunk reaches the browser; returning its credit then stalls, so the
+            // reader stops taking events off the queue.
+            await session.Writer.InjectAsync(Data(slow.StreamId, chunk));
+            await AssertWindowCreditAsync(session.Writer, slow.StreamId, chunk.Length,
+                cancellation.Token);
+            // More frames than the event queue holds, a few hundred bytes of a 1 MiB window.
+            for (var i = 0; i < 33; i++)
+            {
+                await session.Writer.InjectAsync(Data(slow.StreamId, chunk));
+            }
+
+            Assert.Null(session.Context.ReadDisconnectReason());
+            Assert.False(session.Context.Lifetime.IsCancellationRequested);
+            var reset = await session.Writer.ReadAsync(packet =>
+                    packet.NatMessageType == NatMessageType.Rst
+                    && packet.StreamId == slow.StreamId,
+                cancellation.Token);
+            Assert.Equal(8U, reset.Value);
+            Assert.Equal("HTTP response queue exceeded", reset.MetaData!["reason"]);
+            await session.Writer.InjectAsync(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Keepalive,
+            });
+            Assert.False(session.Context.Lifetime.IsCancellationRequested);
+        }
+        finally
+        {
+            session.Writer.ReleasePriorityWrites();
+        }
+
+        // The browser response already under way is cut, as a client RST cuts it.
+        using var slowResponse = await slowTask;
+        Assert.Equal(HttpStatusCode.OK, slowResponse.StatusCode);
+        var cut = await Record.ExceptionAsync(
+            () => slowResponse.Content.ReadAsByteArrayAsync(cancellation.Token));
+        Assert.NotNull(cut);
+        Assert.False(cancellation.IsCancellationRequested);
+        Assert.Contains(_logs.Messages(DirectHttpEndpoints.LoggerCategory), message =>
+            message.Contains("stream reset", StringComparison.Ordinal)
+            && message.Contains("errorCode=8", StringComparison.Ordinal));
+
+        // DATA the device sent before it saw the RST gets the closed-stream answer.
+        await session.Writer.InjectAsync(Data(slow.StreamId, chunk));
+        var late = await session.Writer.ReadAsync(packet =>
+                packet.NatMessageType == NatMessageType.Rst && packet.StreamId == slow.StreamId,
+            cancellation.Token);
+        Assert.Equal(7U, late.Value);
+
+        // The other stream on the same data connection completes untouched.
+        await session.Writer.InjectAsync(HttpResponseHead(other.StreamId));
+        await session.Writer.InjectAsync(Data(other.StreamId, chunk));
+        await session.Writer.InjectAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.Fin,
+            StreamId = other.StreamId,
+        });
+        using var otherResponse = await otherTask;
+        Assert.Equal(HttpStatusCode.OK, otherResponse.StatusCode);
+        Assert.Equal(chunk, await otherResponse.Content.ReadAsByteArrayAsync(cancellation.Token));
+        Assert.False(session.Context.Lifetime.IsCancellationRequested);
+        Assert.Null(session.Context.ReadDisconnectReason());
+        Assert.DoesNotContain(session.Writer.Snapshot(), packet =>
+            packet.NatMessageType == NatMessageType.Rst && packet.StreamId == other.StreamId);
+    }
+
     [Fact]
     public async Task MalformedSws2ResetsNatStreamAndClosesBrowserWithProtocolError()
     {
@@ -645,6 +781,29 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
 
     private static string BasicAuthorization() => "Basic " + Convert.ToBase64String(
         Encoding.UTF8.GetBytes($"{Username}:{Password}"));
+
+    private static HttpRequestMessage AuthorizedHttpGet(string rest)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, HttpPath(rest));
+        request.Headers.Authorization = System.Net.Http.Headers.AuthenticationHeaderValue.Parse(
+            BasicAuthorization());
+        return request;
+    }
+
+    private static bool IsHttpOpen(NatMessagePacket packet) =>
+        packet.NatMessageType == NatMessageType.Open && Equals(packet.MetaData?["source"], "http");
+
+    private static NatMessagePacket HttpResponseHead(uint streamId) => new()
+    {
+        NatMessageType = NatMessageType.Open,
+        StreamId = streamId,
+        MetaData = new Dictionary<string, object?>
+        {
+            ["source"] = "http",
+            ["phase"] = "response",
+            ["statusCode"] = 200,
+        },
+    };
 
     private static string HeaderName(string header)
     {

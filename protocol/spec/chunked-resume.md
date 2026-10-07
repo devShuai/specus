@@ -49,10 +49,10 @@ v1 只覆盖**两个浏览器页面之间经 `bulk` RTCDataChannel 的直连文�
 | `maxChunkCount` | 4096 | 位图最多 512 字节，哈希列表最多 128 KiB |
 | `maxResumableBytes` | 2 GiB | 持久模式单文件上限（待决问题 1） |
 | `memoryLimitBytes` | 128 MiB | 内存模式上限，等于现有设备内存限制 |
-| `maxStoredPartials` | 4 | 接收方同时保留的未清理记录数 |
-| `maxPartialBytesTotal` | 4 GiB | 上述记录声明大小之和的上限 |
+| `maxStoredPartials` | 4 | 接收方同时保留的未清理持久记录数；内存模式的未完成记录另计，也最多 4 条（第 6 节） |
+| `maxPartialBytesTotal` | 4 GiB | 上述持久记录声明大小之和的上限；内存模式每条不超过 `memoryLimitBytes`，未完成记录合计因此不超过 512 MiB |
 | `storageMarginBytes` | 64 MiB | 配额检查的安全余量 |
-| `maxActiveReceives` | 2 | 同时处于活动会话的接收传输数；每个 bulk 通道仍只有 1 个 |
+| `maxActiveReceives` | 2 | 同时处于活动会话的接收传输数；每个 bulk 通道同一时间仍只有 1 个待确认或接收中的文件（第 8 节） |
 | `maxChunkMismatchesPerSession` | 3 | 同一块在一个会话内第 3 次校验失败即结束会话 |
 | `maxIntegrityFailures` | 16 | 单个 transfer 跨会话累计失败数，持久化保存 |
 | `resumeTtlSeconds` | 86400 | 同意与部分数据的绝对有效期，从同意时刻起算 |
@@ -147,13 +147,15 @@ DATA 帧不得跨块，块按帧顺序从 offset 0 连续发送。
 
 1. 来源当前角色无发送权限（VIEWER 等）→ `REJECT NOT_ALLOWED`。
 2. 本地已有同一 `transferId` 的记录 → `REJECT TRANSFER_ID_IN_USE`。续传只能走 `resume-offer`。
-3. 开启自动接收且 `sizeBytes ≤ memoryLimitBytes` → `AUTO_ACCEPT_MEMORY`。**自动接收不得写磁盘**，只能使用内存模式。
+3. 开启自动接收且 `sizeBytes ≤ memoryLimitBytes`：内存模式的未完成记录已达 `maxStoredPartials` 时为
+   `REJECT TOO_MANY_PARTIALS`，否则为 `AUTO_ACCEPT_MEMORY`。**自动接收不得写磁盘**，只能使用内存模式。
 4. 判断持久模式是否可用，依次检查：存储可用（安全上下文、IndexedDB 可开、`navigator.storage.estimate()` 可用）、
    记录数 < `maxStoredPartials`、已有记录声明大小之和 + 本文件 ≤ `maxPartialBytesTotal`、
    `sizeBytes + Σ(其它记录未收字节) + storageMarginBytes ≤ quota - usage`。全部满足时为 `PROMPT_PERSISTENT`：
    必须由用户点击同意，界面说明会写入本机存储、有效期和可随时放弃。
-5. 持久模式不可用时：`sizeBytes ≤ memoryLimitBytes` 为 `PROMPT_MEMORY`（附原因，界面说明刷新后无法恢复），否则以
-   该原因拒绝：`PERSISTENCE_UNAVAILABLE`、`TOO_MANY_PARTIALS`、`PARTIAL_BYTES_LIMIT`、`INSUFFICIENT_STORAGE`。
+5. 持久模式不可用时：`sizeBytes ≤ memoryLimitBytes` 为 `PROMPT_MEMORY`（附原因，界面说明刷新后无法恢复），但内存模式
+   的未完成记录已达 `maxStoredPartials` 时为 `REJECT TOO_MANY_PARTIALS`；更大的文件以该原因拒绝：
+   `PERSISTENCE_UNAVAILABLE`、`TOO_MANY_PARTIALS`、`PARTIAL_BYTES_LIMIT`、`INSUFFICIENT_STORAGE`。
 
 规则：
 
@@ -162,6 +164,10 @@ DATA 帧不得跨块，块按帧顺序从 offset 0 连续发送。
   发送方只能用新的 `transferId` 重新 offer，重新取得同意，从零开始。v1 不跨 transfer 复用已收块。
 - 过期后续传返回 `EXPIRED`，数据按第 10 节清理；需要的话重新发送并重新同意。
 - 续传时重新检查来源角色（邀请可能已撤销）。
+- 内存模式的未完成记录（`RECEIVING`/`INTERRUPTED`）把已收块留在页面内存里，直到完成、放弃或过期，供第 9 节的
+  会话内重试使用，所以中断时不能丢弃。为免对端反复“发完大部分块后中断”让标签页内存无限增长，它们与持久记录分开
+  计数，同样最多 `maxStoredPartials` 条（第 3、5 步）；已完成的内存记录已释放块，只为补发完成通知而保留，不计入。
+  点击同意时再检查一次，因为提示期间可能已有别的内存模式接收开始。续传不新建记录，不受此上限影响。
 
 ## 7. 会话
 
@@ -210,6 +216,9 @@ DATA 帧不得跨块，块按帧顺序从 offset 0 连续发送。
    - 来源当前无发送权限：`NOT_ALLOWED`。
    - 已 `COMPLETE`：回 `resume-state complete=true`，用于补发丢失的完成通知，不占用活动名额。
    - 其它传输的活动会话已达 `maxActiveReceives`：`BUSY`。
+   - 这条通道上已有其它 transfer 的活动会话，或有待确认（含用户已点击、记录尚未建好）的 offer：`BUSY`。每个 bulk
+     通道同一时间只承载一个文件；不同 transfer 之间不互相取代，否则对方仍在途的帧会交给另一个 transfer 的状态机
+     （`WRONG_TRANSFER`），被挤掉的记录也会一直占着活动名额。通道占用不在向量 `resume` 的输入里。
    - 否则回 `resume-state`。若该 transfer 在另一条通道上还有旧会话，新会话**取代**旧会话（旧通道可能已半断开）。
 3. S 按 `have` 继续发送。`resume-state` 附带的 `firstMissing`、`resumeOffset = firstMissing × chunkSize`（全部收齐时
    等于 `sizeBytes`）和 `receivedBytes` 只用于界面，发送范围以位图为准。
@@ -335,7 +344,7 @@ DATA 帧不得跨块，块按帧顺序从 offset 0 连续发送。
 | `frames` | STFR1 接受与拒绝样例；超长样例以头部加 `appendZeroBytes` 个零字节构造 |
 | `bitmap` | 编码、严格解码、续传进度（`firstMissing`/`resumeOffset`/`receivedBytes`/`missing`）、位图合并 |
 | `receiver` | 接收方状态机：逐事件的结果、应发消息、会话是否打开、状态，以及最终位图、失败数与状态 |
-| `consent` | 同意判定 |
+| `consent` | 同意判定；`livePartials` 为持久记录，`memoryPartials` 为内存模式未完成记录数 |
 | `resume` | `resume-offer` 判定及 `resume-state` 内容 |
 | `cleanup` | 页面加载时的记录与孤儿块清理 |
 | `senderPlan` | 发送方依据位图和重选文件的发送计划 |

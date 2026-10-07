@@ -19,9 +19,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -500,6 +502,9 @@ typedef struct {
     char http_relative_path[256];
     char ws_relative_path[256];
     char http_body[256];
+    /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
+    char http_browser_headers[512];
+    char ws_browser_headers[512];
 } route_auth_test_context;
 
 #define ROUTE_RESET_REASON \
@@ -548,7 +553,30 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->http_relative_path[0] = '\0';
     context->ws_relative_path[0] = '\0';
     context->http_body[0] = '\0';
+    context->http_browser_headers[0] = '\0';
+    context->ws_browser_headers[0] = '\0';
     pthread_mutex_unlock(&context->lock);
+}
+
+static void route_auth_test_capture_browser_headers(char *const *headers,
+                                                    size_t headers_len,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    size_t used = 0U;
+    out[0] = '\0';
+    for (size_t i = 0; i < headers_len; ++i) {
+        if (headers[i] == NULL
+            || (strncasecmp(headers[i], "Origin:", 7U) != 0 && strncasecmp(headers[i], "Referer:", 8U) != 0
+                && strncasecmp(headers[i], "Sec-Fetch-Site:", 15U) != 0)) {
+            continue;
+        }
+        int written = snprintf(out + used, out_len - used, "%s%s", used == 0U ? "" : "|", headers[i]);
+        if (written < 0 || (size_t)written >= out_len - used) {
+            return;
+        }
+        used += (size_t)written;
+    }
 }
 
 static int route_auth_test_context_matches(route_auth_test_context *context,
@@ -632,6 +660,9 @@ static int route_auth_http_forwarder(void *ctx,
              "%.*s",
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->http_browser_headers,
+                                            sizeof(context->http_browser_headers));
     pthread_mutex_unlock(&context->lock);
     if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
         /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
@@ -664,6 +695,9 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_relative_path),
              "%s",
              request->relative_path == NULL ? "" : request->relative_path);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->ws_browser_headers,
+                                            sizeof(context->ws_browser_headers));
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -3027,6 +3061,574 @@ static int test_tenant_scoped_admin_mutations(void)
     return failed ? 1 : 0;
 }
 
+/* Number of times needle occurs in haystack. */
+static int count_occurrences(const char *haystack, const char *needle)
+{
+    int count = 0;
+    for (const char *cursor = strstr(haystack, needle); cursor != NULL; cursor = strstr(cursor + 1, needle)) {
+        ++count;
+    }
+    return count;
+}
+
+/* POSTs one route for client_id as the given administrator; returns the response length. */
+static int route_rules_create(long long client_id, const char *admin, const char *tenant, const char *body,
+                              char *response, size_t response_len)
+{
+    char path[96];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", client_id);
+    return tenant_scope_call("POST", path, admin, tenant, "ADMIN", body, response, response_len);
+}
+
+/*
+ * Java HttpRouteServiceTests through the real management handlers: a route name is unique per
+ * client (creating it again is refused instead of overwriting it, renaming onto it as well, keeping
+ * one's own name is no conflict), the same name on another client is fine, route and target are
+ * validated with Java's messages, an unknown client is refused, and every list stays in its tenant.
+ */
+static int test_http_route_service_rules(void)
+{
+    char db_path[256];
+    char path[160];
+    static char response[65536];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-route-rules-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-route-rules-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client client_a, client_b, client_tenant_b;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    int len = 0;
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"RouteClientA\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route rules client A") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"RouteClientB\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route rules client B") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-b", "tenant-b", "ADMIN",
+                                "{\"clientName\":\"RouteClientTenantB\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route rules tenant-b client") != 0
+            || st_storage_get_client_by_name(db_path, "RouteClientA", &client_a) != 0
+            || st_storage_get_client_by_name(db_path, "RouteClientB", &client_b) != 0
+            || st_storage_get_client_by_name(db_path, "RouteClientTenantB", &client_tenant_b) != 0;
+    }
+
+    /* createRouteDuplicateOnSameClientIsRejected: refused, and the first route keeps its target. */
+    st_storage_http_route web;
+    int found = 0;
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"enabled\":true", "route web on client A") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "route web 已存在于该客户端下",
+                                 "duplicate route on one client") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientA", "web", &web, &found) != 0
+            || !found || strcmp(web.target_base_url, "http://127.0.0.1:8080") != 0;
+        if (failed) fprintf(stderr, "the duplicate route overwrote the first one\n");
+    }
+    /* sameRouteOnDifferentClientsIsAllowed */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "same route on another client") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/http-routes", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "route list") != 0
+            || count_occurrences(response, "\"route\":\"web\"") != 2;
+        if (failed) fprintf(stderr, "both web routes expected in %s\n", response);
+    }
+    /* updateRouteCannotCollideWithExistingRouteOnSameClient and updateRouteAllowsRenamingToOwnRoute */
+    st_storage_http_route api;
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"api\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route api on client A") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientA", "api", &api, &found) != 0 || !found;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", api.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9091\",\"enabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "route web 已存在于该客户端下",
+                                 "rename onto another route of the client") != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", web.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"targetBaseUrl\":\"http://127.0.0.1:9090\"",
+                                 "update keeping the route's own name") != 0;
+    }
+    /* blank, '/', too long, non-http target, target without a host, with Java's messages */
+    char sixty[61];
+    char too_long_body[160];
+    memset(sixty, 'a', 60U);
+    sixty[60] = '\0';
+    snprintf(too_long_body, sizeof(too_long_body),
+             "{\"route\":\"%sa\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}", sixty);
+    const struct {
+        const char *body;
+        const char *message;
+    } invalid[] = {
+        {"{\"route\":\" \",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}", "route cannot be blank"},
+        {"{\"route\":\"a/b\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}", "route must not contain '/'"},
+        {too_long_body, "route is too long (max 60)"},
+        {"{\"route\":\"web2\",\"targetBaseUrl\":\"ftp://example.com\"}",
+         "targetBaseUrl must be an absolute http(s) URL"},
+        {"{\"route\":\"web2\",\"targetBaseUrl\":\"http:///path-only\"}", "targetBaseUrl must contain a host"},
+        {"{\"route\":\"web2\",\"targetBaseUrl\":\"  \"}", "targetBaseUrl cannot be blank"}
+    };
+    for (size_t i = 0; !failed && i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a", invalid[i].body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", invalid[i].message, invalid[i].message) != 0;
+    }
+    /* Exactly 60 characters is a valid route; a route and target are stored trimmed. */
+    if (!failed) {
+        char body[256];
+        char expected[96];
+        snprintf(body, sizeof(body),
+                 "{\"route\":\" %s \",\"targetBaseUrl\":\" https://user@[::1]:8443/base \"}", sixty);
+        snprintf(expected, sizeof(expected), "\"route\":\"%s\"", sixty);
+        len = route_rules_create(client_a.id, "root-a", "tenant-a", body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", expected, "a 60-character route") != 0
+            || !contains(response, "\"targetBaseUrl\":\"https://user@[::1]:8443/base\"");
+    }
+    /* createRoutePersistsRowAndDefaultsEnabledTrue */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"plain\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"enabled\":true", "route defaults") != 0
+            || !contains(response, "\"clientName\":\"RouteClientB\"") || !contains(response, "\"mediaCaptureEnabled\":false")
+            || !contains(response, "\"insecureSkipVerify\":false") || !contains(response, "\"createdAt\":\"2")
+            || !contains(response, "\"updatedAt\":\"2");
+        if (failed) fprintf(stderr, "route defaults: %s\n", response);
+    }
+    /* updateRouteRewritesFieldsAndRefreshesTimestamp (timestamps have second resolution here) */
+    if (!failed) {
+        char *created_at = st_json_get_string(strstr(response, "\r\n\r\n"), "updatedAt");
+        st_storage_http_route plain;
+        failed = created_at == NULL
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "plain", &plain, &found) != 0
+            || !found;
+        if (!failed) {
+            struct timespec pause = {.tv_sec = 1, .tv_nsec = 100000000L};
+            nanosleep(&pause, NULL);
+            snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", plain.id);
+            len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                    "{\"route\":\"api2\",\"targetBaseUrl\":\"https://api.example.com\",\"enabled\":false}",
+                                    response, sizeof(response));
+            char *updated_at = len > 0 ? st_json_get_string(strstr(response, "\r\n\r\n"), "updatedAt") : NULL;
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"route\":\"api2\"", "route update") != 0
+                || !contains(response, "\"targetBaseUrl\":\"https://api.example.com\"")
+                || !contains(response, "\"enabled\":false")
+                || updated_at == NULL || strcmp(updated_at, created_at) == 0;
+            if (failed) fprintf(stderr, "route update kept updatedAt %s: %s\n", created_at, response);
+            free(updated_at);
+        }
+        free(created_at);
+    }
+    /* partialUpdatePreservesEnabledAndCaptureFlags, routeCanSkipTlsVerificationAndPartialUpdatePreservesIt */
+    st_storage_http_route media;
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"media\",\"targetBaseUrl\":\"https://127.0.0.1:8443\",\"enabled\":false,"
+                                 "\"detailCaptureEnabled\":true,\"mediaCaptureEnabled\":true,\"pathRewriteEnabled\":true,"
+                                 "\"insecureSkipVerify\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"insecureSkipVerify\":true", "flagged route") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "media", &media, &found) != 0
+            || !found;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", media.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"media\",\"targetBaseUrl\":\"https://127.0.0.1:9443\"}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"targetBaseUrl\":\"https://127.0.0.1:9443\"",
+                                 "partial route update") != 0
+            || !contains(response, "\"enabled\":false") || !contains(response, "\"detailCaptureEnabled\":true")
+            || !contains(response, "\"mediaCaptureEnabled\":true") || !contains(response, "\"pathRewriteEnabled\":true")
+            || !contains(response, "\"insecureSkipVerify\":true");
+        if (failed) fprintf(stderr, "a partial update changed the flags: %s\n", response);
+    }
+    /* firstEnableRequiresUsernameAndPassword (C's message for the colon differs, the 400 does not) */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"viewer\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "authPassword", "authentication without a password") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"bad:user\",\"authPassword\":\"secret\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", NULL, "a username with ':'") != 0;
+    }
+    /* createProtectedRouteHashesPassword..., blankPasswordUpdatePreservesCredentialsAcrossDisableAndReenable */
+    st_storage_http_route private_route;
+    char stored_hash[ST_SHA256_HEX_LEN + 1] = "";
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"  viewer  \",\"authPassword\":\"secret:with-spaces \"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"authUsername\":\"viewer\"", "protected route") != 0
+            || !contains(response, "\"authPasswordConfigured\":true") || contains(response, "secret:with-spaces")
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "private", &private_route, &found) != 0
+            || !found || strcmp(private_route.auth_password_hash, "secret:with-spaces ") == 0;
+        snprintf(stored_hash, sizeof(stored_hash), "%s", found ? private_route.auth_password_hash : "");
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", private_route.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                "\"authEnabled\":false,\"authPassword\":\"   \"}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":false", "authentication off") != 0
+            || !contains(response, "\"authPasswordConfigured\":true");
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"authEnabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":true", "authentication on again") != 0
+            || !contains(response, "\"authUsername\":\"viewer\"")
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "private", &private_route, &found) != 0
+            || !found || strcmp(private_route.auth_password_hash, stored_hash) != 0;
+        if (failed) fprintf(stderr, "re-enabling authentication lost the credentials: %s\n", response);
+    }
+    /* unknownClientIsRejectedOnCreate (C answers 404, Java's IllegalArgumentException maps to 400) */
+    if (!failed) {
+        len = route_rules_create(424242, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "client not found", "route of an unknown client") != 0;
+    }
+    /* deleteUnknownRouteThrows */
+    if (!failed) {
+        len = tenant_scope_call("DELETE", "/api/admin/http-routes/999999999", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "http route not found", "delete of an unknown route") != 0;
+    }
+    /* tenantScopedQueriesDoNotLeakClientsOrRoutes */
+    if (!failed) {
+        len = route_rules_create(client_tenant_b.id, "root-b", "tenant-b",
+                                 "{\"route\":\"api\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "tenant-b route") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_tenant_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"stolen\",\"targetBaseUrl\":\"http://127.0.0.1:9090\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "client not found",
+                                 "route on another tenant's client") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/http-routes", "root-b", "tenant-b", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"route\":\"api\"", "tenant-b route list") != 0
+            || count_occurrences(response, "\"route\":") != 1 || contains(response, "RouteClientA");
+        if (failed) fprintf(stderr, "tenant-b route list leaked: %s\n", response);
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/http-routes", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "tenant-a route list") != 0
+            || contains(response, "RouteClientTenantB") || count_occurrences(response, "\"route\":\"api\"") != 1;
+        if (failed) fprintf(stderr, "tenant-a route list leaked: %s\n", response);
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/clients", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"RouteClientA\"",
+                                 "tenant-a client list") != 0
+            || !contains(response, "\"clientName\":\"RouteClientB\"") || contains(response, "RouteClientTenantB");
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/clients", "root-b", "tenant-b", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"RouteClientTenantB\"",
+                                 "tenant-b client list") != 0
+            || contains(response, "RouteClientA") || contains(response, "RouteClientB");
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* The client_name column of the one row a query selects, compared with expected. */
+static int client_reference_is(const char *db_path, const char *sql, const char *expected)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int matches = 0;
+    if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *value = (const char *)sqlite3_column_text(stmt, 0);
+        matches = value != NULL && strcmp(value, expected) == 0;
+        if (!matches) fprintf(stderr, "%s: %s, expected %s\n", sql, value == NULL ? "NULL" : value, expected);
+    } else {
+        fprintf(stderr, "%s: no row\n", sql);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return matches ? 0 : -1;
+}
+
+/*
+ * Java ClientAccountServiceTests through the real management handlers: the name availability check
+ * is global across tenants, trims the name and allows the client's own name; renaming onto a name
+ * of another tenant is refused; a rename reaches every operational record that carries the name.
+ */
+static int test_client_account_service_rules(void)
+{
+    char db_path[256];
+    char path[256];
+    char sql[512];
+    static char response[65536];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-client-rules-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-client-rules-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client first, source, target;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    int len = 0;
+    static const struct {
+        const char *admin;
+        const char *tenant;
+        const char *name;
+    } clients[] = {
+        {"root-a", "tenant-a", "office-pc"},
+        {"root-b", "tenant-b", "warehouse-pc"},
+        {"root-a", "tenant-a", "source-old"},
+        {"root-a", "tenant-a", "target"}
+    };
+    for (size_t i = 0; !failed && i < sizeof(clients) / sizeof(clients[0]); ++i) {
+        char body[160];
+        snprintf(body, sizeof(body), "{\"clientName\":\" %s \",\"enabled\":true,\"connectionRateLimitPerMinute\":30}",
+                 clients[i].name);
+        len = tenant_scope_call("POST", "/api/admin/clients", clients[i].admin, clients[i].tenant, "ADMIN", body,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, clients[i].name) != 0;
+    }
+    failed = failed || st_storage_get_client_by_name(db_path, "office-pc", &first) != 0
+        || st_storage_get_client_by_name(db_path, "source-old", &source) != 0
+        || st_storage_get_client_by_name(db_path, "target", &target) != 0;
+    if (failed) fprintf(stderr, "client rules: the names were not stored trimmed\n");
+
+    /* nameAvailabilityIsGlobalAndAllowsCurrentClient */
+    static const struct {
+        const char *query;
+        const char *answer;
+    } availability[] = {
+        {"%20office-pc%20", "{\"clientName\":\"office-pc\",\"available\":true}"},
+        {"new-name", "{\"clientName\":\"new-name\",\"available\":true}"},
+        {"warehouse-pc", "{\"clientName\":\"warehouse-pc\",\"available\":false}"},
+        {"%20warehouse-pc", "{\"clientName\":\"warehouse-pc\",\"available\":false}"}
+    };
+    for (size_t i = 0; !failed && i < sizeof(availability) / sizeof(availability[0]); ++i) {
+        snprintf(path, sizeof(path), "/api/admin/clients/name-availability?clientName=%s&excludeClientId=%lld",
+                 availability[i].query, first.id);
+        len = tenant_scope_call("GET", path, "root-a", "tenant-a", "ADMIN", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", availability[i].answer, availability[i].query) != 0;
+    }
+    /* Without excludeClientId a client's own name is taken. */
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/clients/name-availability?clientName=office-pc", "root-a",
+                                "tenant-a", "ADMIN", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"available\":false", "own name, not excluded") != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/clients/%lld", first.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"warehouse-pc\",\"enabled\":true,\"connectionRateLimitPerMinute\":30}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "clientName warehouse-pc 已存在",
+                                 "rename onto another tenant's client name") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"warehouse-pc\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "clientName warehouse-pc 已存在",
+                                 "create with another tenant's client name") != 0;
+    }
+
+    /* renamePropagatesToOperationalClientNameReferences */
+    if (!failed) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO specus_client_identity(tenant_id, credential_id, client_id, client_name, "
+                 "machine_fingerprint, os_user) VALUES('tenant-a', 1, %lld, 'source-old', 'machine-source', 'tester');"
+                 "INSERT INTO specus_mapping(client_name, listen_port, target_address, target_port) "
+                 "VALUES('source-old', 31101, '127.0.0.1', 8080);"
+                 "INSERT INTO http_route_mapping(client_name, route, target_base_url) "
+                 "VALUES('source-old', 'app', 'http://127.0.0.1:8080');",
+                 source.id);
+        failed = test_exec_sql(db_path, sql) != 0;
+    }
+    if (!failed) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO peer_mesh_device(tenant_id, client_id, client_name, virtual_ip) "
+                 "VALUES('tenant-a', %lld, 'source-old', '100.96.0.10');"
+                 "INSERT INTO peer_mesh_acl(tenant_id, source_client_id, source_client_name, target_client_id, "
+                 "target_client_name) VALUES('tenant-a', %lld, 'source-old', %lld, 'target');",
+                 source.id, source.id, target.id);
+        failed = test_exec_sql(db_path, sql) != 0;
+    }
+    if (!failed) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO traffic_usage(client_id, client_name, usage_date) VALUES(%lld, 'source-old', '2026-07-14');"
+                 "INSERT INTO resource_traffic_usage(client_id, client_name, resource_type, resource_key, "
+                 "resource_name, usage_date) VALUES(%lld, 'source-old', 'TCP_SPECUS', '31101', 'SSH', '2026-07-14');",
+                 source.id, source.id);
+        failed = test_exec_sql(db_path, sql) != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/clients/%lld", source.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"source-new\",\"enabled\":true,\"connectionRateLimitPerMinute\":30}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"source-new\"", "client rename") != 0;
+    }
+    failed = failed
+        || client_reference_is(db_path, "SELECT client_name FROM specus_client_identity", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM specus_mapping", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM http_route_mapping", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM peer_mesh_device", "source-new") != 0
+        || client_reference_is(db_path, "SELECT source_client_name FROM peer_mesh_acl", "source-new") != 0
+        || client_reference_is(db_path, "SELECT target_client_name FROM peer_mesh_acl", "target") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM traffic_usage", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM resource_traffic_usage", "source-new") != 0;
+    if (failed) fprintf(stderr, "client rename did not reach every operational record\n");
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* "name|reason" of each client the management API asked to close in the last call. */
+static char client_close_calls[4][160];
+static size_t client_close_call_count = 0U;
+
+static int record_client_close(void *ctx, const char *client_name, const char *reason)
+{
+    (void)ctx;
+    if (client_close_call_count < sizeof(client_close_calls) / sizeof(client_close_calls[0])) {
+        snprintf(client_close_calls[client_close_call_count], sizeof(client_close_calls[0]), "%s|%s",
+                 client_name, reason);
+    }
+    ++client_close_call_count;
+    return 0;
+}
+
+/* One client mutation by tenant-a's administrator: its status and the one close it asks for, or none. */
+static int client_mutation_closes(const char *method, const char *path, const char *body, const char *status,
+                                  const char *expected_close, const char *label)
+{
+    char response[16384];
+    client_close_call_count = 0U;
+    int len = tenant_scope_call(method, path, "root-a", "tenant-a", "ADMIN", body, response, sizeof(response));
+    if (endpoint_expect(len, response, status, NULL, label) != 0) {
+        return -1;
+    }
+    int ok = expected_close == NULL
+        ? client_close_call_count == 0U
+        : client_close_call_count == 1U && strcmp(client_close_calls[0], expected_close) == 0;
+    if (!ok) {
+        fprintf(stderr, "%s: %zu close(s), the first %s; expected %s\n", label, client_close_call_count,
+                client_close_call_count > 0U ? client_close_calls[0] : "(none)",
+                expected_close == NULL ? "none" : expected_close);
+    }
+    return ok ? 0 : -1;
+}
+
+/*
+ * Disabling, renaming or deleting a client closes its online connections on the transitions Go's
+ * management API kicks on, with Go's reasons: disabled from enabled, or renamed while disabled
+ * (ADMIN_DISABLED), renamed (ADMIN_RENAMED), deleted (ADMIN_DELETED). The connections are named
+ * by the client's name before the change. Other updates and refused mutations close nothing.
+ */
+static int test_client_mutations_close_connections(void)
+{
+    char db_path[256];
+    char path[160];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-client-close-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-client-close-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client alpha;
+    st_storage_client foreign;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "close-alpha", "root-a", 1, 30, &alpha) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-b", "close-foreign", "root-b", 1, 30, &foreign) != 0;
+    if (failed) fprintf(stderr, "client close fixture setup failed\n");
+    st_admin_set_client_disconnect_handler(record_client_close, NULL);
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"connectionRateLimitPerMinute\":40}", "HTTP/1.1 200 ", NULL,
+                                  "rate limit change") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_DISABLED", "disable") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ", NULL,
+                                  "disable an already disabled client") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":true}", "HTTP/1.1 200 ", NULL, "enable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-2\"}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_RENAMED", "rename") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-3\",\"enabled\":false}",
+                                  "HTTP/1.1 200 ", "close-alpha-2|ADMIN_DISABLED", "rename and disable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-4\"}", "HTTP/1.1 200 ",
+                                  "close-alpha-3|ADMIN_DISABLED", "rename while disabled") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", foreign.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 404 ", NULL,
+                                  "disable another tenant's client") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete another tenant's client") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 204 ", "close-alpha-4|ADMIN_DELETED", "delete") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete a deleted client") != 0;
+    st_admin_set_client_disconnect_handler(NULL, NULL);
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 /* The connectivity check device for the endpoint test: online and refused by its target, or offline. */
 static int connectivity_test_online;
 
@@ -3074,6 +3676,115 @@ static int connectivity_call(const char *path, const char *username, const char 
  * answer the same 404, the body is checked first, every answer is private and uncacheable, and a
  * result never names the target.
  */
+/*
+ * Java UserDiagramDocumentServiceTests: a cloud diagram is stored under the creating account's
+ * tenant and username, the list is scoped to the caller, and another account (another user of
+ * the same tenant, that tenant's administrator, another tenant's administrator) cannot read,
+ * overwrite or delete it: each attempt answers exactly like a document that does not exist, in
+ * whatever shape the request body comes.
+ */
+static int test_user_diagram_owner_scope(void)
+{
+    char db_path[256];
+    char path[96];
+    char response[32768];
+    char missing[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-diagram-scope-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-diagram-scope-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("alice", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("bob", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "diagram scope fixture setup failed\n");
+    /* "yjs-cloud-state", base64 */
+    int len = failed ? -1 : tenant_scope_call("POST", "/api/admin/diagrams", "alice", "tenant-a", "USER",
+                                              "{\"name\":\"架构图\",\"update\":\"eWpzLWNsb3VkLXN0YXRl\"}",
+                                              response, sizeof(response));
+    long long id = 0;
+    if (!failed) {
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"name\":\"架构图\"", "diagram create") != 0
+            || st_json_get_i64(strstr(response, "\r\n\r\n") + 4, "id", &id) != 0 || id <= 0;
+    }
+    if (!failed) {
+        st_storage_user_diagram stored;
+        failed = st_storage_get_user_diagram(db_path, id, "tenant-a", "alice", &stored) != 0;
+        if (!failed) {
+            failed = strcmp(stored.tenant_id, "tenant-a") != 0 || strcmp(stored.owner_username, "alice") != 0
+                || stored.snapshot_len != 15U || memcmp(stored.snapshot_data, "yjs-cloud-state", 15U) != 0;
+            st_storage_user_diagram_free(&stored);
+        }
+        if (failed) fprintf(stderr, "the diagram was not stored under the creating account\n");
+    }
+    static const struct {
+        const char *username;
+        const char *tenant;
+        const char *role;
+    } others[] = {
+        {"bob", "tenant-a", "USER"}, {"root-a", "tenant-a", "ADMIN"}, {"root-b", "tenant-b", "ADMIN"}
+    };
+    static const struct {
+        const char *method;
+        const char *body;
+    } attempts[] = {
+        {"GET", NULL},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\",\"revision\":0}"},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\"}"},
+        {"PUT", "{\"name\":\"\",\"update\":\"not base64\",\"revision\":0}"},
+        {"DELETE", NULL},
+    };
+    for (size_t who = 0; !failed && who < sizeof(others) / sizeof(others[0]); ++who) {
+        for (size_t i = 0; !failed && i < sizeof(attempts) / sizeof(attempts[0]); ++i) {
+            char label[160];
+            snprintf(label, sizeof(label), "%s %s of another account's diagram as %s/%s",
+                     attempts[i].method, attempts[i].body == NULL ? "" : attempts[i].body,
+                     others[who].tenant, others[who].username);
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+            len = tenant_scope_call(attempts[i].method, path, others[who].username, others[who].tenant,
+                                    others[who].role, attempts[i].body, response, sizeof(response));
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id + 1000);
+            int missing_len = tenant_scope_call(attempts[i].method, path, others[who].username,
+                                                others[who].tenant, others[who].role, attempts[i].body,
+                                                missing, sizeof(missing));
+            failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "{\"error\":\"diagram not found\"}", label) != 0
+                || missing_len != len || strcmp(response, missing) != 0;
+            if (failed) fprintf(stderr, "%s: did not answer like a missing diagram: %s\n", label, missing);
+        }
+        if (!failed) {
+            len = tenant_scope_call("GET", "/api/admin/diagrams", others[who].username, others[who].tenant,
+                                    others[who].role, NULL, response, sizeof(response));
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "another account's diagram list") != 0
+                || strcmp(strstr(response, "\r\n\r\n") + 4, "[]") != 0;
+            if (failed) fprintf(stderr, "another account listed a diagram: %s\n", response);
+        }
+    }
+    /* The owner still has the untouched document, and a stale revision cannot overwrite it. */
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+        len = tenant_scope_call("GET", path, "alice", "tenant-a", "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"update\":\"eWpzLWNsb3VkLXN0YXRl\"",
+                                 "owner diagram detail") != 0
+            || !contains(response, "\"name\":\"架构图\"") || !contains(response, "\"revision\":0");
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/diagrams", "alice", "tenant-a", "USER", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"name\":\"架构图\"", "owner diagram list") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "alice", "tenant-a", "USER",
+                                "{\"name\":\"架构图\",\"update\":\"AQ==\",\"revision\":2}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "stale diagram revision") != 0;
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 static int test_connectivity_check_endpoint(void)
 {
     char db_path[256];
@@ -3172,6 +3883,22 @@ static int test_connectivity_check_endpoint(void)
     (void)bravo;
     (void)charlie;
     return failed ? 1 : 0;
+}
+
+static long long route_auth_exchange_count(const char *database_path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long count = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = 'api'", -1,
+                              &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return count;
 }
 
 static int route_auth_detail_is_sanitized(const char *database_path)
@@ -3388,6 +4115,26 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* TrafficInspectionServiceTests: the route's detailCaptureEnabled is on, but without
+     * SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED (Java's capture-detail-enabled, default false) nothing
+     * is captured. */
+    long long captured_before = route_auth_exchange_count(database_path);
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    int uncaptured = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    if (uncaptured != 0 || !contains(response, "200 OK") || captured_before < 0
+        || route_auth_exchange_count(database_path) != captured_before) {
+        fprintf(stderr, "HTTP detail captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
     snprintf(request,
              sizeof(request),
              "GET %s HTTP/1.1\r\nHost: localhost\r\n"
@@ -3400,6 +4147,7 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !contains(response, "forwarded")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
         || context.normalized_accept_encoding_headers != 1
+        || route_auth_exchange_count(database_path) != captured_before + 1
         || route_auth_detail_is_sanitized(database_path) != 0) {
         fprintf(stderr, "protected route successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
@@ -3422,6 +4170,34 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")
         || !route_auth_test_paths_match(&context, "/items/a+b/c%20d/%E4%BD%A0/x%2Fy", "")) {
         fprintf(stderr, "direct HTTP raw path or query brace encoding mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    /* Java UpstreamBrowserHeaders: the device sees the browser's Origin and Referer moved onto the
+     * route target's origin (https://example.com here) and cross-site fetch metadata as
+     * same-origin, so the target's own CSRF fences accept the request. */
+    static const char browser_headers[] =
+        "Origin: https://specus.example\r\n"
+        "Referer: https://specus.example/http/C%20managed%202/api/page?x=1\r\n"
+        "Sec-Fetch-Site: cross-site\r\n";
+    static const char rewritten_browser_headers[] =
+        "Origin:https://example.com|Referer:https://example.com/http/C%20managed%202/api/page?x=1"
+        "|Sec-Fetch-Site:same-origin";
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)
+        || strcmp(context.http_browser_headers, rewritten_browser_headers) != 0) {
+        fprintf(stderr, "direct HTTP browser headers were not moved onto the route target: %s\n",
+                context.http_browser_headers);
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
         return 1;
@@ -3519,14 +4295,16 @@ static int test_direct_http_route_authentication(const char *database_path)
              "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
-             protected_path);
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
         || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
-        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")
+        || strcmp(context.ws_browser_headers, rewritten_browser_headers) != 0) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
@@ -4799,7 +5577,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/public/client-packages/%d/download", hosted_package_id);
     int download_handled = st_client_package_send_download(
-        package_sockets[0], "GET", request_path, db_path, "198.51.100.40");
+        package_sockets[0], "GET", request_path, db_path, "198.51.100.40", NULL, NULL);
     shutdown(package_sockets[0], SHUT_WR);
     char package_response[4096];
     ssize_t package_response_len = recv(package_sockets[1], package_response,
@@ -5619,7 +6397,10 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
+    int route_authentication_failed = test_log_safe_reason() != 0
+        || test_direct_http_route_authentication(db_path) != 0;
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    if (route_authentication_failed) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -5627,8 +6408,11 @@ int main(void)
     rewrite_response.status_code = 200;
     rewrite_response.headers_len = 2;
     rewrite_response.headers = (char **)calloc(rewrite_response.headers_len, sizeof(*rewrite_response.headers));
+    /* ResponseRewriterTests: protocol-relative and absolute URLs are left as they are. */
     const char *rewrite_html = "<html><head><title>x</title></head><body>"
-        "<a href=\"/login\"><img src='/img/logo.png' srcset=\"/a.png 1x, /b.png 2x\"></body></html>";
+        "<a href=\"/login\"><img src='/img/logo.png' srcset=\"/a.png 1x, /b.png 2x\">"
+        "<img src=\"//cdn.example.com/logo.png\"><img src=\"https://cdn.example.com/external.png\">"
+        "</body></html>";
     if (rewrite_response.headers == NULL
         || (rewrite_response.headers[0] = test_dup_string("Content-Type: text/html; charset=UTF-8")) == NULL
         || (rewrite_response.headers[1] = test_dup_string("ETag: \"old\"")) == NULL
@@ -5641,10 +6425,15 @@ int main(void)
         || !contains((const char *)rewrite_response.body, "href=\"/http/C managed 2/api/login\"")
         || !contains((const char *)rewrite_response.body, "src='/http/C managed 2/api/img/logo.png'")
         || !contains((const char *)rewrite_response.body, "/http/C managed 2/api/a.png 1x")
+        || !contains((const char *)rewrite_response.body, "src=\"//cdn.example.com/logo.png\"")
+        || !contains((const char *)rewrite_response.body, "src=\"https://cdn.example.com/external.png\"")
+        || contains((const char *)rewrite_response.body, "/http/C managed 2/api//cdn")
+        || contains((const char *)rewrite_response.body, "/http/C managed 2/apihttps")
         || !contains((const char *)rewrite_response.body,
                      "<script src=\"/specus-http-route-runtime.js?v=4\" "
                      "data-specus-prefix=\"/http/C managed 2/api\"></script>")
         || contains((const char *)rewrite_response.body, "<script>")
+        || contains((const char *)rewrite_response.body, "specus polyfill failed")
         || rewrite_response.headers[1] != NULL) {
         fprintf(stderr, "direct http html rewrite response mismatch\n");
         st_direct_http_response_free(&rewrite_response);
@@ -5801,7 +6590,7 @@ int main(void)
                                   sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed 2\"")
-        || !contains(response, "\"month\":\"2026-06-20\"")
+        || !contains(response, "\"month\":\"2026-06\"")
         || !contains(response, "\"total\":1")
         || !contains(response, "\"success\":1")
         || !contains(response, "\"failure\":0")
@@ -6081,15 +6870,45 @@ int main(void)
         fprintf(stderr, "traffic detail seed failed\n");
         return 1;
     }
+    /* HttpTrafficExchangeStoreTests: a page of summaries carries no headers and no previews. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"method\":\"POST\"")
         || !contains(response, "\"statusCode\":201")
         || !contains(response, "\"responseBodyType\":\"json\"")
-        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"requestHeaders\":null,\"responseHeaders\":null,\"requestPreviewHex\":null,"
+                               "\"requestPreviewText\":null,\"responsePreviewHex\":null,\"responsePreviewText\":null")
+        || contains(response, "\"requestHeaders\":\"") || contains(response, "\"responseHeaders\":\"")
+        || contains(response, "\"requestPreviewHex\":\"") || contains(response, "\"requestPreviewText\":\"")
+        || contains(response, "\"responsePreviewHex\":\"") || contains(response, "\"responsePreviewText\":\"")
         || !contains(response, "\"size\":20")
         || !contains(response, "\"totalPages\":1")) {
-        fprintf(stderr, "http exchange page response mismatch\n");
+        fprintf(stderr, "http exchange page response mismatch: %.2000s\n", response);
+        return 1;
+    }
+    /* The detail of one exchange carries them, with Java's uppercase spaced hex. */
+    long long post_exchange_id = 0;
+    {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT id FROM specus_http_traffic_exchange WHERE method='POST'", -1, &stmt,
+                                  NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            post_exchange_id = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/traffic/http-exchanges/%lld", post_exchange_id);
+    len = st_admin_build_response("GET", request_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"requestHeaders\":\"Content-Type: application/json\"")
+        || !contains(response, "\"requestPreviewHex\":\"7B 22 68 65 6C 6C 6F 22 3A 74 72 75 65 7D\"")
+        || !contains(response, "\"requestPreviewText\":\"{\\\"hello\\\":true}\"")
+        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"responseTruncated\":false")) {
+        fprintf(stderr, "http exchange detail response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=method&q=POST&page=0&size=20", response, sizeof(response));
@@ -6113,9 +6932,11 @@ int main(void)
         fprintf(stderr, "http exchange status search response mismatch\n");
         return 1;
     }
+    /* The route gate's 401 answers recorded earlier are JSON as well, the JavaScript one is not. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=responseDataType&q=json&page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"total\":1")
+        || !contains(response, "\"relativePath\":\"/items\"")
+        || contains(response, "/vendor.js")
         || !contains(response, "\"responseBodyType\":\"json\"")) {
         fprintf(stderr, "http exchange response data type search response mismatch\n");
         return 1;
@@ -6384,6 +7205,20 @@ int main(void)
         return 1;
     }
     if (test_tenant_scoped_admin_mutations() != 0) {
+        return 1;
+    }
+    if (test_http_route_service_rules() != 0) {
+        fprintf(stderr, "HttpRouteServiceTests rules mismatch\n");
+        return 1;
+    }
+    if (test_client_account_service_rules() != 0) {
+        fprintf(stderr, "ClientAccountServiceTests rules mismatch\n");
+        return 1;
+    }
+    if (test_user_diagram_owner_scope() != 0) {
+        return 1;
+    }
+    if (test_client_mutations_close_connections() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");

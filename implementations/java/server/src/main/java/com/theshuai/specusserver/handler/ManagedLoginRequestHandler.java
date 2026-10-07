@@ -181,15 +181,14 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                 peerSignalService.onClientDisconnected(sessionId);
             });
         }
-        Session session = SessionUtil.getSession(ctx.channel());
-        if (!dataConnection && session != null) {
-            SessionUtil.closeDataSession(session.getClientName());
-        }
+        // The close-future listener has normally unbound the session already, closing the data
+        // connection with it, so the departed client is read from what that unbind left behind.
         SessionUtil.unBindSession(ctx.channel());
-        if (!dataConnection && session != null && StringUtils.hasText(session.getClientName())) {
+        String departed = ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.DEPARTED_CLIENT)
+                .getAndSet(null);
+        if (StringUtils.hasText(departed)) {
             // Submitted after the unbind, not with the tasks above: the executor can run before this
             // thread reaches the unbind, and a roster built then would still count it as online.
-            String departed = session.getClientName();
             submit(() -> peerSignalService.pushOnLogout(departed));
         }
         super.channelInactive(ctx);

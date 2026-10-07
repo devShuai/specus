@@ -218,8 +218,11 @@ static int registration_verify_turnstile(const char *token, const char *expected
     st_registration_handlers handlers = registration_get_handlers();
     if (handlers.turnstile != NULL) return handlers.turnstile(handlers.ctx, token, expected_action);
     if (!registration_text_present(token)) return -1;
+    /* Trimmed on a copy: the caller's token is const and may be a literal. */
+    char *trimmed = strdup(token);
     char *secret = registration_form_encode(getenv("SPECUS_AUTH_TURNSTILE_SECRET_KEY"));
-    char *response = registration_form_encode(registration_trim((char *)token));
+    char *response = trimmed == NULL ? NULL : registration_form_encode(registration_trim(trimmed));
+    free(trimmed);
     if (secret == NULL || response == NULL) {
         free(secret); free(response);
         return -2;
@@ -238,7 +241,9 @@ static int registration_verify_turnstile(const char *token, const char *expected
     int rc = st_http_post_form(getenv("SPECUS_AUTH_TURNSTILE_VERIFY_URL"), NULL, form,
                                &options, &status, &response_body);
     free(form);
-    if (rc != 0 || status / 100L != 2L || response_body == NULL) {
+    /* As Java TurnstileVerifier: a siteverify answer that is not a JSON object means the service
+     * is unavailable (503), not that the visitor failed the challenge (400). */
+    if (rc != 0 || status / 100L != 2L || response_body == NULL || !st_json_is_valid_object(response_body)) {
         free(response_body);
         return -2;
     }
