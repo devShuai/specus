@@ -110,7 +110,12 @@ type WebSocketTicket struct {
 
 // ManagementUser mirrors specus_management_user.
 type ManagementUser struct {
-	Username        string
+	// Username is the login name: unique inside the tenant, case-insensitively, and the identity
+	// (with TenantID) that ownership columns, tokens and the management API carry.
+	Username string
+	// AccountKey is the primary key column, historically named username. Accounts that predate
+	// tenant-scoped login names keep their old username here; new accounts get a random UUID.
+	AccountKey      string
 	TenantID        string
 	PasswordHash    string
 	OIDCIssuer      string

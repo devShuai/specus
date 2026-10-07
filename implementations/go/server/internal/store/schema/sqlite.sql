@@ -115,6 +115,8 @@ CREATE INDEX IF NOT EXISTS idx_client_session_client_status ON specus_client_ses
 
 CREATE TABLE IF NOT EXISTS specus_management_user (
   username TEXT PRIMARY KEY,
+  login_name TEXT,
+  login_name_normalized TEXT,
   tenant_id TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   oidc_issuer TEXT,

@@ -279,6 +279,9 @@ func (db *DB) ensureCompatibleColumns() error {
 		"specus_management_user", "oidc_identity_key"); err != nil {
 		return err
 	}
+	if err := db.migrateManagementLoginNames(); err != nil {
+		return err
+	}
 	if err := db.ensureIndex("idx_specus_connection_tenant", "specus_connection_record", "tenant_id"); err != nil {
 		return err
 	}

@@ -299,7 +299,9 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	// Throttle before the captcha and credential check so deployments without Turnstile are still
 	// bounded. Forwarded addresses participate only through the configured trusted-proxy boundary.
-	if allowed, retryAfter := a.loginLimiter.Allow(a.addressResolver.Resolve(r), req.Username); !allowed {
+	// Same-named accounts of different tenants are throttled apart (Java AuthController.loginIdentity).
+	identity := loginIdentity(req.TenantID, req.Username)
+	if allowed, retryAfter := a.loginLimiter.Allow(a.addressResolver.Resolve(r), identity); !allowed {
 		w.Header().Set("Retry-After", strconv.FormatInt(int64(retryAfter.Seconds()), 10))
 		writeError(w, http.StatusTooManyRequests, security.LoginRateLimitedMessage)
 		return
@@ -309,7 +311,7 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		a.failTurnstile(w, err)
 		return
 	}
-	principal, ok, err := a.authenticatePassword(r.Context(), req.Username, req.Password)
+	principal, ok, err := a.authenticatePassword(r.Context(), req.Username, req.Password, req.TenantID)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -318,7 +320,7 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
-	a.loginLimiter.RecordSuccess(req.Username)
+	a.loginLimiter.RecordSuccess(identity)
 	if !principal.BuiltIn {
 		a.recordMilestone(r.Context(), principal.TenantID, principal.Username, productmetrics.StepSignedIn)
 	}
@@ -389,12 +391,37 @@ func (a *API) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
 }
 
-func (a *API) authenticatePassword(ctx context.Context, username, password string) (managementPrincipal, bool, error) {
+// loginIdentity is the account dimension of the login rate limit: tenant and login name, so
+// same-named accounts of different tenants are counted apart. The limiter lower-cases the key.
+func loginIdentity(tenantID, username string) string {
+	return strings.TrimSpace(tenantID) + "\x00" + strings.TrimSpace(username)
+}
+
+// requestedTenant normalizes an optional tenant of a login request or a token. Blank means none
+// was given; ok is false for a tenant that cannot exist (longer than 80 characters).
+func requestedTenant(value string) (tenant string, ok bool) {
+	tenant = strings.TrimSpace(value)
+	if utf8.RuneCountInString(tenant) > 80 {
+		return "", false
+	}
+	return tenant, true
+}
+
+// authenticatePassword is Java's ManagementUserService.authenticate. With a tenant only that
+// tenant's login names are searched. Without one, the default tenant is searched first and then,
+// only when it has no such name, an account that predates tenant-scoped login names and is found by
+// its account key; new accounts of other tenants must name their tenant.
+func (a *API) authenticatePassword(ctx context.Context, username, password,
+	tenantID string) (managementPrincipal, bool, error) {
 	normalized, err := normalizeUsername(username)
 	if err != nil || password == "" {
 		return managementPrincipal{}, false, nil
 	}
-	if strings.EqualFold(normalized, a.adminUsername()) {
+	tenant, ok := requestedTenant(tenantID)
+	if !ok {
+		return managementPrincipal{}, false, nil
+	}
+	if strings.EqualFold(normalized, a.adminUsername()) && (tenant == "" || tenant == a.defaultTenant()) {
 		if !a.tokens.Authenticate(normalized, password) {
 			return managementPrincipal{}, false, nil
 		}
@@ -407,7 +434,15 @@ func (a *API) authenticatePassword(ctx context.Context, username, password strin
 			Issuer:   security.Issuer,
 		}, true, nil
 	}
-	user, err := a.db.FindManagementUserByUsername(ctx, normalized)
+	var user *store.ManagementUser
+	if tenant != "" {
+		user, err = a.db.FindManagementUserByLogin(ctx, tenant, normalized)
+	} else {
+		user, err = a.db.FindManagementUserByLogin(ctx, a.defaultTenant(), normalized)
+		if err == nil && user == nil {
+			user, err = a.db.FindLegacyManagementUser(ctx, normalized)
+		}
+	}
 	if err != nil {
 		return managementPrincipal{}, false, err
 	}
@@ -601,7 +636,9 @@ func (a *API) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, validation("内置 admin 用户不能重复创建"))
 		return
 	}
-	if existing, err := a.db.FindManagementUserByUsername(r.Context(), username); err != nil {
+	// Login names are unique per tenant: a same-named user of another tenant is no conflict, and the
+	// answer never tells whether one exists (Java ManagementUserService.createUser).
+	if existing, err := a.db.FindManagementUserByLogin(r.Context(), principal.TenantID, username); err != nil {
 		a.fail(w, err)
 		return
 	} else if existing != nil {
@@ -614,7 +651,7 @@ func (a *API) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	user := store.ManagementUser{
+	user, err := a.db.InsertManagementUser(r.Context(), store.ManagementUser{
 		Username:     username,
 		TenantID:     principal.TenantID,
 		PasswordHash: auth.HashPassword(password),
@@ -622,8 +659,13 @@ func (a *API) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Enabled:      boolOr(req.Enabled, true),
 		CreatedAt:    now,
 		UpdatedAt:    now,
-	}
-	if err := a.db.InsertManagementUser(r.Context(), user); err != nil {
+	})
+	if err != nil {
+		if store.IsUniqueConstraintError(err) {
+			// A concurrent create of the same name in this tenant won the unique index.
+			a.fail(w, validation("用户名已存在: "+username))
+			return
+		}
 		a.fail(w, err)
 		return
 	}
@@ -655,12 +697,14 @@ func (a *API) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	user, err := a.db.FindManagementUserByUsername(r.Context(), username)
+	// Only the acting administrator's tenant is searched: a user of another tenant answers like a
+	// missing one.
+	user, err := a.db.FindManagementUserByLogin(r.Context(), principal.TenantID, username)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	if user == nil || !sameTenant(user.TenantID, principal.TenantID) {
+	if user == nil {
 		a.fail(w, store.ErrNotFound)
 		return
 	}
@@ -710,16 +754,16 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, validation("内置 admin 用户不能删除"))
 		return
 	}
-	user, err := a.db.FindManagementUserByUsername(r.Context(), username)
+	user, err := a.db.FindManagementUserByLogin(r.Context(), principal.TenantID, username)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	if user == nil || !sameTenant(user.TenantID, principal.TenantID) {
+	if user == nil {
 		a.fail(w, store.ErrNotFound)
 		return
 	}
-	revoked, err := a.db.DeleteManagementUserAudited(r.Context(), username, principal.Username, a.shareNow(),
+	revoked, err := a.db.DeleteManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
 		a.shares.LapseReason)
 	if err != nil {
 		a.fail(w, err)
@@ -2822,8 +2866,19 @@ func (a *API) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 // authenticate validates a bearer token: local HS256 first, then OIDC RS256 as a fallback.
 func (a *API) authenticate(ctx context.Context, token string) (managementPrincipal, bool) {
 	if claims, ok := a.tokens.ValidateClaims(token); ok {
+		// Java ManagementUserService.resolveLocalTokenUser: the subject is a login name of the
+		// token's tenant; a token without a tenant claim predates tenant-scoped login names and
+		// names its account by the exact account key.
+		tenant, valid := requestedTenant(claims.TenantID)
+		if !valid {
+			return managementPrincipal{}, false
+		}
+		if !claims.HasTenant {
+			tenant = ""
+		}
 		if normalizeRole(claims.Role) == store.ManagementRoleAdmin &&
-			strings.EqualFold(claims.Username, a.adminUsername()) {
+			strings.EqualFold(strings.TrimSpace(claims.Username), a.adminUsername()) &&
+			(tenant == "" || tenant == a.defaultTenant()) {
 			if !a.tokens.PasswordLoginEnabled() {
 				return managementPrincipal{}, false
 			}
@@ -2832,7 +2887,15 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 				Admin: true, BuiltIn: true, Issuer: security.Issuer,
 			}, true
 		}
-		user, err := a.db.FindManagementUserByUsername(ctx, claims.Username)
+		var (
+			user *store.ManagementUser
+			err  error
+		)
+		if tenant != "" {
+			user, err = a.db.FindManagementUserByLogin(ctx, tenant, claims.Username)
+		} else {
+			user, err = a.db.FindManagementUserByAccountKey(ctx, strings.TrimSpace(claims.Username))
+		}
 		if err != nil {
 			a.logger.Warn("local bearer user lookup failed", "err", err)
 			return managementPrincipal{}, false
@@ -3045,10 +3108,6 @@ func normalizeRole(value string) string {
 		return store.ManagementRoleAdmin
 	}
 	return store.ManagementRoleUser
-}
-
-func sameTenant(left, right string) bool {
-	return normalizeTenant(left) == normalizeTenant(right)
 }
 
 func clientIDs(clients []store.ClientAccount) []int64 {

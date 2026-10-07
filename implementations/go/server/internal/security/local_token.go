@@ -29,10 +29,15 @@ type TokenResponse struct {
 
 // Claims is the local management JWT identity used by the admin API.
 type Claims struct {
+	// Username is the subject: the login name of the account (or the built-in admin's name).
 	Username string
+	// TenantID is the tenant claim, or the configured default tenant when the token has none.
 	TenantID string
-	Role     string
-	Expires  int64
+	// HasTenant says the token carried a tenant claim. Every token issued since tenant-scoped login
+	// names does; one without it predates them and names its account by the account key.
+	HasTenant bool
+	Role      string
+	Expires   int64
 }
 
 // LocalTokenService issues and validates HS256 admin tokens and checks admin credentials.
@@ -190,10 +195,11 @@ func (s *LocalTokenService) ValidateClaims(token string) (Claims, bool) {
 	}
 	role := normalizeRole(claims.Role)
 	return Claims{
-		Username: claims.Sub,
-		TenantID: normalizeTenant(firstNonBlank(claims.TenantID, s.auth.TenantID)),
-		Role:     role,
-		Expires:  claims.Exp,
+		Username:  claims.Sub,
+		TenantID:  normalizeTenant(firstNonBlank(claims.TenantID, s.auth.TenantID)),
+		HasTenant: strings.TrimSpace(claims.TenantID) != "",
+		Role:      role,
+		Expires:   claims.Exp,
 	}, true
 }
 
