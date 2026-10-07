@@ -765,6 +765,59 @@ static int test_replayed_login_is_rejected(test_server *server)
     return 0;
 }
 
+/*
+ * ClientAuthNonceServiceIntegrationTests.consumesEachApiKeyAndNoncePairOnlyOnce on the real
+ * process: the consumed pairs live in the database (Java's specus_client_auth_nonce), so a login
+ * replayed after a restart, still inside its 60 s timestamp window, is refused; the same nonce
+ * under another api key is a different pair and is accepted.
+ */
+static int scenario_nonce_survives_restart(test_server *server)
+{
+    CHECK(create_credential(server->db_path, "ck_nonce_a", "nonce-secret-a", 2) == 0
+              && create_credential(server->db_path, "ck_nonce_b", "nonce-secret-b", 2) == 0,
+          "credentials not stored");
+    static const char nonce[] = "0123456789abcdef0123456789abcdef";
+    char body[2048];
+    signed_login_body_with_nonce("ck_nonce_a", "nonce-secret-a", "machine-nonce", "alice", nonce,
+                                 body, sizeof(body));
+    int status = 0;
+    char *response = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) == 0
+          && status == 200, "first login answered %d: %s", status, response == NULL ? "" : response);
+    free(response);
+    char rows[32] = "";
+    CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_client_auth_nonce", NULL, 0, rows, sizeof(rows)) == 0
+              && strcmp(rows, "1") == 0,
+          "the consumed nonce is not in the database: %s row(s)", rows);
+
+    int exit_status = server_stop(server, SHUTDOWN_TIMEOUT_MS);
+    char exit_text[160];
+    CHECK(exit_status == 0, "SIGTERM: %s", describe_server_exit(exit_status, exit_text, sizeof(exit_text)));
+    CHECK(server_start(server) == 0, "restart: the server did not come up (its startup error, if any, is above)");
+
+    response = NULL;
+    int replay_ok = http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL,
+                                 &status, &response) == 0
+        && status == 400 && response != NULL
+        && strstr(response, "{\"error\":\"客户端签名 nonce 已使用\"}") != NULL;
+    if (!replay_ok) {
+        fprintf(stderr, "replay after the restart answered %d: %s\n", status, response == NULL ? "" : response);
+    }
+    free(response);
+    CHECK(replay_ok, "a login replayed after a restart was not refused");
+
+    signed_login_body_with_nonce("ck_nonce_b", "nonce-secret-b", "machine-nonce", "bob", nonce, body, sizeof(body));
+    response = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) == 0
+          && status == 200, "the same nonce under another api key answered %d: %s", status,
+          response == NULL ? "" : response);
+    free(response);
+    CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_client_auth_nonce", NULL, 0, rows, sizeof(rows)) == 0
+              && strcmp(rows, "2") == 0,
+          "expected one row per (api key, nonce) pair, found %s", rows);
+    return 0;
+}
+
 /* Counts the client's closed connection records with the given disconnect reason, or -1. */
 static int connection_reason_count(const char *db_path, const char *client_name, const char *reason)
 {
@@ -952,6 +1005,7 @@ int main(int argc, char **argv)
     failures += run_on_fresh_server("dead channel cleanup", test_dead_channel_is_cleaned_up, short_idle);
     failures += run_on_fresh_server("connection roles refuse the other role's frames", test_connection_roles, NULL);
     failures += run_on_fresh_server("SIGTERM shutdown and restart cleanup", scenario_shutdown_and_restart, NULL);
+    failures += run_on_fresh_server("consumed login nonces survive a restart", scenario_nonce_survives_restart, NULL);
     if (failures != 0) {
         fprintf(stderr, "%d session lifecycle scenario(s) failed\n", failures);
         return 1;

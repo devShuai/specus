@@ -531,10 +531,16 @@ const char *harness_login_environment_extra = "";
 void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
                        const char *os_user, char *body, size_t body_len)
 {
-    char timestamp[32];
     char nonce[33];
-    snprintf(timestamp, sizeof(timestamp), "%lld", wall_clock_ms());
     random_hex(nonce, 16U);
+    signed_login_body_with_nonce(api_key, secret, fingerprint, os_user, nonce, body, body_len);
+}
+
+void signed_login_body_with_nonce(const char *api_key, const char *secret, const char *fingerprint,
+                                  const char *os_user, const char *nonce, char *body, size_t body_len)
+{
+    char timestamp[32];
+    snprintf(timestamp, sizeof(timestamp), "%lld", wall_clock_ms());
     uint8_t key[ST_SHA256_LEN];
     st_sha256((const uint8_t *)secret, strlen(secret), key);
     char canonical[1024];

@@ -97,6 +97,9 @@ extern const char *harness_login_environment_extra;
 /* A POST /api/client/auth/login body, signed exactly as protocol/spec/client-auth.md describes. */
 void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
                        const char *os_user, char *body, size_t body_len);
+/* The same with a chosen nonce. */
+void signed_login_body_with_nonce(const char *api_key, const char *secret, const char *fingerprint,
+                                  const char *os_user, const char *nonce, char *body, size_t body_len);
 /* The real POST /api/client/auth/login with a freshly signed body. */
 int http_client_login(const test_server *server, const char *api_key, const char *secret,
                       const char *fingerprint, const char *os_user, runtime_session *out);
