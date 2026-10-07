@@ -21,6 +21,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <utf8proc.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -408,6 +409,35 @@ static int public_has_iso_control(const uint8_t *data, size_t len)
     return 0;
 }
 
+/*
+ * Java String.equalsIgnoreCase for the in-process name checks: code point by code point, two code
+ * points match when equal, when their simple upper-case mappings are equal, or when the lower-case
+ * mappings of those are. Invalid UTF-8 only matches byte for byte.
+ */
+static int public_names_equal_ignore_case(const char *left, const char *right)
+{
+    const uint8_t *a = (const uint8_t *)left;
+    const uint8_t *b = (const uint8_t *)right;
+    size_t a_len = strlen(left);
+    size_t b_len = strlen(right);
+    size_t a_offset = 0U;
+    size_t b_offset = 0U;
+    while (a_offset < a_len && b_offset < b_len) {
+        uint32_t a_codepoint = 0U;
+        uint32_t b_codepoint = 0U;
+        if (public_utf8_next(a, a_len, &a_offset, &a_codepoint, NULL) < 0
+            || public_utf8_next(b, b_len, &b_offset, &b_codepoint, NULL) < 0) {
+            return strcmp(left, right) == 0;
+        }
+        if (a_codepoint == b_codepoint) continue;
+        utf8proc_int32_t a_upper = utf8proc_toupper((utf8proc_int32_t)a_codepoint);
+        utf8proc_int32_t b_upper = utf8proc_toupper((utf8proc_int32_t)b_codepoint);
+        if (a_upper == b_upper || utf8proc_tolower(a_upper) == utf8proc_tolower(b_upper)) continue;
+        return 0;
+    }
+    return a_offset == a_len && b_offset == b_len;
+}
+
 static int public_write_response(char *out,
                                  size_t out_len,
                                  int status,
@@ -666,7 +696,7 @@ int st_public_discovery_name_availability_response(const char *path,
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
             if ((exclude == NULL || *exclude == '\0' || strcmp(peer->peer_id, exclude) != 0)
-                && strcasecmp(peer->display_name, normalized) == 0) {
+                && public_names_equal_ignore_case(peer->display_name, normalized)) {
                 available = 0;
                 break;
             }
@@ -1214,7 +1244,7 @@ static int public_register_peer(st_public_peer *peer)
         }
     }
     for (st_public_peer *existing = public_peers; existing != NULL; existing = existing->next) {
-        if (strcasecmp(existing->display_name, peer->display_name) == 0) {
+        if (public_names_equal_ignore_case(existing->display_name, peer->display_name)) {
             pthread_mutex_unlock(&public_peer_lock);
             return -4;
         }
