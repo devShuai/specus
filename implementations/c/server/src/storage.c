@@ -129,6 +129,118 @@ static int workbench_delete_object_refs(sqlite3 *db, const char *kind, long long
     return rc;
 }
 
+/*
+ * client_account ids are what runtime tokens, identities and every other table refer to, so one is
+ * never handed out twice: AUTOINCREMENT, where a plain rowid would give a deleted newest account's
+ * id to the next account created. id stays the rowid, so queries by rowid keep working.
+ */
+#define CLIENT_ACCOUNT_COLUMNS                              \
+    "id INTEGER PRIMARY KEY AUTOINCREMENT,"                 \
+    "tenant_id TEXT NOT NULL DEFAULT 'default',"            \
+    "client_name TEXT NOT NULL UNIQUE,"                     \
+    "owner_username TEXT NOT NULL DEFAULT 'admin',"         \
+    "enabled INTEGER NOT NULL DEFAULT 1,"                   \
+    "connection_limit_per_minute INTEGER NOT NULL DEFAULT 30," \
+    "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"   \
+    "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+
+/*
+ * Raises the client_account id sequence above every client id another table still refers to:
+ * a client_id, or any *_client_id column. Before the migration below, SQLite could already have
+ * handed such an id out, freed it with the account and kept it free; it must not come back.
+ */
+static int retire_referenced_client_ids(sqlite3 *db)
+{
+    sqlite3_stmt *columns = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.name, p.name FROM sqlite_master m JOIN pragma_table_info(m.name) p "
+            "WHERE m.type = 'table' AND m.name <> 'client_account' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+            "AND (p.name = 'client_id' OR p.name LIKE '%\\_client\\_id' ESCAPE '\\')",
+            -1, &columns, NULL) != SQLITE_OK) {
+        sqlite3_finalize(columns);
+        return -1;
+    }
+    long long highest = 0;
+    int rc = 0;
+    int step;
+    while (rc == 0 && (step = sqlite3_step(columns)) == SQLITE_ROW) {
+        const char *table = (const char *)sqlite3_column_text(columns, 0);
+        const char *column = (const char *)sqlite3_column_text(columns, 1);
+        char sql[512];
+        int written = table == NULL || column == NULL || strchr(table, '"') != NULL || strchr(column, '"') != NULL
+            ? -1
+            : snprintf(sql, sizeof(sql), "SELECT COALESCE(MAX(\"%s\"), 0) FROM \"%s\"", column, table);
+        sqlite3_stmt *max = NULL;
+        rc = written > 0 && (size_t)written < sizeof(sql)
+                && sqlite3_prepare_v2(db, sql, -1, &max, NULL) == SQLITE_OK
+                && sqlite3_step(max) == SQLITE_ROW
+            ? 0 : -1;
+        if (rc == 0 && sqlite3_column_int64(max, 0) > highest) {
+            highest = sqlite3_column_int64(max, 0);
+        }
+        sqlite3_finalize(max);
+    }
+    if (rc == 0 && step != SQLITE_DONE) {
+        rc = -1;
+    }
+    sqlite3_finalize(columns);
+    sqlite3_stmt *sequence = NULL;
+    if (rc == 0) {
+        rc = exec_sql(db,
+            "INSERT INTO sqlite_sequence(name, seq) SELECT 'client_account', COALESCE(MAX(id), 0) "
+            "FROM client_account WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'client_account')");
+    }
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db, "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'client_account'",
+                                -1, &sequence, NULL) == SQLITE_OK ? 0 : -1;
+    }
+    if (rc == 0) {
+        sqlite3_bind_int64(sequence, 1, highest);
+        rc = sqlite3_step(sequence) == SQLITE_DONE ? 0 : -1;
+    }
+    sqlite3_finalize(sequence);
+    return rc;
+}
+
+/*
+ * Databases from before client_account had an id column keyed it by client_name and used the
+ * implicit rowid as the account id. The table is rebuilt once with CLIENT_ACCOUNT_COLUMNS; every
+ * account keeps its rowid as its id, so nothing that refers to one changes.
+ */
+static int migrate_client_account_ids(sqlite3 *db)
+{
+    int has_id = table_has_column(db, "client_account", "id");
+    if (has_id != 0) {
+        return has_id < 0 ? -1 : 0;
+    }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        return -1;
+    }
+    /* Another process may have migrated it while this one waited for the write lock. */
+    has_id = table_has_column(db, "client_account", "id");
+    int rc = has_id < 0 ? -1 : 0;
+    if (rc == 0 && !has_id) {
+        rc = exec_sql(db,
+            "CREATE TABLE client_account_with_id (" CLIENT_ACCOUNT_COLUMNS ");"
+            "INSERT INTO client_account_with_id(id, tenant_id, client_name, owner_username, enabled, "
+            "connection_limit_per_minute, created_at, updated_at) "
+            "SELECT rowid, tenant_id, client_name, owner_username, enabled, connection_limit_per_minute, "
+            "created_at, updated_at FROM client_account ORDER BY rowid;"
+            "DROP TABLE client_account;"
+            "ALTER TABLE client_account_with_id RENAME TO client_account;");
+        if (rc == 0) {
+            rc = retire_referenced_client_ids(db);
+        }
+    }
+    if (rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    }
+    if (rc != 0) {
+        (void)exec_sql(db, "ROLLBACK");
+    }
+    return rc;
+}
+
 int st_storage_init(const char *path, int seed_demo_client)
 {
     sqlite3 *db = NULL;
@@ -137,15 +249,7 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
 
     int rc = exec_sql(db,
-        "CREATE TABLE IF NOT EXISTS client_account ("
-        "tenant_id TEXT NOT NULL DEFAULT 'default',"
-        "client_name TEXT PRIMARY KEY,"
-        "owner_username TEXT NOT NULL DEFAULT 'admin',"
-        "enabled INTEGER NOT NULL DEFAULT 1,"
-        "connection_limit_per_minute INTEGER NOT NULL DEFAULT 30,"
-        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
-        ");"
+        "CREATE TABLE IF NOT EXISTS client_account (" CLIENT_ACCOUNT_COLUMNS ");"
         "CREATE TABLE IF NOT EXISTS specus_management_user ("
         "username TEXT PRIMARY KEY,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
@@ -630,6 +734,9 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "client_account", "owner_username", "TEXT NOT NULL DEFAULT 'admin'");
+    }
+    if (rc == 0) {
+        rc = migrate_client_account_ids(db);
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "client_download_link", "version", "TEXT");
@@ -3566,10 +3673,13 @@ static int update_client_on_db(sqlite3 *db,
      * The other operational records that carry the name follow the account, as Java
      * ClientNameReferenceRepository.rename does; history (connection records, traffic detail)
      * keeps the name it was captured under. Traffic usage is keyed by name here, so a row a deleted
-     * client of the new name left for the same day gives way to the renamed client's row.
+     * client of the new name left for the same day gives way to the renamed client's row. Logins
+     * resolve the account by id, so the runtime sessions' name is only what they show; it follows
+     * the account too, as Go renames it.
      */
     static const char *const references_sql[] = {
         "UPDATE specus_client_identity SET client_name = ?1 WHERE client_id = ?2",
+        "UPDATE specus_client_session SET client_name = ?1 WHERE client_id = ?2",
         "UPDATE peer_mesh_device SET client_name = ?1, updated_at = CURRENT_TIMESTAMP WHERE client_id = ?2",
         "UPDATE peer_mesh_acl SET source_client_name = ?1, updated_at = CURRENT_TIMESTAMP "
         "WHERE source_client_id = ?2",
@@ -3700,6 +3810,26 @@ static int delete_client_on_db(sqlite3 *db, long long id, const char *client_nam
         rc = sqlite3_prepare_v2(db, "DELETE FROM http_route_mapping WHERE client_name = ?", -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
+        /*
+         * Its runtime tokens end with it. Logins resolve the account by an id that is never handed
+         * out again, so this is defense in depth: no reconnect of its machines logs in again,
+         * whichever account later takes its name.
+         */
+        rc = sqlite3_prepare_v2(db,
+            "UPDATE specus_client_session SET status = 'DISCONNECTED', "
+            "disconnected_at = COALESCE(disconnected_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), "
+            "expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE client_id = ? AND (expires_at = '' OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            -1, &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, id);
             rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
         } else {
             rc = -1;

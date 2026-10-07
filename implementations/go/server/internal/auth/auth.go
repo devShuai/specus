@@ -138,6 +138,42 @@ func (s *SessionStore) Find(sessionID int64, accessToken string) (Session, bool)
 	return session, ok
 }
 
+// RenameClient moves every session of the account to its new name, so the sessions keep naming
+// the connection the account is bound under.
+func (s *SessionStore) RenameClient(clientID int64, clientName string) {
+	if clientID <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, session := range s.byTokenHash {
+		if session.ClientID == clientID && session.ClientName != clientName {
+			session.ClientName = clientName
+			s.byTokenHash[hash] = session
+		}
+	}
+}
+
+// RevokeClient forgets every token issued for the account and returns the revoked session ids.
+// A deleted account's tokens must not come back, whichever account later takes its name.
+func (s *SessionStore) RevokeClient(clientID int64) []int64 {
+	if clientID <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var revoked []int64
+	for hash, session := range s.byTokenHash {
+		if session.ClientID != clientID {
+			continue
+		}
+		delete(s.byTokenHash, hash)
+		delete(s.tokenHashBySessionID, session.ID)
+		revoked = append(revoked, session.ID)
+	}
+	return revoked
+}
+
 func (s *SessionStore) MarkOnline(sessionID int64) {
 	s.updateStatus(sessionID, StatusNettyOnline)
 }
@@ -308,15 +344,22 @@ func (a *Authenticator) authenticate(ctx context.Context, request protocol.Login
 		_ = a.db.MarkClientSessionDisconnected(ctx, session.ID, StatusDisconnected, a.now())
 		return Result{Reason: "客户端访问令牌已过期"}, nil
 	}
-	account, err := a.db.FindClientByName(ctx, session.ClientName)
-	if err != nil {
+	// The token belongs to the account it was issued for, never to a name: a name passes to
+	// another account when the admin renames or deletes this one and creates a new account under
+	// it. Resolve by id and tenant like Java/.NET, and bind under the account's current name.
+	account, err := a.db.GetClient(ctx, session.ClientID)
+	if err != nil && err != store.ErrNotFound {
 		return Result{}, err
 	}
-	if account == nil {
+	if account == nil || normalizeTenant(account.TenantID) != normalizeTenant(session.TenantID) {
 		return Result{Reason: "客户端不存在"}, nil
 	}
 	if !account.Enabled {
 		return Result{Reason: "客户端已停用", Account: account}, nil
+	}
+	if session.ClientName != account.ClientName {
+		a.sessions.RenameClient(account.ID, account.ClientName)
+		session.ClientName = account.ClientName
 	}
 	if dataConnection && session.Status != StatusNettyOnline {
 		return Result{Reason: "数据连接要求控制连接先登录", Account: account}, nil
@@ -383,6 +426,13 @@ func (a *Authenticator) MarkOnline(sessionID int64) {
 
 func (a *Authenticator) MarkDisconnected(sessionID int64) {
 	a.sessions.MarkDisconnected(sessionID)
+}
+
+func normalizeTenant(tenantID string) string {
+	if tenantID == "" {
+		return "default"
+	}
+	return tenantID
 }
 
 func randomHex(size int) string {
