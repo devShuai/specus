@@ -135,7 +135,7 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | Peer session authorization lifetime: the expiry stored for a new peer session and the `sessionTtlSeconds` sent in the login configuration. Non-positive values fall back to `3600`. |
 | `SPECUS_PEER_MESH_CATALOG_TTL_SECONDS` | `300` | Live service-catalog lease before stale withdrawal. Values outside `1..86400` fall back to `300`. |
 | `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | Maximum discoverable peers in one token/public room. |
-| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message limits. Redis failure closes discovery sockets; there is no process-local fallback. |
+| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message, pairing-code redemption and public presign-upload limits. Redis failure closes discovery sockets and answers the two source-address limits with 429; there is no process-local fallback. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | unset | Required in cluster mode. Supports `redis://[user[:password]@]host[:port][/0..15]`; TLS `rediss://` is intentionally rejected until a verified TLS transport is added. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis keys/channel prefix. Use a distinct value per environment. |
 | `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | Shared discovery presence TTL. |
@@ -145,7 +145,7 @@ Additional runtime knobs:
 | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | `60` | Discovery connection rate-limit window in seconds. |
 | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS` | `5` | Maximum blocking discovery-socket write time, clamped to at most 300 seconds. |
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS` | `300` | Pairing-code lifetime, clamped to `60..900` seconds. |
-| `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP` | `10` | Pairing-code redemption attempts per resolved source address in one fixed window. |
+| `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP` | `10` | Pairing-code redemption attempts per resolved source address in one fixed window (shared through Redis in cluster mode). |
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS` | `300` | Pairing-code redemption fixed-window duration. |
 | `SPECUS_OBJECT_STORAGE_PROVIDER` | `disabled` | Attachment provider: `aliyun-oss` is the only supported value. Unset or `disabled` keeps attachment APIs fail-closed; any other value, or `aliyun-oss` without endpoint, bucket, access keys and an inferable or explicit region, is rejected at startup. |
 | `SPECUS_OBJECT_STORAGE_ENDPOINT` / `REGION` / `BUCKET` | unset | Object-storage endpoint, region and bucket. |
@@ -299,9 +299,10 @@ caller's favourites (at most 50) and recent opens (20, 30 days) as bare `(kind, 
 limited per identity in process memory; deleting a route, mapping, Peer service, client, or account deletes
 the references in the same transaction, and the maintenance thread sweeps expired recent opens hourly.
 The public-transfer discovery WebSocket works in process-local mode by default and can use Redis for
-multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message
-limits, and STCE2 Pub/Sub text/binary routing. Redis outages fail closed by terminating local discovery
-sockets rather than falling back to divergent local state. In SQLite mode it resolves
+multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message,
+pairing-code redemption and presign-upload limits, and STCE2 Pub/Sub text/binary routing. Redis outages fail
+closed by terminating local discovery sockets and refusing the source-address limits rather than falling back
+to divergent local state. In SQLite mode it resolves
 owner, editor, and viewer credentials to one persistent room; access-token creation/list/revocation and
 domain-separated HMAC pairing-code creation/atomic redemption follow the Java API. Plaintext credentials
 are returned only at creation/redemption and are never persisted. The roster merges same-room peers across
