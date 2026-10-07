@@ -411,25 +411,30 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         };
 
         SpecusConnectionContext? displaced = null;
+        Action? publish = null;
         if (result.Success)
         {
             context.ConnectionRecordId = recordId;
             context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 packet.ClientSessionId, packet.ConnectionRole!, result.Account!.TenantId);
-            if (dataConnection)
-            {
-                displaced = _sessions.ReplaceData(packet.ClientName!, context);
-                _nat.Attach(context);
-            }
-            else
-            {
-                displaced = _sessions.Replace(packet.ClientName!, context);
-            }
+            publish = dataConnection
+                ? () =>
+                {
+                    // Attach the stream namespace before the registry lists the data connection,
+                    // so a request that finds the client online can open a stream on it.
+                    _nat.Attach(context);
+                    displaced = _sessions.ReplaceData(packet.ClientName!, context);
+                }
+                : () => displaced = _sessions.Replace(packet.ClientName!, context);
         }
 
         try
         {
-            await context.Writer.WriteAsync(response, context.Lifetime).ConfigureAwait(false);
+            // The client reads the login response before any other frame, so whatever the
+            // published state lets others send on this connection (a stream OPEN on data, a
+            // NAT_CONTROL push on control) must queue behind it.
+            await context.Writer.CommitAndWriteAsync(publish, response, context.Lifetime)
+                .ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

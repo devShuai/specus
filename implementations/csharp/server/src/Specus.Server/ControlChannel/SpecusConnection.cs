@@ -239,12 +239,21 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         return WriteDirectAsync(bytes, cancellationToken);
     }
 
-    private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken)
+    /// <summary>
+    /// Holds the write lock across <paramref name="commit"/> and the packet, so any frame the
+    /// committed state lets another producer send (direct, priority, or stream) waits behind it.
+    /// </summary>
+    public ValueTask CommitAndWriteAsync(Action? commit, Packet packet,
+        CancellationToken cancellationToken = default) =>
+        WriteDirectAsync(PacketCodec.Encode(packet), cancellationToken, commit);
+
+    private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken,
+        Action? commit = null)
     {
         var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
         try
         {
-            await WriteEncodedAsync(bytes, cancellationToken).ConfigureAwait(false);
+            await WriteEncodedAsync(bytes, cancellationToken, commit).ConfigureAwait(false);
         }
         finally
         {
@@ -292,11 +301,13 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         }
     }
 
-    private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken)
+    private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken,
+        Action? commit = null)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            commit?.Invoke();
             await _stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
             await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             Volatile.Write(ref _lastWriteTicks, Environment.TickCount64);
