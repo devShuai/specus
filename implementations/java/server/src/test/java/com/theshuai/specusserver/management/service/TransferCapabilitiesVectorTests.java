@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.theshuai.specusserver.config.ObjectStorageProperties;
 import com.theshuai.specusserver.config.PublicTransferProperties;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.TransferAttachment;
 import com.theshuai.specusserver.management.model.TransferAttachmentDownloadUsage;
 import com.theshuai.specusserver.management.repository.TransferAttachmentDownloadGrantRepository;
@@ -83,8 +84,8 @@ class TransferCapabilitiesVectorTests {
             attachment.setStatus(row.path("status").asText());
             attachment.setCreatedAt(now.toString());
             attachment.setUpdatedAt(now.toString());
-            attachment.setUploadExpiresAt(Instant.parse(row.path("uploadExpiresAt").asText()).toString());
-            attachment.setExpiresAt(Instant.parse(row.path("expiresAt").asText()).toString());
+            attachment.setUploadExpiresAt(SortableInstant.normalize(row.path("uploadExpiresAt").asText()));
+            attachment.setExpiresAt(SortableInstant.normalize(row.path("expiresAt").asText()));
             repository.saveAndFlush(attachment);
         }
         for (JsonNode row : testCase.path("downloadUsage")) {

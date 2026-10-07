@@ -4,6 +4,7 @@ import com.theshuai.specusserver.management.model.SpecusMappingView;
 import com.theshuai.specusserver.management.security.ManagementContextResolver;
 import com.theshuai.specusserver.management.service.NatControlService;
 import com.theshuai.specusserver.management.service.NatControlService.MappingMutation;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -29,10 +30,13 @@ import java.util.Map;
 public class SpecusResource {
     private final NatControlService natControlService;
     private final ManagementContextResolver contextResolver;
+    private final ProductMetricsService productMetrics;
 
-    public SpecusResource(NatControlService natControlService, ManagementContextResolver contextResolver) {
+    public SpecusResource(NatControlService natControlService, ManagementContextResolver contextResolver,
+                          ProductMetricsService productMetrics) {
         this.natControlService = natControlService;
         this.contextResolver = contextResolver;
+        this.productMetrics = productMetrics;
     }
 
     @GetMapping("/specus-mappings")
@@ -45,8 +49,9 @@ public class SpecusResource {
     public ResponseEntity<SpecusMappingView> createSpecus(@AuthenticationPrincipal Jwt jwt,
                                                           @PathVariable long id,
                                                           @RequestBody MappingMutation request) {
-        return ResponseEntity.status(HttpStatus.CREATED)
-                .body(natControlService.createMapping(contextResolver.resolve(jwt), id, request));
+        SpecusMappingView created = natControlService.createMapping(contextResolver.resolve(jwt), id, request);
+        productMetrics.servicePublished(created.clientId());
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
     @PutMapping("/specus-mappings/{specusId}")

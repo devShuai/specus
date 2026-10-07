@@ -4,6 +4,7 @@ using Specus.Server.Configuration;
 using Specus.Server.Connectivity;
 using Specus.Server.Hosting;
 using Specus.Server.PeerMesh;
+using Specus.Server.ProductMetrics;
 using Specus.Server.Security;
 
 namespace Specus.Server.Management;
@@ -94,6 +95,10 @@ public static class AdminApiEndpoints
                 {
                     context.Response.Headers.CacheControl = ConnectivityCheck.CacheControl;
                 }
+                else if (HttpShareEndpoints.IsManagementPath(context.Request.Path))
+                {
+                    context.Response.Headers.CacheControl = HttpShareEndpoints.ManagementCacheControl;
+                }
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 await context.Response.WriteAsJsonAsync(new { error = "未授权" }).ConfigureAwait(false);
                 return;
@@ -110,7 +115,7 @@ public static class AdminApiEndpoints
         app.MapPost("/auth/login", async (AdminLoginRequest? request, HttpContext httpContext,
             LocalTokenService tokens, ManagementUserService users, ITurnstileVerifier turnstile,
             LoginRateLimiter loginRateLimiter, ClientAddressResolver addressResolver,
-            CancellationToken cancellationToken) =>
+            ProductMetricsService productMetrics, CancellationToken cancellationToken) =>
         {
             if (request is null)
             {
@@ -141,6 +146,11 @@ public static class AdminApiEndpoints
             }
 
             loginRateLimiter.RecordSuccess(request.Username);
+            if (!user.BuiltInAdmin)
+            {
+                await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
+                    cancellationToken).ConfigureAwait(false);
+            }
             return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
         });
 
@@ -167,7 +177,7 @@ public static class AdminApiEndpoints
         });
 
         app.MapPost("/auth/register/verify", async (RegistrationVerificationRequest? request,
-            RegistrationService registration, LocalTokenService tokens,
+            RegistrationService registration, LocalTokenService tokens, ProductMetricsService productMetrics,
             CancellationToken cancellationToken) =>
         {
             if (request is null)
@@ -177,6 +187,11 @@ public static class AdminApiEndpoints
             var user = await registration.VerifyAsync(request.RegistrationId, request.Code,
                     cancellationToken)
                 .ConfigureAwait(false);
+            // The verified registration created the account and this answer signs it in.
+            await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepAccountCreated,
+                cancellationToken).ConfigureAwait(false);
+            await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
+                cancellationToken).ConfigureAwait(false);
             return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
         });
 
@@ -368,11 +383,14 @@ public static class AdminApiEndpoints
 
         app.MapPost("/api/admin/users",
             async (HttpContext context, UserMutation request, IOptions<AuthOptions> authOptions,
-                ManagementUserService service, CancellationToken cancellationToken) =>
+                ManagementUserService service, ProductMetricsService productMetrics,
+                CancellationToken cancellationToken) =>
             {
                 var created = await service.CreateUserAsync(
                     ManagementContext.From(context, authOptions.Value), request, cancellationToken)
                     .ConfigureAwait(false);
+                await productMetrics.MilestoneAsync(created.TenantId, created.Username,
+                    ProductMetricsModel.StepAccountCreated, cancellationToken).ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
@@ -384,10 +402,13 @@ public static class AdminApiEndpoints
 
         app.MapDelete("/api/admin/users/{username}",
             async (HttpContext context, string username, IOptions<AuthOptions> authOptions,
-                ManagementUserService service, CancellationToken cancellationToken) =>
+                ManagementUserService service, ProductMetricsService productMetrics,
+                CancellationToken cancellationToken) =>
             {
-                await service.DeleteUserAsync(ManagementContext.From(context, authOptions.Value),
-                        username, cancellationToken)
+                var caller = ManagementContext.From(context, authOptions.Value);
+                var deleted = await service.DeleteUserAsync(caller, username, cancellationToken)
+                    .ConfigureAwait(false);
+                await productMetrics.UserDeletedAsync(deleted.TenantId, deleted.Username, cancellationToken)
                     .ConfigureAwait(false);
                 return Results.NoContent();
             });
@@ -496,11 +517,15 @@ public static class AdminApiEndpoints
 
         app.MapPost("/api/admin/client-credentials",
             async (HttpContext context, CredentialMutation request, IOptions<AuthOptions> authOptions,
-                ManagementMutationService service, CancellationToken cancellationToken) =>
+                ManagementMutationService service, ProductMetricsService productMetrics,
+                CancellationToken cancellationToken) =>
             {
-                var created = await service.CreateCredentialAsync(
-                    ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                var caller = ManagementContext.From(context, authOptions.Value);
+                var created = await service.CreateCredentialAsync(caller, request, cancellationToken)
                     .ConfigureAwait(false);
+                // The credential belongs to the caller (CreateCredentialAsync sets the owner).
+                await productMetrics.MilestoneAsync(caller.TenantId, caller.Username,
+                    ProductMetricsModel.StepCredentialCreated, cancellationToken).ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
@@ -606,11 +631,12 @@ public static class AdminApiEndpoints
         app.MapPost("/api/admin/clients/{id:long}/specus-mappings",
             async (HttpContext context, long id, SpecusMappingMutation request,
                 IOptions<AuthOptions> authOptions, ManagementMutationService service,
-                CancellationToken cancellationToken) =>
+                ProductMetricsService productMetrics, CancellationToken cancellationToken) =>
             {
                 var created = await service.CreateSpecusAsync(
                     ManagementContext.From(context, authOptions.Value), id, request, cancellationToken)
                     .ConfigureAwait(false);
+                await productMetrics.ServicePublishedAsync(id, cancellationToken).ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
@@ -652,11 +678,12 @@ public static class AdminApiEndpoints
         app.MapPost("/api/admin/clients/{id:long}/http-routes",
             async (HttpContext context, long id, HttpRouteMutation request,
                 IOptions<AuthOptions> authOptions, ManagementMutationService service,
-                CancellationToken cancellationToken) =>
+                ProductMetricsService productMetrics, CancellationToken cancellationToken) =>
             {
                 var created = await service.CreateHttpRouteAsync(
                     ManagementContext.From(context, authOptions.Value), id, request, cancellationToken)
                     .ConfigureAwait(false);
+                await productMetrics.ServicePublishedAsync(id, cancellationToken).ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 

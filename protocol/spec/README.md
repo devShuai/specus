@@ -21,6 +21,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | [temporary-http-share.md](temporary-http-share.md) | 对单条受保护 HTTP route 的临时分享：有效期、撤销、路径与方法范围、fragment 换 cookie、级联失效与审计；四个服务端与管理前端已实现 |
 | [service-connectivity-check.md](service-connectivity-check.md) | 对单条 HTTP route 的有界端到端检查，四阶段结果码、客户端 RST 分类与限流；实现进行中 |
 | [service-workbench.md](service-workbench.md) | 管理前端服务工作台，按管理身份保存的常用服务与最近打开接口，以及只在前端推导的待处理问题；四个服务端与管理前端已实现 |
+| [product-metrics.md](product-metrics.md) | 租户显式开启的产品指标：服务端接入里程碑、封闭 schema 的互传结果上报、按日计数、保存期限与清除；四个服务端与管理前端已实现 |
 
 ## 参考实现入口
 

@@ -13,6 +13,7 @@ import com.theshuai.specusserver.management.service.ConnectionRecordService;
 import com.theshuai.specusserver.management.service.NatControlService;
 import com.theshuai.specusserver.management.service.PeerSignalService;
 import com.theshuai.specusserver.config.NettyServerProperties;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -38,19 +39,22 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
     private final PeerSignalService peerSignalService;
     private final ExecutorService loginExecutor;
     private final NettyServerProperties nettyProperties;
+    private final ProductMetricsService productMetrics;
 
     public ManagedLoginRequestHandler(ClientAuthService clientAuthService,
                                       ConnectionRecordService connectionRecordService,
                                       NatControlService natControlService,
                                       PeerSignalService peerSignalService,
                                       NettyServerProperties nettyProperties,
-                                      @Qualifier("loginExecutor") ExecutorService loginExecutor) {
+                                      @Qualifier("loginExecutor") ExecutorService loginExecutor,
+                                      ProductMetricsService productMetrics) {
         this.clientAuthService = clientAuthService;
         this.connectionRecordService = connectionRecordService;
         this.natControlService = natControlService;
         this.peerSignalService = peerSignalService;
         this.nettyProperties = nettyProperties;
         this.loginExecutor = loginExecutor;
+        this.productMetrics = productMetrics;
     }
 
     @Override
@@ -137,6 +141,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                         // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
                         submit(() -> natControlService.pushOnLogin(packet.getClientName()));
                         submit(() -> peerSignalService.pushOnLogin(finalAuthentication.account()));
+                        submit(() -> productMetrics.clientOnline(finalAuthentication.account()));
                     }
                 } else {
                     // 登录失败必须主动关连接，否则客户端心跳会让 server 端 reader idle 一直不超时，

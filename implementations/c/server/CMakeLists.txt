@@ -30,9 +30,11 @@ add_library(specus_c_core
     src/login_rate_limiter.c
     src/media_capture.c
     src/object_storage.c
+    src/oidc.c
     src/password_hash.c
     src/peer_egress.c
     src/peer_mesh.c
+    src/product_metrics.c
     src/protocol.c
     src/public_coordination.c
     src/public_discovery.c
@@ -44,7 +46,9 @@ add_library(specus_c_core
     src/stream_tombstones.c
     src/stun_turn.c
     src/tls_transport.c
+    src/traffic_capture.c
     src/turn_auth.c
+    src/upstream_browser_headers.c
     src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
@@ -78,6 +82,26 @@ add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_address_tests COMMAND specus_c_client_address_tests)
+
+add_executable(specus_c_semantic_version_tests tests/semantic_version_tests.c)
+target_link_libraries(specus_c_semantic_version_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_semantic_version_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME semantic_version_tests COMMAND specus_c_semantic_version_tests)
+
+add_executable(specus_c_traffic_capture_tests tests/traffic_capture_tests.c)
+target_link_libraries(specus_c_traffic_capture_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_capture_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_capture_tests COMMAND specus_c_traffic_capture_tests)
+
+add_executable(specus_c_turnstile_verifier_tests tests/turnstile_verifier_tests.c)
+target_link_libraries(specus_c_turnstile_verifier_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_turnstile_verifier_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME turnstile_verifier_tests COMMAND specus_c_turnstile_verifier_tests)
+
+add_executable(specus_c_upstream_browser_headers_tests tests/upstream_browser_headers_tests.c)
+target_link_libraries(specus_c_upstream_browser_headers_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_upstream_browser_headers_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME upstream_browser_headers_tests COMMAND specus_c_upstream_browser_headers_tests)
 
 add_executable(specus_c_client_auth_nonce_tests tests/client_auth_nonce_tests.c)
 target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)
@@ -151,6 +175,12 @@ add_test(NAME media_capture_tests
                  $<TARGET_FILE:specus_c_media_capture_tests>)
 set_tests_properties(media_capture_tests PROPERTIES TIMEOUT 45)
 
+add_executable(specus_c_oidc_tests tests/oidc_tests.c)
+target_link_libraries(specus_c_oidc_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_oidc_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME oidc_tests COMMAND specus_c_oidc_tests)
+set_tests_properties(oidc_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_password_hash_tests tests/password_hash_tests.c)
 target_link_libraries(specus_c_password_hash_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_password_hash_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -178,6 +208,17 @@ add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 45)
+
+# The shared product metrics vector through the real request handling, the write-path hooks, and a
+# real server process (client_online on a control login, the HTTP layer's body hand-over).
+add_executable(specus_c_product_metrics_tests tests/product_metrics_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_product_metrics_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_product_metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_product_metrics_tests PRIVATE
+    ST_PRODUCT_METRICS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/product-metrics-v1.json")
+add_test(NAME product_metrics_tests
+    COMMAND specus_c_product_metrics_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(product_metrics_tests PROPERTIES TIMEOUT 180)
 
 add_executable(specus_c_protocol_fixture_tests tests/protocol_fixture_tests.c)
 target_link_libraries(specus_c_protocol_fixture_tests PRIVATE specus_c_core)

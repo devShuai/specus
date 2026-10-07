@@ -6,6 +6,8 @@ import com.theshuai.specusserver.config.OidcProperties;
 import com.theshuai.specusserver.management.service.RegistrationService;
 import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
+import com.theshuai.specusserver.productmetrics.ProductMetricsModel;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.TurnstileVerifier;
 import lombok.extern.slf4j.Slf4j;
@@ -53,6 +55,7 @@ public class OidcController {
     private final RegistrationService registrationService;
     private final TurnstileVerifier turnstileVerifier;
     private final ObjectProvider<JwtDecoder> jwtDecoderProvider;
+    private final ProductMetricsService productMetrics;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
@@ -63,13 +66,15 @@ public class OidcController {
                           RegistrationService registrationService,
                           TurnstileVerifier turnstileVerifier,
                           @Qualifier("oidcIdTokenDecoder")
-                          ObjectProvider<JwtDecoder> jwtDecoderProvider) {
+                          ObjectProvider<JwtDecoder> jwtDecoderProvider,
+                          ProductMetricsService productMetrics) {
         this.properties = properties;
         this.localTokenService = localTokenService;
         this.managementUserService = managementUserService;
         this.registrationService = registrationService;
         this.turnstileVerifier = turnstileVerifier;
         this.jwtDecoderProvider = jwtDecoderProvider;
+        this.productMetrics = productMetrics;
     }
 
     @GetMapping("/oidc-config")
@@ -178,6 +183,7 @@ public class OidcController {
                         .body(Map.of("error", "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突"));
             }
             LoginUser user = loginUser.get();
+            productMetrics.milestone(user.tenantId(), user.username(), ProductMetricsModel.STEP_SIGNED_IN);
             Map<String, Object> tokens = new LinkedHashMap<>();
             tokens.put("accessToken",
                     localTokenService.issueToken(user.username(), user.tenantId(), user.role()));

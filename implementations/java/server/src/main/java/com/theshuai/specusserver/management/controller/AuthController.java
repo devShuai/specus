@@ -3,6 +3,8 @@ package com.theshuai.specusserver.management.controller;
 import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.management.service.RegistrationService;
+import com.theshuai.specusserver.productmetrics.ProductMetricsModel;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import com.theshuai.specusserver.security.ClientAddressResolver;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.LoginRateLimiter;
@@ -31,19 +33,22 @@ public class AuthController {
     private final TurnstileVerifier turnstileVerifier;
     private final LoginRateLimiter loginRateLimiter;
     private final ClientAddressResolver addressResolver;
+    private final ProductMetricsService productMetrics;
 
     public AuthController(LocalTokenService localTokenService,
                           ManagementUserService managementUserService,
                           RegistrationService registrationService,
                           TurnstileVerifier turnstileVerifier,
                           LoginRateLimiter loginRateLimiter,
-                          ClientAddressResolver addressResolver) {
+                          ClientAddressResolver addressResolver,
+                          ProductMetricsService productMetrics) {
         this.localTokenService = localTokenService;
         this.managementUserService = managementUserService;
         this.registrationService = registrationService;
         this.turnstileVerifier = turnstileVerifier;
         this.loginRateLimiter = loginRateLimiter;
         this.addressResolver = addressResolver;
+        this.productMetrics = productMetrics;
     }
 
     @PostMapping("/auth/login")
@@ -59,6 +64,9 @@ public class AuthController {
         return managementUserService.authenticate(request.username(), request.password(), request.tenantId())
                 .<ResponseEntity<?>>map(user -> {
                     loginRateLimiter.recordSuccess(loginIdentity);
+                    if (!user.builtInAdmin()) {
+                        productMetrics.milestone(user.tenantId(), user.username(), ProductMetricsModel.STEP_SIGNED_IN);
+                    }
                     return ResponseEntity.ok(buildTokenBody(user));
                 })
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
@@ -93,6 +101,9 @@ public class AuthController {
             return ResponseEntity.badRequest().body(Map.of("error", "请求体无效"));
         }
         LoginUser user = registrationService.verifyRegistration(request.registrationId(), request.code());
+        // The verified registration created the account and this answer signs it in.
+        productMetrics.milestone(user.tenantId(), user.username(), ProductMetricsModel.STEP_ACCOUNT_CREATED);
+        productMetrics.milestone(user.tenantId(), user.username(), ProductMetricsModel.STEP_SIGNED_IN);
         return ResponseEntity.ok(buildTokenBody(user));
     }
 

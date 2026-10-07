@@ -13,6 +13,10 @@ public sealed class MultiProviderModelTests
 {
     private static readonly string[] ExpectedTables =
     {
+        "product_metrics_switch",
+        "product_metrics_onboarding_progress",
+        "product_metrics_onboarding_daily",
+        "product_metrics_transfer_daily",
         "specus_client_account",
         "specus_connection_record",
         "specus_mapping",

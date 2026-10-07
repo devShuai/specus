@@ -424,8 +424,9 @@ public class ManagementUserService {
         return view;
     }
 
+    /** Deletes an account of the caller's tenant and returns its login name. */
     @Transactional
-    public void deleteUser(ManagementContext context, String username) {
+    public String deleteUser(ManagementContext context, String username) {
         requireAdmin(context);
         String normalized = normalizeUsername(username);
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
@@ -440,6 +441,7 @@ public class ManagementUserService {
         }
         repository.delete(user);
         endSharesWithoutCreatorAccess(context, user);
+        return loginName(user);
     }
 
     /**

@@ -464,6 +464,9 @@ typedef struct {
     size_t request_body_len;
     const uint8_t *response_body;
     size_t response_body_len;
+    /* Content-Encoding of each body (NULL: identity); the text previews show the decoded body. */
+    const char *request_content_encoding;
+    const char *response_content_encoding;
     const char *captured_at;
 } st_storage_http_exchange_record;
 
@@ -566,6 +569,26 @@ int st_storage_update_management_user(const char *path,
                                       int enabled,
                                       st_storage_management_user *out_user);
 int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username);
+/*
+ * Java ManagementUserService.resolveOrProvisionOidcUser for a verified issuer/subject pair, in one
+ * transaction: the user already bound to identity_key resolves when enabled; otherwise an enabled,
+ * unbound user named username in tenant_id is bound on this first login; otherwise a USER account
+ * named username is created in tenant_id with password_hash. A disabled user, one bound to another
+ * identity, or a same-named user of another tenant is refused. With password_hash NULL nothing is
+ * created and 2 is returned instead, so the caller derives the slow hash only when it is needed.
+ * Returns 0 with *out_user filled, 1 when refused, 2 as above and -1 when the store fails.
+ */
+int st_storage_resolve_oidc_user(const char *path,
+                                 const char *issuer,
+                                 const char *subject,
+                                 const char *identity_key,
+                                 const char *username,
+                                 const char *tenant_id,
+                                 const char *password_hash,
+                                 st_storage_management_user *out_user);
+/* Read-only lookup of the user bound to identity_key: 0 when it exists and is enabled, 1 when there
+ * is none or it is disabled, -1 when the store cannot be read (Java resolveBoundOidcUser). */
+int st_storage_find_oidc_user(const char *path, const char *identity_key, st_storage_management_user *user);
 int st_storage_management_email_exists(const char *path, const char *email);
 int st_storage_get_registration_challenge(const char *path,
                                           const char *registration_id,
@@ -1161,6 +1184,11 @@ int st_storage_list_peer_mesh_service_audits(const char *path,
                                              size_t max_events,
                                              size_t *event_count);
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record);
+/*
+ * A page of exchange summaries: as Java's summary views, the headers and the request/response
+ * previews are neither read nor returned (left empty); st_storage_get_http_exchange_visible
+ * reads one exchange with them.
+ */
 int st_storage_list_http_exchanges_visible(const char *path,
                                            long long client_id,
                                            const char *route,
@@ -1176,6 +1204,13 @@ int st_storage_list_http_exchanges_visible(const char *path,
                                            size_t max_items,
                                            size_t *item_count,
                                            long long *total_count);
+int st_storage_get_http_exchange_visible(const char *path,
+                                         long long exchange_id,
+                                         const char *tenant_id,
+                                         const char *owner_username,
+                                         int include_all_clients,
+                                         st_storage_http_exchange *item,
+                                         int *found);
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record);
 int st_storage_list_tcp_frames_visible(const char *path,
                                        long long client_id,
@@ -1331,6 +1366,8 @@ typedef struct {
     long long client_id;
     char client_name[256];
     char route_name[128];
+    /* The route's target; the browser headers relayed through the share take its origin. */
+    char target_base_url[512];
     int path_rewrite_enabled;
     /* Only for an active share: why its route, client or creator no longer allows it, else NULL. */
     const char *lapse_reason;

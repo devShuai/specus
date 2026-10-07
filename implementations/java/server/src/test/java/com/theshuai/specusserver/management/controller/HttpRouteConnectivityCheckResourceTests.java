@@ -15,6 +15,7 @@ import com.theshuai.specusserver.management.service.HttpRouteService;
 import com.theshuai.specusserver.management.service.HttpShareService;
 import com.theshuai.specusserver.management.service.NatControlService;
 import com.theshuai.specusserver.management.service.WorkbenchReferences;
+import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.session.ClientHttpRouteCapabilities;
 import org.junit.jupiter.api.BeforeEach;
@@ -228,7 +229,8 @@ class HttpRouteConnectivityCheckResourceTests {
         HttpRouteConnectivityCheckService service = new HttpRouteConnectivityCheckService(
                 new HttpRouteConnectivityTargets(routes, accountRepository),
                 new NatConnectivityProbe(new ClientHttpRouteCapabilities()));
-        return standaloneSetup(new HttpRouteResource(routes, mock(HttpShareService.class), resolver, service))
+        return standaloneSetup(new HttpRouteResource(routes, mock(HttpShareService.class), resolver, service,
+                mock(ProductMetricsService.class)))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .setCustomArgumentResolvers(new AuthenticationPrincipalArgumentResolver())
                 .build();

@@ -681,6 +681,47 @@ CREATE TABLE IF NOT EXISTS management_workbench_item (
   PRIMARY KEY (tenant_id, username, list, kind, object_id),
   KEY idx_mwi_object (tenant_id, kind, object_id),
   KEY idx_mwi_list_at (list, at_ms)
+
+-- Opt-in product metrics (protocol/spec/product-metrics.md): a per-tenant switch, per-account
+-- onboarding progress kept only for the 14-day window, and two daily counter tables without any
+-- user column. Times are epoch milliseconds, days are UTC YYYY-MM-DD text.
+CREATE TABLE IF NOT EXISTS product_metrics_switch (
+  tenant_id VARCHAR(80) NOT NULL PRIMARY KEY,
+  enabled TINYINT(1) NOT NULL DEFAULT 0,
+  updated_by VARCHAR(80),
+  updated_at BIGINT,
+  purged_at BIGINT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS product_metrics_onboarding_progress (
+  tenant_id VARCHAR(80) NOT NULL,
+  username VARCHAR(80) NOT NULL,
+  started_at BIGINT NOT NULL,
+  signed_in_at BIGINT,
+  credential_created_at BIGINT,
+  client_online_at BIGINT,
+  PRIMARY KEY (tenant_id, username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS product_metrics_onboarding_daily (
+  tenant_id VARCHAR(80) NOT NULL,
+  cohort_day VARCHAR(10) NOT NULL,
+  reached_step VARCHAR(32) NOT NULL,
+  duration_bucket VARCHAR(16) NOT NULL,
+  users BIGINT NOT NULL,
+  PRIMARY KEY (tenant_id, cohort_day, reached_step, duration_bucket)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS product_metrics_transfer_daily (
+  tenant_id VARCHAR(80) NOT NULL,
+  day VARCHAR(10) NOT NULL,
+  mode VARCHAR(16) NOT NULL,
+  path VARCHAR(16) NOT NULL,
+  size_bucket VARCHAR(16) NOT NULL,
+  attempt VARCHAR(32) NOT NULL,
+  outcome VARCHAR(16) NOT NULL,
+  count BIGINT NOT NULL,
+  PRIMARY KEY (tenant_id, day, mode, path, size_bucket, attempt, outcome)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS http_share (

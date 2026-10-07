@@ -18,12 +18,16 @@ const maxShareRequestBytes = 8 * 1024
 func (a *API) HTTPShares() *httpshare.Service { return a.shares }
 
 func (a *API) registerHTTPShares(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/admin/http-routes/{routeId}/shares", a.requireAuth(a.handleCreateHTTPShare))
-	mux.HandleFunc("GET /api/admin/http-routes/{routeId}/shares", a.requireAuth(a.handleListHTTPShares))
-	mux.HandleFunc("GET /api/admin/http-routes/{routeId}/shares/{shareId}", a.requireAuth(a.handleGetHTTPShare))
-	mux.HandleFunc("POST /api/admin/http-routes/{routeId}/shares/{shareId}/revoke", a.requireAuth(a.handleRevokeHTTPShare))
-	mux.HandleFunc("GET /api/admin/http-routes/{routeId}/access-audit", a.requireAuth(a.handleRouteAccessAudit))
-	mux.HandleFunc("GET /api/admin/http-access-audit", a.requireAuth(a.handleTenantAccessAudit))
+	// Every management answer is private, the 401 of a missing session included (spec §4).
+	mux.HandleFunc("POST /api/admin/http-routes/{routeId}/shares", noStore(a.requireAuth(a.handleCreateHTTPShare)))
+	mux.HandleFunc("GET /api/admin/http-routes/{routeId}/shares", noStore(a.requireAuth(a.handleListHTTPShares)))
+	mux.HandleFunc("GET /api/admin/http-routes/{routeId}/shares/{shareId}",
+		noStore(a.requireAuth(a.handleGetHTTPShare)))
+	mux.HandleFunc("POST /api/admin/http-routes/{routeId}/shares/{shareId}/revoke",
+		noStore(a.requireAuth(a.handleRevokeHTTPShare)))
+	mux.HandleFunc("GET /api/admin/http-routes/{routeId}/access-audit",
+		noStore(a.requireAuth(a.handleRouteAccessAudit)))
+	mux.HandleFunc("GET /api/admin/http-access-audit", noStore(a.requireAuth(a.handleTenantAccessAudit)))
 	mux.HandleFunc("POST /api/public/http-shares/exchange", a.handleExchangeHTTPShare)
 }
 

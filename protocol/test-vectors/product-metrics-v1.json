@@ -1,0 +1,4016 @@
+{
+  "description": "Opt-in product metrics v1: closed transfer-outcome schema, buckets, rates, per-tenant switch, server-observed onboarding progress folded into daily cohorts, daily transfer counters, rate limits, retention sweep, purge and the summary read API. Replay each scenario on the server's own store with its clock fixed at each op's `at`; compare every response marked with `status`, and the store contents at every `checkpoint`. `effect` on milestone ops is informative only. See protocol/spec/product-metrics.md.",
+  "constants": {
+    "disclosureVersion": 1,
+    "retentionDays": 180,
+    "onboardingWindowDays": 14,
+    "maxBodyBytes": 4096,
+    "maxEventsPerRequest": 20,
+    "maxRangeDays": 180,
+    "defaultLimits": {
+      "perUserEventsPerMinute": 120,
+      "perTenantEventsPerMinute": 3000
+    }
+  },
+  "vocabulary": {
+    "steps": [
+      "account_created",
+      "signed_in",
+      "credential_created",
+      "client_online",
+      "service_published"
+    ],
+    "modes": [
+      "device",
+      "link"
+    ],
+    "paths": [
+      "direct",
+      "turn",
+      "cloud",
+      "unestablished"
+    ],
+    "attempts": [
+      "first",
+      "retry_after_failure",
+      "retry_after_cancel"
+    ],
+    "outcomes": [
+      "success",
+      "failure",
+      "cancelled"
+    ],
+    "eventKeys": [
+      "attempt",
+      "mode",
+      "outcome",
+      "path",
+      "sizeBucket"
+    ],
+    "sizeBuckets": [
+      {
+        "name": "lt1m",
+        "minBytes": 1,
+        "maxBytes": 1048575
+      },
+      {
+        "name": "1m-16m",
+        "minBytes": 1048576,
+        "maxBytes": 16777215
+      },
+      {
+        "name": "16m-128m",
+        "minBytes": 16777216,
+        "maxBytes": 134217728
+      },
+      {
+        "name": "128m-512m",
+        "minBytes": 134217729,
+        "maxBytes": 536870912
+      },
+      {
+        "name": "gt512m",
+        "minBytes": 536870913,
+        "maxBytes": null
+      }
+    ],
+    "durationBuckets": [
+      {
+        "name": "lt10m",
+        "minSeconds": 0,
+        "maxSecondsExclusive": 600
+      },
+      {
+        "name": "10m-30m",
+        "minSeconds": 600,
+        "maxSecondsExclusive": 1800
+      },
+      {
+        "name": "30m-2h",
+        "minSeconds": 1800,
+        "maxSecondsExclusive": 7200
+      },
+      {
+        "name": "2h-24h",
+        "minSeconds": 7200,
+        "maxSecondsExclusive": 86400
+      },
+      {
+        "name": "1d-3d",
+        "minSeconds": 86400,
+        "maxSecondsExclusive": 259200
+      },
+      {
+        "name": "3d-14d",
+        "minSeconds": 259200,
+        "maxSecondsExclusive": 1209600
+      }
+    ]
+  },
+  "sizeBuckets": [
+    {
+      "sizeBytes": -1,
+      "bucket": null
+    },
+    {
+      "sizeBytes": 0,
+      "bucket": null
+    },
+    {
+      "sizeBytes": 1,
+      "bucket": "lt1m"
+    },
+    {
+      "sizeBytes": 1048575,
+      "bucket": "lt1m"
+    },
+    {
+      "sizeBytes": 1048576,
+      "bucket": "1m-16m"
+    },
+    {
+      "sizeBytes": 16777215,
+      "bucket": "1m-16m"
+    },
+    {
+      "sizeBytes": 16777216,
+      "bucket": "16m-128m"
+    },
+    {
+      "sizeBytes": 134217728,
+      "bucket": "16m-128m"
+    },
+    {
+      "sizeBytes": 134217729,
+      "bucket": "128m-512m"
+    },
+    {
+      "sizeBytes": 536870912,
+      "bucket": "128m-512m"
+    },
+    {
+      "sizeBytes": 536870913,
+      "bucket": "gt512m"
+    },
+    {
+      "sizeBytes": 4294967296,
+      "bucket": "gt512m"
+    }
+  ],
+  "durationBuckets": [
+    {
+      "seconds": -5,
+      "bucket": "lt10m"
+    },
+    {
+      "seconds": 0,
+      "bucket": "lt10m"
+    },
+    {
+      "seconds": 599,
+      "bucket": "lt10m"
+    },
+    {
+      "seconds": 600,
+      "bucket": "10m-30m"
+    },
+    {
+      "seconds": 1799,
+      "bucket": "10m-30m"
+    },
+    {
+      "seconds": 1800,
+      "bucket": "30m-2h"
+    },
+    {
+      "seconds": 7199,
+      "bucket": "30m-2h"
+    },
+    {
+      "seconds": 7200,
+      "bucket": "2h-24h"
+    },
+    {
+      "seconds": 86399,
+      "bucket": "2h-24h"
+    },
+    {
+      "seconds": 86400,
+      "bucket": "1d-3d"
+    },
+    {
+      "seconds": 259199,
+      "bucket": "1d-3d"
+    },
+    {
+      "seconds": 259200,
+      "bucket": "3d-14d"
+    },
+    {
+      "seconds": 1209599,
+      "bucket": "3d-14d"
+    },
+    {
+      "seconds": 1209600,
+      "bucket": null
+    }
+  ],
+  "rates": [
+    {
+      "numerator": 0,
+      "denominator": 0,
+      "rateBp": null
+    },
+    {
+      "numerator": 0,
+      "denominator": 4,
+      "rateBp": 0
+    },
+    {
+      "numerator": 4,
+      "denominator": 4,
+      "rateBp": 10000
+    },
+    {
+      "numerator": 1,
+      "denominator": 3,
+      "rateBp": 3333
+    },
+    {
+      "numerator": 2,
+      "denominator": 3,
+      "rateBp": 6667
+    },
+    {
+      "numerator": 5,
+      "denominator": 6,
+      "rateBp": 8333
+    },
+    {
+      "numerator": 6,
+      "denominator": 7,
+      "rateBp": 8571
+    },
+    {
+      "numerator": 1,
+      "denominator": 32,
+      "rateBp": 313
+    },
+    {
+      "numerator": 3,
+      "denominator": 32,
+      "rateBp": 938
+    }
+  ],
+  "ingestValidation": {
+    "context": {
+      "actor": {
+        "tenantId": "t1",
+        "username": "alice",
+        "role": "USER"
+      },
+      "tenantEnabled": true,
+      "at": "2026-09-10T00:00:00Z"
+    },
+    "cases": [
+      {
+        "name": "accept-one",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 122,
+        "expect": {
+          "status": 200,
+          "body": {
+            "collecting": true,
+            "accepted": 1
+          }
+        }
+      },
+      {
+        "name": "accept-twenty",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 1870,
+        "expect": {
+          "status": 200,
+          "body": {
+            "collecting": true,
+            "accepted": 20
+          }
+        }
+      },
+      {
+        "name": "accept-reordered-keys-and-whitespace",
+        "bodyText": "{ \"events\" : [ {\"outcome\":\"cancelled\", \"attempt\":\"first\", \"sizeBucket\":\"gt512m\", \"path\":\"unestablished\", \"mode\":\"link\"} ], \"schemaVersion\" : 1 }",
+        "bodyBytes": 144,
+        "expect": {
+          "status": 200,
+          "body": {
+            "collecting": true,
+            "accepted": 1
+          }
+        }
+      },
+      {
+        "name": "accept-device-falling-back-to-cloud",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"cloud\",\"sizeBucket\":\"16m-128m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 125,
+        "expect": {
+          "status": 200,
+          "body": {
+            "collecting": true,
+            "accepted": 1
+          }
+        }
+      },
+      {
+        "name": "accept-cancel-before-a-path",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"unestablished\",\"sizeBucket\":\"lt1m\",\"attempt\":\"retry_after_cancel\",\"outcome\":\"cancelled\"}]}",
+        "bodyBytes": 144,
+        "expect": {
+          "status": 200,
+          "body": {
+            "collecting": true,
+            "accepted": 1
+          }
+        }
+      },
+      {
+        "name": "accept-exactly-4096-bytes",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ",
+        "bodyBytes": 4096,
+        "expect": {
+          "status": 200,
+          "body": {
+            "collecting": true,
+            "accepted": 20
+          }
+        }
+      },
+      {
+        "name": "reject-4097-bytes",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ",
+        "bodyBytes": 4097,
+        "expect": {
+          "status": 413,
+          "body": {
+            "code": "PRODUCT_METRICS_TOO_LARGE"
+          }
+        }
+      },
+      {
+        "name": "reject-oversize-before-parsing",
+        "bodyText": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "bodyBytes": 5000,
+        "expect": {
+          "status": 413,
+          "body": {
+            "code": "PRODUCT_METRICS_TOO_LARGE"
+          }
+        }
+      },
+      {
+        "name": "reject-not-json",
+        "bodyText": "not json",
+        "bodyBytes": 8,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-top-level-array",
+        "bodyText": "[{\"mode\": \"device\", \"path\": \"direct\", \"sizeBucket\": \"lt1m\", \"attempt\": \"first\", \"outcome\": \"success\"}]",
+        "bodyBytes": 102,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-empty-events",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[]}",
+        "bodyBytes": 31,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-21-events",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 1962,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-events-not-array",
+        "bodyText": "{\"schemaVersion\": 1, \"events\": {\"mode\": \"device\", \"path\": \"direct\", \"sizeBucket\": \"lt1m\", \"attempt\": \"first\", \"outcome\": \"success\"}}",
+        "bodyBytes": 132,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-schema-version-2",
+        "bodyText": "{\"schemaVersion\": 2, \"events\": [{\"mode\": \"device\", \"path\": \"direct\", \"sizeBucket\": \"lt1m\", \"attempt\": \"first\", \"outcome\": \"success\"}]}",
+        "bodyBytes": 134,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-schema-version-string",
+        "bodyText": "{\"schemaVersion\": \"1\", \"events\": [{\"mode\": \"device\", \"path\": \"direct\", \"sizeBucket\": \"lt1m\", \"attempt\": \"first\", \"outcome\": \"success\"}]}",
+        "bodyBytes": 136,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-schema-version-boolean",
+        "bodyText": "{\"schemaVersion\": true, \"events\": [{\"mode\": \"device\", \"path\": \"direct\", \"sizeBucket\": \"lt1m\", \"attempt\": \"first\", \"outcome\": \"success\"}]}",
+        "bodyBytes": 137,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-missing-schema-version",
+        "bodyText": "{\"events\": [{\"mode\": \"device\", \"path\": \"direct\", \"sizeBucket\": \"lt1m\", \"attempt\": \"first\", \"outcome\": \"success\"}]}",
+        "bodyBytes": 114,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-tenant-in-body",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}],\"tenantId\":\"t2\"}",
+        "bodyBytes": 138,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-visitor-id-in-body",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}],\"visitorId\":\"v-123\"}",
+        "bodyBytes": 142,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-event-not-object",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[\"direct\"]}",
+        "bodyBytes": 39,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-file-name",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"fileName\":\"report.pdf\"}]}",
+        "bodyBytes": 146,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-exact-size",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"sizeBytes\":1234}]}",
+        "bodyBytes": 139,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-mime-type",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"mimeType\":\"image/png\"}]}",
+        "bodyBytes": 145,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-text-content",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"text\":\"hello\"}]}",
+        "bodyBytes": 137,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-room-id",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"roomId\":\"r1\"}]}",
+        "bodyBytes": 136,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-peer-id",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"peerId\":\"p1\"}]}",
+        "bodyBytes": 136,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-client-ip",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"clientIp\":\"192.168.1.10\"}]}",
+        "bodyBytes": 148,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-ice-candidate-address",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"candidate\":\"10.0.0.5:51234\"}]}",
+        "bodyBytes": 151,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-user-agent",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"userAgent\":\"Mozilla/5.0\"}]}",
+        "bodyBytes": 148,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-error-text",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"failure\",\"error\":\"ICE failed\"}]}",
+        "bodyBytes": 143,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-client-timestamp",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"at\":\"2026-09-10T10:00:00Z\"}]}",
+        "bodyBytes": 150,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-event-id",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"eventId\":\"8c3e\"}]}",
+        "bodyBytes": 139,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-duration",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"durationMs\":5300}]}",
+        "bodyBytes": 140,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-missing-outcome",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\"}]}",
+        "bodyBytes": 102,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-unknown-size-bucket",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"2m-4m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 123,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-numeric-size-bucket",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":1048576,\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 123,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-wrong-case",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"Direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 122,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-null-path",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":null,\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 118,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-numeric-attempt",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":2,\"outcome\":\"success\"}]}",
+        "bodyBytes": 116,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-unknown-mode",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"relay\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 121,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-link-over-direct",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"link\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 120,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-link-over-turn",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"link\",\"path\":\"turn\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"failure\"}]}",
+        "bodyBytes": 118,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-success-without-a-path",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"unestablished\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+        "bodyBytes": 129,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      },
+      {
+        "name": "reject-whole-batch-for-one-bad-event",
+        "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"fileName\":\"a.txt\"}]}",
+        "bodyBytes": 233,
+        "expect": {
+          "status": 400,
+          "body": {
+            "code": "PRODUCT_METRICS_INVALID"
+          }
+        }
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "name": "onboarding-funnel",
+      "limits": {
+        "perUserEventsPerMinute": 120,
+        "perTenantEventsPerMinute": 3000
+      },
+      "initialState": {},
+      "ops": [
+        {
+          "op": "milestone",
+          "at": "2026-08-31T12:00:00Z",
+          "tenantId": "t1",
+          "username": "mallory",
+          "step": "account_created",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 403
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_DISCLOSURE_REQUIRED"
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 2
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_DISCLOSURE_REQUIRED"
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": "true",
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_INVALID"
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1,
+            "retentionDays": 365
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_INVALID"
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root"
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root3"
+            }
+          }
+        },
+        {
+          "op": "getSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t2",
+            "username": "grace",
+            "role": "USER"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": null
+            }
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T08:00:00Z",
+          "tenantId": "t1",
+          "username": "alice",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T08:01:00Z",
+          "tenantId": "t1",
+          "username": "alice",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T08:05:00Z",
+          "tenantId": "t1",
+          "username": "alice",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T08:20:00Z",
+          "tenantId": "t1",
+          "username": "alice",
+          "step": "client_online",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T08:40:00Z",
+          "tenantId": "t1",
+          "username": "alice",
+          "step": "service_published",
+          "expect": {
+            "effect": "completed"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T08:41:00Z",
+          "tenantId": "t1",
+          "username": "alice",
+          "step": "credential_created",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T09:00:00Z",
+          "tenantId": "t1",
+          "username": "bob",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T09:05:00Z",
+          "tenantId": "t1",
+          "username": "bob",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T09:10:00Z",
+          "tenantId": "t1",
+          "username": "bob",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-01T10:00:00Z",
+          "tenantId": "t1",
+          "username": "carol",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T00:00:00Z",
+          "tenantId": "t1",
+          "username": "mallory",
+          "step": "service_published",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T00:00:00Z",
+          "tenantId": "t3",
+          "username": "kate",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T09:30:00Z",
+          "tenantId": "t1",
+          "username": "bob",
+          "step": "credential_created",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T10:00:00Z",
+          "tenantId": "t1",
+          "username": "carol",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T12:00:00Z",
+          "tenantId": "t1",
+          "username": "dave",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T12:01:00Z",
+          "tenantId": "t1",
+          "username": "dave",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T12:02:00Z",
+          "tenantId": "t1",
+          "username": "dave",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T12:03:00Z",
+          "tenantId": "t1",
+          "username": "dave",
+          "step": "client_online",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-02T12:03:00Z",
+          "tenantId": "t2",
+          "username": "grace",
+          "step": "account_created",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T00:00:00Z",
+          "tenantId": "t1",
+          "username": "erin",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T00:00:30Z",
+          "tenantId": "t1",
+          "username": "erin",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T00:02:00Z",
+          "tenantId": "t1",
+          "username": "erin",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T00:05:00Z",
+          "tenantId": "t1",
+          "username": "erin",
+          "step": "client_online",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T00:09:59Z",
+          "tenantId": "t1",
+          "username": "erin",
+          "step": "service_published",
+          "expect": {
+            "effect": "completed"
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-03T00:10:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-03T00:10:00Z",
+              "updatedBy": "root3"
+            }
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T01:00:00Z",
+          "tenantId": "t1",
+          "username": "frank",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T01:01:00Z",
+          "tenantId": "t1",
+          "username": "frank",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T01:02:00Z",
+          "tenantId": "t1",
+          "username": "frank",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T01:03:00Z",
+          "tenantId": "t1",
+          "username": "frank",
+          "step": "client_online",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T01:10:00Z",
+          "tenantId": "t1",
+          "username": "frank",
+          "step": "service_published",
+          "expect": {
+            "effect": "completed"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T10:00:00Z",
+          "tenantId": "t1",
+          "username": "carol",
+          "step": "client_online",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-03T12:00:00Z",
+          "tenantId": "t3",
+          "username": "leo",
+          "step": "account_created",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-04T00:00:00Z",
+          "tenantId": "t1",
+          "username": "heidi",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-04T00:10:00Z",
+          "tenantId": "t1",
+          "username": "heidi",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-04T00:10:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-04T00:10:00Z",
+              "updatedBy": "root3"
+            }
+          }
+        },
+        {
+          "op": "userDeleted",
+          "at": "2026-09-05T00:00:00Z",
+          "tenantId": "t1",
+          "username": "heidi",
+          "expect": {
+            "effect": "deleted"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-05T00:00:00Z",
+          "tenantId": "t3",
+          "username": "kate",
+          "step": "signed_in",
+          "expect": {
+            "effect": "ignored"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-06T00:00:00Z",
+          "tenantId": "t3",
+          "username": "nina",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-06T00:01:00Z",
+          "tenantId": "t3",
+          "username": "nina",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-06T00:02:00Z",
+          "tenantId": "t3",
+          "username": "nina",
+          "step": "credential_created",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-06T00:03:00Z",
+          "tenantId": "t3",
+          "username": "nina",
+          "step": "client_online",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-06T00:30:00Z",
+          "tenantId": "t3",
+          "username": "nina",
+          "step": "service_published",
+          "expect": {
+            "effect": "completed"
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-06T00:30:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-09-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": true,
+                  "updatedBy": "root3",
+                  "updatedAt": "2026-09-04T00:10:00Z",
+                  "purgedAt": null
+                }
+              ],
+              "progress": [
+                {
+                  "tenantId": "t1",
+                  "username": "bob",
+                  "startedAt": "2026-09-01T09:00:00Z",
+                  "signedInAt": "2026-09-01T09:05:00Z",
+                  "credentialCreatedAt": "2026-09-01T09:10:00Z",
+                  "clientOnlineAt": null
+                },
+                {
+                  "tenantId": "t1",
+                  "username": "carol",
+                  "startedAt": "2026-09-01T10:00:00Z",
+                  "signedInAt": null,
+                  "credentialCreatedAt": "2026-09-02T10:00:00Z",
+                  "clientOnlineAt": "2026-09-03T10:00:00Z"
+                },
+                {
+                  "tenantId": "t1",
+                  "username": "dave",
+                  "startedAt": "2026-09-02T12:00:00Z",
+                  "signedInAt": "2026-09-02T12:01:00Z",
+                  "credentialCreatedAt": "2026-09-02T12:02:00Z",
+                  "clientOnlineAt": "2026-09-02T12:03:00Z"
+                }
+              ],
+              "onboardingDaily": [
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "service_published",
+                  "durationBucket": "30m-2h",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-03",
+                  "reachedStep": "service_published",
+                  "durationBucket": "10m-30m",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-03",
+                  "reachedStep": "service_published",
+                  "durationBucket": "lt10m",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t3",
+                  "cohortDay": "2026-09-06",
+                  "reachedStep": "service_published",
+                  "durationBucket": "30m-2h",
+                  "users": 1
+                }
+              ],
+              "transferDaily": []
+            }
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-15T09:59:59Z",
+          "tenantId": "t1",
+          "username": "carol",
+          "step": "service_published",
+          "expect": {
+            "effect": "completed"
+          }
+        },
+        {
+          "op": "sweep",
+          "at": "2026-09-16T00:00:00Z",
+          "expect": {}
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-16T12:00:00Z",
+          "tenantId": "t1",
+          "username": "dave",
+          "step": "service_published",
+          "expect": {
+            "effect": "expired"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-20T00:00:00Z",
+          "tenantId": "t1",
+          "username": "ivan",
+          "step": "account_created",
+          "expect": {
+            "effect": "started"
+          }
+        },
+        {
+          "op": "milestone",
+          "at": "2026-09-20T01:00:00Z",
+          "tenantId": "t1",
+          "username": "ivan",
+          "step": "signed_in",
+          "expect": {
+            "effect": "recorded"
+          }
+        },
+        {
+          "op": "purge",
+          "at": "2026-09-20T02:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "nina",
+            "role": "USER"
+          },
+          "expect": {
+            "status": 403
+          }
+        },
+        {
+          "op": "purge",
+          "at": "2026-09-20T02:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "purged": true,
+              "enabled": true
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-01",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "from": "2026-09-01",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 7,
+                "pendingUsers": 1,
+                "final": false,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 7,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 7,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 6,
+                    "fromPreviousRateBp": 8571
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 5,
+                    "fromPreviousRateBp": 8333
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 4,
+                    "fromPreviousRateBp": 8000
+                  }
+                ],
+                "completed": 4,
+                "completionRateBp": 5714,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 1
+                  }
+                ],
+                "medianDurationBucket": "10m-30m"
+              },
+              "transfers": {
+                "cells": [],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 0,
+                  "failure": 0,
+                  "cancelled": 0,
+                  "successRateBp": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-02",
+            "to": "2026-09-03"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "from": "2026-09-02",
+              "to": "2026-09-03",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 3,
+                "pendingUsers": 0,
+                "final": true,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 3,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 3,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 3,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 3,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 2,
+                    "fromPreviousRateBp": 6667
+                  }
+                ],
+                "completed": 2,
+                "completionRateBp": 6667,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 0
+                  }
+                ],
+                "medianDurationBucket": "lt10m"
+              },
+              "transfers": {
+                "cells": [],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 0,
+                  "failure": 0,
+                  "cancelled": 0,
+                  "successRateBp": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-01",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "from": "2026-09-01",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 0,
+                "pendingUsers": 0,
+                "final": true,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  }
+                ],
+                "completed": 0,
+                "completionRateBp": null,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 0
+                  }
+                ],
+                "medianDurationBucket": null
+              },
+              "transfers": {
+                "cells": [],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 0,
+                  "failure": 0,
+                  "cancelled": 0,
+                  "successRateBp": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "query": {},
+          "expect": {
+            "status": 403
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-05",
+            "to": "2026-09-04"
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_RANGE"
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-01",
+            "to": "2026-09-22"
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_RANGE"
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-03-25",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_RANGE"
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-03-26",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "from": "2026-03-26",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 7,
+                "pendingUsers": 1,
+                "final": false,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 7,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 7,
+                    "fromPreviousRateBp": 10000
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 6,
+                    "fromPreviousRateBp": 8571
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 5,
+                    "fromPreviousRateBp": 8333
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 4,
+                    "fromPreviousRateBp": 8000
+                  }
+                ],
+                "completed": 4,
+                "completionRateBp": 5714,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 1
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 1
+                  }
+                ],
+                "medianDurationBucket": "10m-30m"
+              },
+              "transfers": {
+                "cells": [],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 0,
+                  "failure": 0,
+                  "cancelled": 0,
+                  "successRateBp": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "getSettings",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z"
+            }
+          }
+        },
+        {
+          "op": "getSettings",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root"
+            }
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-21T00:00:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-09-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": true,
+                  "updatedBy": "root3",
+                  "updatedAt": "2026-09-04T00:10:00Z",
+                  "purgedAt": "2026-09-20T02:00:00Z"
+                }
+              ],
+              "progress": [
+                {
+                  "tenantId": "t1",
+                  "username": "ivan",
+                  "startedAt": "2026-09-20T00:00:00Z",
+                  "signedInAt": "2026-09-20T01:00:00Z",
+                  "credentialCreatedAt": null,
+                  "clientOnlineAt": null
+                }
+              ],
+              "onboardingDaily": [
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "credential_created",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "service_published",
+                  "durationBucket": "30m-2h",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "service_published",
+                  "durationBucket": "3d-14d",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-02",
+                  "reachedStep": "client_online",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-03",
+                  "reachedStep": "service_published",
+                  "durationBucket": "10m-30m",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-03",
+                  "reachedStep": "service_published",
+                  "durationBucket": "lt10m",
+                  "users": 1
+                }
+              ],
+              "transferDaily": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "transfer-outcomes",
+      "limits": {
+        "perUserEventsPerMinute": 120,
+        "perTenantEventsPerMinute": 3000
+      },
+      "initialState": {},
+      "ops": [
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root"
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root3"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T10:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"16m-128m\",\"attempt\":\"first\",\"outcome\":\"failure\"},{\"mode\":\"device\",\"path\":\"turn\",\"sizeBucket\":\"1m-16m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"unestablished\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"failure\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 6
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T10:00:05Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\",\"fileName\":\"a.txt\"}]}",
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_INVALID"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T10:00:06Z",
+          "actor": null,
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 401
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T11:00:00Z",
+          "actor": {
+            "tenantId": "t2",
+            "username": "grace",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": false,
+              "accepted": 0
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T23:59:59Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "bob",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"16m-128m\",\"attempt\":\"retry_after_failure\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"cloud\",\"sizeBucket\":\"16m-128m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"link\",\"path\":\"cloud\",\"sizeBucket\":\"128m-512m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"link\",\"path\":\"cloud\",\"sizeBucket\":\"gt512m\",\"attempt\":\"first\",\"outcome\":\"failure\"},{\"mode\":\"device\",\"path\":\"turn\",\"sizeBucket\":\"1m-16m\",\"attempt\":\"first\",\"outcome\":\"cancelled\"},{\"mode\":\"device\",\"path\":\"turn\",\"sizeBucket\":\"1m-16m\",\"attempt\":\"retry_after_cancel\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 6
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-11T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"retry_after_failure\",\"outcome\":\"failure\"},{\"mode\":\"device\",\"path\":\"turn\",\"sizeBucket\":\"lt1m\",\"attempt\":\"retry_after_failure\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"unestablished\",\"sizeBucket\":\"lt1m\",\"attempt\":\"retry_after_failure\",\"outcome\":\"failure\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 3
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-12T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "nina",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 2
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-13T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-13T00:00:00Z",
+              "updatedBy": "root3"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-13T00:00:01Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "nina",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": false,
+              "accepted": 0
+            }
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-13T00:00:01Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-09-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": false,
+                  "updatedBy": "root3",
+                  "updatedAt": "2026-09-13T00:00:00Z",
+                  "purgedAt": null
+                }
+              ],
+              "progress": [],
+              "onboardingDaily": [],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "cloud",
+                  "sizeBucket": "16m-128m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "16m-128m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "16m-128m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 3
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "1m-16m",
+                  "attempt": "first",
+                  "outcome": "cancelled",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "1m-16m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "1m-16m",
+                  "attempt": "retry_after_cancel",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "unestablished",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "link",
+                  "path": "cloud",
+                  "sizeBucket": "128m-512m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "link",
+                  "path": "cloud",
+                  "sizeBucket": "gt512m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-11",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-11",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "lt1m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-11",
+                  "mode": "device",
+                  "path": "unestablished",
+                  "sizeBucket": "lt1m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t3",
+                  "day": "2026-09-12",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 2
+                }
+              ]
+            }
+          }
+        },
+        {
+          "op": "purge",
+          "at": "2026-09-13T00:01:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "purged": true,
+              "enabled": false
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-01",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "from": "2026-09-01",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 0,
+                "pendingUsers": 0,
+                "final": true,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  }
+                ],
+                "completed": 0,
+                "completionRateBp": null,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 0
+                  }
+                ],
+                "medianDurationBucket": null
+              },
+              "transfers": {
+                "cells": [
+                  {
+                    "path": "direct",
+                    "sizeBucket": "lt1m",
+                    "success": 3,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 7500
+                  },
+                  {
+                    "path": "direct",
+                    "sizeBucket": "16m-128m",
+                    "success": 1,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 5000
+                  },
+                  {
+                    "path": "turn",
+                    "sizeBucket": "lt1m",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "path": "turn",
+                    "sizeBucket": "1m-16m",
+                    "success": 2,
+                    "failure": 0,
+                    "cancelled": 1,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "path": "cloud",
+                    "sizeBucket": "16m-128m",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "path": "cloud",
+                    "sizeBucket": "128m-512m",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "path": "cloud",
+                    "sizeBucket": "gt512m",
+                    "success": 0,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 0
+                  },
+                  {
+                    "path": "unestablished",
+                    "sizeBucket": "lt1m",
+                    "success": 0,
+                    "failure": 2,
+                    "cancelled": 0,
+                    "successRateBp": 0
+                  }
+                ],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 8,
+                    "failure": 4,
+                    "cancelled": 1,
+                    "successRateBp": 6667
+                  },
+                  {
+                    "mode": "link",
+                    "success": 1,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 5000
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 6,
+                    "failure": 3,
+                    "cancelled": 1,
+                    "successRateBp": 6667
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 2,
+                    "failure": 2,
+                    "cancelled": 0,
+                    "successRateBp": 5000
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  }
+                ],
+                "total": {
+                  "success": 9,
+                  "failure": 5,
+                  "cancelled": 1,
+                  "successRateBp": 6429
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "query": {
+            "from": "2026-09-11",
+            "to": "2026-09-21"
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "from": "2026-09-11",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 0,
+                "pendingUsers": 0,
+                "final": true,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  }
+                ],
+                "completed": 0,
+                "completionRateBp": null,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 0
+                  }
+                ],
+                "medianDurationBucket": null
+              },
+              "transfers": {
+                "cells": [
+                  {
+                    "path": "direct",
+                    "sizeBucket": "lt1m",
+                    "success": 0,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 0
+                  },
+                  {
+                    "path": "turn",
+                    "sizeBucket": "lt1m",
+                    "success": 1,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": 10000
+                  },
+                  {
+                    "path": "unestablished",
+                    "sizeBucket": "lt1m",
+                    "success": 0,
+                    "failure": 1,
+                    "cancelled": 0,
+                    "successRateBp": 0
+                  }
+                ],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 1,
+                    "failure": 2,
+                    "cancelled": 0,
+                    "successRateBp": 3333
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 1,
+                    "failure": 2,
+                    "cancelled": 0,
+                    "successRateBp": 3333
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 1,
+                  "failure": 2,
+                  "cancelled": 0,
+                  "successRateBp": 3333
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "summary",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "query": {},
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": false,
+              "from": "2026-08-23",
+              "to": "2026-09-21",
+              "generatedAt": "2026-09-21T00:00:00Z",
+              "onboarding": {
+                "windowDays": 14,
+                "cohortUsers": 0,
+                "pendingUsers": 0,
+                "final": true,
+                "steps": [
+                  {
+                    "step": "account_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "signed_in",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "credential_created",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "client_online",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  },
+                  {
+                    "step": "service_published",
+                    "users": 0,
+                    "fromPreviousRateBp": null
+                  }
+                ],
+                "completed": 0,
+                "completionRateBp": null,
+                "durations": [
+                  {
+                    "bucket": "lt10m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "10m-30m",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "30m-2h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "2h-24h",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "1d-3d",
+                    "users": 0
+                  },
+                  {
+                    "bucket": "3d-14d",
+                    "users": 0
+                  }
+                ],
+                "medianDurationBucket": null
+              },
+              "transfers": {
+                "cells": [],
+                "byMode": [
+                  {
+                    "mode": "device",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "mode": "link",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "byAttempt": [
+                  {
+                    "attempt": "first",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_failure",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  },
+                  {
+                    "attempt": "retry_after_cancel",
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "successRateBp": null
+                  }
+                ],
+                "total": {
+                  "success": 0,
+                  "failure": 0,
+                  "cancelled": 0,
+                  "successRateBp": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "op": "putSettings",
+          "at": "2026-09-21T00:00:00Z",
+          "actor": {
+            "tenantId": "t3",
+            "username": "root3",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-21T00:00:00Z",
+              "updatedBy": "root3"
+            }
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-21T00:00:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-09-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": true,
+                  "updatedBy": "root3",
+                  "updatedAt": "2026-09-21T00:00:00Z",
+                  "purgedAt": null
+                }
+              ],
+              "progress": [],
+              "onboardingDaily": [],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "cloud",
+                  "sizeBucket": "16m-128m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "16m-128m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "16m-128m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 3
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "1m-16m",
+                  "attempt": "first",
+                  "outcome": "cancelled",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "1m-16m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "1m-16m",
+                  "attempt": "retry_after_cancel",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "unestablished",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "link",
+                  "path": "cloud",
+                  "sizeBucket": "128m-512m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "link",
+                  "path": "cloud",
+                  "sizeBucket": "gt512m",
+                  "attempt": "first",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-11",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "failure",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-11",
+                  "mode": "device",
+                  "path": "turn",
+                  "sizeBucket": "lt1m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-11",
+                  "mode": "device",
+                  "path": "unestablished",
+                  "sizeBucket": "lt1m",
+                  "attempt": "retry_after_failure",
+                  "outcome": "failure",
+                  "count": 1
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "per-user-rate-limit",
+      "limits": {
+        "perUserEventsPerMinute": 120,
+        "perTenantEventsPerMinute": 3000
+      },
+      "initialState": {},
+      "ops": [
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:10Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 10
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:20Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 429,
+            "body": {
+              "code": "PRODUCT_METRICS_RATE_LIMITED"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:25Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"Direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 400,
+            "body": {
+              "code": "PRODUCT_METRICS_INVALID"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:30Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 10
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:40Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "bob",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:59Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 429,
+            "body": {
+              "code": "PRODUCT_METRICS_RATE_LIMITED"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:01:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-10T12:01:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-09-01T00:00:00Z",
+                  "purgedAt": null
+                }
+              ],
+              "progress": [],
+              "onboardingDaily": [],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 160
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "per-tenant-rate-limit",
+      "limits": {
+        "perUserEventsPerMinute": 30,
+        "perTenantEventsPerMinute": 50
+      },
+      "initialState": {},
+      "ops": [
+        {
+          "op": "putSettings",
+          "at": "2026-09-01T00:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "root",
+            "role": "ADMIN"
+          },
+          "body": {
+            "enabled": true,
+            "disclosureVersion": 1
+          },
+          "expect": {
+            "status": 200,
+            "body": {
+              "schemaVersion": 1,
+              "enabled": true,
+              "disclosureVersion": 1,
+              "retentionDays": 180,
+              "onboardingWindowDays": 14,
+              "updatedAt": "2026-09-01T00:00:00Z",
+              "updatedBy": "root"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:00Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:01Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 10
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:02Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "alice",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 429,
+            "body": {
+              "code": "PRODUCT_METRICS_RATE_LIMITED"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:03Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "bob",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"},{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": true,
+              "accepted": 20
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:04Z",
+          "actor": {
+            "tenantId": "t1",
+            "username": "carol",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 429,
+            "body": {
+              "code": "PRODUCT_METRICS_RATE_LIMITED"
+            }
+          }
+        },
+        {
+          "op": "ingest",
+          "at": "2026-09-10T12:00:05Z",
+          "actor": {
+            "tenantId": "t2",
+            "username": "grace",
+            "role": "USER"
+          },
+          "bodyText": "{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\",\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}",
+          "expect": {
+            "status": 200,
+            "body": {
+              "collecting": false,
+              "accepted": 0
+            }
+          }
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-10T12:00:05Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-09-01T00:00:00Z",
+                  "purgedAt": null
+                }
+              ],
+              "progress": [],
+              "onboardingDaily": [],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-10",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 50
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "retention-sweep",
+      "limits": {
+        "perUserEventsPerMinute": 120,
+        "perTenantEventsPerMinute": 3000
+      },
+      "initialState": {
+        "switches": [
+          {
+            "tenantId": "t1",
+            "enabled": true,
+            "updatedBy": "root",
+            "updatedAt": "2026-03-01T00:00:00Z",
+            "purgedAt": null
+          },
+          {
+            "tenantId": "t2",
+            "enabled": false,
+            "updatedBy": "root",
+            "updatedAt": "2026-03-01T00:00:00Z",
+            "purgedAt": null
+          },
+          {
+            "tenantId": "t3",
+            "enabled": false,
+            "updatedBy": "root",
+            "updatedAt": "2026-03-01T00:00:00Z",
+            "purgedAt": "2026-09-20T23:00:00Z"
+          }
+        ],
+        "progress": [
+          {
+            "tenantId": "t1",
+            "username": "olga",
+            "startedAt": "2026-09-07T00:30:00Z",
+            "signedInAt": "2026-09-07T00:31:00Z",
+            "credentialCreatedAt": "2026-09-07T00:40:00Z",
+            "clientOnlineAt": null
+          },
+          {
+            "tenantId": "t1",
+            "username": "pavel",
+            "startedAt": "2026-09-07T00:30:01Z",
+            "signedInAt": "2026-09-07T00:31:00Z",
+            "credentialCreatedAt": null,
+            "clientOnlineAt": null
+          },
+          {
+            "tenantId": "t2",
+            "username": "quinn",
+            "startedAt": "2026-09-20T00:00:00Z",
+            "signedInAt": null,
+            "credentialCreatedAt": null,
+            "clientOnlineAt": null
+          }
+        ],
+        "onboardingDaily": [
+          {
+            "tenantId": "t1",
+            "cohortDay": "2026-03-25",
+            "reachedStep": "service_published",
+            "durationBucket": "lt10m",
+            "users": 2
+          },
+          {
+            "tenantId": "t1",
+            "cohortDay": "2026-03-26",
+            "reachedStep": "signed_in",
+            "durationBucket": "none",
+            "users": 1
+          },
+          {
+            "tenantId": "t2",
+            "cohortDay": "2026-09-01",
+            "reachedStep": "signed_in",
+            "durationBucket": "none",
+            "users": 4
+          },
+          {
+            "tenantId": "t3",
+            "cohortDay": "2026-09-01",
+            "reachedStep": "signed_in",
+            "durationBucket": "none",
+            "users": 3
+          }
+        ],
+        "transferDaily": [
+          {
+            "tenantId": "t1",
+            "day": "2026-03-25",
+            "mode": "device",
+            "path": "direct",
+            "sizeBucket": "lt1m",
+            "attempt": "first",
+            "outcome": "success",
+            "count": 7
+          },
+          {
+            "tenantId": "t1",
+            "day": "2026-03-26",
+            "mode": "device",
+            "path": "direct",
+            "sizeBucket": "lt1m",
+            "attempt": "first",
+            "outcome": "success",
+            "count": 5
+          },
+          {
+            "tenantId": "t1",
+            "day": "2026-09-21",
+            "mode": "device",
+            "path": "direct",
+            "sizeBucket": "lt1m",
+            "attempt": "first",
+            "outcome": "success",
+            "count": 1
+          },
+          {
+            "tenantId": "t2",
+            "day": "2026-09-20",
+            "mode": "device",
+            "path": "direct",
+            "sizeBucket": "lt1m",
+            "attempt": "first",
+            "outcome": "success",
+            "count": 6
+          },
+          {
+            "tenantId": "t3",
+            "day": "2026-09-20",
+            "mode": "device",
+            "path": "direct",
+            "sizeBucket": "lt1m",
+            "attempt": "first",
+            "outcome": "success",
+            "count": 9
+          }
+        ]
+      },
+      "ops": [
+        {
+          "op": "sweep",
+          "at": "2026-09-21T00:30:00Z",
+          "expect": {}
+        },
+        {
+          "op": "checkpoint",
+          "at": "2026-09-21T00:30:00Z",
+          "expect": {
+            "state": {
+              "switches": [
+                {
+                  "tenantId": "t1",
+                  "enabled": true,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t2",
+                  "enabled": false,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": null
+                },
+                {
+                  "tenantId": "t3",
+                  "enabled": false,
+                  "updatedBy": "root",
+                  "updatedAt": "2026-03-01T00:00:00Z",
+                  "purgedAt": "2026-09-20T23:00:00Z"
+                }
+              ],
+              "progress": [
+                {
+                  "tenantId": "t1",
+                  "username": "pavel",
+                  "startedAt": "2026-09-07T00:30:01Z",
+                  "signedInAt": "2026-09-07T00:31:00Z",
+                  "credentialCreatedAt": null,
+                  "clientOnlineAt": null
+                }
+              ],
+              "onboardingDaily": [
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-03-26",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t1",
+                  "cohortDay": "2026-09-07",
+                  "reachedStep": "credential_created",
+                  "durationBucket": "none",
+                  "users": 1
+                },
+                {
+                  "tenantId": "t2",
+                  "cohortDay": "2026-09-01",
+                  "reachedStep": "signed_in",
+                  "durationBucket": "none",
+                  "users": 4
+                }
+              ],
+              "transferDaily": [
+                {
+                  "tenantId": "t1",
+                  "day": "2026-03-26",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 5
+                },
+                {
+                  "tenantId": "t1",
+                  "day": "2026-09-21",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 1
+                },
+                {
+                  "tenantId": "t2",
+                  "day": "2026-09-20",
+                  "mode": "device",
+                  "path": "direct",
+                  "sizeBucket": "lt1m",
+                  "attempt": "first",
+                  "outcome": "success",
+                  "count": 6
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

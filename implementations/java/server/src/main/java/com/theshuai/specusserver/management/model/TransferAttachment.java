@@ -69,9 +69,11 @@ public class TransferAttachment {
     @Column(name = "updated_at", nullable = false, length = 40)
     private String updatedAt;
 
+    /** {@link SortableInstant} text: the storage-quota query compares it with "now" as a string. */
     @Column(name = "upload_expires_at", nullable = false, length = 40)
     private String uploadExpiresAt;
 
+    /** {@link SortableInstant} text: the storage-quota and expiry-scan queries compare it as a string. */
     @Column(name = "expires_at", nullable = false, length = 40)
     private String expiresAt;
 

@@ -61,6 +61,8 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -252,6 +254,51 @@ class HttpShareVectorTests {
             }
             assertAudit(expect.get("audit"), Map.of());
         }));
+    }
+
+    /**
+     * Concurrent creations on a route one share below the limit: exactly one more share is issued
+     * and every other request is refused with {@code SHARE_LIMIT_REACHED}.
+     */
+    @Test
+    void creationsRacingForTheLastSlotStopAtTheLimit() throws Exception {
+        resetWorld(JSON.createObjectNode());
+        String bearer = bearer("alice");
+        String body = "{\"expiresInSeconds\": 3600}";
+        String path = "/api/admin/http-routes/42/shares";
+        for (int i = 0; i < HttpShareRules.MAX_ACTIVE_PER_ROUTE - 1; i++) {
+            HttpResponse<String> seeded = send("POST", path, "application/json", body, bearer, Map.of());
+            assertThat(seeded.statusCode()).as(seeded.body()).isEqualTo(201);
+        }
+
+        int racers = 8;
+        List<CompletableFuture<HttpResponse<String>>> answers = new ArrayList<>();
+        for (int i = 0; i < racers; i++) {
+            HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + bearer)
+                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                    .build();
+            answers.add(http.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)));
+        }
+        int created = 0;
+        int refused = 0;
+        for (CompletableFuture<HttpResponse<String>> answer : answers) {
+            HttpResponse<String> response = answer.get(30, TimeUnit.SECONDS);
+            assertThat(response.headers().firstValue("Cache-Control")).hasValue("private, no-store");
+            if (response.statusCode() == 201) {
+                created++;
+            } else {
+                assertThat(response.statusCode()).as(response.body()).isEqualTo(409);
+                assertThat(JSON.readTree(response.body()).get("code").asText())
+                        .isEqualTo(HttpShareRules.CODE_LIMIT_REACHED);
+                refused++;
+            }
+        }
+        assertThat(created).isEqualTo(1);
+        assertThat(refused).isEqualTo(racers - 1);
+        assertThat(shareRepository.countByRouteIdAndRevokedAtIsNullAndExpiresAtGreaterThan(42L,
+                DEFAULT_NOW.getEpochSecond())).isEqualTo(HttpShareRules.MAX_ACTIVE_PER_ROUTE);
     }
 
     // =============================================================================================

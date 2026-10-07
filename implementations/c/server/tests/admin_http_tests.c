@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -500,6 +501,9 @@ typedef struct {
     char http_relative_path[256];
     char ws_relative_path[256];
     char http_body[256];
+    /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
+    char http_browser_headers[512];
+    char ws_browser_headers[512];
 } route_auth_test_context;
 
 #define ROUTE_RESET_REASON \
@@ -548,7 +552,30 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->http_relative_path[0] = '\0';
     context->ws_relative_path[0] = '\0';
     context->http_body[0] = '\0';
+    context->http_browser_headers[0] = '\0';
+    context->ws_browser_headers[0] = '\0';
     pthread_mutex_unlock(&context->lock);
+}
+
+static void route_auth_test_capture_browser_headers(char *const *headers,
+                                                    size_t headers_len,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    size_t used = 0U;
+    out[0] = '\0';
+    for (size_t i = 0; i < headers_len; ++i) {
+        if (headers[i] == NULL
+            || (strncasecmp(headers[i], "Origin:", 7U) != 0 && strncasecmp(headers[i], "Referer:", 8U) != 0
+                && strncasecmp(headers[i], "Sec-Fetch-Site:", 15U) != 0)) {
+            continue;
+        }
+        int written = snprintf(out + used, out_len - used, "%s%s", used == 0U ? "" : "|", headers[i]);
+        if (written < 0 || (size_t)written >= out_len - used) {
+            return;
+        }
+        used += (size_t)written;
+    }
 }
 
 static int route_auth_test_context_matches(route_auth_test_context *context,
@@ -632,6 +659,9 @@ static int route_auth_http_forwarder(void *ctx,
              "%.*s",
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->http_browser_headers,
+                                            sizeof(context->http_browser_headers));
     pthread_mutex_unlock(&context->lock);
     if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
         /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
@@ -664,6 +694,9 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_relative_path),
              "%s",
              request->relative_path == NULL ? "" : request->relative_path);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->ws_browser_headers,
+                                            sizeof(context->ws_browser_headers));
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -3267,6 +3300,22 @@ static int test_connectivity_check_endpoint(void)
     return failed ? 1 : 0;
 }
 
+static long long route_auth_exchange_count(const char *database_path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long count = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = 'api'", -1,
+                              &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return count;
+}
+
 static int route_auth_detail_is_sanitized(const char *database_path)
 {
     sqlite3 *db = NULL;
@@ -3481,6 +3530,26 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* TrafficInspectionServiceTests: the route's detailCaptureEnabled is on, but without
+     * SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED (Java's capture-detail-enabled, default false) nothing
+     * is captured. */
+    long long captured_before = route_auth_exchange_count(database_path);
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    int uncaptured = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    if (uncaptured != 0 || !contains(response, "200 OK") || captured_before < 0
+        || route_auth_exchange_count(database_path) != captured_before) {
+        fprintf(stderr, "HTTP detail captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
     snprintf(request,
              sizeof(request),
              "GET %s HTTP/1.1\r\nHost: localhost\r\n"
@@ -3493,6 +3562,7 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !contains(response, "forwarded")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
         || context.normalized_accept_encoding_headers != 1
+        || route_auth_exchange_count(database_path) != captured_before + 1
         || route_auth_detail_is_sanitized(database_path) != 0) {
         fprintf(stderr, "protected route successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
@@ -3515,6 +3585,34 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")
         || !route_auth_test_paths_match(&context, "/items/a+b/c%20d/%E4%BD%A0/x%2Fy", "")) {
         fprintf(stderr, "direct HTTP raw path or query brace encoding mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    /* Java UpstreamBrowserHeaders: the device sees the browser's Origin and Referer moved onto the
+     * route target's origin (https://example.com here) and cross-site fetch metadata as
+     * same-origin, so the target's own CSRF fences accept the request. */
+    static const char browser_headers[] =
+        "Origin: https://specus.example\r\n"
+        "Referer: https://specus.example/http/C%20managed%202/api/page?x=1\r\n"
+        "Sec-Fetch-Site: cross-site\r\n";
+    static const char rewritten_browser_headers[] =
+        "Origin:https://example.com|Referer:https://example.com/http/C%20managed%202/api/page?x=1"
+        "|Sec-Fetch-Site:same-origin";
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)
+        || strcmp(context.http_browser_headers, rewritten_browser_headers) != 0) {
+        fprintf(stderr, "direct HTTP browser headers were not moved onto the route target: %s\n",
+                context.http_browser_headers);
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
         return 1;
@@ -3612,14 +3710,16 @@ static int test_direct_http_route_authentication(const char *database_path)
              "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
-             protected_path);
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
         || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
-        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")
+        || strcmp(context.ws_browser_headers, rewritten_browser_headers) != 0) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
@@ -3736,89 +3836,6 @@ static int test_direct_http_route_authentication(const char *database_path)
     route_auth_stop_server(&server);
     pthread_mutex_destroy(&context.lock);
     return closed_ok == 0 ? 0 : 1;
-}
-
-typedef struct {
-    int fd;
-    int port;
-    char request[4096];
-} oidc_test_server;
-
-static void *oidc_test_server_thread(void *arg)
-{
-    oidc_test_server *server = (oidc_test_server *)arg;
-    int client = accept(server->fd, NULL, NULL);
-    if (client >= 0) {
-        ssize_t got = recv(client, server->request, sizeof(server->request) - 1U, 0);
-        if (got > 0) {
-            server->request[got] = '\0';
-        }
-        const char body[] = "{\"access_token\":\"access-1\",\"id_token\":\"id-1\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
-        char response[512];
-        int response_len = snprintf(response,
-                                    sizeof(response),
-                                    "HTTP/1.1 200 OK\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Content-Length: %zu\r\n"
-                                    "Connection: close\r\n"
-                                    "\r\n"
-                                    "%s",
-                                    strlen(body),
-                                    body);
-        if (response_len > 0 && (size_t)response_len < sizeof(response)) {
-            (void)send(client, response, (size_t)response_len, 0);
-        }
-        close(client);
-    }
-    return NULL;
-}
-
-static int oidc_test_server_start(oidc_test_server *server, pthread_t *thread)
-{
-    memset(server, 0, sizeof(*server));
-    server->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server->fd < 0) {
-        return -1;
-    }
-    int reuse = 1;
-    (void)setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    (void)setsockopt(server->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    struct sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    if (bind(server->fd, (struct sockaddr *)&address, sizeof(address)) != 0
-        || listen(server->fd, 1) != 0) {
-        close(server->fd);
-        server->fd = -1;
-        return -1;
-    }
-    socklen_t address_len = sizeof(address);
-    if (getsockname(server->fd, (struct sockaddr *)&address, &address_len) != 0) {
-        close(server->fd);
-        server->fd = -1;
-        return -1;
-    }
-    server->port = ntohs(address.sin_port);
-    if (pthread_create(thread, NULL, oidc_test_server_thread, server) != 0) {
-        close(server->fd);
-        server->fd = -1;
-        return -1;
-    }
-    return 0;
-}
-
-static void oidc_test_server_stop(oidc_test_server *server, pthread_t thread)
-{
-    (void)pthread_join(thread, NULL);
-    if (server->fd >= 0) {
-        close(server->fd);
-        server->fd = -1;
-    }
 }
 
 /*
@@ -5795,7 +5812,10 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
+    int route_authentication_failed = test_log_safe_reason() != 0
+        || test_direct_http_route_authentication(db_path) != 0;
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    if (route_authentication_failed) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -6257,15 +6277,45 @@ int main(void)
         fprintf(stderr, "traffic detail seed failed\n");
         return 1;
     }
+    /* HttpTrafficExchangeStoreTests: a page of summaries carries no headers and no previews. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"method\":\"POST\"")
         || !contains(response, "\"statusCode\":201")
         || !contains(response, "\"responseBodyType\":\"json\"")
-        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"requestHeaders\":null,\"responseHeaders\":null,\"requestPreviewHex\":null,"
+                               "\"requestPreviewText\":null,\"responsePreviewHex\":null,\"responsePreviewText\":null")
+        || contains(response, "\"requestHeaders\":\"") || contains(response, "\"responseHeaders\":\"")
+        || contains(response, "\"requestPreviewHex\":\"") || contains(response, "\"requestPreviewText\":\"")
+        || contains(response, "\"responsePreviewHex\":\"") || contains(response, "\"responsePreviewText\":\"")
         || !contains(response, "\"size\":20")
         || !contains(response, "\"totalPages\":1")) {
-        fprintf(stderr, "http exchange page response mismatch\n");
+        fprintf(stderr, "http exchange page response mismatch: %.2000s\n", response);
+        return 1;
+    }
+    /* The detail of one exchange carries them, with Java's uppercase spaced hex. */
+    long long post_exchange_id = 0;
+    {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT id FROM specus_http_traffic_exchange WHERE method='POST'", -1, &stmt,
+                                  NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            post_exchange_id = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/traffic/http-exchanges/%lld", post_exchange_id);
+    len = st_admin_build_response("GET", request_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"requestHeaders\":\"Content-Type: application/json\"")
+        || !contains(response, "\"requestPreviewHex\":\"7B 22 68 65 6C 6C 6F 22 3A 74 72 75 65 7D\"")
+        || !contains(response, "\"requestPreviewText\":\"{\\\"hello\\\":true}\"")
+        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"responseTruncated\":false")) {
+        fprintf(stderr, "http exchange detail response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=method&q=POST&page=0&size=20", response, sizeof(response));
@@ -6478,32 +6528,17 @@ int main(void)
         fprintf(stderr, "oidc configured response mismatch\n");
         return 1;
     }
-    oidc_test_server oidc_server;
-    pthread_t oidc_thread;
-    if (oidc_test_server_start(&oidc_server, &oidc_thread) != 0) {
-        fprintf(stderr, "oidc test server start failed\n");
-        return 1;
-    }
-    char oidc_endpoint[128];
-    snprintf(oidc_endpoint, sizeof(oidc_endpoint), "http://127.0.0.1:%d/token", oidc_server.port);
-    setenv("SPECUS_OIDC_TOKEN_ENDPOINT", oidc_endpoint, 1);
+    /* The full exchange runs against a fake identity provider in oidc_tests.c. Here: a callback
+     * without the browser's nonce is refused before the token endpoint is contacted. */
     len = st_admin_build_response_with_body("POST",
                                             "/oidc/token",
                                             "{\"code\":\"abc\",\"codeVerifier\":\"verifier value\"}",
                                             response,
                                             sizeof(response));
-    oidc_test_server_stop(&oidc_server, oidc_thread);
-    if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"accessToken\":\"access-1\"")
-        || !contains(response, "\"idToken\":\"id-1\"")
-        || !contains(response, "\"tokenType\":\"Bearer\"")
-        || !contains(response, "\"expiresIn\":3600")
-        || !contains(oidc_server.request, "POST /token HTTP/1.1")
-        || !contains(oidc_server.request, "grant_type=authorization_code")
-        || !contains(oidc_server.request, "code=abc")
-        || !contains(oidc_server.request, "code_verifier=verifier+value")
-        || !contains(oidc_server.request, "client_id=admin-spa")) {
-        fprintf(stderr, "oidc http token exchange response mismatch\n");
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "缺少 code、code_verifier 或 nonce")
+        || contains(response, "accessToken")) {
+        fprintf(stderr, "oidc token exchange without nonce response mismatch\n");
         return 1;
     }
     unsetenv("SPECUS_OIDC_CLIENT_ID");

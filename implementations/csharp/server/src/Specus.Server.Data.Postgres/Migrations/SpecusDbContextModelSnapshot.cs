@@ -2227,6 +2227,145 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.ToTable("peer_mesh_shared_service", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsOnboardingDaily", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("CohortDay")
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasColumnName("cohort_day");
+
+                    b.Property<string>("ReachedStep")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("reached_step");
+
+                    b.Property<string>("DurationBucket")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("duration_bucket");
+
+                    b.Property<long>("Users")
+                        .HasColumnType("bigint")
+                        .HasColumnName("users");
+
+                    b.HasKey("TenantId", "CohortDay", "ReachedStep", "DurationBucket");
+
+                    b.ToTable("product_metrics_onboarding_daily", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsOnboardingProgress", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Username")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("username");
+
+                    b.Property<long?>("ClientOnlineAt")
+                        .HasColumnType("bigint")
+                        .HasColumnName("client_online_at");
+
+                    b.Property<long?>("CredentialCreatedAt")
+                        .HasColumnType("bigint")
+                        .HasColumnName("credential_created_at");
+
+                    b.Property<long?>("SignedInAt")
+                        .HasColumnType("bigint")
+                        .HasColumnName("signed_in_at");
+
+                    b.Property<long>("StartedAt")
+                        .HasColumnType("bigint")
+                        .HasColumnName("started_at");
+
+                    b.HasKey("TenantId", "Username");
+
+                    b.ToTable("product_metrics_onboarding_progress", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsSwitch", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean")
+                        .HasColumnName("enabled");
+
+                    b.Property<long?>("PurgedAt")
+                        .HasColumnType("bigint")
+                        .HasColumnName("purged_at");
+
+                    b.Property<long?>("UpdatedAt")
+                        .HasColumnType("bigint")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("TenantId");
+
+                    b.ToTable("product_metrics_switch", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ProductMetricsTransferDaily", b =>
+                {
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Day")
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasColumnName("day");
+
+                    b.Property<string>("Mode")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("mode");
+
+                    b.Property<string>("Path")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("path");
+
+                    b.Property<string>("SizeBucket")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("size_bucket");
+
+                    b.Property<string>("Attempt")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("attempt");
+
+                    b.Property<string>("Outcome")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("outcome");
+
+                    b.Property<long>("Count")
+                        .HasColumnType("bigint")
+                        .HasColumnName("count");
+
+                    b.HasKey("TenantId", "Day", "Mode", "Path", "SizeBucket", "Attempt", "Outcome");
+
+                    b.ToTable("product_metrics_transfer_daily", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.PublicTransferDiagramVersion", b =>
                 {
                     b.Property<long>("Id")

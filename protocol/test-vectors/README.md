@@ -88,6 +88,14 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
   [`protocol/spec/service-workbench.md`](../spec/service-workbench.md)。Java、Go、.NET 与 C 服务端经真实 HTTP
   处理代码重放全部 `scenarios`，管理前端的推导测试读取 `problems.cases`。
 
+## 产品指标
+
+- `product-metrics-v1.json`：租户显式开启的产品指标。含封闭取值与区间边界、基点舍入、44 个原样上报请求体的
+  接受/拒绝期望，以及按时刻回放的场景（开关与说明确认、服务端接入里程碑与 14 天窗口、传输计数、限流、保存期
+  清理、清除和汇总），每个 `checkpoint` 给出四张表的期望内容。由 `tools/protocol/generate_product_metrics_vectors.py`
+  生成，语义见 [`protocol/spec/product-metrics.md`](../spec/product-metrics.md)。Java、Go、.NET 与 C 服务端经真实
+  HTTP 处理代码回放全部校验用例与场景并逐个 `checkpoint` 比较四张表；管理前端测试读取分桶、接受用例和汇总期望。
+
 ## HTTP route 生命周期
 
 - `http-route-lifecycle-v1.json`：route 何时不再可达、客户端何时得知。`server.scenarios` 用真实管理 API、一个仍对任何

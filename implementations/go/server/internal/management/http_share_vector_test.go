@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,11 +137,11 @@ func TestShareVectorCreate(t *testing.T) {
 			if response.status != expect.Status() {
 				t.Fatalf("status %d (%s), want %d %s", response.status, response.body, expect.Status(), expect.Code)
 			}
-			if expect.Status() == http.StatusUnauthorized {
-				return
-			}
 			if response.header.Get("Cache-Control") != "private, no-store" {
 				t.Errorf("Cache-Control %q", response.header.Get("Cache-Control"))
+			}
+			if expect.Status() == http.StatusUnauthorized {
+				return
 			}
 			if expect.Body != nil {
 				if !sharetest.SameJSON(response.body, expect.Body) {
@@ -449,5 +450,122 @@ func TestShareManagementListAuditAndTenantAudit(t *testing.T) {
 	_ = json.Unmarshal(other.body, &page)
 	if other.status != http.StatusOK || len(page.Entries) != 0 {
 		t.Fatalf("other tenant sees %s", other.body)
+	}
+}
+
+// Every answer of the share management endpoints is private, the 401 of a missing session
+// included; the anonymous exchange is not a management endpoint.
+func TestShareManagementUnauthenticatedAnswersArePrivate(t *testing.T) {
+	vector := sharetest.Load(t)
+	fixture := newShareAPI(t, vector.World, sharetest.CaseInput{})
+	for _, endpoint := range []struct{ method, path string }{
+		{http.MethodPost, "/api/admin/http-routes/42/shares"},
+		{http.MethodGet, "/api/admin/http-routes/42/shares"},
+		{http.MethodGet, "/api/admin/http-routes/42/shares/WlpaWlpaWlpaWlpa"},
+		{http.MethodPost, "/api/admin/http-routes/42/shares/WlpaWlpaWlpaWlpa/revoke"},
+		{http.MethodGet, "/api/admin/http-routes/42/access-audit"},
+		{http.MethodGet, "/api/admin/http-access-audit"},
+	} {
+		for _, token := range []string{"", "not-a-token"} {
+			response := fixture.request(t, endpoint.method, endpoint.path, token, "application/json",
+				[]byte(`{"expiresInSeconds":3600}`))
+			if response.status != http.StatusUnauthorized {
+				t.Fatalf("%s %s with token %q: status %d (%s)", endpoint.method, endpoint.path, token,
+					response.status, response.body)
+			}
+			if got := response.header.Get("Cache-Control"); got != "private, no-store" {
+				t.Errorf("%s %s with token %q: Cache-Control %q", endpoint.method, endpoint.path, token, got)
+			}
+		}
+	}
+}
+
+// Concurrent creations on a route one share below the limit: exactly one more share is issued and
+// every other request is refused with SHARE_LIMIT_REACHED.
+func TestShareCreationsRacingForTheLastSlotStopAtTheLimit(t *testing.T) {
+	vector := sharetest.Load(t)
+	fixture := newShareAPI(t, vector.World, sharetest.CaseInput{})
+	alice := fixture.token("alice")
+	body := []byte(`{"expiresInSeconds":3600}`)
+	for i := 0; i < httpshare.MaxActiveSharesPerRoute-1; i++ {
+		if created := fixture.request(t, http.MethodPost, "/api/admin/http-routes/42/shares", alice,
+			"application/json", body); created.status != http.StatusCreated {
+			t.Fatalf("seed share %d: %d %s", i, created.status, created.body)
+		}
+	}
+
+	const racers = 8
+	type outcome struct {
+		status       int
+		code         string
+		cacheControl string
+		err          error
+	}
+	outcomes := make(chan outcome, racers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			request, err := http.NewRequest(http.MethodPost, fixture.server.URL+"/api/admin/http-routes/42/shares",
+				bytes.NewReader(body))
+			if err != nil {
+				outcomes <- outcome{err: err}
+				return
+			}
+			request.Header.Set("Authorization", "Bearer "+alice)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				outcomes <- outcome{err: err}
+				return
+			}
+			defer response.Body.Close()
+			var payload struct {
+				Code string `json:"code"`
+			}
+			data, _ := io.ReadAll(response.Body)
+			_ = json.Unmarshal(data, &payload)
+			outcomes <- outcome{status: response.StatusCode, code: payload.Code,
+				cacheControl: response.Header.Get("Cache-Control")}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(outcomes)
+
+	created, refused := 0, 0
+	for result := range outcomes {
+		switch {
+		case result.err != nil:
+			t.Fatalf("request failed: %v", result.err)
+		case result.status == http.StatusCreated:
+			created++
+		case result.status == http.StatusConflict && result.code == httpshare.CodeLimitReached:
+			refused++
+		default:
+			t.Fatalf("unexpected answer %d %s", result.status, result.code)
+		}
+		if result.cacheControl != "private, no-store" {
+			t.Errorf("Cache-Control %q", result.cacheControl)
+		}
+	}
+	if created != 1 || refused != racers-1 {
+		t.Fatalf("created %d, refused %d; want 1 and %d", created, refused, racers-1)
+	}
+	shares, err := fixture.db.ListHTTPSharesByRoute(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := 0
+	for _, share := range shares {
+		if share.Active(fixture.clock.Unix()) {
+			active++
+		}
+	}
+	if active != httpshare.MaxActiveSharesPerRoute {
+		t.Fatalf("%d active shares on the route, want %d", active, httpshare.MaxActiveSharesPerRoute)
 	}
 }

@@ -253,6 +253,12 @@ int st_admin_http_share_sweep(void);
 /* Cuts this instance's streams of the share: NAT RST, HTTP aborted, WebSocket closed with 1008. */
 void st_admin_http_share_cut(const char *share_id);
 size_t st_admin_http_share_stream_count(const char *share_id);
+/*
+ * Test hook for the strict SemVer 2.0 rules of client package versions and the version check
+ * (Java SemanticVersion): *result is <0, 0 or >0 by precedence; -1 when either side does not parse.
+ */
+int st_admin_semver_compare_for_testing(const char *left, const char *right, int *result);
+
 /* Test hooks: placeholder streams that count against the 64-stream admission limit. */
 int st_admin_http_share_occupy_for_testing(const char *share_id, size_t count);
 void st_admin_http_share_release_for_testing(void);

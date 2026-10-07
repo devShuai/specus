@@ -15,8 +15,10 @@
 #include "login_rate_limiter.h"
 #include "media_capture.h"
 #include "object_storage.h"
+#include "oidc.h"
 #include "password_hash.h"
 #include "peer_mesh.h"
+#include "product_metrics.h"
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
@@ -24,7 +26,9 @@
 #include "security_baseline.h"
 #include "storage.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "turn_auth.h"
+#include "upstream_browser_headers.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -82,6 +86,7 @@
 
 static int admin_base64_decode_alloc(const char *encoded, uint8_t **out, size_t *out_len);
 static const char *admin_reason_phrase(int status);
+static int normalize_username_in_place(char *username);
 static int write_registration_error_response(int status,
                                              const char *error,
                                              char *out,
@@ -116,6 +121,8 @@ typedef struct {
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
     int admin;
     int authenticated;
+    /* The bearer was a valid token of the identity provider, whether or not it resolved. */
+    int oidc_bearer;
 } st_admin_context;
 
 typedef struct st_admin_ws_client {
@@ -219,6 +226,8 @@ typedef struct {
     long long client_id;
     char route[128];
     char rewrite_prefix[64];
+    /* The route's target, whose origin the relayed browser headers take (UpstreamBrowserHeaders). */
+    char target_base_url[512];
     char *relative_path;
     const char *raw_query;
     int upgrade;
@@ -874,6 +883,46 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
     return 0;
 }
 
+/*
+ * A token of the identity provider itself, sent straight to the management API (Java's
+ * oidcAccessTokenDecoder, then ManagementContextResolver.resolveBoundOidcUser). A valid token is
+ * not by itself an account: only an issuer/subject pair already bound to an enabled local user gets
+ * in, and tenant and role come from that user, never from the token's claims, the configured
+ * SPECUS_OIDC_TENANT_CLAIM included. Returns like admin_context_from_authorization.
+ */
+static int admin_context_from_oidc_bearer(const char *token, st_admin_context *context)
+{
+    st_oidc_identity identity;
+    if (st_oidc_validate_bearer_token(token, &identity) != ST_OIDC_OK) {
+        return -1;
+    }
+    context->oidc_bearer = 1;
+    int result = -2;
+    char *issuer = admin_trim(identity.issuer);
+    char *subject = admin_trim(identity.subject);
+    char identity_key[65];
+    const char *database_path = admin_database_path();
+    if (database_path != NULL && *issuer != '\0' && *subject != '\0'
+        && strlen(issuer) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && strlen(subject) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && st_oidc_identity_key(issuer, subject, identity_key) == 0) {
+        st_storage_management_user user;
+        int found = st_storage_find_oidc_user(database_path, identity_key, &user);
+        if (found < 0) {
+            result = -3;
+        } else if (found == 0) {
+            snprintf(context->username, sizeof(context->username), "%s", user.username);
+            snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
+            snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+            context->admin = strcmp(context->role, "ADMIN") == 0;
+            context->authenticated = 1;
+            result = 0;
+        }
+    }
+    st_oidc_identity_free(&identity);
+    return result;
+}
+
 /* 0 when the bearer token is valid and its account still resolves, -1 for an invalid token, -2 for
  * a valid token whose account is gone, disabled, moved to another tenant or no longer allowed, and
  * -3 when the account cannot be checked because the user store is unreadable. */
@@ -900,7 +949,8 @@ static int admin_context_from_authorization(const char *authorization, st_admin_
                                          env_text("SPECUS_AUTH_TENANT_ID", "default"),
                                          env_text("SPECUS_AUTH_USERNAME", "admin"),
                                          &claims) != 0) {
-        return -1;
+        /* Java routes by the JOSE alg: HS* only to the local decoder, anything else to OIDC. */
+        return st_oidc_token_is_hmac(token) ? -1 : admin_context_from_oidc_bearer(token, context);
     }
     int resolved = admin_resolve_token_user(&claims, context);
     return resolved == 0 ? 0 : (resolved == -2 ? -3 : -2);
@@ -2782,7 +2832,9 @@ static void record_direct_http_exchange(const char *client_name,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
-    if (client_name == NULL || route == NULL || request == NULL || response == NULL) {
+    /* Java captures only with specus.traffic.capture-detail-enabled and the route's own switch. */
+    if (client_name == NULL || route == NULL || request == NULL || response == NULL
+        || !st_traffic_capture_enabled()) {
         return;
     }
     const char *database_path = admin_database_path();
@@ -2814,11 +2866,17 @@ static void record_direct_http_exchange(const char *client_name,
     char *response_headers = admin_join_headers(response->headers, response->headers_len);
     char *request_content_type = admin_header_array_value(request->headers, request->headers_len, "Content-Type");
     char *response_content_type = admin_header_array_value(response->headers, response->headers_len, "Content-Type");
+    char *request_content_encoding = admin_header_array_value(request->headers, request->headers_len,
+                                                              "Content-Encoding");
+    char *response_content_encoding = admin_header_array_value(response->headers, response->headers_len,
+                                                               "Content-Encoding");
     if (request_headers == NULL || response_headers == NULL) {
         free(request_headers);
         free(response_headers);
         free(request_content_type);
         free(response_content_type);
+        free(request_content_encoding);
+        free(response_content_encoding);
         return;
     }
     st_storage_http_exchange_record record = {
@@ -2847,6 +2905,8 @@ static void record_direct_http_exchange(const char *client_name,
         .request_body_len = request->body_len,
         .response_body = response->body,
         .response_body_len = response->body_len,
+        .request_content_encoding = request_content_encoding,
+        .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
     };
     (void)st_storage_record_http_exchange(database_path, &record);
@@ -2854,6 +2914,8 @@ static void record_direct_http_exchange(const char *client_name,
     free(response_headers);
     free(request_content_type);
     free(response_content_type);
+    free(request_content_encoding);
+    free(response_content_encoding);
 }
 
 static int ensure_admin_database(const char **path, char *out, size_t out_len)
@@ -2870,6 +2932,25 @@ static int ensure_admin_database(const char **path, char *out, size_t out_len)
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"database init failed\"}");
     }
     return 0;
+}
+
+/*
+ * An onboarding milestone of opt-in product metrics (product-metrics.md section 4.1), reported
+ * after the write path it belongs to succeeded. It never fails that write path: the hook logs its
+ * own storage errors (tenant, step and error class only) and is ignored while the tenant is off.
+ */
+static void admin_product_metrics_milestone(const char *tenant_id, const char *username, const char *step)
+{
+    const char *database_path = admin_database_path();
+    if (database_path != NULL) {
+        (void)st_product_metrics_milestone(database_path, tenant_id, username, step);
+    }
+}
+
+/* Whether a management token response carries a session (200), so signed_in may be recorded. */
+static int admin_token_response_issued(const char *out, int response_len)
+{
+    return response_len > 0 && strncmp(out, "HTTP/1.1 200 ", strlen("HTTP/1.1 200 ")) == 0;
 }
 
 static int handle_database_initialize(const st_admin_context *context, char *out, size_t out_len)
@@ -3614,48 +3695,131 @@ static int admin_form_append_pair(st_admin_string_builder *builder, const char *
     return 0;
 }
 
-static int build_oidc_token_proxy_response(const char *body, char *out, size_t out_len)
+static int write_oidc_error(char *out, size_t out_len, int status, const char *error)
 {
-    if (body == NULL) {
-        body = "{}";
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"error\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, error);
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC response build failed\"}");
     }
-    const char *client_id = getenv("SPECUS_OIDC_CLIENT_ID");
-    const char *token_endpoint = getenv("SPECUS_OIDC_TOKEN_ENDPOINT");
-    const char *redirect_uri = getenv("SPECUS_OIDC_REDIRECT_URI");
-    const char *client_secret = getenv("SPECUS_OIDC_CLIENT_SECRET");
-    if (client_id == NULL || *client_id == '\0' || token_endpoint == NULL || *token_endpoint == '\0') {
-        return write_response(out,
-                              out_len,
-                              503,
-                              "Service Unavailable",
-                              "{\"error\":\"OIDC is not configured: client-id or token-endpoint is missing\"}");
+    int response_len = write_response(out, out_len, status, admin_reason_phrase(status), builder.data);
+    free(builder.data);
+    return response_len;
+}
+
+/*
+ * Java ManagementUserService.resolveOrProvisionOidcUser. issuer/subject is the immutable identity;
+ * preferred_username is mutable profile data that only names the account on its first login and
+ * can never claim the built-in administrator, which has no binding row. New accounts are USER in
+ * the default tenant, with a hash of a random password nobody holds. Returns 0 with *user filled,
+ * 1 when the identity is refused and -1 when the user store fails.
+ */
+static int admin_resolve_oidc_login_user(const char *database_path,
+                                         const st_oidc_identity *identity,
+                                         st_storage_management_user *user)
+{
+    char *issuer_copy = strdup(identity->issuer);
+    char *subject_copy = strdup(identity->subject);
+    char *username = strdup(identity->preferred_username);
+    if (issuer_copy == NULL || subject_copy == NULL || username == NULL) {
+        free(issuer_copy);
+        free(subject_copy);
+        free(username);
+        return -1;
     }
-    char *code = st_json_get_string(body, "code");
-    char *code_verifier = st_json_get_string(body, "codeVerifier");
-    if (code_verifier == NULL) {
-        code_verifier = st_json_get_string(body, "code_verifier");
+    const char *issuer = admin_trim(issuer_copy);
+    const char *subject = admin_trim(subject_copy);
+    char identity_key[65];
+    int result = 1;
+    if (*issuer != '\0' && *subject != '\0'
+        && strlen(issuer) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && strlen(subject) <= ST_OIDC_MAX_IDENTITY_FIELD_BYTES
+        && normalize_username_in_place(username) == 0
+        && admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) != 0) {
+        const char *tenant_id = env_text("SPECUS_AUTH_TENANT_ID", "default");
+        result = st_oidc_identity_key(issuer, subject, identity_key) == 0
+            ? st_storage_resolve_oidc_user(database_path, issuer, subject, identity_key, username,
+                                           tenant_id, NULL, user)
+            : -1;
+        if (result == 2) {
+            char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+            result = st_oidc_unusable_password_hash(password_hash) == 0
+                ? st_storage_resolve_oidc_user(database_path, issuer, subject, identity_key, username,
+                                               tenant_id, password_hash, user)
+                : -1;
+        }
     }
-    if (code == NULL || *code == '\0' || code_verifier == NULL || *code_verifier == '\0') {
+    free(issuer_copy);
+    free(subject_copy);
+    free(username);
+    return result == 0 ? 0 : (result < 0 ? -1 : 1);
+}
+
+/*
+ * POST /oidc/token, Java's OidcController.exchange. The browser runs Authorization Code + PKCE:
+ * it creates state, nonce and the code verifier, keeps them in its sessionStorage, checks state on
+ * the callback and sends only code, codeVerifier and nonce here. This endpoint redeems the code at
+ * the token endpoint, verifies the ID token (JWKS signature, issuer, client-id audience, azp,
+ * expiry) and the browser's nonce, binds the issuer/subject pair to a local management user, and
+ * answers with the same local HS256 token the password login issues. The identity provider's
+ * access token never reaches the browser; the ID token is returned, as Java does, only to serve as
+ * id_token_hint for RP-initiated logout.
+ */
+static int build_oidc_token_exchange_response(const char *body, char *out, size_t out_len)
+{
+    const char *client_id = st_oidc_setting("SPECUS_OIDC_CLIENT_ID", "");
+    if (!st_oidc_has_text(client_id)) {
+        return write_oidc_error(out, out_len, 503, "OIDC 未配置（缺少 client-id）");
+    }
+    char *code = st_oidc_json_text(body, "code");
+    char *code_verifier = st_oidc_json_text(body, "codeVerifier");
+    char *nonce = st_oidc_json_text(body, "nonce");
+    if (!st_oidc_has_text(code) || !st_oidc_has_text(code_verifier) || !st_oidc_has_text(nonce)) {
         free(code);
         free(code_verifier);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"code or code_verifier is required\"}");
+        free(nonce);
+        return write_oidc_error(out, out_len, 400, "缺少 code、code_verifier 或 nonce");
     }
+    /* Java always has its database. C needs one to bind the identity, so it says so before the
+     * one-time code is spent. */
+    const char *database_path = admin_database_path();
+    if (database_path == NULL) {
+        free(code);
+        free(code_verifier);
+        free(nonce);
+        return write_oidc_error(out, out_len, 503, "OIDC 登录需要配置 SPECUS_DATABASE_PATH");
+    }
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        free(code);
+        free(code_verifier);
+        free(nonce);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"database init failed\"}");
+    }
+    const char *token_endpoint = st_oidc_setting("SPECUS_OIDC_TOKEN_ENDPOINT", ST_OIDC_DEFAULT_TOKEN_ENDPOINT);
+    const char *redirect_uri = st_oidc_setting("SPECUS_OIDC_REDIRECT_URI", ST_OIDC_DEFAULT_REDIRECT_URI);
+    const char *client_secret = st_oidc_setting("SPECUS_OIDC_CLIENT_SECRET", "");
+    int confidential = st_oidc_has_text(client_secret);
     st_admin_string_builder form = {0};
     int rc = admin_form_append_pair(&form, "grant_type", "authorization_code");
     if (rc == 0) rc = admin_form_append_pair(&form, "code", code);
-    if (rc == 0) rc = admin_form_append_pair(&form, "redirect_uri", redirect_uri == NULL ? "" : redirect_uri);
+    if (rc == 0) rc = admin_form_append_pair(&form, "redirect_uri", redirect_uri);
     if (rc == 0) rc = admin_form_append_pair(&form, "code_verifier", code_verifier);
-    if (rc == 0 && (client_secret == NULL || *client_secret == '\0')) {
+    /* A public PKCE client names itself in the form; a confidential one uses HTTP Basic below. */
+    if (rc == 0 && !confidential) {
         rc = admin_form_append_pair(&form, "client_id", client_id);
     }
     free(code);
     free(code_verifier);
     if (rc != 0 || form.data == NULL) {
         free(form.data);
+        free(nonce);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC token request build failed\"}");
     }
     char *authorization = NULL;
-    if (client_secret != NULL && *client_secret != '\0') {
+    if (confidential) {
         st_admin_string_builder basic = {0};
         if (admin_sb_appendf(&basic, "%s:%s", client_id, client_secret) == 0 && basic.data != NULL) {
             authorization = admin_base64_encode((const uint8_t *)basic.data, basic.len);
@@ -3663,41 +3827,42 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
         free(basic.data);
         if (authorization == NULL) {
             free(form.data);
+            free(nonce);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"OIDC authorization build failed\"}");
         }
     }
     long status_code = 0L;
     char *token_body = NULL;
-    const char *ca_certificate_path = getenv("SPECUS_OIDC_CA_CERTIFICATE_PATH");
     st_http_client_options http_options = {
         .timeout_ms = 15000L,
         .max_response_bytes = 65536U,
-        .ca_certificate_path = ca_certificate_path
+        .ca_certificate_path = getenv("SPECUS_OIDC_CA_CERTIFICATE_PATH")
     };
-    if (st_http_post_form(token_endpoint,
-                          authorization,
-                          form.data,
-                          &http_options,
-                          &status_code,
-                          &token_body) != 0) {
-        free(authorization);
-        free(form.data);
-        return write_response(out, out_len, 502, "Bad Gateway", "{\"error\":\"cannot connect to OIDC token endpoint\"}");
-    }
+    rc = st_http_post_form(token_endpoint, authorization, form.data, &http_options, &status_code, &token_body);
     free(authorization);
     free(form.data);
+    if (rc != 0) {
+        free(nonce);
+        return write_oidc_error(out, out_len, 502, "无法连接 OIDC 令牌端点");
+    }
+    if (!st_json_is_valid(token_body)) {
+        free(token_body);
+        free(nonce);
+        return write_oidc_error(out, out_len, 502, "OIDC 令牌响应无法解析");
+    }
     if (status_code / 100 != 2) {
-        char *error = st_json_get_string(token_body, "error");
-        char *description = st_json_get_string(token_body, "error_description");
+        char *error = st_oidc_json_text(token_body, "error");
+        char *description = st_oidc_json_text(token_body, "error_description");
         st_admin_string_builder builder = {0};
         rc = admin_sb_append(&builder, "{\"error\":");
-        if (rc == 0) rc = admin_sb_append_json_string(&builder, error == NULL || *error == '\0' ? "token_exchange_failed" : error);
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, error == NULL ? "token_exchange_failed" : error);
         if (rc == 0) rc = admin_sb_append(&builder, ",\"error_description\":");
         if (rc == 0) rc = admin_sb_append_json_string(&builder, description == NULL ? "" : description);
         if (rc == 0) rc = admin_sb_append(&builder, "}");
         free(error);
         free(description);
         free(token_body);
+        free(nonce);
         if (rc != 0 || builder.data == NULL) {
             free(builder.data);
             return write_response(out, out_len, 502, "Bad Gateway", "{\"error\":\"token_exchange_failed\",\"error_description\":\"\"}");
@@ -3706,21 +3871,62 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
         free(builder.data);
         return response_len;
     }
-    char *access_token = st_json_get_string(token_body, "access_token");
-    char *id_token = st_json_get_string(token_body, "id_token");
-    char *token_type = st_json_get_string(token_body, "token_type");
-    int expires_in = 0;
-    (void)st_json_get_int(token_body, "expires_in", &expires_in);
+    char *id_token = st_oidc_json_text(token_body, "id_token");
+    char *token_type = st_oidc_json_text(token_body, "token_type");
     free(token_body);
+    if (!st_oidc_has_text(id_token)) {
+        free(id_token);
+        free(token_type);
+        free(nonce);
+        return write_oidc_error(out, out_len, 502, "OIDC 响应缺少 ID Token");
+    }
+    st_oidc_identity identity;
+    int validation = st_oidc_validate_id_token(id_token, nonce, &identity);
+    free(nonce);
+    if (validation != ST_OIDC_OK) {
+        free(id_token);
+        free(token_type);
+        if (validation == ST_OIDC_UNAVAILABLE) {
+            return write_oidc_error(out, out_len, 503, "OIDC 校验服务不可用");
+        }
+        return write_oidc_error(out,
+                                out_len,
+                                502,
+                                validation == ST_OIDC_IDENTITY_REJECTED
+                                    ? "OIDC ID Token 身份或 nonce 校验失败"
+                                    : "OIDC ID Token 校验失败");
+    }
+    st_storage_management_user user;
+    int resolved = admin_resolve_oidc_login_user(database_path, &identity, &user);
+    st_oidc_identity_free(&identity);
+    if (resolved != 0) {
+        free(id_token);
+        free(token_type);
+        return resolved > 0
+            ? write_oidc_error(out, out_len, 403, "该 Certus 账号已禁用或与现有 Specus 账号绑定冲突")
+            : write_oidc_error(out, out_len, 502, "OIDC 账号绑定失败");
+    }
+    long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
+    char access_token[2048];
+    if (st_security_issue_local_token(user.username,
+                                      user.tenant_id,
+                                      normalize_management_role(user.role),
+                                      getenv("SPECUS_AUTH_JWT_SECRET"),
+                                      ttl,
+                                      access_token,
+                                      sizeof(access_token)) != 0) {
+        free(id_token);
+        free(token_type);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
+    }
     st_admin_string_builder builder = {0};
     rc = admin_sb_append(&builder, "{\"accessToken\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(&builder, access_token);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, access_token);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"idToken\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(&builder, id_token);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, id_token);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"tokenType\":");
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, token_type == NULL || *token_type == '\0' ? "Bearer" : token_type);
-    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"expiresIn\":%d}", expires_in);
-    free(access_token);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, token_type == NULL ? "Bearer" : token_type);
+    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"expiresIn\":%lld}", ttl);
     free(id_token);
     free(token_type);
     if (rc != 0 || builder.data == NULL) {
@@ -3729,10 +3935,20 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
     }
     int response_len = write_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
+    /* A local session was issued: the same signed_in milestone as a password sign-in. */
+    if (response_len > 0) {
+        admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
+    }
     return response_len;
 }
 
-static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
+/*
+ * HttpTrafficExchangeView. A summary (detail 0, the list) carries null headers and previews, as
+ * Java's summary views do; the detail of one exchange carries them.
+ */
+static int append_http_exchange_view(st_admin_string_builder *builder,
+                                     const st_storage_http_exchange *item,
+                                     int detail)
 {
     /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
@@ -3773,19 +3989,24 @@ static int append_http_exchange_view(st_admin_string_builder *builder, const st_
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseContentType\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_content_type);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseBodyType\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_body_type);
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(builder,
+                                         st_traffic_body_type_or_classify(item->response_body_type,
+                                                                          item->response_content_type,
+                                                                          item->response_bytes));
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_text : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_text : NULL);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -6054,7 +6275,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
         rc = admin_sb_append(&builder, i == 0 ? "" : ",");
         if (rc == 0) {
-            rc = append_http_exchange_view(&builder, &items[i]);
+            rc = append_http_exchange_view(&builder, &items[i], 0);
         }
     }
     if (rc == 0) {
@@ -6086,41 +6307,25 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
-    const int page_size = 100;
-    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(
-        (size_t)page_size, sizeof(*items));
-    if (items == NULL) {
+    /* One row by id with its headers and previews, under the same visibility as the list. */
+    st_storage_http_exchange *match = (st_storage_http_exchange *)calloc(1U, sizeof(*match));
+    int found = 0;
+    if (match == NULL
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_get_http_exchange_visible(database_path, exchange_id, context->tenant_id, context->username,
+                                                context->admin, match, &found) != 0) {
+        free(match);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"http exchange lookup failed\"}");
     }
-    long long total = 0;
-    int found = 0;
-    st_storage_http_exchange match;
-    for (int page = 0; !found; ++page) {
-        size_t count = 0U;
-        if (st_storage_list_http_exchanges_visible(database_path, 0, NULL, NULL, NULL, NULL,
-                context->tenant_id, context->username, context->admin, page, page_size,
-                items, (size_t)page_size, &count, &total) != 0) {
-            free(items);
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"http exchange lookup failed\"}");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (items[i].id == exchange_id) {
-                match = items[i];
-                found = 1;
-                break;
-            }
-        }
-        if (found || count == 0U || (long long)(page + 1) * page_size >= total) break;
-    }
-    free(items);
     if (!found) {
+        free(match);
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
     st_admin_string_builder builder = {0};
-    int rc = append_http_exchange_view(&builder, &match);
+    int rc = append_http_exchange_view(&builder, match, 1);
+    free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -6133,7 +6338,7 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
 
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", 0);
+    int enabled = st_traffic_capture_enabled();
     return write_response(out, out_len, 200, "OK",
         enabled
             ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
@@ -6849,6 +7054,7 @@ static int handle_specus_create(const st_admin_context *context, long long clien
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or specus create failed\"}");
     }
     admin_notify_nat_control(&owner);
+    admin_product_metrics_milestone(owner.tenant_id, owner.owner_username, ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED);
     return build_mapping_response(&mapping, 201, "Created", out, out_len);
 }
 
@@ -7089,6 +7295,7 @@ static int handle_http_route_create(const st_admin_context *context, long long c
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
     admin_notify_nat_control(&owner);
+    admin_product_metrics_milestone(owner.tenant_id, owner.owner_username, ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED);
     return build_http_route_response(&route, 201, "Created", out, out_len);
 }
 
@@ -8211,6 +8418,8 @@ static int handle_credential_create(const st_admin_context *context, const char 
         free(secret);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"credential create failed\"}");
     }
+    admin_product_metrics_milestone(credential.tenant_id, credential.owner_username,
+                                    ST_PRODUCT_METRICS_STEP_CREDENTIAL_CREATED);
     int response_len = build_credential_result_response(&credential, admin_trim(secret), 201, "Created", out, out_len);
     free(secret);
     return response_len;
@@ -8442,13 +8651,40 @@ static int semver_numeric_part(const char *value)
     return 1;
 }
 
+/*
+ * Dot-separated SemVer identifiers: none may be empty ("a..b", a leading or trailing dot), each is
+ * [0-9A-Za-z-]+, and a numeric pre-release identifier has no leading zero (build metadata may).
+ */
+static int semver_identifiers_valid(const char *text, int prerelease)
+{
+    const char *part = text;
+    for (;;) {
+        const char *end = strchr(part, '.');
+        size_t len = end == NULL ? strlen(part) : (size_t)(end - part);
+        if (len == 0U) return 0;
+        int all_numeric = 1;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = (unsigned char)part[i];
+            if (!isalnum(c) && c != '-') return 0;
+            if (!isdigit(c)) all_numeric = 0;
+        }
+        if (prerelease && all_numeric && len > 1U && part[0] == '0') return 0;
+        if (end == NULL) return 1;
+        part = end + 1;
+    }
+}
+
+/*
+ * Java SemanticVersion.parse: trimmed (every character up to and including space, as String.trim
+ * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0.
+ */
 static int parse_admin_semver(const char *value, st_admin_semver *out)
 {
     if (value == NULL || out == NULL) return -1;
-    while (isspace((unsigned char)*value)) ++value;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
     if (*value == 'v') ++value;
     const char *end = value + strlen(value);
-    while (end > value && isspace((unsigned char)end[-1])) --end;
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
     size_t len = (size_t)(end - value);
     if (len == 0U || len > 32U) return -1;
     char copy[33];
@@ -8456,37 +8692,24 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     copy[len] = '\0';
     char *build = strchr(copy, '+');
     if (build != NULL) {
-        if (build[1] == '\0') return -1;
-        for (char *p = build + 1; *p != '\0'; ++p) {
-            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return -1;
-        }
+        if (!semver_identifiers_valid(build + 1, 0)) return -1;
         *build = '\0';
     }
     char *prerelease = strchr(copy, '-');
     memset(out, 0, sizeof(*out));
     if (prerelease != NULL) {
         *prerelease++ = '\0';
-        if (*prerelease == '\0' || strlen(prerelease) >= sizeof(out->prerelease)) return -1;
-        char validation[33];
-        snprintf(validation, sizeof(validation), "%s", prerelease);
-        char *save = NULL;
-        for (char *part = strtok_r(validation, ".", &save); part != NULL;
-             part = strtok_r(NULL, ".", &save)) {
-            int all_numeric = *part != '\0';
-            for (char *p = part; *p != '\0'; ++p) if (!isdigit((unsigned char)*p)) all_numeric = 0;
-            if (*part == '\0' || (all_numeric && semver_numeric_part(part) == 0)) return -1;
-            for (char *p = part; *p != '\0'; ++p) {
-                if (!isalnum((unsigned char)*p) && *p != '-') return -1;
-            }
-        }
+        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, 1)) return -1;
         snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
     }
-    char *save = NULL;
-    char *major = strtok_r(copy, ".", &save);
-    char *minor = strtok_r(NULL, ".", &save);
-    char *patch = strtok_r(NULL, ".", &save);
-    if (!semver_numeric_part(major) || !semver_numeric_part(minor)
-        || !semver_numeric_part(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+    /* Exactly three parts: strtok_r would skip the empty one in "1..0.0" or ".1.0.0". */
+    char *major = copy;
+    char *minor = strchr(major, '.');
+    char *patch = minor == NULL ? NULL : strchr(minor + 1, '.');
+    if (minor == NULL || patch == NULL || strchr(patch + 1, '.') != NULL) return -1;
+    *minor++ = '\0';
+    *patch++ = '\0';
+    if (!semver_numeric_part(major) || !semver_numeric_part(minor) || !semver_numeric_part(patch)) return -1;
     snprintf(out->major, sizeof(out->major), "%s", major);
     snprintf(out->minor, sizeof(out->minor), "%s", minor);
     snprintf(out->patch, sizeof(out->patch), "%s", patch);
@@ -8532,6 +8755,16 @@ static int compare_admin_semver(const st_admin_semver *left, const st_admin_semv
         right_part = strtok_r(NULL, ".", &right_save);
     }
     return left_part == right_part ? 0 : (left_part == NULL ? -1 : 1);
+}
+
+int st_admin_semver_compare_for_testing(const char *left, const char *right, int *result)
+{
+    st_admin_semver parsed_left;
+    st_admin_semver parsed_right;
+    if (result == NULL || parse_admin_semver(left, &parsed_left) != 0
+        || parse_admin_semver(right, &parsed_right) != 0) return -1;
+    *result = compare_admin_semver(&parsed_left, &parsed_right);
+    return 0;
 }
 
 static int read_client_download_mutation(const char *body,
@@ -9480,6 +9713,7 @@ static int handle_management_user_create(const st_admin_context *context, const 
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"user create failed\"}");
     }
+    admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
     st_admin_string_builder builder = {0};
     if (append_stored_management_user_view(&builder, &user) != 0 || builder.data == NULL) {
         free(builder.data);
@@ -9634,6 +9868,10 @@ static int handle_management_user_delete(const st_admin_context *context, const 
         free(username);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be deleted\"}");
     }
+    /* The stored spelling of the name, which keys the account's product metrics progress row. */
+    st_storage_management_user target;
+    int have_target = st_storage_get_management_user_in_tenant(database_path, context->tenant_id,
+                                                               username, &target) == 0;
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     st_storage_share_ids revoked = {0};
     /* Deleting the user ends its shares in the same transaction, so a later namesake never inherits them. */
@@ -9641,6 +9879,9 @@ static int handle_management_user_delete(const st_admin_context *context, const 
                                                        context->username, st_http_share_now_ms(), &revoked);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == 0 && have_target) {
+        (void)st_product_metrics_user_deleted(database_path, target.tenant_id, target.username);
+    }
     int response_len = rc != 0
         ? write_management_user_not_found(context, "delete", username, out, out_len)
         : write_response(out, out_len, 204, "No Content", "");
@@ -9710,15 +9951,15 @@ static int write_workbench_error(char *out,
     return write_workbench_response(out, out_len, status, body, retry_after_seconds);
 }
 
-/* A refusal of the shared authentication layer, with the workbench's header on a workbench path. */
+/* A refusal of the shared authentication layer, private on a path whose every answer is private. */
 static int write_auth_refusal(char *out,
                               size_t out_len,
-                              int workbench_path,
+                              int private_path,
                               int status,
                               const char *reason,
                               const char *body)
 {
-    return workbench_path
+    return private_path
         ? write_workbench_response(out, out_len, status, body, 0)
         : write_response(out, out_len, status, reason, body);
 }
@@ -9881,6 +10122,7 @@ static int handle_management_auth_login(const char *body,
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
     int ok = 0;
+    int database_user = 0;
     char token_username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
@@ -9926,6 +10168,7 @@ static int handle_management_auth_login(const char *body,
                 snprintf(token_username, sizeof(token_username), "%s", user.username);
                 snprintf(token_tenant, sizeof(token_tenant), "%s", user.tenant_id);
                 snprintf(token_role, sizeof(token_role), "%s", normalize_management_role(user.role));
+                database_user = 1;
             }
         }
     }
@@ -9937,7 +10180,12 @@ static int handle_management_auth_login(const char *body,
     if (!ok) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
-    return write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    int response_len = write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    /* The built-in admin is no user row and never enters the onboarding cohort. */
+    if (database_user && admin_token_response_issued(out, response_len)) {
+        admin_product_metrics_milestone(token_tenant, token_username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
+    }
+    return response_len;
 }
 
 /* The context was re-read from the user record, so the new token carries today's tenant and role. */
@@ -10007,7 +10255,92 @@ static int handle_management_registration_verify(const char *body, char *out, si
     if (st_registration_verify(database_path, body, &user, &status, error, sizeof(error)) != 0) {
         return write_registration_error_response(status, error, out, out_len);
     }
-    return write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    /* Verification created the account and signs it in at once: two milestones, in step order. */
+    admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
+    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    if (admin_token_response_issued(out, response_len)) {
+        admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
+    }
+    return response_len;
+}
+
+/*
+ * Every product metrics answer, success or refusal, is private to the identity that asked and must
+ * not be kept by any cache: "private, no-store" rather than the usual "no-store".
+ */
+static int write_product_metrics_response(char *out, size_t out_len, int status, const char *body)
+{
+    const char *reason;
+    switch (status) {
+    case 200: reason = "OK"; break;
+    case 400: reason = "Bad Request"; break;
+    case 401: reason = "Unauthorized"; break;
+    case 403: reason = "Forbidden"; break;
+    case 404: reason = "Not Found"; break;
+    case 409: reason = "Conflict"; break;
+    case 413: reason = "Payload Too Large"; break;
+    case 429: reason = "Too Many Requests"; break;
+    case 503: reason = "Service Unavailable"; break;
+    default: reason = "Internal Server Error"; break;
+    }
+    int written = snprintf(out,
+                           out_len,
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Cache-Control: private, no-store\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           status,
+                           reason,
+                           strlen(body),
+                           body);
+    return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/*
+ * The product metrics endpoints (protocol/spec/product-metrics.md section 7), reached after the
+ * shared authentication layer re-read the account: the tenant and the username are the session's,
+ * never anything in the path, query or body. The request body is handed over as raw bytes with its
+ * length (the ingest size check runs on them before any parsing) and is never logged.
+ */
+static int handle_product_metrics_request(const st_admin_context *context,
+                                          const char *method,
+                                          const char *path,
+                                          const char *body,
+                                          size_t body_len,
+                                          char *out,
+                                          size_t out_len)
+{
+    st_product_metrics_endpoint endpoint = st_product_metrics_match(method, path);
+    if (endpoint == ST_PRODUCT_METRICS_NO_ENDPOINT) {
+        return write_product_metrics_response(out, out_len, 404, "{\"error\":\"not found\"}");
+    }
+    /* Without a usable database every endpoint that reaches storage answers 503 UNAVAILABLE. */
+    const char *database_path = admin_database_path();
+    if (database_path != NULL && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        database_path = NULL;
+    }
+    const char *query = strchr(path, '?');
+    st_product_metrics_actor actor = {
+        .tenant_id = context->tenant_id,
+        .username = context->username,
+        .admin = context->admin
+    };
+    st_product_metrics_response response;
+    st_product_metrics_handle(database_path, endpoint, &actor, query == NULL ? NULL : query + 1,
+                              body, body == NULL ? 0U : body_len, &response);
+    int response_len;
+    if (response.body != NULL) {
+        response_len = write_product_metrics_response(out, out_len, response.status, response.body);
+    } else if (response.status == 403) {
+        response_len = write_product_metrics_response(out, out_len, 403, "{\"error\":\"需要 admin 权限\"}");
+    } else {
+        response_len = write_product_metrics_response(out, out_len, 500, "{\"error\":\"product metrics failed\"}");
+    }
+    st_product_metrics_response_free(&response);
+    return response_len;
 }
 
 static int st_admin_build_response_internal(const char *method,
@@ -10029,38 +10362,67 @@ static int st_admin_build_response_internal(const char *method,
     }
     st_admin_context context;
     admin_context_from_env(&context);
+    /* Product metrics answers are private, the shared layer's refusals included. */
+    int product_metrics_path = st_product_metrics_path(path);
     if (admin_path_requires_auth(method, path)) {
-        /* Workbench answers are private, the shared layer's refusals included. */
-        int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
+        /*
+         * Workbench and temporary-share management answers are private, the shared layer's refusals
+         * included (service-workbench.md, temporary-http-share.md section 4).
+         */
+        admin_share_path share_path;
+        admin_parse_share_path(path, &share_path);
+        int private_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0
+            || share_path.kind != ADMIN_SHARE_PATH_NONE
+            || admin_path_equals(path, "/api/admin/http-access-audit");
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
+            /* Java's AuthController renews only local tokens; it tells an identity provider's
+             * token so whether or not that token resolves to an account. */
+            if (context.oidc_bearer && (auth_rc == 0 || auth_rc == -2)
+                && admin_path_equals(path, "/auth/refresh")) {
+                return write_response(out, out_len, 400, "Bad Request",
+                                      "{\"error\":\"OIDC 令牌不能通过该端点续期\"}");
+            }
             /* Java's answers: refresh says 401 so the SPA signs in again, any other request 403. */
             if (auth_rc == -2 && admin_path_equals(path, "/auth/refresh")) {
                 return write_response(out, out_len, 401, "Unauthorized",
                                       "{\"error\":\"账号已禁用、不存在或不再允许本地登录\"}");
             }
             if (auth_rc == -2) {
-                return write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
-                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+                return product_metrics_path
+                    ? write_product_metrics_response(out, out_len, 403,
+                                                     "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}")
+                    : write_auth_refusal(out, out_len, private_path, 403, "Forbidden",
+                                         "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
             if (auth_rc == -3) {
-                return write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
-                                          "{\"error\":\"management user store unavailable\"}");
+                return product_metrics_path
+                    ? write_product_metrics_response(out, out_len, 500,
+                                                     "{\"error\":\"management user store unavailable\"}")
+                    : write_auth_refusal(out, out_len, private_path, 500, "Internal Server Error",
+                                         "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
         } else {
             unauthorized = !allow_default_admin;
         }
         if (unauthorized) {
+            if (product_metrics_path) {
+                return write_product_metrics_response(out, out_len, 401,
+                                                      "{\"error\":\"missing or invalid bearer token\"}");
+            }
             /* Every answer of the connectivity check is private, the 401 included. */
             if (admin_connectivity_check_path(path, NULL, 0U)) {
                 return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
             }
-            return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
+            return write_auth_refusal(out, out_len, private_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
+    }
+    if (product_metrics_path) {
+        return handle_product_metrics_request(&context, method, path, body, body_len, out, out_len);
     }
     st_workbench_request workbench_request;
     if (st_workbench_match(method, path, &workbench_request)) {
@@ -10488,7 +10850,7 @@ static int st_admin_build_response_internal(const char *method,
         return write_response(out, out_len, 200, "OK", body);
     }
     if (strcmp(method, "POST") == 0 && strcmp(path, "/oidc/token") == 0) {
-        return build_oidc_token_proxy_response(body, out, out_len);
+        return build_oidc_token_exchange_response(body, out, out_len);
     }
     return write_response(out, out_len, 404, "Not Found", "{\"error\":\"not found\"}");
 }
@@ -12008,7 +12370,8 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
 }
 
 /* Whether route_name is one of the SPECUS_HTTP_ROUTES routes every client is given. */
-static int admin_env_http_route_configured(const char *route_name)
+/* Whether SPECUS_HTTP_ROUTES defines route_name; its target is copied into target when it does. */
+static int admin_env_http_route_configured(const char *route_name, char *target, size_t target_len)
 {
     st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
     size_t route_count = 0;
@@ -12016,6 +12379,9 @@ static int admin_env_http_route_configured(const char *route_name)
     if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
         for (size_t i = 0; i < route_count && !configured; ++i) {
             configured = strcmp(routes[i].route, route_name) == 0;
+            if (configured && target != NULL) {
+                snprintf(target, target_len, "%s", routes[i].target_base_url);
+            }
         }
     }
     free(routes);
@@ -12033,21 +12399,28 @@ static int send_http_route_not_found(int fd)
  * response. It fails closed: a request enters the tunnel only for a route the server itself
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
- * since, so what the client holds never makes a route reachable. *client_id is the account the
- * request was let in for (0 without a database), so that only a data connection of that account,
- * not one of a former account of the same name, can serve it.
+ * since, so what the client holds never makes a route reachable. The route's target is copied into
+ * target_base_url for the browser header rewrite. *client_id is the account the request was let in
+ * for (0 without a database), so that only a data connection of that account, not one of a former
+ * account of the same name, can serve it.
  */
-static int authorize_direct_http_route(int fd, const char *path, const char *raw_request, long long *client_id)
+static int authorize_direct_http_route(int fd,
+                                       const char *path,
+                                       const char *raw_request,
+                                       char *target_base_url,
+                                       size_t target_base_url_len,
+                                       long long *client_id)
 {
     *client_id = 0;
     char *client_name = NULL;
     char *route_name = NULL;
+    target_base_url[0] = '\0';
     if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
         return send_http_route_not_found(fd);
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
-        int configured = admin_env_http_route_configured(route_name);
+        int configured = admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
         free(client_name);
         free(route_name);
         return configured ? 0 : send_http_route_not_found(fd);
@@ -12074,7 +12447,8 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     /* Unknown and disabled clients have no reachable routes, environment ones included: with a
      * database a client cannot log in without an enabled account either. */
     int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
-    int env_configured = !found && client_enabled && admin_env_http_route_configured(route_name);
+    int env_configured = !found && client_enabled
+        && admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
     long long env_client_id = 0;
     if (env_configured) {
         /* A SPECUS_HTTP_ROUTES route has no row of its own: it belongs to the account named. */
@@ -12096,6 +12470,7 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
         return send_http_route_not_found(fd);
     }
     *client_id = route.client_id;
+    snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
     }
@@ -14793,6 +15168,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  const char *path,
                                                  const char *raw_request,
                                                  int strip_authorization,
+                                                 const char *target_base_url,
                                                  long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0
@@ -14861,7 +15237,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(client_name);
         free(route);
@@ -14984,6 +15362,7 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const uint8_t *body,
                                       size_t body_len,
                                       int strip_authorization,
+                                      const char *target_base_url,
                                       long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0) {
@@ -15034,7 +15413,9 @@ static int handle_direct_http_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(client_name);
         free(route);
         free(relative_path);
@@ -15337,6 +15718,7 @@ static int admit_http_share_request(int fd,
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
     admission->client_id = resolution.client_id;
     snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
+    snprintf(admission->target_base_url, sizeof(admission->target_base_url), "%s", resolution.target_base_url);
     return 1;
 }
 
@@ -15366,7 +15748,9 @@ static void forward_http_share_websocket(st_admin_server *server,
     char **headers = NULL;
     size_t headers_len = 0U;
     if (accept_key == NULL || raw_query == NULL
-        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(raw_query);
         send_text_http_error(fd, 500, "direct websocket request build failed");
@@ -15394,7 +15778,9 @@ static void forward_http_share_request(st_admin_server *server,
     char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
     char **headers = NULL;
     size_t headers_len = 0U;
-    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(raw_query);
         send_text_http_error(fd, 500, "direct http request build failed");
         return;
@@ -15616,9 +16002,11 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     int strip_direct_authorization = 0;
+    char direct_target_base_url[512] = "";
     long long direct_client_id = 0;
     if (strncmp(path, "/http/", 6) == 0) {
-        int auth_result = authorize_direct_http_route(fd, path, request, &direct_client_id);
+        int auth_result = authorize_direct_http_route(fd, path, request, direct_target_base_url,
+                                                      sizeof(direct_target_base_url), &direct_client_id);
         if (auth_result < 0) {
             close(fd);
             return;
@@ -15663,6 +16051,7 @@ static void handle_client(st_admin_server *server, int fd)
                                              path,
                                              request,
                                              strip_direct_authorization,
+                                             direct_target_base_url,
                                              direct_client_id)) {
         free(body_buffer);
         close(fd);
@@ -15676,6 +16065,7 @@ static void handle_client(st_admin_server *server, int fd)
                                    (const uint8_t *)body,
                                    available_body_len,
                                    strip_direct_authorization,
+                                   direct_target_base_url,
                                    direct_client_id)) {
         free(body_buffer);
         close(fd);
