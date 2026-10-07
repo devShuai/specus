@@ -126,7 +126,7 @@ Additional runtime knobs:
 | `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | Built-in password-login switch. `/oidc-config.passwordLoginEnabled` is true only when this switch is true and `SPECUS_AUTH_PASSWORD` contains non-whitespace text. SQLite management users keep their own password-login path, matching Java. |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED` | `true` | Enables application-level management login throttling independently of captcha/OIDC. |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP` | `20` | Attempts allowed per source IP in one fixed window. |
-| `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT` | `10` | Attempts allowed per case-insensitive target username in one fixed window. |
+| `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT` | `10` | Attempts allowed per case-insensitive target tenant and username in one fixed window. |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `300` | Fixed login-rate-limit window and maximum `Retry-After`. |
 | `SPECUS_AUTH_JWT_SECRET` | unset | Optional HS256 signing secret for local management Bearer JWTs and the domain-separated pairing-code HMAC. When unset the process uses an ephemeral key: old JWTs and persisted pairing codes fail after restart, so configure a stable high-entropy value when pairing codes are enabled. |
 | `SPECUS_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management Bearer JWT lifetime; values below 60 seconds are normalized to 60. |
@@ -343,7 +343,8 @@ random 16-byte salt and 210,000 iterations. Legacy unsalted SHA-256 rows remain 
 rewritten to the current format after a successful login. High-entropy client credentials and
 per-route Basic secrets intentionally remain single-round SHA-256 digests.
 The built-in password is blank by default, so `admin/admin` is never implicitly accepted. Every
-non-null login request is counted in fixed windows by source IP and case-insensitive username;
+non-null login request is counted in fixed windows by source IP and by the case-insensitive
+tenant and username of the request;
 defaults are 20/IP and 10/account per 300 seconds. Either budget exceeding its limit returns the
 same `429 Too Many Requests` body plus `Retry-After`, and a successful login clears only the account
 budget so the source-IP budget cannot be bypassed by cracking one account.
@@ -352,13 +353,27 @@ published weak management passwords and JWT placeholder as Java, and every SQLit
 path suppresses demo-client seeding. Forwarded client-address headers are ignored by default; after
 an operator configures `SPECUS_TRUSTED_PROXIES`, login throttling and WebSocket ticket binding share
 the same right-to-left trusted-proxy resolver.
+Login names are unique per tenant, as in Java (`protocol/spec/management-accounts.md`): the
+`specus_management_user.username` primary key is an opaque account key (accounts from before keep
+their username, new ones get a random UUID), `login_name` is the name shown and signed in with,
+and `uq_management_user_tenant_login_name` is unique on `(tenant_id, login_name_normalized)` (the
+login name trimmed, ASCII letters lower-cased). `st_storage_init` backfills the two columns of an
+older database and refuses to start when two accounts of one tenant would share a login name or
+an index of that name has another definition. `POST /auth/login` takes an optional `tenantId`:
+with it only that tenant's login names are searched; without it the default tenant
+(`SPECUS_AUTH_TENANT_ID`) first and then, only when it has no such name, an account whose legacy
+key is that name, ignoring case, provided exactly one does. The built-in admin signs in without a
+tenant or with the default one. A same-named account of another tenant is no conflict for
+`POST /api/admin/users`, and self-registration creates accounts in the default tenant.
 The login and refresh responses use the Java-shaped `accessToken/tokenType/expiresIn` fields. The
-token is a local HS256 JWT with `iss=specus`, `sub`, `tenant_id`, `role`, `iat`, and `exp`;
+token is a local HS256 JWT with `iss=specus`, `sub` (the login name), `tenant_id`, `role`, `iat`,
+and `exp`;
 real HTTP requests to `/api/admin/**` and `/auth/refresh` must include it as
 `Authorization: Bearer <token>`. As in Java's `ManagementContextResolver`, the token only names
 the account: every authenticated request and every refresh re-reads it (one read-only SQLite
 query, not cached). The built-in admin must still be allowed to sign in with its password; a stored
-user must exist, be enabled and still belong to the token's tenant; tenant, role and admin rights
+user is the login name `sub` of the tenant `tenant_id` (a token without `tenant_id` names the
+exact account key) and must exist and be enabled; tenant, role and admin rights
 come from the record as it is now. Otherwise requests get `403 {"error":"账号未绑定、已禁用或权限已撤销"}`
 and refresh gets `401 {"error":"账号已禁用、不存在或不再允许本地登录"}`; an unreadable user store
 answers `500`. Refresh issues the new token from the current record, so a demoted admin is
@@ -573,8 +588,9 @@ Security skeleton endpoints:
   management user: the user already bound to it; otherwise, on the first login, an enabled and
   unbound user of the default tenant named `preferred_username`; otherwise a new `USER` in
   `SPECUS_AUTH_TENANT_ID` with a hash of a random password. `preferred_username` never claims the
-  built-in admin, a disabled account, an account bound to another identity, or (usernames being
-  a global key in C) an account of another tenant: those get `403`. The answer is
+  built-in admin, a disabled account or an account bound to another identity: those get `403`.
+  Accounts of other tenants take no part, so a same-named one there neither binds nor blocks the
+  new default-tenant account. The answer is
   `{"accessToken","idToken","tokenType","expiresIn"}` where `accessToken` is the local HS256 token
   password login issues, so it works on `/api/admin/**` and `/auth/refresh`. The identity
   provider's access and refresh tokens are not passed on; `idToken` is returned, as Java does, as

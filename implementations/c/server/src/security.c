@@ -391,6 +391,7 @@ int st_security_validate_local_token(const char *token,
             if (ok) {
                 copy_text(claims->username, sizeof(claims->username), sub, "");
                 copy_text(claims->tenant_id, sizeof(claims->tenant_id), tenant, default_tenant_id);
+                claims->has_tenant = tenant != NULL && *tenant != '\0';
                 copy_text(claims->role, sizeof(claims->role), normalize_role(role), "USER");
                 if (admin_username != NULL && strcasecmp(claims->username, admin_username) == 0) {
                     copy_text(claims->role, sizeof(claims->role), "ADMIN", "ADMIN");

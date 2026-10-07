@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <limits.h>
+#include <openssl/rand.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -241,6 +242,395 @@ static int migrate_client_account_ids(sqlite3 *db)
     return rc;
 }
 
+#define MANAGEMENT_LOGIN_NAME_MAX_CHARS 80U
+#define MANAGEMENT_LOGIN_NAME_INDEX "uq_management_user_tenant_login_name"
+
+/*
+ * Java ManagementUserService.loginNameKey: the login name trimmed and lower-cased. Only ASCII
+ * letters fold, as SQLite's lower() does without ICU; other letters compare as written. 0 on
+ * success, -1 when out is too small.
+ */
+static int management_login_name_key(const char *login_name, char *out, size_t out_len)
+{
+    const char *start = login_name == NULL ? "" : login_name;
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    size_t len = strlen(start);
+    while (len > 0U && isspace((unsigned char)start[len - 1U])) {
+        --len;
+    }
+    if (len >= out_len) {
+        return -1;
+    }
+    for (size_t i = 0U; i < len; ++i) {
+        unsigned char ch = (unsigned char)start[i];
+        out[i] = (char)(ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch);
+    }
+    out[len] = '\0';
+    return 0;
+}
+
+/* Characters (not bytes) of a UTF-8 string, so the 80-character limit matches Java's. */
+static size_t utf8_char_count(const char *text)
+{
+    size_t count = 0U;
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; ++p) {
+        count += (*p & 0xC0U) != 0x80U;
+    }
+    return count;
+}
+
+/* A random UUID (version 4) as the key of a new account, like Java's newAccountKey. */
+static int new_management_account_key(char out[37])
+{
+    unsigned char b[16];
+    if (RAND_bytes(b, (int)sizeof(b)) != 1) {
+        return -1;
+    }
+    b[6] = (unsigned char)((b[6] & 0x0FU) | 0x40U);
+    b[8] = (unsigned char)((b[8] & 0x3FU) | 0x80U);
+    snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return 0;
+}
+
+static void set_migration_error(char *error, size_t error_len, const char *message)
+{
+    if (error != NULL && error_len > 0U) {
+        snprintf(error, error_len, "%s", message);
+    }
+}
+
+/*
+ * Java ManagementUserSchemaMigrator.verifyUniqueIndexDefinition: 0 when the login-name index is
+ * unique on exactly (tenant_id, login_name_normalized), 1 when there is no index of that name, and
+ * -1 when one exists with another definition or the schema cannot be read.
+ */
+static int management_login_name_index_state(sqlite3 *db)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT \"unique\" FROM pragma_index_list('specus_management_user') WHERE name = ?",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, MANAGEMENT_LOGIN_NAME_INDEX, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    int unique = rc == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 0;
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_DONE) {
+        return 1;
+    }
+    if (rc != SQLITE_ROW || !unique) {
+        return -1;
+    }
+    static const char *const expected[] = {"tenant_id", "login_name_normalized"};
+    if (sqlite3_prepare_v2(db, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", -1, &stmt, NULL)
+        != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, MANAGEMENT_LOGIN_NAME_INDEX, -1, SQLITE_STATIC);
+    size_t columns = 0U;
+    int matches = 1;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 0);
+        matches = matches && columns < 2U && name != NULL && strcmp((const char *)name, expected[columns]) == 0;
+        ++columns;
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE && matches && columns == 2U ? 0 : -1;
+}
+
+typedef struct {
+    char *account_key;
+    char *login_name;
+    char *tenant;
+    char *key;
+    int current;
+} management_login_name_row;
+
+static int compare_login_name_rows(const void *left, const void *right)
+{
+    const management_login_name_row *a = left;
+    const management_login_name_row *b = right;
+    int by_tenant = strcmp(a->tenant, b->tenant);
+    return by_tenant != 0 ? by_tenant : strcmp(a->key, b->key);
+}
+
+static void free_login_name_rows(management_login_name_row *rows, size_t count)
+{
+    for (size_t i = 0U; i < count; ++i) {
+        free(rows[i].account_key);
+        free(rows[i].login_name);
+        free(rows[i].tenant);
+        free(rows[i].key);
+    }
+    free(rows);
+}
+
+/* A copy of text (NULL reads as ""), or NULL when out of memory. */
+static char *copy_of_text(const char *text)
+{
+    const char *source = text == NULL ? "" : text;
+    size_t len = strlen(source);
+    char *copy = malloc(len + 1U);
+    if (copy != NULL) {
+        memcpy(copy, source, len + 1U);
+    }
+    return copy;
+}
+
+/* A copy of text without leading and trailing white space; NULL reads as "". NULL when out of memory. */
+static char *trimmed_copy(const char *text)
+{
+    const char *start = text == NULL ? "" : text;
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    size_t len = strlen(start);
+    while (len > 0U && isspace((unsigned char)start[len - 1U])) {
+        --len;
+    }
+    char *copy = malloc(len + 1U);
+    if (copy != NULL) {
+        memcpy(copy, start, len);
+        copy[len] = '\0';
+    }
+    return copy;
+}
+
+/*
+ * Fills one row from the account key, the stored tenant and the stored login name: the login name
+ * is the stored one when it has text, else the account key, as an account that predates login
+ * names had only its username; the tenant falls back to "default". 0 on success, -1 when the login
+ * name is blank or longer than 80 characters, -2 when out of memory.
+ */
+static int fill_login_name_row(management_login_name_row *row,
+                               const char *account_key,
+                               const char *tenant,
+                               const char *stored_name,
+                               const char *stored_key)
+{
+    memset(row, 0, sizeof(*row));
+    row->account_key = copy_of_text(account_key);
+    row->login_name = trimmed_copy(stored_name);
+    row->tenant = trimmed_copy(tenant);
+    if (row->account_key == NULL || row->login_name == NULL || row->tenant == NULL) {
+        return -2;
+    }
+    if (row->login_name[0] == '\0') {
+        free(row->login_name);
+        row->login_name = trimmed_copy(account_key);
+        if (row->login_name == NULL) {
+            return -2;
+        }
+    }
+    if (row->tenant[0] == '\0') {
+        free(row->tenant);
+        row->tenant = copy_of_text("default");
+        if (row->tenant == NULL) {
+            return -2;
+        }
+    }
+    size_t len = strlen(row->login_name);
+    if (len == 0U || utf8_char_count(row->login_name) > MANAGEMENT_LOGIN_NAME_MAX_CHARS) {
+        return -1;
+    }
+    row->key = malloc(len + 1U);
+    if (row->key == NULL) {
+        return -2;
+    }
+    (void)management_login_name_key(row->login_name, row->key, len + 1U);
+    row->current = stored_name != NULL && stored_key != NULL
+        && strcmp(stored_name, row->login_name) == 0 && strcmp(stored_key, row->key) == 0;
+    return 0;
+}
+
+/*
+ * Reads every account and works out its login name. Nothing is written: a blank or too long login
+ * name, or two accounts of one tenant with one normalized login name, fail here, as Java checks
+ * them before its backfill.
+ */
+static int read_management_login_names(sqlite3 *db,
+                                       management_login_name_row **out_rows,
+                                       size_t *out_count,
+                                       char *error,
+                                       size_t error_len)
+{
+    *out_rows = NULL;
+    *out_count = 0U;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT username, tenant_id, login_name, login_name_normalized FROM specus_management_user",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        set_migration_error(error, error_len, "cannot read specus_management_user");
+        return -1;
+    }
+    management_login_name_row *rows = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    int result = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count == capacity) {
+            size_t next = capacity == 0U ? 16U : capacity * 2U;
+            management_login_name_row *grown = realloc(rows, next * sizeof(*rows));
+            if (grown == NULL) {
+                set_migration_error(error, error_len, "out of memory");
+                result = -1;
+                break;
+            }
+            rows = grown;
+            capacity = next;
+        }
+        int filled = fill_login_name_row(&rows[count++],
+                                         (const char *)sqlite3_column_text(stmt, 0),
+                                         (const char *)sqlite3_column_text(stmt, 1),
+                                         (const char *)sqlite3_column_text(stmt, 2),
+                                         (const char *)sqlite3_column_text(stmt, 3));
+        if (filled != 0) {
+            set_migration_error(error, error_len,
+                                filled == -1 ? "management user has an invalid login name" : "out of memory");
+            result = -1;
+            break;
+        }
+    }
+    if (result == 0 && rc != SQLITE_DONE) {
+        set_migration_error(error, error_len, "cannot read specus_management_user");
+        result = -1;
+    }
+    sqlite3_finalize(stmt);
+    if (result == 0 && count > 1U) {
+        qsort(rows, count, sizeof(*rows), compare_login_name_rows);
+        for (size_t i = 1U; i < count; ++i) {
+            if (compare_login_name_rows(&rows[i - 1U], &rows[i]) == 0) {
+                char message[256];
+                snprintf(message, sizeof(message), "duplicate management login name in tenant '%s'",
+                         rows[i].tenant);
+                set_migration_error(error, error_len, message);
+                result = -1;
+                break;
+            }
+        }
+    }
+    if (result != 0) {
+        free_login_name_rows(rows, count);
+        return -1;
+    }
+    *out_rows = rows;
+    *out_count = count;
+    return 0;
+}
+
+static int backfill_management_login_names(sqlite3 *db, const management_login_name_row *rows, size_t count)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE specus_management_user SET login_name = ?, login_name_normalized = ? WHERE username = ?",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        if (rows[i].current) {
+            continue;
+        }
+        sqlite3_reset(stmt);
+        sqlite3_bind_text(stmt, 1, rows[i].login_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, rows[i].key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, rows[i].account_key, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/*
+ * The body of st_storage_migrate_management_login_names on an open handle. st_storage_init runs on
+ * many requests, so once the index is in place and every row has its login name nothing more is
+ * read than one count.
+ */
+static int migrate_management_login_names(sqlite3 *db, char *error, size_t error_len)
+{
+    set_migration_error(error, error_len, "");
+    if (add_column_if_missing(db, "specus_management_user", "login_name", "TEXT") != 0
+        || add_column_if_missing(db, "specus_management_user", "login_name_normalized", "TEXT") != 0) {
+        set_migration_error(error, error_len, "cannot add the login-name columns");
+        return -1;
+    }
+    int index_state = management_login_name_index_state(db);
+    if (index_state < 0) {
+        set_migration_error(error, error_len,
+                            "index " MANAGEMENT_LOGIN_NAME_INDEX
+                            " must be unique on (tenant_id, login_name_normalized)");
+        return -1;
+    }
+    if (index_state == 0) {
+        sqlite3_stmt *stmt = NULL;
+        int missing = -1;
+        if (sqlite3_prepare_v2(db,
+                "SELECT COUNT(*) FROM specus_management_user WHERE COALESCE(login_name, '') = '' "
+                "OR COALESCE(login_name_normalized, '') = ''",
+                -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            missing = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        if (missing == 0) {
+            return 0;
+        }
+    }
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        set_migration_error(error, error_len, "cannot lock the database");
+        return -1;
+    }
+    management_login_name_row *rows = NULL;
+    size_t count = 0U;
+    int rc = read_management_login_names(db, &rows, &count, error, error_len);
+    if (rc == 0 && backfill_management_login_names(db, rows, count) != 0) {
+        set_migration_error(error, error_len, "cannot backfill the login names");
+        rc = -1;
+    }
+    if (rc == 0
+        && exec_sql(db, "CREATE UNIQUE INDEX IF NOT EXISTS " MANAGEMENT_LOGIN_NAME_INDEX
+                        " ON specus_management_user(tenant_id, login_name_normalized)") != 0) {
+        set_migration_error(error, error_len, "cannot create " MANAGEMENT_LOGIN_NAME_INDEX);
+        rc = -1;
+    }
+    if (rc == 0 && management_login_name_index_state(db) != 0) {
+        set_migration_error(error, error_len,
+                            "index " MANAGEMENT_LOGIN_NAME_INDEX
+                            " must be unique on (tenant_id, login_name_normalized)");
+        rc = -1;
+    }
+    free_login_name_rows(rows, count);
+    if (rc == 0 && exec_sql(db, "COMMIT") != 0) {
+        set_migration_error(error, error_len, "cannot commit the login-name backfill");
+        rc = -1;
+    }
+    if (rc != 0) {
+        (void)exec_sql(db, "ROLLBACK");
+    }
+    return rc;
+}
+
+int st_storage_migrate_management_login_names(const char *path, char *error, size_t error_len)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        set_migration_error(error, error_len, "cannot open the database");
+        return -1;
+    }
+    int rc = migrate_management_login_names(db, error, error_len);
+    sqlite3_close(db);
+    return rc;
+}
+
 int st_storage_init(const char *path, int seed_demo_client)
 {
     sqlite3 *db = NULL;
@@ -252,6 +642,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "CREATE TABLE IF NOT EXISTS client_account (" CLIENT_ACCOUNT_COLUMNS ");"
         "CREATE TABLE IF NOT EXISTS specus_management_user ("
         "username TEXT PRIMARY KEY,"
+        "login_name TEXT,"
+        "login_name_normalized TEXT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "password_hash TEXT NOT NULL,"
         "role TEXT NOT NULL DEFAULT 'USER',"
@@ -802,6 +1194,13 @@ int st_storage_init(const char *path, int seed_demo_client)
             "WHERE oidc_identity_key IS NOT NULL AND oidc_identity_key <> '';");
     }
     if (rc == 0) {
+        char error[160];
+        rc = migrate_management_login_names(db, error, sizeof(error));
+        if (rc != 0) {
+            fprintf(stderr, "[schema] management login-name migration failed: %s\n", error);
+        }
+    }
+    if (rc == 0) {
         rc = add_column_if_missing(db, "specus_mapping", "detail_capture_enabled", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
@@ -1197,6 +1596,14 @@ static int scan_client(sqlite3_stmt *stmt, st_storage_client *client)
     return 0;
 }
 
+/*
+ * The columns scan_management_user reads, in its order. The login name falls back to the account
+ * key for a row the login-name migration has not reached.
+ */
+#define MANAGEMENT_USER_COLUMNS \
+    "COALESCE(NULLIF(login_name, ''), username), tenant_id, password_hash, role, enabled, " \
+    "created_at, updated_at, username"
+
 static int scan_management_user(sqlite3_stmt *stmt, st_storage_management_user *user)
 {
     if (copy_text_column(stmt, 0, user->username, sizeof(user->username)) != 0
@@ -1204,7 +1611,8 @@ static int scan_management_user(sqlite3_stmt *stmt, st_storage_management_user *
         || copy_text_column(stmt, 2, user->password_hash, sizeof(user->password_hash)) != 0
         || copy_text_column(stmt, 3, user->role, sizeof(user->role)) != 0
         || copy_text_column(stmt, 5, user->created_at, sizeof(user->created_at)) != 0
-        || copy_text_column(stmt, 6, user->updated_at, sizeof(user->updated_at)) != 0) {
+        || copy_text_column(stmt, 6, user->updated_at, sizeof(user->updated_at)) != 0
+        || copy_text_column(stmt, 7, user->account_key, sizeof(user->account_key)) != 0) {
         return -1;
     }
     user->enabled = sqlite3_column_int(stmt, 4) != 0;
@@ -1787,8 +2195,8 @@ int st_storage_list_management_users(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-        "FROM specus_management_user WHERE tenant_id = ? ORDER BY lower(username)",
+        "SELECT " MANAGEMENT_USER_COLUMNS " FROM specus_management_user WHERE tenant_id = ? "
+        "ORDER BY login_name_normalized, username",
         -1,
         &stmt,
         NULL);
@@ -1811,42 +2219,77 @@ int st_storage_list_management_users(const char *path,
 }
 
 /*
- * Login names are matched case-insensitively, but the username key is case-sensitive, so a legacy
- * or foreign database may hold "Alice" and "alice" (in one tenant or two). Like Java's bare legacy
- * login (ManagementUserService.authenticate), such a name resolves to no one rather than to
- * whichever row comes first. Called after the first row was scanned; an error counts as a match,
- * so it fails closed too.
+ * Called after the first row was scanned: whether another row matches too. An error counts as a
+ * match, so a caller that treats two matches as no one fails closed.
  */
 static int another_user_matches(sqlite3_stmt *stmt)
 {
     return sqlite3_step(stmt) != SQLITE_DONE;
 }
 
-int st_storage_get_management_user(const char *path,
-                                   const char *username,
-                                   st_storage_management_user *user)
+/*
+ * The one-row lookup behind the st_storage_*_management_user_* functions, on an open handle:
+ * by_login selects the login name of tenant_id (tenant scoped, case-insensitive); otherwise name is
+ * an account key, matched exactly or, with legacy, ignoring case. 0 with *user filled when exactly
+ * one row matches, 1 when none or (for legacy) several do, -1 when the store cannot be read.
+ */
+static int management_user_lookup(sqlite3 *db,
+                                  int by_login,
+                                  int legacy,
+                                  const char *tenant_id,
+                                  const char *name,
+                                  st_storage_management_user *user)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
+    char key[256];
+    if (name == NULL || (by_login && management_login_name_key(name, key, sizeof(key)) != 0)) {
+        return 1;
+    }
+    const char *sql = by_login
+        ? "SELECT " MANAGEMENT_USER_COLUMNS " FROM specus_management_user "
+          "WHERE tenant_id = ? AND login_name_normalized = ?"
+        : legacy
+        ? "SELECT " MANAGEMENT_USER_COLUMNS " FROM specus_management_user WHERE lower(username) = lower(?)"
+        : "SELECT " MANAGEMENT_USER_COLUMNS " FROM specus_management_user WHERE username = ?";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
         return -1;
     }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-        "FROM specus_management_user WHERE lower(username) = lower(?)",
-        -1,
-        &stmt,
-        NULL);
-    if (rc != SQLITE_OK) {
+    if (by_login) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+    }
+    int rc = sqlite3_step(stmt);
+    int result = -1;
+    if (rc == SQLITE_ROW) {
+        /* Login names and account keys are unique; only the case-insensitive legacy key can repeat. */
+        result = scan_management_user(stmt, user) != 0 ? -1 : legacy && another_user_matches(stmt) ? 1 : 0;
+    } else if (rc == SQLITE_DONE) {
+        result = 1;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* management_user_lookup on a read-only handle: nothing per request may create or migrate the file. */
+static int management_user_lookup_read_only(const char *path,
+                                            int by_login,
+                                            int legacy,
+                                            const char *tenant_id,
+                                            const char *name,
+                                            st_storage_management_user *user)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return -1;
     }
-    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
-    rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0 && !another_user_matches(stmt);
-    sqlite3_finalize(stmt);
+    sqlite3_busy_timeout(db, 5000);
+    int result = management_user_lookup(db, by_login, legacy, tenant_id, name, user);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return result;
 }
 
 int st_storage_get_management_user_in_tenant(const char *path,
@@ -1858,60 +2301,97 @@ int st_storage_get_management_user_in_tenant(const char *path,
     if (open_db(path, &db) != 0) {
         return -1;
     }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-        "FROM specus_management_user WHERE tenant_id = ? AND lower(username) = lower(?)",
-        -1,
-        &stmt,
-        NULL);
-    if (rc != SQLITE_OK) {
-        sqlite3_close(db);
-        return -1;
-    }
-    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
-    rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_management_user(stmt, user) == 0 && !another_user_matches(stmt);
-    sqlite3_finalize(stmt);
+    int result = management_user_lookup(db, 1, 0, tenant_id, username, user);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return result == 0 ? 0 : -1;
 }
 
-int st_storage_find_management_user(const char *path,
-                                    const char *username,
-                                    st_storage_management_user *user)
+int st_storage_find_management_user_in_tenant(const char *path,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              st_storage_management_user *user)
 {
-    /* Read-only: a lookup on every authenticated request must never create or migrate the file. */
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
+    return management_user_lookup_read_only(path, 1, 0, tenant_id, username, user);
+}
+
+int st_storage_find_management_user_by_account_key(const char *path,
+                                                    const char *account_key,
+                                                    st_storage_management_user *user)
+{
+    return management_user_lookup_read_only(path, 0, 0, NULL, account_key, user);
+}
+
+int st_storage_find_legacy_management_user(const char *path,
+                                           const char *name,
+                                           st_storage_management_user *user)
+{
+    return management_user_lookup_read_only(path, 0, 1, NULL, name, user);
+}
+
+/*
+ * Inserts an account with a fresh random key, unless tenant_id already has the login name: one
+ * statement checks and inserts, and the unique index backs it. 0 on success, -1 otherwise.
+ */
+static int insert_management_user_on_db(sqlite3 *db,
+                                        const char *username,
+                                        const char *tenant_id,
+                                        const char *password_hash,
+                                        const char *role,
+                                        int enabled,
+                                        const char *created_at,
+                                        const char *oidc_issuer,
+                                        const char *oidc_subject,
+                                        const char *oidc_identity_key,
+                                        char account_key[37])
+{
+    char key[256];
+    if (username == NULL || management_login_name_key(username, key, sizeof(key)) != 0 || key[0] == '\0'
+        || new_management_account_key(account_key) != 0) {
         return -1;
     }
-    sqlite3_busy_timeout(db, 5000);
+    char login_name[256];
+    const char *start = username;
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    snprintf(login_name, sizeof(login_name), "%s", start);
+    size_t len = strlen(login_name);
+    while (len > 0U && isspace((unsigned char)login_name[len - 1U])) {
+        login_name[--len] = '\0';
+    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-        "FROM specus_management_user WHERE lower(username) = lower(?)",
+        "INSERT INTO specus_management_user(username, login_name, login_name_normalized, tenant_id, "
+        "password_hash, role, enabled, created_at, updated_at, oidc_issuer, oidc_subject, oidc_identity_key) "
+        "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, CURRENT_TIMESTAMP), COALESCE(?8, CURRENT_TIMESTAMP), "
+        "?9, ?10, ?11 "
+        "WHERE NOT EXISTS (SELECT 1 FROM specus_management_user "
+        "WHERE tenant_id = ?4 AND login_name_normalized = ?3)",
         -1,
         &stmt,
         NULL);
-    if (rc != SQLITE_OK) {
-        sqlite3_close(db);
-        return -1;
-    }
-    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
-    rc = sqlite3_step(stmt);
-    /* An ambiguous name is no one's: its token resolves to nobody, as a missing user's does. */
-    int result = -1;
-    if (rc == SQLITE_ROW) {
-        result = scan_management_user(stmt, user) != 0 ? -1 : another_user_matches(stmt) ? 1 : 0;
-    } else if (rc == SQLITE_DONE) {
-        result = 1;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, account_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, login_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, password_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, role == NULL || *role == '\0' ? "USER" : role, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 7, enabled ? 1 : 0);
+        const char *optional[] = {created_at, oidc_issuer, oidc_subject, oidc_identity_key};
+        for (int i = 0; i < 4; ++i) {
+            if (optional[i] == NULL) {
+                sqlite3_bind_null(stmt, 8 + i);
+            } else {
+                sqlite3_bind_text(stmt, 8 + i, optional[i], -1, SQLITE_TRANSIENT);
+            }
+        }
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    } else {
+        rc = -1;
     }
     sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return result;
+    return rc;
 }
 
 int st_storage_create_management_user(const char *path,
@@ -1926,37 +2406,14 @@ int st_storage_create_management_user(const char *path,
     if (open_db(path, &db) != 0) {
         return -1;
     }
-    if (tenant_id == NULL || *tenant_id == '\0') {
-        tenant_id = "default";
-    }
-    if (role == NULL || *role == '\0') {
-        role = "USER";
-    }
-    sqlite3_stmt *stmt = NULL;
-    /* One statement checks and inserts, so no other spelling of the name can slip in between. */
-    int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, updated_at) "
-        "SELECT ?1,?2,?3,?4,?5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP "
-        "WHERE NOT EXISTS (SELECT 1 FROM specus_management_user WHERE lower(username) = lower(?1))",
-        -1,
-        &stmt,
-        NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, tenant_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, password_hash, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, role, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 5, enabled ? 1 : 0);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
-    } else {
-        rc = -1;
-    }
-    sqlite3_finalize(stmt);
+    char account_key[37];
+    int rc = insert_management_user_on_db(db, username, tenant_id, password_hash, role, enabled,
+                                          NULL, NULL, NULL, NULL, account_key);
     sqlite3_close(db);
     if (rc != 0) {
         return -1;
     }
-    return out_user == NULL ? 0 : st_storage_get_management_user(path, username, out_user);
+    return out_user == NULL ? 0 : st_storage_get_management_user_in_tenant(path, tenant_id, username, out_user);
 }
 
 static int update_management_user_on_db(sqlite3 *db,
@@ -1966,13 +2423,17 @@ static int update_management_user_on_db(sqlite3 *db,
                                         const char *role,
                                         int enabled)
 {
+    char key[256];
+    if (username == NULL || management_login_name_key(username, key, sizeof(key)) != 0) {
+        return -1;
+    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE specus_management_user SET "
         "password_hash = COALESCE(?, password_hash), "
         "role = COALESCE(?, role), "
         "enabled = ?, updated_at = CURRENT_TIMESTAMP "
-        "WHERE tenant_id = ? AND lower(username) = lower(?)",
+        "WHERE tenant_id = ? AND login_name_normalized = ?",
         -1,
         &stmt,
         NULL);
@@ -1989,7 +2450,7 @@ static int update_management_user_on_db(sqlite3 *db,
         }
         sqlite3_bind_int(stmt, 3, enabled ? 1 : 0);
         sqlite3_bind_text(stmt, 4, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, key, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;
@@ -2020,21 +2481,26 @@ int st_storage_update_management_user(const char *path,
 
 static int delete_management_user_on_db(sqlite3 *db, const char *tenant_id, const char *username)
 {
+    char key[256];
+    if (username == NULL || management_login_name_key(username, key, sizeof(key)) != 0) {
+        return -1;
+    }
     /*
      * The account's workbench rows go in the caller's transaction: favourites and recent opens are
-     * personal history, and an account created later under the same name must start empty.
+     * personal history, and an account created later under the same name must start empty. Their
+     * identity is the tenant and the login name as the account record spells it.
      */
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "DELETE FROM management_workbench_item WHERE (tenant_id, username) IN ("
-        "SELECT tenant_id, username FROM specus_management_user "
-        "WHERE tenant_id = ? AND lower(username) = lower(?))",
+        "SELECT tenant_id, COALESCE(NULLIF(login_name, ''), username) FROM specus_management_user "
+        "WHERE tenant_id = ? AND login_name_normalized = ?)",
         -1,
         &stmt,
         NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -2043,13 +2509,13 @@ static int delete_management_user_on_db(sqlite3 *db, const char *tenant_id, cons
     stmt = NULL;
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db,
-            "DELETE FROM specus_management_user WHERE tenant_id = ? AND lower(username) = lower(?)",
+            "DELETE FROM specus_management_user WHERE tenant_id = ? AND login_name_normalized = ?",
             -1,
             &stmt,
             NULL);
         if (rc == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
             rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
         } else {
             rc = -1;
@@ -2084,8 +2550,7 @@ static int oidc_user_by_identity_key(sqlite3 *db, const char *identity_key, st_s
 {
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-            "FROM specus_management_user WHERE oidc_identity_key = ?",
+            "SELECT " MANAGEMENT_USER_COLUMNS " FROM specus_management_user WHERE oidc_identity_key = ?",
             -1,
             &stmt,
             NULL) != SQLITE_OK) {
@@ -2100,40 +2565,44 @@ static int oidc_user_by_identity_key(sqlite3 *db, const char *identity_key, st_s
 }
 
 /*
- * Like oidc_user_by_identity_key, by login name, and 2 when the name matches more than one row.
- * *bound is set when any OIDC column already has text, and bound_key receives the stored identity
- * key.
+ * Like oidc_user_by_identity_key, by the login name of one tenant. *bound is set when any OIDC
+ * column already has text, and bound_key receives the stored identity key.
  */
-static int oidc_user_by_username(sqlite3 *db,
-                                 const char *username,
-                                 st_storage_management_user *user,
-                                 int *bound,
-                                 char *bound_key,
-                                 size_t bound_key_len)
+static int oidc_user_by_login(sqlite3 *db,
+                              const char *tenant_id,
+                              const char *username,
+                              st_storage_management_user *user,
+                              int *bound,
+                              char *bound_key,
+                              size_t bound_key_len)
 {
     *bound = 0;
+    char key[256];
+    if (management_login_name_key(username, key, sizeof(key)) != 0) {
+        return 1;
+    }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at, "
+            "SELECT " MANAGEMENT_USER_COLUMNS ", "
             "COALESCE(oidc_issuer, ''), COALESCE(oidc_subject, ''), COALESCE(oidc_identity_key, '') "
-            "FROM specus_management_user WHERE lower(username) = lower(?)",
+            "FROM specus_management_user WHERE tenant_id = ? AND login_name_normalized = ?",
             -1,
             &stmt,
             NULL) != SQLITE_OK) {
         return -1;
     }
-    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     int result = rc == SQLITE_DONE ? 1 : -1;
     if (rc == SQLITE_ROW && scan_management_user(stmt, user) == 0
-        && copy_text_column(stmt, 9, bound_key, bound_key_len) == 0) {
-        const unsigned char *issuer = sqlite3_column_text(stmt, 7);
-        const unsigned char *subject = sqlite3_column_text(stmt, 8);
+        && copy_text_column(stmt, 10, bound_key, bound_key_len) == 0) {
+        const unsigned char *issuer = sqlite3_column_text(stmt, 8);
+        const unsigned char *subject = sqlite3_column_text(stmt, 9);
         *bound = (issuer != NULL && *issuer != '\0')
             || (subject != NULL && *subject != '\0')
             || *bound_key != '\0';
-        /* Two spellings of the name: neither is linked, and no third account is created. */
-        result = another_user_matches(stmt) ? 2 : 0;
+        result = 0;
     }
     sqlite3_finalize(stmt);
     return result;
@@ -2172,11 +2641,11 @@ int st_storage_resolve_oidc_user(const char *path,
     } else if (found == 1) {
         int bound = 0;
         char bound_key[80];
-        found = oidc_user_by_username(db, username, &user, &bound, bound_key, sizeof(bound_key));
+        /* Only this tenant's login name is linked; a same-named user of another tenant takes no part
+         * and does not stop a new account here. */
+        found = oidc_user_by_login(db, tenant_id, username, &user, &bound, bound_key, sizeof(bound_key));
         if (found == 0) {
-            /* Usernames are a global key in C, so a same-named account of another tenant cannot be
-             * given a sibling in this one the way Java does; it is refused, never linked. */
-            if (strcmp(user.tenant_id, normalize_tenant_id(tenant_id)) != 0 || !user.enabled) {
+            if (!user.enabled) {
                 result = 1;
             } else if (bound) {
                 result = strcmp(bound_key, identity_key) == 0 ? 0 : 1;
@@ -2195,7 +2664,7 @@ int st_storage_resolve_oidc_user(const char *path,
                     sqlite3_bind_text(stmt, 1, issuer, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 2, subject, -1, SQLITE_TRANSIENT);
                     sqlite3_bind_text(stmt, 3, identity_key, -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 4, user.username, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 4, user.account_key, -1, SQLITE_TRANSIENT);
                     rc = sqlite3_step(stmt);
                 }
                 sqlite3_finalize(stmt);
@@ -2205,30 +2674,12 @@ int st_storage_resolve_oidc_user(const char *path,
                     result = found == 0 ? (user.enabled ? 0 : 1) : found == 1 ? 1 : -1;
                 }
             }
-        } else if (found == 2) {
-            result = 1;
         } else if (found == 1 && password_hash == NULL) {
             result = 2;
         } else if (found == 1) {
-            sqlite3_stmt *stmt = NULL;
-            int rc = sqlite3_prepare_v2(db,
-                "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, "
-                "created_at, updated_at, oidc_issuer, oidc_subject, oidc_identity_key) "
-                "VALUES(?,?,?,'USER',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?,?)",
-                -1,
-                &stmt,
-                NULL);
-            if (rc == SQLITE_OK) {
-                sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 3, password_hash, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 4, issuer, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 5, subject, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 6, identity_key, -1, SQLITE_TRANSIENT);
-                rc = sqlite3_step(stmt);
-            }
-            sqlite3_finalize(stmt);
-            if (rc == SQLITE_DONE) {
+            char account_key[37];
+            if (insert_management_user_on_db(db, username, tenant_id, password_hash, "USER", 1, NULL,
+                                             issuer, subject, identity_key, account_key) == 0) {
                 result = oidc_user_by_identity_key(db, identity_key, &user) == 0 ? 0 : -1;
             }
         }
@@ -2499,25 +2950,16 @@ int st_storage_complete_registration(const char *path,
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO specus_management_user(username,tenant_id,password_hash,role,enabled,created_at,updated_at) "
-        "SELECT ?1,?2,?3,'USER',1,?4,?5 "
-        "WHERE NOT EXISTS (SELECT 1 FROM specus_management_user WHERE lower(username) = lower(?1))",
-        -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, challenge->username, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, challenge->password_hash, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, challenge->updated_at, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, challenge->updated_at, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
-    } else rc = -1;
-    sqlite3_finalize(stmt);
+    /* A new account of tenant_id with a random key, unless the tenant already has the login name;
+     * the verified email points at the account key, as Java's RegistrationService stores it. */
+    char account_key[37];
+    int rc = insert_management_user_on_db(db, challenge->username, tenant_id, challenge->password_hash, "USER", 1,
+                                          challenge->updated_at, NULL, NULL, NULL, account_key);
     if (rc == 0) rc = sqlite3_prepare_v2(db,
         "INSERT INTO specus_management_user_email(username,email,verified_at,created_at,updated_at) "
         "VALUES(?,?,?,?,?)", -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, challenge->username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 1, account_key, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, challenge->email, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, challenge->updated_at, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, challenge->updated_at, -1, SQLITE_TRANSIENT);
@@ -2537,7 +2979,8 @@ int st_storage_complete_registration(const char *path,
     if (rc == 0) rc = exec_sql(db, "COMMIT"); else (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
     if (rc != 0) return -1;
-    return out_user == NULL ? 0 : st_storage_get_management_user(path, challenge->username, out_user);
+    return out_user == NULL ? 0
+        : st_storage_get_management_user_in_tenant(path, tenant_id, challenge->username, out_user);
 }
 
 int st_storage_get_client_credential_by_api_key(const char *path,
@@ -9625,8 +10068,10 @@ static int share_role_is_admin(const char *role)
 }
 
 /*
- * A user as the management API sees it now. The built-in admin has no row: under its configured
- * tenant it is an ADMIN that is enabled while it may sign in, as admin_resolve_token_user treats it.
+ * A user as the management API sees it now: the login name username of tenant_hint (the default
+ * tenant when NULL or empty), since login names are unique only inside a tenant. The built-in admin
+ * has no row: under its configured tenant it is an ADMIN that is enabled while it may sign in, as
+ * admin_resolve_token_user treats it.
  */
 static int share_load_principal(sqlite3 *db,
                                 const st_storage_share_builtin_admin *builtin,
@@ -9649,37 +10094,19 @@ static int share_load_principal(sqlite3 *db,
         snprintf(principal->tenant_id, sizeof(principal->tenant_id), "%s", builtin->tenant_id);
         return 0;
     }
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT username, tenant_id, role, enabled FROM specus_management_user "
-            "WHERE lower(username) = lower(?)",
-            -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+    st_storage_management_user user;
+    int found = management_user_lookup(db, 1, 0, tenant_hint, username, &user);
+    if (found < 0) {
         return -1;
     }
-    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    int result = 0;
-    if (rc == SQLITE_ROW) {
-        char role[32];
-        int enabled = sqlite3_column_int(stmt, 3) != 0;
-        if (copy_text_column(stmt, 0, principal->username, sizeof(principal->username)) != 0
-            || copy_text_column(stmt, 1, principal->tenant_id, sizeof(principal->tenant_id)) != 0
-            || copy_text_column(stmt, 2, role, sizeof(role)) != 0) {
-            result = -1;
-        } else if (another_user_matches(stmt)) {
-            /* An ambiguous name is no one: the principal does not exist. */
-            memset(principal, 0, sizeof(*principal));
-        } else {
-            principal->exists = 1;
-            principal->admin = share_role_is_admin(role);
-            principal->enabled = enabled;
-        }
-    } else if (rc != SQLITE_DONE) {
-        result = -1;
+    if (found == 0) {
+        snprintf(principal->username, sizeof(principal->username), "%s", user.username);
+        snprintf(principal->tenant_id, sizeof(principal->tenant_id), "%s", user.tenant_id);
+        principal->exists = 1;
+        principal->admin = share_role_is_admin(user.role);
+        principal->enabled = user.enabled;
     }
-    sqlite3_finalize(stmt);
-    return result;
+    return 0;
 }
 
 /* The route management rule, evaluated now: same tenant, and an admin or the client's owner. */
@@ -10707,34 +11134,19 @@ typedef struct {
     int enabled;
 } share_user_state;
 
-/* 0 found, 1 missing, -1 on error. */
-static int share_load_user_state(sqlite3 *db, const char *username, share_user_state *state)
+/* The login name username of tenant_id: 0 found, 1 missing, -1 on error. */
+static int share_load_user_state(sqlite3 *db, const char *tenant_id, const char *username, share_user_state *state)
 {
     memset(state, 0, sizeof(*state));
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT username, tenant_id, role, enabled FROM specus_management_user WHERE lower(username) = lower(?)",
-            -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
-        return -1;
+    st_storage_management_user user;
+    int found = management_user_lookup(db, 1, 0, tenant_id, username, &user);
+    if (found == 0) {
+        snprintf(state->username, sizeof(state->username), "%s", user.username);
+        snprintf(state->tenant_id, sizeof(state->tenant_id), "%s", user.tenant_id);
+        snprintf(state->role, sizeof(state->role), "%s", user.role);
+        state->enabled = user.enabled;
     }
-    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    int result = rc == SQLITE_DONE ? 1 : -1;
-    if (rc == SQLITE_ROW) {
-        result = copy_text_column(stmt, 0, state->username, sizeof(state->username)) == 0
-            && copy_text_column(stmt, 1, state->tenant_id, sizeof(state->tenant_id)) == 0
-            && copy_text_column(stmt, 2, state->role, sizeof(state->role)) == 0
-            ? 0 : -1;
-        state->enabled = sqlite3_column_int(stmt, 3) != 0;
-        if (result == 0 && another_user_matches(stmt)) {
-            /* Ambiguous: like a missing user, so the caller's change fails closed. */
-            memset(state, 0, sizeof(*state));
-            result = 1;
-        }
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    return found;
 }
 
 /* The user's own active shares whose creator may no longer manage their route (spec 7.3). */
@@ -10788,13 +11200,13 @@ int st_storage_update_management_user_audited(const char *path,
     share_user_state after;
     int rc = share_begin(db);
     if (rc == 0) {
-        rc = share_load_user_state(db, username, &before) == 0 ? 0 : -1;
+        rc = share_load_user_state(db, tenant_id, username, &before) == 0 ? 0 : -1;
     }
     if (rc == 0) {
         rc = update_management_user_on_db(db, tenant_id, username, password_hash, role, enabled);
     }
     if (rc == 0) {
-        rc = share_load_user_state(db, username, &after) == 0 ? 0 : -1;
+        rc = share_load_user_state(db, tenant_id, username, &after) == 0 ? 0 : -1;
     }
     /* Disabling a user or changing its role may end the shares it created. */
     if (rc == 0 && (before.enabled != after.enabled || strcmp(before.role, after.role) != 0)) {
@@ -10823,7 +11235,7 @@ int st_storage_delete_management_user_audited(const char *path,
     share_user_state before;
     int rc = share_begin(db);
     if (rc == 0) {
-        rc = share_load_user_state(db, username, &before) == 0 ? 0 : -1;
+        rc = share_load_user_state(db, tenant_id, username, &before) == 0 ? 0 : -1;
     }
     if (rc == 0) {
         rc = delete_management_user_on_db(db, tenant_id, username);

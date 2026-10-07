@@ -2388,7 +2388,7 @@ static int connection_events_ensure_user(const char *username, const char *tenan
         fprintf(stderr, "connection events need SPECUS_DATABASE_PATH\n");
         return -1;
     }
-    if (st_storage_get_management_user(db_path, username, &user) == 0) {
+    if (st_storage_get_management_user_in_tenant(db_path, tenant, username, &user) == 0) {
         return 0;
     }
     if (st_storage_create_management_user(db_path, username, tenant, "unused-password-hash", role, 1, &user) != 0) {
@@ -2818,7 +2818,7 @@ static int tenant_scope_user_unchanged(const char *database_path, const char *us
                                        const char *role, const char *label)
 {
     st_storage_management_user user;
-    int ok = st_storage_get_management_user(database_path, username, &user) == 0
+    int ok = st_storage_get_management_user_in_tenant(database_path, tenant, username, &user) == 0
         && strcmp(user.tenant_id, tenant) == 0
         && strcmp(user.role, role) == 0
         && user.enabled
@@ -2956,7 +2956,7 @@ static int test_tenant_scoped_admin_mutations(void)
         len = tenant_scope_call("DELETE", "/api/admin/users/carol", "root-a", "tenant-a", "ADMIN", NULL,
                                 response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "own tenant DELETE") != 0
-            || st_storage_get_management_user(db_path, "carol", &gone) == 0;
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-a", "carol", &gone) == 0;
     }
     /*
      * adminManagesUsersInsideOwnTenant, updatesPasswordRoleEnabledAndDeletesInsideActingTenant:
@@ -2970,7 +2970,7 @@ static int test_tenant_scoped_admin_mutations(void)
                                 response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0
             || !contains(response, "\"role\":\"ADMIN\"")
-            || st_storage_get_management_user(db_path, "dave", &updated) != 0
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-b", "dave", &updated) != 0
             || strcmp(updated.password_hash, "unused-password-hash") == 0
             || st_password_verify("new-password", updated.password_hash, &verification) != 0
             || !verification.matches
@@ -2979,7 +2979,7 @@ static int test_tenant_scoped_admin_mutations(void)
         len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
                                               NULL, response, sizeof(response));
         failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0
-            || st_storage_get_management_user(db_path, "dave", &updated) == 0;
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-b", "dave", &updated) == 0;
     }
 
     /* Tenant-b's credential, mapping, route and peer service, as tenant-a's administrator sees them. */
@@ -3295,12 +3295,46 @@ static int test_peer_mesh_path_stats(void)
     return failed ? 1 : 0;
 }
 
+/* POST /auth/login with an optional tenantId; the access token on 200 (the caller frees it), else NULL. */
+static char *tenant_login(const char *username, const char *password, const char *tenant,
+                          char *response, size_t response_len)
+{
+    char body[320];
+    if (tenant == NULL) {
+        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
+    } else {
+        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"%s\",\"tenantId\":\"%s\"}",
+                 username, password, tenant);
+    }
+    int len = st_admin_build_response_with_body("POST", "/auth/login", body, response, response_len);
+    return len > 0 && strncmp(response, "HTTP/1.1 200 ", 13U) == 0 ? st_json_get_string(response, "accessToken")
+                                                                   : NULL;
+}
+
+/* The claims of a local token signed with this test's secret. */
+static int tenant_token_claims(const char *token, st_security_token_claims *claims)
+{
+    memset(claims, 0, sizeof(*claims));
+    return token == NULL ? -1
+        : st_security_validate_local_token(token, getenv("SPECUS_AUTH_JWT_SECRET"), "default", "admin", claims);
+}
+
+/* A request with "Bearer <token>". */
+static int tenant_token_call(const char *method, const char *path, const char *token, const char *body,
+                             char *out, size_t out_len)
+{
+    char authorization[2300];
+    snprintf(authorization, sizeof(authorization), "Bearer %s", token == NULL ? "" : token);
+    return st_admin_build_response_with_auth(method, path, authorization, body, out, out_len);
+}
+
 /*
  * ManagementUserServiceTests.bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous.
- * C matches login names case-insensitively but keys rows by the exact username, so a legacy or
- * foreign database may hold "Alice" (tenant-a) and "alice" (tenant-b). Such a name is no one's:
- * password login, a local token naming it and an administrator's attempt to add a third spelling
- * all fail, and neither row changes. Once one spelling is gone the other works again.
+ * Accounts that predate tenant-scoped login names keep their username as account key, and a login
+ * without a tenant may still find them by it, ignoring case. A database may hold "Alice"
+ * (tenant-a) and "alice" (tenant-b): the migration gives each its login name in its own tenant, a
+ * bare login of that name is no one's, and naming the tenant signs in the right account. Once one
+ * spelling is gone the bare login finds the other; a default-tenant login name always comes first.
  */
 static int test_ambiguous_login_name_fails_closed(void)
 {
@@ -3318,42 +3352,36 @@ static int test_ambiguous_login_name_fails_closed(void)
     char seed[1024];
     int failed = st_storage_init(db_path, 0) != 0 || st_password_hash("secret-password", hash) != 0;
     if (!failed) {
+        /* Rows as a release before login names stored them; the next st_storage_init backfills them. */
         snprintf(seed, sizeof(seed),
                  "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, "
                  "updated_at) VALUES('Alice','tenant-a','%s','ADMIN',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
                  "('alice','tenant-b','%s','USER',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", hash, hash);
-        failed = test_exec_sql(db_path, seed) != 0;
+        failed = test_exec_sql(db_path, seed) != 0 || st_storage_init(db_path, 0) != 0;
     }
     if (failed) fprintf(stderr, "ambiguous user fixture setup failed\n");
     static const char *const spellings[] = {"alice", "Alice", "ALICE"};
     for (size_t i = 0; !failed && i < sizeof(spellings) / sizeof(spellings[0]); ++i) {
-        char body[160];
-        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"secret-password\"}", spellings[i]);
-        int len = st_admin_build_response_with_body("POST", "/auth/login", body, response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "login with an ambiguous name") != 0
-            || contains(response, "accessToken");
+        char *token = tenant_login(spellings[i], "secret-password", NULL, response, sizeof(response));
+        failed = token != NULL || strncmp(response, "HTTP/1.1 401 ", 13U) != 0;
+        if (failed) fprintf(stderr, "bare login with an ambiguous legacy key: %s\n", response);
+        free(token);
     }
-    /* A token naming the ambiguous name answers like one naming a user that does not exist. */
-    if (!failed) {
-        char ghost[16384];
-        int ghost_len = tenant_scope_call("GET", "/api/admin/clients", "ghost", "tenant-b", "USER", NULL,
-                                          ghost, sizeof(ghost));
-        int len = tenant_scope_call("GET", "/api/admin/clients", "alice", "tenant-b", "USER", NULL,
-                                    response, sizeof(response));
-        failed = ghost_len <= 0 || len != ghost_len || strcmp(response, ghost) != 0
-            || (strncmp(response, "HTTP/1.1 401 ", 13U) != 0 && strncmp(response, "HTTP/1.1 403 ", 13U) != 0);
-        if (failed) fprintf(stderr, "token naming an ambiguous user: %s\n", len > 0 ? response : "(none)");
-    }
-    if (!failed) {
-        int len = st_admin_build_response_with_body("POST", "/api/admin/users",
-                                                    "{\"username\":\"ALICE\",\"password\":\"other-password\"}",
-                                                    response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "a third spelling of an ambiguous name") != 0;
+    /* Naming the tenant picks the account; the token carries its login name and tenant. */
+    static const char *const tenants[][2] = {{"tenant-a", "Alice"}, {"tenant-b", "alice"}};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        st_security_token_claims claims;
+        char *token = tenant_login("ALICE", "secret-password", tenants[i][0], response, sizeof(response));
+        failed = tenant_token_claims(token, &claims) != 0 || strcmp(claims.username, tenants[i][1]) != 0
+            || strcmp(claims.tenant_id, tenants[i][0]) != 0 || !claims.has_tenant;
+        if (failed) fprintf(stderr, "tenant-qualified login of %s: %s\n", tenants[i][0], response);
+        free(token);
     }
     if (!failed) {
         char count[16];
         snprintf(seed, sizeof(seed),
-                 "SELECT COUNT(*) FROM specus_management_user WHERE lower(username) = 'alice' AND password_hash = '%s'",
+                 "SELECT COUNT(*) FROM specus_management_user WHERE lower(username) = 'alice' AND password_hash = '%s' "
+                 "AND login_name_normalized = 'alice'",
                  hash);
         sqlite3 *db = NULL;
         sqlite3_stmt *stmt = NULL;
@@ -3365,16 +3393,35 @@ static int test_ambiguous_login_name_fails_closed(void)
         sqlite3_finalize(stmt);
         sqlite3_close(db);
         failed = strcmp(count, "2") != 0;
-        if (failed) fprintf(stderr, "the ambiguous rows changed: %s left as seeded\n", count);
+        if (failed) fprintf(stderr, "the legacy rows were not backfilled as seeded: %s\n", count);
     }
-    /* With one spelling left the name is unambiguous again. */
+    /* With one spelling left the legacy key is unique again. */
     if (!failed) {
         failed = test_exec_sql(db_path, "DELETE FROM specus_management_user WHERE username = 'Alice';") != 0;
-        int len = failed ? -1 : st_admin_build_response_with_body("POST", "/auth/login",
-                                                                  "{\"username\":\"alice\",\"password\":\"secret-password\"}",
-                                                                  response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 200 ", "accessToken",
-                                           "login once the name is unambiguous") != 0;
+        st_security_token_claims claims;
+        char *token = failed ? NULL : tenant_login("alice", "secret-password", NULL, response, sizeof(response));
+        failed = failed || tenant_token_claims(token, &claims) != 0 || strcmp(claims.tenant_id, "tenant-b") != 0;
+        if (failed) fprintf(stderr, "bare login once the legacy key is unique: %s\n", response);
+        free(token);
+    }
+    /* The built-in administrator creates "ALICE" in the default tenant: no conflict with tenant-b's
+     * alice, and from now on a bare login of that name means the default tenant's account. */
+    if (!failed) {
+        int len = st_admin_build_response_with_body("POST", "/api/admin/users",
+                                                    "{\"username\":\"ALICE\",\"password\":\"other-password\"}",
+                                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"tenantId\":\"default\"",
+                                 "the default tenant's own ALICE") != 0;
+    }
+    if (!failed) {
+        st_security_token_claims claims;
+        char *shadowed = tenant_login("alice", "secret-password", NULL, response, sizeof(response));
+        char *token = shadowed != NULL ? NULL : tenant_login("alice", "other-password", NULL, response, sizeof(response));
+        failed = shadowed != NULL || tenant_token_claims(token, &claims) != 0
+            || strcmp(claims.tenant_id, "default") != 0 || strcmp(claims.username, "ALICE") != 0;
+        if (failed) fprintf(stderr, "bare login after the default tenant got the name: %s\n", response);
+        free(shadowed);
+        free(token);
     }
     st_login_rate_limiter_reset();
     unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
@@ -3391,6 +3438,285 @@ static int count_occurrences(const char *haystack, const char *needle)
         ++count;
     }
     return count;
+}
+
+/*
+ * ManagementUserServiceTests.createsSameLoginNameInDifferentTenantWithoutGlobalLookup and
+ * ManagementUserServiceIntegrationTests.tenantsCanCreateTheSameLoginNameWithoutEnumeration. Login
+ * names are unique per tenant: two tenants' administrators both create "Shared" (201, not 409),
+ * each account gets a random key rather than its name, and each list shows its own tenant's only.
+ * A second spelling inside one tenant is still a conflict whose answer names no other tenant, and
+ * an administrator changes and deletes only its own tenant's account of that name.
+ */
+static int test_tenants_share_login_names(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-shared-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-shared-login-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "shared login name fixture setup failed\n");
+    static const char *const admins[][2] = {{"root-a", "tenant-a"}, {"root-b", "tenant-b"}};
+    const char *create = "{\"username\":\"Shared\",\"password\":\"secret-password\",\"role\":\"USER\",\"enabled\":true}";
+    char keys[2][81] = {"", ""};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        char tenant_field[64];
+        snprintf(tenant_field, sizeof(tenant_field), "\"tenantId\":\"%s\"", admins[i][1]);
+        int len = tenant_scope_call("POST", "/api/admin/users", admins[i][0], admins[i][1], "ADMIN", create,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", tenant_field, "Shared in each tenant") != 0
+            || !contains(response, "\"username\":\"Shared\"");
+        st_storage_management_user stored;
+        if (!failed) {
+            failed = st_storage_get_management_user_in_tenant(db_path, admins[i][1], "SHARED", &stored) != 0
+                || strcmp(stored.username, "Shared") != 0
+                || strlen(stored.account_key) != 36U || stored.account_key[8] != '-' || stored.account_key[14] != '4';
+            if (failed) fprintf(stderr, "%s's Shared was not stored under a random account key\n", admins[i][1]);
+            snprintf(keys[i], sizeof(keys[i]), "%s", stored.account_key);
+        }
+    }
+    if (!failed && strcmp(keys[0], keys[1]) == 0) {
+        fprintf(stderr, "both Shared accounts got one key\n");
+        failed = 1;
+    }
+    if (!failed) {
+        int len = tenant_scope_call("POST", "/api/admin/users", "root-a", "tenant-a", "ADMIN",
+                                    "{\"username\":\" SHARED \",\"password\":\"secret-password\"}",
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "a second spelling inside one tenant") != 0
+            || contains(response, "tenant-b");
+    }
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        int len = tenant_scope_call("GET", "/api/admin/users", admins[i][0], admins[i][1], "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"username\":\"Shared\"", "user list") != 0
+            || count_occurrences(response, "\"username\":\"Shared\"") != 1
+            || contains(response, admins[1U - i][0])
+            || contains(response, admins[1U - i][1]);
+        if (failed) fprintf(stderr, "%s's user list crossed its tenant: %s\n", admins[i][1], response);
+    }
+    if (!failed) {
+        int len = tenant_scope_call("PUT", "/api/admin/users/shared", "root-a", "tenant-a", "ADMIN",
+                                    "{\"role\":\"ADMIN\"}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"role\":\"ADMIN\"", "tenant-a PUT of Shared") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/Shared", "root-a", "tenant-a", "ADMIN", NULL,
+                                              response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-a DELETE of Shared") != 0;
+    }
+    if (!failed) {
+        st_storage_management_user kept;
+        st_storage_management_user gone;
+        failed = st_storage_get_management_user_in_tenant(db_path, "tenant-a", "shared", &gone) == 0
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-b", "shared", &kept) != 0
+            || strcmp(kept.role, "USER") != 0 || strcmp(kept.account_key, keys[1]) != 0;
+        if (failed) fprintf(stderr, "tenant-a's changes reached tenant-b's Shared\n");
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * ManagementUserServiceIntegrationTests.tenantQualifiedLoginAndRefreshResolveOnlyTheMatchingTenant,
+ * through the real handlers: tenant-a and tenant-b each have an alice. Each signs in to its own
+ * tenant (tenantId in the login body) and gets a token of that tenant; the wrong tenant, the other
+ * alice's password and no tenant at all are refused; refresh stays in the tenant; neither sees the
+ * other's clients; deleting tenant-a's alice ends its token while tenant-b's goes on.
+ */
+static int test_tenant_qualified_login_and_refresh(void)
+{
+    char db_path[256];
+    static char response[65536];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-tenant-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-tenant-login-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "tenant login fixture setup failed\n");
+    static const char *const alices[][3] = {
+        {"root-a", "tenant-a", "{\"username\":\"alice\",\"password\":\"alice-a-password\"}"},
+        {"root-b", "tenant-b", "{\"username\":\"alice\",\"password\":\"alice-b-password\"}"},
+    };
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        int len = tenant_scope_call("POST", "/api/admin/users", alices[i][0], alices[i][1], "ADMIN", alices[i][2],
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "an alice per tenant") != 0;
+    }
+    char *token_a = NULL;
+    char *token_b = NULL;
+    st_security_token_claims claims;
+    if (!failed) {
+        token_a = tenant_login("alice", "alice-a-password", "tenant-a", response, sizeof(response));
+        failed = tenant_token_claims(token_a, &claims) != 0 || strcmp(claims.username, "alice") != 0
+            || strcmp(claims.tenant_id, "tenant-a") != 0 || !claims.has_tenant || strcmp(claims.role, "USER") != 0;
+        if (failed) fprintf(stderr, "tenant-a alice login: %s\n", response);
+    }
+    if (!failed) {
+        token_b = tenant_login("ALICE", "alice-b-password", " tenant-b ", response, sizeof(response));
+        failed = tenant_token_claims(token_b, &claims) != 0 || strcmp(claims.username, "alice") != 0
+            || strcmp(claims.tenant_id, "tenant-b") != 0;
+        if (failed) fprintf(stderr, "tenant-b alice login: %s\n", response);
+    }
+    static const char *const refused[][2] = {
+        {"alice-a-password", "tenant-b"},
+        {"alice-b-password", "tenant-a"},
+        {"alice-a-password", NULL},
+        {"alice-a-password", "default"},
+        {"alice-a-password", "tenant-c"},
+    };
+    for (size_t i = 0; !failed && i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        char *token = tenant_login("alice", refused[i][0], refused[i][1], response, sizeof(response));
+        failed = token != NULL || strncmp(response, "HTTP/1.1 401 ", 13U) != 0;
+        if (failed) fprintf(stderr, "alice signed in with %s in %s: %s\n", refused[i][0],
+                            refused[i][1] == NULL ? "no tenant" : refused[i][1], response);
+        free(token);
+    }
+    /* Refresh re-reads the account of (tenant_id, sub) and stays in the token's tenant. */
+    if (!failed) {
+        int len = tenant_token_call("POST", "/auth/refresh", token_b, NULL, response, sizeof(response));
+        char *refreshed = len > 0 && strncmp(response, "HTTP/1.1 200 ", 13U) == 0
+            ? st_json_get_string(response, "accessToken") : NULL;
+        failed = tenant_token_claims(refreshed, &claims) != 0 || strcmp(claims.tenant_id, "tenant-b") != 0
+            || strcmp(claims.username, "alice") != 0;
+        if (failed) fprintf(stderr, "tenant-b refresh: %s\n", response);
+        free(refreshed);
+    }
+    static const char *const owners[][2] = {{"tenant-a", "alice-a-client"}, {"tenant-b", "alice-b-client"}};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        const char *token = i == 0U ? token_a : token_b;
+        char tenant_field[64];
+        snprintf(tenant_field, sizeof(tenant_field), "\"tenantId\":\"%s\"", owners[i][0]);
+        int len = tenant_token_call("GET", "/api/admin/me", token, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", tenant_field, "alice's own tenant") != 0
+            || !contains(response, "\"username\":\"alice\"") || contains(response, "\"admin\":true");
+        char body[128];
+        snprintf(body, sizeof(body), "{\"clientName\":\"%s\",\"enabled\":true}", owners[i][1]);
+        len = failed ? -1 : tenant_token_call("POST", "/api/admin/clients", token, body, response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 201 ", "\"ownerUsername\":\"alice\"",
+                                           "alice's client") != 0;
+    }
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        int len = tenant_token_call("GET", "/api/admin/clients", i == 0U ? token_a : token_b, NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", owners[i][1], "alice's clients") != 0
+            || contains(response, owners[1U - i][1]);
+        if (failed) fprintf(stderr, "%s's alice saw another tenant's client\n", owners[i][0]);
+    }
+    if (!failed) {
+        int len = tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "delete tenant-a's alice") != 0;
+    }
+    if (!failed) {
+        int me_len = tenant_token_call("GET", "/api/admin/me", token_a, NULL, response, sizeof(response));
+        failed = me_len <= 0 || strncmp(response, "HTTP/1.1 200 ", 13U) == 0;
+        int refresh_len = failed ? -1 : tenant_token_call("POST", "/auth/refresh", token_a, NULL, response,
+                                                          sizeof(response));
+        failed = failed || endpoint_expect(refresh_len, response, "HTTP/1.1 401 ", NULL,
+                                           "refresh of the deleted tenant-a alice") != 0;
+        int other_len = failed ? -1 : tenant_token_call("GET", "/api/admin/me", token_b, NULL, response,
+                                                        sizeof(response));
+        failed = failed || endpoint_expect(other_len, response, "HTTP/1.1 200 ", "\"tenantId\":\"tenant-b\"",
+                                           "tenant-b alice after tenant-a's was deleted") != 0;
+    }
+    free(token_a);
+    free(token_b);
+    st_login_rate_limiter_reset();
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * A database from before tenant-scoped login names: the account table has no login name and keys
+ * accounts by their username. After the upgrade the accounts sign in as before, without a tenant
+ * (a default-tenant one directly, another tenant's through its unique legacy key) and with their
+ * tenant, and the clients recorded under their names are still theirs.
+ */
+static int test_legacy_accounts_sign_in_after_migration(void)
+{
+    char db_path[256];
+    static char response[65536];
+    char dave_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    char erin_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-legacy-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-legacy-login-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    char seed[2048];
+    int failed = st_password_hash("dave-password", dave_hash) != 0 || st_password_hash("erin-password", erin_hash) != 0;
+    if (!failed) {
+        snprintf(seed, sizeof(seed),
+                 "CREATE TABLE specus_management_user (username TEXT PRIMARY KEY,"
+                 "tenant_id TEXT NOT NULL DEFAULT 'default', password_hash TEXT NOT NULL,"
+                 "role TEXT NOT NULL DEFAULT 'USER', enabled INTEGER NOT NULL DEFAULT 1,"
+                 "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                 "oidc_issuer TEXT, oidc_subject TEXT, oidc_identity_key TEXT);"
+                 "INSERT INTO specus_management_user(username, tenant_id, password_hash, role) VALUES"
+                 "('Dave','default','%s','USER'),('erin','tenant-e','%s','ADMIN');",
+                 dave_hash, erin_hash);
+        failed = test_exec_sql(db_path, seed) != 0 || st_storage_init(db_path, 0) != 0
+            || test_exec_sql(db_path, "INSERT INTO client_account(tenant_id, client_name, owner_username) "
+                                      "VALUES('tenant-e','erin-client','erin');") != 0;
+    }
+    if (failed) fprintf(stderr, "legacy account fixture setup failed\n");
+    st_security_token_claims claims;
+    if (!failed) {
+        char *token = tenant_login("dave", "dave-password", NULL, response, sizeof(response));
+        failed = tenant_token_claims(token, &claims) != 0 || strcmp(claims.username, "Dave") != 0
+            || strcmp(claims.tenant_id, "default") != 0;
+        if (failed) fprintf(stderr, "legacy default-tenant account login: %s\n", response);
+        free(token);
+    }
+    char *erin = NULL;
+    if (!failed) {
+        erin = tenant_login("Erin", "erin-password", NULL, response, sizeof(response));
+        failed = tenant_token_claims(erin, &claims) != 0 || strcmp(claims.username, "erin") != 0
+            || strcmp(claims.tenant_id, "tenant-e") != 0;
+        if (failed) fprintf(stderr, "legacy account of another tenant, without its tenant: %s\n", response);
+    }
+    if (!failed) {
+        char *token = tenant_login("erin", "erin-password", "tenant-e", response, sizeof(response));
+        failed = token == NULL;
+        if (failed) fprintf(stderr, "legacy account with its tenant: %s\n", response);
+        free(token);
+    }
+    if (!failed) {
+        int len = tenant_token_call("GET", "/api/admin/clients", erin, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"erin-client\"",
+                                 "the legacy account's client") != 0;
+    }
+    if (!failed) {
+        st_storage_management_user stored;
+        failed = st_storage_get_management_user_in_tenant(db_path, "tenant-e", "ERIN", &stored) != 0
+            || strcmp(stored.account_key, "erin") != 0 || strcmp(stored.username, "erin") != 0;
+        if (failed) fprintf(stderr, "the legacy account key changed\n");
+    }
+    free(erin);
+    st_login_rate_limiter_reset();
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
 }
 
 /* POSTs one route for client_id as the given administrator; returns the response length. */
@@ -5983,7 +6309,7 @@ int main(void)
         return 1;
     }
     st_storage_management_user premature_user;
-    if (st_storage_get_management_user(db_path, "registered-user", &premature_user) == 0) {
+    if (st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "registered-user", &premature_user) == 0) {
         fprintf(stderr, "registration created user before email verification\n");
         free(registration_id);
         return 1;
@@ -5998,7 +6324,7 @@ int main(void)
     st_storage_management_user registered_user;
     st_password_verification registered_password;
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"accessToken\"")
-        || st_storage_get_management_user(db_path, "registered-user", &registered_user) != 0
+        || st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "registered-user", &registered_user) != 0
         || strcmp(registered_user.role, "USER") != 0 || !registered_user.enabled
         || st_password_verify("password-1", registered_user.password_hash, &registered_password) != 0
         || !registered_password.matches
@@ -6046,7 +6372,7 @@ int main(void)
         return 1;
     }
     st_storage_management_user stored_alice;
-    if (st_storage_get_management_user(db_path, "alice", &stored_alice) != 0
+    if (st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "alice", &stored_alice) != 0
         || strncmp(stored_alice.password_hash,
                    "$pbkdf2-sha256$v=1$i=210000$",
                    strlen("$pbkdf2-sha256$v=1$i=210000$")) != 0) {
@@ -6074,7 +6400,7 @@ int main(void)
                                             response,
                                             sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || st_storage_get_management_user(db_path, "legacy-user", &legacy_user) != 0
+        || st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "legacy-user", &legacy_user) != 0
         || strcmp(legacy_user.password_hash, legacy_password_hash) == 0
         || strncmp(legacy_user.password_hash,
                    "$pbkdf2-sha256$v=1$i=210000$",
@@ -7970,6 +8296,15 @@ int main(void)
         return 1;
     }
     if (test_ambiguous_login_name_fails_closed() != 0) {
+        return 1;
+    }
+    if (test_tenants_share_login_names() != 0) {
+        return 1;
+    }
+    if (test_tenant_qualified_login_and_refresh() != 0) {
+        return 1;
+    }
+    if (test_legacy_accounts_sign_in_after_migration() != 0) {
         return 1;
     }
     if (test_peer_mesh_path_stats() != 0) {

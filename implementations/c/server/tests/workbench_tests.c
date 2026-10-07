@@ -259,32 +259,10 @@ static void vec_text(const char *object, const char *key, char *out, size_t out_
 /* ---- Scenario state ----------------------------------------------------------------------- */
 
 /*
- * Management usernames are the primary key of the account table here and unique across tenants,
- * so the vector's (t2, alice) cannot exist next to (t1, alice). Identities of t1 keep their name;
- * those of any other tenant get "-<tenant>" appended for accounts, tokens, owners and rows, and
- * lose it again when the rows are compared with rowsAfter.
+ * Login names are unique per tenant (protocol/spec/management-accounts.md), so the vector's
+ * (t2, alice) is an account named alice next to (t1, alice): accounts, tokens, owners and rows
+ * carry the vector's names as they are.
  */
-static void map_username(const char *tenant_id, const char *username, char *out, size_t out_len)
-{
-    if (strcmp(tenant_id, "t1") == 0) {
-        snprintf(out, out_len, "%s", username);
-    } else {
-        snprintf(out, out_len, "%s-%s", username, tenant_id);
-    }
-}
-
-static void unmap_username(const char *tenant_id, const char *stored, char *out, size_t out_len)
-{
-    snprintf(out, out_len, "%s", stored);
-    if (strcmp(tenant_id, "t1") != 0) {
-        size_t suffix_len = strlen(tenant_id) + 1U;
-        size_t len = strlen(out);
-        if (len > suffix_len && out[len - suffix_len] == '-'
-            && strcmp(out + len - suffix_len + 1U, tenant_id) == 0) {
-            out[len - suffix_len] = '\0';
-        }
-    }
-}
 
 typedef struct {
     char tenant_id[32];
@@ -330,9 +308,7 @@ static int remember_identity(wb_scenario *scenario, const char *tenant_id, const
         snprintf(identity->tenant_id, sizeof(identity->tenant_id), "%s", tenant_id);
         snprintf(identity->username, sizeof(identity->username), "%s", username);
     }
-    char mapped[96];
-    map_username(tenant_id, username, mapped, sizeof(mapped));
-    return issue_bearer(mapped, tenant_id, identity->bearer, sizeof(identity->bearer));
+    return issue_bearer(username, tenant_id, identity->bearer, sizeof(identity->bearer));
 }
 
 /* A tenant administrator outside the vector, used only to drive the existing management endpoints. */
@@ -341,7 +317,7 @@ static int operator_bearer(const char *tenant_id, char *out, size_t out_len)
     char username[64];
     snprintf(username, sizeof(username), "wbops-%s", tenant_id);
     st_storage_management_user user;
-    if (st_storage_get_management_user(test_db_path, username, &user) != 0
+    if (st_storage_get_management_user_in_tenant(test_db_path, tenant_id, username, &user) != 0
         && st_storage_create_management_user(test_db_path, username, tenant_id, "unused-password-hash",
                                              "ADMIN", 1, NULL) != 0) {
         fprintf(stderr, "operator %s could not be created\n", username);
@@ -462,7 +438,7 @@ static int compare_rows(const void *left_raw, const void *right_raw)
     return rc;
 }
 
-/* Every stored workbench row, usernames mapped back to the vector's and times relative to base. */
+/* Every stored workbench row, times relative to base. */
 static int dump_rows(long long base_ms, wb_row *rows, size_t max_rows, size_t *count)
 {
     *count = 0U;
@@ -479,8 +455,7 @@ static int dump_rows(long long base_ms, wb_row *rows, size_t max_rows, size_t *c
         }
         wb_row *row = &rows[(*count)++];
         snprintf(row->tenant_id, sizeof(row->tenant_id), "%s", (const char *)sqlite3_column_text(stmt, 0));
-        unmap_username(row->tenant_id, (const char *)sqlite3_column_text(stmt, 1), row->username,
-                       sizeof(row->username));
+        snprintf(row->username, sizeof(row->username), "%s", (const char *)sqlite3_column_text(stmt, 1));
         snprintf(row->list, sizeof(row->list), "%s", (const char *)sqlite3_column_text(stmt, 2));
         snprintf(row->kind, sizeof(row->kind), "%s", (const char *)sqlite3_column_text(stmt, 3));
         row->id = sqlite3_column_int64(stmt, 4);
@@ -556,7 +531,6 @@ static int replay_event(wb_scenario *scenario, const char *step, const char *nam
     char tenant_id[32];
     char username[64];
     char kind[16];
-    char mapped[96];
     char bearer[2400];
     char path[192];
     static char buffer[WB_RESPONSE_BYTES];
@@ -583,25 +557,20 @@ static int replay_event(wb_scenario *scenario, const char *step, const char *nam
     }
     if (strcmp(name, "create-object") == 0) {
         char owner[64];
-        char mapped_owner[96];
         vec_text(step, "ownerUsername", owner, sizeof(owner));
-        map_username(tenant_id, owner, mapped_owner, sizeof(mapped_owner));
-        return create_object(scenario, kind, id, tenant_id, mapped_owner);
+        return create_object(scenario, kind, id, tenant_id, owner);
     }
     if (strcmp(name, "change-owner") == 0) {
         char owner[64];
-        char mapped_owner[96];
         wb_object *object = find_object(scenario, kind, id);
         if (object == NULL) {
             return -1;
         }
         vec_text(step, "ownerUsername", owner, sizeof(owner));
-        map_username(object->tenant_id, owner, mapped_owner, sizeof(mapped_owner));
-        return change_owner(scenario, kind, id, mapped_owner);
+        return change_owner(scenario, kind, id, owner);
     }
     if (strcmp(name, "set-admin") == 0 || strcmp(name, "delete-user") == 0 || strcmp(name, "create-user") == 0) {
         /* Through the existing account management endpoints, as a tenant administrator. */
-        map_username(tenant_id, username, mapped, sizeof(mapped));
         if (operator_bearer(tenant_id, bearer, sizeof(bearer)) != 0) {
             return -1;
         }
@@ -609,18 +578,18 @@ static int replay_event(wb_scenario *scenario, const char *step, const char *nam
         int expected;
         int rc;
         if (strcmp(name, "set-admin") == 0) {
-            snprintf(path, sizeof(path), "/api/admin/users/%s", mapped);
+            snprintf(path, sizeof(path), "/api/admin/users/%s", username);
             snprintf(body, sizeof(body), "{\"role\":\"%s\"}", vec_bool(step, "admin") ? "ADMIN" : "USER");
             expected = 200;
             rc = call("PUT", path, bearer, body, buffer, sizeof(buffer), &response);
         } else if (strcmp(name, "delete-user") == 0) {
-            snprintf(path, sizeof(path), "/api/admin/users/%s", mapped);
+            snprintf(path, sizeof(path), "/api/admin/users/%s", username);
             expected = 204;
             rc = call("DELETE", path, bearer, NULL, buffer, sizeof(buffer), &response);
         } else {
             snprintf(body, sizeof(body),
                      "{\"username\":\"%s\",\"password\":\"wb-password-1\",\"role\":\"%s\",\"enabled\":true}",
-                     mapped, vec_bool(step, "admin") ? "ADMIN" : "USER");
+                     username, vec_bool(step, "admin") ? "ADMIN" : "USER");
             expected = 201;
             rc = call("POST", "/api/admin/users", bearer, body, buffer, sizeof(buffer), &response);
             if (rc == 0 && response.status == expected) {
@@ -755,11 +724,9 @@ static int replay_scenario(const char *raw, long long base_ms, size_t *steps_rep
     for (size_t i = 0; rc == 0 && i < users_len; ++i) {
         char tenant_id[32];
         char username[64];
-        char mapped[96];
         vec_text(users[i], "tenantId", tenant_id, sizeof(tenant_id));
         vec_text(users[i], "username", username, sizeof(username));
-        map_username(tenant_id, username, mapped, sizeof(mapped));
-        rc = st_storage_create_management_user(test_db_path, mapped, tenant_id, "unused-password-hash",
+        rc = st_storage_create_management_user(test_db_path, username, tenant_id, "unused-password-hash",
                                                vec_bool(users[i], "admin") ? "ADMIN" : "USER", 1, NULL);
         if (rc == 0) {
             rc = remember_identity(&scenario, tenant_id, username);
@@ -769,20 +736,16 @@ static int replay_scenario(const char *raw, long long base_ms, size_t *steps_rep
         char kind[16];
         char tenant_id[32];
         char owner[64];
-        char mapped_owner[96];
         long long id = 0;
         vec_text(objects[i], "kind", kind, sizeof(kind));
         vec_text(objects[i], "tenantId", tenant_id, sizeof(tenant_id));
         vec_text(objects[i], "ownerUsername", owner, sizeof(owner));
-        map_username(tenant_id, owner, mapped_owner, sizeof(mapped_owner));
-        rc = vec_i64(objects[i], "id", &id) == 0 ? create_object(&scenario, kind, id, tenant_id, mapped_owner) : -1;
+        rc = vec_i64(objects[i], "id", &id) == 0 ? create_object(&scenario, kind, id, tenant_id, owner) : -1;
     }
     for (size_t i = 0; rc == 0 && i < rows_len; ++i) {
         wb_row row;
-        char mapped[96];
         rc = parse_row(rows[i], &row);
-        map_username(row.tenant_id, row.username, mapped, sizeof(mapped));
-        const char *texts[] = {row.tenant_id, mapped, row.list, row.kind};
+        const char *texts[] = {row.tenant_id, row.username, row.list, row.kind};
         long long ints[] = {row.id, base_ms + row.at_ms};
         if (rc == 0) {
             rc = exec_bound("INSERT INTO management_workbench_item(tenant_id, username, list, kind, object_id, at_ms) "

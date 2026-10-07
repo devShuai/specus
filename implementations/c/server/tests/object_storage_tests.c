@@ -244,18 +244,20 @@ static int cap_create_database(const char *path,
         sqlite3_finalize(stmt);
     }
     /* The admin entry point re-reads the account a bearer token names (as Java's
-     * ManagementContextResolver does), so the accounts the HTTP checks use must exist. Usernames
-     * are unique across tenants in the C store, so t2/alice is checked on the module directly. */
+     * ManagementContextResolver does), so the accounts the HTTP checks use must exist, under the
+     * login names of their tenant; t2/alice is checked on the module directly. */
     if (ok) {
         ok = sqlite3_exec(db,
                 "CREATE TABLE IF NOT EXISTS specus_management_user(username TEXT PRIMARY KEY,"
+                "login_name TEXT,login_name_normalized TEXT,"
                 "tenant_id TEXT NOT NULL DEFAULT 'default',password_hash TEXT NOT NULL,"
                 "role TEXT NOT NULL DEFAULT 'USER',enabled INTEGER NOT NULL DEFAULT 1,"
                 "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
                 "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
-                "INSERT OR REPLACE INTO specus_management_user(username,tenant_id,password_hash,role,enabled) "
-                "VALUES('alice','t1','unused','USER',1),('bob','t1','unused','USER',1),"
-                "('root','t1','unused','ADMIN',1);",
+                "INSERT OR REPLACE INTO specus_management_user(username,login_name,login_name_normalized,"
+                "tenant_id,password_hash,role,enabled) "
+                "VALUES('alice','alice','alice','t1','unused','USER',1),('bob','bob','bob','t1','unused','USER',1),"
+                "('root','root','root','t1','unused','ADMIN',1);",
                 NULL, NULL, NULL) == SQLITE_OK;
     }
     if (!ok) fprintf(stderr, "capabilities seed failed: %s\n", db == NULL ? "open" : sqlite3_errmsg(db));
