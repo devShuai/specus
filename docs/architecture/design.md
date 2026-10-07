@@ -258,7 +258,7 @@ HTTP/TCP 明细默认写业务数据库；配置 `SPECUS_ELASTICSEARCH_URIS` 后
 
 | 数据库 | Driver | Hibernate Dialect |
 | --- | --- | --- |
-| SQLite（默认） | `org.sqlite.JDBC` | `org.hibernate.community.dialect.SQLiteDialect` |
+| SQLite（默认） | `org.sqlite.JDBC` | `com.theshuai.specusserver.database.SpecusSqliteDialect`（社区 `SQLiteDialect` 加约束冲突翻译；配置为社区方言时启动自动替换） |
 | MySQL | `com.mysql.cj.jdbc.Driver` | `org.hibernate.dialect.MySQLDialect` |
 | PostgreSQL | `org.postgresql.Driver` | `org.hibernate.dialect.PostgreSQLDialect` |
 
