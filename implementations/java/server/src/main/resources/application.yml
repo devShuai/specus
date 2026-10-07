@@ -21,7 +21,8 @@ spring:
       # Default 1 keeps the single-writer SQLite default safe. Raise it (e.g. 16-32) for MySQL/PostgreSQL.
       maximum-pool-size: ${SPECUS_DB_POOL_SIZE:1}
   jpa:
-    database-platform: ${SPECUS_DB_DIALECT:org.hibernate.community.dialect.SQLiteDialect}
+    # SpecusSqliteDialect is the community SQLiteDialect plus constraint-violation translation.
+    database-platform: ${SPECUS_DB_DIALECT:com.theshuai.specusserver.database.SpecusSqliteDialect}
     hibernate:
       ddl-auto: update
     open-in-view: false
@@ -30,6 +31,7 @@ spring:
       hibernate.jdbc.batch_size: ${SPECUS_DB_BATCH_SIZE:50}
       hibernate.order_inserts: true
       hibernate.order_updates: true
+      # SQLite reads schema metadata table by table: see SqliteSchemaMetadataConfiguration.
   task:
     scheduling:
       # S1.4: flushHttp/flushTcp are separate @Scheduled methods; the default pool size 1
