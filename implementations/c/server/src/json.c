@@ -624,6 +624,75 @@ char *st_json_get_top_level_raw(const char *json, const char *key)
     return result;
 }
 
+int st_json_object_keys_unique(const char *json)
+{
+    if (json == NULL || !st_json_is_valid_object(json)) {
+        return 0;
+    }
+    const char *p = skip_ws(json);
+    p = skip_ws(p + 1);
+    char **names = NULL;
+    size_t *lengths = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    int unique = 1;
+    while (unique && *p != '}') {
+        size_t name_len = 0U;
+        char *name = parse_json_string_value_len(&p, &name_len);
+        if (name == NULL) {
+            unique = 0;
+            break;
+        }
+        for (size_t i = 0U; i < count; ++i) {
+            if (lengths[i] == name_len && memcmp(names[i], name, name_len) == 0) {
+                unique = 0;
+                break;
+            }
+        }
+        if (unique && count == capacity) {
+            size_t next = capacity == 0U ? 8U : capacity * 2U;
+            char **grown_names = next > SIZE_MAX / sizeof(*names)
+                ? NULL : (char **)realloc(names, next * sizeof(*names));
+            if (grown_names != NULL) {
+                names = grown_names;
+            }
+            size_t *grown_lengths = grown_names == NULL || next > SIZE_MAX / sizeof(*lengths)
+                ? NULL : (size_t *)realloc(lengths, next * sizeof(*lengths));
+            if (grown_lengths != NULL) {
+                lengths = grown_lengths;
+                capacity = next;
+            } else {
+                unique = 0;
+            }
+        }
+        if (!unique) {
+            free(name);
+            break;
+        }
+        names[count] = name;
+        lengths[count] = name_len;
+        ++count;
+        p = skip_ws(p);
+        /* The object was validated above, so a ':' and a value follow every name. */
+        p = skip_ws(p + 1);
+        const char *value_end = validate_json_value(p, 1U);
+        if (value_end == NULL) {
+            unique = 0;
+            break;
+        }
+        p = skip_ws(value_end);
+        if (*p == ',') {
+            p = skip_ws(p + 1);
+        }
+    }
+    for (size_t i = 0U; i < count; ++i) {
+        free(names[i]);
+    }
+    free(names);
+    free(lengths);
+    return unique;
+}
+
 void st_json_free_string_array(char **values, size_t values_len)
 {
     if (values == NULL) {

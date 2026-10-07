@@ -569,6 +569,26 @@ int st_storage_update_management_user(const char *path,
                                       int enabled,
                                       st_storage_management_user *out_user);
 int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username);
+/*
+ * Java ManagementUserService.resolveOrProvisionOidcUser for a verified issuer/subject pair, in one
+ * transaction: the user already bound to identity_key resolves when enabled; otherwise an enabled,
+ * unbound user named username in tenant_id is bound on this first login; otherwise a USER account
+ * named username is created in tenant_id with password_hash. A disabled user, one bound to another
+ * identity, or a same-named user of another tenant is refused. With password_hash NULL nothing is
+ * created and 2 is returned instead, so the caller derives the slow hash only when it is needed.
+ * Returns 0 with *out_user filled, 1 when refused, 2 as above and -1 when the store fails.
+ */
+int st_storage_resolve_oidc_user(const char *path,
+                                 const char *issuer,
+                                 const char *subject,
+                                 const char *identity_key,
+                                 const char *username,
+                                 const char *tenant_id,
+                                 const char *password_hash,
+                                 st_storage_management_user *out_user);
+/* Read-only lookup of the user bound to identity_key: 0 when it exists and is enabled, 1 when there
+ * is none or it is disabled, -1 when the store cannot be read (Java resolveBoundOidcUser). */
+int st_storage_find_oidc_user(const char *path, const char *identity_key, st_storage_management_user *user);
 int st_storage_management_email_exists(const char *path, const char *email);
 int st_storage_get_registration_challenge(const char *path,
                                           const char *registration_id,

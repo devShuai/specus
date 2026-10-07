@@ -153,7 +153,10 @@ int st_storage_init(const char *path, int seed_demo_client)
         "role TEXT NOT NULL DEFAULT 'USER',"
         "enabled INTEGER NOT NULL DEFAULT 1,"
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "oidc_issuer TEXT,"
+        "oidc_subject TEXT,"
+        "oidc_identity_key TEXT"
         ");"
         "CREATE TABLE IF NOT EXISTS specus_management_user_email ("
         "username TEXT PRIMARY KEY,"
@@ -672,6 +675,22 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "specus_management_user", "updated_at", "TEXT");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_management_user", "oidc_issuer", "TEXT");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_management_user", "oidc_subject", "TEXT");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "specus_management_user", "oidc_identity_key", "TEXT");
+    }
+    if (rc == 0) {
+        /* Java uq_management_user_oidc_identity_key: one local account per issuer/subject pair. */
+        rc = exec_sql(db,
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_management_user_oidc_identity_key "
+            "ON specus_management_user(oidc_identity_key) "
+            "WHERE oidc_identity_key IS NOT NULL AND oidc_identity_key <> '';");
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "specus_mapping", "detail_capture_enabled", "INTEGER NOT NULL DEFAULT 0");
@@ -1864,6 +1883,196 @@ int st_storage_delete_management_user(const char *path, const char *tenant_id, c
     }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
+}
+
+/* 0 with *user filled when a user is bound to identity_key, 1 when none is, -1 on a read failure. */
+static int oidc_user_by_identity_key(sqlite3 *db, const char *identity_key, st_storage_management_user *user)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
+            "FROM specus_management_user WHERE oidc_identity_key = ?",
+            -1,
+            &stmt,
+            NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, identity_key, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_ROW ? (scan_management_user(stmt, user) == 0 ? 0 : -1)
+        : rc == SQLITE_DONE ? 1 : -1;
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/*
+ * Like oidc_user_by_identity_key, by login name. *bound is set when any OIDC column already has
+ * text, and bound_key receives the stored identity key.
+ */
+static int oidc_user_by_username(sqlite3 *db,
+                                 const char *username,
+                                 st_storage_management_user *user,
+                                 int *bound,
+                                 char *bound_key,
+                                 size_t bound_key_len)
+{
+    *bound = 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at, "
+            "COALESCE(oidc_issuer, ''), COALESCE(oidc_subject, ''), COALESCE(oidc_identity_key, '') "
+            "FROM specus_management_user WHERE lower(username) = lower(?)",
+            -1,
+            &stmt,
+            NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_DONE ? 1 : -1;
+    if (rc == SQLITE_ROW && scan_management_user(stmt, user) == 0
+        && copy_text_column(stmt, 9, bound_key, bound_key_len) == 0) {
+        const unsigned char *issuer = sqlite3_column_text(stmt, 7);
+        const unsigned char *subject = sqlite3_column_text(stmt, 8);
+        *bound = (issuer != NULL && *issuer != '\0')
+            || (subject != NULL && *subject != '\0')
+            || *bound_key != '\0';
+        result = 0;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+int st_storage_resolve_oidc_user(const char *path,
+                                 const char *issuer,
+                                 const char *subject,
+                                 const char *identity_key,
+                                 const char *username,
+                                 const char *tenant_id,
+                                 const char *password_hash,
+                                 st_storage_management_user *out_user)
+{
+    if (path == NULL || issuer == NULL || subject == NULL || identity_key == NULL
+        || *identity_key == '\0' || username == NULL || *username == '\0') {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    /* IMMEDIATE takes the write lock before the first read, so two first logins racing for one
+     * account are serialized; the loser then sees the winner's binding, as Java's conditional
+     * update followed by a re-read has it. */
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    st_storage_management_user user;
+    memset(&user, 0, sizeof(user));
+    int result = -1;
+    int found = oidc_user_by_identity_key(db, identity_key, &user);
+    if (found == 0) {
+        result = user.enabled ? 0 : 1;
+    } else if (found == 1) {
+        int bound = 0;
+        char bound_key[80];
+        found = oidc_user_by_username(db, username, &user, &bound, bound_key, sizeof(bound_key));
+        if (found == 0) {
+            /* Usernames are a global key in C, so a same-named account of another tenant cannot be
+             * given a sibling in this one the way Java does; it is refused, never linked. */
+            if (strcmp(user.tenant_id, normalize_tenant_id(tenant_id)) != 0 || !user.enabled) {
+                result = 1;
+            } else if (bound) {
+                result = strcmp(bound_key, identity_key) == 0 ? 0 : 1;
+            } else {
+                sqlite3_stmt *stmt = NULL;
+                int rc = sqlite3_prepare_v2(db,
+                    "UPDATE specus_management_user SET oidc_issuer = ?, oidc_subject = ?, "
+                    "oidc_identity_key = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE username = ? AND enabled = 1 "
+                    "AND COALESCE(oidc_issuer, '') = '' AND COALESCE(oidc_subject, '') = '' "
+                    "AND COALESCE(oidc_identity_key, '') = ''",
+                    -1,
+                    &stmt,
+                    NULL);
+                if (rc == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, issuer, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 2, subject, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 3, identity_key, -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(stmt, 4, user.username, -1, SQLITE_TRANSIENT);
+                    rc = sqlite3_step(stmt);
+                }
+                sqlite3_finalize(stmt);
+                if (rc == SQLITE_DONE) {
+                    /* Accept only the exact identity that is now stored, whoever wrote it. */
+                    found = oidc_user_by_identity_key(db, identity_key, &user);
+                    result = found == 0 ? (user.enabled ? 0 : 1) : found == 1 ? 1 : -1;
+                }
+            }
+        } else if (found == 1 && password_hash == NULL) {
+            result = 2;
+        } else if (found == 1) {
+            sqlite3_stmt *stmt = NULL;
+            int rc = sqlite3_prepare_v2(db,
+                "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, "
+                "created_at, updated_at, oidc_issuer, oidc_subject, oidc_identity_key) "
+                "VALUES(?,?,?,'USER',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?,?)",
+                -1,
+                &stmt,
+                NULL);
+            if (rc == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 2, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 3, password_hash, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 4, issuer, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 5, subject, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 6, identity_key, -1, SQLITE_TRANSIENT);
+                rc = sqlite3_step(stmt);
+            }
+            sqlite3_finalize(stmt);
+            if (rc == SQLITE_DONE) {
+                result = oidc_user_by_identity_key(db, identity_key, &user) == 0 ? 0 : -1;
+            }
+        }
+    }
+    if (result >= 0) {
+        if (exec_sql(db, "COMMIT") != 0) {
+            result = -1;
+        }
+    }
+    if (result < 0) {
+        (void)exec_sql(db, "ROLLBACK");
+    }
+    sqlite3_close(db);
+    if (result == 0 && out_user != NULL) {
+        *out_user = user;
+    }
+    return result;
+}
+
+int st_storage_find_oidc_user(const char *path, const char *identity_key, st_storage_management_user *user)
+{
+    if (path == NULL || identity_key == NULL || *identity_key == '\0') {
+        return -1;
+    }
+    /* Read-only, like st_storage_find_management_user: this runs on every OIDC bearer request. */
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    st_storage_management_user found_user;
+    memset(&found_user, 0, sizeof(found_user));
+    int found = oidc_user_by_identity_key(db, identity_key, &found_user);
+    sqlite3_close(db);
+    if (found == 0 && !found_user.enabled) {
+        return 1;
+    }
+    if (found == 0 && user != NULL) {
+        *user = found_user;
+    }
+    return found;
 }
 
 static int scan_registration_challenge(sqlite3_stmt *stmt,

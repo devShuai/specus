@@ -22,7 +22,7 @@
 
 ## 汇总
 
-79 个 Java 测试类中，**覆盖 20 个，部分 50 个，无 9 个**（2026-10-07 随 `fix/c-server-test-gaps` 更新；此前为覆盖 17、部分 47、无 15）。
+79 个 Java 测试类中，**覆盖 24 个，部分 48 个，无 7 个**（2026-10-07 随 `fix/c-server-test-gaps` 更新；此前随 C 认证修复、#132、NAT stream 语义修正与 C OIDC 对齐为覆盖 20、部分 46、无 13）。
 
 审计点名的类目前的状态如下：
 
@@ -32,14 +32,14 @@
 | `TcpServerHalfCloseTests` | 覆盖 | `nat_stream_tests` 让公网侧先 `shutdown(SHUT_WR)`，客户端在其 EOF 之后仍能回写并收尾 |
 | `HttpStreamExchangeTests` | 部分 | 帧顺序（响应头唯一且在 body 之前、FIN 之后无帧）与 `DATA\|END_STREAM` 已有测试；trailer 过滤 C 未实现，窗口上限没有确定性测试 |
 | `HttpSpecusBodyLimitFilterTests` | 部分 | `413 HTTP 请求体超过限制`（Content-Length 与 chunked）和恰好 16 MiB 放行已有测试；C 不记录被拒请求，且对整个管理监听生效 |
-| `OidcControllerTests` | 无 | C 的 `/oidc/token` 只代理 code 交换：不校验 ID Token，不绑定本地用户，也不签发本地 token |
-| `SecurityConfigOidcTests` | 无 | C 不接受外部 issuer 签发的 JWT，所以 issuer 校验在 C 不存在 |
+| `OidcControllerTests` | 覆盖 | `oidc_tests` 对 loopback 假 IdP 走完整交换：JWKS 验签、nonce、issuer/audience/azp、本地用户绑定，签发与密码登录相同的本地 HS256 token |
+| `SecurityConfigOidcTests` | 覆盖 | `oidc_tests`：issuer 设为空白时一律拒绝，issuer 须逐字相等；另覆盖 RS256 以外算法、kid 选键与 JWKS 轮换 |
 | `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests`、`ClientAuthNonceRepositoryCustomImplTests` | 覆盖 / 部分 / 无 | C 已原子消费 nonce（`client_auth_nonce_tests`），但存储在进程内存，多实例不共享；仓库方言测试不适用 |
 | `TrafficInspectionServiceTests` | 部分 | 默认关闭、gzip 解码后的文本预览、二进制无文本预览、按预览长度截断、TCP 全量保存均有测试（`traffic_capture_tests`、`nat_stream_tests`）；C 存预览不存 HTTP body |
 | `StunTurnServerMetricsTests` | 部分 | 目的地址策略的全部用例（含 IPv6 与 IPv4-mapped）由 `stun_turn_tests` 对 CreatePermission 与 ChannelBind 验证；C 没有 relay 工作队列与指标 |
 | `ConnectionEventsWebSocketHandlerTests` | 部分 | #132 补了真实 socket 的 created/updated 事件、租户与归属过滤、ticket 规则；C 没有集群扇出 |
 
-全部 9 个“无”：`SpecusServerApplicationTests`、`SecurityConfigOidcTests`、`OidcControllerTests`、`GlobalExceptionHandlerTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ManagementUserSchemaMigratorTests`、`ClientAuthNonceRepositoryCustomImplTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`。除两个 OIDC 类外都是书面平台差异，见各行说明。
+全部 7 个“无”：`SpecusServerApplicationTests`、`GlobalExceptionHandlerTests`、`ClientDownloadSchemaMigratorTests`、`LegacyDemoCredentialSanitizerIntegrationTests`、`ManagementUserSchemaMigratorTests`、`ClientAuthNonceRepositoryCustomImplTests`、`JpaHttpTrafficExchangeStoreIntegrationTests`。都是书面平台差异，见各行说明。
 
 ## 1. 启动、认证与安全规则
 
@@ -47,10 +47,10 @@
 | --- | ---: | --- | --- | --- |
 | `SpecusServerApplicationTests` | 1 | 无 | — | Spring 上下文加载测试，C 没有对应结构。真实进程启动由 `session_lifecycle_tests` 和各 E2E 脚本间接覆盖。 |
 | `config/SecurityBaselineValidatorTests` | 6 | 覆盖 | `tests/security_baseline_tests.c:main`（ctest `security_baseline_tests`） | 覆盖环境解析、同一组 11 个弱口令、prod 拒绝 JWT 占位值、演示数据开关。未断言两项：test 环境允许演示数据，prod 接受非占位 JWT secret。 |
-| `config/SecurityConfigOidcTests` | 2 | 无 | — | C 不存在这项能力。`src/security.c:st_security_validate_local_token` 只接受 `alg=HS256`、`iss=specus` 的本地 token，没有外部 issuer、JWKS 或 RS256 验签。 |
-| `management/controller/OidcControllerTests` | 4 | 无 | 只有代理部分有测试：`security_tests.c` "OIDC configured response mismatch"；"oidc http token exchange response mismatch"（明文 HTTP mock endpoint） | C 不存在这项能力。`/oidc/token` 原样返回 IdP 的 token，不校验 ID Token 的 nonce 和 audience，不解析或开通本地用户，也不签发 Specus token。见 [安全差异](security-differences.md)。 |
-| `management/controller/AuthControllerRefreshTests` | 3 | 部分 | "refresh response mismatch"；`admin_http_tests.c:test_management_token_follows_user_record`："demoted admin was not refreshed as USER"、"disabled user, refresh"、"deleted user, refresh"；`security_tests.c` "local token accepted wrong secret" | 前两项有对应：`/auth/refresh` 与其他鉴权请求走同一个 `admin_context_from_authorization`，按当前 SQLite 记录重新读取用户，`handle_management_auth_refresh` 用读到的 tenant/role 签发；降权的 admin 续期为 USER，已禁用或删除的用户得到 `401`。差异：外部 issuer 签发的 token 在 C 不是有效凭据，刷新得到 `401`，Java 是 `400`。（本行原先写“不回查数据库”，与当时的代码不符，已更正。） |
-| `management/security/ManagementContextResolverTests` | 3 | 部分 | `admin_http_tests.c`：降级 admin 失去 admin 端点且续期为 USER、禁用用户请求 403/续期 401 且重新启用后恢复、删除与不存在的用户被拒、关闭密码登录后内置 admin 被拒 | 每个鉴权请求与 `/auth/refresh` 都按当前 SQLite 记录重新读取管理用户（只读、无缓存）。C 没有外部身份绑定，这部分不适用。 |
+| `config/SecurityConfigOidcTests` | 2 | 覆盖 | ctest `oidc_tests`：`test_configuration_fails_closed`（"an empty issuer setting did not fail closed"、"a blank issuer setting did not fail closed"）、`test_issuer_audience_and_azp`（"a foreign issuer was accepted"、"issuer comparison is not exact"） | `src/oidc.c` 按 Java 的两个 decoder 校验：只收 RS256、JWKS 验签、`exp`/`nbf` 60 s 偏差、`iss` 逐字相等，ID Token 的 `aud` 须含 client id 并遵守 `azp` 规则，直连 Bearer 的 `aud` 须含 `SPECUS_OIDC_AUDIENCE`（未配置则一律拒绝）。差异：Spring 允许缺 `exp`，C 与 Go/.NET 一样拒绝。 |
+| `management/controller/OidcControllerTests` | 4 | 覆盖 | ctest `oidc_tests`（loopback 假 IdP 提供 JWKS 与一次性 code 的 token 端点，RSA/EC 密钥由 OpenSSL 现场生成）：`test_login_issues_local_token`、`test_nonce_is_required_and_bound`、`test_refused_usernames`、`test_issuer_audience_and_azp`、`test_confidential_client`；`admin_http_tests.c` "oidc configured response mismatch"、"oidc token exchange without nonce response mismatch" | 四项断言都有对应：签发本地 token、`idToken` 原样返回、`expiresIn` 为本地 TTL、机密客户端走 HTTP Basic；nonce 不符 `502`；无法开通的身份 `403`；其他 client 的 audience `502`。另测了缺 nonce `400` 且不消耗 code、callback 重放、过期、kid 不存在与签名错误、配置缺失时失败关闭。IdP 的 access/refresh token 不返回浏览器。差异：C 没有数据库时 `503`；账号存储失败 `502 OIDC 账号绑定失败`（Java 落到通用的 `502 无法连接 OIDC 令牌端点`）。 |
+| `management/controller/AuthControllerRefreshTests` | 3 | 覆盖 | "refresh response mismatch"；`admin_http_tests.c:test_management_token_follows_user_record`："demoted admin was not refreshed as USER"、"disabled user, refresh"、"deleted user, refresh"；`oidc_tests.c:test_direct_bearer_tokens`："an identity provider token was renewed"、"refresh of an unbound bearer was not 400"；`security_tests.c` "local token accepted wrong secret" | 三项都有对应：`/auth/refresh` 与其他鉴权请求走同一个 `admin_context_from_authorization`，按当前 SQLite 记录重新读取用户，`handle_management_auth_refresh` 用读到的 tenant/role 签发，降权的 admin 续期为 USER，已禁用或删除的用户得到 `401`；IdP 签发的 Bearer 不能续期，得到 `400`。（本行原先写“刷新时不回查数据库”，与代码不符，已更正。） |
+| `management/security/ManagementContextResolverTests` | 3 | 覆盖 | `admin_http_tests.c`：降级 admin 失去 admin 端点且续期为 USER、禁用用户请求 403/续期 401 且重新启用后恢复、删除与不存在的用户被拒、关闭密码登录后内置 admin 被拒；`oidc_tests.c:test_direct_bearer_tokens`、`test_tenant_claim_does_not_choose_tenant` | 每个鉴权请求与 `/auth/refresh` 都按当前 SQLite 记录重新读取管理用户（只读、无缓存）。IdP 直连 Bearer 只解析到已绑定且启用的本地用户，token 里的 `tenant_id`/`role` 与 `SPECUS_OIDC_TENANT_CLAIM` 都不改变租户和角色；未绑定或已停用 `403`。 |
 | `management/controller/GlobalExceptionHandlerTests` | 1 | 无 | — | 这是 Spring 的统一异常映射层，C 没有对应结构；C 各 handler 直接写错误 JSON。 |
 | `security/ClientAddressResolverTests` | 11 | 覆盖 | `tests/client_address_tests.c:main`（逐用例 `expect_address`）：直连伪造、不可信 peer、可信代理、多跳、伪造前导跳、畸形跳、`X-Real-IP` 回退、IPv6、无效 CIDR 等 | — |
 | `security/LoginRateLimiterTests` | 5 | 覆盖 | `tests/login_rate_limiter_tests.c:main`；"per-IP login rate limit response mismatch"、"per-account login rate limit response mismatch"、"successful login did not clear account rate-limit budget" | 未断言关闭限流后跳过计数。 |
@@ -110,8 +110,8 @@
 | `management/service/SemanticVersionTests` | 2 | 覆盖 | ctest `semantic_version_tests`（经测试钩子 `st_admin_semver_compare_for_testing` 调用 `parse_admin_semver`/`compare_admin_semver`） | Java 两个用例的全部断言都有对应，另测 SemVer 2.0 第 11 节的优先级链与 32 字符上限。补测时修正：`strtok_r` 会跳过空段，C 原先接受 `1.0.0+build..1`（Java 用例中的拒绝项）、`1.0.0-alpha..1`、`1..0.0`、`1.0.0.` 等空标识符；首尾空白按 Java `String.trim` 处理。 |
 | `management/service/HttpRouteServiceTests` | 22 | 部分 | "http route create response mismatch"、"http route filtered list response mismatch"、"http route update response mismatch"、"http route delete response mismatch"、"HTTP media capture route create mismatch"、"http route missing authentication password was not rejected"、"blank http route auth password should retain the configured digest"、"http route authentication storage mismatch" | 未测：同客户端重复 route、空 route、含 `/`、超长 route、非 http target、target 缺 host、未知客户端，以及租户隔离查询。 |
 | `management/service/ConnectionArchiveServiceTests` | 1 | 部分 | "connection archive failed"、"connection stats response mismatch" | 测试直接调用 `st_storage_archive_connections` 后查询统计。60 天保留窗口与定时调度没有测试；测试里 `month` 字段的值是日期 `2026-06-20`，而 Java 按月汇总。 |
-| `management/service/ManagementUserServiceTests` | 11 | 部分 | "management user create response mismatch"、"management user update response mismatch"、"management user delete response mismatch"、"disabled database user login response mismatch"、`test_tenant_scoped_admin_mutations`（"PUT of another tenant's user"、"DELETE of another tenant's user"、"another tenant's user answered unlike a missing one"）、`storage_tests.c` "management user crossed its tenant" | 前 7 项是 OIDC 身份开通与绑定，C 不存在这项能力；不同租户同登录名在 C 也不存在（username 是全局主键），大小写不敏感旧登录的歧义因此无从出现。改删只在调用者租户内查找：其他租户的用户回 404 且与不存在的用户逐字节相同、数据库行不变（Java 对应 `mutationLookupsAreTenantScopedAndDoNotRevealForeignUsers`，Java 的状态码是 400）。 |
-| `management/service/ManagementUserServiceIntegrationTests` | 6 | 部分 | "tenant scoped user create response mismatch"、"tenant scoped user login response mismatch"、`test_tenant_scoped_admin_mutations`（跨租户改/删/读与本租户改删） | `adminCannotReadResetOrDeleteUsersFromAnotherTenant` 与 `adminManagesUsersInsideOwnTenant` 有对应断言。C 不存在三项能力：OIDC 绑定、不同租户同登录名（C 的 username 是全局主键，跨租户同名创建得到 409）、按租户限定的登录/刷新。 |
+| `management/service/ManagementUserServiceTests` | 11 | 部分 | "management user create response mismatch"、"management user update response mismatch"、"management user delete response mismatch"、"disabled database user login response mismatch"、`test_tenant_scoped_admin_mutations`（"PUT of another tenant's user"、"DELETE of another tenant's user"、"another tenant's user answered unlike a missing one"）、`storage_tests.c` "management user crossed its tenant" | 前 7 项（OIDC 身份开通与绑定）由 ctest `oidc_tests` 覆盖：新身份开通为默认租户 USER 且口令是随机口令的 PBKDF2 哈希、改名后仍是同一账号、首次登录绑定已有启用用户、停用或已绑定其他身份的用户 `403`、`preferred_username` 不能冒充内置 admin、8 线程并发首次登录只绑定一个身份（`test_concurrent_first_logins_bind_once`）、直连 Bearer 只认已绑定且启用的身份并取当前角色。差异：同名用户只存在于其他租户时 C 拒绝（`403`），Java 会在默认租户另开一个同名账号。不同租户同登录名在 C 不存在（username 是全局主键），大小写不敏感旧登录的歧义因此无从出现。改删只在调用者租户内查找：其他租户的用户回 404 且与不存在的用户逐字节相同、数据库行不变（Java 对应 `mutationLookupsAreTenantScopedAndDoNotRevealForeignUsers`，Java 的状态码是 400）。 |
+| `management/service/ManagementUserServiceIntegrationTests` | 6 | 部分 | "tenant scoped user create response mismatch"、"tenant scoped user login response mismatch"、`test_tenant_scoped_admin_mutations`（跨租户改/删/读与本租户改删） | `adminCannotReadResetOrDeleteUsersFromAnotherTenant` 与 `adminManagesUsersInsideOwnTenant` 有对应断言。`persistsOidcBindingAndReusesItAfterUsernameChanges` 与 `treatsOidcSubjectsAsCaseSensitive` 由 `oidc_tests.c:test_binding_follows_subject` 覆盖。C 不存在两项能力：不同租户同登录名（C 的 username 是全局主键，跨租户同名创建得到 409）、按租户限定的登录/刷新。 |
 | `management/service/UserDiagramDocumentServiceTests` | 4 | 部分 | "diagram create response mismatch"、"diagram detail response mismatch"、"diagram optimistic-lock response mismatch"、"diagram list response mismatch"、"diagram delete response mismatch" | 只在单个账号下测试，跨账号读不到对方文档没有测试。 |
 
 ## 6. 流量观测与管理事件
@@ -171,8 +171,6 @@
 
 ## 对照中发现的 C 行为差异
 
-以下差异都在源码中逐处核实过。它们也是上表中若干“无”或“部分”的原因。原第 4–6 项（HTTP 流忽略 `DATA|END_STREAM`、未知流上的 DATA/FIN/RST 被静默丢弃、入站 `HEARTBEAT_RESPONSE` 被当作协议违规）已由 `fix/c-server-stream-semantics` 修正，并由 `nat_stream_tests` 覆盖。原第 7 项（TURN 私网 peer 策略放行全部 IPv6，且测试从未在策略开启时运行）已由 #132 修正；`fix/c-server-test-gaps` 又修正了同一策略只查第一个对端地址、以及不核对 allocation 身份两处，见第 8 节。
-
-3. **OIDC 只代理 code 交换**：见第 1 节。C 管理 API 只接受本地 HS256 JWT，所以通过 OIDC 登录拿不到 C 管理 API 的访问权限。
+此前列出的编号项都已修正：原第 3 项（OIDC 只代理 code 交换）由 `fix/c-server-oidc` 修正，并由 `oidc_tests` 覆盖；原第 4–6 项（HTTP 流忽略 `DATA|END_STREAM`、未知流上的 DATA/FIN/RST 被静默丢弃、入站 `HEARTBEAT_RESPONSE` 被当作协议违规）由 `fix/c-server-stream-semantics` 修正，并由 `nat_stream_tests` 覆盖；原第 7 项（TURN 私网 peer 策略放行全部 IPv6，且测试从未在策略开启时运行）由 #132 修正，`fix/c-server-test-gaps` 又修正了同一策略只查第一个对端地址、以及不核对 allocation 身份两处，见第 8 节。仍然存在的差异写在上表各行的“说明”列。
 
 `fix/c-server-test-gaps` 补测时发现并修正的其他差异（详见各行）：转发给设备前不改写 `Origin`/`Referer`/`Sec-Fetch-Site`（第 4 节）；Turnstile siteverify 返回非 JSON 时回 `400`、token 被原地改写（第 1 节）；SemVer 解析接受空标识符（第 5 节）；全局采集开关不起作用、预览格式与 body 类型和 Java 不同、摘要列表返回表头与预览（第 6 节）。

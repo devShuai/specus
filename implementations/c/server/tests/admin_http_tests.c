@@ -3745,89 +3745,6 @@ static int test_direct_http_route_authentication(const char *database_path)
     return closed_ok == 0 ? 0 : 1;
 }
 
-typedef struct {
-    int fd;
-    int port;
-    char request[4096];
-} oidc_test_server;
-
-static void *oidc_test_server_thread(void *arg)
-{
-    oidc_test_server *server = (oidc_test_server *)arg;
-    int client = accept(server->fd, NULL, NULL);
-    if (client >= 0) {
-        ssize_t got = recv(client, server->request, sizeof(server->request) - 1U, 0);
-        if (got > 0) {
-            server->request[got] = '\0';
-        }
-        const char body[] = "{\"access_token\":\"access-1\",\"id_token\":\"id-1\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
-        char response[512];
-        int response_len = snprintf(response,
-                                    sizeof(response),
-                                    "HTTP/1.1 200 OK\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Content-Length: %zu\r\n"
-                                    "Connection: close\r\n"
-                                    "\r\n"
-                                    "%s",
-                                    strlen(body),
-                                    body);
-        if (response_len > 0 && (size_t)response_len < sizeof(response)) {
-            (void)send(client, response, (size_t)response_len, 0);
-        }
-        close(client);
-    }
-    return NULL;
-}
-
-static int oidc_test_server_start(oidc_test_server *server, pthread_t *thread)
-{
-    memset(server, 0, sizeof(*server));
-    server->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server->fd < 0) {
-        return -1;
-    }
-    int reuse = 1;
-    (void)setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    (void)setsockopt(server->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    struct sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    if (bind(server->fd, (struct sockaddr *)&address, sizeof(address)) != 0
-        || listen(server->fd, 1) != 0) {
-        close(server->fd);
-        server->fd = -1;
-        return -1;
-    }
-    socklen_t address_len = sizeof(address);
-    if (getsockname(server->fd, (struct sockaddr *)&address, &address_len) != 0) {
-        close(server->fd);
-        server->fd = -1;
-        return -1;
-    }
-    server->port = ntohs(address.sin_port);
-    if (pthread_create(thread, NULL, oidc_test_server_thread, server) != 0) {
-        close(server->fd);
-        server->fd = -1;
-        return -1;
-    }
-    return 0;
-}
-
-static void oidc_test_server_stop(oidc_test_server *server, pthread_t thread)
-{
-    (void)pthread_join(thread, NULL);
-    if (server->fd >= 0) {
-        close(server->fd);
-        server->fd = -1;
-    }
-}
-
 /*
  * The egress policy endpoint end to end. The rule-by-rule semantics are replayed from the shared
  * vector in peer_egress_tests; what is checked here is that a refused list refuses the whole
@@ -6518,32 +6435,17 @@ int main(void)
         fprintf(stderr, "oidc configured response mismatch\n");
         return 1;
     }
-    oidc_test_server oidc_server;
-    pthread_t oidc_thread;
-    if (oidc_test_server_start(&oidc_server, &oidc_thread) != 0) {
-        fprintf(stderr, "oidc test server start failed\n");
-        return 1;
-    }
-    char oidc_endpoint[128];
-    snprintf(oidc_endpoint, sizeof(oidc_endpoint), "http://127.0.0.1:%d/token", oidc_server.port);
-    setenv("SPECUS_OIDC_TOKEN_ENDPOINT", oidc_endpoint, 1);
+    /* The full exchange runs against a fake identity provider in oidc_tests.c. Here: a callback
+     * without the browser's nonce is refused before the token endpoint is contacted. */
     len = st_admin_build_response_with_body("POST",
                                             "/oidc/token",
                                             "{\"code\":\"abc\",\"codeVerifier\":\"verifier value\"}",
                                             response,
                                             sizeof(response));
-    oidc_test_server_stop(&oidc_server, oidc_thread);
-    if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"accessToken\":\"access-1\"")
-        || !contains(response, "\"idToken\":\"id-1\"")
-        || !contains(response, "\"tokenType\":\"Bearer\"")
-        || !contains(response, "\"expiresIn\":3600")
-        || !contains(oidc_server.request, "POST /token HTTP/1.1")
-        || !contains(oidc_server.request, "grant_type=authorization_code")
-        || !contains(oidc_server.request, "code=abc")
-        || !contains(oidc_server.request, "code_verifier=verifier+value")
-        || !contains(oidc_server.request, "client_id=admin-spa")) {
-        fprintf(stderr, "oidc http token exchange response mismatch\n");
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "缺少 code、code_verifier 或 nonce")
+        || contains(response, "accessToken")) {
+        fprintf(stderr, "oidc token exchange without nonce response mismatch\n");
         return 1;
     }
     unsetenv("SPECUS_OIDC_CLIENT_ID");
