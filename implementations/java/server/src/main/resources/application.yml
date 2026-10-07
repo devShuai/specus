@@ -31,6 +31,7 @@ spring:
       hibernate.jdbc.batch_size: ${SPECUS_DB_BATCH_SIZE:50}
       hibernate.order_inserts: true
       hibernate.order_updates: true
+      # SQLite reads schema metadata table by table: see SqliteSchemaMetadataConfiguration.
   task:
     scheduling:
       # S1.4: flushHttp/flushTcp are separate @Scheduled methods; the default pool size 1
