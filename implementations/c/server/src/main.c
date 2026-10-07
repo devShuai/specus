@@ -2132,6 +2132,7 @@ static void connectivity_probe(void *ctx,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
+    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -2193,10 +2194,12 @@ static void connectivity_probe(void *ctx,
         }
     }
 
-    pthread_mutex_lock(&session->direct_lock);
-    direct_pending_remove(session, &pending);
-    direct_pending_free_events(&pending);
-    pthread_mutex_unlock(&session->direct_lock);
+    /*
+     * Tombstoned like a public stream: the device's own RST may cross the one sent above, or follow
+     * it when the device fails the request it was told to drop. Either is a stale frame then, not an
+     * RST for a never-opened stream that would close the whole data connection.
+     */
+    direct_pending_retire(session, &pending);
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
