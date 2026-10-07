@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.management.repository;
 
 import com.theshuai.specusserver.management.model.HttpMediaCapture;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -14,6 +15,7 @@ public interface HttpMediaCaptureRepository extends JpaRepository<HttpMediaCaptu
     Optional<HttpMediaCapture> findByTenantIdAndDeduplicationKey(
             String tenantId, String deduplicationKey);
 
+    /** {@code expiresAt} and the column are {@link SortableInstant} text, so the string order is the time order. */
     Optional<HttpMediaCapture>
     findFirstByTenantIdAndResourceKeyAndMediaKindAndContentRangeStartAndContentRangeEndAndTotalBytesAndCapturedBytesAndContentEncodingAndStateAndExpiresAtAfterOrderByIdDesc(
             String tenantId,
@@ -53,6 +55,7 @@ public interface HttpMediaCaptureRepository extends JpaRepository<HttpMediaCaptu
     List<HttpMediaCapture> findTop1000ByTenantIdAndClientIdAndRouteAndMediaKindAndStateOrderByIdDesc(
             String tenantId, Long clientId, String route, String mediaKind, String state);
 
+    /** {@code expiresAt} and the column are {@link SortableInstant} text, so the string order is the time order. */
     List<HttpMediaCapture> findTop200ByStateInAndExpiresAtBeforeOrderByIdAsc(
             List<String> states, String expiresAt);
 }

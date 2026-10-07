@@ -32,7 +32,7 @@ public class DatabaseInitializer {
     private final ManagementUserSchemaMigrator managementUserSchemaMigrator;
     private final ClientDownloadSchemaMigrator clientDownloadSchemaMigrator;
     private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
-    private final TransferTimestampMigrator transferTimestampMigrator;
+    private final SortableTimestampMigrator sortableTimestampMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
     private final boolean seedDemoClient;
     private final String databasePlatform;
@@ -46,7 +46,7 @@ public class DatabaseInitializer {
                                ManagementUserSchemaMigrator managementUserSchemaMigrator,
                                ClientDownloadSchemaMigrator clientDownloadSchemaMigrator,
                                PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
-                               TransferTimestampMigrator transferTimestampMigrator,
+                               SortableTimestampMigrator sortableTimestampMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
@@ -60,7 +60,7 @@ public class DatabaseInitializer {
         this.managementUserSchemaMigrator = managementUserSchemaMigrator;
         this.clientDownloadSchemaMigrator = clientDownloadSchemaMigrator;
         this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
-        this.transferTimestampMigrator = transferTimestampMigrator;
+        this.sortableTimestampMigrator = sortableTimestampMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
@@ -85,7 +85,7 @@ public class DatabaseInitializer {
         managementUserSchemaMigrator.migrate();
         clientDownloadSchemaMigrator.migrate();
         peerServiceDiscoverySchemaMigrator.migrate();
-        transferTimestampMigrator.migrate();
+        sortableTimestampMigrator.migrate();
         widenHttpBodyTextColumns();
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();

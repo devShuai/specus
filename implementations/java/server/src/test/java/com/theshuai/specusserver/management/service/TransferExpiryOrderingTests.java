@@ -2,7 +2,7 @@ package com.theshuai.specusserver.management.service;
 
 import com.theshuai.specusserver.config.ObjectStorageProperties;
 import com.theshuai.specusserver.config.PublicTransferProperties;
-import com.theshuai.specusserver.database.TransferTimestampMigrator;
+import com.theshuai.specusserver.database.SortableTimestampMigrator;
 import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.TransferAttachment;
 import com.theshuai.specusserver.management.model.TransferAttachmentDownloadGrant;
@@ -49,7 +49,7 @@ class TransferExpiryOrderingTests {
     @Autowired private TransferAttachmentDownloadUsageRepository downloadUsageRepository;
     @Autowired private ClientAccountService clientAccountService;
     @Autowired private PublicTransferRoomService publicTransferRoomService;
-    @Autowired private TransferTimestampMigrator migrator;
+    @Autowired private SortableTimestampMigrator migrator;
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private EntityManager entityManager;
 

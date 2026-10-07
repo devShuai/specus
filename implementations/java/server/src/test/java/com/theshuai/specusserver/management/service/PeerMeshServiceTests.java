@@ -10,6 +10,7 @@ import com.theshuai.specusserver.management.model.PeerMeshAcl;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
 import com.theshuai.specusserver.management.model.PeerMeshSession;
 import com.theshuai.specusserver.management.model.PeerMeshSharedService;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
@@ -32,6 +33,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -319,6 +322,22 @@ class PeerMeshServiceTests {
         assertThat(reverse.session().id()).isEqualTo(first.session().id());
         assertThat(reverse.token()).isEqualTo(first.token());
         verify(sessionRepository, times(1)).save(any(PeerMeshSession.class));
+        // The sweep compares the stored expiry as text; views and signalling keep the Instant.toString() form.
+        assertThat(saved.get().getExpiresAt()).hasSize(SortableInstant.LENGTH);
+        String expiresAt = Instant.parse(saved.get().getExpiresAt()).toString();
+        assertThat(first.session().expiresAt()).isEqualTo(expiresAt);
+        assertThat(second.session().expiresAt()).isEqualTo(expiresAt);
+    }
+
+    @Test
+    void expirySweepComparesAFixedWidthNow() {
+        when(sessionRepository.findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(any(), any(), any()))
+                .thenReturn(List.of());
+
+        service.expireStaleSessions();
+
+        verify(sessionRepository).findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(
+                eq(PeerMeshService.STATUS_CLOSED), argThat(now -> now.length() == SortableInstant.LENGTH), any());
     }
 
     @Test

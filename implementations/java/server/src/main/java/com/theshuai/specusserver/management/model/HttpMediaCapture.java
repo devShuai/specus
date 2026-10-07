@@ -119,6 +119,7 @@ public class HttpMediaCapture {
     @Column(name = "completed_at", length = 40)
     private String completedAt;
 
+    /** {@link SortableInstant} text: the retention sweep and the reuse lookup compare it as a string. */
     @Column(name = "expires_at", nullable = false, length = 40)
     private String expiresAt;
 }

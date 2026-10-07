@@ -4,6 +4,7 @@ import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.specusserver.management.model.ConnectionRecord;
 import com.theshuai.specusserver.management.model.ConnectionRecordView;
 import com.theshuai.specusserver.management.model.DisconnectReason;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
@@ -23,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -50,7 +52,7 @@ public class ConnectionRecordService {
     @Transactional
     public long recordConnection(AuthenticationResult result, LoginRequestPacket packet,
                                  String channelId, String remoteAddress) {
-        String now = Instant.now().toString();
+        Instant now = Instant.now();
         ConnectionRecord record = new ConnectionRecord();
         String tenantId = result.account() == null
                 ? TenantContext.DEFAULT_TENANT_ID
@@ -61,8 +63,8 @@ public class ConnectionRecordService {
         record.setClientName(StringUtils.hasText(clientName) ? clientName : "unknown-client");
         record.setChannelId(channelId);
         record.setRemoteAddress(remoteAddress);
-        record.setConnectedAt(now);
-        record.setDisconnectedAt(result.success() ? null : now);
+        record.setConnectedAt(SortableInstant.format(now));
+        record.setDisconnectedAt(result.success() ? null : now.toString());
         record.setSuccess(result.success());
         record.setFailureReason(result.reason());
         // 登录失败直接落 LOGIN_FAILURE；成功的行等 channelInactive 再写。
@@ -108,9 +110,9 @@ public class ConnectionRecordService {
     @EventListener(ApplicationReadyEvent.class)
     @Transactional
     public void closeStaleOpenRecordsOnStartup() {
-        String cutoff = Instant.now().toString();
+        Instant cutoff = Instant.now();
         int closed = connectionRecordRepository.closeOpenRecordsBefore(
-                cutoff, DisconnectReason.SERVER_RESTARTED.name());
+                SortableInstant.format(cutoff), cutoff.toString(), DisconnectReason.SERVER_RESTARTED.name());
         if (closed > 0) {
             log.info("closed {} stale open connection record(s) at startup (cutoff={}, reason={})",
                     closed, cutoff, DisconnectReason.SERVER_RESTARTED);
@@ -169,14 +171,26 @@ public class ConnectionRecordService {
                 predicates.add(cb.equal(root.get("success"), filter.success()));
             }
             if (StringUtils.hasText(filter.from())) {
-                predicates.add(cb.greaterThanOrEqualTo(root.get("connectedAt"), filter.from()));
+                predicates.add(cb.greaterThanOrEqualTo(root.get("connectedAt"), connectedAtBound(filter.from())));
             }
             if (StringUtils.hasText(filter.to())) {
-                predicates.add(cb.lessThanOrEqualTo(root.get("connectedAt"), filter.to()));
+                predicates.add(cb.lessThanOrEqualTo(root.get("connectedAt"), connectedAtBound(filter.to())));
             }
             return predicates.isEmpty() ? cb.conjunction() : cb.and(predicates.toArray(new Predicate[0]));
         };
         return connectionRecordRepository.findAll(spec, pageable).map(this::toView);
+    }
+
+    /**
+     * An instant bound such as the console's {@code 2026-09-15T00:00:00Z} compares in time order with
+     * the stored fixed width only in that same form. Anything else, a bare date say, compares as given.
+     */
+    private static String connectedAtBound(String bound) {
+        try {
+            return SortableInstant.normalize(bound.trim());
+        } catch (DateTimeParseException notAnInstant) {
+            return bound;
+        }
     }
 
     private boolean isDenied(List<Long> visibleClientIds, Long clientId) {
@@ -194,7 +208,7 @@ public class ConnectionRecordService {
                 record.getClientName(),
                 record.getChannelId(),
                 record.getRemoteAddress(),
-                record.getConnectedAt(),
+                SortableInstant.toInstantString(record.getConnectedAt()),
                 record.getDisconnectedAt(),
                 record.isSuccess(),
                 record.getFailureReason(),
