@@ -305,6 +305,13 @@ static void test_store(void)
                    detail->response_truncated);
             EXPECT(strstr(detail->response_headers, "Content-Encoding: gzip") != NULL, "detail headers %s",
                    detail->response_headers);
+            /* gzipHttpBodyIsDecodedBeforeStored: the stored body is the bytes as they came. */
+            EXPECT(detail->response_body_data_len == gzip_len
+                       && memcmp(detail->response_body_data, gzip, gzip_len) == 0
+                       && detail->request_body_data_len == 4U && memcmp(detail->request_body_data, "ping", 4U) == 0,
+                   "stored bodies: %zu response bytes of %zu, %zu request bytes", detail->response_body_data_len,
+                   gzip_len, detail->request_body_data_len);
+            st_storage_http_exchange_free_bodies(detail);
         }
         found = 1;
         EXPECT(st_storage_get_http_exchange_visible(path, summary->id, "tenant-a", "bob", 0, detail, &found) == 0
