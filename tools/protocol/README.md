@@ -21,6 +21,7 @@ python tools/protocol/verify_peer_egress_vectors.py
 | `generate_temporary_share_vectors.py` | `protocol/test-vectors/temporary-http-share-v1.json`（临时 HTTP 分享草案的创建、兑换、访问判定、级联失效、审计与限流；见 [`temporary-http-share.md`](../../protocol/spec/temporary-http-share.md)） |
 | `generate_service_connectivity_vectors.py` | `protocol/test-vectors/service-connectivity-check-v1.json`（服务连通性检查草案的四阶段状态机与限流；见 [`service-connectivity-check.md`](../../protocol/spec/service-connectivity-check.md)） |
 | `generate_service_workbench_vectors.py` | `protocol/test-vectors/service-workbench-v1.json`（服务工作台：收藏与最近打开的上限、保留期、排序、隔离与级联；见 [`service-workbench.md`](../../protocol/spec/service-workbench.md)） |
+| `generate_product_metrics_vectors.py` | `protocol/test-vectors/product-metrics-v1.json`（产品指标的上报校验、分桶、接入队列、计数、限流、保存期与汇总；见 [`product-metrics.md`](../../protocol/spec/product-metrics.md)） |
 
 两个生成器各自带一份参考实现（规则匹配器、授权判定器），写文件前会用它断言每条期望，
 因此向量不会带着自相矛盾的用例发布。

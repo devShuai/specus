@@ -865,6 +865,51 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         /*
+         * Opt-in product metrics (protocol/spec/product-metrics.md section 6), the same four tables
+         * as the Go, Java and .NET servers: the per-tenant switch, onboarding progress per account
+         * (only for the 14-day window) and two daily counters without any user column. Times are
+         * epoch milliseconds, days UTC "YYYY-MM-DD" text. No foreign keys, no other indexes. Every
+         * read and write lives in product_metrics.c.
+         */
+        rc = exec_sql(db,
+            "CREATE TABLE IF NOT EXISTS product_metrics_switch ("
+            "tenant_id VARCHAR(80) NOT NULL PRIMARY KEY,"
+            "enabled INTEGER NOT NULL DEFAULT 0,"
+            "updated_by VARCHAR(80),"
+            "updated_at BIGINT,"
+            "purged_at BIGINT"
+            ");"
+            "CREATE TABLE IF NOT EXISTS product_metrics_onboarding_progress ("
+            "tenant_id VARCHAR(80) NOT NULL,"
+            "username VARCHAR(80) NOT NULL,"
+            "started_at BIGINT NOT NULL,"
+            "signed_in_at BIGINT,"
+            "credential_created_at BIGINT,"
+            "client_online_at BIGINT,"
+            "PRIMARY KEY (tenant_id, username)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS product_metrics_onboarding_daily ("
+            "tenant_id VARCHAR(80) NOT NULL,"
+            "cohort_day VARCHAR(10) NOT NULL,"
+            "reached_step VARCHAR(32) NOT NULL,"
+            "duration_bucket VARCHAR(16) NOT NULL,"
+            "users BIGINT NOT NULL,"
+            "PRIMARY KEY (tenant_id, cohort_day, reached_step, duration_bucket)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS product_metrics_transfer_daily ("
+            "tenant_id VARCHAR(80) NOT NULL,"
+            "day VARCHAR(10) NOT NULL,"
+            "mode VARCHAR(16) NOT NULL,"
+            "path VARCHAR(16) NOT NULL,"
+            "size_bucket VARCHAR(16) NOT NULL,"
+            "attempt VARCHAR(32) NOT NULL,"
+            "outcome VARCHAR(16) NOT NULL,"
+            "count BIGINT NOT NULL,"
+            "PRIMARY KEY (tenant_id, day, mode, path, size_bucket, attempt, outcome)"
+            ");");
+    }
+    if (rc == 0) {
+        /*
          * Temporary HTTP shares and the audit of who changed access to a route
          * (protocol/spec/temporary-http-share.md). The names and columns are shared by every
          * server; times are integer epoch seconds and only the token's SHA-256 is stored.

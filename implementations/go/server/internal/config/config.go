@@ -27,6 +27,7 @@ type Config struct {
 	PeerMesh         PeerMeshConfig         `json:"peerMesh"`
 	ObjectStorage    ObjectStorageConfig    `json:"objectStorage"`
 	PublicTransfer   PublicTransferConfig   `json:"publicTransfer"`
+	ProductMetrics   ProductMetricsConfig   `json:"productMetrics"`
 	Oidc             OidcConfig             `json:"oidc"`
 	TLS              TLSConfig              `json:"tls"`
 	// Env is the deployment environment: prod (default) | dev | test. Unset or unknown values
@@ -341,6 +342,13 @@ type ObjectStorageConfig struct {
 	ExpirationScanIntervalMs         int64  `json:"expirationScanIntervalMs"`
 }
 
+// ProductMetricsConfig is the deployment-level switch of the opt-in product metrics
+// (protocol/spec/product-metrics.md section 13). Allowed (default true) lets tenant admins switch
+// metrics on; false keeps every tenant off and collects nothing.
+type ProductMetricsConfig struct {
+	Allowed bool `json:"allowed"`
+}
+
 // PublicTransferConfig mirrors specus.public-transfer abuse-protection limits.
 type PublicTransferConfig struct {
 	PresignRateLimitPerIP                  int    `json:"presignRateLimitPerIp"`
@@ -542,6 +550,7 @@ func Default() Config {
 			PairingCodeRedeemRateLimitPerIP:         10,
 			PairingCodeRedeemRateLimitWindowSeconds: 300,
 		},
+		ProductMetrics: ProductMetricsConfig{Allowed: true},
 		Oidc: OidcConfig{
 			Issuer:                "https://certus.devshuai.com",
 			JwkSetURI:             "https://certus.devshuai.com/oauth2/jwks",
@@ -703,6 +712,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("SPECUS_AUTH_TURNSTILE_VERIFY_URL", &cfg.Auth.Turnstile.VerifyURL)
 	setStrSlice("SPECUS_AUTH_TURNSTILE_ALLOWED_HOSTNAMES", &cfg.Auth.Turnstile.AllowedHostnames)
 	setBool("SPECUS_AUTH_EMAIL_VERIFICATION_ENABLED", &cfg.Auth.EmailVerification.Enabled)
+	setBool("SPECUS_PRODUCT_METRICS_ALLOWED", &cfg.ProductMetrics.Allowed)
 	setStr("SPECUS_AUTH_EMAIL_FROM_ADDRESS", &cfg.Auth.EmailVerification.FromAddress)
 	setStr("SPECUS_AUTH_EMAIL_FROM_NAME", &cfg.Auth.EmailVerification.FromName)
 	setStr("SPECUS_AUTH_EMAIL_SUBJECT", &cfg.Auth.EmailVerification.Subject)
