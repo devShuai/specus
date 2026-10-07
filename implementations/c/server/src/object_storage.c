@@ -1115,8 +1115,9 @@ static int object_normalize_filename(const char *input, char out[256])
     }
     size_t keep = normalized.len > 180U ? 180U : normalized.len;
     if (normalized.len > 180U) {
+        /* As Java and public-transfer.md 3.2.1: neither a leading nor a trailing dot is an extension. */
         char *dot = strrchr(normalized.data, '.');
-        if (dot != NULL && dot != normalized.data) {
+        if (dot != NULL && dot != normalized.data && dot[1] != '\0') {
             size_t extension_len = normalized.len - (size_t)(dot - normalized.data);
             if (extension_len < 180U) {
                 size_t base_len = 180U - extension_len;
