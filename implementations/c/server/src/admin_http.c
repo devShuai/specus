@@ -14666,6 +14666,14 @@ static void admin_drain_websocket(st_admin_ws_client *client)
                 }
             }
         }
+        /* A browser masks every frame (RFC 6455 5.1); Java's container closes 1002 otherwise. The
+         * frame is read first so that the close is not cut off by unread input. */
+        if (!masked) {
+            uint8_t close_payload[2] = {0x03U, 0xeaU};
+            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            free(payload);
+            return;
+        }
         if (opcode == 0x8U) {
             admin_ws_send_frame(client, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
             free(payload);
@@ -14675,6 +14683,12 @@ static void admin_drain_websocket(st_admin_ws_client *client)
             admin_ws_send_frame(client, 0xAU, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
         }
         free(payload);
+        /* Java's TextWebSocketHandler refuses binary messages with 1003; text is ignored. */
+        if (opcode == 0x2U) {
+            uint8_t close_payload[2] = {0x03U, 0xebU};
+            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+            return;
+        }
     }
 }
 
@@ -14749,14 +14763,14 @@ static void *admin_client_message_write_thread(void *arg)
                                                write->message,
                                                NULL);
         } else {
+            /* Java reports any failed write to the target channel as target-write-failed, also
+             * when the control connection went away after the online check. */
             (void)admin_ws_send_message_status(write->client,
-                                               send_rc == -1 ? "error" : "failed",
+                                               "failed",
                                                write->message_id,
                                                NULL,
                                                NULL,
-                                               send_rc == -1
-                                                   ? "target-offline"
-                                                   : "target-write-failed");
+                                               "target-write-failed");
         }
     }
     admin_ws_release_client_message_write(write->client);

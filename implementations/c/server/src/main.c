@@ -2708,6 +2708,37 @@ static int message_body_has_text(const char *value)
     return 0;
 }
 
+/*
+ * Java MessageRequestHandler.clientToClient for an admin:<username> target: the sending account
+ * must still exist and be enabled, and the administrator sees its stored name, in its stored
+ * tenant. Without a database there is no account to check, so the session's own name and tenant
+ * stand in.
+ */
+static int deliver_runtime_client_message_to_admin(specus_session *source_session,
+                                                   const st_message_response *request)
+{
+    if (source_session == NULL || request == NULL) {
+        return -1;
+    }
+    if (source_session->config.database_path[0] == '\0') {
+        return st_admin_deliver_client_message_to_admin(source_session->config.tenant_id,
+                                                        source_session->config.client_name,
+                                                        request->to_client_name,
+                                                        request->message);
+    }
+    st_storage_client source;
+    if (st_storage_get_client_by_name(source_session->config.database_path,
+                                      source_session->config.client_name,
+                                      &source) != 0
+        || !source.enabled) {
+        return -1;
+    }
+    return st_admin_deliver_client_message_to_admin(source.tenant_id,
+                                                    source.client_name,
+                                                    request->to_client_name,
+                                                    request->message);
+}
+
 static int forward_runtime_client_message(specus_session *source_session,
                                           const st_message_response *request)
 {
@@ -4839,10 +4870,7 @@ static void *client_thread(void *arg)
                 && message_request.message != NULL) {
                 int admin_target = message_target_is_admin(message_request.to_client_name);
                 int delivery_rc = admin_target
-                    ? st_admin_deliver_client_message_to_admin(session->config.tenant_id,
-                                                               session->config.client_name,
-                                                               message_request.to_client_name,
-                                                               message_request.message)
+                    ? deliver_runtime_client_message_to_admin(session, &message_request)
                     : forward_runtime_client_message(session, &message_request);
                 printf("[message] client->%s %s source=%s target=%s\n",
                        admin_target ? "admin" : "client",
