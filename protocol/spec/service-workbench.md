@@ -48,7 +48,7 @@
 - 没有通用审计表。Peer 服务审计在 Java、Go、.NET 中是内存里最近 80 条，C 落在 SQLite 里，每租户保留 80 条。
 - 建表方式：Java 用 Hibernate `ddl-auto: update` 加手写迁移器；Go 维护 SQLite/PostgreSQL/MySQL 三份 DDL 和 `ensureColumn`；.NET 是三个提供程序各自的 EF Core 迁移加启动时的幂等 SQL；C 在 `st_storage_init` 里 `CREATE TABLE IF NOT EXISTS`。都不使用外键。
 - 对象 id：Java、Go、.NET 的 HTTP route、TCP 映射和 Peer 服务 id 由应用随机生成，范围在 JavaScript 安全整数之内；C 的 route 与映射用 `AUTOINCREMENT`。Java 删除客户端时不删除其 route 和映射行。
-- C 的管理接口把列表截断在每页 64 条（route、映射），JSON 响应必须放进 32 KiB 缓冲区。
+- C 的管理接口曾把每个客户端的 route、映射限制在 64 条，JSON 响应必须放进 32 KiB 缓冲区；现在与 Java 一样不限条数（#191），唯一的边界是单条 `NAT_CONTROL` 消息 1 MiB 的上限，超出的新增或启用在创建时即被拒绝。
 
 ### 1.4 「待处理问题」能用的现有状态
 
