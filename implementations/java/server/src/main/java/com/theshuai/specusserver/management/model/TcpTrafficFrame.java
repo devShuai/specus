@@ -10,6 +10,7 @@ import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.Length;
 
 @Entity
 @Table(name = "specus_tcp_traffic_frame",
@@ -84,8 +85,9 @@ public class TcpTrafficFrame {
     @Column(name = "payload_bytes", nullable = false)
     private long payloadBytes;
 
+    // A @Lob column keeps @Column's default length of 255, which MySQL turns into tinyblob.
     @Lob
-    @Column(name = "payload_data")
+    @Column(name = "payload_data", length = Length.LONG32)
     private byte[] payloadData;
 
     @Column(name = "payload_preview_hex", length = 4096)
