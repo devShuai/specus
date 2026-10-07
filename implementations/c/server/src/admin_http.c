@@ -4530,60 +4530,227 @@ static int handle_peer_mesh_sessions_close_open(const st_admin_context *context,
     return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
 }
 
+/* A JSON number for a double the way Java's Double.toString writes it here: 0.75, 12.5, 80.0. */
+static int admin_sb_append_json_double(st_admin_string_builder *builder, double value)
+{
+    char text[64];
+    double magnitude = value < 0.0 ? -value : value;
+    /* Java writes plain decimals from 1e-3 up to 1e7, with at least one fractional digit. */
+    int plain = value == 0.0 || (magnitude >= 1e-3 && magnitude < 1e7);
+    for (int precision = 1; precision <= 17; ++precision) {
+        snprintf(text, sizeof(text), plain ? "%.*f" : "%.*g", precision, value);
+        if (strtod(text, NULL) == value) {
+            break;
+        }
+    }
+    return admin_sb_append(builder, text);
+}
+
+/* Adds devices to label's count in a list kept in first-seen order, as Java's LinkedHashMap. */
+typedef struct {
+    char label[128];
+    long long devices;
+} admin_peer_mesh_count;
+
+static int admin_peer_mesh_count_merge(admin_peer_mesh_count **items, size_t *count, const char *label,
+                                       long long devices)
+{
+    for (size_t i = 0; i < *count; ++i) {
+        if (strcmp((*items)[i].label, label) == 0) {
+            (*items)[i].devices += devices;
+            return 0;
+        }
+    }
+    admin_peer_mesh_count *grown = (admin_peer_mesh_count *)realloc(*items, (*count + 1U) * sizeof(**items));
+    if (grown == NULL) {
+        return -1;
+    }
+    *items = grown;
+    snprintf(grown[*count].label, sizeof(grown[*count].label), "%s", label);
+    grown[*count].devices = devices;
+    ++*count;
+    return 0;
+}
+
+static int admin_peer_mesh_has_text(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Java PeerMeshService.normalizeNatBehavior: the trimmed value, or UNKNOWN when blank. */
+static void admin_peer_mesh_nat_behavior(const char *value, char *out, size_t out_len)
+{
+    if (!admin_peer_mesh_has_text(value)) {
+        snprintf(out, out_len, "UNKNOWN");
+        return;
+    }
+    const char *start = value;
+    while (isspace((unsigned char)*start)) ++start;
+    size_t len = strlen(start);
+    while (len > 0U && isspace((unsigned char)start[len - 1U])) --len;
+    snprintf(out, out_len, "%.*s", (int)len, start);
+}
+
+static int admin_peer_mesh_nat_behavior_classified(const char *value)
+{
+    return admin_peer_mesh_has_text(value) && admin_ascii_casecmp(value, "UNKNOWN") != 0
+        && admin_ascii_casecmp(value, "UNSUPPORTED") != 0;
+}
+
+static int admin_peer_mesh_append_counts(st_admin_string_builder *builder, const char *name, const char *key,
+                                         const admin_peer_mesh_count *items, size_t count)
+{
+    int rc = admin_sb_appendf(builder, ",\"%s\":[", name);
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        rc = admin_sb_appendf(builder, "%s{\"%s\":", i == 0U ? "" : ",", key);
+        if (rc == 0) rc = admin_sb_append_json_string(builder, items[i].label);
+        if (rc == 0) rc = admin_sb_appendf(builder, ",\"devices\":%lld}", items[i].devices);
+    }
+    return rc == 0 ? admin_sb_append(builder, "]") : rc;
+}
+
+/*
+ * Java PeerMeshService.pathStats (and Go/.NET): totals and the direct ratio of the active sessions
+ * from the (path type, status) groups, those groups with their reported count, mean RTT and bytes,
+ * the address-family groups, NAT types (blank as UNKNOWN), and the NAT behaviour distribution of the
+ * devices that reported any behaviour, with the share whose mapping and filtering were classified.
+ */
 static int build_peer_mesh_stats_response(const st_admin_context *context, char *out, size_t out_len)
 {
     const char *database_path = admin_database_path();
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
-    size_t count = 0U;
+    st_storage_peer_mesh_stats stats;
+    memset(&stats, 0, sizeof(stats));
     if (database_path != NULL
-        && st_storage_list_peer_mesh_sessions_visible(database_path, context->tenant_id,
-            context->username, context->admin, 1, ST_ADMIN_MAX_PEER_SESSIONS,
-            sessions, ST_ADMIN_MAX_PEER_SESSIONS, &count) != 0) {
+        && (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+            || st_storage_peer_mesh_stats_visible(database_path, context->tenant_id, context->username,
+                                                  context->admin, &stats) != 0)) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
     }
-    long long reported = 0, active = 0, direct = 0, relay = 0;
-    long long direct_bytes = 0, relay_bytes = 0;
-    for (size_t i = 0; i < count; ++i) {
-        int is_reported = sessions[i].rtt_millis >= 0 || sessions[i].local_endpoint[0] != '\0'
-            || sessions[i].remote_endpoint[0] != '\0' || sessions[i].last_traffic_at[0] != '\0';
-        if (is_reported) ++reported;
-        if (strcmp(sessions[i].status, "ACTIVE") == 0) {
-            ++active;
-            if (strcmp(sessions[i].path_type, "RELAY") == 0) ++relay;
-            else if (strcmp(sessions[i].path_type, "DIRECT") == 0) ++direct;
+    long long total = 0, reported = 0, active = 0, active_direct = 0, active_relay = 0;
+    for (size_t i = 0; i < stats.path_count; ++i) {
+        const st_storage_peer_mesh_path_aggregate *item = &stats.paths[i];
+        total += item->sessions;
+        reported += item->reported_sessions;
+        if (strcmp(item->status, "ACTIVE") == 0) {
+            active += item->sessions;
+            if (strcmp(item->path_type, "DIRECT") == 0) active_direct += item->sessions;
+            else if (strcmp(item->path_type, "RELAY") == 0) active_relay += item->sessions;
         }
-        direct_bytes += sessions[i].direct_bytes;
-        relay_bytes += sessions[i].relay_bytes;
     }
-    char body[4096];
-    int written = snprintf(body, sizeof(body),
-        "{\"totalSessions\":%zu,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
-        "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":%s,"
-        "\"pathTypes\":[{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
-        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":%lld,\"relayBytes\":0},"
-        "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
-        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":%lld}],"
-        "\"addressFamilies\":[],\"natTypes\":[],\"natBehaviorDevices\":0,"
-        "\"natBehaviorClassifiedDevices\":0,\"natBehaviorSuccessRatio\":null,"
-        "\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],\"natBehaviorDiscoveries\":[]}",
-        count, reported, active, direct, relay, active > 0 ? "0" : "null",
-        direct, direct, direct_bytes, relay, relay, relay_bytes);
-    if (written < 0 || (size_t)written >= sizeof(body)) {
+    admin_peer_mesh_count *nat_types = NULL, *mappings = NULL, *filterings = NULL, *discoveries = NULL;
+    size_t nat_type_count = 0U, mapping_count = 0U, filtering_count = 0U, discovery_count = 0U;
+    long long behavior_devices = 0, classified_devices = 0;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stats.nat_type_count; ++i) {
+        const st_storage_peer_mesh_nat_aggregate *item = &stats.nat_types[i];
+        rc = admin_peer_mesh_count_merge(&nat_types, &nat_type_count,
+                                         admin_peer_mesh_has_text(item->nat_type) ? item->nat_type : "UNKNOWN",
+                                         item->devices);
+    }
+    for (size_t i = 0; rc == 0 && i < stats.behavior_count; ++i) {
+        const st_storage_peer_mesh_behavior_aggregate *item = &stats.behaviors[i];
+        if (!admin_peer_mesh_has_text(item->mapping) && !admin_peer_mesh_has_text(item->filtering)
+            && !admin_peer_mesh_has_text(item->discovery)) {
+            continue;
+        }
+        char mapping[128], filtering[128], discovery[128];
+        admin_peer_mesh_nat_behavior(item->mapping, mapping, sizeof(mapping));
+        admin_peer_mesh_nat_behavior(item->filtering, filtering, sizeof(filtering));
+        admin_peer_mesh_nat_behavior(item->discovery, discovery, sizeof(discovery));
+        behavior_devices += item->devices;
+        if (admin_peer_mesh_nat_behavior_classified(mapping) && admin_peer_mesh_nat_behavior_classified(filtering)) {
+            classified_devices += item->devices;
+        }
+        rc = admin_peer_mesh_count_merge(&mappings, &mapping_count, mapping, item->devices);
+        if (rc == 0) rc = admin_peer_mesh_count_merge(&filterings, &filtering_count, filtering, item->devices);
+        if (rc == 0) rc = admin_peer_mesh_count_merge(&discoveries, &discovery_count, discovery, item->devices);
+    }
+
+    st_admin_string_builder builder = {0};
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder,
+                              "{\"totalSessions\":%lld,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
+                              "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":",
+                              total, reported, active, active_direct, active_relay);
+    }
+    if (rc == 0) {
+        rc = active == 0 ? admin_sb_append(&builder, "null")
+                         : admin_sb_append_json_double(&builder, (double)active_direct / (double)active);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"pathTypes\":[");
+    for (size_t i = 0; rc == 0 && i < stats.path_count; ++i) {
+        const st_storage_peer_mesh_path_aggregate *item = &stats.paths[i];
+        rc = admin_sb_append(&builder, i == 0U ? "{\"pathType\":" : ",{\"pathType\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->path_type);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->status);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"sessions\":%lld,\"reportedSessions\":%lld,\"avgRttMillis\":",
+                                  item->sessions, item->reported_sessions);
+        }
+        if (rc == 0) {
+            rc = item->has_avg_rtt ? admin_sb_append_json_double(&builder, item->avg_rtt_millis)
+                                   : admin_sb_append(&builder, "null");
+        }
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"directBytes\":%lld,\"relayBytes\":%lld}",
+                                  item->direct_bytes, item->relay_bytes);
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "],\"addressFamilies\":[");
+    for (size_t i = 0; rc == 0 && i < stats.family_count; ++i) {
+        const st_storage_peer_mesh_family_aggregate *item = &stats.families[i];
+        rc = admin_sb_append(&builder, i == 0U ? "{\"addressFamily\":" : ",{\"addressFamily\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->address_family);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->status);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"pathType\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->path_type);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"sessions\":%lld,\"reportedSessions\":%lld}",
+                                  item->sessions, item->reported_sessions);
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc == 0) rc = admin_peer_mesh_append_counts(&builder, "natTypes", "natType", nat_types, nat_type_count);
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder, ",\"natBehaviorDevices\":%lld,\"natBehaviorClassifiedDevices\":%lld,"
+                              "\"natBehaviorSuccessRatio\":", behavior_devices, classified_devices);
+    }
+    if (rc == 0) {
+        rc = behavior_devices == 0
+            ? admin_sb_append(&builder, "null")
+            : admin_sb_append_json_double(&builder, (double)classified_devices / (double)behavior_devices);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natMappingBehaviors", "behavior", mappings, mapping_count);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natFilteringBehaviors", "behavior", filterings,
+                                           filtering_count);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natBehaviorDiscoveries", "behavior", discoveries,
+                                           discovery_count);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(nat_types);
+    free(mappings);
+    free(filterings);
+    free(discoveries);
+    st_storage_peer_mesh_stats_free(&stats);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
     }
-    if (active > 0) {
-        char ratio[32];
-        snprintf(ratio, sizeof(ratio), "%.6f", (double)direct / (double)active);
-        char *placeholder = strstr(body, "\"activeDirectRatio\":0,");
-        if (placeholder != NULL) {
-            size_t prefix = (size_t)(placeholder - body) + strlen("\"activeDirectRatio\":");
-            char rebuilt[4096];
-            snprintf(rebuilt, sizeof(rebuilt), "%.*s%s%s", (int)prefix, body, ratio,
-                     placeholder + strlen("\"activeDirectRatio\":0"));
-            snprintf(body, sizeof(body), "%s", rebuilt);
-        }
-    }
-    return write_response(out, out_len, 200, "OK", body);
+    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return response_len;
 }
 
 static int append_peer_mesh_service_view(st_admin_string_builder *builder,

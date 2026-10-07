@@ -6397,6 +6397,208 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Grows *items (each item_size bytes) so that one more fits; 0 on success. */
+static int peer_mesh_stats_reserve(void **items, size_t count, size_t *capacity, size_t item_size)
+{
+    if (count < *capacity) return 0;
+    size_t next = *capacity == 0U ? 8U : *capacity * 2U;
+    if (next > SIZE_MAX / item_size) return -1;
+    void *grown = realloc(*items, next * item_size);
+    if (grown == NULL) return -1;
+    memset((char *)grown + *capacity * item_size, 0, (next - *capacity) * item_size);
+    *items = grown;
+    *capacity = next;
+    return 0;
+}
+
+/* Text of a column, "" for NULL, cut to fit. */
+static void peer_mesh_stats_text(sqlite3_stmt *stmt, int column, char *out, size_t out_len)
+{
+    const unsigned char *value = sqlite3_column_text(stmt, column);
+    snprintf(out, out_len, "%s", value == NULL ? "" : (const char *)value);
+}
+
+/* SQL for the snprintf formats below, so '%' is written '%%'. */
+#define ST_PEER_MESH_EFFECTIVE_PATH \
+    "CASE WHEN s.relay_bytes > s.direct_bytes THEN 'RELAY' " \
+    "WHEN s.direct_bytes > s.relay_bytes THEN 'DIRECT' ELSE s.path_type END"
+#define ST_PEER_MESH_ADDRESS_FAMILY \
+    "CASE WHEN s.remote_endpoint IS NULL OR TRIM(s.remote_endpoint) = '' THEN 'UNKNOWN' " \
+    "WHEN s.remote_endpoint LIKE '[%%' THEN 'IPv6' ELSE 'IPv4' END"
+
+static int peer_mesh_stats_sessions(sqlite3 *db,
+                                    const char *tenant_id,
+                                    const char *owner_username,
+                                    int include_all_clients,
+                                    st_storage_peer_mesh_stats *stats)
+{
+    char where[512];
+    char sql[1536];
+    if (append_peer_mesh_session_visible_where(where, sizeof(where), include_all_clients, 1, "s") != 0) return -1;
+    int written = snprintf(sql, sizeof(sql),
+        "SELECT " ST_PEER_MESH_EFFECTIVE_PATH " AS effective_path, s.status, COUNT(*), COUNT(s.rtt_millis), "
+        "AVG(s.rtt_millis), COALESCE(SUM(s.direct_bytes), 0), COALESCE(SUM(s.relay_bytes), 0) "
+        "FROM peer_mesh_session s%s GROUP BY effective_path, s.status ORDER BY effective_path, s.status",
+        where);
+    if (written < 0 || (size_t)written >= sizeof(sql)) return -1;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    int bind_index = 1;
+    bind_peer_mesh_session_visible(stmt, tenant_id, owner_username, include_all_clients, &bind_index);
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->paths, stats->path_count, &capacity,
+                                    sizeof(*stats->paths)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_path_aggregate *item = &stats->paths[stats->path_count++];
+        peer_mesh_stats_text(stmt, 0, item->path_type, sizeof(item->path_type));
+        peer_mesh_stats_text(stmt, 1, item->status, sizeof(item->status));
+        item->sessions = sqlite3_column_int64(stmt, 2);
+        item->reported_sessions = sqlite3_column_int64(stmt, 3);
+        item->has_avg_rtt = sqlite3_column_type(stmt, 4) != SQLITE_NULL;
+        item->avg_rtt_millis = item->has_avg_rtt ? sqlite3_column_double(stmt, 4) : 0.0;
+        item->direct_bytes = sqlite3_column_int64(stmt, 5);
+        item->relay_bytes = sqlite3_column_int64(stmt, 6);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+
+    written = snprintf(sql, sizeof(sql),
+        "SELECT " ST_PEER_MESH_ADDRESS_FAMILY " AS family, s.status, " ST_PEER_MESH_EFFECTIVE_PATH " AS effective_path, "
+        "COUNT(*), COUNT(s.rtt_millis) FROM peer_mesh_session s%s "
+        "GROUP BY family, s.status, effective_path ORDER BY family, s.status, effective_path",
+        where);
+    if (written < 0 || (size_t)written >= sizeof(sql)) return -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    bind_index = 1;
+    bind_peer_mesh_session_visible(stmt, tenant_id, owner_username, include_all_clients, &bind_index);
+    capacity = 0U;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->families, stats->family_count, &capacity,
+                                    sizeof(*stats->families)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_family_aggregate *item = &stats->families[stats->family_count++];
+        peer_mesh_stats_text(stmt, 0, item->address_family, sizeof(item->address_family));
+        peer_mesh_stats_text(stmt, 1, item->status, sizeof(item->status));
+        peer_mesh_stats_text(stmt, 2, item->path_type, sizeof(item->path_type));
+        item->sessions = sqlite3_column_int64(stmt, 3);
+        item->reported_sessions = sqlite3_column_int64(stmt, 4);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int peer_mesh_stats_devices(sqlite3 *db,
+                                   const char *tenant_id,
+                                   const char *owner_username,
+                                   int include_all_clients,
+                                   st_storage_peer_mesh_stats *stats)
+{
+    const char *owner = include_all_clients ? "" : " AND owner_username = ?";
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT nat_type, COUNT(*) FROM peer_mesh_device WHERE tenant_id = ?%s "
+             "GROUP BY nat_type ORDER BY nat_type", owner);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    if (!include_all_clients) {
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
+    }
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->nat_types, stats->nat_type_count, &capacity,
+                                    sizeof(*stats->nat_types)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_nat_aggregate *item = &stats->nat_types[stats->nat_type_count++];
+        item->has_value = sqlite3_column_type(stmt, 0) != SQLITE_NULL;
+        peer_mesh_stats_text(stmt, 0, item->nat_type, sizeof(item->nat_type));
+        item->devices = sqlite3_column_int64(stmt, 1);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
+
+    snprintf(sql, sizeof(sql),
+             "SELECT nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery, COUNT(*) "
+             "FROM peer_mesh_device WHERE tenant_id = ?%s "
+             "GROUP BY nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery "
+             "ORDER BY nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery", owner);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    if (!include_all_clients) {
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
+    }
+    capacity = 0U;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (peer_mesh_stats_reserve((void **)&stats->behaviors, stats->behavior_count, &capacity,
+                                    sizeof(*stats->behaviors)) != 0) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+        st_storage_peer_mesh_behavior_aggregate *item = &stats->behaviors[stats->behavior_count++];
+        peer_mesh_stats_text(stmt, 0, item->mapping, sizeof(item->mapping));
+        peer_mesh_stats_text(stmt, 1, item->filtering, sizeof(item->filtering));
+        peer_mesh_stats_text(stmt, 2, item->discovery, sizeof(item->discovery));
+        item->devices = sqlite3_column_int64(stmt, 3);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_peer_mesh_stats_visible(const char *path,
+                                       const char *tenant_id,
+                                       const char *owner_username,
+                                       int include_all_clients,
+                                       st_storage_peer_mesh_stats *stats)
+{
+    if (stats == NULL) return -1;
+    memset(stats, 0, sizeof(*stats));
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE peer_mesh_session SET status = 'CLOSED', "
+        "closed_at = COALESCE(NULLIF(closed_at, ''), CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP "
+        "WHERE tenant_id = ? AND status <> 'CLOSED' AND expires_at <= CURRENT_TIMESTAMP",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0) rc = peer_mesh_stats_sessions(db, tenant_id, owner_username, include_all_clients, stats);
+    if (rc == 0) rc = peer_mesh_stats_devices(db, tenant_id, owner_username, include_all_clients, stats);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) {
+        (void)exec_sql(db, "ROLLBACK");
+        st_storage_peer_mesh_stats_free(stats);
+    }
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+void st_storage_peer_mesh_stats_free(st_storage_peer_mesh_stats *stats)
+{
+    if (stats == NULL) return;
+    free(stats->paths);
+    free(stats->families);
+    free(stats->nat_types);
+    free(stats->behaviors);
+    memset(stats, 0, sizeof(*stats));
+}
+
 int st_storage_close_peer_mesh_session_visible(const char *path,
                                                long long id,
                                                const char *tenant_id,

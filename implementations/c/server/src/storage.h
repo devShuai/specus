@@ -1078,6 +1078,67 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
                                                st_storage_peer_mesh_session *sessions,
                                                size_t max_sessions,
                                                size_t *session_count);
+/* One (effective path type, status) group of Java PeerMeshSessionRepository.aggregatePathTypes. */
+typedef struct {
+    char path_type[32];
+    char status[32];
+    long long sessions;
+    long long reported_sessions;
+    int has_avg_rtt;
+    double avg_rtt_millis;
+    long long direct_bytes;
+    long long relay_bytes;
+} st_storage_peer_mesh_path_aggregate;
+
+/* One (address family, status, effective path type) group of aggregateAddressFamilies. */
+typedef struct {
+    char address_family[16];
+    char status[32];
+    char path_type[32];
+    long long sessions;
+    long long reported_sessions;
+} st_storage_peer_mesh_family_aggregate;
+
+/* One stored natType of the devices (has_value is 0 for NULL), aggregateNatTypes. */
+typedef struct {
+    char nat_type[128];
+    int has_value;
+    long long devices;
+} st_storage_peer_mesh_nat_aggregate;
+
+/* One stored (mapping, filtering, discovery) triple of aggregateNatBehaviors; NULL reads as "". */
+typedef struct {
+    char mapping[128];
+    char filtering[128];
+    char discovery[128];
+    long long devices;
+} st_storage_peer_mesh_behavior_aggregate;
+
+typedef struct {
+    st_storage_peer_mesh_path_aggregate *paths;
+    size_t path_count;
+    st_storage_peer_mesh_family_aggregate *families;
+    size_t family_count;
+    st_storage_peer_mesh_nat_aggregate *nat_types;
+    size_t nat_type_count;
+    st_storage_peer_mesh_behavior_aggregate *behaviors;
+    size_t behavior_count;
+} st_storage_peer_mesh_stats;
+
+/*
+ * The grouped rows behind /api/admin/peer-mesh/stats (Java PeerMeshService.pathStats): first the
+ * tenant's sessions past their expiry are closed, as Java's expireIfStale does, then sessions are
+ * grouped by the path that carried more bytes (the stored path type on a tie) and status, and by
+ * remote address family as well; devices by NAT type and by NAT behaviour triple. An administrator
+ * sees the whole tenant, anyone else the sessions of the clients it owns and its own devices. The
+ * arrays are allocated; st_storage_peer_mesh_stats_free releases them.
+ */
+int st_storage_peer_mesh_stats_visible(const char *path,
+                                       const char *tenant_id,
+                                       const char *owner_username,
+                                       int include_all_clients,
+                                       st_storage_peer_mesh_stats *stats);
+void st_storage_peer_mesh_stats_free(st_storage_peer_mesh_stats *stats);
 int st_storage_close_peer_mesh_session_visible(const char *path,
                                                long long id,
                                                const char *tenant_id,
