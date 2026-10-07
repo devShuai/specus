@@ -886,8 +886,10 @@ static int expect_quiet_while_held(int channel, int request, char *what, size_t 
     }
 }
 
-/* Sends an HTTP request without waiting for its answer; returns the socket, or -1. */
-static int http_request_start(int port, const char *method, const char *path, const char *bearer)
+/* Sends an HTTP request, with a JSON body unless body is NULL, without waiting for its answer;
+ * returns the socket, or -1. */
+static int http_request_start(int port, const char *method, const char *path, const char *body,
+                              const char *bearer)
 {
     char authorization[600] = "";
     if (bearer != NULL) {
@@ -895,8 +897,11 @@ static int http_request_start(int port, const char *method, const char *path, co
     }
     char head[1536];
     int len = snprintf(head, sizeof(head),
-                       "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n%sContent-Length: 0\r\nConnection: close\r\n\r\n",
-                       method, path, port, authorization);
+                       "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n%s%sContent-Length: %zu\r\n"
+                       "Connection: close\r\n\r\n%s",
+                       method, path, port, authorization,
+                       body == NULL ? "" : "Content-Type: application/json\r\n",
+                       body == NULL ? 0U : strlen(body), body == NULL ? "" : body);
     int fd = connect_local(port);
     if (fd >= 0 && (len <= 0 || (size_t)len >= sizeof(head)
                     || send_all(fd, (const uint8_t *)head, (size_t)len) != 0)) {
@@ -923,28 +928,58 @@ static int http_response_status(int fd)
     return sscanf(line, "HTTP/1.1 %d", &status) == 1 ? status : -1;
 }
 
-/* Waits for count NAT_CONTROL pushes on a control connection, skipping every other frame. */
-static int expect_nat_controls(int fd, int count)
+/*
+ * The JSON of the next NAT_CONTROL push on a control connection, skipping every other frame; NULL
+ * when none arrives before deadline. The caller frees it.
+ */
+static char *next_nat_control(int fd, long long deadline)
 {
-    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
-    while (count > 0) {
+    for (;;) {
         long long remaining = deadline - monotonic_ms();
         st_frame_header header;
         uint8_t *body = NULL;
         if (remaining <= 0 || read_frame(fd, (int)remaining, &header, &body) != 1) {
-            return -1;
+            return NULL;
         }
         st_message_response message;
+        char *json = NULL;
+        int nat_control = 0;
         if (header.command == ST_CMD_MESSAGE_RESPONSE
             && st_protocol_decode_message_response(body, header.length, &message) == 0) {
             if (message.message_type == ST_MESSAGE_TYPE_NAT_CONTROL) {
-                --count;
+                nat_control = 1;
+                json = message.message;
+                message.message = NULL;
             }
             st_message_response_free(&message);
         }
         free(body);
+        if (nat_control) {
+            return json;
+        }
+    }
+}
+
+/* Waits for count NAT_CONTROL pushes on a control connection, skipping every other frame. */
+static int expect_nat_controls(int fd, int count)
+{
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (; count > 0; --count) {
+        char *json = next_nat_control(fd, deadline);
+        if (json == NULL) {
+            return -1;
+        }
+        free(json);
     }
     return 0;
+}
+
+/* Whether a NAT_CONTROL's specusConfigList has a TCP mapping listening on port. */
+static int nat_control_lists_port(const char *json, int port)
+{
+    char entry[32];
+    snprintf(entry, sizeof(entry), "{\"port\":%d,", port);
+    return strstr(json, entry) != NULL;
 }
 
 static void url_encode(const char *value, char *out, size_t out_len)
@@ -989,7 +1024,7 @@ static int test_control_login_answered_before_push(test_server *server)
           "the control login was never published and held at the gate");
     char path[160];
     snprintf(path, sizeof(path), "/api/admin/clients/%lld/nat-control", runtime.client_id);
-    int push = http_request_start(server->admin_port, "POST", path, token);
+    int push = http_request_start(server->admin_port, "POST", path, NULL, token);
     free(token);
     CHECK(push >= 0, "NAT_CONTROL push request not sent");
     CHECK(expect_quiet_while_held(control, push, what, sizeof(what)) == 0,
@@ -1004,6 +1039,67 @@ static int test_control_login_answered_before_push(test_server *server)
           timed_outcome(IO_TIMEOUT_MS));
 
     close_fd(&push);
+    close_fd(&control);
+    CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
+          "session not DISCONNECTED after the client left");
+    return 0;
+}
+
+/*
+ * A TCP mapping created while a control login is held after publishing reloads the routes of that
+ * connection and pushes them at it. The login's own NAT_CONTROL and the push both follow the
+ * response, the push last, so the client ends with the new mapping rather than the routes it
+ * logged in with. Under ThreadSanitizer this is also the scenario where the push used to replace
+ * the routes while the login thread read them without map_lock.
+ */
+static int test_route_change_while_held_reaches_client_last(test_server *server)
+{
+    char reason[256];
+    char what[160];
+    runtime_session runtime;
+    int control = -1;
+    CHECK(create_credential(server->db_path, "ck_order_routes", "order-routes-secret", 2) == 0,
+          "credential ck_order_routes not stored");
+    CHECK(http_client_login(server, "ck_order_routes", "order-routes-secret", "machine-order-routes", "rita",
+                            &runtime) == 0,
+          "http login (status and body above)");
+    char *token = admin_access_token(server);
+    CHECK(token != NULL, "admin login failed");
+
+    CHECK(start_held_login(server, &runtime, "control", &control) == 0,
+          "the control login was never published and held at the gate");
+    int listen_port = pick_free_port();
+    CHECK(listen_port > 0, "no free port for the new mapping");
+    char path[160];
+    char body[160];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/specus-mappings", runtime.client_id);
+    snprintf(body, sizeof(body), "{\"listenPort\":%d,\"targetAddress\":\"127.0.0.1\",\"targetPort\":9}",
+             listen_port);
+    int change = http_request_start(server->admin_port, "POST", path, body, token);
+    free(token);
+    CHECK(change >= 0, "mapping create request not sent");
+    CHECK(expect_quiet_while_held(control, change, what, sizeof(what)) == 0,
+          "control login held after publishing, a mapping created for it: %s", what);
+    CHECK(finish_held_login("control", control, reason, sizeof(reason)) == 0,
+          "the first frame on the control connection must be a successful login response: %s", reason);
+    int status = http_response_status(change);
+    CHECK(status == 201, "the mapping create that waited for the login response answered %d, expected 201", status);
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    char *login_routes = next_nat_control(control, deadline);
+    char *pushed_routes = login_routes == NULL ? NULL : next_nat_control(control, deadline);
+    int pushed_has_mapping = pushed_routes != NULL && nat_control_lists_port(pushed_routes, listen_port);
+    if (!pushed_has_mapping) {
+        fprintf(stderr, "NAT_CONTROL after the login response: %s\nthen: %s\n",
+                login_routes == NULL ? "(none)" : login_routes, pushed_routes == NULL ? "(none)" : pushed_routes);
+    }
+    free(login_routes);
+    free(pushed_routes);
+    CHECK(pushed_has_mapping,
+          "the last NAT_CONTROL after the login response must list the mapping on port %d", listen_port);
+    CHECK(TIMED(expect_channel_alive(control)) == 0, "control not served after the login: %s",
+          timed_outcome(IO_TIMEOUT_MS));
+
+    close_fd(&change);
     close_fd(&control);
     CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
           "session not DISCONNECTED after the client left");
@@ -1045,7 +1141,7 @@ static int test_data_login_answered_before_stream_open(test_server *server)
     char path[1024];
     url_encode(runtime.client_name, client, sizeof(client));
     snprintf(path, sizeof(path), "/http/%s/%s/held", client, ORDER_ROUTE);
-    int browser = http_request_start(server->admin_port, "GET", path, NULL);
+    int browser = http_request_start(server->admin_port, "GET", path, NULL, NULL);
     CHECK(browser >= 0, "browser request not sent");
     CHECK(expect_quiet_while_held(data, browser, what, sizeof(what)) == 0,
           "data login held after publishing, HTTP request routed to it: %s", what);
@@ -1270,6 +1366,9 @@ int main(int argc, char **argv)
     const char *const login_gate[] = {login_gate_env, NULL};
     failures += run_on_fresh_server("control login answered before a NAT_CONTROL push sent once it is published",
                                     test_control_login_answered_before_push, login_gate);
+    clear_login_gate();
+    failures += run_on_fresh_server("a route change pushed while a control login is held reaches the client last",
+                                    test_route_change_while_held_reaches_client_last, login_gate);
     clear_login_gate();
     failures += run_on_fresh_server("data login answered before a stream OPEN sent once it is published",
                                     test_data_login_answered_before_stream_open, login_gate);

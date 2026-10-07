@@ -59,7 +59,15 @@
   - 反向验证：保留 `SPECUS_LOGIN_TEST_GATE_DIR` 闸门、去掉加锁修复的 server 上，两个场景各 3 次全部失败，报错分别为 `command -2 was written before the login response` 和 `command 6 was written before the login response`；修复后 3/3 通过。
   - TSan：`-fsanitize=thread` 构建经 `setarch -R` 运行（WSL 内核的 ASLR 熵过高，否则 TSan 无法启动），没有 lock-order-inversion 报告。
     - 报出的 `close_conn_locked`、`session_shutdown` fd 竞争在 `main` 上同样存在。
-    - 新 control 场景还触发了一个已有竞争：`apply_runtime_route_config` 改写 `session->config` 时，登录线程正在不加锁读取它。这个竞争与写序无关，未在本分支修改。
+    - 新 control 场景还触发了一个已有竞争：`apply_runtime_route_config` 改写 `session->config` 时，登录线程正在不加锁读取它。这个竞争与写序无关，未在本分支修改。后由 `fix/c-server-post-login-config-race` 修复，见下条。
+- C server 登录后读取 config 的数据竞争（2026-10-07，分支 `fix/c-server-post-login-config-race`，基于 `fix/c-server-login-response-order`）：
+  - 构建与 CTest：代码提交 `a8e8cc6` 以 `git -c core.autocrlf=false archive` 导出到 `Ubuntu-24.04` WSL 全新目录，CMake Release 构建 0 warning，CTest `41/41` 通过（`-j 4` 约 208 s）；`make test` 0 warning 全部通过（约 5.5 min）。
+  - 回归测试：`session_lifecycle_tests` 新增场景，control 登录停在闸门时经管理接口新增 TCP 映射，断言响应之后的最后一个 NAT_CONTROL 含新映射。修复前的 server 也能通过这条断言：登录线程放行后才读 config，那时推送已经替换完 route。它守护的是「客户端最终持有最新 route」，竞争本身由下面的 TSan 对比证明。
+  - TSan：`-fsanitize=thread`（RelWithDebInfo）构建，同一个测试二进制经 `setarch x86_64 -R` 运行，`TSAN_OPTIONS=exitcode=0` 收集全部报告。
+    - 修复前（`39cab91`）跑两轮，每轮 3 份报告涉及 `apply_runtime_route_config`：两个闸门 control 场景（`/nat-control` 推送、新增映射）各一份 `record_login_success_event` 读 `client_id`，另有一份 `normalize_tenant_id` 读 `tenant_id`。
+    - 修复后跑三轮，这类报告为 0，也没有 lock-order-inversion。剩下的只有 `close_conn_locked`、`session_shutdown` 的 fd 竞争，`main` 上同样存在，未改。
+  - 合并 `main`（`3f5e620`，含已合并的 `fix/c-server-login-response-order` 和令牌登录按账号 id 绑定）后：重载会按 id 取到账号当前名字，推送因此对已改名账号的旧连接同样失败（`00e22c5`）。重新导出验证：0 warning，CTest `43/43` 通过（约 220 s）；TSan 跑一轮，route config 相关报告为 0。
+  - 未改：连接发布前的窗口。登录先在 `verify_login` 里从数据库加载 route，之后才发布连接；这段时间里的运行时推送找不到连接就直接返回，客户端会拿着加载时的旧 route，直到下一次变更。这不是数据竞争，另行跟进。
 - 仍需环境验收：真实 MySQL/PostgreSQL、真实私有 OSS/ES、Windows/Linux/macOS/Android 双机、跨 NAT direct/relay fallback、长时间压力与真实 TLS/OIDC。源码自动化通过不能替代这些外部系统与硬件验证。
 
 ## 当前仍存在的不一致与环境门禁
