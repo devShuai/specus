@@ -1486,8 +1486,11 @@ int st_storage_http_access_audit_list(const char *path,
 
 /*
  * Route, client and user changes with their share hooks and audit in the same transaction
- * (spec 7.3 and 8). actor is the acting user; revoked collects the shares that ended.
+ * (spec 7.3 and 8). actor is the acting user; revoked collects the shares that ended. Creating a
+ * route, or renaming one, onto a route name its client already has fails with
+ * ST_STORAGE_HTTP_ROUTE_EXISTS, as Java HttpRouteService refuses it.
  */
+#define ST_STORAGE_HTTP_ROUTE_EXISTS (-2)
 int st_storage_create_http_route_audited(const char *path,
                                          long long client_id,
                                          const char *route,

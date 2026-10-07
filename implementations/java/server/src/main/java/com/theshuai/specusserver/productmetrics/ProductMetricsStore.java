@@ -146,6 +146,17 @@ public class ProductMetricsStore {
                 tenantId, username);
     }
 
+    /**
+     * Deletes one account's progress row unless the tenant's switch is on when the statement runs.
+     * The retention sweep decides on the switch here, not on the switches it read first, so a tenant
+     * switched back on in between keeps the progress it started since.
+     */
+    public int deleteProgressUnlessEnabled(String tenantId, String username) {
+        return jdbc.update("DELETE FROM product_metrics_onboarding_progress WHERE tenant_id = ? AND username = ?"
+                + " AND NOT EXISTS (SELECT 1 FROM product_metrics_switch WHERE tenant_id = ? AND enabled = ?)",
+                tenantId, username, tenantId, true);
+    }
+
     public void deleteTenantProgress(String tenantId) {
         jdbc.update("DELETE FROM product_metrics_onboarding_progress WHERE tenant_id = ?", tenantId);
     }
@@ -193,6 +204,20 @@ public class ProductMetricsStore {
     public void deleteTenantCounts(String tenantId) {
         jdbc.update("DELETE FROM product_metrics_onboarding_daily WHERE tenant_id = ?", tenantId);
         jdbc.update("DELETE FROM product_metrics_transfer_daily WHERE tenant_id = ?", tenantId);
+    }
+
+    /**
+     * Deletes both daily tables' rows and the progress rows of a tenant, each table only while the
+     * tenant's switch is off with a purge mark when that statement runs. The retention sweep decides
+     * on the switch here, not on the switches it read first: switching on clears the mark, so a
+     * tenant switched back on in between keeps what it collected since.
+     */
+    public void deletePurgedTenantRows(String tenantId) {
+        for (String table : List.of("product_metrics_onboarding_daily", "product_metrics_transfer_daily",
+                "product_metrics_onboarding_progress")) {
+            jdbc.update("DELETE FROM " + table + " WHERE tenant_id = ? AND EXISTS (SELECT 1 FROM product_metrics_switch"
+                    + " WHERE tenant_id = ? AND enabled = ? AND purged_at IS NOT NULL)", tenantId, tenantId, false);
+        }
     }
 
     public void deleteCountsBefore(String cutoffDay) {

@@ -538,6 +538,8 @@ static void random_hex(char *out, size_t bytes)
     st_hex_encode(buffer, bytes, out);
 }
 
+const char *harness_login_environment_extra = "";
+
 void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
                        const char *os_user, char *body, size_t body_len)
 {
@@ -557,8 +559,9 @@ void signed_login_body(const char *api_key, const char *secret, const char *fing
              "{\"apiKey\":\"%s\",\"timestamp\":\"%s\",\"nonce\":\"%s\",\"signature\":\"%s\","
              "\"environment\":{\"machineFingerprint\":\"%s\",\"hostname\":\"lifecycle-host\","
              "\"osUser\":\"%s\",\"osName\":\"Linux\",\"osVersion\":\"test\",\"osArch\":\"amd64\","
-             "\"clientVersion\":\"session-lifecycle-test\"}}",
-             api_key, timestamp, nonce, signature, fingerprint, os_user);
+             "\"clientVersion\":\"session-lifecycle-test\"%s}}",
+             api_key, timestamp, nonce, signature, fingerprint, os_user,
+             harness_login_environment_extra == NULL ? "" : harness_login_environment_extra);
 }
 
 int http_client_login(const test_server *server, const char *api_key, const char *secret,

@@ -447,7 +447,13 @@ user instance limit, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`
   (`SERVER_RESTARTED`). When no matching SQLite credential exists, the explicitly configured environment-token
   smoke-test path is available. Partial environment client-auth configuration is treated as a
 server misconfiguration and returns `503` instead of silently falling back. The same listener also
-serves the SPA and `/specus-http-route-runtime.js` from `SPECUS_STATIC_ROOT`.
+serves the SPA and `/specus-http-route-runtime.js` from `SPECUS_STATIC_ROOT`, with Java
+`SecurityConfig`'s portal headers: the `Content-Security-Policy` (`frame-ancestors 'none'`,
+`connect-src` with `https://api.github.com`, plus the bucket origin when `aliyun-oss` object storage
+is configured), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: strict-origin-when-cross-origin`. `/http/` and `/http-share/` answers never carry
+them. JSON API answers carry `nosniff` only (Java adds the whole set there as well, but a policy on a
+JSON answer is never applied as a page).
 `/api/admin/overview` and `/api/admin/metrics` use the same SQLite plus environment mapping snapshot
 as client auth login, and count only the current management context's visible TCP mappings.
 
@@ -493,7 +499,17 @@ when the 4 MiB client-to-public queue overflows), and `DATA|END_STREAM` is DATA 
 data connection remembers its 1024 most recently closed stream ids so a late `RST` is ignored; an
 `RST` for a stream that was never opened, a `WINDOW_UPDATE` beyond the 16 MiB window and a NAT type a
 client never sends close the data connection. A data connection holds at most 1024 pending HTTP
-streams (the next request gets `502`), and request bodies over 16 MiB get `413`.
+streams (the next request gets `502`), and request bodies over 16 MiB get `413`; because every
+request body is read into memory before it is dispatched, that limit holds on the whole management
+listener (the client package upload has its own), where Java limits `/http/**` only.
+Trailers cross as `protocol/spec/http-route.md` sections 3 and 4 require, like Java
+`HttpSpecusController`: the names of the request's `Trailer` headers are declared in `trailerNames`
+(trimmed tokens, no hop-by-hop field, each once, without `Authorization` once the route gate
+consumed it) and only those fields of a chunked body's trailer section go out in
+`FIN.metadata.trailers`; of a response, only fields the head declared, with a valid name and no
+CR/LF, reach the browser. With detail capture on, refused and failed `/http/` requests are recorded
+as well: a `413` with the request headers and the body's first 64 KiB, the route gate's `401`,
+`503` and `404` without request headers, and forwarding failures with their reason.
 `tests/nat_stream_tests.c` checks each rule against a real server process.
 
 The C

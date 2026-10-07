@@ -407,12 +407,19 @@ func (s *Service) UserDeleted(ctx context.Context, tenantID, username string) st
 // on when it runs, and any number of instances may run it. Step 4 only reaches tenants purged since
 // they switched off: switching off clears the mark a purge made while collecting.
 func (s *Service) Sweep(ctx context.Context) error {
-	now := s.nowMs()
-	metrics := s.db.ProductMetrics()
-	switches, err := metrics.Switches(ctx)
+	switches, err := s.db.ProductMetrics().Switches(ctx)
 	if err != nil {
 		return err
 	}
+	return s.sweep(ctx, switches)
+}
+
+// sweep runs the four steps on switches read beforehand. They only pick the candidates of steps 1
+// and 4: each delete checks the switch again when it runs, so a tenant switched back on since the
+// read keeps what it collects from then on.
+func (s *Service) sweep(ctx context.Context, switches []store.ProductMetricsSwitch) error {
+	now := s.nowMs()
+	metrics := s.db.ProductMetrics()
 	enabled := map[string]bool{}
 	for index := range switches {
 		enabled[switches[index].TenantID] = s.collecting(&switches[index])
@@ -430,7 +437,7 @@ func (s *Service) Sweep(ctx context.Context) error {
 	for _, row := range progress {
 		switch {
 		case !enabled[row.TenantID]:
-			if _, err := metrics.DeleteProgress(ctx, row.TenantID, row.Username); err != nil {
+			if err := s.dropProgress(ctx, metrics, row); err != nil {
 				return err
 			}
 		case now >= row.StartedAtMs+windowMs:
@@ -445,15 +452,26 @@ func (s *Service) Sweep(ctx context.Context) error {
 	}
 	for _, row := range switches {
 		if !row.Enabled && row.PurgedAtMs != nil {
-			if err := metrics.DeleteTenantCounts(ctx, row.TenantID); err != nil {
-				return err
-			}
-			if err := metrics.DeleteTenantProgress(ctx, row.TenantID); err != nil {
+			if err := metrics.DeletePurgedTenantRows(ctx, row.TenantID); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// dropProgress is step 1 for one row of a tenant that was not collecting when the sweep read the
+// switches. The delete checks the switch again, so a tenant switched on since keeps the row; when
+// the deployment does not allow metrics no tenant collects and the row goes regardless.
+func (s *Service) dropProgress(ctx context.Context, metrics *store.ProductMetricsStore,
+	row store.ProductMetricsProgress) error {
+	var err error
+	if s.allowed.Load() {
+		_, err = metrics.DeleteProgressUnlessEnabled(ctx, row.TenantID, row.Username)
+	} else {
+		_, err = metrics.DeleteProgress(ctx, row.TenantID, row.Username)
+	}
+	return err
 }
 
 // Run sweeps a minute after start and then every hour until ctx ends.
