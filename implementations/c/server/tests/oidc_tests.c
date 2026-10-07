@@ -12,6 +12,7 @@
 #include "json.h"
 #include "oidc.h"
 #include "password_hash.h"
+#include "product_metrics.h"
 #include "security.h"
 #include "storage.h"
 
@@ -849,6 +850,38 @@ static void test_binds_existing_user_once(void)
     free(stored_key);
 }
 
+static int db_exec(const char *sql)
+{
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_close(db);
+    return rc;
+}
+
+/* An OIDC sign-in issues a local session, so it records signed_in like a password sign-in. */
+static void test_login_records_signed_in_milestone(void)
+{
+    create_user("dana", "default", "USER", 1);
+    CHECK(db_exec("INSERT INTO product_metrics_switch (tenant_id, enabled, updated_by, updated_at, purged_at) "
+                  "VALUES ('default', 1, 'root', 1, NULL)") == 0,
+          "cannot turn product metrics on");
+    CHECK(strcmp(st_product_metrics_milestone(db_path, "default", "dana", ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED),
+                 "started") == 0,
+          "the account did not enter the onboarding cohort");
+    char *before = db_text("SELECT signed_in_at FROM product_metrics_onboarding_progress WHERE username = ?", "dana");
+    CHECK(before == NULL, "signed_in was recorded before any sign-in");
+    char *token = login_token("subject-dana", "dana");
+    CHECK(token != NULL, "OIDC login of the existing user failed");
+    char *after = db_text("SELECT signed_in_at FROM product_metrics_onboarding_progress WHERE username = ?", "dana");
+    CHECK(after != NULL, "the OIDC sign-in did not record signed_in");
+    CHECK(db_exec("DELETE FROM product_metrics_switch") == 0
+              && db_exec("DELETE FROM product_metrics_onboarding_progress") == 0,
+          "cannot reset product metrics");
+    free(before);
+    free(token);
+    free(after);
+}
+
 static void test_disabled_users_are_refused(void)
 {
     create_user("carol", "default", "USER", 0);
@@ -1426,6 +1459,7 @@ int main(void)
     test_login_issues_local_token();
     test_binding_follows_subject();
     test_binds_existing_user_once();
+    test_login_records_signed_in_milestone();
     test_disabled_users_are_refused();
     test_refused_usernames();
     test_nonce_is_required_and_bound();

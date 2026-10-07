@@ -3894,6 +3894,10 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     }
     int response_len = write_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
+    /* A local session was issued: the same signed_in milestone as a password sign-in. */
+    if (response_len > 0) {
+        admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
+    }
     return response_len;
 }
 
