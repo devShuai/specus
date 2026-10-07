@@ -29,6 +29,12 @@ const char *st_traffic_body_type(const char *content_type, long long body_bytes)
 /* Java HttpBodyTypeClassifier.normalizeOrClassify: a stored supported type, else classify. */
 const char *st_traffic_body_type_or_classify(const char *stored, const char *content_type, long long body_bytes);
 
+/*
+ * Java HttpBodyTypeClassifier.normalize: value trimmed and lower-cased when it is one of the
+ * supported types, NULL otherwise (a blank or unknown responseBodyType filters nothing).
+ */
+const char *st_traffic_body_type_normalize(const char *value);
+
 /* Java TrafficInspectionService.preview hex: the first preview_bytes bytes as "89 50 4E 47". */
 void st_traffic_hex_preview(const uint8_t *data, size_t len, size_t preview_bytes, char *out, size_t out_len);
 

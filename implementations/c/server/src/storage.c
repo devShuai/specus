@@ -7646,6 +7646,45 @@ static int append_http_search_filters(char *where, size_t where_len, const char 
     return 0;
 }
 
+/*
+ * Java JpaHttpTrafficExchangeStore.responseBodyTypePredicate: the stored body type, an empty body
+ * for "empty", or a response Content-Type of that kind. body_type is already normalized, so only
+ * the one placeholder is bound; the patterns are constants.
+ */
+static void append_http_body_type_filter(char *where, size_t where_len, const char *body_type)
+{
+    static const struct {
+        const char *type;
+        const char *patterns[6];
+    } table[] = {
+        {"json", {"'%application/json%'", "'%+json%'", NULL}},
+        {"html", {"'%text/html%'", NULL}},
+        {"xml", {"'%application/xml%'", "'%text/xml%'", "'%+xml%'", NULL}},
+        {"image", {"'image/%'", NULL}},
+        {"video", {"'video/%'", NULL}},
+        {"audio", {"'audio/%'", NULL}},
+        {"form", {"'%application/x-www-form-urlencoded%'", "'%multipart/form-data%'", NULL}},
+        {"script", {"'%javascript%'", "'%ecmascript%'", NULL}},
+        {"text", {"'text/%'", NULL}},
+        {"binary", {"'%application/octet-stream%'", "'%application/pdf%'", "'%application/zip%'",
+                    "'%application/x-%'", "'%application/vnd.%'", NULL}},
+    };
+    strncat(where, " AND (h.response_body_type = ?", where_len - strlen(where) - 1U);
+    if (strcmp(body_type, "empty") == 0) {
+        strncat(where, " OR h.response_bytes = 0", where_len - strlen(where) - 1U);
+    }
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
+        if (strcmp(table[i].type, body_type) != 0) {
+            continue;
+        }
+        for (size_t j = 0; table[i].patterns[j] != NULL; ++j) {
+            strncat(where, " OR LOWER(COALESCE(h.response_content_type,'')) LIKE ", where_len - strlen(where) - 1U);
+            strncat(where, table[i].patterns[j], where_len - strlen(where) - 1U);
+        }
+    }
+    strncat(where, ")", where_len - strlen(where) - 1U);
+}
+
 static void bind_like(sqlite3_stmt *stmt, int *index, const char *query)
 {
     char like[512];
@@ -7721,7 +7760,7 @@ static void bind_http_filters(sqlite3_stmt *stmt,
     if (route != NULL && *route != '\0') {
         sqlite3_bind_text(stmt, (*index)++, route, -1, SQLITE_TRANSIENT);
     }
-    if (response_body_type != NULL && *response_body_type != '\0') {
+    if (response_body_type != NULL) {
         sqlite3_bind_text(stmt, (*index)++, response_body_type, -1, SQLITE_TRANSIENT);
     }
     if (query != NULL && *query != '\0') {
@@ -7781,6 +7820,24 @@ int st_storage_list_http_exchanges_visible(const char *path,
     } else if (size > 500) {
         size = 500;
     }
+    /* As Java: the route is trimmed, and a body type Java does not support filters nothing. */
+    char trimmed_route[512];
+    if (route != NULL) {
+        while (isspace((unsigned char)*route)) {
+            ++route;
+        }
+        size_t route_len = strlen(route);
+        while (route_len > 0U && isspace((unsigned char)route[route_len - 1U])) {
+            --route_len;
+        }
+        if (route_len >= sizeof(trimmed_route)) {
+            route_len = sizeof(trimmed_route) - 1U;
+        }
+        memcpy(trimmed_route, route, route_len);
+        trimmed_route[route_len] = '\0';
+        route = trimmed_route[0] == '\0' ? NULL : trimmed_route;
+    }
+    response_body_type = st_traffic_body_type_normalize(response_body_type);
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -7800,8 +7857,8 @@ int st_storage_list_http_exchanges_visible(const char *path,
     if (route != NULL && *route != '\0') {
         strncat(where, " AND h.route = ?", sizeof(where) - strlen(where) - 1U);
     }
-    if (response_body_type != NULL && *response_body_type != '\0') {
-        strncat(where, " AND h.response_body_type = ?", sizeof(where) - strlen(where) - 1U);
+    if (response_body_type != NULL) {
+        append_http_body_type_filter(where, sizeof(where), response_body_type);
     }
     if (query != NULL && *query != '\0') {
         if (append_http_search_filters(where, sizeof(where), field, query) != 0) {
@@ -8147,8 +8204,10 @@ static int list_tcp_frames_internal(const char *path,
                        "ORDER BY %s LIMIT ? OFFSET ?",
                        include_payload ? "f.payload_data" : "NULL",
                        where,
+                       /* A channel reads in capture order, both directions interleaved (Java sorts
+                        * the stream by id; frame indexes count each direction on its own). */
                        channel_id != NULL && *channel_id != '\0'
-                           ? "f.frame_index ASC, f.id ASC"
+                           ? "f.id ASC"
                            : "f.id DESC");
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         sqlite3_close(db);
@@ -8280,10 +8339,12 @@ int st_storage_list_tcp_stream_visible(const char *path,
                                        const char *tenant_id,
                                        const char *owner_username,
                                        int include_all_clients,
-                                       int limit,
+                                       int page,
+                                       int size,
                                        st_storage_tcp_frame *items,
                                        size_t max_items,
-                                       size_t *item_count)
+                                       size_t *item_count,
+                                       long long *total_count)
 {
     if (st_elasticsearch_traffic_enabled_current()) {
         return st_elasticsearch_list_tcp_stream(path,
@@ -8291,30 +8352,46 @@ int st_storage_list_tcp_stream_visible(const char *path,
                                                 tenant_id,
                                                 owner_username,
                                                 include_all_clients,
-                                                limit,
+                                                page,
+                                                size,
                                                 items,
                                                 max_items,
-                                                item_count);
+                                                item_count,
+                                                total_count);
     }
-    long long total_count = 0;
-    if (channel_id == NULL || *channel_id == '\0') {
-        *item_count = 0;
-        return -1;
+    *item_count = 0;
+    *total_count = 0;
+    /* Java findStream: the channel id is trimmed, and a blank one is an empty page. */
+    char trimmed[256];
+    if (channel_id == NULL) {
+        return 0;
     }
+    while (isspace((unsigned char)*channel_id)) {
+        ++channel_id;
+    }
+    size_t channel_len = strlen(channel_id);
+    while (channel_len > 0U && isspace((unsigned char)channel_id[channel_len - 1U])) {
+        --channel_len;
+    }
+    if (channel_len == 0U || channel_len >= sizeof(trimmed)) {
+        return 0;
+    }
+    memcpy(trimmed, channel_id, channel_len);
+    trimmed[channel_len] = '\0';
     return list_tcp_frames_internal(path,
                                     0,
                                     0,
-                                    channel_id,
+                                    trimmed,
                                     tenant_id,
                                     owner_username,
                                     include_all_clients,
-                                    0,
-                                    limit,
+                                    page,
+                                    size,
                                     1,
                                     items,
                                     max_items,
                                     item_count,
-                                    &total_count);
+                                    total_count);
 }
 
 void st_storage_tcp_frame_free(st_storage_tcp_frame *frame)

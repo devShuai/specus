@@ -7,6 +7,7 @@
 #include "client_package.h"
 #include "crypto.h"
 #include "decompression_limits.h"
+#include "elasticsearch_traffic.h"
 #include "github_release.h"
 #include "http_client.h"
 #include "http_share.h"
@@ -6239,6 +6240,29 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
     return response_len;
 }
 
+static int admin_text_is_blank(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * flush=true on the traffic detail endpoints (Java TrafficInspectionService.flush): what the
+ * Elasticsearch writer still holds is sent before the query. The SQLite store writes as it
+ * captures, so there is nothing to send there.
+ */
+static void admin_traffic_flush_if_asked(const char *path)
+{
+    int flush = 0;
+    if (admin_query_bool(path, "flush", &flush) == 0 && flush && st_elasticsearch_traffic_enabled_current()) {
+        st_elasticsearch_traffic_flush();
+    }
+}
+
 static int build_http_exchanges_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     int page = 0;
@@ -6250,9 +6274,11 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     if (page < 0) page = 0;
     if (size < 1) size = 1;
     if (size > 500) size = 500;
+    admin_traffic_flush_if_asked(path);
     char *route = admin_query_string(path, "route");
     char *response_body_type = admin_query_string(path, "responseBodyType");
-    if (response_body_type == NULL || *response_body_type == '\0') {
+    /* Java firstText(responseBodyType, responseDataType): the first one that is not blank. */
+    if (response_body_type == NULL || admin_text_is_blank(response_body_type)) {
         free(response_body_type);
         response_body_type = admin_query_string(path, "responseDataType");
     }
@@ -6374,17 +6400,38 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
     return len;
 }
 
+/*
+ * Java TrafficInspectionService.Snapshot. With Elasticsearch the counters are those of its write
+ * queue; the SQLite store writes as it captures, so nothing is ever pending or dropped there.
+ */
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
     int enabled = st_traffic_capture_enabled();
-    return write_response(out, out_len, 200, "OK",
-        enabled
-            ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
-            : "{\"enabled\":false,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}");
+    st_elasticsearch_traffic_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (st_elasticsearch_traffic_enabled_current()) {
+        st_elasticsearch_traffic_snapshot_current(&snapshot);
+    }
+    char last_flushed_at[48] = "null";
+    if (snapshot.last_flushed_at[0] != '\0') {
+        snprintf(last_flushed_at, sizeof(last_flushed_at), "\"%s\"", snapshot.last_flushed_at);
+    }
+    char body[256];
+    int written = snprintf(body, sizeof(body),
+                           "{\"enabled\":%s,\"pendingHttp\":%d,\"pendingTcp\":%d,\"droppedHttp\":%lld,"
+                           "\"droppedTcp\":%lld,\"lastFlushedAt\":%s}",
+                           enabled ? "true" : "false", snapshot.pending_http, snapshot.pending_tcp,
+                           snapshot.dropped_http, snapshot.dropped_tcp, last_flushed_at);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"inspection status failed\"}");
+    }
+    return write_response(out, out_len, 200, "OK", body);
 }
 
 static int build_tcp_frames_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
+    admin_traffic_flush_if_asked(path);
     int page = 0;
     int size = 50;
     int limit = 0;
@@ -6406,23 +6453,24 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
-    st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
-    memset(items, 0, sizeof(items));
+    /* Each frame carries its previews (about 8 KiB); a full page stays off the thread's stack. */
+    st_storage_tcp_frame *items = (st_storage_tcp_frame *)calloc(ST_ADMIN_MAX_CONNECTIONS_PAGE, sizeof(*items));
     size_t item_count = 0;
     long long total_count = 0;
-    int rc = st_storage_list_tcp_frames_visible(database_path,
-                                                client_id,
-                                                listen_port,
-                                                context->tenant_id,
-                                                context->username,
-                                                context->admin,
-                                                page,
-                                                size,
-                                                items,
-                                                ST_ADMIN_MAX_CONNECTIONS_PAGE,
-                                                &item_count,
-                                                &total_count);
+    int rc = items == NULL ? -1 : st_storage_list_tcp_frames_visible(database_path,
+                                                                     client_id,
+                                                                     listen_port,
+                                                                     context->tenant_id,
+                                                                     context->username,
+                                                                     context->admin,
+                                                                     page,
+                                                                     size,
+                                                                     items,
+                                                                     ST_ADMIN_MAX_CONNECTIONS_PAGE,
+                                                                     &item_count,
+                                                                     &total_count);
     if (rc != 0) {
+        free(items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
     long long total_pages = total_count <= 0 ? 0 : (total_count + size - 1) / size;
@@ -6434,6 +6482,7 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
             rc = append_tcp_frame_view(&builder, &items[i], 0);
         }
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_appendf(&builder,
                               "],\"total\":%lld,\"page\":%d,\"size\":%d,\"totalPages\":%lld}",
@@ -6482,79 +6531,61 @@ static int build_tcp_frame_detail_response(const st_admin_context *context, long
     return response_len;
 }
 
-static int build_empty_tcp_stream_response(const char *path, char *out, size_t out_len)
-{
-    char *channel_id = admin_query_string(path, "channelId");
-    if (channel_id == NULL || *channel_id == '\0') {
-        free(channel_id);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"channelId is required\"}");
-    }
-    int limit = 500;
-    (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > 1000) {
-        limit = 1000;
-    }
-    st_admin_string_builder builder = {0};
-    int rc = admin_sb_append(&builder, "{\"channelId\":");
-    if (rc == 0) {
-        rc = admin_sb_append_json_string(&builder, channel_id);
-    }
-    if (rc == 0) {
-        rc = admin_sb_appendf(&builder,
-                              ",\"items\":[],\"total\":0,\"limit\":%d,\"truncated\":false}",
-                              limit);
-    }
-    free(channel_id);
-    if (rc != 0 || builder.data == NULL) {
-        free(builder.data);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream response failed\"}");
-    }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
-    free(builder.data);
-    return response_len;
-}
+/* The most frames one tcp-streams page holds (Java clamps size and limit to 1..1000). */
+#define ST_ADMIN_MAX_TCP_STREAM_PAGE 1000
 
+/*
+ * GET /api/admin/traffic/tcp-streams as Java TrafficResource.getTcpStream: page (default 0) and
+ * size (default limit, default 500, both clamped to 1..1000) select one page of the channel's
+ * frames in capture order, each with its payload; limit repeats the size, totalPages is at least
+ * 1 and truncated says a later page exists.
+ */
 static int build_tcp_stream_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     char *channel_id = admin_query_string(path, "channelId");
-    if (channel_id == NULL || *channel_id == '\0') {
-        free(channel_id);
+    if (channel_id == NULL) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"channelId is required\"}");
     }
+    admin_traffic_flush_if_asked(path);
+    int page = 0;
     int limit = 500;
+    int size = 0;
+    (void)admin_query_int_any(path, "page", &page);
     (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) limit = 1;
-    if (limit > 1000) limit = 1000;
+    if (admin_query_int_any(path, "size", &size) != 0) {
+        size = limit;
+    }
+    if (page < 0) page = 0;
+    if (size < 1) size = 1;
+    if (size > ST_ADMIN_MAX_TCP_STREAM_PAGE) size = ST_ADMIN_MAX_TCP_STREAM_PAGE;
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        int response_len = build_empty_tcp_stream_response(path, out, out_len);
-        free(channel_id);
-        return response_len;
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        free(channel_id);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
-    }
-    st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
-    memset(items, 0, sizeof(items));
+    st_storage_tcp_frame *items = NULL;
     size_t item_count = 0;
-    int rc = st_storage_list_tcp_stream_visible(database_path,
-                                                channel_id,
-                                                context->tenant_id,
-                                                context->username,
-                                                context->admin,
-                                                limit,
-                                                items,
-                                                ST_ADMIN_MAX_CONNECTIONS_PAGE,
-                                                &item_count);
-    if (rc != 0) {
-        free(channel_id);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
+    long long total = 0;
+    if (database_path != NULL) {
+        items = (st_storage_tcp_frame *)calloc((size_t)size, sizeof(*items));
+        if (items == NULL
+            || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+            || st_storage_list_tcp_stream_visible(database_path,
+                                                  channel_id,
+                                                  context->tenant_id,
+                                                  context->username,
+                                                  context->admin,
+                                                  page,
+                                                  size,
+                                                  items,
+                                                  (size_t)size,
+                                                  &item_count,
+                                                  &total) != 0) {
+            free(items);
+            free(channel_id);
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
+        }
     }
+    long long total_pages = total <= 0 ? 0 : (total + size - 1) / size;
+    if (total_pages < 1) total_pages = 1;
     st_admin_string_builder builder = {0};
-    rc = admin_sb_append(&builder, "{\"channelId\":");
+    int rc = admin_sb_append(&builder, "{\"channelId\":");
     if (rc == 0) rc = admin_sb_append_json_string(&builder, channel_id);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"items\":[");
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
@@ -6562,14 +6593,21 @@ static int build_tcp_stream_response(const st_admin_context *context, const char
         if (rc == 0) {
             rc = append_tcp_frame_view(&builder, &items[i], 1);
         }
+    }
+    for (size_t i = 0; i < item_count; ++i) {
         st_storage_tcp_frame_free(&items[i]);
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_appendf(&builder,
-                              "],\"total\":%zu,\"limit\":%d,\"truncated\":%s}",
-                              item_count,
-                              limit,
-                              item_count >= (size_t)limit ? "true" : "false");
+                              "],\"total\":%lld,\"page\":%d,\"size\":%d,\"limit\":%d,\"totalPages\":%lld,"
+                              "\"truncated\":%s}",
+                              total,
+                              page,
+                              size,
+                              size,
+                              total_pages,
+                              (long long)page + 1 < total_pages ? "true" : "false");
     }
     free(channel_id);
     if (rc != 0 || builder.data == NULL) {

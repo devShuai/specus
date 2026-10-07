@@ -5305,6 +5305,9 @@ int main(void)
                    unfinished, swept);
         }
     }
+    /* What the channels captured last is written out before the process ends (Java's
+     * TrafficInspectionService flushBeforeShutdown). */
+    st_elasticsearch_traffic_shutdown();
     shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
     st_admin_set_nat_control_handler(NULL, NULL);
