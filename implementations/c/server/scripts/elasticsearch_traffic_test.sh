@@ -30,6 +30,14 @@ import urllib.parse
 indices = {}
 lock = threading.Lock()
 
+# Two HTTP indices that exist before the server starts: one made before bodies were stored, and one
+# where documents with bodies were written before the mapping had them, so they are text.
+LEGACY_HTTP_TYPES = {"id": "long", "tenantId": "keyword", "clientId": "long", "route": "keyword",
+                     "statusCode": "integer", "capturedAt": "keyword"}
+indices["specus-http-legacy"] = {"types": dict(LEGACY_HTTP_TYPES), "docs": {}}
+indices["specus-http-text-bodies"] = {"types": dict(LEGACY_HTTP_TYPES, requestBodyData="text",
+                                                    responseBodyData="text"), "docs": {}}
+
 def index_entry(name):
     return indices.setdefault(name, {"types": {}, "docs": {}})
 
@@ -172,14 +180,29 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) >= 3 and parts[1] == "_doc":
                 index["docs"][parts[2]] = json.loads(body)
                 return self.send_json(201, {"result": "created"})
+            if len(parts) == 2 and parts[1] == "_mapping":
+                # As Elasticsearch: a field keeps the type it has; new fields are added.
+                properties = json.loads(body).get("properties", {})
+                changed = [key for key, value in properties.items()
+                           if key in index["types"] and index["types"][key] != value.get("type")]
+                if changed:
+                    return self.send_json(400, {"error": {"type": "illegal_argument_exception",
+                                                          "reason": "mapper [" + changed[0] + "] cannot be changed"}})
+                index["types"].update({key: value.get("type") for key, value in properties.items()})
+                return self.send_json(200, {"acknowledged": True})
             if body:
                 properties = json.loads(body).get("mappings", {}).get("properties", {})
                 index["types"].update({key: value.get("type") for key, value in properties.items()})
         self.send_json(200, {"acknowledged": True})
 
     def do_GET(self):
-        if not self.auth(): return self.send_json(401, {"error": "unauthorized"})
         name = self.index_name()
+        if urllib.parse.urlsplit(self.path).path.endswith("/_mapping"):
+            # For the tests to inspect, without credentials: the server never reads a mapping.
+            with lock: types = dict(indices.get(name, {}).get("types", {}))
+            properties = {key: {"type": value} for key, value in sorted(types.items())}
+            return self.send_json(200, {name: {"mappings": {"properties": properties}}})
+        if not self.auth(): return self.send_json(401, {"error": "unauthorized"})
         with lock:
             size = sum(len(json.dumps(value, separators=(",", ":")))
                        for value in indices.get(name, {}).get("docs", {}).values())

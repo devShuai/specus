@@ -389,7 +389,19 @@ static const char es_tcp_mapping[] =
     "\"payloadPreviewText\":{\"type\":\"text\"},\"truncated\":{\"type\":\"boolean\"},"
     "\"frameTime\":{\"type\":\"keyword\"}}}}";
 
-static int es_ensure_index(const st_es_config *config, const char *index, const char *mapping, int *ready)
+/*
+ * Java's putBinaryBodyMapping: an HTTP index made before bodies were stored gets the two body
+ * fields as binary, so new documents do not map them dynamically as text.
+ */
+static const char es_http_body_mapping[] =
+    "{\"properties\":{\"requestBodyData\":{\"type\":\"binary\"},\"responseBodyData\":{\"type\":\"binary\"}}}";
+
+/* existing_update, when not NULL, is put on the index's mapping if the index exists already. */
+static int es_ensure_index(const st_es_config *config,
+                           const char *index,
+                           const char *mapping,
+                           const char *existing_update,
+                           int *ready)
 {
     pthread_mutex_lock(&es_index_lock);
     if (strcmp(es_ready_endpoint, config->endpoint) != 0) {
@@ -407,6 +419,19 @@ static int es_ensure_index(const st_es_config *config, const char *index, const 
     if (rc == 0 && status == 404) {
         rc = es_request(config, "PUT", path, mapping, "application/json", &status, &response);
         free(response);
+    } else if (rc == 0 && status >= 200 && status < 300 && existing_update != NULL) {
+        char mapping_path[320];
+        snprintf(mapping_path, sizeof(mapping_path), "/%s/_mapping", index);
+        long update_status = 0;
+        char *update_response = NULL;
+        /* As in Java, a refused update (a field mapped otherwise already) leaves the index as it is. */
+        if (es_request(config, "PUT", mapping_path, existing_update, "application/json",
+                       &update_status, &update_response) != 0
+            || update_status < 200 || update_status >= 300) {
+            fprintf(stderr, "failed to update the mapping of Elasticsearch index %s (HTTP %ld)\n",
+                    index, update_status);
+        }
+        free(update_response);
     }
     if (rc == 0 && status >= 200 && status < 300) *ready = 1;
     else rc = -1;
@@ -423,8 +448,8 @@ int st_elasticsearch_traffic_initialize_current(void)
         fprintf(stderr, "Elasticsearch configuration is invalid\n");
         return -1;
     }
-    if (es_ensure_index(&config, config.http_index, es_http_mapping, &es_http_ready) != 0
-        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, &es_tcp_ready) != 0) {
+    if (es_ensure_index(&config, config.http_index, es_http_mapping, es_http_body_mapping, &es_http_ready) != 0
+        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, NULL, &es_tcp_ready) != 0) {
         fprintf(stderr, "failed to initialize Elasticsearch traffic detail indices\n");
         return -1;
     }
@@ -708,7 +733,7 @@ static void es_write_batch(int tcp, es_pending_doc *docs, size_t count)
     }
     const char *index = tcp ? config.tcp_index : config.http_index;
     if (es_ensure_index(&config, index, tcp ? es_tcp_mapping : es_http_mapping,
-                        tcp ? &es_tcp_ready : &es_http_ready) != 0) {
+                        tcp ? NULL : es_http_body_mapping, tcp ? &es_tcp_ready : &es_http_ready) != 0) {
         fprintf(stderr, "Elasticsearch %s traffic index %s unavailable; %zu document(s) not stored\n",
                 tcp ? "TCP" : "HTTP", index, count);
         es_free_docs(docs);
@@ -1625,7 +1650,7 @@ static int es_query_http(const char *database_path,
     if (denied) return 0;
     st_es_config config;
     if (es_load_config(&config) != 0
-        || es_ensure_index(&config, config.http_index, es_http_mapping, &es_http_ready) != 0) {
+        || es_ensure_index(&config, config.http_index, es_http_mapping, es_http_body_mapping, &es_http_ready) != 0) {
         free(visible); return -1;
     }
     st_es_buffer request = {0};
@@ -1727,7 +1752,7 @@ static int es_list_tcp_internal(const char *database_path,
     if (denied) return document_id > 0 ? -1 : 0;
     st_es_config config;
     if (es_load_config(&config) != 0
-        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, &es_tcp_ready) != 0) {
+        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, NULL, &es_tcp_ready) != 0) {
         free(visible); return -1;
     }
     st_es_buffer request = {0};

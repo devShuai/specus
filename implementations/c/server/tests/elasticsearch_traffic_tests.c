@@ -1,12 +1,49 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "elasticsearch_traffic.h"
+#include "http_client.h"
 #include "storage.h"
 #include "traffic_capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * Stores one exchange in an HTTP index the fake Elasticsearch had before the server started, then
+ * reads that index's mapping back: requestBodyData must have body_type ("binary" when the update
+ * was taken, "text" when the fields were text already and the update was refused).
+ */
+static int check_existing_http_index(const char *path, const st_storage_http_exchange_record *http,
+                                     long long client_id, const char *index, const char *body_type)
+{
+    if (setenv("SPECUS_ELASTICSEARCH_HTTP_INDEX", index, 1) != 0) return -1;
+    st_elasticsearch_traffic_reset_for_tests();
+    if (st_storage_record_http_exchange(path, http) != 0) return -1;
+    st_elasticsearch_traffic_flush();
+    st_storage_http_exchange exchanges[2];
+    size_t exchange_count = 0;
+    long long total = 0;
+    if (st_storage_list_http_exchanges_visible(path, client_id, NULL, NULL, NULL, NULL, "default", "admin", 1,
+                                               0, 10, exchanges, 2, &exchange_count, &total) != 0
+        || total != 1 || exchange_count != 1) {
+        fprintf(stderr, "Elasticsearch existing index %s did not store the exchange\n", index);
+        return -1;
+    }
+    char endpoint[512];
+    snprintf(endpoint, sizeof(endpoint), "%s/%s/_mapping", getenv("SPECUS_ELASTICSEARCH_URIS"), index);
+    st_http_client_options options = {5000, 64U * 1024U, NULL};
+    long status = 0;
+    char *mapping = NULL;
+    char expected[2][96];
+    snprintf(expected[0], sizeof(expected[0]), "\"requestBodyData\":{\"type\":\"%s\"}", body_type);
+    snprintf(expected[1], sizeof(expected[1]), "\"responseBodyData\":{\"type\":\"%s\"}", body_type);
+    int ok = st_http_get_json(endpoint, &options, &status, &mapping) == 0 && status == 200 && mapping != NULL
+        && strstr(mapping, expected[0]) != NULL && strstr(mapping, expected[1]) != NULL;
+    if (!ok) fprintf(stderr, "Elasticsearch existing index %s mapping mismatch: %s\n", index, mapping ? mapping : "");
+    free(mapping);
+    return ok ? 0 : -1;
+}
 
 int main(int argc, char **argv)
 {
@@ -196,6 +233,14 @@ int main(int argc, char **argv)
                                                exchanges, 4, &exchange_count, &total) != 0
         || total != 0 || exchange_count != 0) {
         fprintf(stderr, "Elasticsearch size retention did not delete oldest documents\n");
+        return 1;
+    }
+
+    /* HttpTrafficExchangeStore puts the binary body fields on an HTTP index that exists already;
+     * an index where they are text refuses that, and the server goes on with the index as it is. */
+    if (unsetenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE") != 0
+        || check_existing_http_index(argv[1], &http, client.id, "specus-http-legacy", "binary") != 0
+        || check_existing_http_index(argv[1], &http, client.id, "specus-http-text-bodies", "text") != 0) {
         return 1;
     }
     puts("elasticsearch traffic tests passed");

@@ -213,7 +213,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 1. **每客户端 64 条 TCP 映射 / 64 条 HTTP 路由**（`admin_http.c` `ST_ADMIN_MAX_TCP_MAPPINGS`、`main.c` `ST_MAX_TCP_MAPPINGS`）：创建不受限，但超过后该客户端的登录配置、NAT_CONTROL 推送与 `GET /api/admin/clients/{id}` 失败；Java 无上限。需要把运行时会话里的映射数组改为动态分配。
 2. **Peer Mesh 管理列表的固定上限**（`peer_mesh.c` 256 个客户端、`append_peer_mesh_egress_policy_view` 512 个客户端）：与上面已修的列表同类，留给 `fix/c-server-parity-peer` 合入后处理。
 3. **SQLite 流量明细搜索对照 JPA**：字段代码按 `HttpTrafficSearchField`、未知代码回落 summary、管理员按记录租户（看得到已删除客户端的流量）。
-4. **`fix/c-server-parity-rest` 合入后复核**：HTTP body 存储与详情显示、已存在 Elasticsearch HTTP 索引补 binary body 映射、客户端登录 nonce 存库，以及 test-map 中 `TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 两行。
+4. ~~**`fix/c-server-parity-rest` 合入后复核**~~（已完成）：HTTP body 存储与详情显示、客户端登录 nonce 存库，以及 test-map 中 `TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 两行都已对应；已存在的 Elasticsearch HTTP 索引原先不补 binary body 映射，`fix/c-es-existing-index-body-mapping` 已按 Java `putBinaryBodyMapping` 补上（被拒时记日志、照用原索引），`elasticsearch_traffic_tests` 用 fake 预置的两个旧索引验证。
 5. **未逐项对照的 14 个管理端点**：注册两条、`/api/admin/me`、凭据 CRUD 四条、映射列表与改删三条、`database/initialize`、客户端名称可用性、流量统计两条——逐项对照校验规则、状态码与字段。
 6. 边缘差异：连接记录普通用户可见范围（按名称匹配的失败登录）、`listenPort=0`、裁剪时 `total_data_set_size_in_bytes` 为 0 的回退、`/ws/connections` 文本上限、数字 `messageId` 的回显。
 
