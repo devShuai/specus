@@ -294,7 +294,11 @@ func (stream *httpRequestStream) forward() {
 		}
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
-				stream.fail(28, readErr.Error())
+				// A stream the server reset cancels the request; answering that with an RST of
+				// our own would only cross the server's.
+				if stream.ctx.Err() == nil {
+					stream.fail(28, readErr.Error())
+				}
 				return
 			}
 			trailers := flattenHeaders(upstream.Trailer)

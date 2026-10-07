@@ -26,6 +26,7 @@
 
 #include "json.h"
 #include "protocol.h"
+#include "security.h"
 #include "storage.h"
 #include "stream_tombstones.h"
 
@@ -741,6 +742,74 @@ static int check_rst_for_never_opened_stream(test_server *server, client_pair *p
     return expect_data_connection_served(server, pair);
 }
 
+typedef struct {
+    const test_server *server;
+    long long route_id;
+    int status;
+    char *body;
+} connectivity_call;
+
+static void *run_connectivity_check(void *arg)
+{
+    connectivity_call *call = (connectivity_call *)arg;
+    char token[1024];
+    char path[128];
+    call->status = 0;
+    if (st_security_issue_local_token(ADMIN_USERNAME, "default", "ADMIN", ADMIN_JWT_SECRET, 600,
+                                      token, sizeof(token)) != 0) {
+        return NULL;
+    }
+    snprintf(path, sizeof(path), "/api/admin/http-routes/%lld/connectivity-check", call->route_id);
+    (void)http_request(call->server->admin_port, "POST", path, "{}", token, &call->status, &call->body);
+    return NULL;
+}
+
+/*
+ * A connectivity check (service-connectivity-check.md) ends its probe streams with RST, and the
+ * device may RST them too: the Go client does after its request was cancelled, and the device's
+ * own failure can cross the server's reset. Those late RSTs are stale frames for tombstoned
+ * streams; they used to look like RSTs for never-opened streams and close the whole data
+ * connection, taking every stream of the device down with it.
+ */
+static int check_connectivity_probe_late_rst(test_server *server, client_pair *pair)
+{
+    char route_id[32];
+    CHECK(db_scalar(server->db_path, "SELECT id FROM http_route_mapping WHERE route = ?", ROUTE, 0,
+                    route_id, sizeof(route_id)) == 0,
+          "route id");
+    connectivity_call call = {server, atoll(route_id), 0, NULL};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, run_connectivity_check, &call) == 0, "check thread");
+
+    /* HEAD answered 405: the check falls back to one GET, and resets the HEAD stream. */
+    uint32_t head_stream = 0U;
+    uint32_t get_stream = 0U;
+    uint32_t code = 0U;
+    int failed = expect_http_open(pair->data, &head_stream) != 0
+        || send_nat(pair->data, ST_NAT_OPEN, 0U, head_stream, 0U,
+                    "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":405,"
+                    "\"headers\":[],\"trailerNames\":[]}",
+                    NULL, 0U) != 0
+        || wait_rst(pair->data, head_stream, &code) != 0
+        || send_nat(pair->data, ST_NAT_RST, 0U, head_stream, 28U, NULL, NULL, 0U) != 0
+        /* The GET's head arrives with its body still to come: the server resets it. */
+        || expect_http_open(pair->data, &get_stream) != 0
+        || send_nat(pair->data, ST_NAT_OPEN, 0U, get_stream, 0U, RESPONSE_HEAD, NULL, 0U) != 0
+        || wait_rst(pair->data, get_stream, &code) != 0
+        || send_nat(pair->data, ST_NAT_RST, 0U, get_stream, 28U, NULL, NULL, 0U) != 0;
+    pthread_join(thread, NULL);
+    CHECK(!failed, "the probe exchange did not run as scripted");
+    CHECK(call.status == 200 && call.body != NULL && strstr(call.body, "\"ACCESS_OK\"") != NULL,
+          "check answer %d %s", call.status, call.body == NULL ? "" : call.body);
+    free(call.body);
+    CHECK(expect_alive_without_rst(pair->data, get_stream) == 0,
+          "a late RST for a finished probe stream closed the data connection");
+    /* DATA after the reset is a frame for a closed stream: RST 7, as for a public stream. */
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, get_stream, 0U, NULL, "late", 4U) == 0, "late DATA");
+    CHECK(expect_rst(pair->data, get_stream, 7U) == 0, "late DATA on a probe stream did not get RST 7");
+    return expect_data_connection_served(server, pair);
+}
+
 /*
  * Credit up to the 16 MiB window is accepted; a WINDOW_UPDATE beyond it closes the data connection
  * and its streams, as Java StreamFlowController and Go do (it used to only stop routing to it).
@@ -1019,6 +1088,11 @@ static const char *const long_idle[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900", 
 
 static int run_check(const char *name, pair_check check)
 {
+    /* SPECUS_NAT_STREAM_ONLY=<text> runs only the checks whose name contains it. */
+    const char *only = getenv("SPECUS_NAT_STREAM_ONLY");
+    if (only != NULL && *only != '\0' && strstr(name, only) == NULL) {
+        return 0;
+    }
     current_check = check;
     return run_on_fresh_server(name, run_current_check, long_idle);
 }
@@ -1049,6 +1123,8 @@ int main(int argc, char **argv)
     failures += run_check("RST for a never-opened stream closes the data connection",
                           check_rst_for_never_opened_stream);
     failures += run_check("WINDOW_UPDATE overflow closes the data connection", check_window_overflow);
+    failures += run_check("late RSTs for connectivity probe streams are stale frames",
+                          check_connectivity_probe_late_rst);
     failures += run_check("HEARTBEAT_RESPONSE is accepted on both roles", check_heartbeat_response);
     failures += run_check("4 MiB client-to-public queue overflow resets only that stream", check_tcp_queue_overflow);
     failures += run_on_fresh_server("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
