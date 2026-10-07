@@ -113,6 +113,13 @@ class Handler(BaseHTTPRequestHandler):
         start = request.get("from", 0)
         size = request.get("size", 10)
         docs = docs[start:start + size]
+        source = request.get("_source")
+        excludes = source.get("excludes", []) if isinstance(source, dict) else []
+        if source is False:
+            docs = [(key, {}) for key, doc in docs]
+        elif excludes:
+            docs = [(key, {field: value for field, value in doc.items() if field not in excludes})
+                    for key, doc in docs]
         self.send_json(200, {"hits": {"total": {"value": total, "relation": "eq"},
                                      "hits": [{"_id": key, "_source": doc} for key, doc in docs]}})
 
