@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1326,6 +1327,76 @@ static int scan_http_route(sqlite3_stmt *stmt, st_storage_http_route *route)
     route->path_rewrite_enabled = sqlite3_column_int(stmt, 8) != 0;
     route->insecure_skip_verify = sqlite3_column_int(stmt, 9) != 0;
     route->auth_enabled = sqlite3_column_int(stmt, 10) != 0;
+    return 0;
+}
+
+/* Every row of stmt as a mapping, in a heap array that grows with the rows; NULL when none. */
+static int collect_mappings(sqlite3_stmt *stmt, st_storage_mapping **mappings, size_t *mapping_count)
+{
+    st_storage_mapping *items = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count == capacity) {
+            size_t next = capacity == 0U ? 16U : capacity * 2U;
+            st_storage_mapping *grown = next > SIZE_MAX / sizeof(*items)
+                ? NULL
+                : (st_storage_mapping *)realloc(items, next * sizeof(*items));
+            if (grown == NULL) {
+                free(items);
+                return -1;
+            }
+            items = grown;
+            capacity = next;
+        }
+        if (scan_mapping(stmt, &items[count]) != 0) {
+            free(items);
+            return -1;
+        }
+        ++count;
+    }
+    if (rc != SQLITE_DONE) {
+        free(items);
+        return -1;
+    }
+    *mappings = items;
+    *mapping_count = count;
+    return 0;
+}
+
+/* Every row of stmt as an HTTP route, in a heap array that grows with the rows; NULL when none. */
+static int collect_http_routes(sqlite3_stmt *stmt, st_storage_http_route **routes, size_t *route_count)
+{
+    st_storage_http_route *items = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count == capacity) {
+            size_t next = capacity == 0U ? 16U : capacity * 2U;
+            st_storage_http_route *grown = next > SIZE_MAX / sizeof(*items)
+                ? NULL
+                : (st_storage_http_route *)realloc(items, next * sizeof(*items));
+            if (grown == NULL) {
+                free(items);
+                return -1;
+            }
+            items = grown;
+            capacity = next;
+        }
+        if (scan_http_route(stmt, &items[count]) != 0) {
+            free(items);
+            return -1;
+        }
+        ++count;
+    }
+    if (rc != SQLITE_DONE) {
+        free(items);
+        return -1;
+    }
+    *routes = items;
+    *route_count = count;
     return 0;
 }
 
@@ -3875,10 +3946,10 @@ int st_storage_delete_client(const char *path, long long id)
 
 int st_storage_load_mappings(const char *path,
                              const char *client_name,
-                             st_storage_mapping *mappings,
-                             size_t max_mappings,
+                             st_storage_mapping **mappings,
                              size_t *mapping_count)
 {
+    *mappings = NULL;
     *mapping_count = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -3898,25 +3969,18 @@ int st_storage_load_mappings(const char *path,
         return -1;
     }
     sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (*mapping_count >= max_mappings || scan_mapping(stmt, &mappings[*mapping_count]) != 0) {
-            sqlite3_finalize(stmt);
-            sqlite3_close(db);
-            return -1;
-        }
-        ++*mapping_count;
-    }
+    rc = collect_mappings(stmt, mappings, mapping_count);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return rc;
 }
 
 int st_storage_list_mappings(const char *path,
                              long long client_id,
-                             st_storage_mapping *mappings,
-                             size_t max_mappings,
+                             st_storage_mapping **mappings,
                              size_t *mapping_count)
 {
+    *mappings = NULL;
     *mapping_count = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -3941,17 +4005,10 @@ int st_storage_list_mappings(const char *path,
     if (client_id > 0) {
         sqlite3_bind_int64(stmt, 1, client_id);
     }
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (*mapping_count >= max_mappings || scan_mapping(stmt, &mappings[*mapping_count]) != 0) {
-            sqlite3_finalize(stmt);
-            sqlite3_close(db);
-            return -1;
-        }
-        ++*mapping_count;
-    }
+    rc = collect_mappings(stmt, mappings, mapping_count);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return rc;
 }
 
 static int load_mapping_by_id(const char *path, long long id, st_storage_mapping *mapping)
@@ -4196,10 +4253,10 @@ int st_storage_delete_mapping_by_id(const char *path, long long id)
 
 int st_storage_load_http_routes(const char *path,
                                 const char *client_name,
-                                st_storage_http_route *routes,
-                                size_t max_routes,
+                                st_storage_http_route **routes,
                                 size_t *route_count)
 {
+    *routes = NULL;
     *route_count = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -4220,25 +4277,18 @@ int st_storage_load_http_routes(const char *path,
         return -1;
     }
     sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (*route_count >= max_routes || scan_http_route(stmt, &routes[*route_count]) != 0) {
-            sqlite3_finalize(stmt);
-            sqlite3_close(db);
-            return -1;
-        }
-        ++*route_count;
-    }
+    rc = collect_http_routes(stmt, routes, route_count);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return rc;
 }
 
 int st_storage_list_http_routes(const char *path,
                                 long long client_id,
-                                st_storage_http_route *routes,
-                                size_t max_routes,
+                                st_storage_http_route **routes,
                                 size_t *route_count)
 {
+    *routes = NULL;
     *route_count = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -4265,17 +4315,10 @@ int st_storage_list_http_routes(const char *path,
     if (client_id > 0) {
         sqlite3_bind_int64(stmt, 1, client_id);
     }
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (*route_count >= max_routes || scan_http_route(stmt, &routes[*route_count]) != 0) {
-            sqlite3_finalize(stmt);
-            sqlite3_close(db);
-            return -1;
-        }
-        ++*route_count;
-    }
+    rc = collect_http_routes(stmt, routes, route_count);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return rc;
 }
 
 /* Returns -1 when the row could not be read, otherwise 0 with *found telling whether it exists. */

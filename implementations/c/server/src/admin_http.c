@@ -52,7 +52,6 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#define ST_ADMIN_MAX_TCP_MAPPINGS 64U
 #define ST_ADMIN_MAX_CLIENTS 128U
 #define ST_ADMIN_MAX_CLIENT_DOWNLOADS 128U
 #define ST_ADMIN_MAX_CONNECTIONS_PAGE 500U
@@ -109,6 +108,19 @@ typedef struct {
     char target_base_url[512];
     int insecure_skip_verify;
 } st_admin_http_route;
+
+/* A client's mappings or routes, as many as it has; items is the caller's to free. */
+typedef struct {
+    st_admin_tcp_mapping *items;
+    size_t count;
+    size_t capacity;
+} st_admin_tcp_mapping_list;
+
+typedef struct {
+    st_admin_http_route *items;
+    size_t count;
+    size_t capacity;
+} st_admin_http_route_list;
 
 typedef struct {
     st_admin_server *server;
@@ -401,6 +413,14 @@ static void admin_close_client_connections(const char *client_name, const char *
     }
 }
 
+#define ST_ADMIN_JSON_RESPONSE_HEAD            \
+    "HTTP/1.1 %d %s\r\n"                       \
+    "Content-Type: application/json\r\n"       \
+    "Cache-Control: no-store\r\n"              \
+    "X-Content-Type-Options: nosniff\r\n"      \
+    "Content-Length: %zu\r\n"                  \
+    "\r\n"
+
 static int write_response(char *out, size_t out_len, int status, const char *reason, const char *body)
 {
     if (body == NULL) {
@@ -408,18 +428,57 @@ static int write_response(char *out, size_t out_len, int status, const char *rea
     }
     int written = snprintf(out,
                            out_len,
-                           "HTTP/1.1 %d %s\r\n"
-                           "Content-Type: application/json\r\n"
-                           "Cache-Control: no-store\r\n"
-                           "X-Content-Type-Options: nosniff\r\n"
-                           "Content-Length: %zu\r\n"
-                           "\r\n"
-                           "%s",
+                           ST_ADMIN_JSON_RESPONSE_HEAD "%s",
                            status,
                            reason,
                            strlen(body),
                            body);
     return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/*
+ * A response too large for the buffer handle_client passed in. handle_client arms the slot of its
+ * thread for the request it serves; a caller of the st_admin_build_response* functions brings its
+ * own buffer and leaves it unarmed, so for that caller such a response still fails.
+ */
+typedef struct {
+    char *data;
+    size_t len;
+} admin_heap_response;
+
+static _Thread_local admin_heap_response *admin_armed_heap_response;
+
+/*
+ * write_response for a body that has no fixed bound, such as every mapping and route of a client.
+ * When the response does not fit out and the slot is armed, the whole response goes to the slot
+ * and 1 is returned; handle_client sends the slot instead of out whenever it holds a response.
+ */
+static int write_unbounded_response(char *out, size_t out_len, int status, const char *reason, const char *body)
+{
+    int written = write_response(out, out_len, status, reason, body);
+    admin_heap_response *slot = admin_armed_heap_response;
+    if (written >= 0 || slot == NULL) {
+        return written;
+    }
+    if (body == NULL) {
+        body = "";
+    }
+    size_t body_len = strlen(body);
+    char head[256];
+    int head_len = snprintf(head, sizeof(head), ST_ADMIN_JSON_RESPONSE_HEAD, status, reason, body_len);
+    if (head_len < 0 || (size_t)head_len >= sizeof(head) || body_len > SIZE_MAX - (size_t)head_len) {
+        return -1;
+    }
+    char *data = (char *)malloc((size_t)head_len + body_len);
+    if (data == NULL) {
+        return -1;
+    }
+    memcpy(data, head, (size_t)head_len);
+    memcpy(data + head_len, body, body_len);
+    free(slot->data);
+    slot->data = data;
+    slot->len = (size_t)head_len + body_len;
+    return 1;
 }
 
 static int write_login_rate_limited_response(char *out, size_t out_len, int64_t retry_after_seconds)
@@ -1079,25 +1138,66 @@ static int admin_sb_append_nullable_json_string(st_admin_string_builder *builder
     return admin_sb_append_json_string(builder, value);
 }
 
-static int add_admin_tcp_mapping(st_admin_tcp_mapping *mappings,
-                                 size_t *mapping_count,
+/* Grows *items, of item_size bytes each, so that it holds one more than count. */
+static int admin_grow_array(void **items, size_t *capacity, size_t count, size_t item_size)
+{
+    if (count < *capacity) {
+        return 0;
+    }
+    size_t next = *capacity == 0U ? 16U : *capacity * 2U;
+    void *grown = next < *capacity || next > SIZE_MAX / item_size ? NULL : realloc(*items, next * item_size);
+    if (grown == NULL) {
+        return -1;
+    }
+    *items = grown;
+    *capacity = next;
+    return 0;
+}
+
+static int add_admin_tcp_mapping(st_admin_tcp_mapping_list *mappings,
                                  int port,
                                  const char *target_address,
                                  int target_port)
 {
-    if (*mapping_count >= ST_ADMIN_MAX_TCP_MAPPINGS || target_address == NULL || *target_address == '\0'
-        || strlen(target_address) >= sizeof(mappings[0].specus_address)) {
+    if (target_address == NULL || *target_address == '\0'
+        || strlen(target_address) >= sizeof(mappings->items[0].specus_address)) {
         return -1;
     }
-    st_admin_tcp_mapping *mapping = &mappings[*mapping_count];
+    void *items = mappings->items;
+    if (admin_grow_array(&items, &mappings->capacity, mappings->count, sizeof(st_admin_tcp_mapping)) != 0) {
+        return -1;
+    }
+    mappings->items = (st_admin_tcp_mapping *)items;
+    st_admin_tcp_mapping *mapping = &mappings->items[mappings->count++];
     mapping->port = port;
     strcpy(mapping->specus_address, target_address);
     mapping->specus_port = target_port;
-    ++(*mapping_count);
     return 0;
 }
 
-static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping_count)
+static int add_admin_http_route(st_admin_http_route_list *routes,
+                                const char *route,
+                                const char *target_base_url,
+                                int insecure_skip_verify)
+{
+    if (route == NULL || target_base_url == NULL
+        || strlen(route) >= sizeof(routes->items[0].route)
+        || strlen(target_base_url) >= sizeof(routes->items[0].target_base_url)) {
+        return -1;
+    }
+    void *items = routes->items;
+    if (admin_grow_array(&items, &routes->capacity, routes->count, sizeof(st_admin_http_route)) != 0) {
+        return -1;
+    }
+    routes->items = (st_admin_http_route *)items;
+    st_admin_http_route *item = &routes->items[routes->count++];
+    strcpy(item->route, route);
+    strcpy(item->target_base_url, target_base_url);
+    item->insecure_skip_verify = insecure_skip_verify;
+    return 0;
+}
+
+static int load_env_tcp_mappings(st_admin_tcp_mapping_list *mappings)
 {
     const char *raw = getenv("SPECUS_TCP_MAPPINGS");
     if (raw == NULL || *raw == '\0') {
@@ -1131,7 +1231,7 @@ static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping
         int target_port = 0;
         if (admin_parse_port_text(public_port_text, &public_port) != 0
             || admin_parse_port_text(target_port_text, &target_port) != 0
-            || add_admin_tcp_mapping(mappings, mapping_count, public_port, target_host, target_port) != 0) {
+            || add_admin_tcp_mapping(mappings, public_port, target_host, target_port) != 0) {
             free(copy);
             return -1;
         }
@@ -1141,9 +1241,25 @@ static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping
     return 0;
 }
 
-static int load_database_tcp_mappings(const char *client_name,
-                                      st_admin_tcp_mapping *mappings,
-                                      size_t *mapping_count)
+/* The enabled mappings the database holds for client_name, whether or not the client is enabled. */
+static int add_stored_tcp_mappings(const char *database_path,
+                                   const char *client_name,
+                                   st_admin_tcp_mapping_list *mappings)
+{
+    st_storage_mapping *stored = NULL;
+    size_t stored_count = 0;
+    if (st_storage_load_mappings(database_path, client_name, &stored, &stored_count) != 0) {
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stored_count; ++i) {
+        rc = add_admin_tcp_mapping(mappings, stored[i].listen_port, stored[i].target_address, stored[i].target_port);
+    }
+    free(stored);
+    return rc;
+}
+
+static int load_database_tcp_mappings(const char *client_name, st_admin_tcp_mapping_list *mappings)
 {
     const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') {
@@ -1153,40 +1269,20 @@ static int load_database_tcp_mappings(const char *client_name,
         || st_storage_client_enabled(database_path, client_name) != 0) {
         return -1;
     }
-    st_storage_mapping stored[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t stored_count = 0;
-    if (st_storage_load_mappings(database_path,
-                                 client_name,
-                                 stored,
-                                 ST_ADMIN_MAX_TCP_MAPPINGS,
-                                 &stored_count) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < stored_count; ++i) {
-        if (add_admin_tcp_mapping(mappings,
-                                  mapping_count,
-                                  stored[i].listen_port,
-                                  stored[i].target_address,
-                                  stored[i].target_port)
-            != 0) {
-            return -1;
-        }
-    }
-    return 0;
+    return add_stored_tcp_mappings(database_path, client_name, mappings);
 }
 
-static int load_current_tcp_mappings(const char *client_name,
-                                     st_admin_tcp_mapping *mappings,
-                                     size_t *mapping_count)
+/* The mappings client_name is sent: its enabled database ones, then SPECUS_TCP_MAPPINGS. */
+static int load_current_tcp_mappings(const char *client_name, st_admin_tcp_mapping_list *mappings)
 {
-    *mapping_count = 0;
-    return load_database_tcp_mappings(client_name, mappings, mapping_count) != 0
-            || load_env_tcp_mappings(mappings, mapping_count) != 0
+    mappings->count = 0;
+    return load_database_tcp_mappings(client_name, mappings) != 0
+            || load_env_tcp_mappings(mappings) != 0
         ? -1
         : 0;
 }
 
-static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count)
+static int load_env_http_routes(st_admin_http_route_list *routes)
 {
     const char *raw = getenv("SPECUS_HTTP_ROUTES");
     if (raw == NULL || *raw == '\0') {
@@ -1199,10 +1295,6 @@ static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count
     char *cursor = copy;
     char *token = admin_next_csv_token(&cursor);
     while (token != NULL) {
-        if (*route_count >= ST_ADMIN_MAX_TCP_MAPPINGS) {
-            free(copy);
-            return -1;
-        }
         char *entry = admin_trim(token);
         char *equals = strchr(entry, '=');
         if (equals == NULL) {
@@ -1212,24 +1304,35 @@ static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count
         *equals = '\0';
         char *route = admin_trim(entry);
         char *target = admin_trim(equals + 1);
-        if (*route == '\0' || *target == '\0'
-            || strlen(route) >= sizeof(routes[0].route)
-            || strlen(target) >= sizeof(routes[0].target_base_url)) {
+        if (*route == '\0' || *target == '\0' || add_admin_http_route(routes, route, target, 0) != 0) {
             free(copy);
             return -1;
         }
-        st_admin_http_route *item = &routes[*route_count];
-        strcpy(item->route, route);
-        strcpy(item->target_base_url, target);
-        item->insecure_skip_verify = 0;
-        ++(*route_count);
         token = admin_next_csv_token(&cursor);
     }
     free(copy);
     return 0;
 }
 
-static int load_database_http_routes(const char *client_name, st_admin_http_route *routes, size_t *route_count)
+/* The enabled routes the database holds for client_name, whether or not the client is enabled. */
+static int add_stored_http_routes(const char *database_path,
+                                  const char *client_name,
+                                  st_admin_http_route_list *routes)
+{
+    st_storage_http_route *stored = NULL;
+    size_t stored_count = 0;
+    if (st_storage_load_http_routes(database_path, client_name, &stored, &stored_count) != 0) {
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stored_count; ++i) {
+        rc = add_admin_http_route(routes, stored[i].route, stored[i].target_base_url, stored[i].insecure_skip_verify);
+    }
+    free(stored);
+    return rc;
+}
+
+static int load_database_http_routes(const char *client_name, st_admin_http_route_list *routes)
 {
     const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') {
@@ -1239,37 +1342,56 @@ static int load_database_http_routes(const char *client_name, st_admin_http_rout
         || st_storage_client_enabled(database_path, client_name) != 0) {
         return -1;
     }
-    st_storage_http_route stored[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t stored_count = 0;
-    if (st_storage_load_http_routes(database_path,
-                                    client_name,
-                                    stored,
-                                    ST_ADMIN_MAX_TCP_MAPPINGS,
-                                    &stored_count) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < stored_count; ++i) {
-        if (*route_count >= ST_ADMIN_MAX_TCP_MAPPINGS
-            || strlen(stored[i].route) >= sizeof(routes[0].route)
-            || strlen(stored[i].target_base_url) >= sizeof(routes[0].target_base_url)) {
-            return -1;
-        }
-        st_admin_http_route *item = &routes[*route_count];
-        strcpy(item->route, stored[i].route);
-        strcpy(item->target_base_url, stored[i].target_base_url);
-        item->insecure_skip_verify = stored[i].insecure_skip_verify;
-        ++(*route_count);
-    }
-    return 0;
+    return add_stored_http_routes(database_path, client_name, routes);
 }
 
-static int load_current_http_routes(const char *client_name, st_admin_http_route *routes, size_t *route_count)
+/* The routes client_name is sent: its enabled database ones, then SPECUS_HTTP_ROUTES. */
+static int load_current_http_routes(const char *client_name, st_admin_http_route_list *routes)
 {
-    *route_count = 0;
-    return load_database_http_routes(client_name, routes, route_count) != 0
-            || load_env_http_routes(routes, route_count) != 0
+    routes->count = 0;
+    return load_database_http_routes(client_name, routes) != 0
+            || load_env_http_routes(routes) != 0
         ? -1
         : 0;
+}
+
+/* One specusConfigList entry, as the login answer and NAT_CONTROL (main.c) carry it. */
+static int append_specus_config_entry(st_admin_string_builder *builder,
+                                      int port,
+                                      const char *specus_address,
+                                      int specus_port)
+{
+    char *target = st_json_escape(specus_address);
+    if (target == NULL) {
+        return -1;
+    }
+    int rc = admin_sb_appendf(builder,
+                              "{\"port\":%d,\"specusAddress\":\"%s\",\"specusPort\":%d}",
+                              port,
+                              target,
+                              specus_port);
+    free(target);
+    return rc;
+}
+
+/* One httpSpecusConfigList entry, as the login answer and NAT_CONTROL (main.c) carry it. */
+static int append_http_route_config_entry(st_admin_string_builder *builder,
+                                          const char *route_name,
+                                          const char *target_base_url,
+                                          int insecure_skip_verify)
+{
+    char *route = st_json_escape(route_name);
+    char *target = st_json_escape(target_base_url);
+    int rc = route == NULL || target == NULL
+        ? -1
+        : admin_sb_appendf(builder,
+                           "{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"insecureSkipVerify\":%s}",
+                           route,
+                           target,
+                           insecure_skip_verify ? "true" : "false");
+    free(route);
+    free(target);
+    return rc;
 }
 
 static int append_specus_config_list(st_admin_string_builder *builder,
@@ -1277,18 +1399,11 @@ static int append_specus_config_list(st_admin_string_builder *builder,
                                      size_t mapping_count)
 {
     for (size_t i = 0; i < mapping_count; ++i) {
-        char *target = st_json_escape(mappings[i].specus_address);
-        if (target == NULL) {
-            return -1;
-        }
-        int rc = admin_sb_appendf(builder,
-                                  "%s{\"port\":%d,\"specusAddress\":\"%s\",\"specusPort\":%d}",
-                                  i == 0 ? "" : ",",
-                                  mappings[i].port,
-                                  target,
-                                  mappings[i].specus_port);
-        free(target);
-        if (rc != 0) {
+        if ((i > 0 && admin_sb_append(builder, ",") != 0)
+            || append_specus_config_entry(builder,
+                                          mappings[i].port,
+                                          mappings[i].specus_address,
+                                          mappings[i].specus_port) != 0) {
             return -1;
         }
     }
@@ -1300,22 +1415,11 @@ static int append_http_route_config_list(st_admin_string_builder *builder,
                                          size_t route_count)
 {
     for (size_t i = 0; i < route_count; ++i) {
-        char *route = st_json_escape(routes[i].route);
-        char *target = st_json_escape(routes[i].target_base_url);
-        if (route == NULL || target == NULL) {
-            free(route);
-            free(target);
-            return -1;
-        }
-        int rc = admin_sb_appendf(builder,
-                                  "%s{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"insecureSkipVerify\":%s}",
-                                  i == 0 ? "" : ",",
-                                  route,
-                                  target,
-                                  routes[i].insecure_skip_verify ? "true" : "false");
-        free(route);
-        free(target);
-        if (rc != 0) {
+        if ((i > 0 && admin_sb_append(builder, ",") != 0)
+            || append_http_route_config_entry(builder,
+                                              routes[i].route,
+                                              routes[i].target_base_url,
+                                              routes[i].insecure_skip_verify) != 0) {
             return -1;
         }
     }
@@ -1511,14 +1615,15 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
     }
 
     const char *client_name_raw = env_text("SPECUS_CLIENT_NAME", "Demo client");
-    st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t mapping_count = 0;
-    if (load_current_tcp_mappings(client_name_raw, mappings, &mapping_count) != 0) {
+    st_admin_tcp_mapping_list mappings = {0};
+    if (load_current_tcp_mappings(client_name_raw, &mappings) != 0) {
+        free(mappings.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp mapping response build failed\"}");
     }
-    st_admin_http_route http_routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t http_route_count = 0;
-    if (load_current_http_routes(client_name_raw, http_routes, &http_route_count) != 0) {
+    st_admin_http_route_list http_routes = {0};
+    if (load_current_http_routes(client_name_raw, &http_routes) != 0) {
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response build failed\"}");
     }
 
@@ -1546,6 +1651,8 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
         free(client_name);
         free(netty_host);
         free(token);
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response build failed\"}");
     }
 
@@ -1576,13 +1683,13 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     client_id,
                                     client_name);
     if (build_rc == 0) {
-        build_rc = append_specus_config_list(&builder, mappings, mapping_count);
+        build_rc = append_specus_config_list(&builder, mappings.items, mappings.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "],\"httpSpecusConfigList\":[");
     }
     if (build_rc == 0) {
-        build_rc = append_http_route_config_list(&builder, http_routes, http_route_count);
+        build_rc = append_http_route_config_list(&builder, http_routes.items, http_routes.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "]}");
@@ -1592,11 +1699,13 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
     free(client_name);
     free(netty_host);
     free(token);
+    free(mappings.items);
+    free(http_routes.items);
     if (build_rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response too large\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -2252,14 +2361,15 @@ static int append_db_client_auth_response(char *out,
                                           const st_storage_client_session *session,
                                           const char *access_token)
 {
-    st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t mapping_count = 0;
-    if (load_current_tcp_mappings(identity->client_name, mappings, &mapping_count) != 0) {
+    st_admin_tcp_mapping_list mappings = {0};
+    if (load_current_tcp_mappings(identity->client_name, &mappings) != 0) {
+        free(mappings.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp mapping response build failed\"}");
     }
-    st_admin_http_route http_routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t http_route_count = 0;
-    if (load_current_http_routes(identity->client_name, http_routes, &http_route_count) != 0) {
+    st_admin_http_route_list http_routes = {0};
+    if (load_current_http_routes(identity->client_name, &http_routes) != 0) {
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response build failed\"}");
     }
 
@@ -2272,6 +2382,8 @@ static int append_db_client_auth_response(char *out,
         free(client_name);
         free(netty_host);
         free(token);
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response build failed\"}");
     }
 
@@ -2293,6 +2405,7 @@ static int append_db_client_auth_response(char *out,
     }
     if (peer_mesh_config == NULL) {
         free(tenant_id); free(client_name); free(netty_host); free(token);
+        free(mappings.items); free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh response build failed\"}");
     }
     st_admin_string_builder builder = {0};
@@ -2317,13 +2430,13 @@ static int append_db_client_auth_response(char *out,
     if (build_rc == 0) build_rc = admin_sb_append(&builder, peer_mesh_config);
     if (build_rc == 0) build_rc = admin_sb_append(&builder, ",\"specusConfigList\":[");
     if (build_rc == 0) {
-        build_rc = append_specus_config_list(&builder, mappings, mapping_count);
+        build_rc = append_specus_config_list(&builder, mappings.items, mappings.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "],\"httpSpecusConfigList\":[");
     }
     if (build_rc == 0) {
-        build_rc = append_http_route_config_list(&builder, http_routes, http_route_count);
+        build_rc = append_http_route_config_list(&builder, http_routes.items, http_routes.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "]}");
@@ -2333,11 +2446,13 @@ static int append_db_client_auth_response(char *out,
     free(netty_host);
     free(token);
     free(peer_mesh_config);
+    free(mappings.items);
+    free(http_routes.items);
     if (build_rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response too large\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -2745,15 +2860,12 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
             if (!admin_can_access_client(context, &clients[i])) {
                 continue;
             }
-            st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+            st_storage_mapping *mappings = NULL;
             size_t client_mapping_count = 0;
-            if (st_storage_list_mappings(database_path,
-                                         clients[i].id,
-                                         mappings,
-                                         ST_ADMIN_MAX_TCP_MAPPINGS,
-                                         &client_mapping_count) != 0) {
+            if (st_storage_list_mappings(database_path, clients[i].id, &mappings, &client_mapping_count) != 0) {
                 return -1;
             }
+            free(mappings);
             *mapping_count += client_mapping_count;
         }
         return 0;
@@ -2768,8 +2880,11 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
     if (!admin_can_access_client(context, &client)) {
         return 0;
     }
-    st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    return load_current_tcp_mappings(client.client_name, mappings, mapping_count);
+    st_admin_tcp_mapping_list mappings = {0};
+    int rc = load_current_tcp_mappings(client.client_name, &mappings);
+    *mapping_count = mappings.count;
+    free(mappings.items);
+    return rc;
 }
 
 static int build_overview_response(const st_admin_context *context, char *out, size_t out_len)
@@ -4315,14 +4430,13 @@ static int build_client_detail_response(const st_admin_context *context,
         || !admin_load_accessible_client(database_path, context, client_id, &client)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_mapping *mappings = NULL;
+    st_storage_http_route *routes = NULL;
     size_t mapping_count = 0U;
     size_t route_count = 0U;
-    if (st_storage_list_mappings(database_path, client_id, mappings,
-                                 ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0
-        || st_storage_list_http_routes(database_path, client_id, routes,
-                                       ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+    if (st_storage_list_mappings(database_path, client_id, &mappings, &mapping_count) != 0
+        || st_storage_list_http_routes(database_path, client_id, &routes, &route_count) != 0) {
+        free(mappings);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"client detail failed\"}");
     }
@@ -4340,12 +4454,14 @@ static int build_client_detail_response(const st_admin_context *context,
         if (rc == 0) rc = append_http_route_view(&builder, &routes[i]);
     }
     if (rc == 0) rc = admin_sb_append(&builder, "]}");
+    free(mappings);
+    free(routes);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"client detail failed\"}");
     }
-    int len = write_response(out, out_len, 200, "OK", builder.data);
+    int len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return len;
 }
@@ -5822,10 +5938,9 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
     int first = 1;
     int created = 0;
     int skipped = 0;
-    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_mapping *mappings = NULL;
     size_t mapping_count = 0U;
-    if (rc == 0 && st_storage_list_mappings(database_path, client.id, mappings,
-                                             ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) rc = -1;
+    if (rc == 0 && st_storage_list_mappings(database_path, client.id, &mappings, &mapping_count) != 0) rc = -1;
     for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
         char service_id[65];
         char name[81];
@@ -5838,10 +5953,10 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
             mappings[i].listen_port, "", existing, &existing_count, &first);
         if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
     }
-    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    free(mappings);
+    st_storage_http_route *routes = NULL;
     size_t route_count = 0U;
-    if (rc == 0 && st_storage_list_http_routes(database_path, client.id, routes,
-                                                ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) rc = -1;
+    if (rc == 0 && st_storage_list_http_routes(database_path, client.id, &routes, &route_count) != 0) rc = -1;
     for (size_t i = 0; rc == 0 && i < route_count; ++i) {
         char host[128], application[16], target_path[256], service_id[65];
         int target_port = 0;
@@ -5856,6 +5971,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
             target_port, target_path, existing, &existing_count, &first);
         if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
     }
+    free(routes);
     if (rc == 0) rc = admin_sb_append(&services, "]");
     st_admin_string_builder response = {0};
     if (rc == 0) rc = admin_sb_appendf(&response, "{\"created\":%d,\"skipped\":%d,\"services\":", created, skipped);
@@ -5871,7 +5987,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
     (void)st_storage_record_peer_mesh_service_audit(database_path, "service-import",
         client.tenant_id, client.id, 0, NULL, reason);
     if (created > 0) admin_notify_peer_mesh_refresh(client.tenant_id);
-    int len = write_response(out, out_len, 200, "OK", response.data);
+    int len = write_unbounded_response(out, out_len, 200, "OK", response.data);
     free(response.data);
     return len;
 }
@@ -5964,9 +6080,9 @@ static int build_specusMappings_response(const st_admin_context *context, const 
                 return response_len;
             }
         }
-        st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+        st_storage_mapping *mappings = NULL;
         size_t mapping_count = 0;
-        if (st_storage_list_mappings(database_path, filter_client_id, mappings, ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) {
+        if (st_storage_list_mappings(database_path, filter_client_id, &mappings, &mapping_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
@@ -5982,29 +6098,31 @@ static int build_specusMappings_response(const st_admin_context *context, const 
             }
             ++visible_count;
         }
+        free(mappings);
     } else if (rc == 0) {
-        st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-        size_t mapping_count = 0;
+        st_admin_tcp_mapping_list mappings = {0};
         const char *client_name = env_text("SPECUS_CLIENT_NAME", "Demo client");
-        if (load_current_tcp_mappings(client_name, mappings, &mapping_count) != 0) {
+        if (load_current_tcp_mappings(client_name, &mappings) != 0) {
+            free(mappings.items);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
         long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
-        for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
+        for (size_t i = 0; rc == 0 && i < mappings.count; ++i) {
             st_storage_mapping mapping = {0};
             mapping.id = (long long)i + 1;
             mapping.client_id = client_id;
             snprintf(mapping.client_name, sizeof(mapping.client_name), "%s", client_name);
-            mapping.listen_port = mappings[i].port;
-            snprintf(mapping.target_address, sizeof(mapping.target_address), "%s", mappings[i].specus_address);
-            mapping.target_port = mappings[i].specus_port;
+            mapping.listen_port = mappings.items[i].port;
+            snprintf(mapping.target_address, sizeof(mapping.target_address), "%s", mappings.items[i].specus_address);
+            mapping.target_port = mappings.items[i].specus_port;
             mapping.enabled = 1;
             rc = admin_sb_append(&builder, i == 0 ? "" : ",");
             if (rc == 0) {
                 rc = append_mapping_view(&builder, &mapping);
             }
         }
+        free(mappings.items);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -6013,7 +6131,7 @@ static int build_specusMappings_response(const st_admin_context *context, const 
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus response failed\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -6055,9 +6173,9 @@ static int build_http_routes_response(const st_admin_context *context, const cha
                 return response_len;
             }
         }
-        st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+        st_storage_http_route *routes = NULL;
         size_t route_count = 0;
-        if (st_storage_list_http_routes(database_path, filter_client_id, routes, ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+        if (st_storage_list_http_routes(database_path, filter_client_id, &routes, &route_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
@@ -6073,28 +6191,30 @@ static int build_http_routes_response(const st_admin_context *context, const cha
             }
             ++visible_count;
         }
+        free(routes);
     } else if (rc == 0) {
-        st_admin_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-        size_t route_count = 0;
+        st_admin_http_route_list routes = {0};
         const char *client_name = env_text("SPECUS_CLIENT_NAME", "Demo client");
-        if (load_current_http_routes(client_name, routes, &route_count) != 0) {
+        if (load_current_http_routes(client_name, &routes) != 0) {
+            free(routes.items);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
         long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
-        for (size_t i = 0; rc == 0 && i < route_count; ++i) {
+        for (size_t i = 0; rc == 0 && i < routes.count; ++i) {
             st_storage_http_route route = {0};
             route.id = (long long)i + 1;
             route.client_id = client_id;
             snprintf(route.client_name, sizeof(route.client_name), "%s", client_name);
-            snprintf(route.route, sizeof(route.route), "%.127s", routes[i].route);
-            snprintf(route.target_base_url, sizeof(route.target_base_url), "%s", routes[i].target_base_url);
+            snprintf(route.route, sizeof(route.route), "%.127s", routes.items[i].route);
+            snprintf(route.target_base_url, sizeof(route.target_base_url), "%s", routes.items[i].target_base_url);
             route.enabled = 1;
             rc = admin_sb_append(&builder, i == 0 ? "" : ",");
             if (rc == 0) {
                 rc = append_http_route_view(&builder, &route);
             }
         }
+        free(routes.items);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -6103,7 +6223,7 @@ static int build_http_routes_response(const st_admin_context *context, const cha
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response failed\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -7371,6 +7491,163 @@ static int handle_peer_mesh_acl_delete(const st_admin_context *context, long lon
     return write_response(out, out_len, 204, "No Content", "");
 }
 
+/*
+ * NAT_CONTROL reaches the client as one MESSAGE_RESPONSE, whose body protocol/spec/control-protocol.md
+ * caps at 1 MiB (ST_MAX_MESSAGE_BODY_SIZE). main.c builds it (build_nat_control_json) from the
+ * client's enabled mappings and routes plus SPECUS_TCP_MAPPINGS and SPECUS_HTTP_ROUTES. A change
+ * that takes it past the cap could be stored but never sent, and every control login of the
+ * client would then fail, so the management API refuses that change instead. The client's name is
+ * counted at the longest a rename can make it, 120 characters of up to 4 UTF-8 bytes in the
+ * message and up to 6 bytes (a backslash-u escape) in the JSON, so no later rename pushes an
+ * accepted configuration over.
+ */
+#define ST_ADMIN_NAT_CONTROL_NAME_BYTES (120U * 4U)
+#define ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES (120U * 6U)
+#define ST_ADMIN_NAT_CONTROL_TOO_LARGE_BODY \
+    "{\"error\":\"客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端\"}"
+
+static size_t admin_varint_size(size_t value)
+{
+    size_t size = 1U;
+    while (value >= 0x80U) {
+        value >>= 7;
+        ++size;
+    }
+    return size;
+}
+
+/*
+ * Whether client_name's NAT_CONTROL stays within the cap once added_entry, a list entry as
+ * append_specus_config_entry or append_http_route_config_entry writes it, takes the place of
+ * removed_entry (NULL when it joins the list). -1 when the configuration could not be read, else 0
+ * with *fits set.
+ */
+static int admin_nat_control_fits(const char *database_path,
+                                  const char *client_name,
+                                  const char *removed_entry,
+                                  const char *added_entry,
+                                  int *fits)
+{
+    st_admin_tcp_mapping_list mappings = {0};
+    st_admin_http_route_list routes = {0};
+    st_admin_string_builder json = {0};
+    char *public_address = st_json_escape(env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
+    int rc = public_address == NULL
+            || add_stored_tcp_mappings(database_path, client_name, &mappings) != 0
+            || load_env_tcp_mappings(&mappings) != 0
+            || add_stored_http_routes(database_path, client_name, &routes) != 0
+            || load_env_http_routes(&routes) != 0
+        ? -1
+        : 0;
+    /* build_nat_control_json's document, its clientName left empty to be counted at its longest. */
+    if (rc == 0) {
+        rc = admin_sb_appendf(&json,
+                              "{\"clientName\":\"\",\"remoteAddress\":\"%s\",\"remotePort\":%d,\"specusConfigList\":[",
+                              public_address,
+                              env_int("SPECUS_NETTY_PORT", 7010));
+    }
+    if (rc == 0) rc = append_specus_config_list(&json, mappings.items, mappings.count);
+    if (rc == 0) rc = admin_sb_append(&json, "],\"httpSpecusConfigList\":[");
+    if (rc == 0) rc = append_http_route_config_list(&json, routes.items, routes.count);
+    if (rc == 0) rc = admin_sb_append(&json, "]}");
+    if (rc == 0) {
+        size_t json_len = json.len + ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES;
+        size_t removed_len = removed_entry == NULL ? 0U : strlen(removed_entry);
+        if (removed_len <= json_len) {
+            json_len -= removed_len;
+        }
+        /* An entry that joins the list brings the comma that separates it. */
+        json_len += strlen(added_entry) + (removed_entry == NULL ? 1U : 0U);
+        /* As st_protocol_encode_nat_control writes it: clientName, a null toClientName, the type, the JSON. */
+        size_t body_len = admin_varint_size(ST_ADMIN_NAT_CONTROL_NAME_BYTES + 1U) + ST_ADMIN_NAT_CONTROL_NAME_BYTES
+            + 1U + admin_varint_size((size_t)ST_MESSAGE_TYPE_NAT_CONTROL)
+            + admin_varint_size(json_len + 1U) + json_len;
+        *fits = body_len <= ST_MAX_MESSAGE_BODY_SIZE;
+    }
+    free(public_address);
+    free(mappings.items);
+    free(routes.items);
+    free(json.data);
+    return rc;
+}
+
+/* 0 when added_entry fits client_name's NAT_CONTROL (see above), else the answer written to out. */
+static int admin_nat_control_answer(const char *database_path,
+                                    const char *client_name,
+                                    int entries_built,
+                                    const char *removed_entry,
+                                    const char *added_entry,
+                                    char *out,
+                                    size_t out_len)
+{
+    int fits = 0;
+    if (!entries_built || admin_nat_control_fits(database_path, client_name, removed_entry, added_entry, &fits) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"NAT_CONTROL size check failed\"}");
+    }
+    return fits ? 0 : write_response(out, out_len, 400, "Bad Request", ST_ADMIN_NAT_CONTROL_TOO_LARGE_BODY);
+}
+
+/*
+ * The NAT_CONTROL check of a mapping change: replaced is the enabled mapping the change replaces or
+ * disables (NULL when none), and the new fields are what it leaves enabled, if anything. Removing
+ * an entry only shrinks the message, so a change that enables nothing always passes.
+ */
+static int admin_check_mapping_change(const char *database_path,
+                                      const char *client_name,
+                                      const st_storage_mapping *replaced,
+                                      int enabled,
+                                      int listen_port,
+                                      const char *target_address,
+                                      int target_port,
+                                      char *out,
+                                      size_t out_len)
+{
+    if (!enabled) {
+        return 0;
+    }
+    st_admin_string_builder removed = {0};
+    st_admin_string_builder added = {0};
+    int built = (replaced == NULL
+                 || append_specus_config_entry(&removed, replaced->listen_port, replaced->target_address,
+                                               replaced->target_port) == 0)
+        && append_specus_config_entry(&added, listen_port, target_address, target_port) == 0
+        && added.data != NULL;
+    int answer = admin_nat_control_answer(database_path, client_name, built,
+                                          replaced == NULL ? NULL : removed.data, added.data, out, out_len);
+    free(removed.data);
+    free(added.data);
+    return answer;
+}
+
+/* The NAT_CONTROL check of an HTTP route change, as admin_check_mapping_change. */
+static int admin_check_http_route_change(const char *database_path,
+                                         const char *client_name,
+                                         const st_storage_http_route *replaced,
+                                         int enabled,
+                                         const char *route,
+                                         const char *target_base_url,
+                                         int insecure_skip_verify,
+                                         char *out,
+                                         size_t out_len)
+{
+    if (!enabled) {
+        return 0;
+    }
+    st_admin_string_builder removed = {0};
+    st_admin_string_builder added = {0};
+    int built = (replaced == NULL
+                 || append_http_route_config_entry(&removed, replaced->route, replaced->target_base_url,
+                                                   replaced->insecure_skip_verify) == 0)
+        && append_http_route_config_entry(&added, route, target_base_url, insecure_skip_verify) == 0
+        && added.data != NULL;
+    int answer = admin_nat_control_answer(database_path, client_name, built,
+                                          replaced == NULL ? NULL : removed.data, added.data, out, out_len);
+    free(removed.data);
+    free(added.data);
+    return answer;
+}
+
 static int handle_specus_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
@@ -7398,6 +7675,16 @@ static int handle_specus_create(const st_admin_context *context, long long clien
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = 0;
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    /* The client's mapping on that port, if any, is replaced: the create is an upsert. */
+    st_storage_mapping replaced;
+    int replaces = st_storage_get_mapping_by_client_port(database_path, owner.client_name, listen_port, &replaced) == 0
+        && replaced.enabled;
+    int refused = admin_check_mapping_change(database_path, owner.client_name, replaces ? &replaced : NULL,
+                                             enabled, listen_port, target_address, target_port, out, out_len);
+    if (refused != 0) {
+        free(target_address);
+        return refused;
+    }
     st_storage_mapping mapping;
     int rc = st_storage_create_mapping_for_client(database_path,
                                                   client_id,
@@ -7427,14 +7714,13 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
     if (!admin_load_accessible_client(database_path, context, client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_mapping *mappings = NULL;
+    st_storage_http_route *routes = NULL;
     size_t mapping_count = 0U;
     size_t route_count = 0U;
-    if (st_storage_list_mappings(database_path, client_id, mappings,
-                                 ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0
-        || st_storage_list_http_routes(database_path, client_id, routes,
-                                       ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+    if (st_storage_list_mappings(database_path, client_id, &mappings, &mapping_count) != 0
+        || st_storage_list_http_routes(database_path, client_id, &routes, &route_count) != 0) {
+        free(mappings);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"映射下发失败\"}");
     }
@@ -7442,6 +7728,8 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
     int enabled_routes = 0;
     for (size_t i = 0; i < mapping_count; ++i) if (mappings[i].enabled) ++enabled_mappings;
     for (size_t i = 0; i < route_count; ++i) if (routes[i].enabled) ++enabled_routes;
+    free(mappings);
+    free(routes);
     int push_result = admin_push_nat_control(owner.id, owner.client_name);
     if (push_result == 0) {
         char response[160];
@@ -7491,6 +7779,12 @@ static int handle_specus_update(const st_admin_context *context, long long id, c
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = existing.detail_capture_enabled;
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    int refused = admin_check_mapping_change(database_path, owner.client_name, existing.enabled ? &existing : NULL,
+                                             enabled, listen_port, next_target_address, target_port, out, out_len);
+    if (refused != 0) {
+        free(target_address);
+        return refused;
+    }
     st_storage_mapping mapping;
     int rc = st_storage_update_mapping_by_id(database_path,
                                              id,
@@ -7624,6 +7918,16 @@ static int handle_http_route_create(const st_admin_context *context, long long c
         free(auth_password);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and authPassword are required when authentication is enabled\"}");
     }
+    /* A route name the client already has is refused below, so a new route never replaces one. */
+    int refused = admin_check_http_route_change(database_path, owner.client_name, NULL, enabled, route_name,
+                                                target_base_url, insecure_skip_verify, out, out_len);
+    if (refused != 0) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return refused;
+    }
     st_storage_http_route route;
     st_storage_share_ids revoked = {0};
     /* route.created in the same transaction; a name the client already has is refused. */
@@ -7726,6 +8030,15 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         free(auth_username);
         free(auth_password);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and a configured authPassword are required when authentication is enabled\"}");
+    }
+    int refused = admin_check_http_route_change(database_path, owner.client_name, existing.enabled ? &existing : NULL,
+                                                enabled, next_route, next_target, insecure_skip_verify, out, out_len);
+    if (refused != 0) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return refused;
     }
     st_storage_http_route route;
     st_storage_share_ids revoked = {0};
@@ -13006,18 +13319,17 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
 /* Whether SPECUS_HTTP_ROUTES defines route_name; its target is copied into target when it does. */
 static int admin_env_http_route_configured(const char *route_name, char *target, size_t target_len)
 {
-    st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
-    size_t route_count = 0;
+    st_admin_http_route_list routes = {0};
     int configured = 0;
-    if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
-        for (size_t i = 0; i < route_count && !configured; ++i) {
-            configured = strcmp(routes[i].route, route_name) == 0;
+    if (load_env_http_routes(&routes) == 0) {
+        for (size_t i = 0; i < routes.count && !configured; ++i) {
+            configured = strcmp(routes.items[i].route, route_name) == 0;
             if (configured && target != NULL) {
-                snprintf(target, target_len, "%s", routes[i].target_base_url);
+                snprintf(target, target_len, "%s", routes.items[i].target_base_url);
             }
         }
     }
-    free(routes);
+    free(routes.items);
     return configured;
 }
 
@@ -17378,6 +17690,9 @@ static void handle_client(st_admin_server *server, int fd)
             return;
         }
     }
+    /* An answer without a fixed bound that outgrows response comes back in heap_response. */
+    admin_heap_response heap_response = {NULL, 0U};
+    admin_armed_heap_response = &heap_response;
     int response_len = st_admin_build_response_internal(method,
                                                         path,
                                                         authorization,
@@ -17391,7 +17706,11 @@ static void handle_client(st_admin_server *server, int fd)
                                                         0,
                                                         response,
                                                         response_capacity);
-    if (response_len > 0) {
+    admin_armed_heap_response = NULL;
+    if (heap_response.data != NULL) {
+        send_all(fd, heap_response.data, heap_response.len);
+        free(heap_response.data);
+    } else if (response_len > 0) {
         send_all(fd, response, (size_t)response_len);
     }
     if (response != response_stack) {

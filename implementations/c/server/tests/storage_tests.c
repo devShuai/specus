@@ -1598,9 +1598,9 @@ int main(void)
         unlink(path);
         return 1;
     }
-    st_storage_mapping mappings[4];
+    st_storage_mapping *mappings = NULL;
     size_t count = 0;
-    if (st_storage_load_mappings(path, "Demo client", mappings, 4, &count) != 0
+    if (st_storage_load_mappings(path, "Demo client", &mappings, &count) != 0
         || count != 1U
         || mappings[0].listen_port != 18080
         || strcmp(mappings[0].target_address, "127.0.0.1") != 0
@@ -1608,9 +1608,11 @@ int main(void)
         || mappings[0].enabled != 1
         || mappings[0].detail_capture_enabled != 0) {
         fprintf(stderr, "mapping load mismatch\n");
+        free(mappings);
         unlink(path);
         return 1;
     }
+    free(mappings);
     st_storage_mapping mapping_by_port;
     if (st_storage_get_mapping_by_client_port(path, "Demo client", 18080, &mapping_by_port) != 0
         || mapping_by_port.listen_port != 18080
@@ -1642,11 +1644,13 @@ int main(void)
         return 1;
     }
     count = 0;
-    if (st_storage_list_mappings(path, clients[0].id, mappings, 4, &count) != 0 || count != 2U) {
+    if (st_storage_list_mappings(path, clients[0].id, &mappings, &count) != 0 || count != 2U) {
         fprintf(stderr, "mapping list mismatch\n");
+        free(mappings);
         unlink(path);
         return 1;
     }
+    free(mappings);
     if (st_storage_delete_mapping_by_id(path, created_mapping.id) != 0) {
         fprintf(stderr, "mapping delete failed\n");
         unlink(path);
@@ -1739,16 +1743,18 @@ int main(void)
         unlink(path);
         return 1;
     }
-    st_storage_http_route routes[4];
+    st_storage_http_route *routes = NULL;
     size_t route_count = 0;
-    if (st_storage_list_http_routes(path, clients[0].id, routes, 4, &route_count) != 0
+    if (st_storage_list_http_routes(path, clients[0].id, &routes, &route_count) != 0
         || route_count != 1U
         || strcmp(routes[0].auth_username, "viewer") != 0
         || strcmp(routes[0].auth_password_hash, updated_route_password_hash) != 0) {
         fprintf(stderr, "http route list mismatch\n");
+        free(routes);
         unlink(path);
         return 1;
     }
+    free(routes);
     if (st_storage_delete_http_route_by_id(path, created_route.id) != 0) {
         fprintf(stderr, "http route delete failed\n");
         unlink(path);
