@@ -42,6 +42,13 @@ int st_tls_server_context_create(const st_tls_config *config,
 void st_tls_server_context_free(st_tls_server_context *context);
 int st_tls_server_context_enabled(const st_tls_server_context *context);
 
+/*
+ * A connection reads and writes through OpenSSL's socket BIO, which writes with write(2): a write
+ * to a peer that has gone away, the close_notify of st_tls_connection_free included, raises
+ * SIGPIPE unless the process ignores it. main() of specus-server-c ignores SIGPIPE before it starts
+ * any thread, so there such a write fails with EPIPE; another program using these calls, a test
+ * included, must ignore SIGPIPE as well.
+ */
 int st_tls_connection_accept(st_tls_server_context *context,
                              int fd,
                              st_tls_connection **out,
