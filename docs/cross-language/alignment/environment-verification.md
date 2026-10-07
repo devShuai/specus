@@ -66,6 +66,7 @@
   - TSan：`-fsanitize=thread`（RelWithDebInfo）构建，同一个测试二进制经 `setarch x86_64 -R` 运行，`TSAN_OPTIONS=exitcode=0` 收集全部报告。
     - 修复前（`39cab91`）跑两轮，每轮 3 份报告涉及 `apply_runtime_route_config`：两个闸门 control 场景（`/nat-control` 推送、新增映射）各一份 `record_login_success_event` 读 `client_id`，另有一份 `normalize_tenant_id` 读 `tenant_id`。
     - 修复后跑三轮，这类报告为 0，也没有 lock-order-inversion。剩下的只有 `close_conn_locked`、`session_shutdown` 的 fd 竞争，`main` 上同样存在，未改。
+  - 合并 `main`（`3f5e620`，含已合并的 `fix/c-server-login-response-order` 和令牌登录按账号 id 绑定）后：重载会按 id 取到账号当前名字，推送因此对已改名账号的旧连接同样失败（`00e22c5`）。重新导出验证：0 warning，CTest `43/43` 通过（约 220 s）；TSan 跑一轮，route config 相关报告为 0。
   - 未改：连接发布前的窗口。登录先在 `verify_login` 里从数据库加载 route，之后才发布连接；这段时间里的运行时推送找不到连接就直接返回，客户端会拿着加载时的旧 route，直到下一次变更。这不是数据竞争，另行跟进。
 - 仍需环境验收：真实 MySQL/PostgreSQL、真实私有 OSS/ES、Windows/Linux/macOS/Android 双机、跨 NAT direct/relay fallback、长时间压力与真实 TLS/OIDC。源码自动化通过不能替代这些外部系统与硬件验证。
 
