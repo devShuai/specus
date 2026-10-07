@@ -54,8 +54,6 @@
 #include <zlib.h>
 
 #define ST_ADMIN_MAX_TCP_MAPPINGS 64U
-#define ST_ADMIN_MAX_CLIENTS 128U
-#define ST_ADMIN_MAX_CLIENT_DOWNLOADS 128U
 #define ST_ADMIN_MAX_CONNECTIONS_PAGE 500U
 #define ST_ADMIN_MAX_TRAFFIC_ITEMS 1000U
 #define ST_ADMIN_MAX_PEER_ACLS 256U
@@ -2683,6 +2681,123 @@ static int build_client_auth_login_response(const char *body, char *out, size_t 
     return build_client_auth_login_success_response(out, out_len);
 }
 
+/*
+ * Java's management lists have no row bound, but the storage lists fill a caller's array and fail
+ * once there are more rows than it holds (that used to turn 129 clients, or 65 TCP mappings in the
+ * whole database, into a 500 for every tenant), or quietly stop there (credentials and the client
+ * catalogue were cut at 128 rows). These read every row into a heap array that grows until it
+ * fits; the caller frees it. NULL on a database error.
+ */
+#define ST_ADMIN_LIST_INITIAL 64U
+#define ST_ADMIN_LIST_MAX (1024U * 1024U)
+
+typedef struct {
+    const char *path;
+    const char *text;
+    long long id;
+} admin_list_args;
+
+typedef int (*admin_list_fn)(const admin_list_args *args, void *items, size_t capacity, size_t *count);
+
+static void *admin_list_all(admin_list_fn list, const admin_list_args *args, size_t item_size, size_t *count)
+{
+    *count = 0U;
+    for (size_t capacity = ST_ADMIN_LIST_INITIAL; capacity <= ST_ADMIN_LIST_MAX; capacity *= 4U) {
+        void *items = calloc(capacity, item_size);
+        if (items == NULL) {
+            return NULL;
+        }
+        size_t listed = 0U;
+        int rc = list(args, items, capacity, &listed);
+        /* A full array may hide more rows: some lists fail then, others stop there silently. */
+        if (rc == 0 && listed < capacity) {
+            *count = listed;
+            return items;
+        }
+        free(items);
+        if (listed < capacity) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int admin_list_client_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_clients(args->path, (st_storage_client *)items, capacity, count);
+}
+
+static int admin_list_mapping_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_mappings(args->path, args->id, (st_storage_mapping *)items, capacity, count);
+}
+
+static int admin_list_http_route_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_http_routes(args->path, args->id, (st_storage_http_route *)items, capacity, count);
+}
+
+static int admin_list_credential_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_client_credentials(args->path, args->text, (st_storage_client_credential *)items,
+                                              capacity, count);
+}
+
+static int admin_list_user_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_management_users(args->path, args->text, (st_storage_management_user *)items,
+                                            capacity, count);
+}
+
+static int admin_list_download_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_client_download_links(args->path, (int)args->id,
+                                                 (st_storage_client_download_link *)items, capacity, count);
+}
+
+static st_storage_client *admin_list_all_clients(const char *path, size_t *count)
+{
+    admin_list_args args = {path, NULL, 0};
+    return (st_storage_client *)admin_list_all(admin_list_client_rows, &args, sizeof(st_storage_client), count);
+}
+
+/* client_id 0 lists every client's mappings. */
+static st_storage_mapping *admin_list_all_mappings(const char *path, long long client_id, size_t *count)
+{
+    admin_list_args args = {path, NULL, client_id};
+    return (st_storage_mapping *)admin_list_all(admin_list_mapping_rows, &args, sizeof(st_storage_mapping), count);
+}
+
+static st_storage_http_route *admin_list_all_http_routes(const char *path, long long client_id, size_t *count)
+{
+    admin_list_args args = {path, NULL, client_id};
+    return (st_storage_http_route *)admin_list_all(admin_list_http_route_rows, &args,
+                                                   sizeof(st_storage_http_route), count);
+}
+
+static st_storage_client_credential *admin_list_all_credentials(const char *path, const char *tenant_id,
+                                                                size_t *count)
+{
+    admin_list_args args = {path, tenant_id, 0};
+    return (st_storage_client_credential *)admin_list_all(admin_list_credential_rows, &args,
+                                                          sizeof(st_storage_client_credential), count);
+}
+
+static st_storage_management_user *admin_list_all_users(const char *path, const char *tenant_id, size_t *count)
+{
+    admin_list_args args = {path, tenant_id, 0};
+    return (st_storage_management_user *)admin_list_all(admin_list_user_rows, &args,
+                                                        sizeof(st_storage_management_user), count);
+}
+
+static st_storage_client_download_link *admin_list_all_download_links(const char *path, int enabled_only,
+                                                                      size_t *count)
+{
+    admin_list_args args = {path, NULL, enabled_only};
+    return (st_storage_client_download_link *)admin_list_all(admin_list_download_rows, &args,
+                                                             sizeof(st_storage_client_download_link), count);
+}
+
 static int load_visible_tcp_mapping_count(const st_admin_context *context, size_t *mapping_count)
 {
     *mapping_count = 0;
@@ -2691,26 +2806,25 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
         if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             return -1;
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             return -1;
         }
         for (size_t i = 0; i < client_count; ++i) {
             if (!admin_can_access_client(context, &clients[i])) {
                 continue;
             }
-            st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
             size_t client_mapping_count = 0;
-            if (st_storage_list_mappings(database_path,
-                                         clients[i].id,
-                                         mappings,
-                                         ST_ADMIN_MAX_TCP_MAPPINGS,
-                                         &client_mapping_count) != 0) {
+            st_storage_mapping *mappings = admin_list_all_mappings(database_path, clients[i].id, &client_mapping_count);
+            if (mappings == NULL) {
+                free(clients);
                 return -1;
             }
+            free(mappings);
             *mapping_count += client_mapping_count;
         }
+        free(clients);
         return 0;
     }
 
@@ -4169,9 +4283,9 @@ static int build_clients_response(const st_admin_context *context, char *out, si
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
@@ -4186,6 +4300,7 @@ static int build_clients_response(const st_admin_context *context, char *out, si
             }
             ++visible_count;
         }
+        free(clients);
     } else if (rc == 0) {
         st_storage_client client = {0};
         client.id = env_i64("SPECUS_CLIENT_ID", 1);
@@ -4315,9 +4430,9 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
         }
@@ -4328,6 +4443,7 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
             }
             st_storage_peer_mesh_device device;
             if (st_storage_ensure_peer_mesh_device(database_path, &clients[i], &device) != 0) {
+                free(clients);
                 free(builder.data);
                 return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
             }
@@ -4337,6 +4453,7 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
             }
             ++visible_count;
         }
+        free(clients);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -5798,9 +5915,9 @@ static int build_specusMappings_response(const st_admin_context *context, const 
                 return response_len;
             }
         }
-        st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
         size_t mapping_count = 0;
-        if (st_storage_list_mappings(database_path, filter_client_id, mappings, ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) {
+        st_storage_mapping *mappings = admin_list_all_mappings(database_path, filter_client_id, &mapping_count);
+        if (mappings == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
@@ -5816,6 +5933,7 @@ static int build_specusMappings_response(const st_admin_context *context, const 
             }
             ++visible_count;
         }
+        free(mappings);
     } else if (rc == 0) {
         st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
         size_t mapping_count = 0;
@@ -5889,9 +6007,9 @@ static int build_http_routes_response(const st_admin_context *context, const cha
                 return response_len;
             }
         }
-        st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
         size_t route_count = 0;
-        if (st_storage_list_http_routes(database_path, filter_client_id, routes, ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+        st_storage_http_route *routes = admin_list_all_http_routes(database_path, filter_client_id, &route_count);
+        if (routes == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
@@ -5907,6 +6025,7 @@ static int build_http_routes_response(const st_admin_context *context, const cha
             }
             ++visible_count;
         }
+        free(routes);
     } else if (rc == 0) {
         st_admin_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
         size_t route_count = 0;
@@ -8570,13 +8689,10 @@ static int build_credentials_response(const st_admin_context *context, char *out
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
-        st_storage_client_credential credentials[ST_ADMIN_MAX_CLIENTS];
         size_t credential_count = 0;
-        if (st_storage_list_client_credentials(database_path,
-                                               context->tenant_id,
-                                               credentials,
-                                               ST_ADMIN_MAX_CLIENTS,
-                                               &credential_count) != 0) {
+        st_storage_client_credential *credentials =
+            admin_list_all_credentials(database_path, context->tenant_id, &credential_count);
+        if (credentials == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
@@ -8591,6 +8707,7 @@ static int build_credentials_response(const st_admin_context *context, char *out
             }
             ++visible_count;
         }
+        free(credentials);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -9344,16 +9461,19 @@ static int build_client_downloads_response(const st_admin_context *context,
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link catalogue[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
+        /* Every version of every target stays in the catalogue, so it grows with each release. */
         size_t catalogue_count = 0U;
-        if (st_storage_list_client_download_links(database_path, 0, catalogue,
-                ST_ADMIN_MAX_CLIENT_DOWNLOADS, &catalogue_count) != 0) {
+        st_storage_client_download_link *catalogue =
+            admin_list_all_download_links(database_path, 0, &catalogue_count);
+        size_t link_capacity = catalogue_count + ST_GITHUB_RELEASE_MAX_PACKAGES;
+        st_storage_client_download_link *links = catalogue == NULL
+            ? NULL : (st_storage_client_download_link *)calloc(link_capacity, sizeof(*links));
+        if (links == NULL) {
+            free(catalogue);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link links[
-            ST_ADMIN_MAX_CLIENT_DOWNLOADS + ST_GITHUB_RELEASE_MAX_PACKAGES];
         size_t link_count = 0U;
         if (!enabled_only) {
             memcpy(links, catalogue, catalogue_count * sizeof(*links));
@@ -9395,7 +9515,7 @@ static int build_client_downloads_response(const st_admin_context *context,
                                 break;
                             }
                         }
-                        if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
+                        if (!configured && link_count < link_capacity) {
                             links[link_count++] = fallback[i];
                         }
                     }
@@ -9407,6 +9527,8 @@ static int build_client_downloads_response(const st_admin_context *context,
             rc = admin_sb_append(&builder, i == 0U ? "" : ",");
             if (rc == 0) rc = append_client_download_link_view(&builder, &links[i]);
         }
+        free(links);
+        free(catalogue);
     }
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
@@ -9636,10 +9758,10 @@ static int build_client_version_check_response(const char *path, char *out, size
         return write_response(out, out_len, 400, "Bad Request", target_error);
     }
     const char *database_path = admin_database_path();
-    st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
     size_t count = 0U;
-    if (database_path == NULL || st_storage_list_client_download_links(database_path, 0, links,
-            ST_ADMIN_MAX_CLIENT_DOWNLOADS, &count) != 0) {
+    st_storage_client_download_link *links = database_path == NULL
+        ? NULL : admin_list_all_download_links(database_path, 0, &count);
+    if (links == NULL) {
         return write_response(out, out_len, 200, "OK",
             "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
             "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
@@ -9709,6 +9831,7 @@ static int build_client_version_check_response(const char *path, char *out, size
             }
         }
         if (best == NULL) {
+            free(links);
             return write_response(out, out_len, 200, "OK",
                 "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
                 "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
@@ -9737,6 +9860,7 @@ static int build_client_version_check_response(const char *path, char *out, size
     if (rc == 0) rc = best->hosted
         ? admin_sb_appendf(&builder, "%lld", best->id) : admin_sb_append(&builder, "null");
     if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(links);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -10067,9 +10191,9 @@ static int build_management_users_response(const st_admin_context *context, char
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
-        st_storage_management_user users[ST_ADMIN_MAX_CLIENTS];
         size_t user_count = 0;
-        if (st_storage_list_management_users(database_path, tenant_id, users, ST_ADMIN_MAX_CLIENTS, &user_count) != 0) {
+        st_storage_management_user *users = admin_list_all_users(database_path, tenant_id, &user_count);
+        if (users == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
@@ -10079,6 +10203,7 @@ static int build_management_users_response(const st_admin_context *context, char
                 rc = append_stored_management_user_view(&builder, &users[i]);
             }
         }
+        free(users);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
