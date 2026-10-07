@@ -18,7 +18,11 @@ int st_media_capture_validate_current(void);
 int st_media_capture_ready_current(void);
 int st_media_capture_cleanup_expired(const char *database_path);
 
-/* Opens a route-scoped capture for an original upstream HTTP response. */
+/*
+ * Opens a route-scoped capture for an original upstream HTTP response. NULL means the response is
+ * not captured. A response whose exact range is already stored, or is being stored by another
+ * request, yields Java's externalized no-op: externalized but not active, with no upload of its own.
+ */
 st_media_capture_session *st_media_capture_open(const char *database_path,
                                                 const char *client_name,
                                                 const char *route,
@@ -33,6 +37,8 @@ int st_media_capture_append(st_media_capture_session *session,
 void st_media_capture_complete(st_media_capture_session *session);
 void st_media_capture_fail(st_media_capture_session *session, const char *reason);
 int st_media_capture_externalized(const st_media_capture_session *session);
+/* Java CaptureSession.active(): still receiving body bytes for its own upload. */
+int st_media_capture_active(const st_media_capture_session *session);
 void st_media_capture_free(st_media_capture_session *session);
 
 /* Builds management/public list, ticket, manifest, and playback responses. */

@@ -226,12 +226,22 @@ func loginHTTPTestChannelsAs(
 	t.Helper()
 	session := issueClientSession(t, app, DemoClientName)
 	app.clientAuth.SetHTTPRouteCapability(session.ID, httpRouteCapability)
-	login := protocol.LoginRequest{
+	return loginControlAndDataChannels(t, port, protocol.LoginRequest{
 		ClientName:      DemoClientName,
 		ClientSessionID: session.ID,
 		AccessToken:     session.AccessToken,
-		ConnectionRole:  protocol.ConnectionRoleControl,
-	}
+	})
+}
+
+// loginControlAndDataChannels logs a session in on a control connection and then on its data
+// connection, returning both connections with the readers that consumed the login responses.
+func loginControlAndDataChannels(
+	t *testing.T,
+	port int,
+	login protocol.LoginRequest,
+) (net.Conn, *bufio.Reader, net.Conn, *bufio.Reader) {
+	t.Helper()
+	login.ConnectionRole = protocol.ConnectionRoleControl
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 
 	controlConn, err := net.Dial("tcp", address)

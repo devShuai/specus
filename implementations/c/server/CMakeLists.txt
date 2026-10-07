@@ -258,6 +258,15 @@ add_test(NAME connection_archive_tests
     COMMAND specus_c_connection_archive_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(connection_archive_tests PROPERTIES TIMEOUT 120)
 
+add_executable(specus_c_http_route_lifecycle_tests tests/http_route_lifecycle_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_route_lifecycle_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_route_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_route_lifecycle_tests PRIVATE
+    ST_ROUTE_LIFECYCLE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/http-route-lifecycle-v1.json")
+add_test(NAME http_route_lifecycle_tests
+    COMMAND specus_c_http_route_lifecycle_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_route_lifecycle_tests PROPERTIES TIMEOUT 180)
+
 add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_nat_stream_tests PRIVATE -Wall -Wextra -Wpedantic)

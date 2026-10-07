@@ -77,7 +77,11 @@
   WebSocket 的实现均在打开隧道/Upgrade 前校验，受保护 route 的入口 Authorization 不透传 upstream 或写入明细。
   四个 server 的入口都 fail closed：没有服务端记录的 route（含已删除但客户端仍在转发的 route）、未启用的 route
   与已停用客户端的 route 一律 `404`，不再按"未持久化即公开"放行；C server 的 `SPECUS_HTTP_ROUTES` 作为服务端
-  配置的公开 route 保留。`NAT_CONTROL` 始终携带完整 `httpSpecusConfigList`，删除最后一条 route 时下发空数组。
+  配置的公开 route 保留。`NAT_CONTROL` 始终携带完整 `httpSpecusConfigList`，删除最后一条 route 时下发空数组；
+  控制连接每次登录都推送，即使 TCP 与 HTTP 都为空（客户端凭 token 重连不会重新拿登录快照）。停用、改名或删除客户端
+  时四个 server 都关闭其在线连接。Java、Go、.NET 与 Android 客户端把缺省或 `null` 的 `httpSpecusConfigList`
+  当作空列表，每条 `NAT_CONTROL` 都整体替换 route 表。四个 server 与四个客户端重放
+  `protocol/test-vectors/http-route-lifecycle-v1.json`。
 - Go server 与 .NET server 已补齐数据库版 HTTP/TCP 明细采集链路：
   - 新增 `specus_resource_traffic_usage`，并按 TCP 映射 / HTTP route 聚合资源级每日流量。
   - 资源级流量和每日总流量均带 `tenant_id`，管理查询按当前租户和可见客户端收敛。

@@ -23,7 +23,7 @@ route 的所有者或租户管理员，可以为**一条已有、受保护的 HT
 
 需要特别注意的两点：
 
-- **「记录不存在就当公开」**。四端都这样处理没有服务端记录的 route，用来兼容客户端本地配置。再加上删除最后一条托管 route 时 `NAT_CONTROL` 会省略 `httpSpecusConfigList`，客户端因此保留旧列表，一条受 Basic 保护的 route 被删除后，可能在客户端重连之前变成公开可访问（见第 16 节）。分享路径绝不能沿用这条兜底规则。
+- **「记录不存在就当公开」**。四端都这样处理没有服务端记录的 route，用来兼容客户端本地配置。再加上删除最后一条托管 route 时 `NAT_CONTROL` 会省略 `httpSpecusConfigList`，客户端因此保留旧列表，一条受 Basic 保护的 route 被删除后，可能在客户端重连之前变成公开可访问（见第 16 节）。分享路径绝不能沿用这条兜底规则。（之后已修复：四端入口在没有服务端记录时 fail closed，见 [http-route.md](http-route.md) 第 1、2 节。）
 - **改变不会立刻到处生效。** route 配置推送、停用客户端时踢连接，都只作用于本实例持有的会话；已经建立的 HTTP 流和 WebSocket 在 route 停用或删除后照常运行。
 
 ### 1.2 谁能管理 route
@@ -546,8 +546,8 @@ WHERE share_id = ? AND revoked_at IS NULL AND expires_at > ?
 
 调研中发现的现有问题，分享路径已经避开，但 route 本身仍受影响：
 
-1. **删除最后一条托管 route 可能让它变成公开访问。** 服务端把「记录不存在」当公开；删除最后一条托管 route 时 `NAT_CONTROL` 省略 `httpSpecusConfigList`，客户端因此保留旧列表。四个服务端都存在这一组合（C 在客户端删除、改名或推送失败时也会发生），在客户端重连之前，原本受 Basic 保护的 route 可以被匿名访问。
-2. 公网入口不检查客户端是否已启用，只依赖停用时踢掉连接；而这个动作只作用于本实例。
+1. **删除最后一条托管 route 可能让它变成公开访问（已修复）。** 服务端把「记录不存在」当公开；删除最后一条托管 route 时 `NAT_CONTROL` 省略 `httpSpecusConfigList`，客户端因此保留旧列表。四个服务端都存在这一组合（C 在客户端删除、改名或推送失败时也会发生），在客户端重连之前，原本受 Basic 保护的 route 可以被匿名访问。现在入口只按服务端记录放行；每条 `NAT_CONTROL`（包括每次控制登录的推送）都带完整列表；客户端把缺省或 `null` 的列表当作空列表；停用、改名或删除客户端会关闭其在线连接。见 [http-route.md](http-route.md) 第 1、2 节与 `protocol/test-vectors/http-route-lifecycle-v1.json`。
+2. 公网入口不检查客户端是否已启用，只依赖停用时踢掉连接；而这个动作只作用于本实例。（已修复：入口要求客户端账户存在且已启用，见 [http-route.md](http-route.md) 第 1 节。）
 3. C 的 bearer 校验不读库，`/auth/refresh` 也不读库：被停用或删除的用户可以一直刷新 token，角色变更也不生效。
 4. C 的 `build_prefixed_token`（`cs_`/`ck_`/`sk_` 凭据）用时间、pid 和计数器做 SHA-256，不是 CSPRNG；未配置 JWT 密钥时的回退密钥也是这样生成的。
 5. C 的 `/http/` 入口会解码 `relativePath`（把 `%XX` 与 `+` 都解码），与 [http-route.md](http-route.md) 第 1 节「保留原始百分号编码」不符。
