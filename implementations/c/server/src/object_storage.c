@@ -1394,6 +1394,16 @@ static int object_create_upload(const st_object_config *config,
     if (!object_identity_valid(identity)) return object_error(out, out_len, 401, "missing or invalid bearer token");
     if (body == NULL || strlen(body) > ST_OBJECT_MAX_BODY || !st_json_is_valid_object(body))
         return object_error(out, out_len, 400, "invalid attachment request");
+    /*
+     * Java TransferAttachmentResource checks the source-address window before the service resolves
+     * the room (public-transfer.md 3.2), so refused requests count against it too.
+     */
+    int rate = public_scope
+        ? object_rate_allow(remote_address, config->presign_rate_limit, config->presign_rate_window) : 1;
+    if (rate <= 0) {
+        return object_error(out, out_len, 429, rate < 0 ? "presign upload rate limit is unavailable"
+                                                        : "presign upload rate limit exceeded");
+    }
     char *raw_filename = st_json_get_top_level_string(body, "fileName");
     char *raw_mime = st_json_get_top_level_string(body, "mimeType");
     char *raw_sha = st_json_get_top_level_string(body, "sha256");
@@ -1441,13 +1451,6 @@ static int object_create_upload(const st_object_config *config,
         return object_error(out, out_len, 400, public_scope
             ? "invalid attachment request or room credential" : "target client is not accessible or attachment request is invalid");
     }
-    int rate = public_scope
-        ? object_rate_allow(remote_address, config->presign_rate_limit, config->presign_rate_window) : 1;
-    if (rate <= 0) {
-        free(room_token);
-        return object_error(out, out_len, 429, rate < 0 ? "presign upload rate limit is unavailable"
-                                                        : "presign upload rate limit exceeded");
-    }
     free(room_token);
     sqlite3 *db = NULL;
     int opened = object_open(&db);
@@ -1456,13 +1459,7 @@ static int object_create_upload(const st_object_config *config,
         sqlite3_close(db);
         return object_error(out, out_len, 503, "attachment persistence is busy");
     }
-    long long used = 0;
-    if (object_active_storage_bytes(db, identity->tenant_id, identity->username, -1, time(NULL), &used) != 0
-        || !object_quota_allows(used, size_bytes, config->storage_quota_bytes)) {
-        object_rollback(db);
-        sqlite3_close(db);
-        return object_error(out, out_len, used >= 0 ? 429 : 500, "OSS storage quota is insufficient");
-    }
+    /* Java's order: the room's PENDING limit, then the account's storage quota. */
     if (public_scope) {
         long long pending = 0;
         if (object_pending_count(db, public_room_id, &pending) != 0
@@ -1472,6 +1469,13 @@ static int object_create_upload(const st_object_config *config,
             return object_error(out, out_len, pending >= config->max_pending_per_room ? 429 : 500,
                                 "too many pending uploads in this room");
         }
+    }
+    long long used = 0;
+    if (object_active_storage_bytes(db, identity->tenant_id, identity->username, -1, time(NULL), &used) != 0
+        || !object_quota_allows(used, size_bytes, config->storage_quota_bytes)) {
+        object_rollback(db);
+        sqlite3_close(db);
+        return object_error(out, out_len, used >= 0 ? 429 : 500, "OSS storage quota is insufficient");
     }
     attachment.size_bytes = size_bytes;
     snprintf(attachment.tenant_id, sizeof(attachment.tenant_id), "%s", identity->tenant_id);
