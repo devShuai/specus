@@ -6072,6 +6072,19 @@ int main(void)
         fprintf(stderr, "peer TCP service import mismatch: %s\n", response);
         return 1;
     }
+    /* importCandidatesCreatesDisabledTcpMapping: the imported service is a disabled tcp one. */
+    {
+        const char *imported = strstr(response, "\"serviceId\":\"import-tcp-");
+        const char *end = imported == NULL ? NULL : strstr(imported, "\"createdAt\"");
+        size_t span = end == NULL ? 0U : (size_t)(end - imported);
+        char view[2048] = "";
+        if (span > 0U && span < sizeof(view)) memcpy(view, imported, span);
+        if (!contains(view, "\"application\":\"tcp\"") || !contains(view, "\"enabled\":false")
+            || !contains(view, "\"targetHost\":\"127.0.0.1\"")) {
+            fprintf(stderr, "an imported peer service was not a disabled tcp service: %s\n", response);
+            return 1;
+        }
+    }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/service-audit", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"action\":\"service-import\"")

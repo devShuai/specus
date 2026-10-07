@@ -1235,6 +1235,124 @@ static int test_acl_visibility(void)
     return failed;
 }
 
+/* The service-catalog the peer was sent by the last call, or NULL. */
+static const char *catalog_for(const peer_test_context *ctx, const char *recipient)
+{
+    for (size_t i = 0; i < ctx->count; ++i) {
+        if (strcmp(ctx->signals[i].target, recipient) == 0
+            && contains(ctx->signals[i].message, "\"type\":\"service-catalog\"")) return ctx->signals[i].message;
+    }
+    return NULL;
+}
+
+/*
+ * PeerServiceDiscoveryServiceTests reportIsIgnoredWhenSharingOffAndDoesNotAdvertiseTargetHost and
+ * withdrawalKeepsRevisionTombstoneAndServerBoundsClientTtl: with sharing off a report advertises
+ * nothing; the catalogue's expiry is the server's, whatever the client claims; a withdrawal keeps
+ * the revision, so the earlier report replayed is ignored; a disconnect withdraws the catalogue and
+ * forgets the session's revisions.
+ */
+static int test_service_report_lifecycle(void)
+{
+    char path[64];
+    if (temp_database(path, "peer_service_lifecycle") != 0) return 1;
+    st_storage_client publisher, peer;
+    st_storage_peer_mesh_device device;
+    st_storage_peer_mesh_service service;
+    memset(&service, 0, sizeof(service));
+    int failed = st_storage_upsert_client(path, 0, "tenant-lifecycle", "life-publisher", "owner", 1, 60,
+                                          &publisher) != 0
+        || st_storage_upsert_client(path, 0, "tenant-lifecycle", "life-peer", "owner", 1, 60, &peer) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &publisher, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &peer, 1, &device) != 0;
+    snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", publisher.tenant_id);
+    service.client_id = publisher.id;
+    snprintf(service.client_name, sizeof(service.client_name), "%s", publisher.client_name);
+    snprintf(service.service_id, sizeof(service.service_id), "svc-life0001");
+    snprintf(service.name, sizeof(service.name), "local-ssh");
+    snprintf(service.transport, sizeof(service.transport), "tcp");
+    snprintf(service.application, sizeof(service.application), "ssh");
+    snprintf(service.target_host, sizeof(service.target_host), "127.0.0.1");
+    service.target_port = 22;
+    service.published_port = 2222;
+    service.enabled = 1;
+    snprintf(service.visibility, sizeof(service.visibility), "OWNER");
+    failed = failed || st_storage_upsert_peer_mesh_service(path, &service, NULL) != 0;
+    if (failed) {
+        fprintf(stderr, "service report lifecycle fixture setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    peer_test_context ctx = {0};
+    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, &ctx, 8201, 2};
+    static const char *const report_format =
+        "{\"type\":\"service-report\",\"enabled\":%s,\"revision\":%d,"
+        "\"generatedAt\":\"2099-01-01T00:00:00Z\",\"expiresAt\":\"2099-01-01T01:00:00Z\","
+        "\"services\":[{\"serviceId\":\"svc-life0001\",\"name\":\"client-supplied-name\","
+        "\"transport\":\"tcp\",\"application\":\"ssh\",\"publishedPort\":2222}]}";
+    char report[1024];
+    const char *catalog = NULL;
+
+    /* Sharing has never been switched on: the peer is told of no service. */
+    snprintf(report, sizeof(report), report_format, "true", 1);
+    ctx.count = 0;
+    if (st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
+        || ((catalog = catalog_for(&ctx, "life-peer")) != NULL
+            && (!contains(catalog, "\"services\":[]") || contains(catalog, "svc-life0001")))) {
+        fprintf(stderr, "a report advertised services with sharing off: %s\n", catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    /* Sharing on: published from the stored definition, on the server's expiry. */
+    snprintf(report, sizeof(report), report_format, "true", 2);
+    ctx.count = 0;
+    if (!failed && (st_storage_upsert_peer_mesh_service_sharing(path, publisher.tenant_id, 1, 0, "admin", NULL) != 0
+                    || st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
+                    || (catalog = catalog_for(&ctx, "life-peer")) == NULL
+                    || !contains(catalog, "\"serviceId\":\"svc-life0001\"") || !contains(catalog, "\"revision\":2")
+                    || !contains(catalog, "\"name\":\"local-ssh\"") || contains(catalog, "client-supplied-name")
+                    || contains(catalog, "targetHost") || contains(catalog, "2099-"))) {
+        fprintf(stderr, "a published catalogue did not follow the definition and the server's expiry: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    /* A withdrawal goes out with its own revision; replaying the earlier report changes nothing. */
+    snprintf(report, sizeof(report), report_format, "false", 3);
+    ctx.count = 0;
+    if (!failed && (st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
+                    || (catalog = catalog_for(&ctx, "life-peer")) == NULL
+                    || !contains(catalog, "\"revision\":3") || !contains(catalog, "\"services\":[]"))) {
+        fprintf(stderr, "a withdrawal did not reach the peer: %s\n", catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    snprintf(report, sizeof(report), report_format, "true", 2);
+    ctx.count = 0;
+    if (!failed && (st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
+                    || ctx.count != 0)) {
+        fprintf(stderr, "the report before a withdrawal was published again\n");
+        failed = 1;
+    }
+    /* The disconnect withdraws the catalogue and forgets the session's revisions. */
+    ctx.count = 0;
+    if (!failed && (st_peer_mesh_handle_disconnect(&runtime, publisher.client_name) != 0
+                    || (catalog = catalog_for(&ctx, "life-peer")) == NULL
+                    || !contains(catalog, "\"publisherSessionId\":8201") || !contains(catalog, "\"services\":[]"))) {
+        fprintf(stderr, "a disconnect did not withdraw the catalogue: %s\n", catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    snprintf(report, sizeof(report), report_format, "true", 1);
+    ctx.count = 0;
+    if (!failed && (st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
+                    || (catalog = catalog_for(&ctx, "life-peer")) == NULL
+                    || !contains(catalog, "\"serviceId\":\"svc-life0001\""))) {
+        fprintf(stderr, "a disconnected session's revisions were still tracked: %s\n",
+                catalog == NULL ? "(none)" : catalog);
+        failed = 1;
+    }
+    (void)st_peer_mesh_handle_disconnect(&runtime, publisher.client_name);
+    unlink(path);
+    return failed;
+}
+
 /* ---- service-report bounds (PeerServiceDiscoveryServiceTests, PeerSignalServiceEnvelopeTests) -- */
 
 static int service_report(const char *path, peer_test_context *ctx, long long session_id, const char *client,
@@ -1710,6 +1828,7 @@ int main(void)
     if (test_login_config_stun() != 0) return 1;
     if (test_service_report_bounds() != 0) return 1;
     if (test_acl_visibility() != 0) return 1;
+    if (test_service_report_lifecycle() != 0) return 1;
     printf("peer mesh tests passed\n");
     return 0;
 }
