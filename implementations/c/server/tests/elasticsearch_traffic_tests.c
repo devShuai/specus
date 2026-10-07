@@ -55,6 +55,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "Elasticsearch HTTP traffic round trip mismatch\n");
         return 1;
     }
+    /* HttpTrafficExchangeStoreTests.elasticsearchSummaryExcludesLargeAndDetailOnlyFields: the list
+     * asks Elasticsearch to leave headers and previews out; the detail of one exchange reads them. */
+    if (exchanges[0].request_headers[0] != '\0' || exchanges[0].response_headers[0] != '\0'
+        || exchanges[0].request_preview_hex[0] != '\0' || exchanges[0].request_preview_text[0] != '\0'
+        || exchanges[0].response_preview_hex[0] != '\0' || exchanges[0].response_preview_text[0] != '\0') {
+        fprintf(stderr, "Elasticsearch HTTP summary carried headers or previews\n");
+        return 1;
+    }
+    st_storage_http_exchange *exchange_detail = (st_storage_http_exchange *)calloc(1U, sizeof(*exchange_detail));
+    int exchange_found = 0;
+    int detail_ok = exchange_detail != NULL
+        && st_storage_get_http_exchange_visible(argv[1], exchanges[0].id, "default", "admin", 1,
+                                                exchange_detail, &exchange_found) == 0
+        && exchange_found
+        && strcmp(exchange_detail->request_headers, "Content-Type: text/plain") == 0
+        && strcmp(exchange_detail->response_preview_text, "{\"items\":[1]}") == 0
+        && strcmp(exchange_detail->request_preview_hex, "72 65 71 75 65 73 74 2D 69 74 65 6D 73") == 0;
+    free(exchange_detail);
+    if (!detail_ok) {
+        fprintf(stderr, "Elasticsearch HTTP detail lookup mismatch\n");
+        return 1;
+    }
 
     static const uint8_t payload[] = {0x00, 0x01, 0xfe, 0xff, 'x'};
     st_storage_tcp_frame_record tcp = {

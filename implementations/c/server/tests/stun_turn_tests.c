@@ -534,6 +534,23 @@ static int create_permission6(int fd,
     return exchange(fd, &fixture->address, &request, response, response_size);
 }
 
+/* One CreatePermission naming several peers (RFC 5766 section 9.1). */
+static int create_permissions(int fd,
+                              const turn_fixture *fixture,
+                              const turn_credential *credential,
+                              const struct sockaddr_in *peers,
+                              size_t peer_count,
+                              unsigned seed,
+                              unsigned char *response,
+                              size_t response_size)
+{
+    packet_builder request;
+    start(&request, 0x0008U, seed);
+    for (size_t i = 0; i < peer_count; ++i) add_xor_peer(&request, &peers[i]);
+    sign(&request, credential, st_turn_auth_nonce());
+    return exchange(fd, &fixture->address, &request, response, response_size);
+}
+
 static int channel_bind(int fd,
                         const turn_fixture *fixture,
                         const turn_credential *credential,
@@ -549,6 +566,25 @@ static int channel_bind(int fd,
     start(&request, 0x0009U, seed);
     attr(&request, 0x000cU, channel, sizeof(channel));
     add_xor_peer(&request, peer);
+    sign(&request, credential, st_turn_auth_nonce());
+    return exchange(fd, &fixture->address, &request, response, response_size);
+}
+
+static int channel_bind6(int fd,
+                         const turn_fixture *fixture,
+                         const turn_credential *credential,
+                         unsigned number,
+                         const char *peer,
+                         unsigned seed,
+                         unsigned char *response,
+                         size_t response_size)
+{
+    packet_builder request;
+    unsigned char channel[4] = {0, 0, 0, 0};
+    u16(channel, number);
+    start(&request, 0x0009U, seed);
+    attr(&request, 0x000cU, channel, sizeof(channel));
+    if (add_xor_peer6(&request, peer, 50000U) != 0) return -1;
     sign(&request, credential, st_turn_auth_nonce());
     return exchange(fd, &fixture->address, &request, response, response_size);
 }
@@ -836,6 +872,20 @@ static int test_stale_nonce(void)
     return failed ? -1 : 0;
 }
 
+/*
+ * Java StunTurnServerMetricsTests.generalRelayDestinationPolicyRejectsNonPublicTargets and
+ * isRelayableDestination: unspecified, loopback, link-local, site-local (private), multicast and
+ * ULA destinations are refused; IPv4-mapped addresses are judged as the IPv4 address they carry.
+ */
+static const char *const refused_ipv4_peers[] = {
+    "127.0.0.1", "127.255.0.9", "10.0.0.5", "172.16.0.1", "172.31.255.254", "192.168.1.10",
+    "169.254.1.10", "224.0.0.1", "239.1.1.1", "0.0.0.0"
+};
+static const char *const refused_ipv6_peers[] = {
+    "::1", "::", "fd00::1", "fc00::1", "fe80::1", "febf::1", "fec0::1", "ff02::1", "ff0e::1",
+    "::ffff:127.0.0.1", "::ffff:10.0.0.5", "::ffff:192.168.1.10", "::ffff:169.254.1.10", "::ffff:0.0.0.0"
+};
+
 /* Without SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS the general relay only reaches public peers. */
 static int test_default_private_peer_refusal(void)
 {
@@ -855,30 +905,43 @@ static int test_default_private_peer_refusal(void)
         || allocate(mesh_client, &fixture, &mesh, 501U, NULL) != 0;
     unsigned seed = 510U;
 
-    static const char *const refused_ipv4[] = {
-        "127.0.0.1", "10.0.0.5", "172.16.0.1", "192.168.1.10", "169.254.1.10", "239.1.1.1", "0.0.0.0"
-    };
-    for (size_t i = 0; !failed && i < sizeof(refused_ipv4) / sizeof(refused_ipv4[0]); ++i) {
-        int received = peer_from_text(refused_ipv4[i], 50000U, &peer) != 0 ? -1
+    /* CreatePermission and ChannelBind (which installs a permission too) apply the same policy. */
+    for (size_t i = 0; !failed && i < sizeof(refused_ipv4_peers) / sizeof(refused_ipv4_peers[0]); ++i) {
+        int received = peer_from_text(refused_ipv4_peers[i], 50000U, &peer) != 0 ? -1
             : create_permission(client, &fixture, &general, &peer, seed++, response, sizeof(response));
-        failed = expect_error(response, received, 0x0118U, 403, refused_ipv4[i]) != 0;
+        failed = expect_error(response, received, 0x0118U, 403, refused_ipv4_peers[i]) != 0;
+        received = failed ? -1 : channel_bind(client, &fixture, &general, 0x4000U, &peer, seed++,
+                                              response, sizeof(response));
+        failed = failed || expect_error(response, received, 0x0119U, 403, refused_ipv4_peers[i]) != 0;
     }
-    static const char *const refused_ipv6[] = {
-        "::1", "::", "fd00::1", "fe80::1", "fec0::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:192.168.1.10"
-    };
-    for (size_t i = 0; !failed && i < sizeof(refused_ipv6) / sizeof(refused_ipv6[0]); ++i) {
-        int received = create_permission6(client, &fixture, &general, refused_ipv6[i], seed++,
+    for (size_t i = 0; !failed && i < sizeof(refused_ipv6_peers) / sizeof(refused_ipv6_peers[0]); ++i) {
+        int received = create_permission6(client, &fixture, &general, refused_ipv6_peers[i], seed++,
                                           response, sizeof(response));
-        failed = expect_error(response, received, 0x0118U, 403, refused_ipv6[i]) != 0;
+        failed = expect_error(response, received, 0x0118U, 403, refused_ipv6_peers[i]) != 0;
+        received = failed ? -1 : channel_bind6(client, &fixture, &general, 0x4000U, refused_ipv6_peers[i],
+                                               seed++, response, sizeof(response));
+        failed = failed || expect_error(response, received, 0x0119U, 403, refused_ipv6_peers[i]) != 0;
     }
     /* Port 0 is never a peer, even on a public address. */
     int received = failed || peer_from_text("203.0.113.10", 0U, &peer) != 0 ? -1
         : create_permission(client, &fixture, &general, &peer, seed++, response, sizeof(response));
     failed = failed || expect_error(response, received, 0x0118U, 403, "public peer on port 0") != 0;
-    /* ChannelBind installs a permission too, so it applies the same policy. */
-    received = failed || peer_from_text("192.168.1.10", 50000U, &peer) != 0 ? -1
-        : channel_bind(client, &fixture, &general, 0x4000U, &peer, seed++, response, sizeof(response));
-    failed = failed || expect_error(response, received, 0x0119U, 403, "ChannelBind to a private peer") != 0;
+    received = failed ? -1 : channel_bind(client, &fixture, &general, 0x4000U, &peer, seed++,
+                                          response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0119U, 403, "ChannelBind to port 0") != 0;
+    /* One private peer refuses the whole request, wherever it appears among the peers. */
+    if (!failed) {
+        struct sockaddr_in mixed[2];
+        failed = peer_from_text("203.0.113.10", 50000U, &mixed[0]) != 0
+            || peer_from_text("192.168.1.10", 50000U, &mixed[1]) != 0;
+        received = failed ? -1 : create_permissions(client, &fixture, &general, mixed, 2U, seed++,
+                                                    response, sizeof(response));
+        failed = failed || expect_error(response, received, 0x0118U, 403, "public then private peer") != 0;
+        struct sockaddr_in swapped[2] = {mixed[1], mixed[0]};
+        received = failed ? -1 : create_permissions(client, &fixture, &general, swapped, 2U, seed++,
+                                                    response, sizeof(response));
+        failed = failed || expect_error(response, received, 0x0118U, 403, "private then public peer") != 0;
+    }
 
     /* Public unicast peers stay allowed, including RFC 6598 CGNAT space and IPv4-mapped IPv6. */
     static const char *const allowed_ipv4[] = {"203.0.113.10", "100.64.0.2"};
@@ -899,13 +962,41 @@ static int test_default_private_peer_refusal(void)
             failed = 1;
         }
     }
-    /* A refused loopback peer never receives relayed data. */
+    /* A refused loopback peer never receives relayed data, by Send or on the refused channel. */
     received = failed ? -1 : create_permission(client, &fixture, &general, &local_address, seed++,
                                                response, sizeof(response));
     failed = failed || expect_error(response, received, 0x0118U, 403, "loopback peer socket") != 0;
+    received = failed ? -1 : channel_bind(client, &fixture, &general, 0x4001U, &local_address, seed++,
+                                          response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0119U, 403, "ChannelBind to loopback peer socket") != 0;
     if (!failed && (send_indication(client, &fixture, &local_address, "leak", seed++) != 0
+                    || send_channel_data(client, &fixture, 0x4001U, "leak-channel", 0U) != 0
                     || !stays_silent(local))) {
         fprintf(stderr, "general relay reached a refused loopback peer\n");
+        failed = 1;
+    }
+    /* The policy follows the identity that made the allocation (Java Allocation.matchesClient): a
+     * general relay credential cannot act on the Peer Mesh allocation the policy exempts, nor the
+     * other way round, and neither can refresh the other's allocation away. */
+    received = failed ? -1 : create_permission(mesh_client, &fixture, &general, &local_address, seed++,
+                                               response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0118U, 437, "general credential on a Peer Mesh allocation") != 0;
+    received = failed ? -1 : channel_bind(mesh_client, &fixture, &general, 0x4002U, &local_address, seed++,
+                                          response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0119U, 437, "general ChannelBind on a Peer Mesh allocation") != 0;
+    received = failed ? -1 : refresh(mesh_client, &fixture, &general, st_turn_auth_nonce(), 0, seed++,
+                                     response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0114U, 437, "general Refresh of a Peer Mesh allocation") != 0;
+    received = failed || peer_from_text("203.0.113.10", 50000U, &peer) != 0 ? -1
+        : create_permission(client, &fixture, &mesh, &peer, seed++, response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0118U, 437, "Peer Mesh credential on a general allocation") != 0;
+    received = failed ? -1 : refresh(client, &fixture, &mesh, st_turn_auth_nonce(), 0, seed++,
+                                     response, sizeof(response));
+    failed = failed || expect_error(response, received, 0x0114U, 437, "Peer Mesh Refresh of a general allocation") != 0;
+    received = failed ? -1 : create_permission(client, &fixture, &general, &peer, seed++,
+                                               response, sizeof(response));
+    if (!failed && (received < 20 || r16(response) != 0x0108U)) {
+        fprintf(stderr, "general allocation did not survive a Refresh by another identity\n");
         failed = 1;
     }
     /* Peer Mesh allocations are exempt: their peers are this server's own relay endpoints. */
@@ -918,6 +1009,75 @@ static int test_default_private_peer_refusal(void)
 
     close(local);
     close(mesh_client);
+    close(client);
+    st_stun_turn_server_stop(fixture.server);
+    return failed ? -1 : 0;
+}
+
+/*
+ * SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS=true (a C-only switch for loopback and single-host
+ * deployments) lifts the destination policy: the same peers are accepted and actually relayed to.
+ */
+static int test_private_peers_allowed_by_switch(void)
+{
+    turn_fixture fixture;
+    turn_credential general;
+    if (turn_fixture_start(&fixture, 1, "55700", "55799", NULL) != 0
+        || issue_credential("public-transfer-private", &general) != 0) return -1;
+    struct sockaddr_in client_address, first_address, second_address, relay, peer;
+    int client = udp_socket(&client_address);
+    int first = udp_socket(&first_address);
+    int second = udp_socket_on("127.0.0.2", &second_address);
+    unsigned char response[2048];
+    int failed = client < 0 || first < 0 || second < 0
+        || allocate(client, &fixture, &general, 700U, &relay) != 0;
+    unsigned seed = 710U;
+    unsigned number = 0x4000U;
+
+    for (size_t i = 0; !failed && i < sizeof(refused_ipv4_peers) / sizeof(refused_ipv4_peers[0]); ++i) {
+        int received = peer_from_text(refused_ipv4_peers[i], 50000U, &peer) != 0 ? -1
+            : create_permission(client, &fixture, &general, &peer, seed++, response, sizeof(response));
+        int bound = received < 20 || r16(response) != 0x0108U ? -1
+            : channel_bind(client, &fixture, &general, number++, &peer, seed++, response, sizeof(response));
+        if (received < 20 || bound < 20 || r16(response) != 0x0109U) {
+            fprintf(stderr, "allowed private peer %s was refused\n", refused_ipv4_peers[i]);
+            failed = 1;
+        }
+    }
+    for (size_t i = 0; !failed && i < sizeof(refused_ipv6_peers) / sizeof(refused_ipv6_peers[0]); ++i) {
+        int received = create_permission6(client, &fixture, &general, refused_ipv6_peers[i], seed++,
+                                          response, sizeof(response));
+        int bound = received < 20 || r16(response) != 0x0108U ? -1
+            : channel_bind6(client, &fixture, &general, number++, refused_ipv6_peers[i], seed++,
+                            response, sizeof(response));
+        if (received < 20 || bound < 20 || r16(response) != 0x0109U) {
+            fprintf(stderr, "allowed private peer %s was refused\n", refused_ipv6_peers[i]);
+            failed = 1;
+        }
+    }
+    /* One request installs every peer it names, and each of them is relayed to and from. */
+    struct sockaddr_in both[2] = {first_address, second_address};
+    int received = failed ? -1 : create_permissions(client, &fixture, &general, both, 2U, seed++,
+                                                    response, sizeof(response));
+    if (!failed && (received < 20 || r16(response) != 0x0108U || !integrity_valid(response, received, general.key))) {
+        fprintf(stderr, "CreatePermission with two loopback peers was refused\n");
+        failed = 1;
+    }
+    failed = failed || send_indication(client, &fixture, &first_address, "to-first", seed++) != 0
+        || receive_exact(first, "to-first", &relay, "Send to the first loopback peer") != 0
+        || send_indication(client, &fixture, &second_address, "to-second", seed++) != 0
+        || receive_exact(second, "to-second", &relay, "Send to the second loopback peer") != 0;
+    if (!failed) {
+        received = sendto(second, "from-second", 11U, 0, (struct sockaddr *)&relay, sizeof(relay)) == 11
+            ? (int)recvfrom(client, response, sizeof(response), 0, NULL, NULL) : -1;
+        if (received < 20 || r16(response) != 0x0017U) {
+            fprintf(stderr, "Data indication from the second loopback peer missing\n");
+            failed = 1;
+        }
+    }
+
+    close(second);
+    close(first);
     close(client);
     st_stun_turn_server_stop(fixture.server);
     return failed ? -1 : 0;
@@ -1261,6 +1421,7 @@ int main(void)
         || test_refresh_and_deallocation() != 0
         || test_stale_nonce() != 0
         || test_default_private_peer_refusal() != 0
+        || test_private_peers_allowed_by_switch() != 0
         || test_expiry() != 0) {
         fprintf(stderr, "TURN channel, refresh, nonce, peer policy or expiry tests failed\n");
         return 1;

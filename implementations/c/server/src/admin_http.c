@@ -26,7 +26,9 @@
 #include "security_baseline.h"
 #include "storage.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "turn_auth.h"
+#include "upstream_browser_headers.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -222,6 +224,8 @@ typedef struct {
     char client_name[256];
     char route[128];
     char rewrite_prefix[64];
+    /* The route's target, whose origin the relayed browser headers take (UpstreamBrowserHeaders). */
+    char target_base_url[512];
     char *relative_path;
     const char *raw_query;
     int upgrade;
@@ -2803,7 +2807,9 @@ static void record_direct_http_exchange(const char *client_name,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
-    if (client_name == NULL || route == NULL || request == NULL || response == NULL) {
+    /* Java captures only with specus.traffic.capture-detail-enabled and the route's own switch. */
+    if (client_name == NULL || route == NULL || request == NULL || response == NULL
+        || !st_traffic_capture_enabled()) {
         return;
     }
     const char *database_path = admin_database_path();
@@ -2835,11 +2841,17 @@ static void record_direct_http_exchange(const char *client_name,
     char *response_headers = admin_join_headers(response->headers, response->headers_len);
     char *request_content_type = admin_header_array_value(request->headers, request->headers_len, "Content-Type");
     char *response_content_type = admin_header_array_value(response->headers, response->headers_len, "Content-Type");
+    char *request_content_encoding = admin_header_array_value(request->headers, request->headers_len,
+                                                              "Content-Encoding");
+    char *response_content_encoding = admin_header_array_value(response->headers, response->headers_len,
+                                                               "Content-Encoding");
     if (request_headers == NULL || response_headers == NULL) {
         free(request_headers);
         free(response_headers);
         free(request_content_type);
         free(response_content_type);
+        free(request_content_encoding);
+        free(response_content_encoding);
         return;
     }
     st_storage_http_exchange_record record = {
@@ -2868,6 +2880,8 @@ static void record_direct_http_exchange(const char *client_name,
         .request_body_len = request->body_len,
         .response_body = response->body,
         .response_body_len = response->body_len,
+        .request_content_encoding = request_content_encoding,
+        .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
     };
     (void)st_storage_record_http_exchange(database_path, &record);
@@ -2875,6 +2889,8 @@ static void record_direct_http_exchange(const char *client_name,
     free(response_headers);
     free(request_content_type);
     free(response_content_type);
+    free(request_content_encoding);
+    free(response_content_encoding);
 }
 
 static int ensure_admin_database(const char **path, char *out, size_t out_len)
@@ -3901,7 +3917,13 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     return response_len;
 }
 
-static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
+/*
+ * HttpTrafficExchangeView. A summary (detail 0, the list) carries null headers and previews, as
+ * Java's summary views do; the detail of one exchange carries them.
+ */
+static int append_http_exchange_view(st_admin_string_builder *builder,
+                                     const st_storage_http_exchange *item,
+                                     int detail)
 {
     /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
@@ -3942,19 +3964,24 @@ static int append_http_exchange_view(st_admin_string_builder *builder, const st_
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseContentType\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_content_type);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseBodyType\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_body_type);
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(builder,
+                                         st_traffic_body_type_or_classify(item->response_body_type,
+                                                                          item->response_content_type,
+                                                                          item->response_bytes));
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_text : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_text : NULL);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -6223,7 +6250,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
         rc = admin_sb_append(&builder, i == 0 ? "" : ",");
         if (rc == 0) {
-            rc = append_http_exchange_view(&builder, &items[i]);
+            rc = append_http_exchange_view(&builder, &items[i], 0);
         }
     }
     if (rc == 0) {
@@ -6255,41 +6282,25 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
-    const int page_size = 100;
-    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(
-        (size_t)page_size, sizeof(*items));
-    if (items == NULL) {
+    /* One row by id with its headers and previews, under the same visibility as the list. */
+    st_storage_http_exchange *match = (st_storage_http_exchange *)calloc(1U, sizeof(*match));
+    int found = 0;
+    if (match == NULL
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_get_http_exchange_visible(database_path, exchange_id, context->tenant_id, context->username,
+                                                context->admin, match, &found) != 0) {
+        free(match);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"http exchange lookup failed\"}");
     }
-    long long total = 0;
-    int found = 0;
-    st_storage_http_exchange match;
-    for (int page = 0; !found; ++page) {
-        size_t count = 0U;
-        if (st_storage_list_http_exchanges_visible(database_path, 0, NULL, NULL, NULL, NULL,
-                context->tenant_id, context->username, context->admin, page, page_size,
-                items, (size_t)page_size, &count, &total) != 0) {
-            free(items);
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"http exchange lookup failed\"}");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (items[i].id == exchange_id) {
-                match = items[i];
-                found = 1;
-                break;
-            }
-        }
-        if (found || count == 0U || (long long)(page + 1) * page_size >= total) break;
-    }
-    free(items);
     if (!found) {
+        free(match);
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
     st_admin_string_builder builder = {0};
-    int rc = append_http_exchange_view(&builder, &match);
+    int rc = append_http_exchange_view(&builder, match, 1);
+    free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -6302,7 +6313,7 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
 
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", 0);
+    int enabled = st_traffic_capture_enabled();
     return write_response(out, out_len, 200, "OK",
         enabled
             ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
@@ -8604,13 +8615,40 @@ static int semver_numeric_part(const char *value)
     return 1;
 }
 
+/*
+ * Dot-separated SemVer identifiers: none may be empty ("a..b", a leading or trailing dot), each is
+ * [0-9A-Za-z-]+, and a numeric pre-release identifier has no leading zero (build metadata may).
+ */
+static int semver_identifiers_valid(const char *text, int prerelease)
+{
+    const char *part = text;
+    for (;;) {
+        const char *end = strchr(part, '.');
+        size_t len = end == NULL ? strlen(part) : (size_t)(end - part);
+        if (len == 0U) return 0;
+        int all_numeric = 1;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = (unsigned char)part[i];
+            if (!isalnum(c) && c != '-') return 0;
+            if (!isdigit(c)) all_numeric = 0;
+        }
+        if (prerelease && all_numeric && len > 1U && part[0] == '0') return 0;
+        if (end == NULL) return 1;
+        part = end + 1;
+    }
+}
+
+/*
+ * Java SemanticVersion.parse: trimmed (every character up to and including space, as String.trim
+ * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0.
+ */
 static int parse_admin_semver(const char *value, st_admin_semver *out)
 {
     if (value == NULL || out == NULL) return -1;
-    while (isspace((unsigned char)*value)) ++value;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
     if (*value == 'v') ++value;
     const char *end = value + strlen(value);
-    while (end > value && isspace((unsigned char)end[-1])) --end;
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
     size_t len = (size_t)(end - value);
     if (len == 0U || len > 32U) return -1;
     char copy[33];
@@ -8618,37 +8656,24 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     copy[len] = '\0';
     char *build = strchr(copy, '+');
     if (build != NULL) {
-        if (build[1] == '\0') return -1;
-        for (char *p = build + 1; *p != '\0'; ++p) {
-            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return -1;
-        }
+        if (!semver_identifiers_valid(build + 1, 0)) return -1;
         *build = '\0';
     }
     char *prerelease = strchr(copy, '-');
     memset(out, 0, sizeof(*out));
     if (prerelease != NULL) {
         *prerelease++ = '\0';
-        if (*prerelease == '\0' || strlen(prerelease) >= sizeof(out->prerelease)) return -1;
-        char validation[33];
-        snprintf(validation, sizeof(validation), "%s", prerelease);
-        char *save = NULL;
-        for (char *part = strtok_r(validation, ".", &save); part != NULL;
-             part = strtok_r(NULL, ".", &save)) {
-            int all_numeric = *part != '\0';
-            for (char *p = part; *p != '\0'; ++p) if (!isdigit((unsigned char)*p)) all_numeric = 0;
-            if (*part == '\0' || (all_numeric && semver_numeric_part(part) == 0)) return -1;
-            for (char *p = part; *p != '\0'; ++p) {
-                if (!isalnum((unsigned char)*p) && *p != '-') return -1;
-            }
-        }
+        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, 1)) return -1;
         snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
     }
-    char *save = NULL;
-    char *major = strtok_r(copy, ".", &save);
-    char *minor = strtok_r(NULL, ".", &save);
-    char *patch = strtok_r(NULL, ".", &save);
-    if (!semver_numeric_part(major) || !semver_numeric_part(minor)
-        || !semver_numeric_part(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+    /* Exactly three parts: strtok_r would skip the empty one in "1..0.0" or ".1.0.0". */
+    char *major = copy;
+    char *minor = strchr(major, '.');
+    char *patch = minor == NULL ? NULL : strchr(minor + 1, '.');
+    if (minor == NULL || patch == NULL || strchr(patch + 1, '.') != NULL) return -1;
+    *minor++ = '\0';
+    *patch++ = '\0';
+    if (!semver_numeric_part(major) || !semver_numeric_part(minor) || !semver_numeric_part(patch)) return -1;
     snprintf(out->major, sizeof(out->major), "%s", major);
     snprintf(out->minor, sizeof(out->minor), "%s", minor);
     snprintf(out->patch, sizeof(out->patch), "%s", patch);
@@ -8694,6 +8719,16 @@ static int compare_admin_semver(const st_admin_semver *left, const st_admin_semv
         right_part = strtok_r(NULL, ".", &right_save);
     }
     return left_part == right_part ? 0 : (left_part == NULL ? -1 : 1);
+}
+
+int st_admin_semver_compare_for_testing(const char *left, const char *right, int *result)
+{
+    st_admin_semver parsed_left;
+    st_admin_semver parsed_right;
+    if (result == NULL || parse_admin_semver(left, &parsed_left) != 0
+        || parse_admin_semver(right, &parsed_right) != 0) return -1;
+    *result = compare_admin_semver(&parsed_left, &parsed_right);
+    return 0;
 }
 
 static int read_client_download_mutation(const char *body,
@@ -9880,15 +9915,15 @@ static int write_workbench_error(char *out,
     return write_workbench_response(out, out_len, status, body, retry_after_seconds);
 }
 
-/* A refusal of the shared authentication layer, with the workbench's header on a workbench path. */
+/* A refusal of the shared authentication layer, private on a path whose every answer is private. */
 static int write_auth_refusal(char *out,
                               size_t out_len,
-                              int workbench_path,
+                              int private_path,
                               int status,
                               const char *reason,
                               const char *body)
 {
-    return workbench_path
+    return private_path
         ? write_workbench_response(out, out_len, status, body, 0)
         : write_response(out, out_len, status, reason, body);
 }
@@ -10294,8 +10329,15 @@ static int st_admin_build_response_internal(const char *method,
     /* Product metrics answers are private, the shared layer's refusals included. */
     int product_metrics_path = st_product_metrics_path(path);
     if (admin_path_requires_auth(method, path)) {
-        /* Workbench answers are private, the shared layer's refusals included. */
-        int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
+        /*
+         * Workbench and temporary-share management answers are private, the shared layer's refusals
+         * included (service-workbench.md, temporary-http-share.md section 4).
+         */
+        admin_share_path share_path;
+        admin_parse_share_path(path, &share_path);
+        int private_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0
+            || share_path.kind != ADMIN_SHARE_PATH_NONE
+            || admin_path_equals(path, "/api/admin/http-access-audit");
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
@@ -10315,7 +10357,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 403,
                                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
+                    : write_auth_refusal(out, out_len, private_path, 403, "Forbidden",
                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
@@ -10323,7 +10365,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 500,
                                                      "{\"error\":\"management user store unavailable\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
+                    : write_auth_refusal(out, out_len, private_path, 500, "Internal Server Error",
                                          "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
@@ -10339,7 +10381,7 @@ static int st_admin_build_response_internal(const char *method,
             if (admin_connectivity_check_path(path, NULL, 0U)) {
                 return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
             }
-            return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
+            return write_auth_refusal(out, out_len, private_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
     }
@@ -12292,7 +12334,8 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
 }
 
 /* Whether route_name is one of the SPECUS_HTTP_ROUTES routes every client is given. */
-static int admin_env_http_route_configured(const char *route_name)
+/* Whether SPECUS_HTTP_ROUTES defines route_name; its target is copied into target when it does. */
+static int admin_env_http_route_configured(const char *route_name, char *target, size_t target_len)
 {
     st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
     size_t route_count = 0;
@@ -12300,6 +12343,9 @@ static int admin_env_http_route_configured(const char *route_name)
     if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
         for (size_t i = 0; i < route_count && !configured; ++i) {
             configured = strcmp(routes[i].route, route_name) == 0;
+            if (configured && target != NULL) {
+                snprintf(target, target_len, "%s", routes[i].target_base_url);
+            }
         }
     }
     free(routes);
@@ -12317,18 +12363,24 @@ static int send_http_route_not_found(int fd)
  * response. It fails closed: a request enters the tunnel only for a route the server itself
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
- * since, so what the client holds never makes a route reachable.
+ * since, so what the client holds never makes a route reachable. The route's target is copied into
+ * target_base_url for the browser header rewrite.
  */
-static int authorize_direct_http_route(int fd, const char *path, const char *raw_request)
+static int authorize_direct_http_route(int fd,
+                                       const char *path,
+                                       const char *raw_request,
+                                       char *target_base_url,
+                                       size_t target_base_url_len)
 {
     char *client_name = NULL;
     char *route_name = NULL;
+    target_base_url[0] = '\0';
     if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
         return send_http_route_not_found(fd);
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
-        int configured = admin_env_http_route_configured(route_name);
+        int configured = admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
         free(client_name);
         free(route_name);
         return configured ? 0 : send_http_route_not_found(fd);
@@ -12355,7 +12407,8 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     /* Unknown and disabled clients have no reachable routes, environment ones included: with a
      * database a client cannot log in without an enabled account either. */
     int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
-    int env_configured = !found && client_enabled && admin_env_http_route_configured(route_name);
+    int env_configured = !found && client_enabled
+        && admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
     free(client_name);
     free(route_name);
     if (!client_enabled) {
@@ -12367,6 +12420,7 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     if (!route.enabled) {
         return send_http_route_not_found(fd);
     }
+    snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
     }
@@ -15061,7 +15115,8 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  const char *method,
                                                  const char *path,
                                                  const char *raw_request,
-                                                 int strip_authorization)
+                                                 int strip_authorization,
+                                                 const char *target_base_url)
 {
     if (strncmp(path, "/http/", 6) != 0
         || !admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
@@ -15129,7 +15184,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(client_name);
         free(route);
@@ -15249,7 +15306,8 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const char *raw_request,
                                       const uint8_t *body,
                                       size_t body_len,
-                                      int strip_authorization)
+                                      int strip_authorization,
+                                      const char *target_base_url)
 {
     if (strncmp(path, "/http/", 6) != 0) {
         return 0;
@@ -15299,7 +15357,9 @@ static int handle_direct_http_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(client_name);
         free(route);
         free(relative_path);
@@ -15601,6 +15661,7 @@ static int admit_http_share_request(int fd,
     }
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
     snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
+    snprintf(admission->target_base_url, sizeof(admission->target_base_url), "%s", resolution.target_base_url);
     return 1;
 }
 
@@ -15630,7 +15691,9 @@ static void forward_http_share_websocket(st_admin_server *server,
     char **headers = NULL;
     size_t headers_len = 0U;
     if (accept_key == NULL || raw_query == NULL
-        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(raw_query);
         send_text_http_error(fd, 500, "direct websocket request build failed");
@@ -15657,7 +15720,9 @@ static void forward_http_share_request(st_admin_server *server,
     char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
     char **headers = NULL;
     size_t headers_len = 0U;
-    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(raw_query);
         send_text_http_error(fd, 500, "direct http request build failed");
         return;
@@ -15879,8 +15944,10 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     int strip_direct_authorization = 0;
+    char direct_target_base_url[512] = "";
     if (strncmp(path, "/http/", 6) == 0) {
-        int auth_result = authorize_direct_http_route(fd, path, request);
+        int auth_result = authorize_direct_http_route(fd, path, request, direct_target_base_url,
+                                                      sizeof(direct_target_base_url));
         if (auth_result < 0) {
             close(fd);
             return;
@@ -15924,7 +15991,8 @@ static void handle_client(st_admin_server *server, int fd)
                                              method,
                                              path,
                                              request,
-                                             strip_direct_authorization)) {
+                                             strip_direct_authorization,
+                                             direct_target_base_url)) {
         free(body_buffer);
         close(fd);
         return;
@@ -15936,7 +16004,8 @@ static void handle_client(st_admin_server *server, int fd)
                                    request,
                                    (const uint8_t *)body,
                                    available_body_len,
-                                   strip_direct_authorization)) {
+                                   strip_direct_authorization,
+                                   direct_target_base_url)) {
         free(body_buffer);
         close(fd);
         return;

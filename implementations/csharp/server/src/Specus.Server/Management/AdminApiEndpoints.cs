@@ -95,6 +95,10 @@ public static class AdminApiEndpoints
                 {
                     context.Response.Headers.CacheControl = ConnectivityCheck.CacheControl;
                 }
+                else if (HttpShareEndpoints.IsManagementPath(context.Request.Path))
+                {
+                    context.Response.Headers.CacheControl = HttpShareEndpoints.ManagementCacheControl;
+                }
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 await context.Response.WriteAsJsonAsync(new { error = "未授权" }).ConfigureAwait(false);
                 return;
