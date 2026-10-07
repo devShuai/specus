@@ -15757,6 +15757,30 @@ static void admin_share_stream_attach_ws(admin_share_stream *entry, st_admin_dir
     }
 }
 
+/* Answers the upgrade with 101, closes at once with code and reason, and frees accept_key. */
+static void admin_direct_ws_refuse_after_upgrade(int fd, char *accept_key, uint16_t code, const char *reason)
+{
+    char response[512];
+    int response_len = snprintf(response,
+                                sizeof(response),
+                                "HTTP/1.1 101 Switching Protocols\r\n"
+                                "Upgrade: websocket\r\n"
+                                "Connection: Upgrade\r\n"
+                                "Sec-WebSocket-Accept: %s\r\n"
+                                "\r\n",
+                                accept_key);
+    free(accept_key);
+    if (response_len <= 0 || (size_t)response_len >= sizeof(response)
+        || send_all(fd, response, (size_t)response_len) != 0) {
+        return;
+    }
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(code, reason, payload);
+    if (admin_send_websocket_frame_ex(fd, 1, 0U, 0x8U, payload, payload_len) == 0) {
+        admin_direct_ws_linger(fd);
+    }
+}
+
 /*
  * Bridges one upgraded browser socket to a NAT stream until either side ends it. accept_key is
  * freed here; the request strings stay the caller's. share is the registry entry of a temporary
@@ -15812,13 +15836,22 @@ static void admin_direct_ws_run(st_admin_server *server,
         .client_id = client_id
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
+    if (open_rc == -1) {
+        /*
+         * Java WebSocketSpecusHandler, Go and .NET complete the handshake and then close with
+         * 1011 "客户端不在线": the upgrade is the tunnel handler's, whether or not the client is
+         * there. No NAT stream was opened, so there is nothing to reset.
+         */
+        st_admin_direct_ws_release(stream);
+        admin_direct_ws_refuse_after_upgrade(fd, accept_key, ST_ADMIN_WS_CLOSE_INTERNAL_ERROR,
+                                             ADMIN_ROUTE_CLIENT_OFFLINE_TEXT);
+        return;
+    }
     if (open_rc != 0) {
         st_admin_direct_ws_release(stream);
         free(accept_key);
         if (open_rc == -3) {
             send_text_http_error(fd, 404, "direct websocket route is not configured");
-        } else if (open_rc == -1) {
-            send_text_http_error(fd, 502, "direct websocket target client is offline");
         } else {
             send_text_http_error(fd, 500, "direct websocket open failed");
         }

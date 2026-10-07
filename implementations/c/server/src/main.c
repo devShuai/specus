@@ -2307,7 +2307,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     int route_configured = config_has_http_route(&session->config, request->route);
     pthread_mutex_unlock(&session->map_lock);
     if (!same_account) {
-        /* Not this account's client: answered as offline, never upgraded. */
+        /* Not this account's client: answered as offline, and no stream is opened. */
         fprintf(stderr, "[ws-specus] data connection of client=%s is account %lld, not %lld\n",
                 request->client_name, session_client_id, request->client_id);
         session_reference_release(session);
