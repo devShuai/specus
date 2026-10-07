@@ -2,6 +2,7 @@ package com.theshuai.specusserver.management.service;
 
 import com.theshuai.specusserver.config.ObjectStorageProperties;
 import com.theshuai.specusserver.config.PublicTransferProperties;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.TransferAttachment;
 import com.theshuai.specusserver.management.model.TransferAttachmentDownloadGrant;
 import com.theshuai.specusserver.management.model.TransferAttachmentDownloadUsage;
@@ -103,7 +104,8 @@ class TransferAttachmentServiceTests {
         var month = java.time.YearMonth.from(Instant.parse(snapshot.checkedAt()).atOffset(java.time.ZoneOffset.UTC));
         assertThat(snapshot.downloadUsageMonth()).isEqualTo(month.toString());
         assertThat(snapshot.downloadResetsAt()).isEqualTo(month.plusMonths(1).atDay(1).atStartOfDay().toInstant(java.time.ZoneOffset.UTC).toString());
-        verify(repository).sumActiveStorageBytes("default", "alice", Long.MIN_VALUE, "PENDING", "UPLOADED", snapshot.checkedAt());
+        verify(repository).sumActiveStorageBytes("default", "alice", Long.MIN_VALUE, "PENDING", "UPLOADED",
+                SortableInstant.normalize(snapshot.checkedAt()));
         verify(downloadUsageRepository).sumBytesByAccountAndMonth("default", "alice", snapshot.downloadUsageMonth());
         verify(objectStorageService).isEnabled();
         org.mockito.Mockito.verifyNoMoreInteractions(repository, downloadUsageRepository, objectStorageService);
@@ -115,7 +117,8 @@ class TransferAttachmentServiceTests {
         var other = new ManagementContext(new TenantContext("other-tenant"), "alice", true);
         var result = service.capabilities(other);
         assertThat(result.storageEnabled()).isFalse();
-        verify(repository).sumActiveStorageBytes("other-tenant", "alice", Long.MIN_VALUE, "PENDING", "UPLOADED", result.checkedAt());
+        verify(repository).sumActiveStorageBytes("other-tenant", "alice", Long.MIN_VALUE, "PENDING", "UPLOADED",
+                SortableInstant.normalize(result.checkedAt()));
         verify(downloadUsageRepository).sumBytesByAccountAndMonth("other-tenant", "alice", result.downloadUsageMonth());
         verify(objectStorageService).isEnabled();
         org.mockito.Mockito.verifyNoMoreInteractions(objectStorageService);
@@ -163,8 +166,9 @@ class TransferAttachmentServiceTests {
         when(repository.countByScopeAndPublicTransferRoomIdAndStatus(any(), any(), any())).thenReturn(0L);
         when(repository.existsById(anyLong())).thenReturn(false);
         when(repository.saveAndFlush(any(TransferAttachment.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        Instant uploadExpiresAt = Instant.parse("2026-09-15T12:15:00.500Z");
         when(objectStorageService.presignUpload(any(), eq("text/plain"), any()))
-                .thenReturn(new PresignedObjectUrl("https://oss/upload", Map.of("Content-Type", "text/plain"), Instant.now().plusSeconds(900).toString()));
+                .thenReturn(new PresignedObjectUrl("https://oss/upload", Map.of("Content-Type", "text/plain"), uploadExpiresAt.toString()));
 
         TransferAttachmentService.PresignUploadResponse response = service.createPublicUpload(ACCOUNT, new TransferAttachmentService.PresignUploadRequest(
                 "../hello.txt",
@@ -189,6 +193,11 @@ class TransferAttachmentServiceTests {
         assertThat(saved.getObjectKey()).contains("/public-transfer/").endsWith("/hello.txt");
         assertThat(response.uploadUrl()).isEqualTo("https://oss/upload");
         assertThat(response.attachment().sha256()).isEqualTo(SHA256);
+        // Expiries are stored fixed-width for the text comparisons; the API keeps Instant.toString().
+        assertThat(saved.getUploadExpiresAt()).isEqualTo("2026-09-15T12:15:00.5000000Z");
+        assertThat(saved.getExpiresAt()).hasSize(SortableInstant.LENGTH);
+        assertThat(response.expiresAt()).isEqualTo(uploadExpiresAt.toString());
+        assertThat(response.attachment().expiresAt()).isEqualTo(Instant.parse(saved.getExpiresAt()).toString());
     }
 
     @Test

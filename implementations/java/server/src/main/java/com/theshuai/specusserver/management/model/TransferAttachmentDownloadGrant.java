@@ -36,6 +36,7 @@ public class TransferAttachmentDownloadGrant {
     @Column(name = "created_at", nullable = false, length = 40)
     private String createdAt;
 
+    /** {@link SortableInstant} text: the consume and purge queries compare it as a string. */
     @Column(name = "expires_at", nullable = false, length = 40)
     private String expiresAt;
 
