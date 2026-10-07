@@ -2568,13 +2568,15 @@ static int prepare_runtime_route_config(const server_config *current, server_con
     refreshed->nat_control_json = NULL;
     refreshed->owns_nat_control_json = 0;
     /*
-     * The routes are reloaded by name, which resolves the account again. A published connection
-     * keeps the account and tenant it logged in with: one whose name now resolves to another
-     * account belongs to a client being renamed or deleted, and gets no other account's routes.
+     * Reloading resolves the account again: by id for a token login, by name for the static
+     * configuration, and under the account's current name either way. A published connection keeps
+     * the account, tenant and name it logged in with: one whose account was renamed, or whose name
+     * now resolves to another account, is being closed and gets no other name's routes.
      */
     if (load_database_config(refreshed, refreshed->database_path) != 0
         || refreshed->client_id != current->client_id
         || strcmp(refreshed->tenant_id, current->tenant_id) != 0
+        || strcmp(refreshed->client_name, current->client_name) != 0
         || parse_tcp_mappings(refreshed) != 0
         || parse_http_routes(refreshed) != 0
         || build_nat_control_json(refreshed) != 0) {
