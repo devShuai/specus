@@ -241,7 +241,11 @@ def consent(case):
         return {"decision": "REJECT", "code": "NOT_ALLOWED"}
     if case["transferIdInUse"]:
         return {"decision": "REJECT", "code": "TRANSFER_ID_IN_USE"}
+    # Unfinished memory-mode receives keep their chunks in the tab for in-session retry: capped on their own.
+    memory_full = case["memoryPartials"] >= MAX_STORED_PARTIALS
     if policy["autoAccept"] and size <= MEMORY_LIMIT_BYTES:
+        if memory_full:
+            return {"decision": "REJECT", "code": "TOO_MANY_PARTIALS"}
         return {"decision": "AUTO_ACCEPT_MEMORY"}
     live = case["livePartials"]
     if not policy["persistentAvailable"]:
@@ -256,6 +260,8 @@ def consent(case):
     else:
         return {"decision": "PROMPT_PERSISTENT"}
     if size <= MEMORY_LIMIT_BYTES:
+        if memory_full:
+            return {"decision": "REJECT", "code": "TOO_MANY_PARTIALS"}
         return {"decision": "PROMPT_MEMORY", "memoryReason": reason}
     return {"decision": "REJECT", "code": reason}
 
@@ -676,9 +682,9 @@ RECEIVER = [
 POLICY = {"autoAccept": False, "persistentAvailable": True, "quotaBytes": 10 * GIB, "usageBytes": 1 * GIB}
 
 
-def consent_case(size, policy=None, live=(), allowed=True, in_use=False):
+def consent_case(size, policy=None, live=(), allowed=True, in_use=False, memory=0):
     return {"policy": {**POLICY, **(policy or {})}, "sizeBytes": size, "livePartials": list(live),
-            "senderAllowed": allowed, "transferIdInUse": in_use}
+            "memoryPartials": memory, "senderAllowed": allowed, "transferIdInUse": in_use}
 
 
 def partial(size, received):
@@ -719,6 +725,21 @@ CONSENT = [
      consent_case(512 * MIB, {"quotaBytes": 3 * GIB, "usageBytes": 3 * GIB // 2},
                   live=[partial(GIB, GIB), partial(GIB, GIB)]),
      "PROMPT_PERSISTENT"),
+    ("auto-accept-below-memory-partial-limit",
+     consent_case(10 * MIB, {"autoAccept": True}, memory=MAX_STORED_PARTIALS - 1), "AUTO_ACCEPT_MEMORY"),
+    ("auto-accept-memory-partials-at-limit",
+     consent_case(10 * MIB, {"autoAccept": True}, memory=MAX_STORED_PARTIALS), ("REJECT", "TOO_MANY_PARTIALS")),
+    ("stored-partials-do-not-block-auto-accept",
+     consent_case(10 * MIB, {"autoAccept": True}, live=[partial(MIB, 0)] * MAX_STORED_PARTIALS),
+     "AUTO_ACCEPT_MEMORY"),
+    ("memory-partials-do-not-block-persistent", consent_case(10 * MIB, memory=MAX_STORED_PARTIALS),
+     "PROMPT_PERSISTENT"),
+    ("memory-fallback-memory-partials-at-limit",
+     consent_case(100 * MIB, {"persistentAvailable": False}, memory=MAX_STORED_PARTIALS),
+     ("REJECT", "TOO_MANY_PARTIALS")),
+    ("large-file-keeps-its-reason-when-memory-is-full",
+     consent_case(200 * MIB, {"persistentAvailable": False}, memory=MAX_STORED_PARTIALS),
+     ("REJECT", "PERSISTENCE_UNAVAILABLE")),
 ]
 
 NOW = "2026-10-06T12:00:00Z"
