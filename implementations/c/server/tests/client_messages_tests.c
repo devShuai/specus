@@ -262,6 +262,22 @@ static int scenario_message_channel(test_server *server)
               && ws_read_text(first, text, sizeof(text), IO_TIMEOUT_MS) == 1
               && contains(text, "\"error\":\"target-not-found\"") && contains(text, "\"messageId\":\"m-2\""),
           "target-not-found: %s", text);
+    /* Java's default ObjectMapper: an unknown member or a non-scalar value is invalid-json, without
+     * a messageId; a number where a string belongs is read as text. */
+    static const char *const unmappable[] = {
+        "{\"type\":\"message\",\"messageId\":\"m-3\",\"toClientName\":\"x\",\"message\":\"y\",\"extra\":1}",
+        "{\"type\":\"message\",\"messageId\":\"m-4\",\"toClientName\":{\"name\":\"x\"},\"message\":\"y\"}",
+        "[\"message\"]",
+    };
+    for (size_t i = 0; i < sizeof(unmappable) / sizeof(unmappable[0]); ++i) {
+        CHECK(ws_send_text(first, unmappable[i]) == 0 && ws_read_text(first, text, sizeof(text), IO_TIMEOUT_MS) == 1
+                  && strcmp(text, "{\"type\":\"error\",\"error\":\"invalid-json\"}") == 0,
+              "unmappable command %zu: %s", i, text);
+    }
+    CHECK(ws_send_text(first, "{\"type\":\"message\",\"messageId\":5,\"toClientName\":\"\",\"message\":\"y\"}") == 0
+              && ws_read_text(first, text, sizeof(text), IO_TIMEOUT_MS) == 1
+              && contains(text, "\"error\":\"target-and-message-required\""),
+          "a numeric messageId is not invalid-json: %s", text);
 
     /* Client to administrator: every open session of that administrator gets it. */
     char to_admin[128];
