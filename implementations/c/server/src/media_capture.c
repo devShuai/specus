@@ -2135,7 +2135,7 @@ static int media_list_response(const char *path,
         if (client_id > 0) sqlite3_bind_int64(stmt, index++, client_id);
         if (route != NULL && *route != '\0') sqlite3_bind_text(stmt, index++, route, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, index++, size);
-        sqlite3_bind_int(stmt, index++, page * size);
+        sqlite3_bind_int64(stmt, index++, (sqlite3_int64)page * size);
         int first = 1;
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             st_media_capture_row row;
