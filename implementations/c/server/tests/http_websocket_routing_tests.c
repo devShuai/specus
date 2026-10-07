@@ -2,9 +2,11 @@
  * Java HttpWebSocketRoutingTests against a real specus-server-c process. The public entry
  * /http/{client}/{route}/... splits by the request, not by the path:
  *
- *   - an Upgrade: websocket request goes to the WebSocket tunnel handler, which completes the
- *     handshake (101) and, the client being offline, closes with 1011 "客户端不在线";
- *   - a plain GET of the same route reaches the HTTP tunnel and gets 502 "客户端不在线";
+ *   - an Upgrade: websocket request goes to the WebSocket tunnel handler. The client being
+ *     offline, C refuses it before the upgrade with the handler's own plain-text 502
+ *     (http-route.md section 1; a refused WebSocket gets no 101), where Java, Go and .NET complete
+ *     the handshake and then close with 1011;
+ *   - a plain GET of the same route reaches the HTTP tunnel and gets its JSON 502 "客户端不在线";
  *   - raw braces in the query reach the tunnel too (502), and so does a raw '|': Tomcat answers
  *     the latter with 400 before Spring sees it, C has no such container rule;
  *   - the route runtime polyfill is a public JavaScript asset.
@@ -110,18 +112,10 @@ static int check_websocket_upgrade(test_server *server)
              server->admin_port, server->admin_port);
     raw_answer answer;
     CHECK(raw_request(server, request, &answer) == 0, "upgrade request");
-    CHECK(answer.status == 101 && strstr(answer.text, "\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n")
-              != NULL,
-          "the upgrade must be answered by the tunnel handler with 101:\n%s", answer.text);
-    size_t frame_len = 0U;
-    const uint8_t *frame = (const uint8_t *)answer_body(&answer, &frame_len);
-    static const char reason[] = "客户端不在线";
-    size_t reason_len = sizeof(reason) - 1U;
-    /* One unmasked CLOSE frame: 1011 and the reason, then the end of the connection. */
-    CHECK(frame_len == 4U + reason_len && frame[0] == 0x88U && frame[1] == (uint8_t)(2U + reason_len)
-              && frame[2] == 0x03U && frame[3] == 0xf3U && memcmp(frame + 4, reason, reason_len) == 0,
-          "an offline client must close the upgraded socket with 1011 %s (%zu bytes after the head)", reason,
-          frame_len);
+    /* The tunnel handler's answer, not the HTTP tunnel's "客户端不在线" (check_plain_get). */
+    CHECK(answer.status == 502 && strstr(answer.text, "{\"error\":\"direct websocket target client is offline\"}")
+              != NULL && strstr(answer.text, "Sec-WebSocket-Accept") == NULL,
+          "the upgrade must reach the WebSocket tunnel handler and be refused before 101:\n%s", answer.text);
     return 0;
 }
 
