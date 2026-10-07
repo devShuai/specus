@@ -1071,6 +1071,153 @@ static int test_data_login_answered_before_stream_open(test_server *server)
     return 0;
 }
 
+/* Counts the client's closed connection records with the given disconnect reason, or -1. */
+static int connection_reason_count(const char *db_path, const char *client_name, const char *reason)
+{
+    char sql[256];
+    char count[32] = "";
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM connection_record WHERE client_name = ? AND disconnect_reason = '%s'", reason);
+    return db_scalar(db_path, sql, client_name, 0, count, sizeof(count)) == 0 ? atoi(count) : -1;
+}
+
+/* Waits until the client has at least expected connection records closed for reason. */
+static int wait_connection_reason_count(const char *db_path, const char *client_name, const char *reason,
+                                        int expected)
+{
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        int count = connection_reason_count(db_path, client_name, reason);
+        if (count >= expected) {
+            return 0;
+        }
+        if (monotonic_ms() >= deadline) {
+            fprintf(stderr, "%d %s record(s) for %s, expected %d\n", count, reason, client_name, expected);
+            return -1;
+        }
+        sleep_ms(50);
+    }
+}
+
+/* A MESSAGE_REQUEST frame: the compact message body under the client-to-server command. */
+static st_buffer encode_message_request(const char *client_name)
+{
+    st_buffer frame = st_protocol_encode_message_response(client_name, NULL, ST_MESSAGE_TYPE_CLIENT_TO_SERVER,
+                                                          "role test");
+    if (frame.data != NULL) {
+        frame.data[6] = (uint8_t)ST_CMD_MESSAGE_REQUEST;
+    }
+    return frame;
+}
+
+/* The server packets a client must never send: login, message and logout responses. */
+static st_buffer encode_server_packet(int which, const char *client_name)
+{
+    if (which == 0) {
+        return st_protocol_encode_login_response(client_name, 1, NULL);
+    }
+    if (which == 1) {
+        return st_protocol_encode_message_response(client_name, NULL, ST_MESSAGE_TYPE_SERVER_TO_CLIENT, "x");
+    }
+    return st_protocol_encode_empty_packet(ST_CMD_LOGOUT_RESPONSE);
+}
+
+/* LOGOUT_REQUEST is answered with LOGOUT_RESPONSE before the server closes the connection. */
+static int expect_logout_answered(int fd)
+{
+    st_buffer logout = st_protocol_encode_empty_packet(ST_CMD_LOGOUT_REQUEST);
+    if (send_buffer(fd, &logout) != 0) {
+        return -1;
+    }
+    for (;;) {
+        st_frame_header header;
+        uint8_t *body = NULL;
+        if (read_frame(fd, IO_TIMEOUT_MS, &header, &body) != 1) {
+            fprintf(stderr, "no LOGOUT_RESPONSE\n");
+            return -1;
+        }
+        free(body);
+        if (header.command == ST_CMD_LOGOUT_RESPONSE) {
+            return expect_channel_closed(fd, IO_TIMEOUT_MS);
+        }
+    }
+}
+
+/*
+ * Java ConnectionRoleHandlerTests on real connections: a control connection takes MESSAGE_REQUEST,
+ * heartbeats both ways and LOGOUT_REQUEST, a data connection NAT frames, heartbeats and
+ * LOGOUT_REQUEST. A frame of the other role (NAT on control, MESSAGE_REQUEST on data) or a server
+ * response packet closes that connection, and only it, as a protocol violation.
+ */
+static int test_connection_roles(test_server *server)
+{
+    char reason[256];
+    runtime_session runtime;
+    int control = -1;
+    int data = -1;
+    CHECK(create_credential(server->db_path, "ck_roles", "roles-secret", 2) == 0, "credential ck_roles not stored");
+    CHECK(http_client_login(server, "ck_roles", "roles-secret", "machine-roles", "rita", &runtime) == 0,
+          "login (status and body above)");
+    CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
+          "control: %s", reason);
+    CHECK(channel_login(server->control_port, &runtime, "data", &data, reason, sizeof(reason)) == 1,
+          "data: %s", reason);
+
+    /* Accepted: the frames of each role. */
+    st_buffer frame = encode_message_request(runtime.client_name);
+    CHECK(send_buffer(control, &frame) == 0, "control MESSAGE_REQUEST");
+    frame = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_RESPONSE);
+    CHECK(send_buffer(control, &frame) == 0, "control HEARTBEAT_RESPONSE");
+    CHECK(expect_channel_alive(control) == 0, "the control connection refused a control frame");
+    frame = st_protocol_encode_nat_message(ST_NAT_KEEPALIVE, 0U, 0U, 0U, NULL, NULL, 0U);
+    CHECK(send_buffer(data, &frame) == 0, "data NAT KEEPALIVE");
+    frame = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_RESPONSE);
+    CHECK(send_buffer(data, &frame) == 0, "data HEARTBEAT_RESPONSE");
+    CHECK(expect_channel_alive(data) == 0, "the data connection refused a data frame");
+
+    /* Refused on data: MESSAGE_REQUEST and every server packet close the data connection only. */
+    for (int which = -1; which < 3; ++which) {
+        frame = which < 0 ? encode_message_request(runtime.client_name) : encode_server_packet(which, runtime.client_name);
+        CHECK(send_buffer(data, &frame) == 0, "refused frame %d on data", which);
+        CHECK(TIMED(expect_channel_closed(data, IO_TIMEOUT_MS)) == 0,
+              "the data connection tolerated %s: %s", which < 0 ? "MESSAGE_REQUEST" : "a server packet",
+              timed_outcome(IO_TIMEOUT_MS));
+        close_fd(&data);
+        CHECK(expect_channel_alive(control) == 0, "a data connection's violation closed the control connection");
+        CHECK(channel_login(server->control_port, &runtime, "data", &data, reason, sizeof(reason)) == 1,
+              "data re-login: %s", reason);
+    }
+    /* LOGOUT_REQUEST is a data frame as well: answered, then the data connection ends. */
+    CHECK(expect_logout_answered(data) == 0, "LOGOUT_REQUEST on data");
+    close_fd(&data);
+    CHECK(expect_channel_alive(control) == 0, "the data logout closed the control connection");
+    CHECK(expect_logout_answered(control) == 0, "LOGOUT_REQUEST on control");
+    close_fd(&control);
+    CHECK(wait_connection_reason(server->db_path, runtime.client_name, "CLIENT_CLOSED", IO_TIMEOUT_MS) == 0,
+          "the control logout was not recorded as CLIENT_CLOSED");
+
+    /* Refused on control: a NAT frame and every server packet, each recorded as a violation. */
+    int violations = connection_reason_count(server->db_path, runtime.client_name, "PROTOCOL_VIOLATION");
+    CHECK(violations >= 0, "violation count");
+    for (int which = -1; which < 3; ++which) {
+        CHECK(http_client_login(server, "ck_roles", "roles-secret", "machine-roles", "rita", &runtime) == 0,
+              "login (status and body above)");
+        CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
+              "control: %s", reason);
+        frame = which < 0 ? st_protocol_encode_nat_message(ST_NAT_KEEPALIVE, 0U, 0U, 0U, NULL, NULL, 0U)
+                          : encode_server_packet(which, runtime.client_name);
+        CHECK(send_buffer(control, &frame) == 0, "refused frame %d on control", which);
+        CHECK(TIMED(expect_channel_closed(control, IO_TIMEOUT_MS)) == 0,
+              "the control connection tolerated %s: %s", which < 0 ? "a NAT frame" : "a server packet",
+              timed_outcome(IO_TIMEOUT_MS));
+        close_fd(&control);
+        CHECK(wait_connection_reason_count(server->db_path, runtime.client_name, "PROTOCOL_VIOLATION",
+                                           ++violations) == 0,
+              "the control connection's violation was not recorded");
+    }
+    return 0;
+}
+
 static int scenario_default_limits(test_server *server)
 {
     return test_replayed_login_is_rejected(server)
@@ -1109,6 +1256,7 @@ int main(int argc, char **argv)
     failures += run_on_fresh_server("new session replaces previous session",
                                     test_new_session_replaces_previous_session, two_per_machine);
     failures += run_on_fresh_server("dead channel cleanup", test_dead_channel_is_cleaned_up, short_idle);
+    failures += run_on_fresh_server("connection roles refuse the other role's frames", test_connection_roles, NULL);
     failures += run_on_fresh_server("SIGTERM shutdown and restart cleanup", scenario_shutdown_and_restart, NULL);
 
     const char *tmp = getenv("TMPDIR");

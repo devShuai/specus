@@ -381,6 +381,42 @@ static int append_bytes(char **out, size_t *len, size_t *cap, const unsigned cha
     return 0;
 }
 
+/*
+ * The length of the well-formed UTF-8 sequence at text (RFC 3629: no overlong forms, no
+ * surrogates, nothing above U+10FFFF), or 0 when the bytes there are not one.
+ */
+static size_t utf8_sequence_length(const unsigned char *text)
+{
+    size_t length;
+    unsigned int value;
+    unsigned int minimum;
+    if (text[0] >= 0xc2U && text[0] <= 0xdfU) {
+        length = 2U;
+        value = text[0] & 0x1fU;
+        minimum = 0x80U;
+    } else if (text[0] >= 0xe0U && text[0] <= 0xefU) {
+        length = 3U;
+        value = text[0] & 0x0fU;
+        minimum = 0x800U;
+    } else if (text[0] >= 0xf0U && text[0] <= 0xf4U) {
+        length = 4U;
+        value = text[0] & 0x07U;
+        minimum = 0x10000U;
+    } else {
+        return 0U;
+    }
+    for (size_t i = 1U; i < length; ++i) {
+        if ((text[i] & 0xc0U) != 0x80U) {
+            return 0U;
+        }
+        value = (value << 6) | (text[i] & 0x3fU);
+    }
+    if (value < minimum || value > 0x10ffffU || (value >= 0xd800U && value <= 0xdfffU)) {
+        return 0U;
+    }
+    return length;
+}
+
 static int hex_value(char ch)
 {
     if (ch >= '0' && ch <= '9') {
@@ -407,6 +443,24 @@ static char *parse_json_string_value_len(const char **cursor, size_t *out_len)
     size_t len = 0;
     size_t cap = 0;
     while (*p != '\0' && *p != '"') {
+        if ((unsigned char)*p >= 0x80U) {
+            /*
+             * Raw UTF-8 is kept as it is. Each byte used to be taken for a code point of its own and
+             * re-encoded, which turned every non-ASCII character into mojibake; malformed UTF-8 is
+             * refused, as Java's Jackson refuses it.
+             */
+            size_t sequence = utf8_sequence_length((const unsigned char *)p);
+            if (sequence == 0U) {
+                free(out);
+                return NULL;
+            }
+            if (append_bytes(&out, &len, &cap, (const unsigned char *)p, sequence) != 0) {
+                free(out);
+                return NULL;
+            }
+            p += sequence;
+            continue;
+        }
         unsigned char ch = (unsigned char)*p++;
         if (ch == '\\') {
             if (*p == '\0') {
@@ -490,9 +544,8 @@ static char *parse_json_string_value_len(const char **cursor, size_t *out_len)
             }
         }
         /*
-         * An unescaped character is copied byte for byte: the body is UTF-8 already, and taking
-         * each byte of a multi-byte character for a code point of its own turned "架" into "æ¶".
-         * (The escapes above all yield ASCII.)
+         * What is left here is ASCII (raw UTF-8 was copied above and escapes either yield ASCII or
+         * were appended as UTF-8), so one byte is one character.
          */
         if (append_bytes(&out, &len, &cap, &ch, 1U) != 0) {
             free(out);

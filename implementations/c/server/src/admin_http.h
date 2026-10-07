@@ -17,6 +17,14 @@ typedef struct {
     const uint8_t *body;
     size_t body_len;
     /*
+     * The trailer names the request's Trailer header declared and the declared trailer fields of
+     * a chunked body as name:value (http-route.md section 3); both empty when there are none.
+     */
+    char **trailer_names;
+    size_t trailer_names_len;
+    char **trailers;
+    size_t trailers_len;
+    /*
      * The client account whose record let the request in (http-route.md section 1), or 0 when no
      * account record was involved. The forwarder only uses a data connection that logged in as
      * this account; one still bound under the name for another account is treated as offline.
