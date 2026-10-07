@@ -621,9 +621,254 @@ static int test_client_session_lifecycle_queries(void)
     return failures;
 }
 
+/* A scratch database path on /dev/shm when it is writable (much faster), otherwise TMPDIR or /tmp. */
+static void scratch_db_path(char *path, size_t path_len, const char *name)
+{
+    const char *tmp = getenv("TMPDIR");
+    const char *dir = access("/dev/shm", W_OK) == 0 ? "/dev/shm" : (tmp != NULL && *tmp != '\0' ? tmp : "/tmp");
+    snprintf(path, path_len, "%s/specus-c-%s-%ld.db", dir, name, (long)getpid());
+    unlink(path);
+}
+
+/* First column of the first row as an integer; -1000 when there is no row, -2000 on error. */
+static long long query_int(const char *path, const char *sql)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long value = -2000;
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        int step = sqlite3_step(stmt);
+        if (step == SQLITE_ROW) {
+            value = sqlite3_column_type(stmt, 0) == SQLITE_NULL ? -3000 : sqlite3_column_int64(stmt, 0);
+        } else if (step == SQLITE_DONE) {
+            value = -1000;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return value;
+}
+
+static int exec_script(const char *path, const char *sql)
+{
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    int rc = sqlite3_open(path, &db) == SQLITE_OK
+        && sqlite3_exec(db, sql, NULL, NULL, &error) == SQLITE_OK ? 0 : -1;
+    if (rc != 0) fprintf(stderr, "sql failed: %s\n", error == NULL ? "sqlite error" : error);
+    sqlite3_free(error);
+    sqlite3_close(db);
+    return rc;
+}
+
+/*
+ * Java PeerServiceDiscoverySchemaMigratorTests, createsTablesDisabledByDefaultAndAddsSessionCapabilityColumns.
+ * A session table from before peer service discovery and peer egress gains the four capability
+ * columns, and a row already there as well as a new row that does not set them announce nothing.
+ * Sharing tables from before mDNS import and the allow list gain both columns switched off, a
+ * NULL enabled flag is forced off, and a fresh database creates both tables disabled by default.
+ * Startup runs the migration twice to show it is idempotent.
+ */
+static int test_peer_service_discovery_migration(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "peer-service-migration");
+    const char *legacy_schema =
+        "CREATE TABLE specus_client_session ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL DEFAULT 'default',"
+        "credential_id INTEGER NOT NULL,identity_id INTEGER NOT NULL,client_id INTEGER NOT NULL,"
+        "client_name TEXT NOT NULL,token_hash TEXT NOT NULL,status TEXT NOT NULL,"
+        "machine_fingerprint TEXT NOT NULL,os_user TEXT NOT NULL,hostname TEXT,os_name TEXT,"
+        "os_version TEXT,os_arch TEXT,client_version TEXT,java_version TEXT,local_addresses TEXT,"
+        "message_send_capable INTEGER NOT NULL DEFAULT 0,message_receive_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_attachments_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_media_preview_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,"
+        "http_login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,netty_connected_at TEXT,"
+        "disconnected_at TEXT,expires_at TEXT NOT NULL,channel_id TEXT,remote_address TEXT);"
+        "INSERT INTO specus_client_session(id,credential_id,identity_id,client_id,client_name,token_hash,"
+        "status,machine_fingerprint,os_user,expires_at) VALUES(2,1,1,7,'legacy','legacy-token',"
+        "'DISCONNECTED','machine','user','2026-06-25T08:00:00Z');"
+        "CREATE TABLE peer_mesh_service_sharing (tenant_id TEXT NOT NULL PRIMARY KEY,enabled INTEGER,"
+        "updated_by TEXT,updated_at TEXT NOT NULL);"
+        "INSERT INTO peer_mesh_service_sharing(tenant_id,enabled,updated_at) VALUES('legacy-tenant',NULL,'then');"
+        "CREATE TABLE peer_mesh_shared_service (id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,"
+        "client_id INTEGER NOT NULL,client_name TEXT NOT NULL,service_id TEXT NOT NULL,name TEXT NOT NULL,"
+        "description TEXT,transport TEXT NOT NULL,application TEXT NOT NULL,target_host TEXT NOT NULL,"
+        "target_port INTEGER NOT NULL,published_port INTEGER NOT NULL,path TEXT,enabled INTEGER,"
+        "visibility TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+        "UNIQUE(tenant_id,client_id,service_id));"
+        "INSERT INTO peer_mesh_shared_service(id,tenant_id,client_id,client_name,service_id,name,transport,"
+        "application,target_host,target_port,published_port,enabled,visibility,created_at,updated_at) "
+        "VALUES(9,'legacy-tenant',1,'a','svc-legacy','ssh','tcp','ssh','127.0.0.1',22,2222,NULL,'OWNER','then','then');";
+    int failures = 0;
+    if (exec_script(path, legacy_schema) != 0
+        || st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "peer service discovery migration of a legacy database failed\n");
+        unlink(path);
+        return 1;
+    }
+    if (exec_script(path,
+            "INSERT INTO specus_client_session(id,credential_id,identity_id,client_id,client_name,token_hash,"
+            "status,machine_fingerprint,os_user,expires_at) VALUES(1,1,1,7,'legacy','fresh-token',"
+            "'HTTP_AUTHENTICATED','machine','user','2026-06-25T08:00:00Z');") != 0) {
+        failures++;
+    }
+    for (int id = 1; id <= 2; ++id) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "SELECT peer_service_discovery_version + client_egress_version * 10 "
+                 "+ client_egress_domain_targets * 100 FROM specus_client_session WHERE id=%d", id);
+        long long announced = query_int(path, sql);
+        snprintf(sql, sizeof(sql), "SELECT peer_service_applications FROM specus_client_session WHERE id=%d", id);
+        long long applications = query_int(path, sql);
+        if (announced != 0 || applications != -3000) {
+            fprintf(stderr, "session %d after the migration announced %lld (applications %lld)\n",
+                    id, announced, applications);
+            failures++;
+        }
+    }
+    if (query_int(path, "SELECT enabled FROM peer_mesh_service_sharing WHERE tenant_id='legacy-tenant'") != 0
+        || query_int(path, "SELECT mdns_import_enabled FROM peer_mesh_service_sharing "
+                           "WHERE tenant_id='legacy-tenant'") != 0
+        || query_int(path, "SELECT enabled FROM peer_mesh_shared_service WHERE id=9") != 0
+        || query_int(path, "SELECT allowed_client_ids FROM peer_mesh_shared_service WHERE id=9") != -3000) {
+        fprintf(stderr, "legacy sharing rows were not switched off with the new columns\n");
+        failures++;
+    }
+    unlink(path);
+
+    /* A fresh database: both tables exist and a row that does not say otherwise is off. */
+    if (st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0
+        || exec_script(path,
+               "INSERT INTO peer_mesh_service_sharing(tenant_id) VALUES('default');"
+               "INSERT INTO peer_mesh_shared_service(id,tenant_id,client_id,client_name,service_id,name,"
+               "transport,application,target_host,target_port,published_port) VALUES(1,'default',1,'a',"
+               "'svc-ssh001','ssh','tcp','ssh','127.0.0.1',22,2222);") != 0) {
+        fprintf(stderr, "fresh peer service discovery tables could not take a row\n");
+        unlink(path);
+        return 1;
+    }
+    if (query_int(path, "SELECT enabled FROM peer_mesh_service_sharing WHERE tenant_id='default'") != 0
+        || query_int(path, "SELECT mdns_import_enabled FROM peer_mesh_service_sharing WHERE tenant_id='default'") != 0
+        || query_int(path, "SELECT enabled FROM peer_mesh_shared_service WHERE id=1") != 0
+        || query_int(path, "SELECT allowed_client_ids FROM peer_mesh_shared_service WHERE id=1") != -3000) {
+        fprintf(stderr, "fresh peer service discovery tables are not disabled by default\n");
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
+/*
+ * Java ConnectionArchiveServiceTests at the storage level, with the clock fixed at
+ * 2026-10-07T12:00:00Z: the cutoff is the UTC date 60 days earlier, detail before it is rolled into
+ * per-month totals and deleted, detail from the cutoff day on stays, and a later run adds to a
+ * month that was already archived. The scheduled run through a real server is in
+ * connection_archive_tests.
+ */
+static int test_connection_archive_window(void)
+{
+    const long long now = 1791374400LL; /* 2026-10-07T12:00:00Z */
+    char cutoff[11];
+    if (st_storage_connection_archive_cutoff(60, now, cutoff) != 0 || strcmp(cutoff, "2026-08-08") != 0
+        || st_storage_connection_archive_cutoff(0, now, cutoff) != -1
+        || st_storage_connection_archive_cutoff(1, 1767225600LL, cutoff) != 0
+        || strcmp(cutoff, "2025-12-31") != 0
+        || st_storage_connection_archive_cutoff(366, 1772323200LL, cutoff) != 0
+        || strcmp(cutoff, "2025-02-28") != 0) {
+        fprintf(stderr, "connection archive cutoff mismatch: %s\n", cutoff);
+        return 1;
+    }
+    char path[256];
+    scratch_db_path(path, sizeof(path), "connection-archive");
+    static const struct {
+        const char *at;
+        int success;
+    } records[] = {
+        {"2026-06-03T08:00:00.000Z", 1}, {"2026-06-17T08:00:00.000Z", 1}, {"2026-06-30T23:59:59.000Z", 0},
+        {"2026-07-12T08:00:00.000Z", 1},
+        {"2026-08-07T23:59:59.999Z", 1}, /* the last moment before the cutoff day */
+        {"2026-08-08T00:00:00.000Z", 0}, /* the cutoff day itself stays */
+        {"2026-10-02T08:00:00.000Z", 1}, {"2026-10-02T09:00:00.000Z", 0},
+    };
+    int failures = 0;
+    if (st_storage_init(path, 0) != 0) {
+        unlink(path);
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(records) / sizeof(records[0]); ++i) {
+        if (st_storage_record_connection(path, "ArchiveClient", records[i].success,
+                                         records[i].success ? NULL : "LOGIN_FAILURE", records[i].at) != 0) {
+            failures++;
+        }
+    }
+    /* Retention 0 turns the archive off: nothing moves. */
+    if (st_storage_archive_expired_connections(path, 0, now) != 0
+        || query_int(path, "SELECT COUNT(*) FROM connection_stat") != 0
+        || query_int(path, "SELECT COUNT(*) FROM connection_record") != 8) {
+        fprintf(stderr, "a retention of 0 still archived connection detail\n");
+        failures++;
+    }
+    if (st_storage_archive_expired_connections(path, 60, now) != 0
+        || st_storage_archive_expired_connections(path, 60, now) != 0) {
+        fprintf(stderr, "connection archive run failed\n");
+        unlink(path);
+        return 1;
+    }
+    int successes = 0;
+    int failures_count = 0;
+    if (query_int(path, "SELECT COUNT(*) FROM connection_record") != 3
+        || query_int(path, "SELECT COUNT(*) FROM connection_record WHERE connected_at < '2026-08-08'") != 0) {
+        fprintf(stderr, "connection detail inside the 60-day window was not kept as it was\n");
+        failures++;
+    }
+    if (st_storage_load_connection_stat(path, "ArchiveClient", "2026-06", &successes, &failures_count) != 0
+        || successes != 2 || failures_count != 1) {
+        fprintf(stderr, "June total mismatch: %d/%d\n", successes, failures_count);
+        failures++;
+    }
+    if (st_storage_load_connection_stat(path, "ArchiveClient", "2026-08", &successes, &failures_count) != 0
+        || successes != 1 || failures_count != 0) {
+        fprintf(stderr, "the month straddling the cutoff was not archived up to the cutoff\n");
+        failures++;
+    }
+    if (st_storage_load_connection_stat(path, "ArchiveClient", "2026-10", &successes, &failures_count) != -1) {
+        fprintf(stderr, "the recent month was archived\n");
+        failures++;
+    }
+    st_storage_connection_stat stats[8];
+    size_t stat_count = 0;
+    if (st_storage_list_connection_stats(path, "ArchiveClient", 100, stats, 8, &stat_count) != 0
+        || stat_count != 3U
+        || strcmp(stats[0].month, "2026-08") != 0 || strcmp(stats[1].month, "2026-07") != 0
+        || strcmp(stats[2].month, "2026-06") != 0
+        || stats[2].total != 3 || stats[2].success != 2 || stats[2].failure != 1
+        || stats[1].total != 1 || stats[1].success != 1 || stats[1].failure != 0) {
+        fprintf(stderr, "archived months mismatch (%zu rows)\n", stat_count);
+        failures++;
+    }
+    /* Two months later the rest of August ages out and is added to the August total. */
+    if (st_storage_archive_expired_connections(path, 60, now + 61LL * 86400LL) != 0
+        || st_storage_load_connection_stat(path, "ArchiveClient", "2026-08", &successes, &failures_count) != 0
+        || successes != 1 || failures_count != 1
+        || query_int(path, "SELECT COUNT(*) FROM connection_record") != 0) {
+        fprintf(stderr, "a later run did not add to the month already archived\n");
+        failures++;
+    }
+    unlink(path);
+    return failures;
+}
+
 int main(void)
 {
     if (test_peer_mesh_acl_direction_migration() != 0) {
+        return 1;
+    }
+    if (test_peer_service_discovery_migration() != 0) {
+        return 1;
+    }
+    if (test_connection_archive_window() != 0) {
         return 1;
     }
     if (test_client_session_lifecycle_queries() != 0) {
