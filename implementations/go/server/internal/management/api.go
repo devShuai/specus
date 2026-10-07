@@ -1481,6 +1481,10 @@ func (a *API) handleCreateSpecus(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            now,
 		UpdatedAt:            now,
 	}
+	if err := a.requireNatControlFits(r.Context(), account.ID, &mapping, nil); err != nil {
+		a.fail(w, err)
+		return
+	}
 	if err := a.db.InsertSpecus(r.Context(), mapping); err != nil {
 		a.fail(w, err)
 		return
@@ -1532,6 +1536,10 @@ func (a *API) handleUpdateSpecus(w http.ResponseWriter, r *http.Request) {
 	mapping.Enabled = boolOr(req.Enabled, mapping.Enabled)
 	mapping.DetailCaptureEnabled = boolOr(req.DetailCaptureEnabled, mapping.DetailCaptureEnabled)
 	mapping.UpdatedAt = time.Now()
+	if err := a.requireNatControlFits(r.Context(), mapping.ClientID, mapping, nil); err != nil {
+		a.fail(w, err)
+		return
+	}
 	if err := a.db.UpdateSpecus(r.Context(), *mapping); err != nil {
 		a.fail(w, err)
 		return
@@ -1685,6 +1693,10 @@ func (a *API) handleCreateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	if err := a.requireNatControlFits(r.Context(), account.ID, nil, &mapping); err != nil {
+		a.fail(w, err)
+		return
+	}
 	if err := a.db.InsertHTTPRouteAudited(r.Context(), mapping, principal.Username, a.shareNow(),
 		routeExposure(mapping)); err != nil {
 		a.fail(w, err)
@@ -1744,6 +1756,10 @@ func (a *API) handleUpdateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mapping.UpdatedAt = time.Now()
+	if err := a.requireNatControlFits(r.Context(), mapping.ClientID, nil, mapping); err != nil {
+		a.fail(w, err)
+		return
+	}
 	// A route that stops being protected ends its shares in the same transaction; exposure and
 	// credential changes are audited with it.
 	revoked, err := a.db.UpdateHTTPRouteAudited(r.Context(), *mapping, routeChange(before, *mapping, req),
@@ -2645,6 +2661,22 @@ func (a *API) handlePeerMeshCloseSessions(w http.ResponseWriter, r *http.Request
 }
 
 // ---- helpers -------------------------------------------------------------------------
+
+// requireNatControlFits refuses, as a validation error, a change that leaves the mapping or route
+// enabled when the client's NAT_CONTROL would then no longer fit one MESSAGE. A change that leaves
+// the entry disabled only shrinks the message and is never refused. See "NAT_CONTROL 的大小" in
+// protocol/spec/control-protocol.md.
+func (a *API) requireNatControlFits(ctx context.Context, clientID int64, mapping *store.SpecusMapping,
+	route *store.HTTPRouteMapping) error {
+	if (mapping != nil && !mapping.Enabled) || (route != nil && !route.Enabled) {
+		return nil
+	}
+	err := a.natControl.CheckFits(ctx, clientID, mapping, route)
+	if errors.Is(err, nat.ErrNatControlTooLarge) {
+		return validation(err.Error())
+	}
+	return err
+}
 
 func (a *API) pushNatControl(ctx context.Context, clientID int64, clientName string) {
 	pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

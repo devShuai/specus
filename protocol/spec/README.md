@@ -9,7 +9,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 
 | 文档 | 说明 |
 | --- | --- |
-| [control-protocol.md](control-protocol.md) | 控制连接二进制帧、`Command`、`MessageType`、`NAT_MESSAGE`、心跳和 `NAT_CONTROL` |
+| [control-protocol.md](control-protocol.md) | 控制连接二进制帧、`Command`、`MessageType`、`NAT_MESSAGE`、心跳和 `NAT_CONTROL`（含管理接口如何守住它的 1 MiB 上限） |
 | [client-auth.md](client-auth.md) | 客户端启动 HTTP 登录、apiKey/secret 签名、运行时 token 和刷新机制 |
 | [http-route.md](http-route.md) | HTTP route 直转语义、WebSocket 隧道、Header 透传、响应改写和流量观测 |
 | [peer-mesh.md](peer-mesh.md) | Peer Mesh 私有组网、虚拟 IP、信令、标准 STUN/TURN 子集、加密数据帧和管理面 |
