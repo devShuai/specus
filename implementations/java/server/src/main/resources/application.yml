@@ -30,11 +30,7 @@ spring:
       hibernate.jdbc.batch_size: ${SPECUS_DB_BATCH_SIZE:50}
       hibernate.order_inserts: true
       hibernate.order_updates: true
-      # ddl-auto=update reads the existing schema at startup. The default (grouped) strategy calls
-      # getColumns for every table at once, which sqlite-jdbc builds as one compound SELECT with a
-      # term per column; SQLite caps those at 500 terms, so a restart fails once the schema grows
-      # past that. Reading table by table keeps each query to a single table's columns.
-      hibernate.hbm2ddl.jdbc_metadata_extraction_strategy: individually
+      # SQLite reads schema metadata table by table: see SqliteSchemaMetadataConfig.
   task:
     scheduling:
       # S1.4: flushHttp/flushTcp are separate @Scheduled methods; the default pool size 1
