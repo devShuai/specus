@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -2562,6 +2563,8 @@ static char *read_file(const char *path)
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    /* The in-process admin server can still be writing to a socket the test has closed. */
+    (void)signal(SIGPIPE, SIG_IGN);
     setenv("SPECUS_ENV", "test", 1);
     setenv("SPECUS_AUTH_JWT_SECRET", "c-http-share-test-secret", 1);
     /* "admin" is a stored user of the vector's world, so the built-in admin goes by another name. */

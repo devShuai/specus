@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -995,6 +996,8 @@ static int test_catalogue_mutations(void)
 
 int main(void)
 {
+    /* The in-process admin server can still be writing to a socket the test has closed. */
+    (void)signal(SIGPIPE, SIG_IGN);
     setenv("SPECUS_ENV", "test", 1);
     setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
     /* Generous by default; test_rate_limits sets its own budget. */

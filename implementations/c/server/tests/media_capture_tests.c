@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1417,6 +1418,8 @@ static int login(void)
 
 int main(void)
 {
+    /* The in-process admin server can still be writing to a socket the test has closed. */
+    (void)signal(SIGPIPE, SIG_IGN);
     unsetenv("SPECUS_MEDIA_CAPTURE_ENABLED");
     if (st_media_capture_validate_current() != 0 || st_media_capture_ready_current()) {
         fprintf(stderr, "disabled media capture initialization mismatch\n");
