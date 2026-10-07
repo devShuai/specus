@@ -96,9 +96,9 @@ func (s *ControlService) buildMessage(clientName string, mappings []store.Specus
 	} else {
 		bean["remoteAddress"] = nil
 	}
-	// The HTTP route list is always the full set, even when empty: a client keeps the list it
-	// has when the field is missing, so omitting it after the last route was deleted left that
-	// route forwarding on the client until it reconnected.
+	// The HTTP route list is always the full set, even when empty: older clients keep the list
+	// they have when the field is missing, so omitting it after the last route was deleted left
+	// that route forwarding on the client until it reconnected.
 	httpList := make([]map[string]any, 0, len(httpRoutes))
 	for _, route := range httpRoutes {
 		httpList = append(httpList, map[string]any{
