@@ -40,14 +40,10 @@ public sealed class NatControlService
             return;
         }
 
+        // Always the full snapshot, empty lists included: a client that reconnects with its access
+        // token gets no new HTTP login snapshot, so if its last route was deleted while it was
+        // offline, this push is the only way it learns to stop forwarding that route.
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
-
-        // Nothing to push beyond the empty snapshot the HTTP login response already carried.
-        if (mappings.Count == 0 && httpRoutes.Count == 0)
-        {
-            return;
-        }
-
         if (await SendNatControlAsync(clientName, mappings, httpRoutes, cancellationToken)
                 .ConfigureAwait(false))
         {
@@ -138,9 +134,9 @@ public sealed class NatControlService
             ["specusConfigList"] = specusConfigList,
         };
 
-        // The HTTP route list is always the full set, even when empty: a client keeps the list it
-        // has when the field is missing, so omitting it after the last route was deleted left that
-        // route forwarding on the client until it reconnected.
+        // The HTTP route list is always the full set, even when empty: older clients keep the list
+        // they have when the field is missing, so omitting it after the last route was deleted left
+        // that route forwarding on the client until it reconnected.
         var httpSpecusConfigList = new List<Dictionary<string, object?>>(httpRoutes.Count);
         foreach (var route in httpRoutes)
         {

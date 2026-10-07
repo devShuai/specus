@@ -107,9 +107,13 @@ type ClientMessage struct {
 	Message        string
 }
 
+// natControlConfig is the client's full configuration snapshot. Both lists replace the current
+// ones; a missing or null httpSpecusConfigList means "no routes", because routes only ever come
+// from the server (HTTP login snapshot and NAT_CONTROL) and an older server omitted the field after
+// the last route was deleted.
 type natControlConfig struct {
-	SpecusConfigList     []SpecusConfig      `json:"specusConfigList"`
-	HTTPSpecusConfigList *[]HTTPSpecusConfig `json:"httpSpecusConfigList"`
+	SpecusConfigList     []SpecusConfig     `json:"specusConfigList"`
+	HTTPSpecusConfigList []HTTPSpecusConfig `json:"httpSpecusConfigList"`
 }
 
 type controlLoginAction int
@@ -657,9 +661,7 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 	if dataConnection != nil {
 		client.syncSpecusConfigs(dataConnection, config.SpecusConfigList)
 	}
-	if config.HTTPSpecusConfigList != nil {
-		client.syncHTTPSpecusConfigs(*config.HTTPSpecusConfigList)
-	}
+	client.syncHTTPSpecusConfigs(config.HTTPSpecusConfigList)
 	return nil
 }
 

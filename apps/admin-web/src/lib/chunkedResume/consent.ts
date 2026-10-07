@@ -30,6 +30,11 @@ export interface ConsentInput {
   sizeBytes: number;
   /** Records still counted against the partial-data quota (not expired, failed, cancelled or saved). */
   livePartials: readonly { sizeBytes: number; receivedBytes: number }[];
+  /**
+   * Unfinished memory-mode receives of this page (RECEIVING or INTERRUPTED). Counted on their own:
+   * they hold chunks in the tab, not on disk, and completed ones have dropped theirs.
+   */
+  memoryPartials: number;
   senderAllowed: boolean;
   transferIdInUse: boolean;
 }
@@ -42,8 +47,13 @@ export function decideConsent(input: ConsentInput): ConsentDecision {
   if (input.transferIdInUse) {
     return { decision: "REJECT", code: "TRANSFER_ID_IN_USE" };
   }
+  // Memory mode keeps an interrupted transfer's chunks for in-session retry, so it has a cap too.
+  const memoryFull = input.memoryPartials >= MAX_STORED_PARTIALS;
   // Auto-accept never writes to disk: only memory mode is allowed without a click.
   if (policy.autoAccept && sizeBytes <= MEMORY_LIMIT_BYTES) {
+    if (memoryFull) {
+      return { decision: "REJECT", code: "TOO_MANY_PARTIALS" };
+    }
     return { decision: "AUTO_ACCEPT_MEMORY" };
   }
   let reason: MemoryReason;
@@ -61,6 +71,9 @@ export function decideConsent(input: ConsentInput): ConsentDecision {
     return { decision: "PROMPT_PERSISTENT" };
   }
   if (sizeBytes <= MEMORY_LIMIT_BYTES) {
+    if (memoryFull) {
+      return { decision: "REJECT", code: "TOO_MANY_PARTIALS" };
+    }
     return { decision: "PROMPT_MEMORY", memoryReason: reason };
   }
   return { decision: "REJECT", code: reason };

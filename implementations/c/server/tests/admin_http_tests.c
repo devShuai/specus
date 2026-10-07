@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -500,6 +501,9 @@ typedef struct {
     char http_relative_path[256];
     char ws_relative_path[256];
     char http_body[256];
+    /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
+    char http_browser_headers[512];
+    char ws_browser_headers[512];
 } route_auth_test_context;
 
 #define ROUTE_RESET_REASON \
@@ -548,7 +552,30 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->http_relative_path[0] = '\0';
     context->ws_relative_path[0] = '\0';
     context->http_body[0] = '\0';
+    context->http_browser_headers[0] = '\0';
+    context->ws_browser_headers[0] = '\0';
     pthread_mutex_unlock(&context->lock);
+}
+
+static void route_auth_test_capture_browser_headers(char *const *headers,
+                                                    size_t headers_len,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    size_t used = 0U;
+    out[0] = '\0';
+    for (size_t i = 0; i < headers_len; ++i) {
+        if (headers[i] == NULL
+            || (strncasecmp(headers[i], "Origin:", 7U) != 0 && strncasecmp(headers[i], "Referer:", 8U) != 0
+                && strncasecmp(headers[i], "Sec-Fetch-Site:", 15U) != 0)) {
+            continue;
+        }
+        int written = snprintf(out + used, out_len - used, "%s%s", used == 0U ? "" : "|", headers[i]);
+        if (written < 0 || (size_t)written >= out_len - used) {
+            return;
+        }
+        used += (size_t)written;
+    }
 }
 
 static int route_auth_test_context_matches(route_auth_test_context *context,
@@ -632,6 +659,9 @@ static int route_auth_http_forwarder(void *ctx,
              "%.*s",
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->http_browser_headers,
+                                            sizeof(context->http_browser_headers));
     pthread_mutex_unlock(&context->lock);
     if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
         /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
@@ -664,6 +694,9 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_relative_path),
              "%s",
              request->relative_path == NULL ? "" : request->relative_path);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->ws_browser_headers,
+                                            sizeof(context->ws_browser_headers));
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -3027,6 +3060,99 @@ static int test_tenant_scoped_admin_mutations(void)
     return failed ? 1 : 0;
 }
 
+/* "name|reason" of each client the management API asked to close in the last call. */
+static char client_close_calls[4][160];
+static size_t client_close_call_count = 0U;
+
+static int record_client_close(void *ctx, const char *client_name, const char *reason)
+{
+    (void)ctx;
+    if (client_close_call_count < sizeof(client_close_calls) / sizeof(client_close_calls[0])) {
+        snprintf(client_close_calls[client_close_call_count], sizeof(client_close_calls[0]), "%s|%s",
+                 client_name, reason);
+    }
+    ++client_close_call_count;
+    return 0;
+}
+
+/* One client mutation by tenant-a's administrator: its status and the one close it asks for, or none. */
+static int client_mutation_closes(const char *method, const char *path, const char *body, const char *status,
+                                  const char *expected_close, const char *label)
+{
+    char response[16384];
+    client_close_call_count = 0U;
+    int len = tenant_scope_call(method, path, "root-a", "tenant-a", "ADMIN", body, response, sizeof(response));
+    if (endpoint_expect(len, response, status, NULL, label) != 0) {
+        return -1;
+    }
+    int ok = expected_close == NULL
+        ? client_close_call_count == 0U
+        : client_close_call_count == 1U && strcmp(client_close_calls[0], expected_close) == 0;
+    if (!ok) {
+        fprintf(stderr, "%s: %zu close(s), the first %s; expected %s\n", label, client_close_call_count,
+                client_close_call_count > 0U ? client_close_calls[0] : "(none)",
+                expected_close == NULL ? "none" : expected_close);
+    }
+    return ok ? 0 : -1;
+}
+
+/*
+ * Disabling, renaming or deleting a client closes its online connections on the transitions Go's
+ * management API kicks on, with Go's reasons: disabled from enabled, or renamed while disabled
+ * (ADMIN_DISABLED), renamed (ADMIN_RENAMED), deleted (ADMIN_DELETED). The connections are named
+ * by the client's name before the change. Other updates and refused mutations close nothing.
+ */
+static int test_client_mutations_close_connections(void)
+{
+    char db_path[256];
+    char path[160];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-client-close-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-client-close-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client alpha;
+    st_storage_client foreign;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "close-alpha", "root-a", 1, 30, &alpha) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-b", "close-foreign", "root-b", 1, 30, &foreign) != 0;
+    if (failed) fprintf(stderr, "client close fixture setup failed\n");
+    st_admin_set_client_disconnect_handler(record_client_close, NULL);
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"connectionRateLimitPerMinute\":40}", "HTTP/1.1 200 ", NULL,
+                                  "rate limit change") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_DISABLED", "disable") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ", NULL,
+                                  "disable an already disabled client") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":true}", "HTTP/1.1 200 ", NULL, "enable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-2\"}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_RENAMED", "rename") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-3\",\"enabled\":false}",
+                                  "HTTP/1.1 200 ", "close-alpha-2|ADMIN_DISABLED", "rename and disable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-4\"}", "HTTP/1.1 200 ",
+                                  "close-alpha-3|ADMIN_DISABLED", "rename while disabled") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", foreign.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 404 ", NULL,
+                                  "disable another tenant's client") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete another tenant's client") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 204 ", "close-alpha-4|ADMIN_DELETED", "delete") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete a deleted client") != 0;
+    st_admin_set_client_disconnect_handler(NULL, NULL);
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 /* The connectivity check device for the endpoint test: online and refused by its target, or offline. */
 static int connectivity_test_online;
 
@@ -3074,6 +3200,115 @@ static int connectivity_call(const char *path, const char *username, const char 
  * answer the same 404, the body is checked first, every answer is private and uncacheable, and a
  * result never names the target.
  */
+/*
+ * Java UserDiagramDocumentServiceTests: a cloud diagram is stored under the creating account's
+ * tenant and username, the list is scoped to the caller, and another account (another user of
+ * the same tenant, that tenant's administrator, another tenant's administrator) cannot read,
+ * overwrite or delete it: each attempt answers exactly like a document that does not exist, in
+ * whatever shape the request body comes.
+ */
+static int test_user_diagram_owner_scope(void)
+{
+    char db_path[256];
+    char path[96];
+    char response[32768];
+    char missing[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-diagram-scope-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-diagram-scope-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("alice", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("bob", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "diagram scope fixture setup failed\n");
+    /* "yjs-cloud-state", base64 */
+    int len = failed ? -1 : tenant_scope_call("POST", "/api/admin/diagrams", "alice", "tenant-a", "USER",
+                                              "{\"name\":\"架构图\",\"update\":\"eWpzLWNsb3VkLXN0YXRl\"}",
+                                              response, sizeof(response));
+    long long id = 0;
+    if (!failed) {
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"name\":\"架构图\"", "diagram create") != 0
+            || st_json_get_i64(strstr(response, "\r\n\r\n") + 4, "id", &id) != 0 || id <= 0;
+    }
+    if (!failed) {
+        st_storage_user_diagram stored;
+        failed = st_storage_get_user_diagram(db_path, id, "tenant-a", "alice", &stored) != 0;
+        if (!failed) {
+            failed = strcmp(stored.tenant_id, "tenant-a") != 0 || strcmp(stored.owner_username, "alice") != 0
+                || stored.snapshot_len != 15U || memcmp(stored.snapshot_data, "yjs-cloud-state", 15U) != 0;
+            st_storage_user_diagram_free(&stored);
+        }
+        if (failed) fprintf(stderr, "the diagram was not stored under the creating account\n");
+    }
+    static const struct {
+        const char *username;
+        const char *tenant;
+        const char *role;
+    } others[] = {
+        {"bob", "tenant-a", "USER"}, {"root-a", "tenant-a", "ADMIN"}, {"root-b", "tenant-b", "ADMIN"}
+    };
+    static const struct {
+        const char *method;
+        const char *body;
+    } attempts[] = {
+        {"GET", NULL},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\",\"revision\":0}"},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\"}"},
+        {"PUT", "{\"name\":\"\",\"update\":\"not base64\",\"revision\":0}"},
+        {"DELETE", NULL},
+    };
+    for (size_t who = 0; !failed && who < sizeof(others) / sizeof(others[0]); ++who) {
+        for (size_t i = 0; !failed && i < sizeof(attempts) / sizeof(attempts[0]); ++i) {
+            char label[160];
+            snprintf(label, sizeof(label), "%s %s of another account's diagram as %s/%s",
+                     attempts[i].method, attempts[i].body == NULL ? "" : attempts[i].body,
+                     others[who].tenant, others[who].username);
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+            len = tenant_scope_call(attempts[i].method, path, others[who].username, others[who].tenant,
+                                    others[who].role, attempts[i].body, response, sizeof(response));
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id + 1000);
+            int missing_len = tenant_scope_call(attempts[i].method, path, others[who].username,
+                                                others[who].tenant, others[who].role, attempts[i].body,
+                                                missing, sizeof(missing));
+            failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "{\"error\":\"diagram not found\"}", label) != 0
+                || missing_len != len || strcmp(response, missing) != 0;
+            if (failed) fprintf(stderr, "%s: did not answer like a missing diagram: %s\n", label, missing);
+        }
+        if (!failed) {
+            len = tenant_scope_call("GET", "/api/admin/diagrams", others[who].username, others[who].tenant,
+                                    others[who].role, NULL, response, sizeof(response));
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "another account's diagram list") != 0
+                || strcmp(strstr(response, "\r\n\r\n") + 4, "[]") != 0;
+            if (failed) fprintf(stderr, "another account listed a diagram: %s\n", response);
+        }
+    }
+    /* The owner still has the untouched document, and a stale revision cannot overwrite it. */
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+        len = tenant_scope_call("GET", path, "alice", "tenant-a", "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"update\":\"eWpzLWNsb3VkLXN0YXRl\"",
+                                 "owner diagram detail") != 0
+            || !contains(response, "\"name\":\"架构图\"") || !contains(response, "\"revision\":0");
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/diagrams", "alice", "tenant-a", "USER", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"name\":\"架构图\"", "owner diagram list") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "alice", "tenant-a", "USER",
+                                "{\"name\":\"架构图\",\"update\":\"AQ==\",\"revision\":2}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "stale diagram revision") != 0;
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 static int test_connectivity_check_endpoint(void)
 {
     char db_path[256];
@@ -3172,6 +3407,22 @@ static int test_connectivity_check_endpoint(void)
     (void)bravo;
     (void)charlie;
     return failed ? 1 : 0;
+}
+
+static long long route_auth_exchange_count(const char *database_path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long count = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = 'api'", -1,
+                              &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return count;
 }
 
 static int route_auth_detail_is_sanitized(const char *database_path)
@@ -3388,6 +3639,26 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* TrafficInspectionServiceTests: the route's detailCaptureEnabled is on, but without
+     * SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED (Java's capture-detail-enabled, default false) nothing
+     * is captured. */
+    long long captured_before = route_auth_exchange_count(database_path);
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    int uncaptured = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    if (uncaptured != 0 || !contains(response, "200 OK") || captured_before < 0
+        || route_auth_exchange_count(database_path) != captured_before) {
+        fprintf(stderr, "HTTP detail captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
     snprintf(request,
              sizeof(request),
              "GET %s HTTP/1.1\r\nHost: localhost\r\n"
@@ -3400,6 +3671,7 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !contains(response, "forwarded")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
         || context.normalized_accept_encoding_headers != 1
+        || route_auth_exchange_count(database_path) != captured_before + 1
         || route_auth_detail_is_sanitized(database_path) != 0) {
         fprintf(stderr, "protected route successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
@@ -3422,6 +3694,34 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")
         || !route_auth_test_paths_match(&context, "/items/a+b/c%20d/%E4%BD%A0/x%2Fy", "")) {
         fprintf(stderr, "direct HTTP raw path or query brace encoding mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    /* Java UpstreamBrowserHeaders: the device sees the browser's Origin and Referer moved onto the
+     * route target's origin (https://example.com here) and cross-site fetch metadata as
+     * same-origin, so the target's own CSRF fences accept the request. */
+    static const char browser_headers[] =
+        "Origin: https://specus.example\r\n"
+        "Referer: https://specus.example/http/C%20managed%202/api/page?x=1\r\n"
+        "Sec-Fetch-Site: cross-site\r\n";
+    static const char rewritten_browser_headers[] =
+        "Origin:https://example.com|Referer:https://example.com/http/C%20managed%202/api/page?x=1"
+        "|Sec-Fetch-Site:same-origin";
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)
+        || strcmp(context.http_browser_headers, rewritten_browser_headers) != 0) {
+        fprintf(stderr, "direct HTTP browser headers were not moved onto the route target: %s\n",
+                context.http_browser_headers);
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
         return 1;
@@ -3519,14 +3819,16 @@ static int test_direct_http_route_authentication(const char *database_path)
              "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
-             protected_path);
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
         || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
-        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")
+        || strcmp(context.ws_browser_headers, rewritten_browser_headers) != 0) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
@@ -4799,7 +5101,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/public/client-packages/%d/download", hosted_package_id);
     int download_handled = st_client_package_send_download(
-        package_sockets[0], "GET", request_path, db_path, "198.51.100.40");
+        package_sockets[0], "GET", request_path, db_path, "198.51.100.40", NULL, NULL);
     shutdown(package_sockets[0], SHUT_WR);
     char package_response[4096];
     ssize_t package_response_len = recv(package_sockets[1], package_response,
@@ -5619,7 +5921,10 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
+    int route_authentication_failed = test_log_safe_reason() != 0
+        || test_direct_http_route_authentication(db_path) != 0;
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    if (route_authentication_failed) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -5801,7 +6106,7 @@ int main(void)
                                   sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed 2\"")
-        || !contains(response, "\"month\":\"2026-06-20\"")
+        || !contains(response, "\"month\":\"2026-06\"")
         || !contains(response, "\"total\":1")
         || !contains(response, "\"success\":1")
         || !contains(response, "\"failure\":0")
@@ -6081,15 +6386,45 @@ int main(void)
         fprintf(stderr, "traffic detail seed failed\n");
         return 1;
     }
+    /* HttpTrafficExchangeStoreTests: a page of summaries carries no headers and no previews. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"method\":\"POST\"")
         || !contains(response, "\"statusCode\":201")
         || !contains(response, "\"responseBodyType\":\"json\"")
-        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"requestHeaders\":null,\"responseHeaders\":null,\"requestPreviewHex\":null,"
+                               "\"requestPreviewText\":null,\"responsePreviewHex\":null,\"responsePreviewText\":null")
+        || contains(response, "\"requestHeaders\":\"") || contains(response, "\"responseHeaders\":\"")
+        || contains(response, "\"requestPreviewHex\":\"") || contains(response, "\"requestPreviewText\":\"")
+        || contains(response, "\"responsePreviewHex\":\"") || contains(response, "\"responsePreviewText\":\"")
         || !contains(response, "\"size\":20")
         || !contains(response, "\"totalPages\":1")) {
-        fprintf(stderr, "http exchange page response mismatch\n");
+        fprintf(stderr, "http exchange page response mismatch: %.2000s\n", response);
+        return 1;
+    }
+    /* The detail of one exchange carries them, with Java's uppercase spaced hex. */
+    long long post_exchange_id = 0;
+    {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT id FROM specus_http_traffic_exchange WHERE method='POST'", -1, &stmt,
+                                  NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            post_exchange_id = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/traffic/http-exchanges/%lld", post_exchange_id);
+    len = st_admin_build_response("GET", request_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"requestHeaders\":\"Content-Type: application/json\"")
+        || !contains(response, "\"requestPreviewHex\":\"7B 22 68 65 6C 6C 6F 22 3A 74 72 75 65 7D\"")
+        || !contains(response, "\"requestPreviewText\":\"{\\\"hello\\\":true}\"")
+        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"responseTruncated\":false")) {
+        fprintf(stderr, "http exchange detail response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=method&q=POST&page=0&size=20", response, sizeof(response));
@@ -6384,6 +6719,12 @@ int main(void)
         return 1;
     }
     if (test_tenant_scoped_admin_mutations() != 0) {
+        return 1;
+    }
+    if (test_user_diagram_owner_scope() != 0) {
+        return 1;
+    }
+    if (test_client_mutations_close_connections() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");

@@ -53,11 +53,15 @@ typedef struct {
 } oidc_jws;
 
 /*
- * One JWK Set for the process, like Java's single decoder bean. The lock is held across a fetch,
- * as Spring's JWK source holds its own, so concurrent misses wait for one request instead of each
- * issuing their own.
+ * One JWK Set for the process, like Java's single decoder bean. A fetch runs without the lock:
+ * a token a cached key verifies never waits for the identity provider, however slow it is, while
+ * concurrent misses wait for the one fetch in flight instead of each issuing their own.
+ * oidc_jwks_generation discards a fetch that a reset or a new JWK Set URI overtook.
  */
 static pthread_mutex_t oidc_jwks_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t oidc_jwks_fetch_done = PTHREAD_COND_INITIALIZER;
+static int oidc_jwks_fetching;
+static unsigned long long oidc_jwks_generation;
 static oidc_jwk_set oidc_jwks;
 static char *oidc_jwks_uri;
 static int oidc_jwks_loaded;
@@ -517,6 +521,7 @@ static long long oidc_monotonic_ms(void)
 
 static void oidc_jwks_reset_locked(void)
 {
+    ++oidc_jwks_generation;
     oidc_jwk_set_clear(&oidc_jwks);
     free(oidc_jwks_uri);
     oidc_jwks_uri = NULL;
@@ -531,11 +536,26 @@ static int oidc_jwks_may_fetch_locked(void)
     return !oidc_jwks_attempted || oidc_monotonic_ms() - oidc_jwks_attempted_ms >= oidc_jwks_cooldown_ms;
 }
 
-/* The cached set is replaced only by a fetch that yields usable keys. */
+/*
+ * Called with the lock held and no fetch in flight; releases the lock for the request itself and
+ * holds it again on return. The cached set is replaced only by a fetch that yields usable keys.
+ */
 static void oidc_jwks_refresh_locked(const char *uri)
 {
+    unsigned long long generation = oidc_jwks_generation;
+    oidc_jwks_fetching = 1;
+    pthread_mutex_unlock(&oidc_jwks_lock);
     oidc_jwk_set fresh;
     int rc = oidc_jwk_set_fetch(uri, &fresh);
+    pthread_mutex_lock(&oidc_jwks_lock);
+    oidc_jwks_fetching = 0;
+    pthread_cond_broadcast(&oidc_jwks_fetch_done);
+    if (generation != oidc_jwks_generation) {
+        if (rc == 0) {
+            oidc_jwk_set_clear(&fresh);
+        }
+        return;
+    }
     /* Spacing counts from completion, so a slow identity provider still gets a full pause. */
     oidc_jwks_attempted = 1;
     oidc_jwks_attempted_ms = oidc_monotonic_ms();
@@ -600,15 +620,23 @@ static int oidc_verify_signature(const char *uri, const oidc_jws *jws, const cha
         oidc_jwk_set_clear(&oidc_jwks);
         oidc_jwks_loaded = 0;
     }
-    int fetched = 0;
-    if (!oidc_jwks_loaded && oidc_jwks_may_fetch_locked()) {
-        oidc_jwks_refresh_locked(uri);
-        fetched = 1;
-    }
-    int verified = oidc_jwks_verify_locked(jws, kid, kid_present);
-    if (!verified && !fetched && oidc_jwks_may_fetch_locked()) {
-        oidc_jwks_refresh_locked(uri);
+    int verified = 0;
+    for (int fetched = 0;;) {
         verified = oidc_jwks_verify_locked(jws, kid, kid_present);
+        if (verified || fetched) {
+            break;
+        }
+        if (oidc_jwks_fetching) {
+            /* Someone else is fetching: their result is the one this token gets. */
+            while (oidc_jwks_fetching) {
+                pthread_cond_wait(&oidc_jwks_fetch_done, &oidc_jwks_lock);
+            }
+        } else if (oidc_jwks_may_fetch_locked()) {
+            oidc_jwks_refresh_locked(uri);
+        } else {
+            break;
+        }
+        fetched = 1;
     }
     pthread_mutex_unlock(&oidc_jwks_lock);
     return verified;

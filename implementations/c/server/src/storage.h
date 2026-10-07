@@ -464,6 +464,9 @@ typedef struct {
     size_t request_body_len;
     const uint8_t *response_body;
     size_t response_body_len;
+    /* Content-Encoding of each body (NULL: identity); the text previews show the decoded body. */
+    const char *request_content_encoding;
+    const char *response_content_encoding;
     const char *captured_at;
 } st_storage_http_exchange_record;
 
@@ -929,7 +932,15 @@ int st_storage_list_connections_visible(const char *path,
                                         size_t max_connections,
                                         size_t *connection_count,
                                         long long *total_count);
+/* Rolls detail rows connected before the timestamp into monthly connection_stat rows, then deletes them. */
 int st_storage_archive_connections(const char *path, const char *before_timestamp);
+/*
+ * The "yyyy-MM-dd" UTC date retention_days before now (Java's archive cutoff); -1 when
+ * retention_days <= 0.
+ */
+int st_storage_connection_archive_cutoff(int retention_days, long long now_epoch_seconds, char out[11]);
+/* Java ConnectionArchiveService.archive: nothing when retention_days <= 0. */
+int st_storage_archive_expired_connections(const char *path, int retention_days, long long now_epoch_seconds);
 int st_storage_load_connection_stat(const char *path,
                                     const char *client_name,
                                     const char *stat_date,
@@ -1181,6 +1192,11 @@ int st_storage_list_peer_mesh_service_audits(const char *path,
                                              size_t max_events,
                                              size_t *event_count);
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record);
+/*
+ * A page of exchange summaries: as Java's summary views, the headers and the request/response
+ * previews are neither read nor returned (left empty); st_storage_get_http_exchange_visible
+ * reads one exchange with them.
+ */
 int st_storage_list_http_exchanges_visible(const char *path,
                                            long long client_id,
                                            const char *route,
@@ -1196,6 +1212,13 @@ int st_storage_list_http_exchanges_visible(const char *path,
                                            size_t max_items,
                                            size_t *item_count,
                                            long long *total_count);
+int st_storage_get_http_exchange_visible(const char *path,
+                                         long long exchange_id,
+                                         const char *tenant_id,
+                                         const char *owner_username,
+                                         int include_all_clients,
+                                         st_storage_http_exchange *item,
+                                         int *found);
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record);
 int st_storage_list_tcp_frames_visible(const char *path,
                                        long long client_id,
@@ -1351,6 +1374,8 @@ typedef struct {
     long long client_id;
     char client_name[256];
     char route_name[128];
+    /* The route's target; the browser headers relayed through the share take its origin. */
+    char target_base_url[512];
     int path_rewrite_enabled;
     /* Only for an active share: why its route, client or creator no longer allows it, else NULL. */
     const char *lapse_reason;

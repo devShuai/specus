@@ -46,7 +46,9 @@ add_library(specus_c_core
     src/stream_tombstones.c
     src/stun_turn.c
     src/tls_transport.c
+    src/traffic_capture.c
     src/turn_auth.c
+    src/upstream_browser_headers.c
     src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
@@ -76,10 +78,36 @@ target_link_libraries(specus_c_github_release_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_github_release_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME github_release_tests COMMAND specus_c_github_release_tests)
 
+# The client catalogue and hosted packages against the Java ClientDownloadLink*/ClientPackage* tests.
+add_executable(specus_c_client_package_tests tests/client_package_tests.c)
+target_link_libraries(specus_c_client_package_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_package_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_package_tests COMMAND specus_c_client_package_tests)
+
 add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_address_tests COMMAND specus_c_client_address_tests)
+
+add_executable(specus_c_semantic_version_tests tests/semantic_version_tests.c)
+target_link_libraries(specus_c_semantic_version_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_semantic_version_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME semantic_version_tests COMMAND specus_c_semantic_version_tests)
+
+add_executable(specus_c_traffic_capture_tests tests/traffic_capture_tests.c)
+target_link_libraries(specus_c_traffic_capture_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_capture_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_capture_tests COMMAND specus_c_traffic_capture_tests)
+
+add_executable(specus_c_turnstile_verifier_tests tests/turnstile_verifier_tests.c)
+target_link_libraries(specus_c_turnstile_verifier_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_turnstile_verifier_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME turnstile_verifier_tests COMMAND specus_c_turnstile_verifier_tests)
+
+add_executable(specus_c_upstream_browser_headers_tests tests/upstream_browser_headers_tests.c)
+target_link_libraries(specus_c_upstream_browser_headers_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_upstream_browser_headers_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME upstream_browser_headers_tests COMMAND specus_c_upstream_browser_headers_tests)
 
 add_executable(specus_c_client_auth_nonce_tests tests/client_auth_nonce_tests.c)
 target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)
@@ -221,6 +249,23 @@ target_compile_options(specus_c_session_lifecycle_tests PRIVATE -Wall -Wextra -W
 add_test(NAME session_lifecycle_tests
     COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
+
+# Java ConnectionArchiveServiceTests on a real server process: the scheduled monthly archive.
+add_executable(specus_c_connection_archive_tests tests/connection_archive_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connection_archive_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connection_archive_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connection_archive_tests
+    COMMAND specus_c_connection_archive_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connection_archive_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_http_route_lifecycle_tests tests/http_route_lifecycle_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_route_lifecycle_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_route_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_route_lifecycle_tests PRIVATE
+    ST_ROUTE_LIFECYCLE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/http-route-lifecycle-v1.json")
+add_test(NAME http_route_lifecycle_tests
+    COMMAND specus_c_http_route_lifecycle_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_route_lifecycle_tests PROPERTIES TIMEOUT 180)
 
 add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)

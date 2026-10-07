@@ -22,7 +22,16 @@ import (
 func fakeForwardingClient(t *testing.T, dataConn net.Conn, dataReader *bufio.Reader) *atomic.Int32 {
 	t.Helper()
 	var opened atomic.Int32
+	serveFakeForwardingClient(dataConn, dataReader, &opened)
+	return &opened
+}
+
+// serveFakeForwardingClient runs the fake client on the data channel, adding every HTTP OPEN to
+// opened. The returned channel closes once the data channel can no longer be read.
+func serveFakeForwardingClient(dataConn net.Conn, dataReader *bufio.Reader, opened *atomic.Int32) <-chan struct{} {
+	closed := make(chan struct{})
 	go func() {
+		defer close(closed)
 		for {
 			packet, err := readProtocolPacket(dataReader)
 			if err != nil {
@@ -44,7 +53,7 @@ func fakeForwardingClient(t *testing.T, dataConn net.Conn, dataReader *bufio.Rea
 			_ = protocol.WritePacket(dataConn, protocol.NatMessage{Type: protocol.NatFin, StreamID: message.StreamID})
 		}
 	}()
-	return &opened
+	return closed
 }
 
 // awaitHTTPRouteListPush reads NAT_CONTROL pushes until one no longer lists the given route and

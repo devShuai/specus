@@ -128,6 +128,7 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_STUN_TURN_PORT` | `3478` | Built-in STUN/TURN UDP listen port and published URL port. |
 | `SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS` | unset | Optional comma-separated public STUN URLs appended to the discovery response; missing ports default to `3478` and duplicates are removed. |
 | `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | Whether the built-in TURN listener requires long-term credentials; also returned as `turnAuthRequired` by the public ICE response. |
+| `SPECUS_PEER_MESH_TURN_ALLOW_PRIVATE_PEERS` | `false` | C-only. By default general (public-transfer) TURN allocations may only reach public unicast peers, as Java/Go/.NET enforce: CreatePermission and ChannelBind to loopback, unspecified, link-local, private/site-local, multicast or IPv6 ULA addresses (IPv4-mapped forms included) or to port 0 get `403` and a `[peer-mesh][audit]` line on stderr. `true` lifts that policy for loopback or single-host test setups; never enable it on a public listener. Peer Mesh allocations are not subject to it. |
 | `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | unset | Shared secret used for temporary TURN HMAC-SHA1 credentials. When unset the process generates a random secret at startup, as Java does, so credentials issued before a restart stop working. |
 | `SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | Temporary public-transfer TURN credential lifetime, clamped to at least 60 seconds. |
 | `SPECUS_PEER_MESH_CIDR` | `100.96.0.0/11` | Virtual address pool advertised to Peer Mesh clients. |
@@ -152,8 +153,10 @@ Additional runtime knobs:
 | `SPECUS_MEDIA_CAPTURE_ENABLED` | `false` | Enables route-level media capture after its S3-compatible endpoint/bucket/credentials validate. |
 | `SPECUS_MEDIA_CAPTURE_ENDPOINT` / `REGION` / `BUCKET` | unset | Dedicated RustFS/S3-compatible media store. |
 | `SPECUS_ELASTICSEARCH_URIS` | unset | Enables Elasticsearch HTTP/TCP detail storage and management queries; unset keeps SQLite details. |
-| `SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY` | `data/client-packages` | Root for hosted client-package artifacts. |
+| `SPECUS_CLIENT_PACKAGE_DATA_DIRECTORY` | `./data` | Parent directory of hosted client-package artifacts; the bytes live in its `packages` child, as in Java. |
 | `SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED` | `true` | Merges validated official GitHub latest-release assets for targets without any configured row. |
+| `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` | `60` | Connection detail older than this many UTC days is rolled into monthly totals and deleted; `0` or less turns the archive off. |
+| `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` | Delay between archive runs; the first run comes one interval after start. |
 | `SPECUS_AUTH_REGISTRATION_ENABLED` | `false` | Enables `/auth/register`; optional SMTP verification and Turnstile use the `SPECUS_AUTH_EMAIL_*`, `SPECUS_AUTH_SMTP_*`, and `SPECUS_AUTH_TURNSTILE_*` groups. |
 | `SPECUS_OIDC_CLIENT_ID` | unset | OIDC browser client id. Non-blank marks OIDC as configured in `/oidc-config`; without it `/oidc/token` answers `503`. ID tokens must list it in `aud`, and `azp` must equal it when present or when `aud` has several entries. |
 | `SPECUS_OIDC_ISSUER` | `https://certus.devshuai.com` | Exact `iss` required of ID tokens and of identity-provider bearer tokens. Set but blank refuses every token, as Java does. |
@@ -236,7 +239,8 @@ The management API skeleton is enabled by setting `SPECUS_ADMIN_PORT`. It curren
 `GET/POST /api/admin/clients`, `PUT/DELETE /api/admin/clients/{id}`, startup credential endpoints
 `GET/POST /api/admin/client-credentials`, `PUT/DELETE /api/admin/client-credentials/{id}`,
 client package endpoints `GET /api/public/client-downloads`, `GET /api/public/client-version-check`,
-`GET/HEAD /api/public/client-packages/{id}/download`, `GET/POST /api/admin/client-downloads`,
+`GET/HEAD /api/public/client-packages/{id}/download` (byte ranges and `If-None-Match` as Spring serves a
+`Resource`), `GET/POST /api/admin/client-downloads`,
 `POST /api/admin/client-packages`, `POST /api/admin/client-downloads/{id}/latest`, and
 `PUT/DELETE /api/admin/client-downloads/{id}`,
 TCP mapping endpoints `GET /api/admin/specus-mappings`, `POST /api/admin/clients/{id}/specus-mappings`,
@@ -376,19 +380,29 @@ with missing `clientId`, `channelId`, `remoteAddress`, `disconnectedAt`, and dis
 fields represented as `null`.
 `GET /api/admin/connection-stats` follows Java's monthly archive view shape and returns an array of
 `id`, `clientId`, `clientName`, `month`, `total`, `success`, `failure`, and `updatedAt`. Existing
-archive rows without `client_id` or `updated_at` are returned with nullable fields.
+archive rows without `client_id` or `updated_at` are returned with nullable fields. The totals come
+from the background archive (Java `ConnectionArchiveService`): every
+`SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS`, detail older than `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS`
+UTC days is added to its client's `yyyy-MM` row and deleted in the same transaction.
 `GET /api/admin/traffic` and `GET /api/admin/traffic/resources` follow the Java summary view
 shapes for daily client traffic and per-resource traffic. When `SPECUS_DATABASE_PATH` is set, the
 C server records successful TCP specus bytes as `TCP_SPECUS` resources with keys such as
 `tcp:18080`, and successful Direct HTTP body bytes as `HTTP_ROUTE` resources with keys such as
 `http:api`.
 
-SQLite traffic detail capture is available when the corresponding TCP mapping or HTTP route has
-`detailCaptureEnabled=true`. TCP frames are written to `specus_tcp_traffic_frame` with the full
+SQLite traffic detail capture runs only when `SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true` (default
+`false`, as Java's `specus.traffic.capture-detail-enabled`) and the corresponding TCP mapping or
+HTTP route has `detailCaptureEnabled=true`. TCP frames are written to `specus_tcp_traffic_frame` with the full
 binary payload, canonical directions `PUBLIC_TO_CLIENT` / `CLIENT_TO_PUBLIC`, source and
 destination endpoint fields, per-channel stream offsets, and preview text/hex. HTTP exchanges are
 written to `specus_http_traffic_exchange` with request/response headers, body previews, status,
-content types, response body type, and elapsed time. The management endpoints
+content types, response body type, and elapsed time. Previews follow Java's
+`TrafficInspectionService`: `SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES` (default `256`, capped at
+`1024`) bytes as uppercase spaced hex, and for HTTP a text preview of the body decoded per
+`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. Unlike Java,
+the C server stores HTTP previews rather than whole bodies, so `requestTruncated` /
+`responseTruncated` say whether the preview holds the whole body. The exchange list returns
+summaries without headers or previews; `GET /api/admin/traffic/http-exchanges/{id}` returns them. The management endpoints
 `GET /api/admin/traffic/http-exchanges`, `GET /api/admin/traffic/tcp-frames`,
 `GET /api/admin/traffic/tcp-frames/{id}`, and `GET /api/admin/traffic/tcp-streams` now query these
 SQLite tables with the same basic tenant/owner visibility rule as other management APIs. HTTP
@@ -413,7 +427,10 @@ user instance limit, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`
   connection carries. A newer control or data login of the same client replaces the older
   connection instead of being refused (`REPLACED_BY_NEW_LOGIN`): a control login also closes the
   previous data connection, its NAT streams, pending Direct HTTP requests and public listeners, and
-  the previous session can no longer attach a data connection. A control connection that goes
+  the previous session can no longer attach a data connection. Disabling, renaming or deleting a
+  client through the management API closes its online control and data connections the same way,
+  recorded as `ADMIN_DISABLED`, `ADMIN_RENAMED` or `ADMIN_DELETED` as in Go, so no session keeps
+  serving a name or route set the server no longer has. A control connection that goes
   away closes the data connection of the same session; a data connection that goes away leaves its
   control alone, as in Java and Go. A dead peer is closed by
   `SPECUS_CONTROL_READ_IDLE_SECONDS` and stops counting as online. On `SIGTERM`/`SIGINT` the server
@@ -430,7 +447,11 @@ as client auth login, and count only the current management context's visible TC
 Requests under `/http/{clientName}/{route}/...` are recognized by the management listener and are
 forwarded to the active runtime session whose `clientName` matches the path and whose `route`
 exists in the configured HTTP route snapshot. Runtime sessions are indexed by client name, and
-each binds one control connection plus one data connection. Ordinary HTTP requests use NAT stream v2 on the authenticated
+each binds one control connection plus one data connection; a data connection that logged in as
+another account than the one whose route record let the request in (an account renamed away
+from that name, for instance) is answered as offline rather than used.
+`tests/http_route_lifecycle_tests.c` replays every server scenario of
+`protocol/test-vectors/http-route-lifecycle-v1.json` against a real server process. Ordinary HTTP requests use NAT stream v2 on the authenticated
 data connection: request/response metadata is carried once in `OPEN`, body bytes are streamed with
 `DATA`, and `FIN`, `RST`, and `WINDOW_UPDATE` propagate half-close, cancellation, and flow control.
 WebSocket upgrades use the same NAT stream and preserve frame semantics in the mandatory 12-byte
