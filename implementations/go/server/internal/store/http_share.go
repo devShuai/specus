@@ -281,8 +281,36 @@ func (db *DB) insertAudit(ctx context.Context, runner sqlRunner, entry HTTPAcces
 	return err
 }
 
+// httpRouteShareLockQuery holds a route row until the end of the transaction, or is "" where no
+// lock is needed: SQLite has no SELECT ... FOR UPDATE, and its single writer already serializes
+// the creation.
+func (db *DB) httpRouteShareLockQuery() string {
+	if db.dialect == DialectSQLite {
+		return ""
+	}
+	return db.rebind(`SELECT id FROM http_route_mapping WHERE id = ? FOR UPDATE`)
+}
+
+// lockHTTPRouteForShares serializes the share creations of one route, on every instance. It must
+// be the transaction's first statement: MySQL's REPEATABLE READ snapshot then starts only after
+// the lock is granted, so the count sees the share committed by the creation that held it. A
+// route that is gone has no row to lock, and the creation goes on as it would without the lock.
+func (db *DB) lockHTTPRouteForShares(ctx context.Context, tx *sql.Tx, routeID int64) error {
+	query := db.httpRouteShareLockQuery()
+	if query == "" {
+		return nil
+	}
+	var locked int64
+	if err := tx.QueryRowContext(ctx, query, routeID).Scan(&locked); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return nil
+}
+
 // InsertHTTPShare stores a new share with its share.created audit entry, unless the route already
-// has maxActive active shares at now. The count, the insert and the audit share one transaction.
+// has maxActive active shares at now. The count, the insert and the audit share one transaction,
+// which first locks the route row so that concurrent creations cannot all count the same total.
 func (db *DB) InsertHTTPShare(ctx context.Context, share HTTPShare, maxActive int, now int64,
 	audit HTTPAccessAuditEntry) error {
 	tx, err := db.sql.BeginTx(ctx, nil)
@@ -290,6 +318,9 @@ func (db *DB) InsertHTTPShare(ctx context.Context, share HTTPShare, maxActive in
 		return err
 	}
 	defer tx.Rollback()
+	if err := db.lockHTTPRouteForShares(ctx, tx, share.RouteID); err != nil {
+		return err
+	}
 	var active int
 	if err := tx.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM http_share
 		WHERE route_id = ? AND revoked_at IS NULL AND expires_at > ?`), share.RouteID, now).Scan(&active); err != nil {
