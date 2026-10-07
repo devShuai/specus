@@ -236,10 +236,11 @@ public class PeerServiceRuntimeTest {
 
     @Test
     public void onlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds() throws Exception {
-        int firstPublishedPort = freePort();
-        int secondPublishedPort = freePort();
-        try (ServerSocket firstTarget = listen(freePort());
-             ServerSocket secondTarget = listen(freePort())) {
+        int[] ports = freePorts(4);
+        int firstPublishedPort = ports[0];
+        int secondPublishedPort = ports[1];
+        try (ServerSocket firstTarget = listen(ports[2]);
+             ServerSocket secondTarget = listen(ports[3])) {
             firstTarget.setSoTimeout(5_000);
             secondTarget.setSoTimeout(5_000);
             runtime = newRuntime();
@@ -367,8 +368,9 @@ public class PeerServiceRuntimeTest {
 
     @Test
     public void tcpBridgeEnforcesServerAuthoredSourceAcl() throws Exception {
-        int targetPort = freePort();
-        int publishedPort = freePort();
+        int[] ports = freePorts(3);
+        int targetPort = ports[0];
+        int publishedPort = ports[1];
         SpecusCore.LocalPeerService local = new SpecusCore.LocalPeerService();
         local.serviceId = "svc-acl01";
         local.targetHost = "127.0.0.1";
@@ -387,7 +389,7 @@ public class PeerServiceRuntimeTest {
             }
         }
 
-        publishedPort = freePort();
+        publishedPort = ports[2];
         local.publishedPort = publishedPort;
         local.allowedPeerVirtualIps = List.of("127.0.0.1");
         try (ServerSocket target = listen(targetPort);
@@ -400,8 +402,9 @@ public class PeerServiceRuntimeTest {
 
     @Test
     public void tcpBridgeSeparatesThreePeersAndRevocationClosesTheActiveFlow() throws Exception {
-        int targetPort = freePort();
-        int publishedPort = freePort();
+        int[] ports = freePorts(2);
+        int targetPort = ports[0];
+        int publishedPort = ports[1];
         SpecusCore.LocalPeerService local = new SpecusCore.LocalPeerService();
         local.serviceId = "svc-acl-three";
         local.targetHost = "127.0.0.1";
@@ -517,9 +520,12 @@ public class PeerServiceRuntimeTest {
         }
     }
 
+    /** EOF or a reset; a read that only timed out did not see the close. */
     private static boolean readClosed(Socket socket) {
         try {
             return socket.getInputStream().read() == -1;
+        } catch (SocketTimeoutException stillOpen) {
+            return false;
         } catch (IOException closed) {
             return true;
         }
@@ -582,6 +588,29 @@ public class PeerServiceRuntimeTest {
     private static int freePort() throws Exception {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
+        }
+    }
+
+    /**
+     * Ports that were free at the same time, so no two are the same. Taking them one by one with
+     * freePort() can hand out a port just released, and a target listening on a service's
+     * published port lets callers reach the target without the bridge.
+     */
+    private static int[] freePorts(int count) throws Exception {
+        ServerSocket[] sockets = new ServerSocket[count];
+        try {
+            int[] ports = new int[count];
+            for (int i = 0; i < count; i++) {
+                sockets[i] = new ServerSocket(0);
+                ports[i] = sockets[i].getLocalPort();
+            }
+            return ports;
+        } finally {
+            for (ServerSocket socket : sockets) {
+                if (socket != null) {
+                    socket.close();
+                }
+            }
         }
     }
 

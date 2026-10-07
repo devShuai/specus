@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/protocol-v2.yml"
       - "apps/admin-web/**"
+      - "implementations/android/**"
       - "implementations/c/**"
       - "implementations/csharp/**"
       - "implementations/go/**"
@@ -17,6 +18,7 @@ on:
     paths:
       - ".github/workflows/protocol-v2.yml"
       - "apps/admin-web/**"
+      - "implementations/android/**"
       - "implementations/c/**"
       - "implementations/csharp/**"
       - "implementations/go/**"
