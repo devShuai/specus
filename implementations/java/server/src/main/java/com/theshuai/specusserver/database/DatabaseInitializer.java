@@ -34,6 +34,7 @@ public class DatabaseInitializer {
     private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
     private final TransferTimestampMigrator transferTimestampMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
+    private final SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator;
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
@@ -48,6 +49,7 @@ public class DatabaseInitializer {
                                PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
                                TransferTimestampMigrator transferTimestampMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
+                               SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
@@ -62,6 +64,7 @@ public class DatabaseInitializer {
         this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
         this.transferTimestampMigrator = transferTimestampMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
+        this.sqliteUniqueIndexMigrator = sqliteUniqueIndexMigrator;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
         this.databasePlatform = databasePlatform;
@@ -90,6 +93,8 @@ public class DatabaseInitializer {
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();
         legacyDemoCredentialSanitizer.sanitize();
+        // After the backfills: a NULL tenant never collides in a unique index, 'default' can.
+        sqliteUniqueIndexMigrator.migrate();
         if (seedDemoClient && clientAccountRepository
                 .findByTenantIdAndClientName(tenant.tenantId(), "Demo client").isEmpty()) {
             String now = Instant.now().toString();

@@ -243,7 +243,9 @@ static int read_string_field(const uint8_t *body, size_t body_len, size_t *pos, 
     return 0;
 }
 
-int read_login_response(int fd, int timeout_ms, int *command, int *success, char *reason, size_t reason_len)
+/* read_login_response that also copies the client name the response carries into name, unless NULL. */
+static int read_named_login_response(int fd, int timeout_ms, int *command, int *success,
+                                     char *name, size_t name_len, char *reason, size_t reason_len)
 {
     *command = 0;
     *success = 0;
@@ -270,6 +272,9 @@ int read_login_response(int fd, int timeout_ms, int *command, int *success, char
         return -1;
     }
     *success = body[pos++] == 1U;
+    if (name != NULL && name_len > 0U) {
+        snprintf(name, name_len, "%s", client_name);
+    }
     if (read_string_field(body, header.length, &pos, reason, reason_len) != 0) {
         free(body);
         snprintf(reason, reason_len, "malformed login response reason");
@@ -279,11 +284,25 @@ int read_login_response(int fd, int timeout_ms, int *command, int *success, char
     return 1;
 }
 
+int read_login_response(int fd, int timeout_ms, int *command, int *success, char *reason, size_t reason_len)
+{
+    return read_named_login_response(fd, timeout_ms, command, success, NULL, 0U, reason, reason_len);
+}
+
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len)
 {
+    return channel_login_answer(port, runtime, role, fd_out, NULL, 0U, reason, reason_len);
+}
+
+int channel_login_answer(int port, const runtime_session *runtime, const char *role, int *fd_out,
+                         char *answered_name, size_t answered_name_len, char *reason, size_t reason_len)
+{
     *fd_out = -1;
     reason[0] = '\0';
+    if (answered_name != NULL && answered_name_len > 0U) {
+        answered_name[0] = '\0';
+    }
     int fd = connect_local(port);
     if (fd < 0 || send_login_request(fd, runtime, role) != 0) {
         if (fd >= 0) {
@@ -294,7 +313,8 @@ int channel_login(int port, const runtime_session *runtime, const char *role,
     }
     int command = 0;
     int success = 0;
-    if (read_login_response(fd, IO_TIMEOUT_MS, &command, &success, reason, reason_len) != 1) {
+    if (read_named_login_response(fd, IO_TIMEOUT_MS, &command, &success, answered_name, answered_name_len,
+                                  reason, reason_len) != 1) {
         close(fd);
         return -1;
     }

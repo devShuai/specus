@@ -100,7 +100,9 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
 
 - `http-route-lifecycle-v1.json`：route 何时不再可达、客户端何时得知。`server.scenarios` 用真实管理 API、一个仍对任何
   route 名都回 200 的假客户端和公网入口重放：删除在线客户端的最后一条受保护 route、客户端离线时删除后凭 token 重连、
-  停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除客户端、删除后同名重建；期望是每一步的登录推送与
+  停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除客户端、删除后同名重建，以及删除、停用或改名后凭旧
+  token 重连（`reconnect`：被拒，或登录成改名后的账户而不是同名新账户，见
+  [`protocol/spec/client-auth.md`](../spec/client-auth.md)）；期望是每一步的登录推送与
   变更推送里的 route 集合（空数组也必须出现）、连接是否被关闭，以及入口状态码、`no-store`、Basic 质询和请求是否到达
   客户端。`client.cases` 给出登录快照和一串真实 `NAT_CONTROL` 原文，期望是每步之后的 route 表；缺省与 `null` 都表示
   清空。由 `tools/protocol/generate_http_route_lifecycle_vectors.py` 生成，语义见
