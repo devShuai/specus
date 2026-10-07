@@ -21,8 +21,10 @@ import org.springframework.security.oauth2.jwt.JwtException;
 import org.springframework.security.oauth2.jwt.JwtIssuerValidator;
 import org.springframework.security.oauth2.jwt.JwtTimestampValidator;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.security.oauth2.server.resource.web.BearerTokenAuthenticationEntryPoint;
 import org.springframework.security.oauth2.server.resource.web.BearerTokenResolver;
 import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
+import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.header.HeaderWriter;
 import org.springframework.security.web.header.writers.CompositeHeaderWriter;
@@ -77,7 +79,9 @@ public class SecurityConfig {
                         .anyRequest().permitAll())
                 .oauth2ResourceServer(oauth2 -> oauth2
                         .bearerTokenResolver(adminApiBearerTokenResolver())
+                        .authenticationEntryPoint(privateAnswerEntryPoint())
                         .jwt(jwt -> jwt.decoder(jwtDecoder)))
+                .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(privateAnswerEntryPoint()))
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .csrf(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -142,6 +146,40 @@ public class SecurityConfig {
                                 "no-cache, no-store, max-age=0, must-revalidate"),
                         new StaticHeadersWriter("Pragma", "no-cache"),
                         new StaticHeadersWriter("Expires", "0"))));
+    }
+
+    /**
+     * The usual bearer 401, except that the answers of the service workbench, the connectivity check
+     * and the temporary-share management are private to the identity that asked, the refusals of
+     * this layer included (their contracts: "all responses carry Cache-Control: private, no-store").
+     * The portal header writer only adds its no-cache set when no Cache-Control is present.
+     */
+    private static AuthenticationEntryPoint privateAnswerEntryPoint() {
+        AuthenticationEntryPoint bearer = new BearerTokenAuthenticationEntryPoint();
+        return (request, response, exception) -> {
+            if (privateAdminAnswer(request.getRequestURI().substring(request.getContextPath().length()))) {
+                response.setHeader("Cache-Control", "private, no-store");
+            }
+            bearer.commence(request, response, exception);
+        };
+    }
+
+    static boolean privateAdminAnswer(String path) {
+        if ("/api/admin/workbench".equals(path) || path.startsWith("/api/admin/workbench/")
+                || "/api/admin/http-access-audit".equals(path)) {
+            return true;
+        }
+        String routes = "/api/admin/http-routes/";
+        if (!path.startsWith(routes)) {
+            return false;
+        }
+        int slash = path.indexOf('/', routes.length());
+        if (slash < 0) {
+            return false;
+        }
+        String rest = path.substring(slash);
+        return "/connectivity-check".equals(rest) || "/access-audit".equals(rest)
+                || "/shares".equals(rest) || rest.startsWith("/shares/");
     }
 
     private BearerTokenResolver adminApiBearerTokenResolver() {
