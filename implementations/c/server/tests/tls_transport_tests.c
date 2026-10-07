@@ -10,6 +10,7 @@
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -547,6 +548,8 @@ static int expect_deployment(const char *name,
 
 int main(void)
 {
+    /* The server thread's close_notify can land after the client has closed its end of the pair. */
+    (void)signal(SIGPIPE, SIG_IGN);
     if (expect_deployment("prod public plaintext",
                           ST_TLS_DISABLED, 0, 0, "prod", "0.0.0.0", 0) != 0
         || expect_deployment("unknown environment fails safe",

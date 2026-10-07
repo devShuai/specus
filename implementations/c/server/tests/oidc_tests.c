@@ -26,6 +26,7 @@
 #include <openssl/hmac.h>
 #include <openssl/x509.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1499,6 +1500,8 @@ static void remove_database(void)
 
 int main(void)
 {
+    /* The fake identity provider can answer a client that has already given up, e.g. on a slow JWKS. */
+    (void)signal(SIGPIPE, SIG_IGN);
     /* Talk to the fake identity provider directly even when the caller's shell sets a proxy. */
     const char *proxies[] = {"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"};
     for (size_t i = 0U; i < sizeof(proxies) / sizeof(proxies[0]); ++i) {
