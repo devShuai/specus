@@ -415,6 +415,8 @@ CREATE TABLE IF NOT EXISTS specus_http_traffic_exchange (
   request_preview_text TEXT,
   response_preview_hex VARCHAR(4096),
   response_preview_text TEXT,
+  request_body_data BYTEA,
+  response_body_data BYTEA,
   request_truncated SMALLINT NOT NULL,
   response_truncated SMALLINT NOT NULL,
   captured_at VARCHAR(40) NOT NULL
