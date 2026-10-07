@@ -1351,6 +1351,39 @@ static int check_connectivity_probe_late_rst(test_server *server, client_pair *p
 }
 
 /*
+ * HttpStreamExchangeTests.theResponseEndsOnlyWithItsFin, the half check_connectivity_probe_late_rst
+ * leaves out: a probe stream whose response its FIN already ended is not reset. The server runs
+ * with SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END, so the probe decides after it has read the FIN
+ * that follows the head instead of whenever it happens to wake up; any RST it sent would be on the
+ * wire before the check answers.
+ */
+static int check_connectivity_probe_ended_by_fin(test_server *server, client_pair *pair)
+{
+    char route_id[32];
+    CHECK(db_scalar(server->db_path, "SELECT id FROM http_route_mapping WHERE route = ?", ROUTE, 0,
+                    route_id, sizeof(route_id)) == 0,
+          "route id");
+    connectivity_call call = {server, atoll(route_id), 0, NULL};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, run_connectivity_check, &call) == 0, "check thread");
+    uint32_t head_stream = 0U;
+    int failed = expect_http_open(pair->data, &head_stream) != 0
+        || send_nat(pair->data, ST_NAT_OPEN, 0U, head_stream, 0U,
+                    "{\"source\":\"http\",\"phase\":\"response\",\"statusCode\":204,"
+                    "\"headers\":[],\"trailerNames\":[]}",
+                    NULL, 0U) != 0
+        || send_nat(pair->data, ST_NAT_FIN, 0U, head_stream, 0U, NULL, NULL, 0U) != 0;
+    pthread_join(thread, NULL);
+    CHECK(!failed, "the probe exchange did not run as scripted");
+    CHECK(call.status == 200 && call.body != NULL && strstr(call.body, "\"ACCESS_OK\"") != NULL,
+          "check answer %d %s", call.status, call.body == NULL ? "" : call.body);
+    free(call.body);
+    CHECK(expect_alive_without_rst(pair->data, head_stream) == 0,
+          "a probe stream its FIN had ended was reset");
+    return expect_data_connection_served(server, pair);
+}
+
+/*
  * HttpStreamExchangeTests.aClientResetCarriesItsFailureToTheHeadWaiter through the connectivity
  * check of a client that classifies its resets (clientHttpRouteCapabilities version 1): the
  * client's RST before any head hands its metadata.failure to the waiting check, which reports the
@@ -2055,6 +2088,10 @@ static const char *const long_idle_with_capture[] = {
     "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED=true", NULL
 };
 
+static const char *const long_idle_probe_awaits_end[] = {
+    "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true", NULL
+};
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -2096,6 +2133,9 @@ int main(int argc, char **argv)
     current_check = check_connectivity_client_reset_failure;
     failures += run_scenario("a client RST hands its failure to the connectivity check",
                              run_current_check_capable, long_idle);
+    current_check = check_connectivity_probe_ended_by_fin;
+    failures += run_scenario("a connectivity probe its FIN ended is not reset", run_current_check,
+                             long_idle_probe_awaits_end);
     failures += run_check("HEARTBEAT_RESPONSE is accepted on both roles", check_heartbeat_response);
     failures += run_check("request OPEN carries browser headers moved onto the route target",
                           check_upstream_browser_headers);

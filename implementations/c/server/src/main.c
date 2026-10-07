@@ -2183,6 +2183,18 @@ static long long connectivity_now_ms(void *ctx)
 }
 
 /*
+ * Test hook, SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true: once a response head has come, the
+ * probe also waits, within the same deadline, for the stream to end (FIN, or a reset) before it
+ * decides whether to reset it. A test can then show that a response its FIN ended is not reset,
+ * which otherwise depends on whether the FIN was read before the probe woke up. Off by default.
+ */
+static int connectivity_probe_awaits_end(void)
+{
+    const char *value = getenv("SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END");
+    return value != NULL && strcmp(value, "true") == 0;
+}
+
+/*
  * One connectivity check probe (protocol/spec/service-connectivity-check.md section 5): the same
  * HTTP stream as a public request, minus the public entry -- no route Basic auth, no server-side
  * route lookup (the device answers for its own configuration), no traffic accounting or detail.
@@ -2256,6 +2268,14 @@ static void connectivity_probe(void *ctx,
         while (pending.events_head == NULL && pending.error == NULL) {
             if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
                 break;
+            }
+        }
+        if (connectivity_probe_awaits_end() && pending.events_head != NULL
+            && pending.events_head->type == ST_NAT_OPEN) {
+            while (!pending.done && pending.error == NULL) {
+                if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
+                    break;
+                }
             }
         }
         if (pending.events_head != NULL && pending.events_head->type == ST_NAT_OPEN) {
