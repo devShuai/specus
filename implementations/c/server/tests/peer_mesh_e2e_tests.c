@@ -36,9 +36,13 @@ static void random_nonce(char out[33])
     st_hex_encode(bytes, sizeof(bytes), out);
 }
 
-/* The real POST /api/client/auth/login, announcing the given egress capability version. */
+/*
+ * The real POST /api/client/auth/login, announcing the given egress capability version and the
+ * peer public key "pk-<fingerprint>". The response is kept in *login_response when asked for.
+ */
 static int egress_login(const test_server *server, const char *api_key, const char *secret,
-                        const char *fingerprint, int egress_version, runtime_session *out)
+                        const char *fingerprint, int egress_version, runtime_session *out,
+                        char **login_response)
 {
     char timestamp[32];
     char nonce[33];
@@ -57,9 +61,10 @@ static int egress_login(const test_server *server, const char *api_key, const ch
              "{\"apiKey\":\"%s\",\"timestamp\":\"%s\",\"nonce\":\"%s\",\"signature\":\"%s\","
              "\"environment\":{\"machineFingerprint\":\"%s\",\"hostname\":\"egress-host\","
              "\"osUser\":\"egress\",\"osName\":\"Linux\",\"osVersion\":\"test\",\"osArch\":\"amd64\","
-             "\"clientVersion\":\"peer-mesh-e2e-test\",\"clientEgressCapabilities\":{\"version\":%d,"
+             "\"clientVersion\":\"peer-mesh-e2e-test\",\"peerPublicKey\":\"pk-%s\","
+             "\"clientEgressCapabilities\":{\"version\":%d,"
              "\"egressCapable\":%s,\"consumerCapable\":%s}}}",
-             api_key, timestamp, nonce, signature, fingerprint, egress_version,
+             api_key, timestamp, nonce, signature, fingerprint, fingerprint, egress_version,
              egress_version >= 1 ? "true" : "false", egress_version >= 1 ? "true" : "false");
     memset(out, 0, sizeof(*out));
     int status = 0;
@@ -80,7 +85,8 @@ static int egress_login(const test_server *server, const char *api_key, const ch
     }
     free(client_name);
     free(token);
-    free(response);
+    if (login_response != NULL && rc == 0) *login_response = response;
+    else free(response);
     return rc;
 }
 
@@ -176,8 +182,27 @@ static int scenario_egress_report(test_server *server)
     CHECK(create_credential(server->db_path, "ck_legacy", "legacy-secret", 2) == 0, "legacy credential not stored");
     runtime_session egress;
     runtime_session legacy;
-    CHECK(egress_login(server, "ck_egress", "egress-secret", "machine-egress", 1, &egress) == 0, "egress login");
-    CHECK(egress_login(server, "ck_legacy", "legacy-secret", "machine-legacy", 0, &legacy) == 0, "legacy login");
+    char *login = NULL;
+    CHECK(egress_login(server, "ck_egress", "egress-secret", "machine-egress", 1, &egress, &login) == 0,
+          "egress login");
+    /*
+     * loginConfigAllocatesVirtualIpButLeavesDeviceDisabledByDefault, over the real login: a new
+     * device gets a virtual IP and the public key it announced, stays off, and is still told the
+     * STUN/TURN endpoints and its TURN credential.
+     */
+    char ice_subject[64];
+    snprintf(ice_subject, sizeof(ice_subject), ":pm-%lld:", egress.client_id);
+    int login_ok = login != NULL && strstr(login, "\"peerMesh\":{\"enabled\":false,") != NULL
+        && strstr(login, "\"virtualIp\":\"100.") != NULL
+        && strstr(login, "\"clientPublicKey\":\"pk-machine-egress\"") != NULL
+        && strstr(login, "\"stunHost\":\"127.0.0.1\"") != NULL && strstr(login, "\"turnHost\":\"127.0.0.1\"") != NULL
+        && strstr(login, ice_subject) != NULL
+        && strstr(login, "\"deploymentEnabled\":true,\"configuredEnabled\":false,\"effectiveEnabled\":false") != NULL;
+    if (!login_ok) fprintf(stderr, "login peerMesh config mismatch: %s\n", login == NULL ? "(none)" : login);
+    free(login);
+    CHECK(login_ok, "login peerMesh config");
+    CHECK(egress_login(server, "ck_legacy", "legacy-secret", "machine-legacy", 0, &legacy, NULL) == 0,
+          "legacy login");
     int fd = -1;
     int legacy_fd = -1;
     char reason[256];

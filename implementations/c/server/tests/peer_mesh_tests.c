@@ -1145,6 +1145,37 @@ static int test_service_report_bounds(void)
         failed = 1;
     }
 
+    /*
+     * PeerSignalServiceEnvelopeTests: the server binds the publisher, so a report addressed to a
+     * peer, or naming any identity or routing field even as null, is refused.
+     */
+    static const char *const server_bound[] = {
+        "sourceClientId", "sourceClientName", "sourceVirtualIp", "sourcePublicKey", "sourceKeyEpoch",
+        "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey", "sessionId", "token",
+        "publisherClientId", "publisherClientName", "publisherSessionId",
+    };
+    st_peer_mesh_runtime envelope_runtime = {path, capture_signal, always_online, &ctx, 8105, 2};
+    if (!failed && st_peer_mesh_handle_control(&envelope_runtime, "bounds-publisher", "peer-b",
+            "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[]}") == 0) {
+        fprintf(stderr, "a service-report addressed to a peer was accepted\n");
+        failed = 1;
+    }
+    for (size_t i = 0U; !failed && i < sizeof(server_bound) / sizeof(server_bound[0]); ++i) {
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[],\"%s\":null}",
+                 server_bound[i]);
+        if (st_peer_mesh_handle_control(&envelope_runtime, "bounds-publisher", NULL, message) == 0) {
+            fprintf(stderr, "a service-report naming %s was accepted\n", server_bound[i]);
+            failed = 1;
+        }
+    }
+    /* With none of them it is accepted. */
+    if (!failed && st_peer_mesh_handle_control(&envelope_runtime, "bounds-publisher", NULL,
+            "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[]}") != 0) {
+        fprintf(stderr, "an identity-free service-report was refused\n");
+        failed = 1;
+    }
+
     /* The raw message is bounded before it is read, and so is every collection after. */
     snprintf(message, sizeof(message), "{\"type\":\"service-report\",\"revision\":2,\"padding\":\"");
     size_t used = strlen(message);
