@@ -15,14 +15,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static com.theshuai.specusserver.database.SqliteConstraintTestSupport.createMediaDeduplicationIndex;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -47,11 +45,9 @@ class HttpMediaCaptureSqliteRaceTests {
     @Autowired private HttpRouteMappingRepository routeRepository;
     @Autowired private HttpMediaCaptureRepository captureRepository;
     @Autowired private HttpMediaReferenceRepository referenceRepository;
-    @Autowired private JdbcTemplate jdbcTemplate;
 
     @BeforeEach
     void setUp() {
-        createMediaDeduplicationIndex(jdbcTemplate);
         clearRows();
         clientAccountService.createClient(new ClientMutation(CLIENT, true, 0));
         long clientId = clientAccountRepository.findByClientName(CLIENT).orElseThrow().getId();

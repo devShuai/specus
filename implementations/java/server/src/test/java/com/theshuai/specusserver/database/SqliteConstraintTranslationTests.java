@@ -2,6 +2,7 @@ package com.theshuai.specusserver.database;
 
 import com.theshuai.specusserver.management.repository.HttpMediaCaptureRepository;
 import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.engine.spi.SessionFactoryImplementor;
 import org.hibernate.exception.ConstraintViolationException;
 import org.hibernate.exception.ConstraintViolationException.ConstraintKind;
 import org.junit.jupiter.api.AfterEach;
@@ -14,8 +15,6 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import static com.theshuai.specusserver.database.SqliteConstraintTestSupport.capture;
-import static com.theshuai.specusserver.database.SqliteConstraintTestSupport.createMediaDeduplicationIndex;
-import static com.theshuai.specusserver.database.SqliteConstraintTestSupport.dialectOf;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
@@ -38,11 +37,6 @@ class SqliteConstraintTranslationTests {
     @Autowired private JdbcTemplate jdbcTemplate;
 
     @BeforeEach
-    void createIndexAndClearCaptures() {
-        createMediaDeduplicationIndex(jdbcTemplate);
-        captureRepository.deleteAll();
-    }
-
     @AfterEach
     void clearCaptures() {
         captureRepository.deleteAll();
@@ -50,7 +44,8 @@ class SqliteConstraintTranslationTests {
 
     @Test
     void theDefaultDialectTranslatesConstraintViolations() {
-        assertThat(dialectOf(entityManagerFactory)).isExactlyInstanceOf(SpecusSqliteDialect.class);
+        assertThat(entityManagerFactory.unwrap(SessionFactoryImplementor.class).getJdbcServices().getDialect())
+                .isExactlyInstanceOf(SpecusSqliteDialect.class);
     }
 
     @Test

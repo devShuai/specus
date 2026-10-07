@@ -3,16 +3,16 @@ package com.theshuai.specusserver.database;
 import com.theshuai.specusserver.database.JpaUniqueKeys.Key;
 import com.theshuai.specusserver.database.JpaUniqueKeys.Mapping;
 import com.theshuai.specusserver.database.JpaUniqueKeys.SqliteUniqueIndex;
-import com.theshuai.specusserver.management.model.HttpMediaCapture;
 import com.theshuai.specusserver.management.repository.HttpMediaCaptureRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.List;
 
+import static com.theshuai.specusserver.database.SqliteConstraintTestSupport.capture;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -43,38 +43,18 @@ class SqliteUniqueIndexStartupTests {
 
     /**
      * Two captures racing for one range can no longer both be stored, so the keyed lookup keeps
-     * finding a single row. The community SQLite dialect does not translate SQLITE_CONSTRAINT,
-     * so the loser sees a JpaSystemException rather than the DataIntegrityViolationException
-     * HttpMediaCaptureService.open() catches.
+     * finding a single row, and the loser sees the DataIntegrityViolationException
+     * HttpMediaCaptureService.open() catches: the community dialect configured above is replaced
+     * by SpecusSqliteDialect, which translates SQLITE_CONSTRAINT.
      */
     @Test
     void aSecondCaptureWithTheSameDeduplicationKeyIsRejected() {
         captureRepository.saveAndFlush(capture("dedup-startup-test"));
 
         assertThatThrownBy(() -> captureRepository.saveAndFlush(capture("dedup-startup-test")))
-                .isInstanceOf(DataAccessException.class)
+                .isInstanceOf(DataIntegrityViolationException.class)
                 .hasRootCauseMessage("[SQLITE_CONSTRAINT_UNIQUE] A UNIQUE constraint failed "
                         + "(UNIQUE constraint failed: specus_http_media_capture.deduplication_key)");
         assertThat(captureRepository.findByTenantIdAndDeduplicationKey("default", "dedup-startup-test")).isPresent();
-    }
-
-    private static HttpMediaCapture capture(String deduplicationKey) {
-        HttpMediaCapture capture = new HttpMediaCapture();
-        capture.setTenantId("default");
-        capture.setClientId(1L);
-        capture.setClientName("client");
-        capture.setRoute("media");
-        capture.setSourceUrl("https://example.test/video.mp4");
-        capture.setResourceKey("resource");
-        capture.setDeduplicationKey(deduplicationKey);
-        capture.setMethod("GET");
-        capture.setStatusCode(206);
-        capture.setMediaKind("video");
-        capture.setCapturedBytes(0);
-        capture.setObjectKey("object");
-        capture.setState("STARTING");
-        capture.setCapturedAt("2026-10-07T00:00:00Z");
-        capture.setExpiresAt("2026-10-08T00:00:00Z");
-        return capture;
     }
 }
