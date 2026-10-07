@@ -139,7 +139,7 @@ int main(void)
         database_path, response, 2U * 1024U * 1024U);
     if (response_len <= 0 || strstr(response, "200 OK") == NULL
         || strstr(response, "\"total\":1") == NULL
-        || strstr(response, "token=[REDACTED]") == NULL
+        || strstr(response, "token=***") == NULL
         || strstr(response, "\"playable\":true") == NULL) {
         fprintf(stderr, "media capture management list mismatch\n");
         free(response);
