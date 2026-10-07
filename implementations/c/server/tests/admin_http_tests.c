@@ -3078,6 +3078,144 @@ static int test_tenant_scoped_admin_mutations(void)
 }
 
 /*
+ * Java PeerMeshServiceTests.pathStatsAggregatesDirectRatioAndNatTypes through GET
+ * /api/admin/peer-mesh/stats. Sessions group by the path that carried more bytes (RELAY stored but
+ * DIRECT-heavy counts as DIRECT) and status, with the reported (RTT) count, mean RTT and bytes, and
+ * by remote address family; a session past its expiry is closed first. Devices group by NAT type,
+ * blank as UNKNOWN, and by NAT behaviour: a device that reported none is left out, values are
+ * trimmed, and the success ratio counts classified mapping and filtering. An administrator sees the
+ * tenant, an ordinary user the sessions of its clients and its own devices.
+ */
+static int test_peer_mesh_path_stats(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-peer-stats-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-peer-stats-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    static const char seed[] =
+        "INSERT INTO client_account(rowid, tenant_id, client_name, owner_username, enabled) VALUES "
+        "(801, 'tenant-stats', 'stats-c1', 'owner-a', 1), (802, 'tenant-stats', 'stats-c2', 'owner-a', 1), "
+        "(803, 'tenant-stats', 'stats-c3', 'owner-b', 1), (804, 'tenant-other', 'stats-c4', 'owner-o', 1);"
+        "INSERT INTO peer_mesh_session(tenant_id, source_client_id, source_client_name, target_client_id, "
+        "target_client_name, path_type, status, expires_at, rtt_millis, remote_endpoint, direct_bytes, relay_bytes) "
+        "VALUES "
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 10, "
+        "'203.0.113.1:4000', 600, 0),"
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 15, "
+        "'[2001:db8::1]:4000', 300, 0),"
+        "('tenant-stats', 802, 'stats-c2', 801, 'stats-c1', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', NULL, "
+        "NULL, 0, 0),"
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'RELAY', 'ACTIVE', '2999-01-01 00:00:00', 80, "
+        "'203.0.113.2:4000', 10, 400),"
+        "('tenant-stats', 803, 'stats-c3', 803, 'stats-c3', 'RELAY', 'CLOSED', '2999-01-01 00:00:00', NULL, "
+        "'198.51.100.7:5000', 500, 100),"
+        "('tenant-stats', 801, 'stats-c1', 803, 'stats-c3', 'DIRECT', 'NEGOTIATING', '2000-01-01 00:00:00', NULL, "
+        "NULL, 0, 0),"
+        "('tenant-other', 804, 'stats-c4', 804, 'stats-c4', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 5, "
+        "'203.0.113.9:4000', 7, 0);"
+        "INSERT INTO peer_mesh_device(tenant_id, owner_username, client_id, client_name, enabled, nat_type, "
+        "nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery) VALUES "
+        "('tenant-stats', 'owner-a', 801, 'stats-c1', 1, '', 'ENDPOINT_INDEPENDENT', 'ADDRESS_AND_PORT_DEPENDENT', "
+        "'RFC5780'),"
+        "('tenant-stats', 'owner-a', 802, 'stats-c2', 1, 'UNKNOWN', 'ADDRESS_DEPENDENT', 'UNSUPPORTED', 'BASIC'),"
+        "('tenant-stats', 'owner-b', 803, 'stats-c3', 1, 'SYMMETRIC_NAT', NULL, NULL, NULL),"
+        "('tenant-stats', 'owner-b', 805, 'stats-c5', 0, '   ', '  ENDPOINT_INDEPENDENT ', '', NULL),"
+        "('tenant-other', 'owner-o', 804, 'stats-c4', 1, 'FULL_CONE', 'ENDPOINT_INDEPENDENT', "
+        "'ENDPOINT_INDEPENDENT', 'RFC5780');";
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("stats-root", "tenant-stats", "ADMIN") != 0
+        || connection_events_ensure_user("owner-a", "tenant-stats", "USER") != 0
+        || test_exec_sql(db_path, seed) != 0;
+    if (failed) fprintf(stderr, "peer mesh stats fixture setup failed\n");
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "stats-root", "tenant-stats", "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_body_equals(len, response,
+            "{\"totalSessions\":6,\"reportedSessions\":3,\"activeSessions\":4,\"activeDirectSessions\":3,"
+            "\"activeRelaySessions\":1,\"activeDirectRatio\":0.75,\"pathTypes\":["
+            "{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":3,\"reportedSessions\":2,"
+            "\"avgRttMillis\":12.5,\"directBytes\":900,\"relayBytes\":0},"
+            "{\"pathType\":\"DIRECT\",\"status\":\"CLOSED\",\"sessions\":2,\"reportedSessions\":0,"
+            "\"avgRttMillis\":null,\"directBytes\":500,\"relayBytes\":100},"
+            "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":1,\"reportedSessions\":1,"
+            "\"avgRttMillis\":80.0,\"directBytes\":10,\"relayBytes\":400}],\"addressFamilies\":["
+            "{\"addressFamily\":\"IPv4\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"IPv4\",\"status\":\"ACTIVE\",\"pathType\":\"RELAY\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"IPv4\",\"status\":\"CLOSED\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0},"
+            "{\"addressFamily\":\"IPv6\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"UNKNOWN\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0},"
+            "{\"addressFamily\":\"UNKNOWN\",\"status\":\"CLOSED\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0}],"
+            "\"natTypes\":[{\"natType\":\"UNKNOWN\",\"devices\":3},{\"natType\":\"SYMMETRIC_NAT\",\"devices\":1}],"
+            "\"natBehaviorDevices\":3,\"natBehaviorClassifiedDevices\":1,"
+            "\"natBehaviorSuccessRatio\":0.3333333333333333,"
+            "\"natMappingBehaviors\":[{\"behavior\":\"ENDPOINT_INDEPENDENT\",\"devices\":2},"
+            "{\"behavior\":\"ADDRESS_DEPENDENT\",\"devices\":1}],"
+            "\"natFilteringBehaviors\":[{\"behavior\":\"UNKNOWN\",\"devices\":1},"
+            "{\"behavior\":\"UNSUPPORTED\",\"devices\":1},{\"behavior\":\"ADDRESS_AND_PORT_DEPENDENT\",\"devices\":1}],"
+            "\"natBehaviorDiscoveries\":[{\"behavior\":\"UNKNOWN\",\"devices\":1},{\"behavior\":\"BASIC\",\"devices\":1},"
+            "{\"behavior\":\"RFC5780\",\"devices\":1}]}",
+            "tenant administrator's peer mesh stats") != 0;
+    }
+    if (!failed) {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        int closed = 0;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM peer_mesh_session WHERE status = 'CLOSED' "
+                                      "AND closed_at IS NOT NULL AND source_client_id = 801 AND target_client_id = 803",
+                                  -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            closed = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        failed = closed != 1;
+        if (failed) fprintf(stderr, "the expired negotiating session was not closed by the stats\n");
+    }
+    /* An ordinary user: the sessions of its own clients, its own devices. */
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "owner-a", "tenant-stats", "USER", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"totalSessions\":5,\"reportedSessions\":3,"
+                                 "\"activeSessions\":4,\"activeDirectSessions\":3,\"activeRelaySessions\":1,"
+                                 "\"activeDirectRatio\":0.75", "owner's peer mesh stats") != 0
+            || !contains(response, "{\"pathType\":\"DIRECT\",\"status\":\"CLOSED\",\"sessions\":1,"
+                                   "\"reportedSessions\":0,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":0}")
+            || !contains(response, "\"natTypes\":[{\"natType\":\"UNKNOWN\",\"devices\":2}],\"natBehaviorDevices\":2,"
+                                   "\"natBehaviorClassifiedDevices\":1,\"natBehaviorSuccessRatio\":0.5,")
+            || contains(response, "SYMMETRIC_NAT") || contains(response, "198.51.100.7");
+        if (failed && len > 0) fprintf(stderr, "owner's peer mesh stats: %s\n", response);
+    }
+    /* Nothing reported, nothing to divide: both ratios are null. */
+    if (!failed) {
+        failed = connection_events_ensure_user("nobody-peer", "tenant-empty", "ADMIN") != 0;
+        int len = failed ? -1 : tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "nobody-peer", "tenant-empty",
+                                              "ADMIN", NULL, response, sizeof(response));
+        failed = failed || endpoint_body_equals(len, response,
+            "{\"totalSessions\":0,\"reportedSessions\":0,\"activeSessions\":0,\"activeDirectSessions\":0,"
+            "\"activeRelaySessions\":0,\"activeDirectRatio\":null,\"pathTypes\":[],\"addressFamilies\":[],"
+            "\"natTypes\":[],\"natBehaviorDevices\":0,\"natBehaviorClassifiedDevices\":0,"
+            "\"natBehaviorSuccessRatio\":null,\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],"
+            "\"natBehaviorDiscoveries\":[]}", "an empty tenant's peer mesh stats") != 0;
+    }
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
  * ManagementUserServiceTests.bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous.
  * C matches login names case-insensitively but keys rows by the exact username, so a legacy or
  * foreign database may hold "Alice" (tenant-a) and "alice" (tenant-b). Such a name is no one's:
@@ -7312,6 +7450,9 @@ int main(void)
         return 1;
     }
     if (test_ambiguous_login_name_fails_closed() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_path_stats() != 0) {
         return 1;
     }
     if (test_http_route_service_rules() != 0) {
