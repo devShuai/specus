@@ -3545,6 +3545,39 @@ static int update_client_on_db(sqlite3 *db,
         }
         sqlite3_finalize(stmt);
     }
+    /*
+     * The other operational records that carry the name follow the account, as Java
+     * ClientNameReferenceRepository.rename does; history (connection records, traffic detail)
+     * keeps the name it was captured under. Traffic usage is keyed by name here, so a row a deleted
+     * client of the new name left for the same day gives way to the renamed client's row.
+     */
+    static const char *const references_sql[] = {
+        "UPDATE specus_client_identity SET client_name = ?1 WHERE client_id = ?2",
+        "UPDATE peer_mesh_device SET client_name = ?1, updated_at = CURRENT_TIMESTAMP WHERE client_id = ?2",
+        "UPDATE peer_mesh_acl SET source_client_name = ?1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE source_client_id = ?2",
+        "UPDATE peer_mesh_acl SET target_client_name = ?1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE target_client_id = ?2",
+        "UPDATE OR REPLACE traffic_usage SET client_name = ?1 "
+        "WHERE client_id = ?2 OR (client_id IS NULL AND client_name = ?3)",
+        "UPDATE OR REPLACE resource_traffic_usage SET client_name = ?1 "
+        "WHERE client_id = ?2 OR (client_id IS NULL AND client_name = ?3)"
+    };
+    for (size_t i = 0; rc == 0 && previous_name != NULL && strcmp(previous_name, client_name) != 0
+                       && i < sizeof(references_sql) / sizeof(references_sql[0]); ++i) {
+        if (sqlite3_prepare_v2(db, references_sql[i], -1, &stmt, NULL) != SQLITE_OK) {
+            rc = -1;
+        } else {
+            sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, id);
+            if (sqlite3_bind_parameter_count(stmt) >= 3) {
+                sqlite3_bind_text(stmt, 3, previous_name, -1, SQLITE_TRANSIENT);
+            }
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
     return rc;
 }
 
