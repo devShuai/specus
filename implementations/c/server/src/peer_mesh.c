@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <limits.h>
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -24,6 +25,40 @@
 #define ST_PEER_MESH_MAX_CATALOGS 4096U
 #define ST_PEER_MESH_MAX_CATALOG_SERVICES 32U
 #define ST_PEER_MESH_CATALOG_TTL_SECONDS 300
+/* service-report and egress-report: each at most 20 per control session per minute. */
+#define ST_PEER_REPORT_RATE_LIMIT 20U
+
+/*
+ * A sliding one-minute window, as Java keeps one per session: a report is admitted while fewer
+ * than the limit were admitted in the last window. A window that restarts every minute would let
+ * twice the limit through around each restart.
+ */
+typedef struct {
+    long long stamps[ST_PEER_REPORT_RATE_LIMIT];
+    unsigned int head;
+    unsigned int count;
+} pm_rate_window;
+
+static long long pm_monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
+static int pm_rate_window_admit(pm_rate_window *window, long long now_ms, unsigned int limit,
+                                long long window_ms)
+{
+    if (limit > ST_PEER_REPORT_RATE_LIMIT) limit = ST_PEER_REPORT_RATE_LIMIT;
+    while (window->count > 0U && window->stamps[window->head] < now_ms - window_ms) {
+        window->head = (window->head + 1U) % ST_PEER_REPORT_RATE_LIMIT;
+        --window->count;
+    }
+    if (window->count >= limit) return 0;
+    window->stamps[(window->head + window->count) % ST_PEER_REPORT_RATE_LIMIT] = now_ms;
+    ++window->count;
+    return 1;
+}
 
 typedef struct {
     char service_id[65];
@@ -45,8 +80,7 @@ typedef struct {
     char instance_id[65];
     time_t generated_at;
     time_t expires_at;
-    time_t rate_window_started_at;
-    unsigned int rate_count;
+    pm_rate_window rate;
     char service_ids[ST_PEER_MESH_MAX_CATALOG_SERVICES][65];
     size_t service_count;
     pm_service_stats stats[ST_PEER_MESH_MAX_CATALOG_SERVICES];
@@ -1187,6 +1221,35 @@ static pm_catalog *pm_find_or_allocate_catalog_locked(const st_storage_client *s
     return free_slot;
 }
 
+/* Placeholder catalogues belong to no tenant and no client, and never expire. */
+int st_peer_mesh_catalogs_occupy_for_testing(size_t count)
+{
+    size_t occupied = 0U;
+    pthread_mutex_lock(&peer_catalog_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS && occupied < count; ++i) {
+        pm_catalog *catalog = &peer_catalogs[i];
+        if (catalog->in_use) continue;
+        memset(catalog, 0, sizeof(*catalog));
+        catalog->in_use = 1;
+        catalog->publisher_client_id = -1;
+        catalog->expires_at = (time_t)INT_MAX;
+        ++occupied;
+    }
+    pthread_mutex_unlock(&peer_catalog_lock);
+    return occupied == count ? 0 : -1;
+}
+
+void st_peer_mesh_catalogs_release_for_testing(void)
+{
+    pthread_mutex_lock(&peer_catalog_lock);
+    for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
+        if (peer_catalogs[i].in_use && peer_catalogs[i].publisher_client_id == -1) {
+            memset(&peer_catalogs[i], 0, sizeof(peer_catalogs[i]));
+        }
+    }
+    pthread_mutex_unlock(&peer_catalog_lock);
+}
+
 static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
                                     const st_storage_client *source,
                                     const st_storage_peer_mesh_device *source_device,
@@ -1247,11 +1310,7 @@ static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
         free(instance_id);
         return -1;
     }
-    if (catalog->rate_window_started_at == 0 || now - catalog->rate_window_started_at >= 60) {
-        catalog->rate_window_started_at = now;
-        catalog->rate_count = 0U;
-    }
-    if (catalog->rate_count >= 20U) {
+    if (!pm_rate_window_admit(&catalog->rate, pm_monotonic_ms(), ST_PEER_REPORT_RATE_LIMIT, 60000LL)) {
         pthread_mutex_unlock(&peer_catalog_lock);
         free(mdns_copy);
         free(instance_id);
@@ -1260,7 +1319,6 @@ static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
             runtime->publisher_session_id, NULL, "rate-limited");
         return -1;
     }
-    ++catalog->rate_count;
     if (revision <= catalog->report_revision) {
         pthread_mutex_unlock(&peer_catalog_lock);
         free(mdns_copy);
@@ -1961,14 +2019,13 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
 
 /* Cap on one envelope. Counters only, so this is far above what a well-formed report needs. */
 #define ST_PEER_EGRESS_MAX_REPORT_BYTES (8U * 1024U)
-#define ST_PEER_EGRESS_REPORT_RATE_LIMIT 20U
+#define ST_PEER_EGRESS_REPORT_RATE_LIMIT ST_PEER_REPORT_RATE_LIMIT
 #define ST_PEER_EGRESS_REPORT_RATE_WINDOW 60
 #define ST_PEER_EGRESS_MAX_RATE_SESSIONS 4096U
 
 typedef struct {
     long long session_id;
-    time_t window_started_at;
-    unsigned int count;
+    pm_rate_window window;
 } pm_egress_rate_slot;
 
 static pm_egress_rate_slot peer_egress_rate_slots[ST_PEER_EGRESS_MAX_RATE_SESSIONS];
@@ -1982,7 +2039,7 @@ static pthread_mutex_t peer_egress_rate_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 static int pm_enforce_egress_report_rate(long long session_id)
 {
-    time_t now = time(NULL);
+    long long now = pm_monotonic_ms();
     int allowed = 0;
     pthread_mutex_lock(&peer_egress_rate_lock);
     pm_egress_rate_slot *slot = NULL;
@@ -1994,23 +2051,52 @@ static int pm_enforce_egress_report_rate(long long session_id)
     }
     if (slot == NULL && peer_egress_rate_used < ST_PEER_EGRESS_MAX_RATE_SESSIONS) {
         slot = &peer_egress_rate_slots[peer_egress_rate_used++];
+        memset(slot, 0, sizeof(*slot));
         slot->session_id = session_id;
-        slot->window_started_at = 0;
-        slot->count = 0U;
     }
     if (slot != NULL) {
-        if (slot->window_started_at == 0
-            || now - slot->window_started_at >= ST_PEER_EGRESS_REPORT_RATE_WINDOW) {
-            slot->window_started_at = now;
-            slot->count = 0U;
-        }
-        if (slot->count < ST_PEER_EGRESS_REPORT_RATE_LIMIT) {
-            ++slot->count;
-            allowed = 1;
-        }
+        allowed = pm_rate_window_admit(&slot->window, now, ST_PEER_EGRESS_REPORT_RATE_LIMIT,
+                                       ST_PEER_EGRESS_REPORT_RATE_WINDOW * 1000LL);
     }
     pthread_mutex_unlock(&peer_egress_rate_lock);
     return allowed ? 0 : -1;
+}
+
+/* Placeholder sessions take negative ids, which no control session has. */
+int st_peer_mesh_egress_report_rate_occupy_for_testing(size_t count)
+{
+    int rc = 0;
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    for (size_t i = 0U; i < count; ++i) {
+        if (peer_egress_rate_used >= ST_PEER_EGRESS_MAX_RATE_SESSIONS) {
+            rc = -1;
+            break;
+        }
+        pm_egress_rate_slot *slot = &peer_egress_rate_slots[peer_egress_rate_used++];
+        memset(slot, 0, sizeof(*slot));
+        slot->session_id = -(long long)peer_egress_rate_used;
+    }
+    pthread_mutex_unlock(&peer_egress_rate_lock);
+    return rc;
+}
+
+size_t st_peer_mesh_egress_report_rate_sessions_for_testing(void)
+{
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    size_t used = peer_egress_rate_used;
+    pthread_mutex_unlock(&peer_egress_rate_lock);
+    return used;
+}
+
+void st_peer_mesh_egress_report_rate_release_for_testing(void)
+{
+    pthread_mutex_lock(&peer_egress_rate_lock);
+    size_t kept = 0U;
+    for (size_t i = 0U; i < peer_egress_rate_used; ++i) {
+        if (peer_egress_rate_slots[i].session_id >= 0) peer_egress_rate_slots[kept++] = peer_egress_rate_slots[i];
+    }
+    peer_egress_rate_used = kept;
+    pthread_mutex_unlock(&peer_egress_rate_lock);
 }
 
 static long long pm_report_counter(const char *message, const char *field)

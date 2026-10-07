@@ -79,4 +79,14 @@ char *st_peer_mesh_build_login_config(const char *database_path,
  */
 int st_peer_mesh_normalize_local_host(const char *value, char out[256]);
 
+/*
+ * Test hooks for the two bounded tables of client-driven session ids: placeholder entries that fill
+ * the egress-report rate table and the service catalogue table, and their removal.
+ */
+int st_peer_mesh_egress_report_rate_occupy_for_testing(size_t count);
+size_t st_peer_mesh_egress_report_rate_sessions_for_testing(void);
+void st_peer_mesh_egress_report_rate_release_for_testing(void);
+int st_peer_mesh_catalogs_occupy_for_testing(size_t count);
+void st_peer_mesh_catalogs_release_for_testing(void);
+
 #endif

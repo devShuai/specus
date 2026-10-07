@@ -5032,7 +5032,10 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
     st_storage_client egress;
     if (st_storage_get_client(database_path, egress_client_id, &egress) != 0
         || strcmp(egress.tenant_id, context->tenant_id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+        /* Named as Java PeerEgressService names it. */
+        char missing[96];
+        snprintf(missing, sizeof(missing), "{\"error\":\"client not found: %lld\"}", egress_client_id);
+        return write_response(out, out_len, 404, "Not Found", missing);
     }
 
     st_storage_peer_mesh_egress_policy policy;
@@ -5184,7 +5187,9 @@ static int handle_peer_mesh_egress_policy_delete(const st_admin_context *context
     st_storage_peer_mesh_egress_policy policy;
     int found = st_storage_get_peer_mesh_egress_policy(database_path, id, context->tenant_id, &policy);
     if (found != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"egress policy not found\"}");
+        char missing[96];
+        snprintf(missing, sizeof(missing), "{\"error\":\"egress policy not found: %lld\"}", id);
+        return write_response(out, out_len, 404, "Not Found", missing);
     }
     if (st_storage_delete_peer_mesh_egress_policy(database_path, id, context->tenant_id) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error",
