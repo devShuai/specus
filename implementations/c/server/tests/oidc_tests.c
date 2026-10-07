@@ -800,9 +800,9 @@ static void test_login_issues_local_token(void)
 
     char expected_key[65];
     CHECK(st_oidc_identity_key(issuer, "subject-alice", expected_key) == 0, "identity key failed");
-    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE username = ?", "alice");
-    char *stored_issuer = db_text("SELECT oidc_issuer FROM specus_management_user WHERE username = ?", "alice");
-    char *hash = db_text("SELECT password_hash FROM specus_management_user WHERE username = ?", "alice");
+    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE login_name = ?", "alice");
+    char *stored_issuer = db_text("SELECT oidc_issuer FROM specus_management_user WHERE login_name = ?", "alice");
+    char *hash = db_text("SELECT password_hash FROM specus_management_user WHERE login_name = ?", "alice");
     CHECK(stored_key != NULL && strcmp(stored_key, expected_key) == 0, "binding key is not SHA-256(iss NUL sub)");
     CHECK(stored_issuer != NULL && strcmp(stored_issuer, issuer) == 0, "binding issuer not stored");
     CHECK(hash != NULL && strncmp(hash, "$pbkdf2-sha256$v=1$i=", strlen("$pbkdf2-sha256$v=1$i=")) == 0,
@@ -824,7 +824,7 @@ static void test_binding_follows_subject(void)
     st_security_token_claims claims;
     CHECK(local_claims_of(renamed, &claims) == 0 && strcmp(claims.username, "alice") == 0,
           "a renamed identity provider account did not keep its bound user");
-    char *row = db_text("SELECT username FROM specus_management_user WHERE username = ?", "alice-renamed");
+    char *row = db_text("SELECT username FROM specus_management_user WHERE login_name = ?", "alice-renamed");
     CHECK(row == NULL, "a rename created a second account");
     /* Subjects are case-sensitive: a different subject is a different identity. */
     char *upper = login_token("SUBJECT-ALICE", "alice-upper");
@@ -845,7 +845,7 @@ static void test_binds_existing_user_once(void)
           "first OIDC login did not link the existing local user with its role");
     char expected_key[65];
     st_oidc_identity_key(issuer, "subject-bob", expected_key);
-    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE username = ?", "bob");
+    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE login_name = ?", "bob");
     CHECK(stored_key != NULL && strcmp(stored_key, expected_key) == 0, "existing user was not bound");
     claims_spec intruder = id_claims("subject-intruder", "bob", "nonce-intruder");
     CHECK(login_claims(key_main, "k1", &intruder) == 403
@@ -893,7 +893,7 @@ static void test_disabled_users_are_refused(void)
     create_user("carol", "default", "USER", 0);
     claims_spec carol = id_claims("subject-carol", "carol", "nonce-carol");
     CHECK(login_claims(key_main, "k1", &carol) == 403, "a disabled unbound user was linked");
-    char *bound = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE username = ?", "carol");
+    char *bound = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE login_name = ?", "carol");
     CHECK(bound == NULL || *bound == '\0', "a disabled user was bound");
 
     char *alice = login_token("subject-alice", "alice");
@@ -916,14 +916,13 @@ static void test_refused_usernames(void)
     memset(long_name, 'x', 81U);
     long_name[81] = '\0';
     create_user("dora", "tenant-b", "USER", 1);
-    const char *names[] = {"admin", "ADMIN", NULL, "   ", long_name, "dora"};
+    const char *names[] = {"admin", "ADMIN", NULL, "   ", long_name};
     const char *labels[] = {
         "preferred_username equal to the built-in admin was accepted",
         "preferred_username equal to the built-in admin in other case was accepted",
         "an ID token without preferred_username was accepted",
         "a blank preferred_username was accepted",
-        "an 81-character preferred_username was accepted",
-        "a same-named user of another tenant was linked or duplicated"
+        "an 81-character preferred_username was accepted"
     };
     for (size_t i = 0U; i < sizeof(names) / sizeof(names[0]); ++i) {
         char *subject = format("subject-refused-%zu", i);
@@ -933,23 +932,19 @@ static void test_refused_usernames(void)
               labels[i]);
         free(subject);
     }
-    char *dora_tenant = db_text("SELECT tenant_id FROM specus_management_user WHERE username = ?", "dora");
-    CHECK(dora_tenant != NULL && strcmp(dora_tenant, "tenant-b") == 0, "the other tenant's user changed");
-    free(dora_tenant);
-
-    /* Two spellings of one name (a legacy database): neither is linked and no third is created. */
-    CHECK(db_exec("INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled) "
-                  "VALUES ('Erin', 'default', 'x', 'USER', 1), ('erin', 'default', 'x', 'USER', 1)") == 0,
-          "cannot store two spellings of erin");
-    static const char *const erin_spellings[] = {"erin", "ERIN"};
-    for (size_t i = 0U; i < sizeof(erin_spellings) / sizeof(erin_spellings[0]); ++i) {
-        claims_spec erin = id_claims("subject-erin", erin_spellings[i], "nonce-erin");
-        CHECK(login_claims(key_main, "k1", &erin) == 403, "an ambiguous preferred_username was linked or created");
-    }
-    char *erin_rows = db_text("SELECT COUNT(*) || ':' || COUNT(oidc_identity_key) FROM specus_management_user "
-                              "WHERE lower(username) = lower(?)", "erin");
-    CHECK(erin_rows != NULL && strcmp(erin_rows, "2:0") == 0, "the ambiguous rows changed");
-    free(erin_rows);
+    /*
+     * Login names are unique per tenant only: a same-named user of another tenant is neither linked
+     * nor in the way. The first login provisions a USER of the default tenant (Java
+     * resolveOrProvisionOidcUser looks in the default tenant only) and tenant-b's dora is untouched.
+     */
+    claims_spec dora = id_claims("subject-dora", "Dora", "nonce-dora");
+    CHECK(login_claims(key_main, "k1", &dora) == 200, "a same-named user of another tenant blocked the login");
+    char *dora_rows = db_text("SELECT group_concat(tenant_id || ':' || COALESCE(oidc_subject, '-'), ',') FROM "
+                              "(SELECT tenant_id, oidc_subject FROM specus_management_user "
+                              "WHERE login_name_normalized = ? ORDER BY tenant_id)", "dora");
+    CHECK(dora_rows != NULL && strcmp(dora_rows, "default:subject-dora,tenant-b:-") == 0,
+          "the other tenant's user was linked, or no default-tenant account was provisioned");
+    free(dora_rows);
 
     /* Java stores issuer and subject in 255-character columns and refuses longer values. */
     char long_subject[257];
@@ -957,7 +952,7 @@ static void test_refused_usernames(void)
     long_subject[256] = '\0';
     claims_spec long_spec = id_claims(long_subject, "long-subject-user", "nonce-long");
     CHECK(login_claims(key_main, "k1", &long_spec) == 403, "a 256-character subject was bound");
-    char *created = db_text("SELECT username FROM specus_management_user WHERE username = ?", "long-subject-user");
+    char *created = db_text("SELECT username FROM specus_management_user WHERE login_name = ?", "long-subject-user");
     CHECK(created == NULL, "a refused identity still created an account");
     free(created);
 }

@@ -863,19 +863,23 @@ static const char *normalize_management_role(const char *role);
  * A valid signature only says which account the token was issued to. Like Java's
  * ManagementContextResolver (ManagementUserService.resolveLocalTokenUser) every request re-reads
  * that account: the built-in admin must still be allowed to log in with its password, and a stored
- * user must still exist, be enabled and belong to the token's tenant. Tenant, role and admin rights
- * come from the record as it is now, so disabling, deleting or demoting a user takes effect on the
- * next request rather than when the token expires. This is one SQLite read per authenticated
- * request, the counterpart of Java's repository lookup; nothing is cached. Returns 0 when the
- * account resolves, -1 when it does not, and -2 when the user store cannot be read.
+ * user must still exist and be enabled. The subject is a login name of the token's tenant, so the
+ * lookup is (tenant_id, sub): a same-named user of another tenant is someone else. A token without
+ * a tenant claim predates tenant-scoped login names and names its account by the exact account
+ * key. Tenant, role and admin rights come from the record as it is now, so disabling, deleting or
+ * demoting a user takes effect on the next request rather than when the token expires. This is one
+ * SQLite read per authenticated request, the counterpart of Java's repository lookup; nothing is
+ * cached. Returns 0 when the account resolves, -1 when it does not, and -2 when the user store
+ * cannot be read.
  */
 static int admin_resolve_token_user(const st_security_token_claims *claims, st_admin_context *context)
 {
     memset(context, 0, sizeof(*context));
     const char *builtin_username = env_text("SPECUS_AUTH_USERNAME", "admin");
     const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
+    const char *token_tenant = claims->has_tenant ? claims->tenant_id : "";
     if (admin_ascii_casecmp(claims->username, builtin_username) == 0
-        && (claims->tenant_id[0] == '\0' || admin_ascii_casecmp(claims->tenant_id, default_tenant) == 0)) {
+        && (token_tenant[0] == '\0' || strcmp(token_tenant, default_tenant) == 0)) {
         if (!management_password_login_enabled()) {
             return -1;
         }
@@ -892,13 +896,13 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
         return -1;
     }
     st_storage_management_user user;
-    int found = st_storage_find_management_user(database_path, claims->username, &user);
+    int found = token_tenant[0] != '\0'
+        ? st_storage_find_management_user_in_tenant(database_path, token_tenant, claims->username, &user)
+        : st_storage_find_management_user_by_account_key(database_path, claims->username, &user);
     if (found < 0) {
         return -2;
     }
-    if (found != 0
-        || !user.enabled
-        || (claims->tenant_id[0] != '\0' && strcmp(user.tenant_id, claims->tenant_id) != 0)) {
+    if (found != 0 || !user.enabled) {
         return -1;
     }
     snprintf(context->username, sizeof(context->username), "%s", user.username);
@@ -10729,9 +10733,12 @@ static int handle_management_user_create(const st_admin_context *context, const 
         free(role);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username and password are required\"}");
     }
+    /* Login names are unique per tenant: a same-named user of another tenant is no conflict, and the
+     * answer never tells whether one exists (Java ManagementUserService.createUser). */
     st_storage_management_user existing_user;
     if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0
-        || st_storage_get_management_user(database_path, username, &existing_user) == 0) {
+        || st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username,
+                                                    &existing_user) == 0) {
         free(username);
         free(password);
         free(role);
@@ -11127,6 +11134,31 @@ static int write_management_token_response(const char *username,
     return write_response(out, out_len, 200, "OK", body);
 }
 
+/*
+ * The account dimension of the login rate limit, Java's AuthController.loginIdentity: the tenant
+ * and the login name as sent, so same-named accounts of different tenants are counted apart. The
+ * limiter trims and lower-cases the key; the separator is no white space, so it survives that.
+ */
+static char *management_login_identity(const char *tenant_id, const char *username)
+{
+    const char *tenant = tenant_id == NULL ? "" : tenant_id;
+    const char *name = username == NULL ? "" : username;
+    size_t len = strlen(tenant) + 1U + strlen(name) + 1U;
+    char *identity = malloc(len);
+    if (identity != NULL) {
+        snprintf(identity, len, "%s\x1f%s", tenant, name);
+    }
+    return identity;
+}
+
+/*
+ * POST /auth/login, Java's ManagementUserService.authenticate. The tenant comes from the request
+ * body only (tenantId). With a tenant only that tenant's login names are searched. Without one the
+ * default tenant is searched first and then, only when it has no such name, an account that
+ * predates tenant-scoped login names, found by its account key and only when that key is unique;
+ * new accounts of other tenants must name their tenant. The built-in admin matches without a tenant
+ * or with the default one. Every refusal answers alike.
+ */
 static int handle_management_auth_login(const char *body,
                                         const char *remote_address,
                                         char *out,
@@ -11138,18 +11170,27 @@ static int handle_management_auth_login(const char *body,
     char *username = st_json_get_string(body, "username");
     char *password = st_json_get_string(body, "password");
     char *turnstile_token = st_json_get_string(body, "turnstileToken");
+    char *tenant_text = st_json_get_string(body, "tenantId");
+    const char *requested_tenant = tenant_text == NULL ? "" : admin_trim(tenant_text);
+    char *identity = management_login_identity(requested_tenant, username == NULL ? "" : username);
     st_login_rate_limit_config rate_limit = management_login_rate_limit_config();
     int64_t retry_after_seconds = 0;
     time_t now = time(NULL);
-    if (st_login_rate_limiter_check(remote_address,
-                                    username,
-                                    &rate_limit,
-                                    now < 0 ? 0 : (int64_t)now,
-                                    &retry_after_seconds) != 0) {
+    if (identity == NULL
+        || st_login_rate_limiter_check(remote_address,
+                                       identity,
+                                       &rate_limit,
+                                       now < 0 ? 0 : (int64_t)now,
+                                       &retry_after_seconds) != 0) {
+        int failed = identity == NULL;
         free(username);
         free(password);
         free(turnstile_token);
-        return write_login_rate_limited_response(out, out_len, retry_after_seconds);
+        free(tenant_text);
+        free(identity);
+        return failed
+            ? write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"login failed\"}")
+            : write_login_rate_limited_response(out, out_len, retry_after_seconds);
     }
     int turnstile_status = 400;
     char turnstile_error[256];
@@ -11158,23 +11199,32 @@ static int handle_management_auth_login(const char *body,
         free(username);
         free(password);
         free(turnstile_token);
+        free(tenant_text);
+        free(identity);
         return write_registration_error_response(turnstile_status, turnstile_error, out, out_len);
     }
     free(turnstile_token);
-    if (normalize_username_in_place(username) != 0 || password == NULL) {
+    /* A tenant id longer than any tenant can have (Java's TenantContext allows 80 characters, C
+     * stores 63 bytes) names no tenant: the login fails like any other. */
+    if (normalize_username_in_place(username) != 0 || password == NULL
+        || strlen(requested_tenant) > ST_SECURITY_TOKEN_TENANT_LEN) {
         free(username);
         free(password);
+        free(tenant_text);
+        free(identity);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
     int ok = 0;
     int database_user = 0;
     char token_username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
     snprintf(token_username, sizeof(token_username), "%s", username);
-    snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+    snprintf(token_tenant, sizeof(token_tenant), "%s", default_tenant);
     snprintf(token_role, sizeof(token_role), "%s", "USER");
-    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
+    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0
+        && (*requested_tenant == '\0' || strcmp(requested_tenant, default_tenant) == 0)) {
         const char *admin_password = getenv("SPECUS_AUTH_PASSWORD");
         if (admin_password == NULL) {
             admin_password = "";
@@ -11187,7 +11237,7 @@ static int handle_management_auth_login(const char *body,
             && st_constant_time_eq(expected, actual, sizeof(expected));
         if (ok) {
             snprintf(token_username, sizeof(token_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
-            snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+            snprintf(token_tenant, sizeof(token_tenant), "%s", default_tenant);
             snprintf(token_role, sizeof(token_role), "%s", "ADMIN");
         }
     } else {
@@ -11196,7 +11246,13 @@ static int handle_management_auth_login(const char *body,
             && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
             st_storage_management_user user;
             st_password_verification verification;
-            ok = st_storage_get_management_user(database_path, username, &user) == 0
+            int found = *requested_tenant != '\0'
+                ? st_storage_find_management_user_in_tenant(database_path, requested_tenant, username, &user)
+                : st_storage_find_management_user_in_tenant(database_path, default_tenant, username, &user);
+            if (found == 1 && *requested_tenant == '\0') {
+                found = st_storage_find_legacy_management_user(database_path, username, &user);
+            }
+            ok = found == 0
                 && user.enabled
                 && st_password_verify(password, user.password_hash, &verification) == 0
                 && verification.matches;
@@ -11218,10 +11274,12 @@ static int handle_management_auth_login(const char *body,
         }
     }
     if (ok) {
-        st_login_rate_limiter_record_success(username);
+        st_login_rate_limiter_record_success(identity);
     }
     free(username);
     free(password);
+    free(tenant_text);
+    free(identity);
     if (!ok) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }

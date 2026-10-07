@@ -91,6 +91,13 @@ static void registration_error(char *error, size_t error_len, const char *messag
     if (error != NULL && error_len > 0U) snprintf(error, error_len, "%s", message);
 }
 
+/* Self-registration opens accounts in the default tenant only (Java RegistrationService). */
+static const char *registration_tenant(void)
+{
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    return tenant == NULL || *tenant == '\0' ? "default" : tenant;
+}
+
 void st_registration_set_handlers(st_registration_turnstile_handler turnstile,
                                   st_registration_email_handler email,
                                   void *ctx)
@@ -478,7 +485,9 @@ int st_registration_request(const char *database_path,
     }
     st_storage_management_user existing_user;
     int email_exists = st_storage_management_email_exists(database_path, email);
-    if (st_storage_get_management_user(database_path, username, &existing_user) == 0) {
+    /* Registration opens accounts in the default tenant only, so only its login names conflict. */
+    if (st_storage_get_management_user_in_tenant(database_path, registration_tenant(), username,
+                                                 &existing_user) == 0) {
         registration_error(error, error_len, "用户名已存在");
         goto fail;
     }
@@ -627,16 +636,15 @@ int st_registration_verify(const char *database_path,
         free(registration_id); free(code);
         return -1;
     }
-    if (st_storage_get_management_user(database_path, challenge.username, &existing) == 0
+    if (st_storage_get_management_user_in_tenant(database_path, registration_tenant(), challenge.username,
+                                                 &existing) == 0
         || email_exists > 0) {
         registration_error(error, error_len, email_exists > 0 ? "该邮箱已注册" : "用户名已存在");
         free(registration_id); free(code);
         return -1;
     }
     snprintf(challenge.updated_at, sizeof(challenge.updated_at), "%s", now_text);
-    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
-    if (st_storage_complete_registration(database_path, &challenge,
-                                         tenant == NULL ? "default" : tenant, user) != 0) {
+    if (st_storage_complete_registration(database_path, &challenge, registration_tenant(), user) != 0) {
         registration_error(error, error_len, "用户名或邮箱已被注册");
         free(registration_id); free(code);
         return -1;

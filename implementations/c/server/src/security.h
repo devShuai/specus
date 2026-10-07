@@ -10,6 +10,9 @@
 typedef struct {
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
+    /* The token carried tenant_id; without it tenant_id holds the default tenant. Tokens issued since
+     * tenant-scoped login names always carry it, so one without it names its account by account key. */
+    int has_tenant;
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
     long long expires_at;
 } st_security_token_claims;

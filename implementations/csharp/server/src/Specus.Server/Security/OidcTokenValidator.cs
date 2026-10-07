@@ -42,7 +42,10 @@ public sealed class AdminBearerTokenValidator
             {
                 return null;
             }
-            var current = await _users.ResolveRefreshUserAsync(subject, cancellationToken)
+            // sub is a login name of the token's tenant; a token without tenant_id predates
+            // tenant-scoped login names and its sub is an account key.
+            var current = await _users.ResolveLocalTokenUserAsync(subject,
+                    signedPrincipal.FindFirst("tenant_id")?.Value, cancellationToken)
                 .ConfigureAwait(false);
             return current is null
                 ? null

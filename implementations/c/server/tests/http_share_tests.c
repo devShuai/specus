@@ -373,9 +373,10 @@ static int seed_world(void)
         char *tenant = jget_string(members[i].value, "tenantId");
         char *role = jget_string(members[i].value, "role");
         char *sql = sqlite3_mprintf(
-            "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled) "
-            "VALUES(%Q,%Q,'x',%Q,%d)",
-            members[i].key, tenant, role, jget_bool(members[i].value, "enabled", 1));
+            "INSERT INTO specus_management_user(username, login_name, login_name_normalized, tenant_id, "
+            "password_hash, role, enabled) VALUES(%Q,%Q,lower(%Q),%Q,'x',%Q,%d)",
+            members[i].key, members[i].key, members[i].key, tenant, role,
+            jget_bool(members[i].value, "enabled", 1));
         rc = sql_exec(sql);
         sqlite3_free(sql);
         free(tenant);

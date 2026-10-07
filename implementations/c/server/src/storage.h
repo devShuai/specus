@@ -34,8 +34,16 @@ typedef struct {
     char updated_at[64];
 } st_storage_client;
 
+/*
+ * A management account (protocol/spec/management-accounts.md). username is the login name: unique
+ * inside the tenant, case-insensitively, and with tenant_id the identity that tokens, ownership
+ * columns and the management API carry. account_key is the primary key column, historically named
+ * username: accounts that predate tenant-scoped login names keep their old username there, new
+ * accounts get a random UUID. It is never shown and never used to sign in.
+ */
 typedef struct {
     char username[81];
+    char account_key[81];
     char tenant_id[64];
     char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     char role[20];
@@ -527,6 +535,15 @@ typedef struct {
 } st_storage_tcp_frame_record;
 
 int st_storage_init(const char *path, int seed_demo_client);
+/*
+ * Java ManagementUserSchemaMigrator, which st_storage_init runs too: adds login_name and
+ * login_name_normalized, refuses (before writing anything) a login name that is blank or longer
+ * than 80 characters and two accounts of one tenant with the same normalized login name, backfills
+ * both columns, and creates the unique index uq_management_user_tenant_login_name on
+ * (tenant_id, login_name_normalized), refusing an index of that name with another definition.
+ * Idempotent. 0 on success; -1 with the reason in error otherwise.
+ */
+int st_storage_migrate_management_login_names(const char *path, char *error, size_t error_len);
 int st_storage_client_enabled(const char *path, const char *client_name);
 int st_storage_count_clients_by_tenant(const char *path, const char *tenant_id, long long *count);
 int st_storage_list_clients(const char *path,
@@ -539,28 +556,43 @@ int st_storage_client_has_online_receive_capability(const char *path,
                                                     long long client_id,
                                                     int *capable);
 /*
- * Usernames are a global key, so a lookup by name alone (login, registration, create conflicts and
- * token resolution) finds a user of any tenant. Listing, reading on behalf of an administrator,
- * updating and deleting are scoped to one tenant instead (NULL or empty means the default tenant):
- * a user of another tenant is simply not found there, as Java's
- * ManagementUserService.requireMutableUserInTenant has it.
+ * Login names are unique per tenant, compared trimmed and lower-cased (ASCII letters only), so
+ * every lookup by name names its tenant (NULL or empty means "default"): a user of another tenant
+ * is simply not found, as Java's ManagementUserService has it. The only lookups by account key are
+ * st_storage_find_management_user_by_account_key (a token without a tenant claim) and
+ * st_storage_find_legacy_management_user (a login without a tenant).
  */
 int st_storage_list_management_users(const char *path,
                                      const char *tenant_id,
                                      st_storage_management_user *users,
                                      size_t max_users,
                                      size_t *user_count);
-int st_storage_get_management_user(const char *path,
-                                   const char *username,
-                                   st_storage_management_user *user);
 int st_storage_get_management_user_in_tenant(const char *path,
                                              const char *tenant_id,
                                              const char *username,
                                              st_storage_management_user *user);
-/* Read-only lookup: 0 when found, 1 when there is no such user, -1 when the store cannot be read. */
-int st_storage_find_management_user(const char *path,
-                                    const char *username,
-                                    st_storage_management_user *user);
+/*
+ * Read-only lookups for every authenticated request: 0 when found, 1 when there is no such user,
+ * -1 when the store cannot be read. The first finds a login name of one tenant; the second the
+ * exact account key that a token issued without a tenant claim names.
+ */
+int st_storage_find_management_user_in_tenant(const char *path,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              st_storage_management_user *user);
+int st_storage_find_management_user_by_account_key(const char *path,
+                                                    const char *account_key,
+                                                    st_storage_management_user *user);
+/*
+ * The bare-login fallback of Java's ManagementUserService.authenticate: an account that predates
+ * tenant-scoped login names kept its username as account key, so a login without a tenant may find
+ * it by that key, ignoring case. 0 when exactly one account matches, 1 when none or several do (an
+ * ambiguous key is no one's), -1 when the store cannot be read.
+ */
+int st_storage_find_legacy_management_user(const char *path,
+                                           const char *name,
+                                           st_storage_management_user *user);
+/* The new account gets a random account key; -1 when tenant_id already has the login name. */
 int st_storage_create_management_user(const char *path,
                                       const char *username,
                                       const char *tenant_id,
@@ -580,10 +612,11 @@ int st_storage_delete_management_user(const char *path, const char *tenant_id, c
 /*
  * Java ManagementUserService.resolveOrProvisionOidcUser for a verified issuer/subject pair, in one
  * transaction: the user already bound to identity_key resolves when enabled; otherwise an enabled,
- * unbound user named username in tenant_id is bound on this first login; otherwise a USER account
- * named username is created in tenant_id with password_hash. A disabled user, one bound to another
- * identity, or a same-named user of another tenant is refused. With password_hash NULL nothing is
- * created and 2 is returned instead, so the caller derives the slow hash only when it is needed.
+ * unbound user of tenant_id with the login name username is bound on this first login; otherwise a
+ * USER account with that login name is created in tenant_id with password_hash and a random
+ * account key. A disabled user or one bound to another identity is refused; users of other tenants
+ * take no part. With password_hash NULL nothing is created and 2 is returned instead, so the
+ * caller derives the slow hash only when it is needed.
  * Returns 0 with *out_user filled, 1 when refused, 2 as above and -1 when the store fails.
  */
 int st_storage_resolve_oidc_user(const char *path,

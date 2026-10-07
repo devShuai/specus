@@ -80,40 +80,44 @@ func (db *DB) DeleteExpiredRegistrationChallenges(ctx context.Context, expiresBe
 	return err
 }
 
+// CompleteVerifiedRegistration creates the account, its verified email and consumes the challenge in
+// one transaction, and returns the account as stored. The account gets a fresh random key, and the
+// email row points at that key (Java RegistrationService stores user.accountKey()); the Username of
+// userEmail is ignored.
 func (db *DB) CompleteVerifiedRegistration(
 	ctx context.Context,
 	challenge ManagementRegistrationChallenge,
 	user ManagementUser,
 	userEmail ManagementUserEmail,
-) error {
+) (ManagementUser, error) {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return ManagementUser{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, db.rebind(`INSERT INTO specus_management_user
-		(username, tenant_id, password_hash, role, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`), user.Username, defaultTenant(user.TenantID), user.PasswordHash,
-		normalizeManagementRole(user.Role), boolToInt(user.Enabled), formatTime(user.CreatedAt),
-		formatTime(user.UpdatedAt)); err != nil {
-		return err
+	user.AccountKey = ""
+	if err := db.insertManagementUserOn(ctx, tx, &user); err != nil {
+		return ManagementUser{}, err
 	}
 	if _, err := tx.ExecContext(ctx, db.rebind(`INSERT INTO specus_management_user_email
 		(username, email, verified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`),
-		userEmail.Username, userEmail.Email, formatTime(userEmail.VerifiedAt),
+		user.AccountKey, userEmail.Email, formatTime(userEmail.VerifiedAt),
 		formatTime(userEmail.CreatedAt), formatTime(userEmail.UpdatedAt)); err != nil {
-		return err
+		return ManagementUser{}, err
 	}
 	result, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM specus_management_registration_challenge
 		WHERE registration_id = ? AND code_hash = ?`), challenge.RegistrationID, challenge.CodeHash)
 	if err != nil {
-		return err
+		return ManagementUser{}, err
 	}
 	deleted, err := result.RowsAffected()
 	if err != nil || deleted != 1 {
-		return fmt.Errorf("registration challenge changed before completion")
+		return ManagementUser{}, fmt.Errorf("registration challenge changed before completion")
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return ManagementUser{}, err
+	}
+	return user, nil
 }
 
 type registrationChallengeScanner interface {

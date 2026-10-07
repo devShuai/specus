@@ -1053,9 +1053,215 @@ static int test_client_account_id_migration(void)
     return failures == 0 ? 0 : 1;
 }
 
+/* specus_management_user as releases before tenant-scoped login names created it. */
+static const char legacy_management_user_table[] =
+    "CREATE TABLE specus_management_user ("
+    "username TEXT PRIMARY KEY,"
+    "tenant_id TEXT NOT NULL DEFAULT 'default',"
+    "password_hash TEXT NOT NULL DEFAULT 'hash',"
+    "role TEXT NOT NULL DEFAULT 'USER',"
+    "enabled INTEGER NOT NULL DEFAULT 1,"
+    "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    "oidc_issuer TEXT,"
+    "oidc_subject TEXT,"
+    "oidc_identity_key TEXT);";
+
+static int login_name_exec(const char *path, const char *sql)
+{
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    int rc = sqlite3_open(path, &db) == SQLITE_OK ? sqlite3_exec(db, sql, NULL, NULL, &error) : SQLITE_ERROR;
+    sqlite3_free(error);
+    sqlite3_close(db);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
+/* A fresh file holding only the legacy account table and the given rows. */
+static int legacy_login_name_database(const char *path, const char *rows)
+{
+    unlink(path);
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "%s%s", legacy_management_user_table, rows);
+    if (login_name_exec(path, sql) != 0) {
+        fprintf(stderr, "legacy account table setup failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int login_name_query_text(const char *path, const char *sql, char *out, size_t out_len)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    out[0] = '\0';
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        snprintf(out, out_len, "%s", text == NULL ? "(null)" : (const char *)text);
+        rc = 0;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+/* Java ManagementUserSchemaMigratorTests.backfillsLegacyRowsAndEnforcesTenantScopedUniqueness. */
+static int test_login_name_migration_backfills_legacy_rows(void)
+{
+    char path[256];
+    char text[128];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-backfill-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "INSERT INTO specus_management_user(username, tenant_id) "
+                                         "VALUES('Alice','tenant-a'),('alice','tenant-b');") != 0) {
+        return 1;
+    }
+    int failed = st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0;
+    char error[160];
+    failed = failed || st_storage_migrate_management_login_names(path, error, sizeof(error)) != 0;
+    if (failed) fprintf(stderr, "login-name migration of legacy rows failed\n");
+    if (!failed) {
+        failed = login_name_query_text(path, "SELECT login_name || '/' || login_name_normalized "
+                                             "FROM specus_management_user WHERE username = 'Alice'",
+                                       text, sizeof(text)) != 0
+            || strcmp(text, "Alice/alice") != 0;
+        if (failed) fprintf(stderr, "legacy row backfill mismatch: %s\n", text);
+    }
+    if (!failed && login_name_exec(path, "INSERT INTO specus_management_user(username, tenant_id, login_name, "
+                                         "login_name_normalized, password_hash) "
+                                         "VALUES('new-key','tenant-a','ALICE','alice','hash');") == 0) {
+        fprintf(stderr, "a second alice of tenant-a was stored\n");
+        failed = 1;
+    }
+    static const char *const tenants[][2] = {{"tenant-a", "Alice"}, {"tenant-b", "alice"}};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        st_storage_management_user user;
+        failed = st_storage_get_management_user_in_tenant(path, tenants[i][0], "ALICE", &user) != 0
+            || strcmp(user.account_key, tenants[i][1]) != 0 || strcmp(user.username, tenants[i][1]) != 0
+            || strcmp(user.tenant_id, tenants[i][0]) != 0;
+        if (failed) fprintf(stderr, "%s's alice is not found in its own tenant\n", tenants[i][0]);
+    }
+    st_storage_management_user nobody;
+    if (!failed && st_storage_get_management_user_in_tenant(path, "default", "alice", &nobody) == 0) {
+        fprintf(stderr, "the default tenant found another tenant's alice\n");
+        failed = 1;
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/* Java ManagementUserSchemaMigratorTests.failsBeforeBackfillWhenLegacyRowsCollideInsideTenant. */
+static int test_login_name_migration_refuses_duplicates_inside_a_tenant(void)
+{
+    char path[256];
+    char text[128];
+    char error[160];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-duplicate-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "INSERT INTO specus_management_user(username, tenant_id) "
+                                         "VALUES('Alice','tenant-a'),('alice','tenant-a');") != 0) {
+        return 1;
+    }
+    int failed = st_storage_init(path, 0) == 0;
+    if (failed) fprintf(stderr, "storage opened with two alices in one tenant\n");
+    if (!failed) {
+        failed = st_storage_migrate_management_login_names(path, error, sizeof(error)) == 0
+            || strstr(error, "duplicate management login name") == NULL || strstr(error, "tenant-a") == NULL;
+        if (failed) fprintf(stderr, "duplicate login name error mismatch: %s\n", error);
+    }
+    if (!failed) {
+        failed = login_name_query_text(path, "SELECT COUNT(*) FROM specus_management_user "
+                                             "WHERE login_name IS NOT NULL", text, sizeof(text)) != 0
+            || strcmp(text, "0") != 0;
+        if (failed) fprintf(stderr, "%s rows were backfilled before the failure\n", text);
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/* Java ManagementUserSchemaMigratorTests.rejectsAnExistingIndexWithTheExpectedNameButWrongDefinition. */
+static int test_login_name_migration_rejects_a_wrong_index(void)
+{
+    char path[256];
+    char error[160];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-index-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "CREATE UNIQUE INDEX uq_management_user_tenant_login_name "
+                                         "ON specus_management_user(username);") != 0) {
+        return 1;
+    }
+    int failed = st_storage_init(path, 0) == 0
+        || st_storage_migrate_management_login_names(path, error, sizeof(error)) == 0
+        || strstr(error, "must be unique on (tenant_id, login_name_normalized)") == NULL;
+    if (failed) fprintf(stderr, "a wrong login-name index was accepted: %s\n", error);
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * ManagementUserServiceTests.createsSameLoginNameInDifferentTenantWithoutGlobalLookup at the store:
+ * a new account gets a random key rather than its name, so tenants share login names, and the
+ * legacy key lookup finds only accounts that predate login names, and only an unambiguous one.
+ */
+static int test_login_names_are_unique_per_tenant(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-tenants-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "INSERT INTO specus_management_user(username, tenant_id) "
+                                         "VALUES('Carol','tenant-c'),('carol','tenant-d'),('erin','tenant-e');") != 0) {
+        return 1;
+    }
+    st_storage_management_user a;
+    st_storage_management_user b;
+    st_storage_management_user other;
+    int failed = st_storage_init(path, 0) != 0
+        || st_storage_create_management_user(path, "Bob", "tenant-a", "hash", "USER", 1, &a) != 0
+        || st_storage_create_management_user(path, "bob", "tenant-b", "hash", "USER", 1, &b) != 0;
+    if (failed) fprintf(stderr, "same login name in two tenants was refused\n");
+    if (!failed) {
+        failed = strlen(a.account_key) != 36U || a.account_key[8] != '-' || a.account_key[14] != '4'
+            || strcmp(a.account_key, b.account_key) == 0 || strcmp(a.username, "Bob") != 0
+            || strcmp(b.username, "bob") != 0;
+        if (failed) fprintf(stderr, "new accounts did not get random keys: %s %s\n", a.account_key, b.account_key);
+    }
+    if (!failed && st_storage_create_management_user(path, " BOB ", "tenant-a", "hash", "USER", 1, &other) == 0) {
+        fprintf(stderr, "a second bob of tenant-a was created\n");
+        failed = 1;
+    }
+    if (!failed && st_storage_find_legacy_management_user(path, "bob", &other) != 1) {
+        fprintf(stderr, "a new account was found by its login name as a legacy key\n");
+        failed = 1;
+    }
+    if (!failed && st_storage_find_legacy_management_user(path, "CAROL", &other) != 1) {
+        fprintf(stderr, "an ambiguous legacy key resolved\n");
+        failed = 1;
+    }
+    if (!failed) {
+        failed = st_storage_find_legacy_management_user(path, "Erin", &other) != 0
+            || strcmp(other.account_key, "erin") != 0 || strcmp(other.tenant_id, "tenant-e") != 0;
+        if (failed) fprintf(stderr, "a unique legacy key did not resolve\n");
+    }
+    if (!failed) {
+        failed = st_storage_find_management_user_by_account_key(path, a.account_key, &other) != 0
+            || strcmp(other.tenant_id, "tenant-a") != 0
+            || st_storage_find_management_user_by_account_key(path, "ERIN", &other) != 1
+            || st_storage_find_management_user_in_tenant(path, "tenant-b", "BOB", &other) != 0
+            || strcmp(other.account_key, b.account_key) != 0
+            || st_storage_find_management_user_in_tenant(path, "tenant-c", "bob", &other) != 1;
+        if (failed) fprintf(stderr, "account key or tenant lookups mismatch\n");
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
 int main(void)
 {
     if (test_client_account_id_migration() != 0) {
+        return 1;
+    }
+    if (test_login_name_migration_backfills_legacy_rows() != 0
+        || test_login_name_migration_refuses_duplicates_inside_a_tenant() != 0
+        || test_login_name_migration_rejects_a_wrong_index() != 0
+        || test_login_names_are_unique_per_tenant() != 0) {
         return 1;
     }
     if (test_peer_mesh_acl_direction_migration() != 0) {
@@ -1162,7 +1368,7 @@ int main(void)
         || st_storage_update_management_user(path, "tenant-other", "ALICE", "taken-over", "ADMIN", 0,
                                              &foreign_view) == 0
         || st_storage_delete_management_user(path, "tenant-other", "alice") == 0
-        || st_storage_get_management_user(path, "alice", &created_user) != 0
+        || st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) != 0
         || strcmp(created_user.tenant_id, "default") != 0
         || strcmp(created_user.password_hash, "hash-value") != 0
         || strcmp(created_user.role, "USER") != 0
@@ -1188,7 +1394,7 @@ int main(void)
         unlink(path);
         return 1;
     }
-    if (st_storage_get_management_user(path, "alice", &created_user) != 0
+    if (st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) != 0
         || strcmp(created_user.username, "alice") != 0
         || created_user.enabled != 0) {
         fprintf(stderr, "management user lookup mismatch\n");
@@ -1196,7 +1402,7 @@ int main(void)
         return 1;
     }
     if (st_storage_delete_management_user(path, "default", "alice") != 0
-        || st_storage_get_management_user(path, "alice", &created_user) == 0) {
+        || st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) == 0) {
         fprintf(stderr, "management user delete mismatch\n");
         unlink(path);
         return 1;

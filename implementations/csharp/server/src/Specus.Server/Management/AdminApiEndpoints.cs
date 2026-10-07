@@ -124,9 +124,12 @@ public static class AdminApiEndpoints
             }
             // Throttle before the captcha and credential check so deployments without Turnstile are
             // still bounded. Forwarded addresses are accepted only from configured trusted proxies.
+            // The account budget belongs to the tenant-qualified login name, so the same name in
+            // two tenants is counted, and cleared, separately.
+            var loginIdentity = LoginRateLimiter.LoginIdentity(request.TenantId, request.Username);
             if (!loginRateLimiter.TryAcquire(
                     addressResolver.Resolve(httpContext),
-                    request.Username,
+                    loginIdentity,
                     out var retryAfterSeconds))
             {
                 httpContext.Response.Headers.RetryAfter =
@@ -137,7 +140,9 @@ public static class AdminApiEndpoints
             await turnstile.VerifyAsync(request.TurnstileToken, TurnstileVerifier.LoginAction,
                     cancellationToken)
                 .ConfigureAwait(false);
-            var user = await users.AuthenticateAsync(request.Username, request.Password, cancellationToken)
+            // Only the body's tenantId selects the tenant; never the host or another header.
+            var user = await users.AuthenticateAsync(request.Username, request.Password, request.TenantId,
+                    cancellationToken)
                 .ConfigureAwait(false);
             if (user is null)
             {
@@ -145,7 +150,7 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status401Unauthorized);
             }
 
-            loginRateLimiter.RecordSuccess(request.Username);
+            loginRateLimiter.RecordSuccess(loginIdentity);
             if (!user.BuiltInAdmin)
             {
                 await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
@@ -206,8 +211,10 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
+            // The bearer was already re-resolved to the account's login name and tenant.
             var principal = ManagementContext.From(context, authOptions.Value);
-            var current = await users.ResolveRefreshUserAsync(principal.Username, cancellationToken)
+            var current = await users.ResolveLocalTokenUserAsync(principal.Username, principal.TenantId,
+                    cancellationToken)
                 .ConfigureAwait(false);
             if (current is null)
             {
