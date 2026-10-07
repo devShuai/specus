@@ -1431,8 +1431,9 @@ static void pm_get_settings(const char *database_path,
 }
 
 /*
- * Switching off drops the tenant's progress rows (they are not folded into counts); switching on
- * clears the purge mark. An unchanged state keeps updatedAt and updatedBy.
+ * Switching off drops the tenant's progress rows (they are not folded into counts). Any change of
+ * state clears the purge mark, so while the switch is off the mark only stands for a purge made
+ * after switching off. An unchanged state keeps updatedAt, updatedBy and the mark.
  */
 static void pm_put_settings(const char *database_path,
                             const st_product_metrics_actor *actor,
@@ -1472,10 +1473,8 @@ static void pm_put_settings(const char *database_path,
             snprintf(row.updated_by, sizeof(row.updated_by), "%s", actor->username == NULL ? "" : actor->username);
             row.has_updated_at = 1;
             row.updated_at_ms = now;
-            if (update.enabled) {
-                row.has_purged_at = 0;
-                row.purged_at_ms = 0;
-            }
+            row.has_purged_at = 0;
+            row.purged_at_ms = 0;
         }
         rc = pm_save_switch(db, &row);
     }
@@ -1784,7 +1783,8 @@ static int pm_list_switches(sqlite3 *db, pm_switch **rows, size_t *count)
 /*
  * The four steps of section 9: progress of tenants that are off goes (no fold); progress past the
  * window closes as expired; daily rows older than the retention go; tenants that are off and were
- * purged lose every daily and progress row (stragglers written within the switch cache period).
+ * purged since switching off lose every daily and progress row (stragglers written within the
+ * switch cache period). Switching off clears the mark a purge made while collecting.
  * Idempotent, independent of when it runs, safe on any number of instances.
  */
 int st_product_metrics_sweep(const char *database_path)
