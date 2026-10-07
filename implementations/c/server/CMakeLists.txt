@@ -30,6 +30,7 @@ add_library(specus_c_core
     src/login_rate_limiter.c
     src/media_capture.c
     src/object_storage.c
+    src/oidc.c
     src/password_hash.c
     src/peer_egress.c
     src/peer_mesh.c
@@ -151,6 +152,12 @@ add_test(NAME media_capture_tests
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/media_capture_test.sh
                  $<TARGET_FILE:specus_c_media_capture_tests>)
 set_tests_properties(media_capture_tests PROPERTIES TIMEOUT 45)
+
+add_executable(specus_c_oidc_tests tests/oidc_tests.c)
+target_link_libraries(specus_c_oidc_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_oidc_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME oidc_tests COMMAND specus_c_oidc_tests)
+set_tests_properties(oidc_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_password_hash_tests tests/password_hash_tests.c)
 target_link_libraries(specus_c_password_hash_tests PRIVATE specus_c_core)
