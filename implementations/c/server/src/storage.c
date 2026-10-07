@@ -3562,6 +3562,39 @@ static int update_client_on_db(sqlite3 *db,
         }
         sqlite3_finalize(stmt);
     }
+    /*
+     * The other operational records that carry the name follow the account, as Java
+     * ClientNameReferenceRepository.rename does; history (connection records, traffic detail)
+     * keeps the name it was captured under. Traffic usage is keyed by name here, so a row a deleted
+     * client of the new name left for the same day gives way to the renamed client's row.
+     */
+    static const char *const references_sql[] = {
+        "UPDATE specus_client_identity SET client_name = ?1 WHERE client_id = ?2",
+        "UPDATE peer_mesh_device SET client_name = ?1, updated_at = CURRENT_TIMESTAMP WHERE client_id = ?2",
+        "UPDATE peer_mesh_acl SET source_client_name = ?1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE source_client_id = ?2",
+        "UPDATE peer_mesh_acl SET target_client_name = ?1, updated_at = CURRENT_TIMESTAMP "
+        "WHERE target_client_id = ?2",
+        "UPDATE OR REPLACE traffic_usage SET client_name = ?1 "
+        "WHERE client_id = ?2 OR (client_id IS NULL AND client_name = ?3)",
+        "UPDATE OR REPLACE resource_traffic_usage SET client_name = ?1 "
+        "WHERE client_id = ?2 OR (client_id IS NULL AND client_name = ?3)"
+    };
+    for (size_t i = 0; rc == 0 && previous_name != NULL && strcmp(previous_name, client_name) != 0
+                       && i < sizeof(references_sql) / sizeof(references_sql[0]); ++i) {
+        if (sqlite3_prepare_v2(db, references_sql[i], -1, &stmt, NULL) != SQLITE_OK) {
+            rc = -1;
+        } else {
+            sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, id);
+            if (sqlite3_bind_parameter_count(stmt) >= 3) {
+                sqlite3_bind_text(stmt, 3, previous_name, -1, SQLITE_TRANSIENT);
+            }
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
     return rc;
 }
 
@@ -9887,10 +9920,16 @@ int st_storage_create_http_route_audited(const char *path,
     }
     share_route_state existing;
     share_route_state created;
+    (void)password_set;
+    (void)revoked;
     int rc = share_begin(db);
     if (rc == 0) {
         rc = share_load_route_state(db, ST_SHARE_ROUTE_STATE_COLUMNS "WHERE r.client_name = ? AND r.route = ?",
                                     0, client.client_name, route, &existing);
+    }
+    /* A second route of the same name is refused; it used to overwrite the first one. */
+    if (rc == 0 && existing.found) {
+        rc = ST_STORAGE_HTTP_ROUTE_EXISTS;
     }
     if (rc == 0) {
         rc = upsert_http_route_on_db(db, client.client_name, route, target_base_url, enabled,
@@ -9904,23 +9943,15 @@ int st_storage_create_http_route_audited(const char *path,
             rc = -1;
         }
     }
-    const char *after = share_exposure(enabled, auth_enabled);
-    if (rc == 0 && !existing.found) {
+    if (rc == 0) {
         char detail[64];
-        snprintf(detail, sizeof(detail), "{\"exposure\":\"%s\"}", after);
+        snprintf(detail, sizeof(detail), "{\"exposure\":\"%s\"}", share_exposure(enabled, auth_enabled));
         rc = share_audit(db, client.tenant_id, now_ms / 1000LL, actor, "route.created", created.id, NULL, detail);
-    } else if (rc == 0) {
-        /* Creating a route that already exists updates it, with the update's audit and hooks. */
-        const char *username = auth_username == NULL ? "" : auth_username;
-        int credentials_changed = auth_enabled && (strcmp(username, existing.auth_username) != 0 || password_set);
-        rc = share_route_changed(db, client.tenant_id, existing.id,
-                                 share_exposure(existing.enabled, existing.auth_enabled), after,
-                                 credentials_changed, actor, now_ms, revoked);
     }
     rc = share_end(db, rc);
     sqlite3_close(db);
     if (rc != 0) {
-        return -1;
+        return rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? rc : -1;
     }
     return out_route == NULL
         ? 0
@@ -9958,6 +9989,22 @@ int st_storage_update_http_route_audited(const char *path,
         }
     }
     if (rc == 0) {
+        /* Another route of the client already has the new name (its own name is no conflict). */
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db,
+                                "SELECT 1 FROM http_route_mapping self JOIN http_route_mapping other "
+                                "ON other.client_name = self.client_name AND other.route = ? AND other.id <> self.id "
+                                "WHERE self.id = ?",
+                                -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, route, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, id);
+            int step = sqlite3_step(stmt);
+            rc = step == SQLITE_ROW ? ST_STORAGE_HTTP_ROUTE_EXISTS : step == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) {
         rc = update_http_route_on_db(db, id, route, target_base_url, enabled, detail_capture_enabled,
                                      media_capture_enabled, path_rewrite_enabled, insecure_skip_verify,
                                      auth_enabled, auth_username, auth_password_hash);
@@ -9973,7 +10020,7 @@ int st_storage_update_http_route_audited(const char *path,
     rc = share_end(db, rc);
     sqlite3_close(db);
     if (rc != 0) {
-        return -1;
+        return rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? rc : -1;
     }
     return out_route == NULL ? 0 : load_http_route_by_id(path, id, out_route);
 }

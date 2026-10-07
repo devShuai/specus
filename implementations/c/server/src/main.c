@@ -267,6 +267,7 @@ static size_t live_connection_count = 0U;
 static int server_stopping = 0;
 
 static char *json_http_request(const st_direct_http_request *request);
+static char *json_http_request_fin(const st_direct_http_request *request, int *failed);
 static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason);
 static int send_window_update(specus_session *session, uint32_t stream_id, size_t credit);
@@ -2006,9 +2007,15 @@ static int direct_http_forward(void *ctx,
         }
         offset += chunk_len;
     }
+    int fin_failed = 0;
+    char *fin_json = json_http_request_fin(request, &fin_failed);
+    if (fin_failed) {
+        goto failed;
+    }
     packet = st_protocol_encode_nat_message(ST_NAT_FIN, 0U,
                                             pending.stream_id, 0U,
-                                            NULL, NULL, 0U);
+                                            fin_json, NULL, 0U);
+    free(fin_json);
     if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
         goto failed;
     }
@@ -3482,11 +3489,42 @@ static char *json_http_request(const st_direct_http_request *request)
                                       request->headers_len, &first);
     }
     if (rc == 0) {
-        rc = sb_appendf(&builder, ",\"contentLength\":%zu,\"trailerNames\":[]}",
-                        request->body_len);
+        rc = sb_appendf(&builder, ",\"contentLength\":%zu", request->body_len);
+    }
+    /* Only when the request declared trailers (http-route.md section 3), as Java sends it. */
+    if (rc == 0 && request->trailer_names_len > 0U) {
+        rc = append_json_string_array(&builder, "trailerNames", request->trailer_names,
+                                      request->trailer_names_len, &first);
+    }
+    if (rc == 0) {
+        rc = sb_append(&builder, "}");
     }
     if (rc != 0) {
         free(builder.data);
+        return NULL;
+    }
+    return sb_finish(&builder);
+}
+
+/* The request FIN's metadata: {"trailers":[...]} with the declared trailer fields, or NULL. */
+static char *json_http_request_fin(const st_direct_http_request *request, int *failed)
+{
+    *failed = 0;
+    if (request->trailers_len == 0U) {
+        return NULL;
+    }
+    string_builder builder = {0};
+    int first = 1;
+    int rc = sb_append(&builder, "{");
+    if (rc == 0) {
+        rc = append_json_string_array(&builder, "trailers", request->trailers, request->trailers_len, &first);
+    }
+    if (rc == 0) {
+        rc = sb_append(&builder, "}");
+    }
+    if (rc != 0) {
+        free(builder.data);
+        *failed = 1;
         return NULL;
     }
     return sb_finish(&builder);
