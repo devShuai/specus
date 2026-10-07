@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "json.h"
 #include "login_rate_limiter.h"
+#include "password_hash.h"
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
@@ -2956,13 +2957,28 @@ static int test_tenant_scoped_admin_mutations(void)
         failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "own tenant DELETE") != 0
             || st_storage_get_management_user(db_path, "carol", &gone) == 0;
     }
+    /*
+     * adminManagesUsersInsideOwnTenant, updatesPasswordRoleEnabledAndDeletesInsideActingTenant:
+     * password, role and the enabled flag change together, the stored hash is the new password's.
+     */
     if (!failed) {
+        st_storage_management_user updated;
+        st_password_verification verification;
         len = tenant_scope_call("PUT", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
-                                "{\"enabled\":false}", response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0;
+                                "{\"password\":\"new-password\",\"role\":\"ADMIN\",\"enabled\":false}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0
+            || !contains(response, "\"role\":\"ADMIN\"")
+            || st_storage_get_management_user(db_path, "dave", &updated) != 0
+            || strcmp(updated.password_hash, "unused-password-hash") == 0
+            || st_password_verify("new-password", updated.password_hash, &verification) != 0
+            || !verification.matches
+            || strcmp(updated.role, "ADMIN") != 0 || updated.enabled;
+        if (failed) fprintf(stderr, "tenant-b PUT did not store the new password, role and enabled flag\n");
         len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
                                               NULL, response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0;
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0
+            || st_storage_get_management_user(db_path, "dave", &updated) == 0;
     }
 
     /* Tenant-b's credential, mapping, route and peer service, as tenant-a's administrator sees them. */
@@ -3055,6 +3071,94 @@ static int test_tenant_scoped_admin_mutations(void)
         len = tenant_scope_call("DELETE", path, "root-b", "tenant-b", "ADMIN", NULL, response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, label) != 0;
     }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * ManagementUserServiceTests.bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous.
+ * C matches login names case-insensitively but keys rows by the exact username, so a legacy or
+ * foreign database may hold "Alice" (tenant-a) and "alice" (tenant-b). Such a name is no one's:
+ * password login, a local token naming it and an administrator's attempt to add a third spelling
+ * all fail, and neither row changes. Once one spelling is gone the other works again.
+ */
+static int test_ambiguous_login_name_fails_closed(void)
+{
+    char db_path[256];
+    char response[16384];
+    char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-ambiguous-user-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-ambiguous-user-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    char seed[1024];
+    int failed = st_storage_init(db_path, 0) != 0 || st_password_hash("secret-password", hash) != 0;
+    if (!failed) {
+        snprintf(seed, sizeof(seed),
+                 "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, "
+                 "updated_at) VALUES('Alice','tenant-a','%s','ADMIN',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
+                 "('alice','tenant-b','%s','USER',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", hash, hash);
+        failed = test_exec_sql(db_path, seed) != 0;
+    }
+    if (failed) fprintf(stderr, "ambiguous user fixture setup failed\n");
+    static const char *const spellings[] = {"alice", "Alice", "ALICE"};
+    for (size_t i = 0; !failed && i < sizeof(spellings) / sizeof(spellings[0]); ++i) {
+        char body[160];
+        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"secret-password\"}", spellings[i]);
+        int len = st_admin_build_response_with_body("POST", "/auth/login", body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "login with an ambiguous name") != 0
+            || contains(response, "accessToken");
+    }
+    /* A token naming the ambiguous name answers like one naming a user that does not exist. */
+    if (!failed) {
+        char ghost[16384];
+        int ghost_len = tenant_scope_call("GET", "/api/admin/clients", "ghost", "tenant-b", "USER", NULL,
+                                          ghost, sizeof(ghost));
+        int len = tenant_scope_call("GET", "/api/admin/clients", "alice", "tenant-b", "USER", NULL,
+                                    response, sizeof(response));
+        failed = ghost_len <= 0 || len != ghost_len || strcmp(response, ghost) != 0
+            || (strncmp(response, "HTTP/1.1 401 ", 13U) != 0 && strncmp(response, "HTTP/1.1 403 ", 13U) != 0);
+        if (failed) fprintf(stderr, "token naming an ambiguous user: %s\n", len > 0 ? response : "(none)");
+    }
+    if (!failed) {
+        int len = st_admin_build_response_with_body("POST", "/api/admin/users",
+                                                    "{\"username\":\"ALICE\",\"password\":\"other-password\"}",
+                                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "a third spelling of an ambiguous name") != 0;
+    }
+    if (!failed) {
+        char count[16];
+        snprintf(seed, sizeof(seed),
+                 "SELECT COUNT(*) FROM specus_management_user WHERE lower(username) = 'alice' AND password_hash = '%s'",
+                 hash);
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        count[0] = '\0';
+        if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, seed, -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            snprintf(count, sizeof(count), "%s", (const char *)sqlite3_column_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        failed = strcmp(count, "2") != 0;
+        if (failed) fprintf(stderr, "the ambiguous rows changed: %s left as seeded\n", count);
+    }
+    /* With one spelling left the name is unambiguous again. */
+    if (!failed) {
+        failed = test_exec_sql(db_path, "DELETE FROM specus_management_user WHERE username = 'Alice';") != 0;
+        int len = failed ? -1 : st_admin_build_response_with_body("POST", "/auth/login",
+                                                                  "{\"username\":\"alice\",\"password\":\"secret-password\"}",
+                                                                  response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 200 ", "accessToken",
+                                           "login once the name is unambiguous") != 0;
+    }
+    st_login_rate_limiter_reset();
     unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
     unsetenv("SPECUS_DATABASE_PATH");
     unlink(db_path);
@@ -7205,6 +7309,9 @@ int main(void)
         return 1;
     }
     if (test_tenant_scoped_admin_mutations() != 0) {
+        return 1;
+    }
+    if (test_ambiguous_login_name_fails_closed() != 0) {
         return 1;
     }
     if (test_http_route_service_rules() != 0) {

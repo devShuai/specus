@@ -937,6 +937,20 @@ static void test_refused_usernames(void)
     CHECK(dora_tenant != NULL && strcmp(dora_tenant, "tenant-b") == 0, "the other tenant's user changed");
     free(dora_tenant);
 
+    /* Two spellings of one name (a legacy database): neither is linked and no third is created. */
+    CHECK(db_exec("INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled) "
+                  "VALUES ('Erin', 'default', 'x', 'USER', 1), ('erin', 'default', 'x', 'USER', 1)") == 0,
+          "cannot store two spellings of erin");
+    static const char *const erin_spellings[] = {"erin", "ERIN"};
+    for (size_t i = 0U; i < sizeof(erin_spellings) / sizeof(erin_spellings[0]); ++i) {
+        claims_spec erin = id_claims("subject-erin", erin_spellings[i], "nonce-erin");
+        CHECK(login_claims(key_main, "k1", &erin) == 403, "an ambiguous preferred_username was linked or created");
+    }
+    char *erin_rows = db_text("SELECT COUNT(*) || ':' || COUNT(oidc_identity_key) FROM specus_management_user "
+                              "WHERE lower(username) = lower(?)", "erin");
+    CHECK(erin_rows != NULL && strcmp(erin_rows, "2:0") == 0, "the ambiguous rows changed");
+    free(erin_rows);
+
     /* Java stores issuer and subject in 255-character columns and refuses longer values. */
     char long_subject[257];
     memset(long_subject, 's', 256U);
