@@ -34,6 +34,7 @@ public class DatabaseInitializer {
     private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
     private final TransferTimestampMigrator transferTimestampMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
+    private final SqliteIdentityKeyMigrator sqliteIdentityKeyMigrator;
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
@@ -48,6 +49,7 @@ public class DatabaseInitializer {
                                PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
                                TransferTimestampMigrator transferTimestampMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
+                               SqliteIdentityKeyMigrator sqliteIdentityKeyMigrator,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
@@ -62,6 +64,7 @@ public class DatabaseInitializer {
         this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
         this.transferTimestampMigrator = transferTimestampMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
+        this.sqliteIdentityKeyMigrator = sqliteIdentityKeyMigrator;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
         this.databasePlatform = databasePlatform;
@@ -81,6 +84,7 @@ public class DatabaseInitializer {
 
     @Transactional
     public synchronized Map<String, Object> initialize(TenantContext tenant) {
+        sqliteIdentityKeyMigrator.migrate();
         backfillDefaultTenant();
         managementUserSchemaMigrator.migrate();
         clientDownloadSchemaMigrator.migrate();
