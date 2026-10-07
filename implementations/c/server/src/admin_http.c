@@ -5270,8 +5270,9 @@ static int handle_peer_mesh_sharing_update(const st_admin_context *context,
     int has_enabled = st_json_get_bool(body, "enabled", &enabled) == 0;
     int has_mdns = st_json_get_bool(body, "mdnsImportEnabled", &mdns) == 0;
     if (!has_enabled && !has_mdns) return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled or mdnsImportEnabled is required\"}");
+    /* A request the deployment cannot honour: 400, as Java's IllegalArgumentException maps it. */
     if (has_enabled && enabled && !env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
