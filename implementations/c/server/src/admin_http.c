@@ -11182,18 +11182,23 @@ static int admin_wire_read(admin_wire_reader *reader, char *out, size_t len)
 
 /*
  * Reads a chunked request body (RFC 9112 section 7.1) into one malloc'd, NUL-terminated buffer,
- * the way a Content-Length body is read. Chunk extensions and trailer fields are read and
- * dropped. Returns 0, -1 for a malformed or truncated body, or -2 once it outgrows max_len.
+ * the way a Content-Length body is read. Chunk extensions are dropped; the trailer fields come back
+ * in *trailers as they arrived (the caller keeps only declared ones). Returns 0, -1 for a malformed
+ * or truncated body, or -2 once it outgrows max_len.
  */
 static int admin_read_chunked_body(int fd,
                                    const char *received,
                                    size_t received_len,
                                    size_t max_len,
                                    char **out,
-                                   size_t *out_len)
+                                   size_t *out_len,
+                                   char ***trailers,
+                                   size_t *trailers_len)
 {
     *out = NULL;
     *out_len = 0;
+    *trailers = NULL;
+    *trailers_len = 0U;
     admin_wire_reader *reader = (admin_wire_reader *)malloc(sizeof(*reader));
     if (reader == NULL || received_len > sizeof(reader->buffer)) {
         free(reader);
@@ -11252,21 +11257,40 @@ static int admin_read_chunked_body(int fd,
         len += size;
     }
     /* The trailer section ends at an empty line. */
-    for (int fields = 0; rc == 0; ++fields) {
-        if (fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
+    char **fields = NULL;
+    size_t field_count = 0U;
+    for (int read_fields = 0; rc == 0; ++read_fields) {
+        if (read_fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
             rc = -1;
         } else if (line[0] == '\0') {
             break;
+        } else if (strchr(line, ':') != NULL) {
+            char **grown = (char **)realloc(fields, (field_count + 1U) * sizeof(*grown));
+            char *copy = grown == NULL ? NULL : admin_dup_string(line);
+            if (grown != NULL) {
+                fields = grown;
+            }
+            if (copy == NULL) {
+                rc = -1;
+            } else {
+                fields[field_count++] = copy;
+            }
         }
     }
     free(reader);
     if (rc != 0) {
         free(body);
+        for (size_t i = 0; i < field_count; ++i) {
+            free(fields[i]);
+        }
+        free(fields);
         return rc;
     }
     body[len] = '\0';
     *out = body;
     *out_len = len;
+    *trailers = fields;
+    *trailers_len = field_count;
     return 0;
 }
 
@@ -12657,17 +12681,162 @@ void st_direct_http_response_free(st_direct_http_response *response)
     memset(response, 0, sizeof(*response));
 }
 
-static int direct_valid_trailer_name(const char *name)
+/* An RFC 9110 field-name token of len bytes. */
+static int direct_trailer_token(const char *name, size_t len)
 {
-    if (name == NULL || *name == '\0') {
+    if (len == 0U) {
         return 0;
     }
-    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; ++p) {
-        if (!isalnum(*p) && strchr("!#$%&'*+-.^_`|~", *p) == NULL) {
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '\0' || (!isalnum(c) && strchr("!#$%&'*+-.^_`|~", c) == NULL)) {
             return 0;
         }
     }
     return 1;
+}
+
+/* Java HttpSpecusController.SKIPPED_HEADERS: hop-by-hop or recomputed, so never a trailer either. */
+static int direct_trailer_name_forbidden(const char *name, size_t len)
+{
+    static const char *const forbidden[] = {
+        "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
+    };
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); ++i) {
+        if (strlen(forbidden[i]) == len && admin_ascii_ncasecmp(name, forbidden[i], len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Narrows [*start, *start + *len) to the bytes between leading and trailing spaces and tabs. */
+static void direct_trim_span(const char **start, size_t *len)
+{
+    while (*len > 0U && (**start == ' ' || **start == '\t')) {
+        ++*start;
+        --*len;
+    }
+    while (*len > 0U && ((*start)[*len - 1U] == ' ' || (*start)[*len - 1U] == '\t')) {
+        --*len;
+    }
+}
+
+static int direct_trailer_name_listed(char *const *names, size_t names_len, const char *name, size_t len)
+{
+    for (size_t i = 0; i < names_len; ++i) {
+        if (strlen(names[i]) == len && admin_ascii_ncasecmp(names[i], name, len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The trailer names that may cross (Java HttpSpecusController.validTrailerNames, http-route.md
+ * sections 3 and 4): each candidate trimmed, a token, no hop-by-hop field, not Authorization when
+ * the route gate consumed it, and every name once in its first spelling. *out is the caller's.
+ */
+static int direct_valid_trailer_names(char *const *candidates,
+                                      size_t candidates_len,
+                                      int strip_authorization,
+                                      char ***out,
+                                      size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    if (candidates_len == 0U) {
+        return 0;
+    }
+    char **names = (char **)calloc(candidates_len, sizeof(*names));
+    if (names == NULL) {
+        return -1;
+    }
+    size_t count = 0U;
+    for (size_t i = 0; i < candidates_len; ++i) {
+        const char *name = candidates[i] == NULL ? "" : candidates[i];
+        size_t len = strlen(name);
+        direct_trim_span(&name, &len);
+        if (!direct_trailer_token(name, len) || direct_trailer_name_forbidden(name, len)
+            || (strip_authorization && len == strlen("Authorization")
+                && admin_ascii_ncasecmp(name, "Authorization", len) == 0)
+            || direct_trailer_name_listed(names, count, name, len)) {
+            continue;
+        }
+        names[count] = admin_dup_range(name, len);
+        if (names[count] == NULL) {
+            direct_free_strings(names, count);
+            return -1;
+        }
+        ++count;
+    }
+    if (count == 0U) {
+        free(names);
+        return 0;
+    }
+    *out = names;
+    *out_len = count;
+    return 0;
+}
+
+/*
+ * The trailer fields that may cross (Java HttpSpecusController.validTrailerLines and
+ * flattenTrailers): name:value fields whose trimmed name was declared, is a token and no hop-by-hop
+ * field, and whose value carries no CR or LF. Each comes out as name:value, both sides trimmed.
+ * declared holds names direct_valid_trailer_names already accepted. *out is the caller's.
+ */
+static int direct_declared_trailer_fields(char *const *fields,
+                                          size_t fields_len,
+                                          char *const *declared,
+                                          size_t declared_len,
+                                          char ***out,
+                                          size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    if (fields_len == 0U || declared_len == 0U) {
+        return 0;
+    }
+    char **kept = (char **)calloc(fields_len, sizeof(*kept));
+    if (kept == NULL) {
+        return -1;
+    }
+    size_t count = 0U;
+    for (size_t i = 0; i < fields_len; ++i) {
+        const char *field = fields[i];
+        const char *colon = field == NULL ? NULL : strchr(field, ':');
+        if (colon == NULL || colon == field || strchr(field, '\r') != NULL || strchr(field, '\n') != NULL) {
+            continue;
+        }
+        const char *name = field;
+        size_t name_len = (size_t)(colon - field);
+        const char *value = colon + 1;
+        size_t value_len = strlen(value);
+        direct_trim_span(&name, &name_len);
+        direct_trim_span(&value, &value_len);
+        if (!direct_trailer_token(name, name_len) || direct_trailer_name_forbidden(name, name_len)
+            || !direct_trailer_name_listed(declared, declared_len, name, name_len)) {
+            continue;
+        }
+        kept[count] = (char *)malloc(name_len + value_len + 2U);
+        if (kept[count] == NULL) {
+            direct_free_strings(kept, count);
+            return -1;
+        }
+        memcpy(kept[count], name, name_len);
+        kept[count][name_len] = ':';
+        memcpy(kept[count] + name_len + 1U, value, value_len);
+        kept[count][name_len + 1U + value_len] = '\0';
+        ++count;
+    }
+    if (count == 0U) {
+        free(kept);
+        return 0;
+    }
+    *out = kept;
+    *out_len = count;
+    return 0;
 }
 
 static int direct_should_buffer_rewrite(const char *client_name,
@@ -12712,13 +12881,8 @@ static int direct_sink_start_chunked(admin_direct_http_sink_state *state)
     }
     if (rc == 0 && state->trailer_names_len > 0U) {
         rc = admin_sb_append(&builder, "Trailer: ");
-        int written = 0;
         for (size_t i = 0; rc == 0 && i < state->trailer_names_len; ++i) {
-            if (direct_valid_trailer_name(state->trailer_names[i])) {
-                rc = admin_sb_appendf(&builder, "%s%s", written ? ", " : "",
-                                      state->trailer_names[i]);
-                written = 1;
-            }
+            rc = admin_sb_appendf(&builder, "%s%s", i == 0U ? "" : ", ", state->trailer_names[i]);
         }
         if (rc == 0) {
             rc = admin_sb_append(&builder, "\r\n");
@@ -12780,11 +12944,12 @@ static int direct_sink_on_headers(void *ctx,
                                   size_t trailer_names_len)
 {
     admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    /* Only valid, non-hop-by-hop names are declared, and only their fields cross at the end. */
     if (state->started || state->response.status_code != 0 || status_code < 100 || status_code > 599
         || direct_copy_strings(headers, headers_len,
                                &state->response.headers, &state->response.headers_len) != 0
-        || direct_copy_strings(trailer_names, trailer_names_len,
-                               &state->trailer_names, &state->trailer_names_len) != 0) {
+        || direct_valid_trailer_names(trailer_names, trailer_names_len, 0,
+                                      &state->trailer_names, &state->trailer_names_len) != 0) {
         return -1;
     }
     if (state->share_id != NULL) {
@@ -12809,7 +12974,7 @@ static int direct_sink_on_headers(void *ctx,
                                                 status_code,
                                                 state->response.headers,
                                                 state->response.headers_len);
-    state->buffer_for_rewrite = trailer_names_len == 0U
+    state->buffer_for_rewrite = state->trailer_names_len == 0U
         && direct_should_buffer_rewrite(
             state->client_name, state->route, state->response.headers,
             state->response.headers_len, &state->rewrite_limit);
@@ -12869,19 +13034,20 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
         return -1;
     }
-    for (size_t i = 0; i < trailers_len; ++i) {
-        const char *trailer = trailers[i];
-        const char *colon = trailer == NULL ? NULL : strchr(trailer, ':');
-        if (colon != NULL && colon != trailer && strchr(trailer, '\r') == NULL
-            && strchr(trailer, '\n') == NULL
-            && send_all(state->fd, trailer, strlen(trailer)) != 0) {
-            return -1;
-        }
-        if (colon != NULL && colon != trailer && send_all(state->fd, "\r\n", 2U) != 0) {
-            return -1;
-        }
+    /* Undeclared, hop-by-hop and CR/LF-carrying trailers are dropped (http-route.md section 4). */
+    char **declared = NULL;
+    size_t declared_len = 0U;
+    if (direct_declared_trailer_fields(trailers, trailers_len, state->trailer_names, state->trailer_names_len,
+                                       &declared, &declared_len) != 0) {
+        return -1;
     }
-    if (send_all(state->fd, "\r\n", 2U) != 0) {
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < declared_len; ++i) {
+        rc = send_all(state->fd, declared[i], strlen(declared[i])) == 0
+            && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+    }
+    direct_free_strings(declared, declared_len);
+    if (rc != 0 || send_all(state->fd, "\r\n", 2U) != 0) {
         return -1;
     }
     state->ended = 1;
@@ -15219,6 +15385,21 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
  * for a request through a temporary HTTP share: its response headers are rewritten, the path
  * rewrite uses the share prefix, and an ended share can cancel the stream.
  */
+/* A request's declared trailer names and the declared trailer fields of its chunked body. */
+typedef struct {
+    char **names;
+    size_t names_len;
+    char **fields;
+    size_t fields_len;
+} admin_request_trailers;
+
+static void admin_request_trailers_free(admin_request_trailers *trailers)
+{
+    direct_free_strings(trailers->names, trailers->names_len);
+    direct_free_strings(trailers->fields, trailers->fields_len);
+    memset(trailers, 0, sizeof(*trailers));
+}
+
 static void admin_forward_direct_http(st_admin_server *server,
                                       int fd,
                                       const char *method,
@@ -15230,6 +15411,7 @@ static void admin_forward_direct_http(st_admin_server *server,
                                       size_t headers_len,
                                       const uint8_t *body,
                                       size_t body_len,
+                                      const admin_request_trailers *trailers,
                                       admin_share_admission *share)
 {
     st_direct_http_request direct = {
@@ -15240,7 +15422,11 @@ static void admin_forward_direct_http(st_admin_server *server,
         .headers = headers,
         .headers_len = headers_len,
         .body = body,
-        .body_len = body_len
+        .body_len = body_len,
+        .trailer_names = trailers->names,
+        .trailer_names_len = trailers->names_len,
+        .trailers = trailers->fields,
+        .trailers_len = trailers->fields_len
     };
     size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
     char *source_url = (char *)malloc(source_len);
@@ -15315,6 +15501,7 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const char *raw_request,
                                       const uint8_t *body,
                                       size_t body_len,
+                                      const admin_request_trailers *trailers,
                                       int strip_authorization,
                                       const char *target_base_url)
 {
@@ -15377,7 +15564,7 @@ static int handle_direct_http_request(st_admin_server *server,
         return 1;
     }
     admin_forward_direct_http(server, fd, method, client_name, route, relative_path, raw_query,
-                              headers, headers_len, body, body_len, NULL);
+                              headers, headers_len, body, body_len, trailers, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
     free(route);
@@ -15486,6 +15673,65 @@ static int admin_collect_header_values(const char *request, const char *name, ch
         line = next + 2;
     }
     return 0;
+}
+
+/*
+ * The request trailers that cross to the client (http-route.md section 3; Java
+ * HttpSpecusController.declaredTrailerNames and flattenTrailers): the names every Trailer header
+ * declares, without Authorization when the route gate consumed it, and of the chunked body's
+ * trailer fields only the declared ones. Takes over nothing; *out is the caller's to free.
+ */
+static int admin_request_trailers_collect(const char *raw_request,
+                                          int strip_authorization,
+                                          char *const *received,
+                                          size_t received_len,
+                                          admin_request_trailers *out)
+{
+    memset(out, 0, sizeof(*out));
+    char **declarations = NULL;
+    size_t declaration_count = 0U;
+    if (admin_collect_header_values(raw_request, "Trailer", &declarations, &declaration_count) != 0) {
+        return -1;
+    }
+    char **candidates = NULL;
+    size_t candidate_count = 0U;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < declaration_count; ++i) {
+        const char *cursor = declarations[i];
+        for (;;) {
+            size_t len = strcspn(cursor, ",");
+            char **grown = (char **)realloc(candidates, (candidate_count + 1U) * sizeof(*grown));
+            if (grown == NULL) {
+                rc = -1;
+                break;
+            }
+            candidates = grown;
+            candidates[candidate_count] = admin_dup_range(cursor, len);
+            if (candidates[candidate_count] == NULL) {
+                rc = -1;
+                break;
+            }
+            ++candidate_count;
+            if (cursor[len] == '\0') {
+                break;
+            }
+            cursor += len + 1U;
+        }
+    }
+    free_header_array(declarations, declaration_count);
+    if (rc == 0) {
+        rc = direct_valid_trailer_names(candidates, candidate_count, strip_authorization,
+                                        &out->names, &out->names_len);
+    }
+    free_header_array(candidates, candidate_count);
+    if (rc == 0) {
+        rc = direct_declared_trailer_fields(received, received_len, out->names, out->names_len,
+                                            &out->fields, &out->fields_len);
+    }
+    if (rc != 0) {
+        admin_request_trailers_free(out);
+    }
+    return rc;
 }
 
 /*
@@ -15720,6 +15966,7 @@ static void forward_http_share_request(st_admin_server *server,
                                        const char *raw_request,
                                        const uint8_t *body,
                                        size_t body_len,
+                                       const admin_request_trailers *trailers,
                                        admin_share_admission *admission)
 {
     if (server->direct_http_forward == NULL) {
@@ -15739,7 +15986,7 @@ static void forward_http_share_request(st_admin_server *server,
     /* No Basic gate: Authorization belongs to the target and is relayed as it came. */
     admin_forward_direct_http(server, fd, method, admission->client_name, admission->route,
                               admission->relative_path, raw_query, headers, headers_len, body, body_len,
-                              admission);
+                              trailers, admission);
     free_header_array(headers, headers_len);
     free(raw_query);
 }
@@ -15876,7 +16123,8 @@ static int send_static_file(int fd, const char *method, const char *path, const 
 /*
  * Reads the body that follows the header block in request (len bytes received so far), by
  * Content-Length or chunked and within the limit of the path. 0 with the body (in request or in
- * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out.
+ * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out. A chunked
+ * body's trailer fields come back in *trailers_out, the caller's to free.
  */
 static int admin_read_request_body(int fd,
                                    const char *request,
@@ -15884,12 +16132,16 @@ static int admin_read_request_body(int fd,
                                    const char *path,
                                    const char **body_out,
                                    size_t *body_len_out,
-                                   char **body_buffer_out)
+                                   char **body_buffer_out,
+                                   char ***trailers_out,
+                                   size_t *trailers_len_out)
 {
     const char *body = strstr(request, "\r\n\r\n");
     size_t available_body_len = 0;
     size_t content_length = 0;
     char *body_buffer = NULL;
+    *trailers_out = NULL;
+    *trailers_len_out = 0U;
     if (body != NULL) {
         body += 4;
         available_body_len = (size_t)(request + len - body);
@@ -15915,7 +16167,8 @@ static int admin_read_request_body(int fd,
                 return -1;
             }
             int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
-                                                     &body_buffer, &content_length);
+                                                     &body_buffer, &content_length,
+                                                     trailers_out, trailers_len_out);
             if (chunked_rc != 0) {
                 send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
                                      chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
@@ -15986,10 +16239,23 @@ static void handle_http_share_client(st_admin_server *server,
         const char *body = NULL;
         size_t body_len = 0U;
         char *body_buffer = NULL;
-        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer) == 0) {
-            forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
-                                       &admission);
+        char **received_trailers = NULL;
+        size_t received_trailers_len = 0U;
+        admin_request_trailers trailers;
+        memset(&trailers, 0, sizeof(trailers));
+        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer,
+                                    &received_trailers, &received_trailers_len) == 0) {
+            /* No Basic gate on a share: an Authorization trailer belongs to the target as well. */
+            if (admin_request_trailers_collect(request, 0, received_trailers, received_trailers_len,
+                                               &trailers) != 0) {
+                send_text_http_error(fd, 500, "direct http request build failed");
+            } else {
+                forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
+                                           &trailers, &admission);
+            }
         }
+        admin_request_trailers_free(&trailers);
+        free_header_array(received_trailers, received_trailers_len);
         free(body_buffer);
     }
     admin_share_stream_unregister(&admission.stream);
@@ -16048,11 +16314,25 @@ static void handle_client(st_admin_server *server, int fd)
     const char *body = NULL;
     size_t available_body_len = 0;
     char *body_buffer = NULL;
+    char **received_trailers = NULL;
+    size_t received_trailers_len = 0U;
     if (admin_read_request_body(fd, request, (size_t)len, path, &body, &available_body_len,
-                                &body_buffer) != 0) {
+                                &body_buffer, &received_trailers, &received_trailers_len) != 0) {
         close(fd);
         return;
     }
+    admin_request_trailers direct_trailers;
+    memset(&direct_trailers, 0, sizeof(direct_trailers));
+    if (strncmp(path, "/http/", 6) == 0
+        && admin_request_trailers_collect(request, strip_direct_authorization, received_trailers,
+                                          received_trailers_len, &direct_trailers) != 0) {
+        free_header_array(received_trailers, received_trailers_len);
+        free(body_buffer);
+        send_text_http_error(fd, 500, "direct http request build failed");
+        close(fd);
+        return;
+    }
+    free_header_array(received_trailers, received_trailers_len);
 
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, request_remote_address);
@@ -16062,17 +16342,20 @@ static void handle_client(st_admin_server *server, int fd)
                                              path,
                                              request,
                                              request_remote_address)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
 
     if (handle_connection_websocket_request(fd, method, path, request)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
     if (handle_client_messages_websocket_request(fd, method, path, request)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
@@ -16084,19 +16367,23 @@ static void handle_client(st_admin_server *server, int fd)
                                              request,
                                              strip_direct_authorization,
                                              direct_target_base_url)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
-    if (handle_direct_http_request(server,
-                                   fd,
-                                   method,
-                                   path,
-                                   request,
-                                   (const uint8_t *)body,
-                                   available_body_len,
-                                   strip_direct_authorization,
-                                   direct_target_base_url)) {
+    int direct_handled = handle_direct_http_request(server,
+                                                    fd,
+                                                    method,
+                                                    path,
+                                                    request,
+                                                    (const uint8_t *)body,
+                                                    available_body_len,
+                                                    &direct_trailers,
+                                                    strip_direct_authorization,
+                                                    direct_target_base_url);
+    admin_request_trailers_free(&direct_trailers);
+    if (direct_handled) {
         free(body_buffer);
         close(fd);
         return;

@@ -16,6 +16,14 @@ typedef struct {
     size_t headers_len;
     const uint8_t *body;
     size_t body_len;
+    /*
+     * The trailer names the request's Trailer header declared and the declared trailer fields of
+     * a chunked body as name:value (http-route.md section 3); both empty when there are none.
+     */
+    char **trailer_names;
+    size_t trailer_names_len;
+    char **trailers;
+    size_t trailers_len;
 } st_direct_http_request;
 
 typedef struct {
