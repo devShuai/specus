@@ -98,6 +98,7 @@ int main(int argc, char **argv)
     image.response_body = png;
     image.response_body_len = sizeof(png);
     if (st_storage_record_http_exchange(argv[1], &image) != 0) return 1;
+    st_elasticsearch_traffic_flush();
     exchange_count = 0;
     if (st_storage_list_http_exchanges_visible(argv[1], client.id, "images", NULL, NULL, NULL,
                                                "default", "admin", 1, 0, 10,
