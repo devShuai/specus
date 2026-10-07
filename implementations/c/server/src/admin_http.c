@@ -15744,6 +15744,84 @@ static void forward_http_share_request(st_admin_server *server,
     free(raw_query);
 }
 
+/*
+ * The object-storage bucket origin Java SecurityConfig adds to the portal policy when aliyun-oss is
+ * configured, so the browser may PUT to and preview from the bucket directly; empty otherwise.
+ */
+static void admin_portal_oss_origin(char *out, size_t out_len)
+{
+    out[0] = '\0';
+    const char *provider = getenv("SPECUS_OBJECT_STORAGE_PROVIDER");
+    const char *endpoint = getenv("SPECUS_OBJECT_STORAGE_ENDPOINT");
+    const char *bucket = getenv("SPECUS_OBJECT_STORAGE_BUCKET");
+    if (provider == NULL || endpoint == NULL || bucket == NULL) {
+        return;
+    }
+    while (isspace((unsigned char)*provider)) ++provider;
+    size_t provider_len = strlen(provider);
+    while (provider_len > 0U && isspace((unsigned char)provider[provider_len - 1U])) --provider_len;
+    if (provider_len != strlen("aliyun-oss") || admin_ascii_ncasecmp(provider, "aliyun-oss", provider_len) != 0) {
+        return;
+    }
+    while (isspace((unsigned char)*endpoint)) ++endpoint;
+    if (admin_ascii_ncasecmp(endpoint, "https://", 8U) == 0) {
+        endpoint += 8;
+    } else if (admin_ascii_ncasecmp(endpoint, "http://", 7U) == 0) {
+        endpoint += 7;
+    }
+    size_t host_len = strcspn(endpoint, "/");
+    while (host_len > 0U && isspace((unsigned char)endpoint[host_len - 1U])) --host_len;
+    while (isspace((unsigned char)*bucket)) ++bucket;
+    size_t bucket_len = strlen(bucket);
+    while (bucket_len > 0U && isspace((unsigned char)bucket[bucket_len - 1U])) --bucket_len;
+    if (host_len == 0U || bucket_len == 0U) {
+        return;
+    }
+    int written = snprintf(out, out_len, "https://%.*s.%.*s", (int)bucket_len, bucket, (int)host_len, endpoint);
+    if (written < 0 || (size_t)written >= out_len) {
+        out[0] = '\0';
+    }
+}
+
+/*
+ * The security headers of Java SecurityConfig's portal header writer (and Go securityHeaders) for
+ * the management pages; /http/ and /http-share/ are never served from here, their responses belong
+ * to the target application. Returns the header lines, each ending in CRLF, or NULL.
+ */
+static char *admin_portal_security_headers(void)
+{
+    char oss_origin[384];
+    admin_portal_oss_origin(oss_origin, sizeof(oss_origin));
+    const char *oss_space = oss_origin[0] == '\0' ? "" : " ";
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+                              "Content-Security-Policy: default-src 'self'; "
+                              "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com "
+                              "'sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=' "
+                              "'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
+                              "style-src 'self' 'unsafe-inline'; "
+                              "img-src 'self' blob: data: https://www.google-analytics.com "
+                              "https://*.googletagmanager.com%s%s; "
+                              "media-src 'self' blob: data:%s%s; "
+                              "object-src 'self' blob:; "
+                              "frame-src 'self' blob: https://challenges.cloudflare.com; "
+                              "font-src 'self' data:; "
+                              "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com "
+                              "https://*.analytics.google.com https://*.googletagmanager.com%s%s; "
+                              "form-action 'self'; "
+                              "frame-ancestors 'none'; "
+                              "base-uri 'self'\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "X-Frame-Options: DENY\r\n"
+                              "Referrer-Policy: strict-origin-when-cross-origin\r\n",
+                              oss_space, oss_origin, oss_space, oss_origin, oss_space, oss_origin);
+    if (rc != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
+}
+
 static int send_static_file(int fd, const char *method, const char *path, const char *static_root)
 {
     if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
@@ -15762,17 +15840,21 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     if (file == NULL) {
         return 0;
     }
-    char header[512];
-    int header_len = snprintf(header,
-                              sizeof(header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: %s\r\n"
-                              "Cache-Control: no-cache\r\n"
-                              "X-Content-Type-Options: nosniff\r\n"
-                              "Content-Length: %lld\r\n"
-                              "\r\n",
-                              content_type,
-                              (long long)st.st_size);
+    char *security_headers = admin_portal_security_headers();
+    char header[4096];
+    int header_len = security_headers == NULL ? -1
+        : snprintf(header,
+                   sizeof(header),
+                   "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: %s\r\n"
+                   "Cache-Control: no-cache\r\n"
+                   "%s"
+                   "Content-Length: %lld\r\n"
+                   "\r\n",
+                   content_type,
+                   security_headers,
+                   (long long)st.st_size);
+    free(security_headers);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header)
         || send_all(fd, header, (size_t)header_len) != 0) {
         fclose(file);
