@@ -1221,14 +1221,19 @@ static pm_catalog *pm_find_or_allocate_catalog_locked(const st_storage_client *s
     return free_slot;
 }
 
-/* Placeholder catalogues belong to no tenant and no client, and never expire. */
+/*
+ * Placeholder catalogues belong to no tenant and no client, and never expire. They take the slots a
+ * new session could have: free ones and those whose catalogue has expired.
+ */
 int st_peer_mesh_catalogs_occupy_for_testing(size_t count)
 {
     size_t occupied = 0U;
+    time_t now = time(NULL);
     pthread_mutex_lock(&peer_catalog_lock);
     for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS && occupied < count; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
-        if (catalog->in_use) continue;
+        if (catalog->in_use && catalog->expires_at >= now) continue;
+        free(catalog->mdns_candidates);
         memset(catalog, 0, sizeof(*catalog));
         catalog->in_use = 1;
         catalog->publisher_client_id = -1;

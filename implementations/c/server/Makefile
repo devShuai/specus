@@ -25,6 +25,7 @@ OIDC_TESTS := $(BUILD_DIR)/specus_c_oidc_tests
 PASSWORD_HASH_TESTS := $(BUILD_DIR)/specus_c_password_hash_tests
 PEER_EGRESS_TESTS := $(BUILD_DIR)/specus_c_peer_egress_tests
 PEER_MESH_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_tests
+PEER_MESH_E2E_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_e2e_tests
 PRODUCT_METRICS_TESTS := $(BUILD_DIR)/specus_c_product_metrics_tests
 PUBLIC_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_public_coordination_tests
 PROTOCOL_TESTS := $(BUILD_DIR)/specus_c_protocol_fixture_tests
@@ -43,6 +44,7 @@ UPSTREAM_BROWSER_HEADERS_TESTS := $(BUILD_DIR)/specus_c_upstream_browser_headers
 WORKBENCH_TESTS := $(BUILD_DIR)/specus_c_workbench_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIENT_AUTH_NONCE_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(OIDC_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS) $(WORKBENCH_TESTS) $(HTTP_SHARE_TESTS) $(SEMANTIC_VERSION_TESTS) $(TRAFFIC_CAPTURE_TESTS) $(TURNSTILE_VERIFIER_TESTS) $(UPSTREAM_BROWSER_HEADERS_TESTS)
 ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS)
+ALL_TESTS += $(PEER_MESH_E2E_TESTS)
 
 .PHONY: all test release clean
 
@@ -114,6 +116,9 @@ $(PEER_EGRESS_TESTS): $(CORE_OBJS) tests/peer_egress_tests.c | $(BUILD_DIR)
 $(PEER_MESH_TESTS): $(CORE_OBJS) tests/peer_mesh_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_mesh_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(PEER_MESH_E2E_TESTS): $(CORE_OBJS) tests/peer_mesh_e2e_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_mesh_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(PUBLIC_COORDINATION_TESTS): $(CORE_OBJS) tests/public_coordination_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/public_coordination_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -174,6 +179,7 @@ test: all
 	$(HTTP_ROUTE_LIFECYCLE_TESTS) $(SERVER)
 	$(NAT_STREAM_TESTS) $(SERVER)
 	$(PRODUCT_METRICS_TESTS) $(SERVER)
+	$(PEER_MESH_E2E_TESTS) $(SERVER)
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
 release: clean $(SERVER)
