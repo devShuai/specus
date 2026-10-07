@@ -9626,8 +9626,21 @@ static int handle_user_diagram_update(const st_admin_context *context,
                                       char *out,
                                       size_t out_len)
 {
+    /*
+     * Java UserDiagramDocumentService.update: the document must belong to the caller (404) before
+     * its revision is compared (409) and the new content is read (400), so another account learns
+     * nothing from the body it sends.
+     */
+    const char *database_path = admin_database_path();
+    st_storage_user_diagram existing;
+    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
+            context->tenant_id, context->username, &existing) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
+    }
+    long long current_revision = existing.revision;
+    st_storage_user_diagram_free(&existing);
     long long revision = -1;
-    if (st_json_get_i64(body, "revision", &revision) != 0 || revision < 0) {
+    if (st_json_get_i64(body, "revision", &revision) != 0 || revision != current_revision) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"diagram revision conflict\"}");
     }
@@ -9636,14 +9649,6 @@ static int handle_user_diagram_update(const st_admin_context *context,
     size_t snapshot_len = 0U;
     int validation = read_user_diagram_mutation(body, name, &snapshot, &snapshot_len, out, out_len);
     if (validation != 0) return validation;
-    const char *database_path = admin_database_path();
-    st_storage_user_diagram existing;
-    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
-            context->tenant_id, context->username, &existing) != 0) {
-        free(snapshot);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
-    }
-    st_storage_user_diagram_free(&existing);
     st_storage_user_diagram updated;
     int rc = st_storage_update_user_diagram(database_path, id, context->tenant_id, context->username,
                                             revision, name, snapshot, snapshot_len, &updated);
