@@ -4666,11 +4666,12 @@ static void session_shutdown(specus_session *session)
 }
 
 /*
- * SPECUS_LOGIN_TEST_GATE_DIR, honoured outside production only, holds every successful login
- * between publishing its connection and writing its response, with send_lock held, as a slow
- * scheduler could: the login creates <dir>/<role>-published, waits for <dir>/<role>-release (at
- * most LOGIN_TEST_GATE_MAX_WAIT_MS) and removes both, role being "control" or "data". The session
- * lifecycle tests use it to send on a connection inside that window.
+ * SPECUS_LOGIN_TEST_GATE_DIR, honoured outside production only, holds every successful login at
+ * two points, as a slow scheduler could: "loaded", once its routes are loaded and before its
+ * connection is published, and "published", once published and before its response is written,
+ * with send_lock held. At each point the login creates <dir>/<role>-<point>, waits for
+ * <dir>/<role>-<point>-release (at most LOGIN_TEST_GATE_MAX_WAIT_MS) and removes both, role being
+ * "control" or "data". The session lifecycle tests use it to act inside those windows.
  */
 #define LOGIN_TEST_GATE_MAX_WAIT_MS 30000
 static char login_test_gate_dir[256];
@@ -4693,17 +4694,17 @@ static int configure_login_test_gate(void)
     return 0;
 }
 
-static void login_test_gate_wait(const specus_session *session)
+static void login_test_gate_wait(const specus_session *session, const char *point)
 {
     if (login_test_gate_dir[0] == '\0') {
         return;
     }
     const char *role = session->is_data_connection ? "data" : "control";
-    char published[320];
-    char release[320];
-    snprintf(published, sizeof(published), "%s/%s-published", login_test_gate_dir, role);
-    snprintf(release, sizeof(release), "%s/%s-release", login_test_gate_dir, role);
-    int fd = open(published, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    char reached[320];
+    char release[336];
+    snprintf(reached, sizeof(reached), "%s/%s-%s", login_test_gate_dir, role, point);
+    snprintf(release, sizeof(release), "%s-release", reached);
+    int fd = open(reached, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) {
         close(fd);
     }
@@ -4714,7 +4715,7 @@ static void login_test_gate_wait(const specus_session *session)
         nanosleep(&poll_interval, NULL);
     }
     unlink(release);
-    unlink(published);
+    unlink(reached);
 }
 
 static void *client_thread(void *arg)
@@ -4849,6 +4850,9 @@ static void *client_thread(void *arg)
                                                              session->config.nat_control_json);
                 nat_control_tcp_routes = session->config.mapping_count;
             }
+            if (logged_in) {
+                login_test_gate_wait(session, "loaded");
+            }
             pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
                 session->connected_since_ms = now_ms();
@@ -4860,7 +4864,7 @@ static void *client_thread(void *arg)
                 pthread_mutex_unlock(&control_admission_lock);
             }
             if (logged_in) {
-                login_test_gate_wait(session);
+                login_test_gate_wait(session, "published");
             }
             st_buffer response = st_protocol_encode_login_response(
                 request.client_name == NULL ? "" : request.client_name,

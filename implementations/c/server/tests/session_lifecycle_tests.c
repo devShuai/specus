@@ -779,8 +779,9 @@ static int test_replayed_login_is_rejected(test_server *server)
 
 /*
  * The order scenario's server runs with SPECUS_LOGIN_TEST_GATE_DIR=login_gate_dir: each successful
- * login stops between publishing its connection and writing its response until the test lets it
- * go, so the test can send on the connection inside that window every time.
+ * login stops at two points until the test lets it go on, "loaded" once its routes are loaded and
+ * before its connection is published, then "published" before its response is written, so the
+ * test can act inside either window every time.
  */
 static char login_gate_dir[256];
 static char login_gate_env[320];
@@ -800,27 +801,24 @@ static void login_gate_path(const char *role, const char *event, char *out, size
 /* Removes what a failed scenario may have left at the gate, so the next one starts clean. */
 static void clear_login_gate(void)
 {
-    static const char *const files[][2] = {
-        {"control", "published"}, {"control", "release"}, {"data", "published"}, {"data", "release"}
-    };
-    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
-        char path[400];
-        login_gate_path(files[i][0], files[i][1], path, sizeof(path));
-        unlink(path);
+    static const char *const roles[] = {"control", "data"};
+    static const char *const events[] = {"loaded", "loaded-release", "published", "published-release"};
+    for (size_t i = 0; i < sizeof(roles) / sizeof(roles[0]); ++i) {
+        for (size_t j = 0; j < sizeof(events) / sizeof(events[0]); ++j) {
+            char path[400];
+            login_gate_path(roles[i], events[j], path, sizeof(path));
+            unlink(path);
+        }
     }
 }
 
-/* Sends a login and waits until the server holds it at the gate with its connection published. */
-static int start_held_login(const test_server *server, const runtime_session *runtime, const char *role, int *fd)
+/* Waits until the server holds a login of role at point. */
+static int wait_login_gate(const char *role, const char *point)
 {
-    *fd = connect_local(server->control_port);
-    if (*fd < 0 || send_login_request(*fd, runtime, role) != 0) {
-        return -1;
-    }
-    char published[400];
-    login_gate_path(role, "published", published, sizeof(published));
+    char reached[400];
+    login_gate_path(role, point, reached, sizeof(reached));
     long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
-    while (access(published, F_OK) != 0) {
+    while (access(reached, F_OK) != 0) {
         if (monotonic_ms() >= deadline) {
             return -1;
         }
@@ -829,21 +827,67 @@ static int start_held_login(const test_server *server, const runtime_session *ru
     return 0;
 }
 
-/* Lets a held login go; 0 when the first frame on its connection is then a successful response. */
-static int finish_held_login(const char *role, int fd, char *reason, size_t reason_len)
+/* Lets a login of role held at point go on. */
+static int release_login_gate(const char *role, const char *point)
 {
+    char event[32];
     char release[400];
-    login_gate_path(role, "release", release, sizeof(release));
+    snprintf(event, sizeof(event), "%s-release", point);
+    login_gate_path(role, event, release, sizeof(release));
     int gate = open(release, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (gate < 0) {
-        snprintf(reason, reason_len, "cannot release the %s login: %s", role, strerror(errno));
+        fprintf(stderr, "cannot release the %s login at %s: %s\n", role, point, strerror(errno));
         return -1;
     }
     close(gate);
+    return 0;
+}
+
+/* Lets a login held with its routes loaded go on until the server holds it published. */
+static int advance_held_login(const char *role)
+{
+    return release_login_gate(role, "loaded") == 0 && wait_login_gate(role, "published") == 0 ? 0 : -1;
+}
+
+/*
+ * Sends a login and waits until the server holds it at point: "loaded" with its routes loaded and
+ * its connection not yet published, or "published" with its response not yet written.
+ */
+static int start_held_login(const test_server *server, const runtime_session *runtime, const char *role,
+                            const char *point, int *fd)
+{
+    *fd = connect_local(server->control_port);
+    if (*fd < 0 || send_login_request(*fd, runtime, role) != 0 || wait_login_gate(role, "loaded") != 0) {
+        return -1;
+    }
+    return strcmp(point, "loaded") == 0 ? 0 : advance_held_login(role);
+}
+
+/*
+ * Lets a login held published go; 0 when the first frame on its connection is then a successful
+ * response.
+ */
+static int finish_held_login(const char *role, int fd, char *reason, size_t reason_len)
+{
+    if (release_login_gate(role, "published") != 0) {
+        snprintf(reason, reason_len, "cannot release the %s login", role);
+        return -1;
+    }
     int command = 0;
     int success = 0;
     return read_login_response(fd, IO_TIMEOUT_MS, &command, &success, reason, reason_len) == 1 && success
         ? 0 : -1;
+}
+
+/* A login through both gate points without stopping; 0 when it succeeds. */
+static int gated_login(const test_server *server, const runtime_session *runtime, const char *role, int *fd,
+                       char *reason, size_t reason_len)
+{
+    if (start_held_login(server, runtime, role, "published", fd) != 0) {
+        snprintf(reason, reason_len, "the %s login was never published and held at the gate", role);
+        return -1;
+    }
+    return finish_held_login(role, *fd, reason, reason_len);
 }
 
 /*
@@ -1020,7 +1064,7 @@ static int test_control_login_answered_before_push(test_server *server)
     char *token = admin_access_token(server);
     CHECK(token != NULL, "admin login failed");
 
-    CHECK(start_held_login(server, &runtime, "control", &control) == 0,
+    CHECK(start_held_login(server, &runtime, "control", "published", &control) == 0,
           "the control login was never published and held at the gate");
     char path[160];
     snprintf(path, sizeof(path), "/api/admin/clients/%lld/nat-control", runtime.client_id);
@@ -1048,9 +1092,9 @@ static int test_control_login_answered_before_push(test_server *server)
 /*
  * A TCP mapping created while a control login is held after publishing reloads the routes of that
  * connection and pushes them at it. The login's own NAT_CONTROL and the push both follow the
- * response, the push last, so the client ends with the new mapping rather than the routes it
- * logged in with. Under ThreadSanitizer this is also the scenario where the push used to replace
- * the routes while the login thread read them without map_lock.
+ * response, the push after the login's, so the client ends with the new mapping rather than the
+ * routes it logged in with. Under ThreadSanitizer this is also the scenario where the push used
+ * to replace the routes while the login thread read them without map_lock.
  */
 static int test_route_change_while_held_reaches_client_last(test_server *server)
 {
@@ -1066,7 +1110,7 @@ static int test_route_change_while_held_reaches_client_last(test_server *server)
     char *token = admin_access_token(server);
     CHECK(token != NULL, "admin login failed");
 
-    CHECK(start_held_login(server, &runtime, "control", &control) == 0,
+    CHECK(start_held_login(server, &runtime, "control", "published", &control) == 0,
           "the control login was never published and held at the gate");
     int listen_port = pick_free_port();
     CHECK(listen_port > 0, "no free port for the new mapping");
@@ -1131,11 +1175,11 @@ static int test_data_login_answered_before_stream_open(test_server *server)
               && strstr(reason, "数据连接") != NULL,
           "a data login without its control must be refused with an answer; expected a 数据连接 refusal, got %s: %s",
           login_outcome(), reason);
-    CHECK(start_held_login(server, &runtime, "control", &control) == 0,
+    CHECK(start_held_login(server, &runtime, "control", "published", &control) == 0,
           "the control login was never published and held at the gate");
     CHECK(finish_held_login("control", control, reason, sizeof(reason)) == 0, "control login: %s", reason);
 
-    CHECK(start_held_login(server, &runtime, "data", &data) == 0,
+    CHECK(start_held_login(server, &runtime, "data", "published", &data) == 0,
           "the data login was never published and held at the gate");
     char client[768];
     char path[1024];
@@ -1160,6 +1204,158 @@ static int test_data_login_answered_before_stream_open(test_server *server)
     CHECK(status == 200, "the request that waited for the login response answered %d, expected 200", status);
 
     close_fd(&browser);
+    close_fd(&data);
+    close_fd(&control);
+    CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
+          "session not DISCONNECTED after the client left");
+    return 0;
+}
+
+/* Creates a TCP mapping through the admin API; returns the status code, or -1. */
+static int admin_create_mapping(const test_server *server, const char *token, long long client_id,
+                                int listen_port)
+{
+    char path[160];
+    char body[160];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/specus-mappings", client_id);
+    snprintf(body, sizeof(body), "{\"listenPort\":%d,\"targetAddress\":\"127.0.0.1\",\"targetPort\":9}",
+             listen_port);
+    int status = -1;
+    char *response = NULL;
+    int rc = http_request(server->admin_port, "POST", path, body, token, &status, &response);
+    if (rc == 0 && status != 201) {
+        fprintf(stderr, "mapping create answered %d: %s\n", status, response == NULL ? "" : response);
+    }
+    free(response);
+    return rc == 0 ? status : -1;
+}
+
+/*
+ * Sends a heartbeat on a control connection and reads up to its answer: 0 when a NAT_CONTROL came
+ * first and the last one lists the TCP mapping on port. Whatever the server sent before it read
+ * the heartbeat, a push by the login thread itself included, arrives ahead of the answer.
+ */
+static int expect_last_nat_control_lists_port(int fd, int port)
+{
+    st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
+    if (send_buffer(fd, &heartbeat) != 0) {
+        return -1;
+    }
+    char *last = NULL;
+    int nat_controls = 0;
+    int answered = 0;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    while (!answered) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        if (remaining <= 0 || read_frame(fd, (int)remaining, &header, &body) != 1) {
+            break;
+        }
+        st_message_response message;
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
+            answered = 1;
+        } else if (header.command == ST_CMD_MESSAGE_RESPONSE
+                   && st_protocol_decode_message_response(body, header.length, &message) == 0) {
+            if (message.message_type == ST_MESSAGE_TYPE_NAT_CONTROL) {
+                ++nat_controls;
+                free(last);
+                last = message.message;
+                message.message = NULL;
+            }
+            st_message_response_free(&message);
+        }
+        free(body);
+    }
+    int listed = answered && last != NULL && nat_control_lists_port(last, port);
+    if (!listed) {
+        fprintf(stderr, "%d NAT_CONTROL(s) before the heartbeat answer%s, the last: %s\n", nat_controls,
+                answered ? "" : " (never answered)", last == NULL ? "(none)" : last);
+    }
+    free(last);
+    return listed ? 0 : -1;
+}
+
+/*
+ * A TCP mapping created while a control login has loaded its routes but not yet published its
+ * connection: the runtime push finds no connection, and the login's own NAT_CONTROL carries the
+ * routes loaded before the change. The login pushes again once it has answered, so the last
+ * NAT_CONTROL the client gets lists the new mapping, which a data connection then registers.
+ */
+static int test_route_change_before_control_published(test_server *server)
+{
+    char reason[256];
+    runtime_session runtime;
+    int control = -1, data = -1;
+    CHECK(create_credential(server->db_path, "ck_loaded_control", "loaded-control-secret", 2) == 0,
+          "credential ck_loaded_control not stored");
+    CHECK(http_client_login(server, "ck_loaded_control", "loaded-control-secret", "machine-loaded-control",
+                            "lena", &runtime) == 0,
+          "http login (status and body above)");
+    char *token = admin_access_token(server);
+    CHECK(token != NULL, "admin login failed");
+
+    CHECK(start_held_login(server, &runtime, "control", "loaded", &control) == 0,
+          "the control login never loaded its routes and was held at the gate");
+    int listen_port = pick_free_port();
+    int status = listen_port > 0 ? admin_create_mapping(server, token, runtime.client_id, listen_port) : -1;
+    free(token);
+    CHECK(status == 201, "the mapping created before the control was published answered %d, expected 201",
+          status);
+    CHECK(advance_held_login("control") == 0, "the control login was never published and held at the gate");
+    CHECK(finish_held_login("control", control, reason, sizeof(reason)) == 0,
+          "the first frame on the control connection must be a successful login response: %s", reason);
+    CHECK(expect_last_nat_control_lists_port(control, listen_port) == 0,
+          "the last NAT_CONTROL after the login must list the mapping on port %d created before it was "
+          "published", listen_port);
+
+    CHECK(gated_login(server, &runtime, "data", &data, reason, sizeof(reason)) == 0, "data login: %s", reason);
+    CHECK(nat_register(data, runtime.client_name, listen_port, 9) == 0,
+          "the data connection could not register the mapping on port %d", listen_port);
+
+    close_fd(&data);
+    close_fd(&control);
+    CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
+          "session not DISCONNECTED after the client left");
+    return 0;
+}
+
+/*
+ * The same for a data login: the push finds the control, but not the data connection that is not
+ * yet published, whose routes stay those it loaded. The data login pushes again once it has
+ * answered, so the REGISTER it reads next is checked against the new mapping.
+ */
+static int test_route_change_before_data_published(test_server *server)
+{
+    char reason[256];
+    runtime_session runtime;
+    int control = -1, data = -1;
+    CHECK(create_credential(server->db_path, "ck_loaded_data", "loaded-data-secret", 2) == 0,
+          "credential ck_loaded_data not stored");
+    CHECK(http_client_login(server, "ck_loaded_data", "loaded-data-secret", "machine-loaded-data", "lars",
+                            &runtime) == 0,
+          "http login (status and body above)");
+    char *token = admin_access_token(server);
+    CHECK(token != NULL, "admin login failed");
+    CHECK(gated_login(server, &runtime, "control", &control, reason, sizeof(reason)) == 0,
+          "control login: %s", reason);
+
+    CHECK(start_held_login(server, &runtime, "data", "loaded", &data) == 0,
+          "the data login never loaded its routes and was held at the gate");
+    int listen_port = pick_free_port();
+    int status = listen_port > 0 ? admin_create_mapping(server, token, runtime.client_id, listen_port) : -1;
+    free(token);
+    CHECK(status == 201, "the mapping created before the data connection was published answered %d, expected 201",
+          status);
+    CHECK(advance_held_login("data") == 0, "the data login was never published and held at the gate");
+    CHECK(finish_held_login("data", data, reason, sizeof(reason)) == 0,
+          "the first frame on the data connection must be a successful login response: %s", reason);
+    CHECK(nat_register(data, runtime.client_name, listen_port, 9) == 0,
+          "the data connection could not register the mapping on port %d created before it was published",
+          listen_port);
+    CHECK(expect_last_nat_control_lists_port(control, listen_port) == 0,
+          "the last NAT_CONTROL on the control connection must list the mapping on port %d", listen_port);
+
     close_fd(&data);
     close_fd(&control);
     CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
@@ -1372,6 +1568,12 @@ int main(int argc, char **argv)
     clear_login_gate();
     failures += run_on_fresh_server("data login answered before a stream OPEN sent once it is published",
                                     test_data_login_answered_before_stream_open, login_gate);
+    clear_login_gate();
+    failures += run_on_fresh_server("a route change before a control login is published reaches the client",
+                                    test_route_change_before_control_published, login_gate);
+    clear_login_gate();
+    failures += run_on_fresh_server("a route change before a data login is published reaches its routes",
+                                    test_route_change_before_data_published, login_gate);
     clear_login_gate();
     rmdir(login_gate_dir);
 
