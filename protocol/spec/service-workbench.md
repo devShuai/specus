@@ -36,6 +36,8 @@
 | .NET | HS256 JWT（另接受已绑定账号的 OIDC bearer） | 每次请求重读账号；`ManagementContext` 提供租户、用户名、角色 | `username` 为主键，全局唯一，`ToLower()` 比较 | 不支持 | 只删账号行，不级联 |
 | C | HS256 JWT | 自 #133（`8d082b2`）起与 Java 相同：每次请求和刷新都重读账号，账号必须存在、已启用且仍属 token 的租户；租户与角色取账号记录 | `username` 为主键，`lower()` 比较 | 不支持 | 只删账号行，不级联 |
 
+上表是本契约制定时的现状。自 #183 起，Go、.NET、C 的账号主键、租户内唯一的登录名、带租户的登录与按 `(tenant_id, sub)` 的 token 解析都与 Java 相同，见 [management-accounts.md](management-accounts.md)；工作台身份 `(tenantId, username)` 中的 `username` 在四端都是登录名。
+
 共同点：没有数值用户 id；内置管理员来自配置，没有账号行；客户端的 `owner_username` 是创建者的用户名，按字符串精确比较。
 
 **可见性**在四端一致：管理员看见本租户全部客户端；普通用户只看见 `tenant_id` 等于自己租户、并且 `owner_username` 等于自己用户名的客户端。HTTP route、TCP 映射和 Peer 服务跟随所属客户端可见；Peer 服务的增删改只允许管理员，普通用户读到的 `targetHost`/`targetPort` 被置空。对不存在或不可见对象的响应四端不一致（Java 多为 `400`，Go 为 `403`/`404`，.NET 为 `400`/`403`，C 为 `404`）。
