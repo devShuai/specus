@@ -2,7 +2,12 @@
 
 #include "traffic_capture.h"
 
+#include "decompression_limits.h"
+
 #include <ctype.h>
+#include <limits.h>
+#include <openssl/evp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -383,4 +388,169 @@ void st_traffic_http_text_preview(const uint8_t *data,
         sanitize_utf8(display, display_len, preview_bytes, out, out_len);
     }
     free(decoded);
+}
+
+/* HttpBodyDataCodec.headerValue: the trimmed value of the first "name: value" line, malloc'd. */
+static char *joined_header_value(const char *headers, const char *name)
+{
+    size_t name_len = strlen(name);
+    for (const char *line = headers; line != NULL && *line != '\0';) {
+        const char *end = line + strcspn(line, "\r\n");
+        const char *colon = memchr(line, ':', (size_t)(end - line));
+        if (colon != NULL && colon > line) {
+            const char *key = line;
+            const char *key_end = colon;
+            while (key < key_end && isspace((unsigned char)*key)) ++key;
+            while (key_end > key && isspace((unsigned char)key_end[-1])) --key_end;
+            if ((size_t)(key_end - key) == name_len && strncasecmp(key, name, name_len) == 0) {
+                const char *value = colon + 1;
+                const char *value_end = end;
+                while (value < value_end && isspace((unsigned char)*value)) ++value;
+                while (value_end > value && isspace((unsigned char)value_end[-1])) --value_end;
+                char *copy = (char *)malloc((size_t)(value_end - value) + 1U);
+                if (copy != NULL) {
+                    memcpy(copy, value, (size_t)(value_end - value));
+                    copy[value_end - value] = '\0';
+                }
+                return copy;
+            }
+        }
+        line = *end == '\0' ? end : end + 1;
+    }
+    return NULL;
+}
+
+/* HttpBodyDataCodec.mediaType: lower-cased type/subtype, application/octet-stream when not one. */
+static void display_media_type(const char *content_type, char *out, size_t out_len)
+{
+    media_type(content_type, out, out_len);
+    const char *slash = strchr(out, '/');
+    int valid = out[0] != '\0' && slash != NULL && slash != out && slash[1] != '\0' && strchr(slash + 1, '/') == NULL;
+    for (const char *p = out; valid && *p != '\0'; ++p) {
+        valid = isalnum((unsigned char)*p) || strchr("!#$&^_.+-/", *p) != NULL;
+    }
+    if (!valid) snprintf(out, out_len, "application/octet-stream");
+}
+
+/*
+ * HttpBodyDataCodec.decodeContentEncoding: every layer, last applied first, within the bounds of
+ * DecompressionLimits. 1 when the encoding is only identity, 0 with *out decoded, -1 when a layer
+ * is unknown (br included) or fails.
+ */
+static int display_decode(const uint8_t *data, size_t len, const char *encoding, uint8_t **out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    char *tokens = strdup(encoding);
+    if (tokens == NULL) return -1;
+    const char *items[16];
+    size_t lengths[16];
+    size_t count = 0U;
+    /* More layers than anyone sends is not decoded, like an unknown one. */
+    int failed = 0;
+    for (char *cursor = tokens;;) {
+        if (count == 16U) {
+            failed = 1;
+            break;
+        }
+        char *comma = strchr(cursor, ',');
+        char *end = comma == NULL ? cursor + strlen(cursor) : comma;
+        char *start = cursor;
+        while (start < end && isspace((unsigned char)*start)) ++start;
+        while (end > start && isspace((unsigned char)end[-1])) --end;
+        items[count] = start;
+        lengths[count] = (size_t)(end - start);
+        ++count;
+        if (comma == NULL) break;
+        cursor = comma + 1;
+    }
+    uint8_t *current = NULL;
+    size_t current_len = len;
+    int decoded = 0;
+    for (size_t i = count; i-- > 0U && !failed;) {
+        if (lengths[i] == 0U || token_equals(items[i], lengths[i], "identity")) continue;
+        const uint8_t *input = current == NULL ? data : current;
+        uint8_t *next = NULL;
+        size_t next_len = 0U;
+        if (token_equals(items[i], lengths[i], "gzip") || token_equals(items[i], lengths[i], "x-gzip")) {
+            failed = st_decompress_bounded(input, current_len, ST_DECOMPRESSION_GZIP, &next, &next_len)
+                != ST_DECOMPRESSION_OK;
+        } else if (token_equals(items[i], lengths[i], "deflate") || token_equals(items[i], lengths[i], "x-deflate")) {
+            failed = st_decompress_bounded(input, current_len, ST_DECOMPRESSION_ZLIB, &next, &next_len)
+                    != ST_DECOMPRESSION_OK
+                && st_decompress_bounded(input, current_len, ST_DECOMPRESSION_RAW_DEFLATE, &next, &next_len)
+                    != ST_DECOMPRESSION_OK;
+        } else {
+            failed = 1;
+        }
+        if (failed) break;
+        free(current);
+        current = next;
+        current_len = next_len;
+        decoded = 1;
+    }
+    free(tokens);
+    if (failed) {
+        free(current);
+        return -1;
+    }
+    if (!decoded) return 1;
+    *out = current;
+    *out_len = current_len;
+    return 0;
+}
+
+static char *display_data_url(const char *media, const uint8_t *data, size_t len)
+{
+    if (len > (size_t)INT_MAX / 2U) return NULL;
+    size_t encoded_len = 4U * ((len + 2U) / 3U);
+    size_t prefix_len = strlen("data:") + strlen(media) + strlen(";base64,");
+    char *text = (char *)malloc(prefix_len + encoded_len + 1U);
+    if (text == NULL) return NULL;
+    snprintf(text, prefix_len + 1U, "data:%s;base64,", media);
+    if (len > 0U && EVP_EncodeBlock((unsigned char *)text + prefix_len, data, (int)len) != (int)encoded_len) {
+        free(text);
+        return NULL;
+    }
+    text[prefix_len + encoded_len] = '\0';
+    return text;
+}
+
+/* HttpBodyDataCodec.toDisplayText(bytes, contentType): the sanitized text, or a data: URL. */
+static char *display_plain(const uint8_t *data, size_t len, const char *content_type)
+{
+    if (!text_media_type(content_type) && !looks_like_text(data, len)) {
+        char media[256];
+        display_media_type(content_type, media, sizeof(media));
+        return display_data_url(media, data, len);
+    }
+    /* Each byte becomes at most three (U+FFFD for a malformed one). */
+    if (len > (SIZE_MAX - 1U) / 3U) return NULL;
+    char *text = (char *)malloc(len * 3U + 1U);
+    if (text != NULL) sanitize_utf8(data, len, (size_t)-1, text, len * 3U + 1U);
+    return text;
+}
+
+char *st_traffic_body_display_text(const uint8_t *data,
+                                   size_t len,
+                                   const char *content_type,
+                                   const char *headers,
+                                   const char *fallback)
+{
+    if (data == NULL || len == 0U) return strdup(fallback == NULL ? "" : fallback);
+    char *encoding = joined_header_value(headers, "content-encoding");
+    char *text;
+    if (encoding == NULL) {
+        text = display_plain(data, len, content_type);
+    } else {
+        uint8_t *decoded = NULL;
+        size_t decoded_len = 0U;
+        int rc = display_decode(data, len, encoding, &decoded, &decoded_len);
+        text = rc == 1 ? display_plain(data, len, content_type)
+            : rc == 0 ? display_plain(decoded, decoded_len, content_type)
+            : display_data_url("application/octet-stream", data, len);
+        free(decoded);
+    }
+    free(encoding);
+    return text;
 }

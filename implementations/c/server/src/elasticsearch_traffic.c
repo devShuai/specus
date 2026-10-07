@@ -371,7 +371,8 @@ static const char es_http_mapping[] =
     "\"requestPreviewHex\":{\"type\":\"text\"},\"requestPreviewText\":{\"type\":\"text\"},"
     "\"responsePreviewHex\":{\"type\":\"text\"},\"responsePreviewText\":{\"type\":\"text\"},"
     "\"requestTruncated\":{\"type\":\"boolean\"},\"responseTruncated\":{\"type\":\"boolean\"},"
-    "\"capturedAt\":{\"type\":\"keyword\"}}}}";
+    "\"capturedAt\":{\"type\":\"keyword\"},"
+    "\"requestBodyData\":{\"type\":\"binary\"},\"responseBodyData\":{\"type\":\"binary\"}}}}";
 
 static const char es_tcp_mapping[] =
     "{\"mappings\":{\"properties\":{"
@@ -837,6 +838,8 @@ void st_elasticsearch_traffic_snapshot_current(st_elasticsearch_traffic_snapshot
     pthread_mutex_unlock(&es_queue_lock);
 }
 
+static char *es_base64(const uint8_t *data, size_t len);
+
 int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
 {
     if (record == NULL || record->client_id <= 0 || record->client_name == NULL || record->route == NULL) return -1;
@@ -858,6 +861,18 @@ int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
     st_traffic_http_text_preview(record->response_body, record->response_body_len, record->response_content_type,
                                  record->response_content_encoding, preview_bytes,
                                  response_text, sizeof(response_text));
+    /* The kept bodies as Java's binary requestBodyData/responseBodyData, base64 in the document. */
+    size_t request_kept = record->request_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+        ? record->request_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+    size_t response_kept = record->response_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+        ? record->response_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+    char *request_data = request_kept == 0U ? NULL : es_base64(record->request_body, request_kept);
+    char *response_data = response_kept == 0U ? NULL : es_base64(record->response_body, response_kept);
+    if ((request_kept > 0U && request_data == NULL) || (response_kept > 0U && response_data == NULL)) {
+        free(request_data);
+        free(response_data);
+        return -1;
+    }
     st_es_buffer json = {0};
     int first = 1;
     int rc = es_buffer_append(&json, "{")
@@ -890,10 +905,16 @@ int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
         || es_json_string_field(&json, "requestPreviewText", request_text, &first)
         || es_json_string_field(&json, "responsePreviewHex", response_hex, &first)
         || es_json_string_field(&json, "responsePreviewText", response_text, &first)
-        || es_json_bool_field(&json, "requestTruncated", record->request_body_len > preview_bytes, &first)
-        || es_json_bool_field(&json, "responseTruncated", record->response_body_len > preview_bytes, &first)
+        || es_json_bool_field(&json, "requestTruncated",
+                              request_kept > 0U && record->request_bytes > (long long)request_kept, &first)
+        || es_json_bool_field(&json, "responseTruncated",
+                              response_kept > 0U && record->response_bytes > (long long)response_kept, &first)
         || es_json_string_field(&json, "capturedAt", record->captured_at, &first)
+        || es_json_string_field(&json, "requestBodyData", request_data, &first)
+        || es_json_string_field(&json, "responseBodyData", response_data, &first)
         || es_buffer_append(&json, "}");
+    free(request_data);
+    free(response_data);
     if (rc) { free(json.data); return -1; }
     return es_enqueue(&es_http_queue, id, json.data, json.len);
 }
@@ -1355,7 +1376,7 @@ static int es_build_http_query(st_es_buffer *json,
             || es_buffer_append(json,
                                 ",\"_source\":{\"excludes\":[\"requestHeaders\",\"responseHeaders\","
                                 "\"requestPreviewHex\",\"requestPreviewText\",\"responsePreviewHex\","
-                                "\"responsePreviewText\"]}}");
+                                "\"responsePreviewText\",\"requestBodyData\",\"responseBodyData\"]}}");
     }
     return rc ? -1 : 0;
 }
@@ -1479,6 +1500,27 @@ static uint8_t *es_decode_base64(const char *value, size_t *out_len)
     if (len > 1U && value[len - 2U] == '=') --actual;
     *out_len = actual;
     return out;
+}
+
+/* The stored bodies of one exchange, read for its detail only. */
+static int es_parse_http_bodies(const char *source, st_storage_http_exchange *item)
+{
+    static const char *const fields[] = {"requestBodyData", "responseBodyData"};
+    uint8_t **data[] = {&item->request_body_data, &item->response_body_data};
+    size_t *lengths[] = {&item->request_body_data_len, &item->response_body_data_len};
+    for (size_t i = 0; i < 2U; ++i) {
+        char *encoded = st_json_get_top_level_string(source, fields[i]);
+        if (encoded != NULL && *encoded != '\0') {
+            *data[i] = es_decode_base64(encoded, lengths[i]);
+            if (*data[i] == NULL) {
+                free(encoded);
+                st_storage_http_exchange_free_bodies(item);
+                return -1;
+            }
+        }
+        free(encoded);
+    }
+    return 0;
 }
 
 static int es_parse_tcp_source(const char *source, st_storage_tcp_frame *item, int include_payload)
@@ -1605,7 +1647,8 @@ static int es_query_http(const char *database_path,
     for (size_t i = 0; i < hit_count; ++i) {
         char *source = NULL;
         if (es_parse_hit_source(hits[i], &source) != 0
-            || es_parse_http_source(source, &items[*item_count]) != 0) {
+            || es_parse_http_source(source, &items[*item_count]) != 0
+            || (document_id > 0 && es_parse_http_bodies(source, &items[*item_count]) != 0)) {
             free(source); st_json_free_string_array(hits, hit_count); return -1;
         }
         free(source);

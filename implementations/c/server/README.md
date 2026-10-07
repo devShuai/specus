@@ -49,11 +49,14 @@ The environment-token mode is a local smoke-test fixture, not an alternate wire 
 In both modes a login whose signature verifies consumes its `(apiKey, nonce)` pair, as
 `protocol/spec/client-auth.md` requires: the same pair again within 120 s gets Java's
 `400 {"error":"客户端签名 nonce 已使用"}` and no token; a request whose signature fails consumes nothing.
-The digests live in process memory (Java and Go keep them in the database): at most 65536 at a time,
-expiring by the same wall clock as the +-60 s timestamp window, and a full store answers
-`503` with `Retry-After` rather than evicting a pair that could still be replayed. Being per process,
-they are not shared between C server instances and do not survive a restart; the timestamp window
-limits a replay after a restart to requests signed in the preceding 60 s.
+With a database the digests go to Java's `specus_client_auth_nonce` table (same id, `api_key_hash`
+and text `expires_at`), consumed in one write transaction that first deletes expired rows, so a
+restart does not forget them and instances sharing the database file share them; a failing database
+answers `503`. Without one (the environment-token mode) they live in process memory: at most 65536
+at a time, expiring by the same wall clock as the +-60 s timestamp window, and a full store answers
+`503` with `Retry-After` rather than evicting a pair that could still be replayed. That store is per
+process and empty after a restart; the timestamp window limits a replay after a restart to requests
+signed in the preceding 60 s.
 The login response carries `nettyTls`, derived as Java and Go derive it: `true` when
 `SPECUS_TLS_MODE` is `file` or `self-signed`, or `SPECUS_TLS_TERMINATED_UPSTREAM=true`. Clients
 whose `controlTls.enabled` is unset follow it.
@@ -407,10 +410,14 @@ written to `specus_http_traffic_exchange` with request/response headers, body pr
 content types, response body type, and elapsed time. Previews follow Java's
 `TrafficInspectionService`: `SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES` (default `256`, capped at
 `1024`) bytes as uppercase spaced hex, and for HTTP a text preview of the body decoded per
-`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. Unlike Java,
-the C server stores HTTP previews rather than whole bodies, so `requestTruncated` /
-`responseTruncated` say whether the preview holds the whole body. The exchange list returns
-summaries without headers or previews; `GET /api/admin/traffic/http-exchanges/{id}` returns them. The management endpoints
+`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. The bodies
+themselves go to `request_body_data` / `response_body_data` (Elasticsearch: binary
+`requestBodyData` / `responseBodyData`): the first 64 KiB of each, where Java keeps the whole
+body, so `requestTruncated` / `responseTruncated` say the body was longer than what was kept. A
+response that media capture took keeps its size but no body. The exchange list returns summaries
+without headers, previews or bodies; `GET /api/admin/traffic/http-exchanges/{id}` returns them, the
+preview texts showing the stored bodies as Java's `HttpBodyDataCodec` does (the decoded text, or
+`data:<type>;base64,...` for a binary body). The management endpoints
 `GET /api/admin/traffic/http-exchanges`, `GET /api/admin/traffic/tcp-frames`,
 `GET /api/admin/traffic/tcp-frames/{id}`, and `GET /api/admin/traffic/tcp-streams` now query these
 SQLite tables with the same basic tenant/owner visibility rule as other management APIs. HTTP

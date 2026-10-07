@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "json.h"
 #include "login_rate_limiter.h"
+#include "password_hash.h"
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
@@ -2725,7 +2726,8 @@ static int test_admin_endpoint_contracts(void)
             "\"responseBytes\":34", "\"elapsedMs\":5", "\"requestContentType\":", "\"responseContentType\":",
             "\"responseBodyType\":\"json\"", "\"requestHeaders\":", "\"responseHeaders\":", "\"requestPreviewHex\":",
             "\"requestPreviewText\":", "\"responsePreviewHex\":", "\"responsePreviewText\":",
-            "\"requestTruncated\":false", "\"responseTruncated\":false", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
+            /* The fixture hands over 11 of its 34 response bytes, so the kept response is truncated. */
+            "\"requestTruncated\":false", "\"responseTruncated\":true", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
         };
         len = endpoint_call("GET", path, "alice", "tenant-a", "USER", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", expected_id, "exchange detail for its owner") != 0;
@@ -2956,13 +2958,28 @@ static int test_tenant_scoped_admin_mutations(void)
         failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "own tenant DELETE") != 0
             || st_storage_get_management_user(db_path, "carol", &gone) == 0;
     }
+    /*
+     * adminManagesUsersInsideOwnTenant, updatesPasswordRoleEnabledAndDeletesInsideActingTenant:
+     * password, role and the enabled flag change together, the stored hash is the new password's.
+     */
     if (!failed) {
+        st_storage_management_user updated;
+        st_password_verification verification;
         len = tenant_scope_call("PUT", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
-                                "{\"enabled\":false}", response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0;
+                                "{\"password\":\"new-password\",\"role\":\"ADMIN\",\"enabled\":false}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0
+            || !contains(response, "\"role\":\"ADMIN\"")
+            || st_storage_get_management_user(db_path, "dave", &updated) != 0
+            || strcmp(updated.password_hash, "unused-password-hash") == 0
+            || st_password_verify("new-password", updated.password_hash, &verification) != 0
+            || !verification.matches
+            || strcmp(updated.role, "ADMIN") != 0 || updated.enabled;
+        if (failed) fprintf(stderr, "tenant-b PUT did not store the new password, role and enabled flag\n");
         len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
                                               NULL, response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0;
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0
+            || st_storage_get_management_user(db_path, "dave", &updated) == 0;
     }
 
     /* Tenant-b's credential, mapping, route and peer service, as tenant-a's administrator sees them. */
@@ -3055,6 +3072,311 @@ static int test_tenant_scoped_admin_mutations(void)
         len = tenant_scope_call("DELETE", path, "root-b", "tenant-b", "ADMIN", NULL, response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, label) != 0;
     }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * HttpTrafficExchangeStoreTests through GET /api/admin/traffic/http-exchanges: the summary list
+ * carries no headers, previews or body, the detail of one exchange shows the stored bodies the way
+ * Java's HttpBodyDataCodec does: a PNG response as data:image/png;base64,... and the request text
+ * whole although the preview is cut at 8 bytes.
+ */
+static int test_http_exchange_body_detail(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-exchange-bodies-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-exchange-bodies-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    static const char request_body[] = "{\"order\":\"0123456789\"}";
+    st_storage_client client;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("bodies-owner", "tenant-bodies", "USER") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-bodies", "bodies-client", "bodies-owner", 1, 60,
+                                    &client) != 0;
+    if (!failed) {
+        st_storage_http_exchange_record record;
+        memset(&record, 0, sizeof(record));
+        record.tenant_id = "tenant-bodies";
+        record.client_id = client.id;
+        record.client_name = client.client_name;
+        record.route = "images";
+        record.method = "POST";
+        record.relative_path = "/logo.png";
+        record.status_code = 200;
+        record.success = 1;
+        record.request_bytes = (long long)strlen(request_body);
+        record.response_bytes = (long long)sizeof(png);
+        record.request_content_type = "application/json";
+        record.response_content_type = "image/png";
+        record.request_headers = "Content-Type: application/json";
+        record.response_headers = "Content-Type: image/png";
+        record.request_body = (const uint8_t *)request_body;
+        record.request_body_len = strlen(request_body);
+        record.response_body = png;
+        record.response_body_len = sizeof(png);
+        record.captured_at = "2026-10-07T00:00:00Z";
+        setenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES", "8", 1);
+        failed = st_storage_record_http_exchange(db_path, &record) != 0;
+        unsetenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES");
+    }
+    long long id = failed ? -1 : endpoint_exchange_id(db_path, "bodies-client");
+    failed = failed || id <= 0;
+    if (failed) fprintf(stderr, "exchange body fixture setup failed\n");
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/traffic/http-exchanges", "bodies-owner", "tenant-bodies",
+                                    "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"requestPreviewText\":null", "exchange list") != 0
+            || !contains(response, "\"responsePreviewText\":null") || contains(response, "data:")
+            || contains(response, "0123456789");
+        if (failed && len > 0) fprintf(stderr, "the exchange list carried a body: %s\n", response);
+    }
+    if (!failed) {
+        char path[96];
+        snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%lld", id);
+        int len = tenant_scope_call("GET", path, "bodies-owner", "tenant-bodies", "USER", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ",
+                                 "\"requestPreviewText\":\"{\\\"order\\\":\\\"0123456789\\\"}\"",
+                                 "exchange detail request body") != 0
+            || !contains(response, "\"responsePreviewHex\":\"89 50 4E 47 0D 0A 1A 0A\"")
+            || !contains(response, "\"responsePreviewText\":\"data:image/png;base64,iVBORw0KGgo=\"")
+            || !contains(response, "\"responseBodyType\":\"image\"")
+            || !contains(response, "\"requestTruncated\":false,\"responseTruncated\":false");
+        if (failed && len > 0) fprintf(stderr, "exchange detail bodies: %s\n", response);
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * Java PeerMeshServiceTests.pathStatsAggregatesDirectRatioAndNatTypes through GET
+ * /api/admin/peer-mesh/stats. Sessions group by the path that carried more bytes (RELAY stored but
+ * DIRECT-heavy counts as DIRECT) and status, with the reported (RTT) count, mean RTT and bytes, and
+ * by remote address family; a session past its expiry is closed first. Devices group by NAT type,
+ * blank as UNKNOWN, and by NAT behaviour: a device that reported none is left out, values are
+ * trimmed, and the success ratio counts classified mapping and filtering. An administrator sees the
+ * tenant, an ordinary user the sessions of its clients and its own devices.
+ */
+static int test_peer_mesh_path_stats(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-peer-stats-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-peer-stats-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    static const char seed[] =
+        "INSERT INTO client_account(rowid, tenant_id, client_name, owner_username, enabled) VALUES "
+        "(801, 'tenant-stats', 'stats-c1', 'owner-a', 1), (802, 'tenant-stats', 'stats-c2', 'owner-a', 1), "
+        "(803, 'tenant-stats', 'stats-c3', 'owner-b', 1), (804, 'tenant-other', 'stats-c4', 'owner-o', 1);"
+        "INSERT INTO peer_mesh_session(tenant_id, source_client_id, source_client_name, target_client_id, "
+        "target_client_name, path_type, status, expires_at, rtt_millis, remote_endpoint, direct_bytes, relay_bytes) "
+        "VALUES "
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 10, "
+        "'203.0.113.1:4000', 600, 0),"
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 15, "
+        "'[2001:db8::1]:4000', 300, 0),"
+        "('tenant-stats', 802, 'stats-c2', 801, 'stats-c1', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', NULL, "
+        "NULL, 0, 0),"
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'RELAY', 'ACTIVE', '2999-01-01 00:00:00', 80, "
+        "'203.0.113.2:4000', 10, 400),"
+        "('tenant-stats', 803, 'stats-c3', 803, 'stats-c3', 'RELAY', 'CLOSED', '2999-01-01 00:00:00', NULL, "
+        "'198.51.100.7:5000', 500, 100),"
+        "('tenant-stats', 801, 'stats-c1', 803, 'stats-c3', 'DIRECT', 'NEGOTIATING', '2000-01-01 00:00:00', NULL, "
+        "NULL, 0, 0),"
+        "('tenant-other', 804, 'stats-c4', 804, 'stats-c4', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 5, "
+        "'203.0.113.9:4000', 7, 0);"
+        "INSERT INTO peer_mesh_device(tenant_id, owner_username, client_id, client_name, enabled, nat_type, "
+        "nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery) VALUES "
+        "('tenant-stats', 'owner-a', 801, 'stats-c1', 1, '', 'ENDPOINT_INDEPENDENT', 'ADDRESS_AND_PORT_DEPENDENT', "
+        "'RFC5780'),"
+        "('tenant-stats', 'owner-a', 802, 'stats-c2', 1, 'UNKNOWN', 'ADDRESS_DEPENDENT', 'UNSUPPORTED', 'BASIC'),"
+        "('tenant-stats', 'owner-b', 803, 'stats-c3', 1, 'SYMMETRIC_NAT', NULL, NULL, NULL),"
+        "('tenant-stats', 'owner-b', 805, 'stats-c5', 0, '   ', '  ENDPOINT_INDEPENDENT ', '', NULL),"
+        "('tenant-other', 'owner-o', 804, 'stats-c4', 1, 'FULL_CONE', 'ENDPOINT_INDEPENDENT', "
+        "'ENDPOINT_INDEPENDENT', 'RFC5780');";
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("stats-root", "tenant-stats", "ADMIN") != 0
+        || connection_events_ensure_user("owner-a", "tenant-stats", "USER") != 0
+        || test_exec_sql(db_path, seed) != 0;
+    if (failed) fprintf(stderr, "peer mesh stats fixture setup failed\n");
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "stats-root", "tenant-stats", "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_body_equals(len, response,
+            "{\"totalSessions\":6,\"reportedSessions\":3,\"activeSessions\":4,\"activeDirectSessions\":3,"
+            "\"activeRelaySessions\":1,\"activeDirectRatio\":0.75,\"pathTypes\":["
+            "{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":3,\"reportedSessions\":2,"
+            "\"avgRttMillis\":12.5,\"directBytes\":900,\"relayBytes\":0},"
+            "{\"pathType\":\"DIRECT\",\"status\":\"CLOSED\",\"sessions\":2,\"reportedSessions\":0,"
+            "\"avgRttMillis\":null,\"directBytes\":500,\"relayBytes\":100},"
+            "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":1,\"reportedSessions\":1,"
+            "\"avgRttMillis\":80.0,\"directBytes\":10,\"relayBytes\":400}],\"addressFamilies\":["
+            "{\"addressFamily\":\"IPv4\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"IPv4\",\"status\":\"ACTIVE\",\"pathType\":\"RELAY\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"IPv4\",\"status\":\"CLOSED\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0},"
+            "{\"addressFamily\":\"IPv6\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"UNKNOWN\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0},"
+            "{\"addressFamily\":\"UNKNOWN\",\"status\":\"CLOSED\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0}],"
+            "\"natTypes\":[{\"natType\":\"UNKNOWN\",\"devices\":3},{\"natType\":\"SYMMETRIC_NAT\",\"devices\":1}],"
+            "\"natBehaviorDevices\":3,\"natBehaviorClassifiedDevices\":1,"
+            "\"natBehaviorSuccessRatio\":0.3333333333333333,"
+            "\"natMappingBehaviors\":[{\"behavior\":\"ENDPOINT_INDEPENDENT\",\"devices\":2},"
+            "{\"behavior\":\"ADDRESS_DEPENDENT\",\"devices\":1}],"
+            "\"natFilteringBehaviors\":[{\"behavior\":\"UNKNOWN\",\"devices\":1},"
+            "{\"behavior\":\"UNSUPPORTED\",\"devices\":1},{\"behavior\":\"ADDRESS_AND_PORT_DEPENDENT\",\"devices\":1}],"
+            "\"natBehaviorDiscoveries\":[{\"behavior\":\"UNKNOWN\",\"devices\":1},{\"behavior\":\"BASIC\",\"devices\":1},"
+            "{\"behavior\":\"RFC5780\",\"devices\":1}]}",
+            "tenant administrator's peer mesh stats") != 0;
+    }
+    if (!failed) {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        int closed = 0;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM peer_mesh_session WHERE status = 'CLOSED' "
+                                      "AND closed_at IS NOT NULL AND source_client_id = 801 AND target_client_id = 803",
+                                  -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            closed = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        failed = closed != 1;
+        if (failed) fprintf(stderr, "the expired negotiating session was not closed by the stats\n");
+    }
+    /* An ordinary user: the sessions of its own clients, its own devices. */
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "owner-a", "tenant-stats", "USER", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"totalSessions\":5,\"reportedSessions\":3,"
+                                 "\"activeSessions\":4,\"activeDirectSessions\":3,\"activeRelaySessions\":1,"
+                                 "\"activeDirectRatio\":0.75", "owner's peer mesh stats") != 0
+            || !contains(response, "{\"pathType\":\"DIRECT\",\"status\":\"CLOSED\",\"sessions\":1,"
+                                   "\"reportedSessions\":0,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":0}")
+            || !contains(response, "\"natTypes\":[{\"natType\":\"UNKNOWN\",\"devices\":2}],\"natBehaviorDevices\":2,"
+                                   "\"natBehaviorClassifiedDevices\":1,\"natBehaviorSuccessRatio\":0.5,")
+            || contains(response, "SYMMETRIC_NAT") || contains(response, "198.51.100.7");
+        if (failed && len > 0) fprintf(stderr, "owner's peer mesh stats: %s\n", response);
+    }
+    /* Nothing reported, nothing to divide: both ratios are null. */
+    if (!failed) {
+        failed = connection_events_ensure_user("nobody-peer", "tenant-empty", "ADMIN") != 0;
+        int len = failed ? -1 : tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "nobody-peer", "tenant-empty",
+                                              "ADMIN", NULL, response, sizeof(response));
+        failed = failed || endpoint_body_equals(len, response,
+            "{\"totalSessions\":0,\"reportedSessions\":0,\"activeSessions\":0,\"activeDirectSessions\":0,"
+            "\"activeRelaySessions\":0,\"activeDirectRatio\":null,\"pathTypes\":[],\"addressFamilies\":[],"
+            "\"natTypes\":[],\"natBehaviorDevices\":0,\"natBehaviorClassifiedDevices\":0,"
+            "\"natBehaviorSuccessRatio\":null,\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],"
+            "\"natBehaviorDiscoveries\":[]}", "an empty tenant's peer mesh stats") != 0;
+    }
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * ManagementUserServiceTests.bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous.
+ * C matches login names case-insensitively but keys rows by the exact username, so a legacy or
+ * foreign database may hold "Alice" (tenant-a) and "alice" (tenant-b). Such a name is no one's:
+ * password login, a local token naming it and an administrator's attempt to add a third spelling
+ * all fail, and neither row changes. Once one spelling is gone the other works again.
+ */
+static int test_ambiguous_login_name_fails_closed(void)
+{
+    char db_path[256];
+    char response[16384];
+    char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-ambiguous-user-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-ambiguous-user-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    char seed[1024];
+    int failed = st_storage_init(db_path, 0) != 0 || st_password_hash("secret-password", hash) != 0;
+    if (!failed) {
+        snprintf(seed, sizeof(seed),
+                 "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, "
+                 "updated_at) VALUES('Alice','tenant-a','%s','ADMIN',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
+                 "('alice','tenant-b','%s','USER',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", hash, hash);
+        failed = test_exec_sql(db_path, seed) != 0;
+    }
+    if (failed) fprintf(stderr, "ambiguous user fixture setup failed\n");
+    static const char *const spellings[] = {"alice", "Alice", "ALICE"};
+    for (size_t i = 0; !failed && i < sizeof(spellings) / sizeof(spellings[0]); ++i) {
+        char body[160];
+        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"secret-password\"}", spellings[i]);
+        int len = st_admin_build_response_with_body("POST", "/auth/login", body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 401 ", NULL, "login with an ambiguous name") != 0
+            || contains(response, "accessToken");
+    }
+    /* A token naming the ambiguous name answers like one naming a user that does not exist. */
+    if (!failed) {
+        char ghost[16384];
+        int ghost_len = tenant_scope_call("GET", "/api/admin/clients", "ghost", "tenant-b", "USER", NULL,
+                                          ghost, sizeof(ghost));
+        int len = tenant_scope_call("GET", "/api/admin/clients", "alice", "tenant-b", "USER", NULL,
+                                    response, sizeof(response));
+        failed = ghost_len <= 0 || len != ghost_len || strcmp(response, ghost) != 0
+            || (strncmp(response, "HTTP/1.1 401 ", 13U) != 0 && strncmp(response, "HTTP/1.1 403 ", 13U) != 0);
+        if (failed) fprintf(stderr, "token naming an ambiguous user: %s\n", len > 0 ? response : "(none)");
+    }
+    if (!failed) {
+        int len = st_admin_build_response_with_body("POST", "/api/admin/users",
+                                                    "{\"username\":\"ALICE\",\"password\":\"other-password\"}",
+                                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "a third spelling of an ambiguous name") != 0;
+    }
+    if (!failed) {
+        char count[16];
+        snprintf(seed, sizeof(seed),
+                 "SELECT COUNT(*) FROM specus_management_user WHERE lower(username) = 'alice' AND password_hash = '%s'",
+                 hash);
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        count[0] = '\0';
+        if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, seed, -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            snprintf(count, sizeof(count), "%s", (const char *)sqlite3_column_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        failed = strcmp(count, "2") != 0;
+        if (failed) fprintf(stderr, "the ambiguous rows changed: %s left as seeded\n", count);
+    }
+    /* With one spelling left the name is unambiguous again. */
+    if (!failed) {
+        failed = test_exec_sql(db_path, "DELETE FROM specus_management_user WHERE username = 'Alice';") != 0;
+        int len = failed ? -1 : st_admin_build_response_with_body("POST", "/auth/login",
+                                                                  "{\"username\":\"alice\",\"password\":\"secret-password\"}",
+                                                                  response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 200 ", "accessToken",
+                                           "login once the name is unambiguous") != 0;
+    }
+    st_login_rate_limiter_reset();
     unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
     unsetenv("SPECUS_DATABASE_PATH");
     unlink(db_path);
@@ -4573,6 +4895,420 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     return 0;
 }
 
+/* The body of a response, after its header. */
+static const char *response_body(const char *response)
+{
+    const char *body = strstr(response, "\r\n\r\n");
+    return body == NULL ? "" : body + 4;
+}
+
+/*
+ * PeerEgressResourceTests mutationsByANonAdminAreForbidden, enablingWhilePeerMeshIsOffIsABadRequest,
+ * anUnknownEgressClientIsNotFound and deletingAnUnknownPolicyIsNotFound: a tenant USER may read
+ * but not change egress, Peer Mesh being off forbids switching egress on, and the 404s name the id.
+ * Nothing refused is stored or pushed to the peers.
+ */
+static int test_peer_mesh_egress_admin_only(int egress_client_id)
+{
+    static const char *const switch_path = "/api/admin/peer-mesh/egress/switch";
+    static const char *const policies_path = "/api/admin/peer-mesh/egress/policies";
+    char response[16384];
+    char before_switch[4096];
+    char before_policies[8192];
+    char body[256];
+    char path[128];
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    if (tenant == NULL || connection_events_ensure_user("egress-member", tenant, "USER") != 0) {
+        fprintf(stderr, "egress member fixture setup failed\n");
+        return 1;
+    }
+    snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"enabled\":false}", egress_client_id);
+    int len = st_admin_build_response_with_body("POST", policies_path, body, response, sizeof(response));
+    int policy_id = 0;
+    if (len <= 0 || !contains(response, "200 OK") || st_json_get_int(response, "id", &policy_id) != 0) {
+        fprintf(stderr, "egress policy fixture create failed: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", switch_path, response, sizeof(response));
+    snprintf(before_switch, sizeof(before_switch), "%s", response_body(response));
+    len = st_admin_build_response("GET", policies_path, response, sizeof(response));
+    snprintf(before_policies, sizeof(before_policies), "%s", response_body(response));
+    int refreshes = peer_mesh_refresh_calls;
+
+    snprintf(path, sizeof(path), "%s/%d", policies_path, policy_id);
+    snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"enabled\":true}", egress_client_id);
+    struct {
+        const char *method;
+        const char *path;
+        const char *body;
+    } mutations[] = {
+        {"PUT", switch_path, "{\"enabled\":false}"},
+        {"POST", policies_path, body},
+        {"DELETE", path, NULL},
+    };
+    for (size_t i = 0U; i < sizeof(mutations) / sizeof(mutations[0]); ++i) {
+        len = tenant_scope_call(mutations[i].method, mutations[i].path, "egress-member", tenant, "USER",
+                                mutations[i].body, response, sizeof(response));
+        char *error = len > 0 ? st_json_get_string(response, "error") : NULL;
+        int refused = len > 0 && contains(response, "403 Forbidden") && error != NULL && *error != '\0';
+        free(error);
+        if (!refused) {
+            fprintf(stderr, "a USER's %s %s was not 403: %s\n", mutations[i].method, mutations[i].path, response);
+            return 1;
+        }
+    }
+    /* Reading stays open to the member. */
+    len = tenant_scope_call("GET", policies_path, "egress-member", tenant, "USER", NULL, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "a USER could not read the egress policies: %s\n", response);
+        return 1;
+    }
+
+    /*
+     * aSwitchRequestWithoutEnabledIsRefused and aBodyThatCannotBeParsedIsABadRequest: a switch
+     * request without enabled, or with it null, used to read as off and could stop egress for the
+     * whole tenant; a port range that is not a list is not a policy either.
+     */
+    static const char *const switch_bodies[] = {"{}", "{\"enabled\":null}"};
+    for (size_t i = 0U; i < sizeof(switch_bodies) / sizeof(switch_bodies[0]); ++i) {
+        len = st_admin_build_response_with_body("PUT", switch_path, switch_bodies[i], response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")
+            || !contains(response, "{\"error\":\"enabled is required\"}")) {
+            fprintf(stderr, "egress switch %s was not refused: %s\n", switch_bodies[i], response);
+            return 1;
+        }
+    }
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"destinationRules\":[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":\"443\"}]}",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", policies_path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "a policy with portRanges \"443\" was accepted: %s\n", response);
+        return 1;
+    }
+
+    /* Peer Mesh is off in this deployment: switching egress on is a bad request, off is allowed. */
+    const char *peer_mesh = getenv("SPECUS_PEER_MESH_ENABLED");
+    char saved_peer_mesh[16] = "";
+    if (peer_mesh != NULL) snprintf(saved_peer_mesh, sizeof(saved_peer_mesh), "%s", peer_mesh);
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    len = st_admin_build_response_with_body("PUT", switch_path, "{\"enabled\":true}", response, sizeof(response));
+    char *error = len > 0 ? st_json_get_string(response, "error") : NULL;
+    int refused = len > 0 && contains(response, "400 Bad Request") && error != NULL && *error != '\0';
+    free(error);
+    if (!refused) {
+        fprintf(stderr, "enabling egress with Peer Mesh off was not 400: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", switch_path, response, sizeof(response));
+    if (len <= 0 || strcmp(response_body(response), before_switch) != 0) {
+        fprintf(stderr, "a refused switch request changed the switch: %s, was %s\n", response_body(response),
+                before_switch);
+        return 1;
+    }
+    len = st_admin_build_response("GET", policies_path, response, sizeof(response));
+    if (len <= 0 || strcmp(response_body(response), before_policies) != 0 || peer_mesh_refresh_calls != refreshes) {
+        fprintf(stderr, "a refused egress request changed the policies or pushed a refresh\n");
+        return 1;
+    }
+    len = st_admin_build_response_with_body("PUT", switch_path, "{\"enabled\":false}", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"configuredEnabled\":false")) {
+        fprintf(stderr, "switching egress off with Peer Mesh off was refused: %s\n", response);
+        return 1;
+    }
+    if (saved_peer_mesh[0] != '\0') setenv("SPECUS_PEER_MESH_ENABLED", saved_peer_mesh, 1);
+
+    len = st_admin_build_response_with_body("POST", policies_path,
+                                            "{\"egressClientId\":987654321,\"enabled\":true}",
+                                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found")
+        || !contains(response, "{\"error\":\"client not found: 987654321\"}")) {
+        fprintf(stderr, "an unknown egress client was not named in the 404: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "egress policy fixture delete failed: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", path, response, sizeof(response));
+    char expected[96];
+    snprintf(expected, sizeof(expected), "{\"error\":\"egress policy not found: %d\"}", policy_id);
+    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, expected)) {
+        fprintf(stderr, "a missing egress policy was not named in the 404: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * PeerServiceDiscoveryServiceTests rejectsPublicTargetAndUnsafePath and
+ * rejectsUdpApplicationWithTcpTransport over the management API: the refused definitions are 400
+ * and nothing of them is stored; a local target in another spelling is stored normalised.
+ */
+static int test_peer_service_definition_validation(int client_id)
+{
+    static const char *const services_path = "/api/admin/peer-mesh/services";
+    static const char *const refused[] = {
+        "\"name\":\"evil\",\"application\":\"http\",\"targetHost\":\"evil.example\",\"targetPort\":80,"
+        "\"publishedPort\":28080",
+        "\"name\":\"public\",\"application\":\"http\",\"targetHost\":\"198.51.100.9\",\"targetPort\":80,"
+        "\"publishedPort\":28081",
+        "\"name\":\"url\",\"application\":\"http\",\"targetHost\":\"http://127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28082",
+        "\"name\":\"wildcard\",\"application\":\"tcp\",\"targetHost\":\"0.0.0.0\",\"targetPort\":80,"
+        "\"publishedPort\":28083",
+        "\"name\":\"script\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28084,\"path\":\"javascript:alert(1)\"",
+        "\"name\":\"traversal\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28085,\"path\":\"/a/../b\"",
+        "\"name\":\"spaces\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28086,\"path\":\"/a b\"",
+        "\"name\":\"dns\",\"transport\":\"tcp\",\"application\":\"udp\",\"targetHost\":\"127.0.0.1\","
+        "\"targetPort\":53,\"publishedPort\":28087",
+        "\"name\":\"web-over-udp\",\"transport\":\"udp\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\","
+        "\"targetPort\":80,\"publishedPort\":28088",
+        "\"name\":\"open\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28089,\"visibility\":\"public\"",
+    };
+    char body[512];
+    char response[32768];
+    for (size_t i = 0U; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        snprintf(body, sizeof(body), "{\"clientId\":%d,%s}", client_id, refused[i]);
+        int len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")) {
+            fprintf(stderr, "peer service definition was not refused: %s -> %s\n", refused[i], response);
+            return 1;
+        }
+    }
+    int len = st_admin_build_response("GET", services_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || contains(response, "evil.example")
+        || contains(response, "198.51.100.9") || contains(response, "javascript") || contains(response, "2808")) {
+        fprintf(stderr, "a refused peer service definition was stored: %s\n", response);
+        return 1;
+    }
+    /* Accepted spellings are stored normalised, and a new service starts disabled. */
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-normal01\",\"name\":\" Local DNS \",\"application\":\"UDP\","
+             "\"targetHost\":\" LOCALHOST \",\"targetPort\":53,\"publishedPort\":28053,\"visibility\":\"acl\"}",
+             client_id);
+    len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
+    int service_id = 0;
+    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"name\":\"Local DNS\"")
+        || !contains(response, "\"application\":\"udp\"") || !contains(response, "\"transport\":\"udp\"")
+        || !contains(response, "\"targetHost\":\"127.0.0.1\"") || !contains(response, "\"visibility\":\"ACL\"")
+        || !contains(response, "\"enabled\":false") || !contains(response, "\"path\":\"\"")
+        || st_json_get_int(response, "id", &service_id) != 0 || service_id <= 0) {
+        fprintf(stderr, "a valid peer service definition was not stored normalised: %s\n", response);
+        return 1;
+    }
+    /* An update is checked the same way. */
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%d", services_path, service_id);
+    len = st_admin_build_response_with_body("PUT", path, "{\"targetHost\":\"8.8.8.8\"}", response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "an update to a public target was accepted: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "204 No Content")) {
+        fprintf(stderr, "peer service fixture delete failed: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * PeerServiceDiscoveryServiceTests sharingDefaultsToOffWhenTableEmpty,
+ * nonAdminCannotToggleSharingOrMutateServices and cannotEnableSharingWhenDeploymentDisabled:
+ * nothing stored means sharing is off; a tenant USER may neither switch it nor define services;
+ * with Peer Mesh off the deployment refuses to switch it on.
+ */
+static int test_peer_service_sharing_rules(int client_id)
+{
+    static const char *const sharing_path = "/api/admin/peer-mesh/service-sharing";
+    char response[16384];
+    int len = st_admin_build_response("GET", sharing_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"deploymentEnabled\":true,\"configuredEnabled\":false,"
+                                        "\"effectiveEnabled\":false")
+        || !contains(response, "\"enabledServiceCount\":0") || !contains(response, "\"mdnsImportEnabled\":false")) {
+        fprintf(stderr, "peer service sharing did not default to off: %s\n", response);
+        return 1;
+    }
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-member01\",\"name\":\"ssh\",\"application\":\"ssh\","
+             "\"targetHost\":\"127.0.0.1\",\"targetPort\":22,\"publishedPort\":2222}", client_id);
+    if (tenant == NULL || connection_events_ensure_user("sharing-member", tenant, "USER") != 0) {
+        fprintf(stderr, "sharing member fixture setup failed\n");
+        return 1;
+    }
+    len = tenant_scope_call("PUT", sharing_path, "sharing-member", tenant, "USER", "{\"enabled\":true}",
+                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "403 Forbidden")) {
+        fprintf(stderr, "a USER switched peer service sharing: %s\n", response);
+        return 1;
+    }
+    len = tenant_scope_call("POST", "/api/admin/peer-mesh/services", "sharing-member", tenant, "USER", body,
+                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "403 Forbidden")) {
+        fprintf(stderr, "a USER defined a peer service: %s\n", response);
+        return 1;
+    }
+    const char *peer_mesh = getenv("SPECUS_PEER_MESH_ENABLED");
+    char saved[16] = "";
+    if (peer_mesh != NULL) snprintf(saved, sizeof(saved), "%s", peer_mesh);
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    len = st_admin_build_response_with_body("PUT", sharing_path, "{\"enabled\":true}", response, sizeof(response));
+    if (saved[0] != '\0') setenv("SPECUS_PEER_MESH_ENABLED", saved, 1);
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "部署端未启用")) {
+        fprintf(stderr, "enabling sharing without Peer Mesh was not 400: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", sharing_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"configuredEnabled\":false")) {
+        fprintf(stderr, "a refused sharing request switched sharing on: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * serviceReportRateAndStateTablesAreBounded (its audit half): however many audit events a tenant
+ * collects, the management API lists the latest 50.
+ */
+static int test_peer_service_audit_bounded(void)
+{
+    const char *database_path = getenv("SPECUS_DATABASE_PATH");
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    for (int i = 0; i < 120; ++i) {
+        if (database_path == NULL || tenant == NULL
+            || st_storage_record_peer_mesh_service_audit(database_path, "service-report", tenant, 1, 7001 + i,
+                                                         NULL, "rate-limited") != 0) {
+            fprintf(stderr, "peer service audit fixture failed\n");
+            return 1;
+        }
+    }
+    char response[65536];
+    int len = st_admin_build_response("GET", "/api/admin/peer-mesh/service-audit", response, sizeof(response));
+    size_t events = 0U;
+    for (const char *cursor = strstr(response, "\"action\":"); cursor != NULL;
+         cursor = strstr(cursor + 1, "\"action\":")) {
+        ++events;
+    }
+    if (len <= 0 || !contains(response, "200 OK") || events != 50U || !contains(response, "\"sessionId\":7120")) {
+        fprintf(stderr, "peer service audit listed %zu events: %s\n", events, response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * PublicPeerMeshResourceTests: stun-config prefers a standalone STUN server, publishes it while
+ * Peer Mesh is off, and falls back to the embedded endpoint when the standalone setting is
+ * incomplete; nat-probe-config offers RFC 5780 only with a full second address and port.
+ */
+static int test_public_stun_config_endpoints(void)
+{
+    static const char *const settings[] = {
+        "SPECUS_PEER_MESH_ENABLED", "SPECUS_PEER_MESH_PUBLIC_ADDRESS", "SPECUS_PEER_MESH_STUN_TURN_PORT",
+        "SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS", "SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS",
+        "SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS",
+        "SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", "SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS",
+        "SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT",
+    };
+    for (size_t i = 0U; i < sizeof(settings) / sizeof(settings[0]); ++i) unsetenv(settings[i]);
+    char response[16384];
+    int failed = 0;
+
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", "turn.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "5349", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS", "stun-backup.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", "5350", 1);
+    static const char *const preferred =
+        "{\"peerMeshEnabled\":true,\"selfHostedStunServer\":\"stun:stun.example.com:5349\","
+        "\"stunServers\":[\"stun:stun.example.com:5349\",\"stun:stun-backup.example.com:5349\"],"
+        "\"stunTurnPort\":3478}";
+    int len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (len <= 0 || strcmp(response_body(response), preferred) != 0) {
+        fprintf(stderr, "stun-config did not prefer the standalone endpoint: %s\n", response_body(response));
+        failed = 1;
+    }
+    /* The alternate is listed on the primary port whether or not a second port is set. */
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (!failed && (len <= 0 || strcmp(response_body(response), preferred) != 0)) {
+        fprintf(stderr, "stun-config dropped the alternate without a second port: %s\n", response_body(response));
+        failed = 1;
+    }
+
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT");
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"peerMeshEnabled\":false")
+                    || !contains(response, "\"selfHostedStunServer\":\"stun:stun.example.com:3478\""))) {
+        fprintf(stderr, "stun-config did not publish standalone STUN with Peer Mesh off: %s\n",
+                response_body(response));
+        failed = 1;
+    }
+
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", "relay.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STUN_TURN_PORT", "4444", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "0", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"selfHostedStunServer\":\"stun:relay.example.com:4444\"")
+                    || !contains(response, "\"stunTurnPort\":4444") || contains(response, "stun.example.com"))) {
+        fprintf(stderr, "an incomplete standalone STUN did not fall back: %s\n", response_body(response));
+        failed = 1;
+    }
+
+    for (size_t i = 0U; i < sizeof(settings) / sizeof(settings[0]); ++i) unsetenv(settings[i]);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun-a.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "34780", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS", "203.0.113.20", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", "34781", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"available\":true,\"protocol\":\"RFC8489\","
+                                                     "\"discoveryMethod\":\"RFC5780\"")
+                    || !contains(response, "{\"id\":\"A1P1\",\"url\":\"stun:stun-a.example.com:34780\"")
+                    || !contains(response, "{\"id\":\"A1P2\",\"url\":\"stun:stun-a.example.com:34781\"")
+                    || !contains(response, "{\"id\":\"A2P1\",\"url\":\"stun:203.0.113.20:34780\"")
+                    || !contains(response, "{\"id\":\"A2P2\",\"url\":\"stun:203.0.113.20:34781\"")
+                    || !contains(response, "\"changeRequest\":true")
+                    || !contains(response, "\"padding\":true,\"browserMappingObservation\":true,"
+                                           "\"browserFilteringObservation\":false"))) {
+        fprintf(stderr, "standalone RFC 5780 nat-probe-config mismatch: %s\n", response_body(response));
+        failed = 1;
+    }
+    /* Without the second port the NAT probe alternate port stands in, as in Java. */
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "{\"id\":\"A2P2\",\"url\":\"stun:203.0.113.20:3479\""))) {
+        fprintf(stderr, "nat-probe-config ignored the NAT probe alternate port: %s\n", response_body(response));
+        failed = 1;
+    }
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"discoveryMethod\":\"BASIC_STUN\","
+                                                     "\"endpoints\":[{\"id\":\"A1P1\","
+                                                     "\"url\":\"stun:stun.example.com:34780\"")
+                    || contains(response, "A1P2") || !contains(response, "\"changeRequest\":false"))) {
+        fprintf(stderr, "basic STUN nat-probe-config mismatch: %s\n", response_body(response));
+        failed = 1;
+    }
+    for (size_t i = 0U; i < sizeof(settings) / sizeof(settings[0]); ++i) unsetenv(settings[i]);
+    return failed;
+}
+
 int main(void)
 {
     /* The suite deliberately exercises demo credentials and seeding; production disables both. */
@@ -4747,6 +5483,9 @@ int main(void)
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT");
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
+    if (test_public_stun_config_endpoints() != 0) {
+        return 1;
+    }
     len = st_admin_build_response_with_auth("GET", "/api/admin/overview", NULL, NULL, response, sizeof(response));
     if (len <= 0 || !contains(response, "401 Unauthorized")) {
         fprintf(stderr, "unauthenticated admin api response mismatch\n");
@@ -5964,7 +6703,8 @@ int main(void)
         fprintf(stderr, "peer mesh acl list response mismatch\n");
         return 1;
     }
-    if (test_peer_mesh_egress_policy_validation(target_client_id) != 0) {
+    if (test_peer_mesh_egress_policy_validation(target_client_id) != 0
+        || test_peer_mesh_egress_admin_only(target_client_id) != 0) {
         return 1;
     }
     snprintf(acl_body,
@@ -6126,6 +6866,9 @@ int main(void)
         fprintf(stderr, "peer service sharing status mismatch\n");
         return 1;
     }
+    if (test_peer_service_sharing_rules(created_client_id) != 0) {
+        return 1;
+    }
     len = st_admin_build_response_with_body("PUT", "/api/admin/peer-mesh/service-sharing",
                                             "{\"enabled\":true,\"mdnsImportEnabled\":true}",
                                             response, sizeof(response));
@@ -6172,6 +6915,9 @@ int main(void)
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
     if (len <= 0 || !contains(response, "204 No Content")) {
         fprintf(stderr, "peer service delete mismatch\n");
+        return 1;
+    }
+    if (test_peer_service_definition_validation(created_client_id) != 0) {
         return 1;
     }
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
@@ -6233,11 +6979,27 @@ int main(void)
         fprintf(stderr, "peer TCP service import mismatch: %s\n", response);
         return 1;
     }
+    /* importCandidatesCreatesDisabledTcpMapping: the imported service is a disabled tcp one. */
+    {
+        const char *imported = strstr(response, "\"serviceId\":\"import-tcp-");
+        const char *end = imported == NULL ? NULL : strstr(imported, "\"createdAt\"");
+        size_t span = end == NULL ? 0U : (size_t)(end - imported);
+        char view[2048] = "";
+        if (span > 0U && span < sizeof(view)) memcpy(view, imported, span);
+        if (!contains(view, "\"application\":\"tcp\"") || !contains(view, "\"enabled\":false")
+            || !contains(view, "\"targetHost\":\"127.0.0.1\"")) {
+            fprintf(stderr, "an imported peer service was not a disabled tcp service: %s\n", response);
+            return 1;
+        }
+    }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/service-audit", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"action\":\"service-import\"")
         || !contains(response, "\"reason\":\"created=1,skipped=0\"")) {
         fprintf(stderr, "peer service audit mismatch: %s\n", response);
+        return 1;
+    }
+    if (test_peer_service_audit_bounded() != 0) {
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/specus-mappings?clientId=%d", created_client_id);
@@ -7205,6 +7967,15 @@ int main(void)
         return 1;
     }
     if (test_tenant_scoped_admin_mutations() != 0) {
+        return 1;
+    }
+    if (test_ambiguous_login_name_fails_closed() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_path_stats() != 0) {
+        return 1;
+    }
+    if (test_http_exchange_body_detail() != 0) {
         return 1;
     }
     if (test_http_route_service_rules() != 0) {
