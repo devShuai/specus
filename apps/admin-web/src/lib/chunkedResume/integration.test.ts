@@ -3,7 +3,7 @@ import { ChunkBitmap } from "./bitmap";
 import { randomHex128, sha256, toHex, type Bytes } from "./bytes";
 import type { BulkChannel } from "./channel";
 import { hashChunksOnCurrentThread } from "./chunkHashes";
-import { GIB, KIB, RESUME_TTL_SECONDS, UNACKED_WINDOW_CHUNKS } from "./constants";
+import { GIB, KIB, MAX_STORED_PARTIALS, RESUME_TTL_SECONDS, UNACKED_WINDOW_CHUNKS } from "./constants";
 import { decodeFrame, encodeChunkFrames, encodeHashFrames } from "./frames";
 import { chunkLengthOf, fileMetaMessage, manifestFromHashes, type Manifest } from "./manifest";
 import { ReceiverController, type ReceivedFile } from "./receiverController";
@@ -749,5 +749,66 @@ describe("chunked resume between two pages", { timeout: 30_000 }, () => {
     // Never announced, so not kept as a partial either.
     expect((await store.listReceives()).map((record) => record.transferId)).toEqual([x1.transferId]);
     expect(receiver.errors.at(-1)).toContain("直连通道已断开");
+  });
+
+  it("resumes a memory-mode receive in-session after a cut without a second consent", async () => {
+    const { receiver, sender, persistentStore } = setup(); // auto-accept: memory mode
+    const size = 12 * CHUNK + 99;
+    let cuts = 0;
+    const result = await sender.send(new Blob([pattern(3, size)]), {
+      tapForNewChannels: () => (cuts++ === 0 ? { receiver: cutAfterAcks(5) } : undefined),
+    });
+    await settle();
+    expect(result.kind).toBe("complete");
+    expect(sender.sleeps).toEqual([1000]);
+    expect(sender.transfers).toHaveLength(1);
+    expect(receiver.completed[0].storage).toBe("memory");
+    expect(await bytesOf(receiver.completed[0].blob)).toEqual(pattern(3, size));
+    expect(await persistentStore!.listReceives()).toEqual([]);
+    // Delivered: the Blob holds the bytes, the memory store no longer does.
+    expect(await receiver.memory.listChunkTransferIds()).toEqual([]);
+  });
+
+  it("keeps at most maxStoredPartials unfinished memory-mode receives and refuses more with TOO_MANY_PARTIALS", async () => {
+    const { receiver, clock, persistentStore } = setup(); // auto-accept: memory mode
+    const size = 6 * CHUNK;
+    const senders: SenderPage[] = [];
+    const outcomes: string[] = [];
+    const rounds = MAX_STORED_PARTIALS + 3;
+    for (let round = 0; round < rounds; round += 1) {
+      const sender = new SenderPage(receiver, clock);
+      senders.push(sender);
+      // Most of the file, then the connection dies and every reconnect fails.
+      const failure = await sender.send(new Blob([pattern(round, size)]), { tapForNewChannels: interruptAfter(4) })
+        .catch((error: unknown) => error);
+      outcomes.push(failure instanceof SenderError ? failure.code ?? failure.failure : String(failure));
+      await settle();
+      expect((await receiver.memory.listReceives()).length).toBeLessThanOrEqual(MAX_STORED_PARTIALS);
+      expect((await receiver.memory.listChunkTransferIds()).length).toBeLessThanOrEqual(MAX_STORED_PARTIALS);
+    }
+    expect(outcomes).toEqual([
+      ...Array<string>(MAX_STORED_PARTIALS).fill("retry"),
+      ...Array<string>(rounds - MAX_STORED_PARTIALS).fill("TOO_MANY_PARTIALS"),
+    ]);
+    expect((await receiver.memory.listReceives()).map((record) => record.state))
+      .toEqual(Array<string>(MAX_STORED_PARTIALS).fill("INTERRUPTED"));
+    expect(receiver.errors.filter((message) => message.includes("本机未完成的接收已达 4 个")))
+      .toHaveLength(rounds - MAX_STORED_PARTIALS);
+    expect(await persistentStore!.listReceives()).toEqual([]); // auto-accept never writes to disk
+
+    // The limit does not touch in-session retry: the first sender comes back and finishes.
+    const first = senders[0];
+    const resumed = await first.send(new Blob([pattern(0, size)]), { existing: first.transfers[0] });
+    await settle();
+    expect(resumed.kind).toBe("complete");
+    expect(resumed.transfer.transferId).toBe(first.transfers[0].transferId);
+    expect(await bytesOf(receiver.completed[0].blob)).toEqual(pattern(0, size));
+    // A completed memory record keeps no chunks and stops counting: a new file fits again.
+    const fresh = new SenderPage(receiver, clock);
+    const next = await fresh.send(new Blob([pattern(50, 2 * CHUNK)]));
+    await settle();
+    expect(next.kind).toBe("complete");
+    expect(await bytesOf(receiver.completed[1].blob)).toEqual(pattern(50, 2 * CHUNK));
+    expect((await receiver.memory.listChunkTransferIds()).length).toBe(MAX_STORED_PARTIALS - 1);
   });
 });

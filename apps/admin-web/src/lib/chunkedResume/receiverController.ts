@@ -1,4 +1,4 @@
-import { MAX_ACTIVE_RECEIVES, MEMORY_LIMIT_BYTES, RESUME_TTL_SECONDS } from "./constants";
+import { MAX_ACTIVE_RECEIVES, MAX_STORED_PARTIALS, MEMORY_LIMIT_BYTES, RESUME_TTL_SECONDS } from "./constants";
 import { ChunkBitmap } from "./bitmap";
 import { fromHex, isHex32, type Bytes, type Digest } from "./bytes";
 import { sendJson, isRecord, type BulkChannel } from "./channel";
@@ -138,6 +138,8 @@ export class ReceiverController {
   private readonly pending = new Map<string, Pending>();
   /** Clicked offers whose record is being written; their channel stays reserved until bound. */
   private readonly accepting = new Set<Pending>();
+  /** Memory-mode records past the limit check but not yet in `entries`. */
+  private memoryAdmissions = 0;
   private readonly channelTransfers = new Map<BulkChannel, string>();
   private readonly resumeRequestedAt = new Map<string, number>();
   private persistentStore: Promise<ResumeStore | null> | null = null;
@@ -302,6 +304,7 @@ export class ReceiverController {
         sizeBytes: record.sizeBytes,
         receivedBytes: receivedBytesOf(record),
       })),
+      memoryPartials: this.memoryPartials(),
       senderAllowed: this.deps.senderAllowed(peerId),
       transferIdInUse: inUse,
     });
@@ -385,8 +388,15 @@ export class ReceiverController {
     }
     let store = pending.storage === "persistent" ? await this.persistent() : this.deps.memoryStore;
     if (!store) store = this.deps.memoryStore;
-    if (store.mode === "memory" && offer.sizeBytes > MEMORY_LIMIT_BYTES) {
+    const memory = store.mode === "memory";
+    if (memory && offer.sizeBytes > MEMORY_LIMIT_BYTES) {
       this.sendReject(channel, transferId, "PERSISTENCE_UNAVAILABLE");
+      return null;
+    }
+    if (memory && this.memoryPartials() >= MAX_STORED_PARTIALS) {
+      // Checked again at the click: other memory-mode receives may have started since the prompt.
+      this.sendReject(channel, transferId, "TOO_MANY_PARTIALS");
+      this.deps.onError(`未接收 ${offer.fileName}：${LOCAL_REJECT_TEXT.TOO_MANY_PARTIALS}`);
       return null;
     }
     const now = this.deps.now();
@@ -411,12 +421,16 @@ export class ReceiverController {
       sourcePeerId: peerId,
       sourceName: this.deps.peerName(peerId),
     };
+    // Counted from the check above until it is in `entries`, so a concurrent click cannot slip past.
+    if (memory) this.memoryAdmissions += 1;
     try {
       await store.putReceive(record);
     } catch {
       this.sendReject(channel, transferId, "INSUFFICIENT_STORAGE");
       this.deps.onError(`未接收 ${offer.fileName}：本机浏览器存储空间不足`);
       return null;
+    } finally {
+      if (memory) this.memoryAdmissions -= 1;
     }
     const entry = this.entryFromRecord(record, store);
     this.entries.set(transferId, entry);
@@ -618,6 +632,21 @@ export class ReceiverController {
 
   private activeSessions(): number {
     return [...this.entries.values()].filter((entry) => entry.channel !== null).length;
+  }
+
+  /**
+   * Unfinished memory-mode receives (§6): their chunks stay in this tab until they complete, are
+   * abandoned or expire, so they are capped like stored partials. A completed one dropped its chunks.
+   */
+  private memoryPartials(): number {
+    let count = this.memoryAdmissions;
+    for (const entry of this.entries.values()) {
+      const { state } = entry.engine;
+      if (entry.store.mode === "memory" && (state === "RECEIVING" || state === "INTERRUPTED")) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   private sendReject(channel: BulkChannel, transferId: string, code: string) {

@@ -2474,6 +2474,7 @@
       },
       "sizeBytes": 10485760,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2490,6 +2491,7 @@
       },
       "sizeBytes": 10485760,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2506,6 +2508,7 @@
       },
       "sizeBytes": 134217728,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2522,6 +2525,7 @@
       },
       "sizeBytes": 134217729,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2538,6 +2542,7 @@
       },
       "sizeBytes": 10485760,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2554,6 +2559,7 @@
       },
       "sizeBytes": 10485760,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": false,
       "transferIdInUse": false,
       "expect": {
@@ -2571,6 +2577,7 @@
       },
       "sizeBytes": 10485760,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": true,
       "expect": {
@@ -2588,6 +2595,7 @@
       },
       "sizeBytes": 104857600,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2605,6 +2613,7 @@
       },
       "sizeBytes": 209715200,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2639,6 +2648,7 @@
           "receivedBytes": 0
         }
       ],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2673,6 +2683,7 @@
           "receivedBytes": 0
         }
       ],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2699,6 +2710,7 @@
           "receivedBytes": 536870912
         }
       ],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2724,6 +2736,7 @@
           "receivedBytes": 536870912
         }
       ],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2741,6 +2754,7 @@
       },
       "sizeBytes": 1006632960,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2757,6 +2771,7 @@
       },
       "sizeBytes": 1006632961,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2774,6 +2789,7 @@
       },
       "sizeBytes": 104857600,
       "livePartials": [],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2800,6 +2816,7 @@
           "receivedBytes": 1073741824
         }
       ],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
@@ -2826,10 +2843,133 @@
           "receivedBytes": 1073741824
         }
       ],
+      "memoryPartials": 0,
       "senderAllowed": true,
       "transferIdInUse": false,
       "expect": {
         "decision": "PROMPT_PERSISTENT"
+      }
+    },
+    {
+      "name": "auto-accept-below-memory-partial-limit",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "memoryPartials": 3,
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "AUTO_ACCEPT_MEMORY"
+      }
+    },
+    {
+      "name": "auto-accept-memory-partials-at-limit",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "memoryPartials": 4,
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "TOO_MANY_PARTIALS"
+      }
+    },
+    {
+      "name": "stored-partials-do-not-block-auto-accept",
+      "policy": {
+        "autoAccept": true,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        },
+        {
+          "sizeBytes": 1048576,
+          "receivedBytes": 0
+        }
+      ],
+      "memoryPartials": 0,
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "AUTO_ACCEPT_MEMORY"
+      }
+    },
+    {
+      "name": "memory-partials-do-not-block-persistent",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": true,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 10485760,
+      "livePartials": [],
+      "memoryPartials": 4,
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "PROMPT_PERSISTENT"
+      }
+    },
+    {
+      "name": "memory-fallback-memory-partials-at-limit",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": false,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 104857600,
+      "livePartials": [],
+      "memoryPartials": 4,
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "TOO_MANY_PARTIALS"
+      }
+    },
+    {
+      "name": "large-file-keeps-its-reason-when-memory-is-full",
+      "policy": {
+        "autoAccept": false,
+        "persistentAvailable": false,
+        "quotaBytes": 10737418240,
+        "usageBytes": 1073741824
+      },
+      "sizeBytes": 209715200,
+      "livePartials": [],
+      "memoryPartials": 4,
+      "senderAllowed": true,
+      "transferIdInUse": false,
+      "expect": {
+        "decision": "REJECT",
+        "code": "PERSISTENCE_UNAVAILABLE"
       }
     }
   ],
