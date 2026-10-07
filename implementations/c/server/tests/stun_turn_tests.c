@@ -945,7 +945,7 @@ static int test_default_private_peer_refusal(void)
     }
 
     /* Public unicast peers stay allowed, including RFC 6598 CGNAT space and IPv4-mapped IPv6. */
-    static const char *const allowed_ipv4[] = {"203.0.113.10", "100.64.0.2"};
+    static const char *const allowed_ipv4[] = {"203.0.113.10", "100.64.0.2", "100.96.0.2"};
     for (size_t i = 0; !failed && i < sizeof(allowed_ipv4) / sizeof(allowed_ipv4[0]); ++i) {
         received = peer_from_text(allowed_ipv4[i], 50000U, &peer) != 0 ? -1
             : create_permission(client, &fixture, &general, &peer, seed++, response, sizeof(response));

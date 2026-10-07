@@ -12,6 +12,13 @@
 #define ST_TRAFFIC_PREVIEW_TEXT_CAP 8192U
 
 /*
+ * How much of each HTTP body a detail record keeps. Java keeps the whole body; C keeps the first
+ * 64 KiB (as much of a response as the forwarding path holds on to), and requestTruncated or
+ * responseTruncated says the body was longer than what was kept.
+ */
+#define ST_TRAFFIC_BODY_CAPTURE_BYTES (64U * 1024U)
+
+/*
  * Java specus.traffic.capture-detail-enabled (SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED, default
  * false): detail capture is off unless the server enables it, whatever a route or mapping says.
  */
@@ -52,5 +59,20 @@ void st_traffic_http_text_preview(const uint8_t *data,
                                   size_t preview_bytes,
                                   char *out,
                                   size_t out_len);
+
+/*
+ * Java HttpBodyDataCodec.toDisplayText, the text of a stored body in the detail view: fallback
+ * when nothing was stored. A Content-Encoding (taken from headers, "Name: value" lines) other than
+ * identity is decoded within DecompressionLimits (gzip, x-gzip, deflate, x-deflate; br is not, Java
+ * decodes it), or the stored bytes are shown as data:application/octet-stream;base64,... when that
+ * fails. A textual media type, or bytes that look like text, give the whole text, sanitized like
+ * the previews; anything else is data:<media type>;base64,<body>. Returns a malloc'd string, or
+ * NULL when out of memory.
+ */
+char *st_traffic_body_display_text(const uint8_t *data,
+                                   size_t len,
+                                   const char *content_type,
+                                   const char *headers,
+                                   const char *fallback);
 
 #endif
