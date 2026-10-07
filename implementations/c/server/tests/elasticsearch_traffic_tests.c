@@ -44,6 +44,8 @@ int main(int argc, char **argv)
         .captured_at = "2026-08-28T01:02:03Z"
     };
     if (st_storage_record_http_exchange(argv[1], &http) != 0) return 1;
+    /* The writer sends queued documents in the background; flush=true sends them now. */
+    st_elasticsearch_traffic_flush();
 
     st_storage_http_exchange exchanges[4];
     size_t exchange_count = 0;
@@ -96,6 +98,7 @@ int main(int argc, char **argv)
     image.response_body = png;
     image.response_body_len = sizeof(png);
     if (st_storage_record_http_exchange(argv[1], &image) != 0) return 1;
+    st_elasticsearch_traffic_flush();
     exchange_count = 0;
     if (st_storage_list_http_exchanges_visible(argv[1], client.id, "images", NULL, NULL, NULL,
                                                "default", "admin", 1, 0, 10,
@@ -152,6 +155,7 @@ int main(int argc, char **argv)
         .frame_time = "2026-08-28T01:02:04Z"
     };
     if (st_storage_record_tcp_frame(argv[1], &tcp) != 0) return 1;
+    st_elasticsearch_traffic_flush();
     st_storage_tcp_frame frames[4];
     size_t frame_count = 0;
     total = 0;
@@ -173,7 +177,7 @@ int main(int argc, char **argv)
     st_storage_tcp_frame_free(&detail);
     frame_count = 0;
     if (st_storage_list_tcp_stream_visible(argv[1], "channel-es-1", "default", "admin", 1,
-                                           10, frames, 4, &frame_count) != 0
+                                           0, 4, frames, 4, &frame_count, &total) != 0
         || frame_count != 1 || frames[0].frame_index != 2) {
         fprintf(stderr, "Elasticsearch TCP stream mismatch\n");
         return 1;
@@ -183,6 +187,8 @@ int main(int argc, char **argv)
     if (setenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE", "1", 1) != 0) return 1;
     st_elasticsearch_traffic_reset_for_tests();
     if (st_storage_record_http_exchange(argv[1], &http) != 0) return 1;
+    /* The writer sends queued documents in the background; flush=true sends them now. */
+    st_elasticsearch_traffic_flush();
     exchange_count = 0;
     total = -1;
     if (st_storage_list_http_exchanges_visible(argv[1], client.id, NULL, NULL, NULL, NULL,

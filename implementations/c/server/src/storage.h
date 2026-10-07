@@ -1328,15 +1328,21 @@ int st_storage_get_tcp_frame_visible(const char *path,
                                      const char *owner_username,
                                      int include_all_clients,
                                      st_storage_tcp_frame *frame);
+/*
+ * One page (size up to 1000) of a channel's frames with their payloads, in capture order as Java's
+ * findStream (by id, both directions interleaved); *total_count is the channel's frame count.
+ */
 int st_storage_list_tcp_stream_visible(const char *path,
                                        const char *channel_id,
                                        const char *tenant_id,
                                        const char *owner_username,
                                        int include_all_clients,
-                                       int limit,
+                                       int page,
+                                       int size,
                                        st_storage_tcp_frame *items,
                                        size_t max_items,
-                                       size_t *item_count);
+                                       size_t *item_count,
+                                       long long *total_count);
 void st_storage_tcp_frame_free(st_storage_tcp_frame *frame);
 
 /*

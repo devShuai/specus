@@ -139,6 +139,41 @@ add_test(NAME elasticsearch_traffic_tests
                  $<TARGET_FILE:specus_c_elasticsearch_traffic_tests>)
 set_tests_properties(elasticsearch_traffic_tests PROPERTIES TIMEOUT 45)
 
+# The traffic detail API against Java's semantics: search over Elasticsearch through an in-process
+# admin listener, TCP capture from a real server process through the write queue, and the stream
+# contract and large pages on SQLite. Runs against the same fake Elasticsearch.
+add_executable(specus_c_traffic_detail_api_tests tests/traffic_detail_api_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_traffic_detail_api_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_detail_api_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_detail_api_tests
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/elasticsearch_traffic_test.sh
+                 $<TARGET_FILE:specus_c_traffic_detail_api_tests> $<TARGET_FILE:specus-server-c>)
+set_tests_properties(traffic_detail_api_tests PROPERTIES TIMEOUT 180)
+
+# protocol/spec/client-messages.md on a real server process (admin to client, client to every
+# session of an administrator, a disabled sender) and a failed write on an in-process listener.
+add_executable(specus_c_client_messages_tests tests/client_messages_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_client_messages_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_messages_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_messages_tests
+    COMMAND specus_c_client_messages_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(client_messages_tests PROPERTIES TIMEOUT 120)
+
+# Management lists with more rows than the arrays C used to read them into, over real HTTP.
+add_executable(specus_c_management_lists_tests tests/management_lists_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_lists_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_lists_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_lists_tests COMMAND specus_c_management_lists_tests)
+set_tests_properties(management_lists_tests PROPERTIES TIMEOUT 180)
+
+# Java OverviewService on a real server process: clients, logins and public connection counters.
+add_executable(specus_c_management_overview_tests tests/management_overview_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_overview_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_overview_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_overview_tests
+    COMMAND specus_c_management_overview_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(management_overview_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_http_share_tests tests/http_share_tests.c)
 target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_http_share_tests PRIVATE -Wall -Wextra -Wpedantic)
