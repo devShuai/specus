@@ -630,8 +630,21 @@ static int object_random(uint8_t *out, size_t len)
     return 0;
 }
 
+/* IDs queued by st_object_storage_set_ids_for_tests, handed out before random ones. */
+static pthread_mutex_t object_test_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static long long object_test_ids[8];
+static size_t object_test_id_count = 0U;
+static size_t object_test_id_next = 0U;
+
 static long long object_new_id(void)
 {
+    pthread_mutex_lock(&object_test_id_lock);
+    if (object_test_id_next < object_test_id_count) {
+        long long queued = object_test_ids[object_test_id_next++];
+        pthread_mutex_unlock(&object_test_id_lock);
+        return queued;
+    }
+    pthread_mutex_unlock(&object_test_id_lock);
     uint8_t bytes[8];
     if (object_random(bytes, sizeof(bytes)) != 0) return -1;
     uint64_t value = 0U;
@@ -2341,6 +2354,16 @@ void st_object_storage_reset_for_tests(void)
         object_rate_windows = next;
     }
     pthread_mutex_unlock(&object_rate_lock);
+}
+
+void st_object_storage_set_ids_for_tests(const long long *ids, size_t count)
+{
+    pthread_mutex_lock(&object_test_id_lock);
+    if (ids == NULL || count > sizeof(object_test_ids) / sizeof(object_test_ids[0])) count = 0U;
+    for (size_t i = 0U; i < count; ++i) object_test_ids[i] = ids[i];
+    object_test_id_count = count;
+    object_test_id_next = 0U;
+    pthread_mutex_unlock(&object_test_id_lock);
 }
 
 void st_object_storage_set_callback_key_fetcher_for_tests(st_object_callback_key_fetcher fetcher,

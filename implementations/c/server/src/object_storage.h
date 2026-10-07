@@ -42,6 +42,12 @@ int st_object_storage_capabilities_for_tests(const st_object_storage_identity *i
  * for a failed fetch. NULL restores the real fetch; either call empties the key cache.
  */
 typedef char *(*st_object_callback_key_fetcher)(const char *url, void *context);
+
+/*
+ * Hands out these IDs (at most 8) for the next attachments and download grants before random IDs
+ * resume, so a test can make an attachment ID collide. NULL or 0 drops the queue.
+ */
+void st_object_storage_set_ids_for_tests(const long long *ids, size_t count);
 void st_object_storage_set_callback_key_fetcher_for_tests(st_object_callback_key_fetcher fetcher,
                                                           void *context);
 

@@ -1554,6 +1554,185 @@ static int att_admin_paths(void)
     return failed ? -1 : 0;
 }
 
+/* The attachment member of an upload response, decoded field by field. */
+static char *att_view_text(const char *response, const char *key)
+{
+    char *attachment = st_json_get_top_level_raw(cap_body(response), "attachment");
+    char *value = attachment == NULL ? NULL : st_json_get_top_level_string(attachment, key);
+    free(attachment);
+    return value;
+}
+
+static int att_ends_with(const char *value, const char *suffix)
+{
+    size_t value_len = value == NULL ? 0U : strlen(value);
+    size_t suffix_len = strlen(suffix);
+    return value != NULL && value_len >= suffix_len && strcmp(value + value_len - suffix_len, suffix) == 0;
+}
+
+/* Java createPublicUploadNormalizesMetadataAndPresignsClientPut. */
+static int att_upload_normalization(void)
+{
+    static const char public_path[] = "/api/public/transfer/attachments/presign-upload";
+    const st_object_storage_identity fiona = {"t1", "fiona", 0, 1};
+    char response[16384];
+    int len = att_post(public_path,
+                       "{\"fileName\":\"../hello.txt\",\"mimeType\":\"text/plain\",\"sizeBytes\":10,"
+                       "\"sha256\":\"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\","
+                       "\"roomId\":\" norm-room \",\"roomToken\":\"attachment-norm-token\"}",
+                       &fiona, response, sizeof(response));
+    if (att_expect(len, response, 200, "\"uploadUrl\":\"http", "normalised upload") != 0) return -1;
+    char *object_key = st_json_get_top_level_string(cap_body(response), "objectKey");
+    char *file_name = att_view_text(response, "fileName");
+    char *sha256 = att_view_text(response, "sha256");
+    char *status = att_view_text(response, "status");
+    char *headers = st_json_get_top_level_raw(cap_body(response), "uploadHeaders");
+    long long id = 0;
+    int ok = st_json_get_i64(cap_body(response), "attachmentId", &id) == 0
+        && object_key != NULL && strstr(object_key, "/public-transfer/") != NULL
+        && att_ends_with(object_key, "/hello.txt")
+        && file_name != NULL && strcmp(file_name, "hello.txt") == 0
+        && sha256 != NULL && strcmp(sha256, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == 0
+        && status != NULL && strcmp(status, "PENDING") == 0
+        && headers != NULL && strstr(headers, "\"Content-Type\":\"text/plain\"") != NULL;
+    free(object_key); free(file_name); free(sha256); free(status); free(headers);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM transfer_attachment a JOIN public_transfer_room r "
+             "ON r.id=a.public_transfer_room_id WHERE a.id=%lld AND a.file_name='hello.txt' "
+             "AND a.room_id='norm-room' AND r.room_name='norm-room' AND a.tenant_id='t1' "
+             "AND a.owner_username='fiona' AND a.scope='PUBLIC_TRANSFER' AND a.status='PENDING' "
+             "AND a.sha256='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' "
+             "AND a.mime_type='text/plain' AND a.size_bytes=10", id);
+    if (!ok || att_count(sql) != 1) {
+        fprintf(stderr, "upload metadata was not normalised as Java does: %s\n", response);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Java fileNameNormalizationUsesUnicodeCodePointsAndSafeLengthBoundaries and the boundary table of
+ * public-transfer.md 3.2.1, plus an over-long name ending in a dot (no extension).
+ */
+static int att_filename_normalization(void)
+{
+    static const char public_path[] = "/api/public/transfer/attachments/presign-upload";
+    const st_object_storage_identity fiona = {"t1", "fiona", 0, 1};
+    char inputs[16][512];
+    char expected[16][256];
+    size_t count = 0U;
+    static const char *const literal[][2] = {
+        /* JSON string bodies: a backslash is written \\ */
+        {"mixed/path\\\\photo\xF0\x9F\x98\x80  \xE4\xB8\xAD\xE6\x96\x87.png", "photo_.png"},
+        {"\xF0\x9F\x98\x80\xF0\x9F\x98\x80.txt", "_.txt"},
+        {"folder/", "attachment"},
+        {"folder\\\\", "attachment"},
+        {"folder/...", "attachment"},
+        {"archive..tar...gz", "archive.tar.gz"},
+        {".env", ".env"},
+        {"file.", "file."},
+        {"   ", "_"},
+        {"  photo .png  ", "_photo_.png_"},
+    };
+    for (size_t i = 0U; i < sizeof(literal) / sizeof(literal[0]); ++i, ++count) {
+        snprintf(inputs[count], sizeof(inputs[count]), "%s", literal[i][0]);
+        snprintf(expected[count], sizeof(expected[count]), "%s", literal[i][1]);
+    }
+    /* 200 a + ".txt" -> 176 a + ".txt" */
+    memset(inputs[count], 'a', 200U); memcpy(inputs[count] + 200U, ".txt", 5U);
+    memset(expected[count], 'a', 176U); memcpy(expected[count] + 176U, ".txt", 5U);
+    ++count;
+    /* "abcdefghij." + 178 b -> "a." + 178 b */
+    memcpy(inputs[count], "abcdefghij.", 11U); memset(inputs[count] + 11U, 'b', 178U); inputs[count][189] = '\0';
+    memcpy(expected[count], "a.", 2U); memset(expected[count] + 2U, 'b', 178U); expected[count][180] = '\0';
+    ++count;
+    /* "a." + 180 b -> its first 180 characters */
+    memcpy(inputs[count], "a.", 2U); memset(inputs[count] + 2U, 'b', 180U); inputs[count][182] = '\0';
+    memcpy(expected[count], "a.", 2U); memset(expected[count] + 2U, 'b', 178U); expected[count][180] = '\0';
+    ++count;
+    /* 181 x -> 180 x */
+    memset(inputs[count], 'x', 181U); inputs[count][181] = '\0';
+    memset(expected[count], 'x', 180U); expected[count][180] = '\0';
+    ++count;
+    /* 185 y + "." -> 180 y: a trailing dot does not define an extension */
+    memset(inputs[count], 'y', 185U); memcpy(inputs[count] + 185U, ".", 2U);
+    memset(expected[count], 'y', 180U); expected[count][180] = '\0';
+    ++count;
+    for (size_t i = 0U; i < count; ++i) {
+        char body[1024];
+        char response[16384];
+        char suffix[260];
+        snprintf(body, sizeof(body),
+                 "{\"fileName\":\"%.511s\",\"mimeType\":\"application/octet-stream\",\"sizeBytes\":1,"
+                 "\"roomId\":\"fname-room-%zu\",\"roomToken\":\"attachment-fname-token-%zu\"}", inputs[i], i, i);
+        int len = att_post(public_path, body, &fiona, response, sizeof(response));
+        char *file_name = att_status(len, response) == 200 ? att_view_text(response, "fileName") : NULL;
+        char *object_key = file_name == NULL ? NULL : st_json_get_top_level_string(cap_body(response), "objectKey");
+        snprintf(suffix, sizeof(suffix), "/%s", expected[i]);
+        int ok = file_name != NULL && strcmp(file_name, expected[i]) == 0
+            && att_ends_with(object_key, suffix) && strstr(object_key, "..") == NULL;
+        if (!ok) fprintf(stderr, "file name case %zu (%s): expected %s, got %s\n", i, inputs[i], expected[i],
+                         len > 0 ? response : "(none)");
+        free(file_name);
+        free(object_key);
+        if (!ok) return -1;
+    }
+    return 0;
+}
+
+/* Java createPublicUploadRetriesWhenSaveHitsIdCollision. */
+static int att_id_collision(void)
+{
+    const st_object_storage_identity fiona = {"t1", "fiona", 0, 1};
+    static const long long ids[] = {778001LL, 778002LL};
+    long long id = 0;
+    char key[256];
+    if (cap_exec(att_db_path,
+                 "INSERT INTO transfer_attachment(id,tenant_id,scope,owner_username,object_key,file_name,"
+                 "mime_type,size_bytes,status,created_at,updated_at,upload_expires_at,expires_at) VALUES("
+                 "778001,'t2','PUBLIC_TRANSFER','someone','prefix/seed/778001.bin','seed.bin',"
+                 "'application/octet-stream',1,'UPLOADED','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z',"
+                 "'2000-01-01T00:00:00Z','2999-01-01T00:00:00Z')") != 0) {
+        return -1;
+    }
+    st_object_storage_set_ids_for_tests(ids, 2U);
+    int rc = att_public_upload(&fiona, "collision-room", "attachment-collision-token", 1, 200, NULL, &id, key,
+                               "upload whose first ID collides");
+    st_object_storage_set_ids_for_tests(NULL, 0U);
+    if (rc != 0) return -1;
+    if (id != 778002LL || strstr(key, "/778002/") == NULL
+        || att_count("SELECT COUNT(*) FROM transfer_attachment WHERE id=778001 AND tenant_id='t2'") != 1
+        || att_count("SELECT COUNT(*) FROM transfer_attachment WHERE id=778002 AND object_key LIKE '%/778002/%'") != 1) {
+        fprintf(stderr, "an ID collision was not retried with a new ID and key: %lld %s\n", id, key);
+        return -1;
+    }
+    return 0;
+}
+
+/* Java createDownloadRejectsPendingAttachment: no grant, no object storage request. */
+static int att_pending_download(void)
+{
+    const st_object_storage_identity fiona = {"t1", "fiona", 0, 1};
+    char response[16384];
+    char key[256];
+    long long id = 0;
+    if (att_public_upload(&fiona, "pending-room", "attachment-pending-token", 1, 200, NULL, &id, key,
+                          "pending upload") != 0) {
+        return -1;
+    }
+    int requests = att_oss_requests();
+    char sql[160];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM transfer_attachment_download_grant WHERE attachment_id=%lld", id);
+    if (att_action(&fiona, 1, id, "presign-download", "attachment-pending-token", 409, "not uploaded", response,
+                   sizeof(response), "download of a PENDING attachment") != 0
+        || att_count(sql) > 0 || att_oss_requests() != requests) {
+        fprintf(stderr, "a PENDING attachment got a download grant or touched object storage\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* POST /api/public/transfer/oss-callback: RSA-MD5 signature, key URL pinning and body checks. */
 static int att_callback_paths(void)
 {
@@ -1608,6 +1787,45 @@ static int att_callback_paths(void)
         fprintf(stderr, "a callback-completed upload was still verified with HEAD\n");
         failed = 1;
     }
+    /*
+     * Java uploadCallbackVerificationPinsAndCachesAliyunPublicKey: every verification so far used
+     * one key, fetched once and over https although the header named http://.
+     */
+    if (!failed && (key_server.calls != 1
+                    || strcmp(key_server.last_url, "https://gosspublic.alicdn.com/callback_pub_key_v1.pem") != 0)) {
+        fprintf(stderr, "callback key fetched %d times, last from %s\n", key_server.calls, key_server.last_url);
+        failed = 1;
+    }
+    /* A padded header (trimmed as in Java) names the cached key; another key path is fetched once. */
+    char padded_url[512];
+    snprintf(padded_url, sizeof(padded_url), "  %s  ", key_url == NULL ? "" : key_url);
+    ATT_STEP(att_callback(body, signature, padded_url, 200, "\"Status\":\"OK\"", "callback with a padded key URL"));
+    static const char second_location[] = "https://gosspublic.alicdn.com/callback_pub_key_v2.pem";
+    char *second_url = att_base64((const unsigned char *)second_location, strlen(second_location));
+    ATT_STEP(second_url == NULL ? -1 : att_callback(body, signature, second_url, 200, "\"Status\":\"OK\"",
+                                                    "callback under a second key URL"));
+    ATT_STEP(second_url == NULL ? -1 : att_callback(body, signature, second_url, 200, "\"Status\":\"OK\"",
+                                                    "callback under the cached second key URL"));
+    free(second_url);
+    if (!failed && (key_server.calls != 2 || strcmp(key_server.last_url, second_location) != 0)) {
+        fprintf(stderr, "second callback key fetched %d times in all, last from %s\n", key_server.calls,
+                key_server.last_url);
+        failed = 1;
+    }
+    /* A failed fetch is not cached: the next callback naming that key fetches again. */
+    static const char third_location[] = "http://gosspublic.alicdn.com/callback_pub_key_v3.pem";
+    char *third_url = att_base64((const unsigned char *)third_location, strlen(third_location));
+    key_server.pem = NULL;
+    ATT_STEP(third_url == NULL ? -1 : att_callback(body, signature, third_url, 403, "signature",
+                                                   "callback whose key fetch fails"));
+    ATT_STEP(third_url == NULL ? -1 : att_callback(body, signature, third_url, 403, "signature",
+                                                   "callback whose key fetch fails again"));
+    key_server.pem = pem;
+    free(third_url);
+    if (!failed && key_server.calls != 4) {
+        fprintf(stderr, "a failed callback key fetch was cached (%d fetches)\n", key_server.calls);
+        failed = 1;
+    }
     /* Without a configured callback URL every callback is refused. */
     unsetenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL");
     ATT_STEP(att_callback(body, signature, key_url, 403, "signature", "callback with callbacks disabled"));
@@ -1626,7 +1844,9 @@ static int test_attachment_negative_paths(void)
     if (att_oss_start(&port) != 0) return -1;
     int failed = att_configure(port) != 0;
     if (failed) fprintf(stderr, "attachment fixture setup failed\n");
-    failed = failed || att_public_paths() != 0 || att_admin_paths() != 0 || att_callback_paths() != 0;
+    failed = failed || att_public_paths() != 0 || att_admin_paths() != 0 || att_callback_paths() != 0
+        || att_upload_normalization() != 0 || att_filename_normalization() != 0 || att_id_collision() != 0
+        || att_pending_download() != 0;
     att_oss_stop();
     att_unconfigure();
     return failed ? -1 : 0;
