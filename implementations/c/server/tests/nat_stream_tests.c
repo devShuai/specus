@@ -796,8 +796,7 @@ static int check_connectivity_probe_late_rst(test_server *server, client_pair *p
         || expect_http_open(pair->data, &get_stream) != 0
         || send_nat(pair->data, ST_NAT_OPEN, 0U, get_stream, 0U, RESPONSE_HEAD, NULL, 0U) != 0
         || wait_rst(pair->data, get_stream, &code) != 0
-        || send_nat(pair->data, ST_NAT_RST, 0U, get_stream, 28U, NULL, NULL, 0U) != 0
-        || send_nat(pair->data, ST_NAT_DATA, 0U, get_stream, 0U, NULL, "late", 4U) != 0;
+        || send_nat(pair->data, ST_NAT_RST, 0U, get_stream, 28U, NULL, NULL, 0U) != 0;
     pthread_join(thread, NULL);
     CHECK(!failed, "the probe exchange did not run as scripted");
     CHECK(call.status == 200 && call.body != NULL && strstr(call.body, "\"ACCESS_OK\"") != NULL,
@@ -805,6 +804,9 @@ static int check_connectivity_probe_late_rst(test_server *server, client_pair *p
     free(call.body);
     CHECK(expect_alive_without_rst(pair->data, get_stream) == 0,
           "a late RST for a finished probe stream closed the data connection");
+    /* DATA after the reset is a frame for a closed stream: RST 7, as for a public stream. */
+    CHECK(send_nat(pair->data, ST_NAT_DATA, 0U, get_stream, 0U, NULL, "late", 4U) == 0, "late DATA");
+    CHECK(expect_rst(pair->data, get_stream, 7U) == 0, "late DATA on a probe stream did not get RST 7");
     return expect_data_connection_served(server, pair);
 }
 
@@ -1086,6 +1088,11 @@ static const char *const long_idle[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=900", 
 
 static int run_check(const char *name, pair_check check)
 {
+    /* SPECUS_NAT_STREAM_ONLY=<text> runs only the checks whose name contains it. */
+    const char *only = getenv("SPECUS_NAT_STREAM_ONLY");
+    if (only != NULL && *only != '\0' && strstr(name, only) == NULL) {
+        return 0;
+    }
     current_check = check;
     return run_on_fresh_server(name, run_current_check, long_idle);
 }
