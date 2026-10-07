@@ -76,14 +76,17 @@ public class WorkbenchService {
     private final PeerMeshSharedServiceRepository peerMeshSharedServiceRepository;
     private final ClientAccountRepository clientAccountRepository;
     private final WorkbenchClock clock;
+    private final WorkbenchItemWriter writer;
 
     public WorkbenchService(ManagementWorkbenchItemRepository repository,
                             HttpRouteMappingRepository httpRouteMappingRepository,
                             SpecusMappingRepository specusMappingRepository,
                             PeerMeshSharedServiceRepository peerMeshSharedServiceRepository,
                             ClientAccountRepository clientAccountRepository,
-                            WorkbenchClock clock) {
+                            WorkbenchClock clock,
+                            WorkbenchItemWriter writer) {
         this.repository = repository;
+        this.writer = writer;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.specusMappingRepository = specusMappingRepository;
         this.peerMeshSharedServiceRepository = peerMeshSharedServiceRepository;
@@ -130,7 +133,7 @@ public class WorkbenchService {
                 throw new Refusal(HttpStatus.CONFLICT, "WORKBENCH_FAVORITES_FULL",
                         "favourites are full (max " + MAX_FAVORITES + ")");
             }
-            repository.save(new ManagementWorkbenchItem(key(context, FAVORITE, reference), now));
+            writer.addFavorite(context.tenant().tenantId(), context.username(), reference.kind(), reference.id(), now);
         }
         return afterWrite(context, now);
     }
@@ -144,7 +147,7 @@ public class WorkbenchService {
             // A clock behind the stored time (another instance) never moves an entry back.
             existing.get().setAtMs(Math.max(existing.get().getAtMs(), now));
         } else {
-            repository.save(new ManagementWorkbenchItem(key(context, RECENT, reference), now));
+            writer.recordRecent(context.tenant().tenantId(), context.username(), reference.kind(), reference.id(), now);
         }
         return afterWrite(context, now);
     }
@@ -230,12 +233,20 @@ public class WorkbenchService {
     }
 
     /**
-     * The object exists and is visible to the caller now: its client is in the caller's tenant and
-     * the caller is an administrator by the current account role or the client's owner. Missing,
-     * another tenant's and another owner's objects are refused alike.
+     * The object exists and is visible to the caller now, by the rule of its kind's list endpoint:
+     * its client is in the caller's tenant and the caller is an administrator by the current account
+     * role or the client's owner. The Peer service list shows an administrator every service of the
+     * tenant, its client deleted or not, so the client is not looked up for them. Missing, another
+     * tenant's and another owner's objects are refused alike.
      */
     private void requireVisible(ManagementContext context, Reference reference) {
         String tenantId = context.tenant().tenantId();
+        if (context.isAdmin() && WorkbenchReferences.PEER_SERVICE.equals(reference.kind())) {
+            if (peerMeshSharedServiceRepository.findByIdAndTenantId(reference.id(), tenantId).isEmpty()) {
+                throw new Refusal(HttpStatus.NOT_FOUND, "WORKBENCH_TARGET_NOT_FOUND", "service not found");
+            }
+            return;
+        }
         Optional<Long> clientId = switch (reference.kind()) {
             case WorkbenchReferences.HTTP_ROUTE -> httpRouteMappingRepository
                     .findByIdAndTenantId(reference.id(), tenantId).map(HttpRouteMapping::getClientId);
@@ -265,11 +276,6 @@ public class WorkbenchService {
                         && reference.kind().equals(row.getKey().kind())
                         && reference.id() == row.getKey().objectId())
                 .findFirst();
-    }
-
-    private static ManagementWorkbenchItem.Key key(ManagementContext context, String list, Reference reference) {
-        return new ManagementWorkbenchItem.Key(
-                context.tenant().tenantId(), context.username(), list, reference.kind(), reference.id());
     }
 
     private static boolean withinRetention(ManagementWorkbenchItem row, long now) {
