@@ -5,6 +5,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Specus.Server.Configuration;
 using Specus.Server.Management;
+using Specus.Server.ProductMetrics;
 
 namespace Specus.Server.Security;
 
@@ -16,13 +17,15 @@ public sealed class OidcTokenExchangeService
     private readonly ManagementUserService _users;
     private readonly LocalTokenService _localTokens;
     private readonly ILogger<OidcTokenExchangeService> _logger;
+    private readonly ProductMetricsService _productMetrics;
 
     public OidcTokenExchangeService(IOptions<OidcOptions> options,
         IOidcTokenEndpointClient client,
         OidcTokenValidator validator,
         ManagementUserService users,
         LocalTokenService localTokens,
-        ILogger<OidcTokenExchangeService> logger)
+        ILogger<OidcTokenExchangeService> logger,
+        ProductMetricsService productMetrics)
     {
         _options = options.Value;
         _client = client;
@@ -30,6 +33,7 @@ public sealed class OidcTokenExchangeService
         _users = users;
         _localTokens = localTokens;
         _logger = logger;
+        _productMetrics = productMetrics;
     }
 
     public async Task<IResult> ExchangeAsync(OidcTokenExchangeRequest? request,
@@ -113,6 +117,8 @@ public sealed class OidcTokenExchangeService
                     statusCode: StatusCodes.Status403Forbidden);
             }
 
+            await _productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
+                cancellationToken).ConfigureAwait(false);
             return Results.Ok(new
             {
                 accessToken = _localTokens.IssueToken(user.Username, user.TenantId, user.Role),

@@ -207,6 +207,10 @@ specus:
     pairing-code-ttl-seconds: ${SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS:300}
     pairing-code-redeem-rate-limit-per-ip: ${SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP:10}
     pairing-code-redeem-rate-limit-window-seconds: ${SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS:300}
+  product-metrics:
+    # Opt-in product metrics (protocol/spec/product-metrics.md). Tenant admins switch them on per
+    # tenant; false keeps every tenant off and collects nothing.
+    allowed: ${SPECUS_PRODUCT_METRICS_ALLOWED:true}
   client-auth:
     default-max-online-instances: ${SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}

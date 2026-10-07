@@ -33,6 +33,7 @@ add_library(specus_c_core
     src/password_hash.c
     src/peer_egress.c
     src/peer_mesh.c
+    src/product_metrics.c
     src/protocol.c
     src/public_coordination.c
     src/public_discovery.c
@@ -200,6 +201,17 @@ add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 45)
+
+# The shared product metrics vector through the real request handling, the write-path hooks, and a
+# real server process (client_online on a control login, the HTTP layer's body hand-over).
+add_executable(specus_c_product_metrics_tests tests/product_metrics_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_product_metrics_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_product_metrics_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_product_metrics_tests PRIVATE
+    ST_PRODUCT_METRICS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/product-metrics-v1.json")
+add_test(NAME product_metrics_tests
+    COMMAND specus_c_product_metrics_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(product_metrics_tests PROPERTIES TIMEOUT 180)
 
 add_executable(specus_c_protocol_fixture_tests tests/protocol_fixture_tests.c)
 target_link_libraries(specus_c_protocol_fixture_tests PRIVATE specus_c_core)

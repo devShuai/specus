@@ -64,6 +64,11 @@ Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补�
 `AddManagementWorkbench` 增加服务工作台的 `management_workbench_item`（`protocol/spec/service-workbench.md`）：
 主键为 `(tenant_id, username, list, kind, object_id)`，`at_ms` 为 epoch 毫秒，索引 `idx_mwi_object`、
 `idx_mwi_list_at`，不建外键；启动兼容 SQL 同样幂等建表与索引。三套迁移和快照保持同步。
+`AddProductMetrics` 增加可选产品指标（protocol/spec/product-metrics.md）的四张表：`product_metrics_switch`、
+`product_metrics_onboarding_progress`、`product_metrics_onboarding_daily`、`product_metrics_transfer_daily`。
+时间列是 epoch 毫秒，日期列是 UTC `yyyy-MM-dd` 文本，计数表没有任何用户列；表名与列名和 Go、Java、C 服务端一致，
+启动兼容 SQL 也会幂等建表。三套迁移和快照保持同步。
+
 临时 HTTP 分享由三套 `AddTemporaryHttpShare` migration 新增 `http_share` 与 `http_access_audit`
 （protocol/spec/temporary-http-share.md）。列名与类型和 Go、Java、C 服务端一致，以便共用同一个库：时刻一律是
 整数 epoch 秒，`expiry_recorded` 是 0/1 整数（SQLite INTEGER、PostgreSQL smallint、MySQL tinyint），不是布尔。

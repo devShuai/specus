@@ -31,6 +31,8 @@ import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { TransferFilePreflight } from "../components/TransferFilePreflight";
 import { ResumableTransfersPanel } from "../components/ResumableTransfersPanel";
+import { ProductMetricsMemberNotice } from "../components/ProductMetricsDisclosure";
+import { useTransferOutcomeMetrics } from "../hooks/useTransferOutcomeMetrics";
 import { useFileLeaveWarning } from "../hooks/useFileLeaveWarning";
 import { useTransferCapabilities } from "../hooks/useTransferCapabilities";
 import { SyncedClipboard } from "../components/SyncedClipboard";
@@ -863,6 +865,10 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       setState(nextState);
       const activityId = activeOutgoingActivityIdRef.current;
       if (activityId) {
+        if (nextState === "direct") {
+          // The peer connection carries this send now: a failure from here on had a path.
+          transferMetricsRef.current?.markEstablished(activityId);
+        }
         updateOutgoingActivity(activityId, {
           status: nextState === "connecting" || nextState === "waiting" ? "connecting" : "sending",
         });
@@ -872,6 +878,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     onError: (message) => setError(userFacingTransferError(message)),
     onNotice: setNotice,
   });
+
+  // Opt-in product metrics: finished send attempts of a signed-in member, five closed fields only.
+  const transferMetrics = useTransferOutcomeMetrics({
+    signedIn: authReady && authed,
+    sends: outgoingActivities,
+    peerPath: (targetPeerId) => peerTransportPaths[targetPeerId],
+  });
+  const transferMetricsRef = useRef(transferMetrics);
+  transferMetricsRef.current = transferMetrics;
 
   useEffect(() => {
     let active = true;
@@ -2147,6 +2162,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       assertFileTransferTaskCurrent(task);
       const file = files[index];
       let peerTransferError = "";
+      transferMetrics.startAttempt(task.activityId);
       updateOutgoingActivity(task.activityId, { status: "connecting", error: undefined });
       if (task.targetPeerId && typeof RTCPeerConnection !== "undefined") {
         let peerResult: DirectTransferResult | null = null;
@@ -2518,6 +2534,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       assertFileTransferTaskCurrent(task);
 
       setState("uploading");
+      transferMetrics.markCloudStarted(task.activityId);
       setNotice(`服务端已允许本次上传；文件有效期：${presign.attachment.expiresAt ? formatDateTime(presign.attachment.expiresAt) : "未提供"}。正在上传文件内容。`);
       await putObject(
         presign.uploadUrl,
@@ -3416,6 +3433,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 </Button>
               </div>
             </div>
+
+            {transferMetrics.collecting ? (
+              <ProductMetricsMemberNotice className="mt-2">
+                <button
+                  type="button"
+                  className="ml-2 text-primary underline-offset-2 hover:underline max-sm:min-h-11"
+                  onClick={() => transferMetrics.setOptedOut(!transferMetrics.optedOut)}
+                >
+                  {transferMetrics.optedOut ? "本设备已不参与 · 恢复参与" : "本设备不参与"}
+                </button>
+              </ProductMetricsMemberNotice>
+            ) : null}
 
             {discoveryStatus !== "online" || discoveryError ? (
               <div

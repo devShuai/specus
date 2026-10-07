@@ -59,6 +59,12 @@ public sealed class SpecusDbContext : DbContext
         Set<PublicTransferRoomPairingCode>();
     public DbSet<PublicTransferDiagramVersion> PublicTransferDiagramVersions =>
         Set<PublicTransferDiagramVersion>();
+    public DbSet<ProductMetricsSwitch> ProductMetricsSwitches => Set<ProductMetricsSwitch>();
+    public DbSet<ProductMetricsOnboardingProgress> ProductMetricsOnboardingProgress =>
+        Set<ProductMetricsOnboardingProgress>();
+    public DbSet<ProductMetricsOnboardingDaily> ProductMetricsOnboardingDaily =>
+        Set<ProductMetricsOnboardingDaily>();
+    public DbSet<ProductMetricsTransferDaily> ProductMetricsTransferDaily => Set<ProductMetricsTransferDaily>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -1056,6 +1062,63 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.RoomId).HasDatabaseName("idx_public_transfer_version_room");
             b.HasIndex(x => x.CreatedAt).HasDatabaseName("idx_public_transfer_version_created");
+        });
+
+        ConfigureProductMetrics(modelBuilder);
+    }
+
+    /// <summary>
+    /// Opt-in product metrics (protocol/spec/product-metrics.md section 6): natural keys only, no
+    /// surrogate id and no foreign key; times are epoch milliseconds, days UTC "yyyy-MM-dd".
+    /// </summary>
+    private static void ConfigureProductMetrics(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<ProductMetricsSwitch>(b =>
+        {
+            b.ToTable("product_metrics_switch");
+            b.HasKey(x => x.TenantId);
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.UpdatedBy).HasColumnName("updated_by").HasMaxLength(80);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            b.Property(x => x.PurgedAt).HasColumnName("purged_at");
+        });
+
+        modelBuilder.Entity<ProductMetricsOnboardingProgress>(b =>
+        {
+            b.ToTable("product_metrics_onboarding_progress");
+            b.HasKey(x => new { x.TenantId, x.Username });
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.StartedAt).HasColumnName("started_at").IsRequired();
+            b.Property(x => x.SignedInAt).HasColumnName("signed_in_at");
+            b.Property(x => x.CredentialCreatedAt).HasColumnName("credential_created_at");
+            b.Property(x => x.ClientOnlineAt).HasColumnName("client_online_at");
+        });
+
+        modelBuilder.Entity<ProductMetricsOnboardingDaily>(b =>
+        {
+            b.ToTable("product_metrics_onboarding_daily");
+            b.HasKey(x => new { x.TenantId, x.CohortDay, x.ReachedStep, x.DurationBucket });
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.CohortDay).HasColumnName("cohort_day").HasMaxLength(10).IsRequired();
+            b.Property(x => x.ReachedStep).HasColumnName("reached_step").HasMaxLength(32).IsRequired();
+            b.Property(x => x.DurationBucket).HasColumnName("duration_bucket").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Users).HasColumnName("users").IsRequired();
+        });
+
+        modelBuilder.Entity<ProductMetricsTransferDaily>(b =>
+        {
+            b.ToTable("product_metrics_transfer_daily");
+            b.HasKey(x => new { x.TenantId, x.Day, x.Mode, x.Path, x.SizeBucket, x.Attempt, x.Outcome });
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Day).HasColumnName("day").HasMaxLength(10).IsRequired();
+            b.Property(x => x.Mode).HasColumnName("mode").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Path).HasColumnName("path").HasMaxLength(16).IsRequired();
+            b.Property(x => x.SizeBucket).HasColumnName("size_bucket").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Attempt).HasColumnName("attempt").HasMaxLength(32).IsRequired();
+            b.Property(x => x.Outcome).HasColumnName("outcome").HasMaxLength(16).IsRequired();
+            b.Property(x => x.Count).HasColumnName("count").IsRequired();
         });
     }
 }

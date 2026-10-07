@@ -405,8 +405,9 @@ public sealed class ManagementUserService
         return ToView(user);
     }
 
-    public async Task DeleteUserAsync(ManagementContext context, string username,
-        CancellationToken cancellationToken)
+    /// <summary>Deletes an account of the caller's tenant and returns who it was.</summary>
+    public async Task<(string TenantId, string Username)> DeleteUserAsync(ManagementContext context,
+        string username, CancellationToken cancellationToken)
     {
         RequireAdmin(context);
         var normalized = NormalizeUsername(username);
@@ -436,6 +437,7 @@ public sealed class ManagementUserService
             cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
+        return (ManagementContext.NormalizeTenant(user.TenantId), user.Username);
     }
 
     public static void RequireAdmin(ManagementContext context)
