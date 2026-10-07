@@ -37,6 +37,24 @@ int main(void)
     }
     free(top_level);
     free(emoji);
+    /* Raw UTF-8 comes back as it was sent; malformed UTF-8 is refused instead of being mangled. */
+    char *raw_utf8 = st_json_get_top_level_string("{\"name\":\"云端架构图 \xf0\x9f\x98\x80\"}", "name");
+    char *nested_utf8 = st_json_get_string("{\"client\":{\"clientName\":\"办公室\"}}", "clientName");
+    char *invalid_utf8 = st_json_get_top_level_string("{\"name\":\"\xe4\xba\"}", "name");
+    char *overlong = st_json_get_top_level_string("{\"name\":\"\xc0\xaf\"}", "name");
+    char *surrogate = st_json_get_top_level_string("{\"name\":\"\xed\xa0\x80\"}", "name");
+    int utf8_ok = raw_utf8 != NULL && strcmp(raw_utf8, "云端架构图 \xf0\x9f\x98\x80") == 0
+        && nested_utf8 != NULL && strcmp(nested_utf8, "办公室") == 0
+        && invalid_utf8 == NULL && overlong == NULL && surrogate == NULL;
+    free(raw_utf8);
+    free(nested_utf8);
+    free(invalid_utf8);
+    free(overlong);
+    free(surrogate);
+    if (!utf8_ok) {
+        fprintf(stderr, "json raw UTF-8 string mismatch\n");
+        return 1;
+    }
     size_t decoded_len = 0;
     char *decoded = st_json_decode_string(" \"a\\u0000b\" ", &decoded_len);
     char *not_string = st_json_decode_string("42", &decoded_len);

@@ -31,6 +31,7 @@ PROTOCOL_TESTS := $(BUILD_DIR)/specus_c_protocol_fixture_tests
 SECURITY_TESTS := $(BUILD_DIR)/specus_c_security_tests
 SECURITY_BASELINE_TESTS := $(BUILD_DIR)/specus_c_security_baseline_tests
 SESSION_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_session_lifecycle_tests
+SECURITY_RULES_TESTS := $(BUILD_DIR)/specus_c_security_rules_tests
 NAT_STREAM_TESTS := $(BUILD_DIR)/specus_c_nat_stream_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 STUN_TURN_TESTS := $(BUILD_DIR)/specus_c_stun_turn_tests
@@ -41,7 +42,7 @@ TURNSTILE_VERIFIER_TESTS := $(BUILD_DIR)/specus_c_turnstile_verifier_tests
 UPSTREAM_BROWSER_HEADERS_TESTS := $(BUILD_DIR)/specus_c_upstream_browser_headers_tests
 WORKBENCH_TESTS := $(BUILD_DIR)/specus_c_workbench_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIENT_AUTH_NONCE_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(OIDC_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS) $(WORKBENCH_TESTS) $(HTTP_SHARE_TESTS) $(SEMANTIC_VERSION_TESTS) $(TRAFFIC_CAPTURE_TESTS) $(TURNSTILE_VERIFIER_TESTS) $(UPSTREAM_BROWSER_HEADERS_TESTS)
-ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS)
+ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS)
 
 .PHONY: all test release clean
 
@@ -128,6 +129,9 @@ $(SECURITY_BASELINE_TESTS): $(CORE_OBJS) tests/security_baseline_tests.c | $(BUI
 $(SESSION_LIFECYCLE_TESTS): $(CORE_OBJS) tests/session_lifecycle_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/session_lifecycle_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(SECURITY_RULES_TESTS): $(CORE_OBJS) tests/security_rules_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/security_rules_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(NAT_STREAM_TESTS): $(CORE_OBJS) tests/nat_stream_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_stream_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -167,6 +171,7 @@ test: all
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
 	$(SESSION_LIFECYCLE_TESTS) $(SERVER)
+	$(SECURITY_RULES_TESTS) $(SERVER)
 	$(NAT_STREAM_TESTS) $(SERVER)
 	$(PRODUCT_METRICS_TESTS) $(SERVER)
 
