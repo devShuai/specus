@@ -206,15 +206,12 @@ public class DatabaseInitializer {
     }
 
     private void widenHttpBodyTextColumns() {
+        // On MySQL and MariaDB MySqlLobColumnMigrator widens them, and only while they are narrow.
         String normalizedPlatform = databasePlatform == null ? "" : databasePlatform.toLowerCase();
-        String statement;
-        if (normalizedPlatform.contains("mysql") || normalizedPlatform.contains("mariadb")) {
-            statement = "alter table " + HTTP_EXCHANGE_TABLE + " modify column %s longtext";
-        } else if (normalizedPlatform.contains("postgres")) {
-            statement = "alter table " + HTTP_EXCHANGE_TABLE + " alter column %s type text";
-        } else {
+        if (!normalizedPlatform.contains("postgres")) {
             return;
         }
+        String statement = "alter table " + HTTP_EXCHANGE_TABLE + " alter column %s type text";
         SchemaMetadata.Table table = SchemaMetadata.table(jdbcTemplate, HTTP_EXCHANGE_TABLE);
         for (String column : List.of("request_preview_text", "response_preview_text")) {
             if (table == null || !table.hasColumn(column)) {

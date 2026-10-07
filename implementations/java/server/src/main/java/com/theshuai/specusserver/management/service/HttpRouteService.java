@@ -125,6 +125,10 @@ public class HttpRouteService {
         row.setCreatedAt(now);
         row.setUpdatedAt(now);
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
+        if (saved.isEnabled()) {
+            // Rolls the creation back when the client's NAT_CONTROL would no longer fit one MESSAGE.
+            natControlService.requireNatControlFits(account);
+        }
         // Same transaction: the route.created audit entry fails the creation if it cannot be written.
         httpShareService.onRouteCreated(actor, saved);
         natControlService.pushSnapshotIfOnline(account);
@@ -195,16 +199,18 @@ public class HttpRouteService {
                 || StringUtils.hasText(request.authPassword()));
         row.setUpdatedAt(Instant.now().toString());
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
+        ClientAccount account = clientAccountRepository
+                .findByIdAndTenantId(saved.getClientId(), tenant.tenantId())
+                .orElse(null);
+        if (account != null && saved.isEnabled()) {
+            // Rolls the change back when the client's NAT_CONTROL would no longer fit one MESSAGE.
+            natControlService.requireNatControlFits(account);
+        }
         // Same transaction: exposure audit and, when the route is no longer protected, its shares end.
         httpShareService.onRouteUpdated(actor, saved, exposureBefore, credentialsChanged);
 
-        if (dataPlaneChanged) {
-            ClientAccount account = clientAccountRepository
-                    .findByIdAndTenantId(saved.getClientId(), tenant.tenantId())
-                    .orElse(null);
-            if (account != null) {
-                natControlService.pushSnapshotIfOnline(account);
-            }
+        if (dataPlaneChanged && account != null) {
+            natControlService.pushSnapshotIfOnline(account);
         }
         return toView(saved);
     }

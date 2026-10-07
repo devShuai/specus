@@ -5,6 +5,7 @@ import com.theshuai.common.clientauth.ClientAuthLoginRequest;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientAuthSigner;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import com.theshuai.specusclient.bean.SpecusBean;
 import com.theshuai.specusclient.client.NettyClient;
 import com.theshuai.specusclient.handler.NatClientHandler;
@@ -270,10 +271,13 @@ class EndToEndSpecusIT {
             var routesField = NatClientHandler.class.getDeclaredField("httpRoutes");
             routesField.setAccessible(true);
             Object routes = routesField.get(handler);
+            // The handler keeps each route's whole HttpSpecusConfig; the test compares its target URL.
             return routes instanceof Map<?, ?> map
                     ? map.entrySet().stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
                             entry -> String.valueOf(entry.getKey()),
-                            entry -> String.valueOf(entry.getValue())))
+                            entry -> entry.getValue() instanceof HttpSpecusConfig config
+                                    ? String.valueOf(config.getTargetBaseUrl())
+                                    : String.valueOf(entry.getValue())))
                     : null;
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("failed to read client routes via reflection", e);

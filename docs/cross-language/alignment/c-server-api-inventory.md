@@ -19,8 +19,8 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 86 | 其中 10 个是本分支修正后才一致 |
-| 有差异 | 14 | 见各节“说明”，可修的列入第 9 节 |
+| 一致 | 88 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致 |
+| 有差异 | 12 | 见各节“说明”，可修的列入第 9 节 |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
 | 未逐项对照 | 41 | Peer Mesh / Egress 27 个由 `fix/c-server-parity-peer` 对照；其余 14 个是管理 CRUD 等，见第 9 节 |
 
@@ -51,8 +51,8 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | --- | --- | --- | --- | --- | --- |
 | GET | `/api/admin/clients` | Bearer | 可见客户端列表（管理员为本租户） | 一致 | `ClientAccountServiceTests` 覆盖可见性；**本分支**去掉 128 行上限（原先全库超过 128 个客户端时所有租户都得 500），`management_lists_tests` |
 | GET | `/api/admin/clients/name-availability` | Bearer | 名称是否可用 | 未逐项对照 | `admin_http_tests` 有 C 侧断言 |
-| GET | `/api/admin/clients/{id}` | Bearer | `{client, specusMappings, httpRoutes}` | 有差异 | 单个客户端超过 64 条 TCP 映射或 64 条 HTTP 路由时读取失败（`ST_ADMIN_MAX_TCP_MAPPINGS`），Java 无上限；第 9 节 |
-| POST | `/api/admin/clients/{id}/force-refresh-port-mapping` | Bearer | 推送 NAT_CONTROL，回 `{specusMappings,httpRoutes}` | 有差异 | C 多回一个 `pushed`（兼容字段，无害）；同样受每客户端 64 条上限限制 |
+| GET | `/api/admin/clients/{id}` | Bearer | `{client, specusMappings, httpRoutes}` | 一致 | 原先单个客户端超过 64 条 TCP 映射或 64 条 HTTP 路由时读取失败；#191 起不限条数（`client_route_scale_tests`） |
+| POST | `/api/admin/clients/{id}/force-refresh-port-mapping` | Bearer | 推送 NAT_CONTROL，回 `{specusMappings,httpRoutes}` | 有差异 | C 多回一个 `pushed`（兼容字段，无害）；每客户端 64 条的上限已在 #191 去掉 |
 | POST | `/api/admin/clients` | Bearer | 创建客户端，201 | 一致 | `ClientAccountServiceTests` 覆盖 |
 | PUT | `/api/admin/clients/{id}` | Bearer | 改名、停用（踢下线） | 一致 | `ClientAccountServiceTests` 覆盖 |
 | DELETE | `/api/admin/clients/{id}` | Bearer | 删除并踢下线，204 | 一致 | `ClientAccountServiceTests` 覆盖 |
@@ -61,17 +61,17 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | PUT | `/api/admin/client-credentials/{id}` | Bearer | 更新凭据 | 未逐项对照 | 同上 |
 | DELETE | `/api/admin/client-credentials/{id}` | Bearer | 删除，204 | 未逐项对照 | 同上 |
 | GET | `/api/admin/specus-mappings` | Bearer | 可见 TCP 映射，可按 `clientId` | 未逐项对照 | **本分支**修正：原先全库超过 64 条映射时 500（`management_lists_tests`） |
-| POST | `/api/admin/clients/{id}/specus-mappings` | Bearer | 创建映射，201，推送 NAT_CONTROL | 有差异 | 创建不限数量，但单客户端超过 64 条后登录配置与 NAT_CONTROL 构建失败（`load_database_tcp_mappings`），Java 无上限；第 9 节 |
+| POST | `/api/admin/clients/{id}/specus-mappings` | Bearer | 创建映射，201，推送 NAT_CONTROL | 有差异 | 不限条数（#191）；会让该客户端的 `NAT_CONTROL` 超过单条消息 1 MiB 上限的新增或启用以 400 拒绝，Java 不检查（#197） |
 | PUT | `/api/admin/specus-mappings/{specusId}` | Bearer | 更新映射并推送 | 未逐项对照 | `session_lifecycle_tests`、`runtime_config_e2e.sh` 覆盖推送 |
 | DELETE | `/api/admin/specus-mappings/{specusId}` | Bearer | 删除并推送，204 | 未逐项对照 | 同上 |
-| POST | `/api/admin/clients/{id}/nat-control` | Bearer | 手动推送，回 `{pushed,specusMappings,httpRoutes}` | 有差异 | 每客户端 64 条上限（同上） |
+| POST | `/api/admin/clients/{id}/nat-control` | Bearer | 手动推送，回 `{pushed,specusMappings,httpRoutes}` | 一致 | 每客户端 64 条的上限已在 #191 去掉 |
 
 ## 3. HTTP 路由、临时分享、访问审计与连通性检查
 
 | 方法 | 路径 | 鉴权 | 请求 / 响应要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
 | GET | `/api/admin/http-routes` | Bearer | 可见 HTTP 路由 | 一致 | `HttpRouteServiceTests` 覆盖；**本分支**去掉全库 64 条上限 |
-| POST | `/api/admin/clients/{id}/http-routes` | Bearer | 创建路由 | 有差异 | 每客户端 64 条上限（同第 2 节） |
+| POST | `/api/admin/clients/{id}/http-routes` | Bearer | 创建路由 | 有差异 | 不限条数（#191）；会让 `NAT_CONTROL` 超过 1 MiB 的新增或启用以 400 拒绝，Java 不检查（#197） |
 | PUT | `/api/admin/http-routes/{routeId}` | Bearer | 更新路由 | 一致 | `HttpRouteServiceTests` 覆盖；中央向量 `http-route-lifecycle-v1.json`（ctest `http_route_lifecycle_tests`） |
 | DELETE | `/api/admin/http-routes/{routeId}` | Bearer | 删除路由 | 一致 | 同上 |
 | POST | `/api/admin/http-routes/{routeId}/shares` | Bearer | 创建临时分享 | 一致 | 中央向量 `temporary-http-share-v1.json`（ctest `http_share_tests`）；Java `HttpShareHttpTests`/`HttpShareVectorTests` 消费同一向量 |
@@ -210,7 +210,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 
 ## 9. 待办（按影响排序）
 
-1. **每客户端 64 条 TCP 映射 / 64 条 HTTP 路由**（`admin_http.c` `ST_ADMIN_MAX_TCP_MAPPINGS`、`main.c` `ST_MAX_TCP_MAPPINGS`）：创建不受限，但超过后该客户端的登录配置、NAT_CONTROL 推送与 `GET /api/admin/clients/{id}` 失败；Java 无上限。需要把运行时会话里的映射数组改为动态分配。
+1. ~~**每客户端 64 条 TCP 映射 / 64 条 HTTP 路由**~~（已完成，#191）：登录配置、`NAT_CONTROL` 推送、客户端详情与运行时会话里的映射和路由都改为动态分配；唯一的边界是单条 `NAT_CONTROL` 1 MiB，超出的新增或启用在创建时拒绝，其余三端的同一检查见 #197。
 2. **Peer Mesh 管理列表的固定上限**（`peer_mesh.c` 256 个客户端、`append_peer_mesh_egress_policy_view` 512 个客户端）：与上面已修的列表同类，留给 `fix/c-server-parity-peer` 合入后处理。
 3. **SQLite 流量明细搜索对照 JPA**：字段代码按 `HttpTrafficSearchField`、未知代码回落 summary、管理员按记录租户（看得到已删除客户端的流量）。
 4. ~~**`fix/c-server-parity-rest` 合入后复核**~~（已完成）：HTTP body 存储与详情显示、客户端登录 nonce 存库，以及 test-map 中 `TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 两行都已对应；已存在的 Elasticsearch HTTP 索引原先不补 binary body 映射，`fix/c-es-existing-index-body-mapping` 已按 Java `putBinaryBodyMapping` 补上（被拒时记日志、照用原索引），`elasticsearch_traffic_tests` 用 fake 预置的两个旧索引验证。

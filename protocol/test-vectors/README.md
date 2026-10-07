@@ -21,6 +21,11 @@ implementations/java/common/src/test/java/com/theshuai/common/tools/WireFixtureG
 更新 schema 后必须重新生成整个目录，并让 Java、Go、.NET、C 的 decoder 与 roundtrip 测试同时通过。
 `login_request.bin` 固定包含 `connectionRole=control`。
 
+`nat-control-size-v1.json` 描述单条 `NAT_CONTROL` 的 1 MiB 上限在管理接口上如何执行，语义见
+[`protocol/spec/control-protocol.md`](../spec/control-protocol.md) 的「NAT_CONTROL 的大小」。`sizing` 给出
+空串客户端名下的 JSON 字节数与为改名预留后的 MESSAGE body 字节数；`management` 是在恰好 1 MiB 的边界上新建、
+启用、修改映射和 route 的步骤与期望状态码。Java、Go、.NET 服务端的测试直接读取并重放这两部分。
+
 ## Peer Mesh
 
 - `peer-mesh-spm2.json`：固定 session key、方向 traffic key、nonce、明文和完整 SPM2 帧。
