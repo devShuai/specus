@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import vectors from "../../../../../protocol/test-vectors/peer-egress-domain-policy-v1.json";
+import rulesVector from "../../../../../protocol/test-vectors/peer-egress-rules-v1.json";
 import type { PeerEgressPolicy, PeerEgressSwitch } from "../../api/types";
 import {
   checkPolicyDraft,
@@ -9,13 +10,17 @@ import {
   draftFromPolicy,
   emptyDomainRuleDraft,
   emptyPolicyDraft,
+  formatIpv6,
   formatPorts,
   MAX_DOMAIN_RULES,
   MAX_PORT_RANGES,
   MAX_RULES_JSON_BYTES,
   normalizeDomainRules,
   parseCidr,
+  parseDestinationCidr,
   parseDomainMatch,
+  parseIpv6,
+  parseIpv6Cidr,
   parsePorts,
   policyState,
   storedDomainRuleProblem,
@@ -40,6 +45,40 @@ describe("parseCidr", () => {
     expect(parseCidr("2001:db8::/32")).toEqual({ error: "2001:db8::/32：目前只支持 IPv4" });
     expect(parseCidr("example.com")).toHaveProperty("error");
     expect(parseCidr("")).toEqual({ error: "请填写目标网段" });
+  });
+});
+
+describe("IPv6 destinations", () => {
+  // The spelling every implementation reads, from the ipv6Prefixes section of the rules vector.
+  it("reads and refuses the spellings the shared vector pins", () => {
+    for (const { text, address, prefixLength } of rulesVector.ipv6Prefixes.accept) {
+      const parsed = parseDestinationCidr(text);
+      expect(parsed, text).toEqual(expect.objectContaining({ prefix: prefixLength, text: `${address}/${prefixLength}` }));
+      expect(parseIpv6(address), address).toBe((parsed as { base: bigint }).base);
+      expect(formatIpv6(parseIpv6(address) ?? -1n)).toBe(address);
+    }
+    for (const { text } of rulesVector.ipv6Prefixes.reject) {
+      expect(parseIpv6Cidr(text), text).toHaveProperty("error");
+    }
+  });
+
+  it("says why an IPv6 rule is refused and what it means to save one", () => {
+    expect(parseIpv6Cidr("2001:db8::1/32")).toEqual({ error: "2001:db8::1/32：主机位不为零，应写作 2001:db8::/32" });
+    expect(parseIpv6Cidr("2001:db8::/129")).toEqual({ error: "2001:db8::/129：前缀长度应为 0–128" });
+    expect(parseIpv6Cidr("::ffff:192.0.2.1")).toHaveProperty("error");
+    expect(destinationNotes("2001:db8::/32", "PUBLIC", mesh)).toEqual([
+      "2001:db8::/32 是 IPv6：出口暂不授权 IPv6 目标，这条规则目前不会放行任何流量",
+    ]);
+    expect(storedRuleProblem({ cidr: "2001:db8::/32", protocols: ["tcp"], portRanges: [[443, 443]] })).toBe("");
+    expect(storedRuleProblem({ cidr: "2001:db8::1/32", protocols: ["tcp"], portRanges: [[443, 443]] })).toBe("网段无效，不会匹配");
+  });
+
+  it("sends an IPv6 rule in RFC 5952 form", () => {
+    const draft = { ...emptyPolicyDraft(), egressClientId: "2", consumers: ["3"],
+      rules: [{ cidr: " 2001:0DB8:0000::/48 ", tcp: true, udp: false, ports: "443" }] };
+    const check = checkPolicyDraft(draft, mesh);
+    expect(check.errors).toEqual([]);
+    expect(check.mutation?.destinationRules).toEqual([{ cidr: "2001:db8::/48", protocols: ["tcp"], portRanges: [[443, 443]] }]);
   });
 });
 

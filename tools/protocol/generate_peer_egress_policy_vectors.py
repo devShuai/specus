@@ -8,6 +8,8 @@ import json
 import ipaddress
 from pathlib import Path
 
+import peer_egress_ipv6 as ipv6
+
 # --------------------------------------------------------------------------
 # Consumer-side rule matching
 #
@@ -51,11 +53,26 @@ REFUSED_RULES = [
 ]
 
 
-def validate_rule(rule):
+def parse_rule_match(match):
+    """A rule's match as (family, network, length): 6 for anything with a colon, 4 otherwise.
+    None when it does not read as an address or prefix of that family."""
+    if ":" in match:
+        parsed = ipv6.parse_prefix(match)
+        return None if parsed is None else (6, parsed[0], parsed[1])
+    try:
+        # strict by default, so host bits are a refusal rather than something to normalise
+        network = ipaddress.IPv4Network(match)
+    except ValueError:
+        return None
+    return 4, int(network.network_address), network.prefixlen
+
+
+def validate_rule(rule, ipv6_data_plane=False):
     """The fixed validation order from protocol/spec/peer-egress.md.
 
     Here so the codes in CONFIG_REJECT are checked against a reference rather than only
-    against each other, and so match_rule can skip what it refuses.
+    against each other, and so match_rule can skip what it refuses. ipv6_data_plane says whether
+    the consumer carries IPv6; none of the clients does yet, so the default is the codes they give.
     """
     # Only an explicit false switches a rule off; an absent field is the rule as written.
     if rule.get("enabled") is False:
@@ -63,18 +80,22 @@ def validate_rule(rule):
     match = (rule.get("match") or "").strip()
     if not match:
         return "EGRESS_RULE_MALFORMED"
+    # A colon is unambiguous: the match is an IPv6 address or prefix, or it is malformed. An
+    # IPv4-mapped prefix reads but can never match a packet, so it is refused as malformed too.
     if ":" in match:
-        return "EGRESS_RULE_IPV6_UNSUPPORTED"
-    if match.startswith("*") or any(c.isalpha() for c in match):
+        parsed = parse_rule_match(match)
+        if parsed is None or ipv6.is_mapped(parsed[1]):
+            return "EGRESS_RULE_MALFORMED"
+    elif match.startswith("*") or any(c.isalpha() for c in match):
         return "EGRESS_RULE_DOMAIN_UNSUPPORTED"
-    try:
-        # strict by default, so host bits are a refusal rather than something to normalise
-        network = ipaddress.IPv4Network(match)
-    except ValueError:
+    parsed = parse_rule_match(match)
+    if parsed is None:
         return "EGRESS_RULE_MALFORMED"
-    if network.prefixlen == 0:
+    family, network, length = parsed
+    if length == 0:
         return "EGRESS_RULE_DEFAULT_ROUTE"
-    if network.overlaps(MESH_NETWORK):
+    # The mesh is IPv4, so only an IPv4 rule can overlap it.
+    if family == 4 and ipaddress.IPv4Network((network, length)).overlaps(MESH_NETWORK):
         return "EGRESS_RULE_MESH_OVERLAP"
     if rule.get("port") is not None:
         return "EGRESS_RULE_PORT_UNSUPPORTED"
@@ -82,6 +103,10 @@ def validate_rule(rule):
         return "EGRESS_RULE_MALFORMED"
     if rule["action"] == "egress" and int(rule.get("egressClientId") or 0) <= 0:
         return "EGRESS_RULE_MISSING_TARGET"
+    # Last: everything about the rule is right, and what is missing is this device's ability to
+    # carry IPv6 at all.
+    if family == 6 and not ipv6_data_plane:
+        return "EGRESS_RULE_IPV6_UNSUPPORTED"
     return None
 
 
@@ -155,9 +180,27 @@ CONFIG_REJECT = [
      "reason": "域名后缀同样属于二期范围"},
     {"name": "ipv6-cidr", "rule": {"match": "2001:db8::/32", "action": "egress", "egressClientId": 2},
      "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
-     "reason": "一期数据面只有 IPv4；拒绝而不是静默忽略，否则会静默走本地形成泄漏"},
+     "reason": "写法合法的 IPv6 规则，但消费端还没有 IPv6 数据面；拒绝而不是静默忽略，否则会静默走本地形成泄漏"},
     {"name": "ipv6-single", "rule": {"match": "2001:db8::1", "action": "block"},
      "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
+     "reason": "同上"},
+    {"name": "ipv6-host-bits-set", "rule": {"match": "2001:db8::1/32", "action": "block"},
+     "code": "EGRESS_RULE_MALFORMED",
+     "reason": "IPv6 与 IPv4 同一条：主机位非零拒绝，不做隐式掩码。写错的规则先报写错，而不是笼统的「不支持」"},
+    {"name": "ipv6-dotted-tail", "rule": {"match": "::ffff:192.0.2.1", "action": "block"},
+     "code": "EGRESS_RULE_MALFORMED",
+     "reason": "不接受末尾内嵌点分 IPv4 的写法；IPv6 只写十六进制"},
+    {"name": "ipv6-mapped", "rule": {"match": "::ffff:cb00:7100/120", "action": "egress", "egressClientId": 2},
+     "code": "EGRESS_RULE_MALFORMED",
+     "reason": "IPv4 映射段 ::ffff:0:0/96 是 IPv4 目标在 IPv6 接口里的写法，线上不出现，这条规则永远不会命中；写成 IPv4"},
+    {"name": "ipv6-default-route", "rule": {"match": "::/0", "action": "egress", "egressClientId": 2},
+     "code": "EGRESS_RULE_DEFAULT_ROUTE",
+     "reason": "与 0.0.0.0/0 同理，不接管 IPv6 默认路由"},
+    {"name": "ipv6-port-outranks-ipv6-unsupported", "rule": {"match": "2001:db8::/32", "action": "egress", "egressClientId": 2, "port": 443},
+     "code": "EGRESS_RULE_PORT_UNSUPPORTED",
+     "reason": "规则本身的问题先于本机能力：IPv6 不受支持排在全部内容检查之后"},
+    {"name": "ipv6-missing-target-outranks-ipv6-unsupported", "rule": {"match": "2001:db8::/32", "action": "egress"},
+     "code": "EGRESS_RULE_MISSING_TARGET",
      "reason": "同上"},
     {"name": "malformed-prefix-length", "rule": {"match": "203.0.113.0/33", "action": "block"},
      "code": "EGRESS_RULE_MALFORMED",
@@ -179,9 +222,9 @@ CONFIG_REJECT = [
      "reason": "消费端按路由分流，路由只能选目的地址。端口与协议限制只存在于出口策略，在建流时执行"},
     # 同时违反多项的用例。规范固定了校验顺序，但在补这几条之前向量里没有任何一条规则同时踩两个坑，
     # 于是各语言可以各返回一个码而向量抓不到——这正是四端实现最容易漂开的地方。
-    {"name": "ipv6-outranks-domain", "rule": {"match": "*.example.com:443", "action": "egress", "egressClientId": 2},
-     "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
-     "reason": "冒号是无歧义信号，先于域名判断，否则带冒号的通配串在各实现里会被归成不同类"},
+    {"name": "colon-outranks-domain", "rule": {"match": "*.example.com:443", "action": "egress", "egressClientId": 2},
+     "code": "EGRESS_RULE_MALFORMED",
+     "reason": "冒号是无歧义信号，先于域名判断：带冒号的就按 IPv6 读，读不出即写错，否则带冒号的通配串在各实现里会被归成不同类"},
     {"name": "domain-outranks-port", "rule": {"match": "*.example.com", "action": "egress", "egressClientId": 2, "port": 443},
      "code": "EGRESS_RULE_DOMAIN_UNSUPPORTED",
      "reason": "先判断 match 是什么，再判断它带了什么维度"},
@@ -241,6 +284,216 @@ CONSUMER_DISABLED = {
     ],
 }
 
+# --------------------------------------------------------------------------
+# IPv6 spelling, shared by consumer rules and egress policies
+#
+# One grammar for both, written out in tools/protocol/peer_egress_ipv6.py. Each accepted case gives
+# the address in RFC 5952 form and the length; a server stores the former, with the length only if
+# it was written. The refused spellings are the ones a runtime's own parser tends to let through.
+# --------------------------------------------------------------------------
+
+IPV6_ACCEPT = [
+    ("2001:db8::/32", "前缀"),
+    ("2001:DB8:0:0::/32", "大小写与零组只是写法，按数值读"),
+    ("2001:0db8:0000:0000:0000:0000:0000:0001", "完整写法；每组前导零可写可不写"),
+    ("2001:db8::7/128", "带 /128 的单地址"),
+    ("::", "全零地址"),
+    ("::/0", "全零前缀；作为消费端规则是默认路由，另行拒绝"),
+    ("::1", "回环"),
+    ("1::", "压缩在末尾"),
+    ("1:2:3:4:5:6:7::", "压缩只代表一组零也合法；规范形式不压缩单组零"),
+    ("1:0:0:2:0:0:0:3", "规范形式压缩最长的一段零"),
+    ("1:0:0:2:0:0:3:4", "等长时压缩靠左的一段"),
+    ("fe80::/10", "链路本地"),
+    ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "最大地址"),
+    ("::ffff:0:0/96", "IPv4 映射段写法本身合法；消费端规则另行拒绝"),
+    ("64:ff9b::/96", "NAT64 前缀"),
+]
+
+IPV6_REJECT = [
+    ("2001:db8::1/32", "主机位非零"),
+    ("2001:db8::/129", "前缀长度越界"),
+    ("2001:db8::/032", "前缀长度有前导零"),
+    ("2001:db8::/", "斜杠后为空"),
+    ("2001:db8::/-1", "前缀长度带符号"),
+    ("2001:db8::/32/64", "两个斜杠"),
+    ("2001:db8::/\uff13\uff12", "全角数字不是数字"),
+    ("\uff12001:db8::1", "同上，在地址里"),
+    ("::ffff:192.0.2.1", "末尾内嵌点分 IPv4"),
+    ("64:ff9b::192.0.2.1/120", "同上，带前缀"),
+    ("fe80::1%eth0", "区域标识"),
+    ("[2001:db8::1]", "方括号"),
+    ("2001:db8::12345", "一组超过四位"),
+    ("2001:db8:::1", "三个冒号"),
+    ("2001::db8::1", "两处压缩"),
+    ("1:2:3:4:5:6:7:8:9", "九组"),
+    ("1:2:3:4:5:6:7", "不压缩时不足八组"),
+    ("1:2:3:4:5:6:7:8::", "压缩之外已有八组"),
+    ("::1:2:3:4:5:6:7:8", "同上，压缩在开头"),
+    (":1:2:3:4:5:6:7:8", "单冒号开头"),
+    ("1:2:3:4:5:6:7:8:", "单冒号结尾"),
+    ("2001:db8 ::1", "中间有空白"),
+    ("g::1", "非十六进制字符"),
+    (":", "单个冒号"),
+]
+
+
+def ipv6_prefix_cases():
+    accept = []
+    for text, reason in IPV6_ACCEPT:
+        ipv6.cross_check(text)
+        parsed = ipv6.parse_prefix(text)
+        assert parsed is not None, text
+        accept.append({"text": text, "address": ipv6.format_address(parsed[0]), "prefixLength": parsed[1],
+                       "reason": reason})
+    reject = []
+    for text, reason in IPV6_REJECT:
+        assert ipv6.parse_prefix(text) is None, text
+        reject.append({"text": text, "reason": reason})
+    # Hand-checked, so the reference itself is pinned.
+    by_text = {case["text"]: case["address"] for case in accept}
+    assert by_text["1:2:3:4:5:6:7::"] == "1:2:3:4:5:6:7:0"
+    assert by_text["1:0:0:2:0:0:0:3"] == "1:0:0:2::3"
+    assert by_text["1:0:0:2:0:0:3:4"] == "1::2:0:0:3:4"
+    assert by_text["::ffff:0:0/96"] == "::ffff:0:0"
+    return {
+        "description": "IPv6 地址与前缀的写法，消费端规则的 match 与出口策略的目的规则共用。address 为 RFC 5952 规范形式，"
+                       "prefixLength 为前缀长度（单地址为 128）。reject 中的写法一律读不出：消费端规则报 EGRESS_RULE_MALFORMED，"
+                       "服务端保存策略以 400 拒绝。",
+        "accept": accept,
+        "reject": reject,
+    }
+
+
+# --------------------------------------------------------------------------
+# IPv6 rules on a consumer that carries IPv6
+#
+# None does yet: every client refuses a well-formed IPv6 rule with EGRESS_RULE_IPV6_UNSUPPORTED, and
+# the sections above are what they do. This one pins how IPv6 rules read and match once a consumer
+# has an IPv6 data plane, so the three clients agree before that data plane exists.
+# --------------------------------------------------------------------------
+
+IPV6_RULES = [
+    {"index": 0, "match": "2001:db8::/32", "action": "direct"},
+    {"index": 1, "match": "2001:db8:8000::/33", "action": "egress", "egressClientId": 2},
+    # Written in upper case with a zero group spelled out: matched by value, not by text.
+    {"index": 2, "match": "2001:DB8:1:0::/48", "action": "egress", "egressClientId": 3},
+    {"index": 3, "match": "2001:db8:1::50", "action": "block"},
+    # An IPv4 rule in the same list: the families never compete.
+    {"index": 4, "match": "203.0.113.0/24", "action": "egress", "egressClientId": 2},
+    {"index": 5, "match": "2001:db8:2::/48", "action": "egress", "egressClientId": 2},
+    {"index": 6, "match": "2001:db8:2::/48", "action": "block"},
+    # Refused, with prefixes long enough to win if a matcher only parsed the match.
+    {"index": 7, "match": "2001:db8:3::1/48", "action": "block"},
+    {"index": 8, "match": "::ffff:cb00:7100/120", "action": "block"},
+    {"index": 9, "match": "2001:db8:4::/48", "action": "block", "enabled": False},
+    {"index": 10, "match": "2000::/3", "action": "egress", "egressClientId": 3},
+]
+
+IPV6_REFUSED = [
+    {"index": 7, "code": "EGRESS_RULE_MALFORMED", "reason": "主机位非零"},
+    {"index": 8, "code": "EGRESS_RULE_MALFORMED", "reason": "IPv4 映射段，永远不会命中"},
+    {"index": 9, "code": "EGRESS_RULE_DISABLED", "reason": "用户停用"},
+]
+
+
+def match_rule_in(rules, destination, ipv6_data_plane):
+    """Longest prefix within the destination's family; the earlier rule among equals."""
+    if ":" in destination:
+        address = ipv6.parse_address(destination)
+        family = 6
+    else:
+        address = int(ipaddress.IPv4Address(destination))
+        family = 4
+    best, best_length = None, -1
+    for rule in rules:
+        if validate_rule(rule, ipv6_data_plane) is not None:
+            continue
+        rule_family, network, length = parse_rule_match(rule["match"].strip())
+        if rule_family != family:
+            continue
+        width = 128 if family == 6 else 32
+        if network >> (width - length) != address >> (width - length):
+            continue
+        if length > best_length:
+            best, best_length = rule, length
+    if best is None:
+        return {"action": "direct", "matchedRuleIndex": None, "reason": "default"}
+    result = {"action": best["action"], "matchedRuleIndex": best["index"], "reason": "matched"}
+    if best["action"] == "egress":
+        result["egressClientId"] = best["egressClientId"]
+    return result
+
+
+IPV6_CASES = [
+    ("longest-prefix-beats-order", "2001:db8:8000::1", "更长的 /33 胜出，尽管 /32 排在前面"),
+    ("shorter-prefix-when-no-longer-match", "2001:db8::1", "不在 /33 内，落到 /32 的 direct"),
+    ("host-route-beats-covering-rule", "2001:db8:1::50", "/128 胜过覆盖它的 /48"),
+    ("rule-matches-by-value-not-spelling", "2001:db8:1::51", "规则写作 2001:DB8:1:0::/48，按数值与目的地址比较"),
+    ("destination-spelling-is-read-by-value", "2001:0DB8:0001:0000:0000:0000:0000:0050", "目的地址的写法同样按数值读"),
+    ("equal-prefix-first-wins", "2001:db8:2::9", "前缀长度相同时先匹配者胜"),
+    ("refused-host-bits-does-not-steer", "2001:db8:3::1", "覆盖它的 /48 因主机位非零被拒，落回 /32"),
+    ("disabled-rule-does-not-steer", "2001:db8:4::1", "覆盖它的 /48 已停用，落回 /32"),
+    ("broad-rule-for-other-global-addresses", "2001:db9::1", "落在 2000::/3 内"),
+    ("unmatched-falls-through-to-direct", "fd00::1", "不在任何规则内，本地直连"),
+    ("mapped-destination-is-not-an-ipv4-destination", "::ffff:cb00:7109",
+     "IPv4 映射写法的目的地址按 IPv6 读，IPv4 规则 203.0.113.0/24 不覆盖它；线上的 IPv4 包按 IPv4 规则走"),
+    ("ipv4-destination-ignores-ipv6-rules", "203.0.113.9", "IPv4 目的只看 IPv4 规则，两族规则从不竞争"),
+]
+
+
+# Validation cases that only mean something on a consumer that carries IPv6: the same rule is in force
+# there and refused with EGRESS_RULE_IPV6_UNSUPPORTED everywhere else.
+IPV6_ONLY_VALIDATION = [
+    {"name": "ipv6-in-force", "rule": {"match": "2001:db8::/32", "action": "egress", "egressClientId": 2}},
+    {"name": "ipv6-direct-in-force", "rule": {"match": "2001:db8::1", "action": "direct"}},
+]
+
+
+def ipv6_section():
+    refused = {entry["index"]: entry["code"] for entry in IPV6_REFUSED}
+    for rule in IPV6_RULES:
+        assert validate_rule(rule, True) == refused.get(rule["index"]), f"ipv6 rule {rule['index']}"
+    cases = []
+    without = []
+    for name, destination, description in IPV6_CASES:
+        cases.append({"name": name, "destination": destination, "description": description,
+                      "expect": match_rule_in(IPV6_RULES, destination, True)})
+        without.append({"destination": destination, "expect": match_rule_in(IPV6_RULES, destination, False)})
+    by_name = {case["name"]: case["expect"] for case in cases}
+    assert by_name["longest-prefix-beats-order"]["matchedRuleIndex"] == 1
+    assert by_name["refused-host-bits-does-not-steer"]["matchedRuleIndex"] == 0
+    assert by_name["mapped-destination-is-not-an-ipv4-destination"]["matchedRuleIndex"] is None
+    assert by_name["ipv4-destination-ignores-ipv6-rules"]["matchedRuleIndex"] == 4
+    validation = []
+    for case in CONFIG_REJECT + IPV6_ONLY_VALIDATION:
+        if ":" not in (case["rule"].get("match") or ""):
+            continue
+        validation.append({"name": case["name"], "rule": case["rule"], "code": validate_rule(case["rule"], True)})
+    return {
+        "description": "有 IPv6 数据面的消费端如何校验与匹配 IPv6 规则。三个客户端目前都没有 IPv6 数据面，"
+                       "按上面各节的结果执行（合法的 IPv6 规则报 EGRESS_RULE_IPV6_UNSUPPORTED，不参与匹配）；"
+                       "本节钉住数据面交付之后的语义，供实现在测试里以「承载 IPv6」运行。code 为 null 即生效。",
+        "notes": [
+            "地址族分开匹配：IPv4 目的只看 IPv4 规则，IPv6 目的只看 IPv6 规则；族内最长前缀优先，等长先配置者胜。两族规则从不竞争，也不与域名规则竞争（fake-IP 池是 IPv4）。",
+            "规则与目的地址都按数值比较，写法（大小写、前导零、:: 的位置）不影响结果。",
+            "IPv6 规则不与 Peer Mesh 网段或 fake-IP 池比较重叠：两者都是 IPv4。",
+            "校验失败与停用的规则同样不参与匹配。",
+        ],
+        "ipv6DataPlane": True,
+        "rules": IPV6_RULES,
+        "refusedRules": IPV6_REFUSED,
+        "cases": cases,
+        "configValidation": validation,
+        "withoutIpv6DataPlane": {
+            "description": "同一份规则在没有 IPv6 数据面的消费端（三个客户端目前都是）：IPv6 规则全部不生效，"
+                           "IPv6 目的地址一律未匹配；IPv4 规则照常。code 为 null 即生效。",
+            "ruleCodes": [{"index": rule["index"], "code": validate_rule(rule, False)} for rule in IPV6_RULES],
+            "cases": without,
+        },
+    }
+
+
 rules_vector = {
     "name": "peer-egress-rules-v1",
     "version": 1,
@@ -260,6 +513,8 @@ rules_vector = {
     "cases": rule_cases,
     "configValidation": CONFIG_REJECT,
     "consumerDisabled": CONSUMER_DISABLED,
+    "ipv6Prefixes": ipv6_prefix_cases(),
+    "ipv6": ipv6_section(),
 }
 
 # --------------------------------------------------------------------------

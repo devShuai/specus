@@ -15,6 +15,8 @@ import ipaddress
 import json
 from pathlib import Path
 
+import peer_egress_ipv6 as ipv6
+
 VECTORS = Path("protocol/test-vectors")
 MESH_CIDR = "100.96.0.0/11"
 
@@ -28,24 +30,34 @@ def validate_rule(rule, mesh_cidr=MESH_CIDR):
     match = (rule.get("match") or "").strip()
     if not match:
         return "EGRESS_RULE_MALFORMED"
+    # A colon makes it IPv6: read as such, refused as malformed when it does not read or lies in the
+    # IPv4-mapped block, and otherwise refused last, since no consumer carries IPv6 yet.
     if ":" in match:
-        return "EGRESS_RULE_IPV6_UNSUPPORTED"
-    if match.startswith("*") or any(c.isalpha() for c in match):
+        parsed = ipv6.parse_prefix(match)
+        if parsed is None or ipv6.is_mapped(parsed[0]):
+            return "EGRESS_RULE_MALFORMED"
+        if parsed[1] == 0:
+            return "EGRESS_RULE_DEFAULT_ROUTE"
+        network = None
+    elif match.startswith("*") or any(c.isalpha() for c in match):
         return "EGRESS_RULE_DOMAIN_UNSUPPORTED"
-    try:
-        network = ipaddress.IPv4Network(match)
-    except ValueError:
-        return "EGRESS_RULE_MALFORMED"
-    if network.prefixlen == 0:
-        return "EGRESS_RULE_DEFAULT_ROUTE"
-    if network.overlaps(ipaddress.IPv4Network(mesh_cidr)):
-        return "EGRESS_RULE_MESH_OVERLAP"
+    else:
+        try:
+            network = ipaddress.IPv4Network(match)
+        except ValueError:
+            return "EGRESS_RULE_MALFORMED"
+        if network.prefixlen == 0:
+            return "EGRESS_RULE_DEFAULT_ROUTE"
+        if network.overlaps(ipaddress.IPv4Network(mesh_cidr)):
+            return "EGRESS_RULE_MESH_OVERLAP"
     if rule.get("port") is not None:
         return "EGRESS_RULE_PORT_UNSUPPORTED"
     if rule.get("action") not in ("egress", "direct", "block"):
         return "EGRESS_RULE_MALFORMED"
     if rule["action"] == "egress" and int(rule.get("egressClientId") or 0) <= 0:
         return "EGRESS_RULE_MISSING_TARGET"
+    if network is None:
+        return "EGRESS_RULE_IPV6_UNSUPPORTED"
     return None
 
 
