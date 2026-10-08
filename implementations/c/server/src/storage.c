@@ -620,6 +620,31 @@ static int migrate_management_login_names(sqlite3 *db, char *error, size_t error
     return rc;
 }
 
+/*
+ * Step 6 of the migration in protocol/spec/management-accounts.md: the email records whose account
+ * key no account has any more (accounts deleted before the delete took their email along) are
+ * deleted, so those addresses can register again. st_storage_init runs on many requests, so this
+ * only reads unless there is something to delete.
+ */
+static int remove_orphaned_management_emails(sqlite3 *db)
+{
+    sqlite3_stmt *stmt = NULL;
+    int orphaned = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT EXISTS(SELECT 1 FROM specus_management_user_email "
+            "WHERE username NOT IN (SELECT username FROM specus_management_user))",
+            -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        orphaned = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (orphaned <= 0) {
+        return orphaned;
+    }
+    return exec_sql(db, "DELETE FROM specus_management_user_email "
+                        "WHERE username NOT IN (SELECT username FROM specus_management_user)");
+}
+
 int st_storage_migrate_management_login_names(const char *path, char *error, size_t error_len)
 {
     sqlite3 *db = NULL;
@@ -1200,6 +1225,9 @@ int st_storage_init(const char *path, int seed_demo_client)
         if (rc != 0) {
             fprintf(stderr, "[schema] management login-name migration failed: %s\n", error);
         }
+    }
+    if (rc == 0) {
+        rc = remove_orphaned_management_emails(db);
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "specus_mapping", "detail_capture_enabled", "INTEGER NOT NULL DEFAULT 0");
@@ -2628,6 +2656,25 @@ static int delete_management_user_on_db(sqlite3 *db, const char *tenant_id, cons
     }
     sqlite3_finalize(stmt);
     stmt = NULL;
+    /* The registered email points at the account key and goes with the account, in the same
+     * transaction, so the address can register again once the delete commits. */
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db,
+            "DELETE FROM specus_management_user_email WHERE username IN ("
+            "SELECT username FROM specus_management_user WHERE tenant_id = ? AND login_name_normalized = ?)",
+            -1,
+            &stmt,
+            NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db,
             "DELETE FROM specus_management_user WHERE tenant_id = ? AND login_name_normalized = ?",
