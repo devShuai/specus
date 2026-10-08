@@ -461,6 +461,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
 
             try
             {
+                // A NAT_CONTROL that does not fit one MESSAGE is logged inside and does not throw, so
+                // the connection stays and the Peer Mesh push still runs: closing it only had the
+                // client log in again into the same failure.
                 var natControl = scope.ServiceProvider.GetRequiredService<NatControlService>();
                 await natControl.PushOnLoginAsync(packet.ClientName!, context.Lifetime)
                     .ConfigureAwait(false);

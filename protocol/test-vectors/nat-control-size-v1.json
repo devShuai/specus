@@ -1,14 +1,17 @@
 {
   "name": "nat-control-size-v1",
   "version": 1,
-  "description": "The 1 MiB MESSAGE body a client's NAT_CONTROL travels in, as the management API enforces it: creating an enabled TCP mapping or HTTP route, or changing one so that it is enabled afterwards, is refused with 400 when the client's NAT_CONTROL, measured in the server's own encoding with the client name counted at the longest a rename allows, would no longer fit. See protocol/spec/control-protocol.md (NAT_CONTROL 的大小).",
+  "description": "The 1 MiB MESSAGE body a client's NAT_CONTROL travels in, as the management API enforces it: creating an enabled TCP mapping or HTTP route, or changing one so that it is enabled afterwards, is refused with 400 when the client's NAT_CONTROL, measured in the server's own encoding with the client name counted at the longest a rename allows, would no longer fit; and how a NAT_CONTROL that already does not fit, written before the check existed or straight to the database, is handled when it is due: not sent, logged, the connection kept, the manual push answered with 409. See protocol/spec/control-protocol.md (NAT_CONTROL 的大小).",
   "notes": [
     "J 是该实现按当前配置生成的 NAT_CONTROL JSON 在 clientName 为空串时的 UTF-8 字节数。bodyBytes 是 clientName 按 120 个字符预留之后的 MESSAGE body 字节数：482 + 1 + 1 + varint(J + 721) + J + 720。fits 为 bodyBytes <= messageBodyLimitBytes。",
     "sizing：每个 case 用该实现的 JSON 生成逻辑构造一个空串名字下 JSON 恰为 jsonBytesWithEmptyClientName 字节的配置（例如调整一条 route 的 targetBaseUrl 长度），断言实现的大小计算给出 bodyBytes 和 fits。15662/15663 跨过 JSON 长度前缀从 2 字节变成 3 字节的位置。",
     "management：在一台全新的服务端上建一个客户端账户，先直接向数据库写入启用的 route，使 J 恰为 maxJsonBytesWithEmptyClientName - fillRemainingJsonBytes；再按顺序经管理 API 重放 steps。",
     "createRoute 的 targetBaseUrl 为 exact 时，测试选择 http://127.0.0.1:8080/ 加若干 ASCII 字母，使这条 route 加入后 J 恰为 maxJsonBytesWithEmptyClientName，即 body 恰为上限；否则用给出的 URL。createMapping 的 listenPort 由测试选一个未用的端口，targetAddress 为 127.0.0.1，targetPort 为 8080。",
     "updateRoute / updateMapping 只改给出的字段，其余字段按当前值原样提交；growTargetBaseUrlBy 表示在当前 targetBaseUrl 末尾追加这么多个 ASCII 字母。",
-    "expect 为期望的 HTTP 状态码。400 时响应的 error 必须包含 errorContains，并且该客户端的映射和 route（条目、字段和启用状态）与这一步之前完全相同。每一步之后，按 clientName 预留计算的 body 都不得超过 messageBodyLimitBytes。"
+    "expect 为期望的 HTTP 状态码。400 时响应的 error 必须包含 errorContains，并且该客户端的映射和 route（条目、字段和启用状态）与这一步之前完全相同。每一步之后，按 clientName 预留计算的 body 都不得超过 messageBodyLimitBytes。",
+    "existingOversize：在一台全新的服务端上建一个客户端账户，绕过管理接口直接向数据库写入启用的 route（每条 targetBaseUrl 不超过 fillTargetBaseUrlMaxBytes 字节，C 服务端的 route 目标最长 511 字节），使空串名字下的 J 不少于 jsonBytesWithEmptyClientName。它比上限多出不止一条 route，所以无论客户端叫什么、删掉其中任意一条之后，NAT_CONTROL 都放不进一条 MESSAGE。然后按顺序执行 steps。",
+    "connect 用该客户端登录 control 连接（也可以接着登录 data 连接），登录必须成功；开启了 Peer Mesh 的服务端还必须照常发来 Peer Mesh 的登录推送。pushNatControl 和 forceRefreshPortMapping 分别调用 POST /api/admin/clients/{id}/nat-control 和 POST /api/admin/clients/{id}/force-refresh-port-mapping。createRoute 经管理接口新建 route；deleteFillRoute 经管理接口删除任意一条直接写库的 route。expect 为期望的 HTTP 状态码，409 时响应的 error 必须包含 errorContains。shrinkInStore 直接在数据库里停用所有直接写库的 route，不经管理接口，也不触发推送。",
+    "整个场景里服务端不得关闭 control 连接。natControl 为 true 的那一步之前不得收到任何 NAT_CONTROL；那一步之后收到的第一条 NAT_CONTROL 不含任何直接写库的 route。"
   ],
   "messageBodyLimitBytes": 1048576,
   "clientNameReserve": {
@@ -42,6 +45,19 @@
       { "op": "updateMapping", "mapping": "tcp-idle", "enabled": true, "expect": 200 },
       { "op": "updateRoute", "route": "edge", "enabled": true, "expect": 400 },
       { "op": "deleteRoute", "route": "edge", "expect": 204 }
+    ]
+  },
+  "existingOversize": {
+    "jsonBytesWithEmptyClientName": 1050000,
+    "fillTargetBaseUrlMaxBytes": 500,
+    "steps": [
+      { "op": "connect" },
+      { "op": "pushNatControl", "expect": 409 },
+      { "op": "forceRefreshPortMapping", "expect": 409 },
+      { "op": "createRoute", "route": "idle", "targetBaseUrl": "http://127.0.0.1:8080", "enabled": false, "expect": 201 },
+      { "op": "deleteFillRoute", "expect": 204 },
+      { "op": "shrinkInStore" },
+      { "op": "pushNatControl", "expect": 200, "natControl": true }
     ]
   }
 }

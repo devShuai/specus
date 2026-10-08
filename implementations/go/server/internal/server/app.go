@@ -354,6 +354,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	dispatcher.SetOnLoginSuccess(func(conn *control.Conn) {
 		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// A NAT_CONTROL that cannot be sent is only logged: the connection stays, and the Peer Mesh
+		// push below still runs. Closing it would only have the client log in into the same failure.
 		if _, _, err := natControl.PushToName(pushCtx, conn.ClientName()); err != nil {
 			logger.Error("NAT_CONTROL push failed", "client", conn.ClientName(), "err", err)
 		}

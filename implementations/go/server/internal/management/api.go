@@ -1637,6 +1637,12 @@ func (a *API) handleNatControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, online, err := a.natControl.PushToID(r.Context(), account.ID, account.ClientName)
+	if errors.Is(err, nat.ErrNatControlNotSent) {
+		// Nothing was sent and the connection is kept; the caller must not take it as pushed.
+		a.logger.Error("NAT_CONTROL push failed", "client", account.ClientName, "err", err)
+		a.fail(w, conflict(nat.ErrNatControlNotSent.Error()))
+		return
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -2722,10 +2728,15 @@ func (a *API) requireNatControlFits(ctx context.Context, clientID int64, mapping
 	return err
 }
 
+// pushNatControl sends the client its configuration after a change. A push that fails, such as a
+// NAT_CONTROL past the 1 MiB MESSAGE body that predates the size check, is logged and leaves the
+// change and its answer as they are. See "NAT_CONTROL 的大小" in protocol/spec/control-protocol.md.
 func (a *API) pushNatControl(ctx context.Context, clientID int64, clientName string) {
 	pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _, _ = a.natControl.PushToID(pushCtx, clientID, clientName)
+	if _, _, err := a.natControl.PushToID(pushCtx, clientID, clientName); err != nil {
+		a.logger.Error("NAT_CONTROL push failed", "client", clientName, "err", err)
+	}
 }
 
 // revokeClientTokens forgets the runtime tokens of a deleted account and closes their session rows.
