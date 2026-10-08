@@ -392,6 +392,13 @@ server_log_since() {
   tail -n +"$(( $1 + 1 ))" "$TMP_DIR/server.log"
 }
 
+# Whether the server log from line $1 on has a line with the text $2. grep -q would stop at the
+# first match, and on a long log tail then dies of SIGPIPE, which pipefail turns into a failed
+# check although the line is there; grep -c reads everything.
+server_log_since_has() {
+  server_log_since "$1" | grep -cF -- "$2" >/dev/null
+}
+
 # --- Phase one: both clients beside the server, a DIRECT path over loopback --------------------
 
 start_client a direct
@@ -427,9 +434,9 @@ DIRECT_REMOTE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["rem
 [[ "$DIRECT_REMOTE" == "$SERVER_IP:"* || "$DIRECT_REMOTE" == 127.* ]] \
   || fail "the direct path should run over the loopback interface, not $DIRECT_REMOTE"
 
-server_log_since 0 | grep -q "signal accepted source=$CLIENT_A target=$CLIENT_B" \
+server_log_since_has 0 "signal accepted source=$CLIENT_A target=$CLIENT_B" \
   || fail "the server never accepted a signal from A to B"
-server_log_since 0 | grep -q "signal accepted source=$CLIENT_B target=$CLIENT_A" \
+server_log_since_has 0 "signal accepted source=$CLIENT_B target=$CLIENT_A" \
   || fail "the server never accepted a signal from B to A"
 if [[ "$CLIENT_LABEL" != Java && "$CLIENT_LABEL" != Android ]]; then
   # Go and .NET log the path at info. Java logs it at debug level, and the Android core reports it
@@ -539,9 +546,9 @@ RELAY_SESSION="$(check session "$ADMIN_PORT" "$ADMIN_TOKEN" "$CLIENT_A" "$CLIENT
   || fail "no RELAY session between A and B"
 echo "relay session: $RELAY_SESSION"
 
-server_log_since "$PHASE_TWO_LOG_START" | grep -q "signal accepted source=$CLIENT_A target=$CLIENT_B" \
+server_log_since_has "$PHASE_TWO_LOG_START" "signal accepted source=$CLIENT_A target=$CLIENT_B" \
   || fail "the server accepted no signal from A to B in phase two"
-server_log_since "$PHASE_TWO_LOG_START" | grep -q "signal accepted source=$CLIENT_B target=$CLIENT_A" \
+server_log_since_has "$PHASE_TWO_LOG_START" "signal accepted source=$CLIENT_B target=$CLIENT_A" \
   || fail "the server accepted no signal from B to A in phase two"
 RELAY_SOCKETS="$(( $(check relay-sockets "$RELAY_MIN_PORT" "$RELAY_MAX_PORT") - RELAY_SOCKETS_BEFORE ))"
 (( RELAY_SOCKETS >= 2 )) \
