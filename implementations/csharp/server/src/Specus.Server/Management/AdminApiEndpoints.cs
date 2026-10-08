@@ -156,7 +156,7 @@ public static class AdminApiEndpoints
                 await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
                     cancellationToken).ConfigureAwait(false);
             }
-            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
+            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role, user.AccountKey));
         });
 
         app.MapPost("/auth/register", async (RegistrationRequest? request,
@@ -197,7 +197,7 @@ public static class AdminApiEndpoints
                 cancellationToken).ConfigureAwait(false);
             await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
                 cancellationToken).ConfigureAwait(false);
-            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
+            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role, user.AccountKey));
         });
 
         app.MapPost("/auth/refresh", async (HttpContext context, LocalTokenService tokens,
@@ -211,10 +211,10 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
-            // The bearer was already re-resolved to the account's login name and tenant.
+            // The bearer was already re-resolved to the account's login name, tenant and account key.
             var principal = ManagementContext.From(context, authOptions.Value);
             var current = await users.ResolveLocalTokenUserAsync(principal.Username, principal.TenantId,
-                    cancellationToken)
+                    context.User.FindFirst(LocalTokenService.AccountKeyClaim)?.Value, cancellationToken)
                 .ConfigureAwait(false);
             if (current is null)
             {
@@ -222,7 +222,7 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status401Unauthorized);
             }
             return Results.Ok(tokens.IssueTokenBody(current.Username, current.TenantId,
-                current.Role));
+                current.Role, current.AccountKey));
         });
 
         app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens,

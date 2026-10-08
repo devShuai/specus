@@ -381,6 +381,13 @@ target_compile_definitions(specus_c_workbench_tests PRIVATE
     ST_WORKBENCH_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/service-workbench-v1.json")
 add_test(NAME workbench_tests COMMAND specus_c_workbench_tests)
 
+add_executable(specus_c_management_accounts_tests tests/management_accounts_tests.c)
+target_link_libraries(specus_c_management_accounts_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_accounts_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_management_accounts_tests PRIVATE
+    ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/management-accounts-v1.json")
+add_test(NAME management_accounts_tests COMMAND specus_c_management_accounts_tests)
+
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_tls_transport_tests PRIVATE -Wall -Wextra -Wpedantic)

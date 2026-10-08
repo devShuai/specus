@@ -29,6 +29,12 @@ import java.time.Instant;
 @Service
 public class LocalTokenService {
     public static final String ISSUER = "specus";
+    /**
+     * The account key of the account a token was issued for. A login name can be reused once its
+     * account is deleted; the key cannot, so a token never outlives the account row it names.
+     * The built-in administrator has no account row and its tokens carry no such claim.
+     */
+    public static final String ACCOUNT_KEY_CLAIM = "uid";
 
     private final AuthProperties properties;
     private final SecretKey secretKey;
@@ -66,12 +72,21 @@ public class LocalTokenService {
     }
 
     public String issueToken(String username, String tenantId, ManagementRole role) {
+        return issueToken(username, tenantId, role, null);
+    }
+
+    /** Issues a token for an account; {@code accountKey} is null only for the built-in administrator. */
+    public String issueToken(String username, String tenantId, ManagementRole role, String accountKey) {
         Instant now = Instant.now();
-        JwtClaimsSet claims = JwtClaimsSet.builder()
+        JwtClaimsSet.Builder builder = JwtClaimsSet.builder()
                 .issuer(ISSUER)
                 .subject(username)
                 .claim(TenantResolver.LOCAL_TENANT_CLAIM, TenantContext.normalize(tenantId))
-                .claim("role", role == null ? ManagementRole.USER.name() : role.name())
+                .claim("role", role == null ? ManagementRole.USER.name() : role.name());
+        if (StringUtils.hasText(accountKey)) {
+            builder.claim(ACCOUNT_KEY_CLAIM, accountKey);
+        }
+        JwtClaimsSet claims = builder
                 .issuedAt(now)
                 .expiresAt(now.plusSeconds(properties.getTokenTtlSeconds()))
                 .build();
