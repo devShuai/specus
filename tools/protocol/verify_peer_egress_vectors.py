@@ -141,6 +141,83 @@ for rule in rules["rules"]:
     check(not net.overlaps(ipaddress.IPv4Network(rules["meshCidr"])),
           f"rules: {rule['match']} overlaps the mesh CIDR")
 
+# ---- IPv6 spelling and rules --------------------------------------------
+# Checked with ipaddress rather than the generator's own parser: every accepted spelling has to mean
+# the address and length the case states, and the stated address has to be ipaddress's own
+# compression wherever that is not the dotted form, which the grammar does not read back.
+for case in rules["ipv6Prefixes"]["accept"]:
+    text = case["text"]
+    network = ipaddress.IPv6Network(text if "/" in text else text + "/128", strict=True)
+    check(network.prefixlen == case["prefixLength"], f"ipv6Prefixes/{text}: length mismatch")
+    check(ipaddress.IPv6Address(case["address"]) == network.network_address, f"ipv6Prefixes/{text}: address mismatch")
+    compressed = network.network_address.compressed
+    if "." not in compressed:
+        check(compressed == case["address"], f"ipv6Prefixes/{text}: {case['address']} is not RFC 5952 form")
+    check("." not in case["address"], f"ipv6Prefixes/{text}: the canonical form must not be dotted")
+
+
+def ipv6_parses(text):
+    try:
+        ipaddress.IPv6Network(text if "/" in text else text + "/128", strict=True)
+    except ValueError:
+        return False
+    return True
+
+
+# A refused spelling that ipaddress reads as well has to be one the grammar refuses on purpose.
+for case in rules["ipv6Prefixes"]["reject"]:
+    text = case["text"]
+    # A dotted tail, a zone, brackets, space, non-ASCII digits and a zero-padded length.
+    deliberate = (any(mark in text for mark in (".", "%", "[", " ")) or any(ord(c) > 127 for c in text)
+                  or "/0" in text and text.split("/", 1)[1] != "0")
+    check(deliberate or not ipv6_parses(text), f"ipv6Prefixes/{text}: refused, but reads as IPv6 for no stated reason")
+
+ipv6_rules = rules["ipv6"]
+IPV6_REFUSED_INDEXES = {entry["index"] for entry in ipv6_rules["refusedRules"]}
+
+
+def ipv6_match(destination, skip):
+    family = 6 if ":" in destination else 4
+    address = ipaddress.ip_address(destination)
+    best, best_length = None, -1
+    for rule in ipv6_rules["rules"]:
+        if rule["index"] in skip:
+            continue
+        match = rule["match"]
+        network = ipaddress.ip_network(match if "/" in match else match + ("/128" if ":" in match else "/32"), strict=False)
+        if network.version != family or address not in network:
+            continue
+        if network.prefixlen > best_length:
+            best, best_length = rule, network.prefixlen
+    return best
+
+
+check(any(
+    (unfiltered := ipv6_match(case["destination"], set())) is not None
+    and unfiltered["index"] in IPV6_REFUSED_INDEXES
+    for case in ipv6_rules["cases"]
+), "rules/ipv6: no case would have matched a refused rule, so the skip is untested")
+for case in ipv6_rules["cases"]:
+    best = ipv6_match(case["destination"], IPV6_REFUSED_INDEXES)
+    expect = case["expect"]
+    if best is None:
+        check(expect["matchedRuleIndex"] is None and expect["action"] == "direct",
+              f"rules/ipv6/{case['name']}: unmatched destination must fall through to direct")
+    else:
+        check(best["index"] == expect["matchedRuleIndex"],
+              f"rules/ipv6/{case['name']}: expected rule {expect['matchedRuleIndex']}, matcher picked {best['index']}")
+# Without an IPv6 data plane only the IPv4 rules are in force.
+without = ipv6_rules["withoutIpv6DataPlane"]
+for entry in without["ruleCodes"]:
+    rule = ipv6_rules["rules"][entry["index"]]
+    if ":" in rule["match"] and entry["index"] not in IPV6_REFUSED_INDEXES:
+        check(entry["code"] == "EGRESS_RULE_IPV6_UNSUPPORTED",
+              f"rules/ipv6/withoutIpv6DataPlane: rule {entry['index']} must be refused as IPv6")
+for case in without["cases"]:
+    if ":" in case["destination"]:
+        check(case["expect"]["matchedRuleIndex"] is None,
+              f"rules/ipv6/withoutIpv6DataPlane/{case['destination']}: an IPv6 destination cannot match")
+
 # ---- control vector -----------------------------------------------------
 # Checked without re-implementing the decoder: what matters is that the cases still exercise the
 # two things a JSON library would otherwise decide on the protocol's behalf.

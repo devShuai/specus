@@ -255,6 +255,207 @@ int st_egress_cidr_overlaps(const st_egress_cidr *left, const st_egress_cidr *ri
     return (left->network & mask) == (right->network & mask);
 }
 
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* Colon-separated groups of one to four hex digits; an empty span is no groups. Returns 0 on success. */
+static int hex_groups(const char *text, size_t len, uint16_t *groups, size_t *count)
+{
+    *count = 0U;
+    if (len == 0U) {
+        return 0;
+    }
+    size_t start = 0U;
+    for (size_t i = 0U; i <= len; i++) {
+        if (i != len && text[i] != ':') {
+            continue;
+        }
+        size_t digits = i - start;
+        if (digits < 1U || digits > 4U || *count >= 8U) {
+            return 1;
+        }
+        uint16_t value = 0U;
+        for (size_t j = start; j < i; j++) {
+            value = (uint16_t)((value << 4) | (uint16_t)hex_value(text[j]));
+        }
+        groups[(*count)++] = value;
+        start = i + 1U;
+    }
+    return 0;
+}
+
+int st_egress_parse_address6(const char *text, uint8_t out[16])
+{
+    if (text == NULL || out == NULL) {
+        return 1;
+    }
+    size_t length = strlen(text);
+    if (length == 0U || length > 39U) {
+        return 1;
+    }
+    for (size_t i = 0U; i < length; i++) {
+        if (hex_value(text[i]) < 0 && text[i] != ':') {
+            return 1;
+        }
+    }
+    if (strstr(text, ":::") != NULL) {
+        return 1;
+    }
+    const char *compressed = strstr(text, "::");
+    if (compressed != NULL && strstr(compressed + 1, "::") != NULL) {
+        return 1;
+    }
+    uint16_t groups[8] = {0};
+    if (compressed != NULL) {
+        uint16_t high[8];
+        uint16_t low[8];
+        size_t high_len = 0U;
+        size_t low_len = 0U;
+        size_t head = (size_t)(compressed - text);
+        if (hex_groups(text, head, high, &high_len) != 0
+            || hex_groups(compressed + 2, length - head - 2U, low, &low_len) != 0
+            || high_len + low_len > 7U) {
+            return 1;
+        }
+        for (size_t i = 0U; i < high_len; i++) {
+            groups[i] = high[i];
+        }
+        for (size_t i = 0U; i < low_len; i++) {
+            groups[8U - low_len + i] = low[i];
+        }
+    } else {
+        size_t count = 0U;
+        if (hex_groups(text, length, groups, &count) != 0 || count != 8U) {
+            return 1;
+        }
+    }
+    for (size_t i = 0U; i < 8U; i++) {
+        out[2U * i] = (uint8_t)(groups[i] >> 8);
+        out[2U * i + 1U] = (uint8_t)(groups[i] & 0xFFU);
+    }
+    return 0;
+}
+
+int st_egress_parse_cidr6(const char *text, st_egress_cidr6 *out, int *had_length)
+{
+    if (text == NULL || out == NULL) {
+        return 1;
+    }
+    char buffer[64];
+    size_t length = strlen(text);
+    if (length >= sizeof(buffer)) {
+        return 1;
+    }
+    memcpy(buffer, text, length + 1U);
+    char *slash = strchr(buffer, '/');
+    uint8_t address[16];
+    int prefix = ST_EGRESS_MAX_PREFIX6;
+    if (slash != NULL) {
+        *slash = '\0';
+        const char *prefix_part = slash + 1;
+        size_t prefix_len = strlen(prefix_part);
+        if (prefix_len == 0U || prefix_len > 3U || (prefix_len > 1U && prefix_part[0] == '0')) {
+            return 1;
+        }
+        prefix = 0;
+        for (size_t i = 0U; i < prefix_len; i++) {
+            if (prefix_part[i] < '0' || prefix_part[i] > '9') {
+                return 1;
+            }
+            prefix = (prefix * 10) + (prefix_part[i] - '0');
+        }
+        if (prefix > ST_EGRESS_MAX_PREFIX6) {
+            return 1;
+        }
+    }
+    if (st_egress_parse_address6(buffer, address) != 0) {
+        return 1;
+    }
+    /* Host bits set: refused rather than masked, as for IPv4. */
+    for (int i = 0; i < 16; i++) {
+        int bits = prefix - (i * 8);
+        unsigned mask = bits >= 8 ? 0xFFU : (bits <= 0 ? 0U : ((0xFFU << (8 - bits)) & 0xFFU));
+        if (((unsigned)address[i] & ~mask) != 0U) {
+            return 1;
+        }
+    }
+    memcpy(out->network, address, sizeof(address));
+    out->prefix_length = prefix;
+    if (had_length != NULL) {
+        *had_length = slash != NULL;
+    }
+    return 0;
+}
+
+void st_egress_format_address6(const uint8_t address[16], char *out, size_t out_len)
+{
+    if (address == NULL || out == NULL || out_len == 0U) {
+        return;
+    }
+    unsigned groups[8];
+    for (int i = 0; i < 8; i++) {
+        groups[i] = ((unsigned)address[2 * i] << 8) | address[2 * i + 1];
+    }
+    int best_start = -1;
+    int best_length = 0;
+    for (int i = 0; i < 8;) {
+        if (groups[i] != 0U) {
+            i++;
+            continue;
+        }
+        int end = i;
+        while (end < 8 && groups[end] == 0U) {
+            end++;
+        }
+        if (end - i > best_length) {
+            best_start = i;
+            best_length = end - i;
+        }
+        i = end;
+    }
+    if (best_length < 2) {
+        best_start = -1;
+    }
+    size_t used = 0U;
+    out[0] = '\0';
+    for (int i = 0; i < 8; i++) {
+        if (i == best_start) {
+            used += (size_t)snprintf(out + used, out_len - used, "::");
+            i += best_length - 1;
+            continue;
+        }
+        int after_gap = best_start >= 0 && i == best_start + best_length;
+        used += (size_t)snprintf(out + used, out_len - used, "%s%x", (i == 0 || after_gap) ? "" : ":", groups[i]);
+        if (used >= out_len) {
+            return;
+        }
+    }
+}
+
+int st_egress_cidr6_mapped(const st_egress_cidr6 *cidr)
+{
+    if (cidr == NULL) {
+        return 0;
+    }
+    for (int i = 0; i < 10; i++) {
+        if (cidr->network[i] != 0U) {
+            return 0;
+        }
+    }
+    return cidr->network[10] == 0xFFU && cidr->network[11] == 0xFFU;
+}
+
 int st_egress_normalize_version(int version)
 {
     if (version < 1) {
@@ -284,6 +485,8 @@ static int contained_in(uint32_t address, const char *const *cidrs, size_t cidrs
     return 0;
 }
 
+static const char *validate_rule_target(const st_egress_rule *rule);
+
 /* Anything outside digits, dots and the prefix separator is treated as a name. */
 static int looks_like_domain(const char *match)
 {
@@ -311,8 +514,22 @@ const char *st_egress_validate_rule(const st_egress_rule *rule, const char *mesh
     if (match[0] == '\0') {
         return ST_EGRESS_CODE_RULE_MALFORMED;
     }
+    /*
+     * A colon is unambiguous: the match is an IPv6 address or prefix, or it is malformed. A
+     * well-formed one is refused last, once everything about the rule itself is known to be right:
+     * what is missing is a consumer that carries IPv6, and none does yet.
+     */
     if (strchr(match, ':') != NULL) {
-        return ST_EGRESS_CODE_RULE_IPV6_UNSUPPORTED;
+        st_egress_cidr6 cidr6;
+        if (st_egress_parse_cidr6(match, &cidr6, NULL) != 0 || st_egress_cidr6_mapped(&cidr6)) {
+            /* An IPv4-mapped prefix reads but no packet is addressed to one, so it would never match. */
+            return ST_EGRESS_CODE_RULE_MALFORMED;
+        }
+        if (cidr6.prefix_length == 0) {
+            return ST_EGRESS_CODE_RULE_DEFAULT_ROUTE;
+        }
+        const char *target = validate_rule_target(rule);
+        return target != NULL ? target : ST_EGRESS_CODE_RULE_IPV6_UNSUPPORTED;
     }
     if (looks_like_domain(match)) {
         return ST_EGRESS_CODE_RULE_DOMAIN_UNSUPPORTED;
@@ -335,6 +552,12 @@ const char *st_egress_validate_rule(const st_egress_rule *rule, const char *mesh
     if (st_egress_parse_cidr(mesh_text, &mesh) == 0 && st_egress_cidr_overlaps(&cidr, &mesh)) {
         return ST_EGRESS_CODE_RULE_MESH_OVERLAP;
     }
+    return validate_rule_target(rule);
+}
+
+/* The part of the order after the match: no port, a known action, and an egress rule's egress. */
+static const char *validate_rule_target(const st_egress_rule *rule)
+{
     if (rule->has_port) {
         return ST_EGRESS_CODE_RULE_PORT_UNSUPPORTED;
     }
@@ -815,11 +1038,28 @@ static int normalize_cidr(const char *rule_raw, st_egress_destination_rule *out)
         return 1;
     }
     const char *trimmed = trim_in_place(cidr);
-    st_egress_cidr parsed;
-    int ok = strlen(trimmed) < sizeof(out->cidr) && st_egress_parse_cidr(trimmed, &parsed) == 0;
-    if (ok) {
-        /* Kept as written: a bare address stays bare, so the operator reads back what they typed. */
-        copy_bounded(out->cidr, sizeof(out->cidr), trimmed);
+    int ok;
+    if (strchr(trimmed, ':') != NULL) {
+        /* IPv6 is stored in RFC 5952 form, the /length kept only when it was written. */
+        st_egress_cidr6 parsed6;
+        int had_length = 0;
+        ok = st_egress_parse_cidr6(trimmed, &parsed6, &had_length) == 0;
+        if (ok) {
+            char stored[64];
+            st_egress_format_address6(parsed6.network, stored, sizeof(stored));
+            if (had_length) {
+                size_t used = strlen(stored);
+                snprintf(stored + used, sizeof(stored) - used, "/%d", parsed6.prefix_length);
+            }
+            copy_bounded(out->cidr, sizeof(out->cidr), stored);
+        }
+    } else {
+        st_egress_cidr parsed;
+        ok = strlen(trimmed) < sizeof(out->cidr) && st_egress_parse_cidr(trimmed, &parsed) == 0;
+        if (ok) {
+            /* Kept as written: a bare address stays bare, so the operator reads back what they typed. */
+            copy_bounded(out->cidr, sizeof(out->cidr), trimmed);
+        }
     }
     free(cidr);
     return ok ? 0 : 1;

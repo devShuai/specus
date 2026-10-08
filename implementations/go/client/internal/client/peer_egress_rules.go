@@ -78,6 +78,20 @@ func validateEgressRule(rule egressRule, meshCIDR string) string {
 // compete with the domain rule that handed each one out. Not running, a domain rule is refused
 // exactly as in phase one, and the pool means nothing to an address rule.
 func validateEgressRuleIn(rule egressRule, meshCIDR, fakeIPPool string) string {
+	return validateEgressRuleFor(rule, meshCIDR, fakeIPPool, egressConsumerCarriesIPv6)
+}
+
+// egressConsumerCarriesIPv6 says whether this consumer has an IPv6 data plane: IPv6 packets read
+// from the TUN, IPv6 routes installed into it, and IPv6 carried to the egress. It does not yet, so a
+// well-formed IPv6 rule is refused with EGRESS_RULE_IPV6_UNSUPPORTED: installing nothing for it and
+// reporting it in force would send its destinations straight out of the local interface.
+//
+// The rule is still read and checked in full first, so a mistake in it is reported as one, and how
+// IPv6 rules match is pinned by the vector's ipv6 section, which the tests run with this set.
+const egressConsumerCarriesIPv6 = false
+
+// validateEgressRuleFor is validateEgressRuleIn with the consumer's IPv6 data plane stated.
+func validateEgressRuleFor(rule egressRule, meshCIDR, fakeIPPool string, carriesIPv6 bool) string {
 	// First, ahead of anything about the rule's content: switching a rule off is the user's choice,
 	// and a rule should not have to be fixed before it is allowed to sit in the list switched off.
 	if rule.switchedOff() {
@@ -87,9 +101,28 @@ func validateEgressRuleIn(rule egressRule, meshCIDR, fakeIPPool string) string {
 	if match == "" {
 		return egressCodeRuleMalformed
 	}
-	// A colon is unambiguous, so IPv6 is settled before anything else is guessed at.
+	// A colon is unambiguous, so IPv6 is settled before anything else is guessed at: the match is
+	// an IPv6 address or prefix, or it is malformed. The mesh and the fake-IP pool are IPv4, so an
+	// IPv6 rule has neither to stay clear of.
 	if strings.Contains(match, ":") {
-		return egressCodeRuleIPv6Unsupported
+		cidr, _, ok := parseEgressCIDR6(match)
+		if !ok || cidr.mapped() {
+			// An IPv4-mapped prefix reads, but no packet is ever addressed to one: the rule would
+			// sit there matching nothing while its writer believed the IPv4 addresses covered.
+			return egressCodeRuleMalformed
+		}
+		if cidr.prefixLen == 0 {
+			return egressCodeRuleDefaultRoute
+		}
+		if code := validateEgressRuleTarget(rule); code != "" {
+			return code
+		}
+		// Last: everything about the rule is right, and what is missing is this device's ability
+		// to carry IPv6 at all.
+		if !carriesIPv6 {
+			return egressCodeRuleIPv6Unsupported
+		}
+		return ""
 	}
 	if looksLikeEgressDomainRule(match) {
 		if fakeIPPool == "" {
@@ -116,6 +149,12 @@ func validateEgressRuleIn(rule egressRule, meshCIDR, fakeIPPool string) string {
 			return egressCodeRuleFakeIPOverlap
 		}
 	}
+	return validateEgressRuleTarget(rule)
+}
+
+// validateEgressRuleTarget is the part of the order after the match: the port the rule must not
+// carry, the action, and the egress an egress rule needs.
+func validateEgressRuleTarget(rule egressRule) string {
 	if rule.Port != 0 {
 		return egressCodeRulePortUnsupported
 	}
@@ -199,7 +238,7 @@ func selectEgressDomainRule(rules []egressRule, name, meshCIDR, fakeIPPool strin
 	best, bestSuffix, bestLabels := -1, false, 0
 	for index, rule := range rules {
 		match := strings.TrimSpace(rule.Match)
-		if !looksLikeEgressDomainRule(match) || validateEgressRuleIn(rule, meshCIDR, fakeIPPool) != "" {
+		if egressRuleKind(match) != "domain" || validateEgressRuleIn(rule, meshCIDR, fakeIPPool) != "" {
 			continue
 		}
 		suffix, labels, covers := egressDomainRank(match, name)
@@ -227,7 +266,7 @@ func egressRuleStatusCode(rule egressRule, meshCIDR, fakeIPPool string, online, 
 	if code := validateEgressRuleIn(rule, meshCIDR, fakeIPPool); code != "" {
 		return code
 	}
-	if rule.Action == egressActionEgress && looksLikeEgressDomainRule(strings.TrimSpace(rule.Match)) &&
+	if rule.Action == egressActionEgress && egressRuleKind(rule.Match) == "domain" &&
 		online[rule.EgressClientID] && !capable[rule.EgressClientID] {
 		return egressCodeRuleEgressNoDomain
 	}
@@ -296,7 +335,22 @@ func matchEgressRules(rules []egressRule, destination string, meshCIDR string) e
 // rules are in force. Domain rules never match an address: a destination in the pool is steered by
 // the name it was handed out for, and one outside it by address rules alone.
 func matchEgressRulesIn(rules []egressRule, destination, meshCIDR, fakeIPPool string) egressRuleDecision {
-	address, ok := parseEgressAddress(strings.TrimSpace(destination))
+	return matchEgressRulesFor(rules, destination, meshCIDR, fakeIPPool, egressConsumerCarriesIPv6)
+}
+
+// matchEgressRulesFor is matchEgressRulesIn with the consumer's IPv6 data plane stated.
+//
+// The families never compete: an IPv4 destination is decided by IPv4 rules alone and an IPv6 one by
+// IPv6 rules alone, longest prefix within the family. Both are compared by value, so how a rule or a
+// destination is spelled (case, leading zeros, where "::" falls) does not change the result.
+func matchEgressRulesFor(rules []egressRule, destination, meshCIDR, fakeIPPool string, carriesIPv6 bool) egressRuleDecision {
+	destination = strings.TrimSpace(destination)
+	ipv6 := strings.Contains(destination, ":")
+	address, ok := parseEgressAddress(destination)
+	var address6 [16]byte
+	if ipv6 {
+		address6, ok = parseEgressAddress6(destination)
+	}
 	if !ok {
 		return egressRuleDecision{Action: egressActionDirect, MatchedRuleIndex: -1, Reason: egressReasonDefault}
 	}
@@ -304,15 +358,20 @@ func matchEgressRulesIn(rules []egressRule, destination, meshCIDR, fakeIPPool st
 	best := -1
 	bestPrefix := -1
 	for index, rule := range rules {
-		if validateEgressRuleIn(rule, meshCIDR, fakeIPPool) != "" {
+		if validateEgressRuleFor(rule, meshCIDR, fakeIPPool, carriesIPv6) != "" {
 			continue
 		}
-		cidr, parsed := parseEgressRuleMatch(strings.TrimSpace(rule.Match))
-		if !parsed || !cidr.contains(address) {
-			continue
+		match := strings.TrimSpace(rule.Match)
+		prefixLen := -1
+		if strings.Contains(match, ":") {
+			if cidr, _, parsed := parseEgressCIDR6(match); parsed && ipv6 && cidr.contains(address6) {
+				prefixLen = cidr.prefixLen
+			}
+		} else if cidr, parsed := parseEgressRuleMatch(match); parsed && !ipv6 && cidr.contains(address) {
+			prefixLen = cidr.prefixLen
 		}
-		if cidr.prefixLen > bestPrefix {
-			best, bestPrefix = index, cidr.prefixLen
+		if prefixLen > bestPrefix {
+			best, bestPrefix = index, prefixLen
 		}
 	}
 

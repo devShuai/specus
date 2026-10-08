@@ -9,7 +9,7 @@
 ## 先看它不做什么
 
 - **默认只支持 IPv4 地址与 CIDR 规则。** 域名规则要打开二期的 `peerEgressDnsTakeover`（见[第五节](#五二期域名规则与系统-dns-接管)）；不打开时写域名会被拒绝，不会在启动时解析成 IP。
-- **不支持 IPv6 规则**，IPv6 目标随二期一起提供。
+- **IPv6 规则暂不生效。** IPv6 地址与前缀已经能写、会按规范校验（写错报 `EGRESS_RULE_MALFORMED`），但客户端还不能承载 IPv6 流量，写对的 IPv6 规则以 `EGRESS_RULE_IPV6_UNSUPPORTED` 不生效，不安装路由——它的目标照常走本机，请勿把它当成已接管。出口也还不授权 IPv6 目标。
 - **不转发 ICMP。** 命中出口规则的目标 ping 不通——消费端会丢掉这些包，而不是让它从本机地址出去。
 - **不支持多跳出口链。** 出口自己也是消费端时，它转发的流量不会再经过第二个出口。
 - **目标看到的是出口所在网络的公网出口地址**，不保证等于出口设备自身的地址。
@@ -72,6 +72,7 @@ Content-Type: application/json
 几点要注意：
 
 - **`destinationRules` 为空等于全部拒绝**，没有「不配置即放行」。
+- `cidr` 可以写 IPv6（如 `2001:db8::/32`、`::/0`），服务端按 RFC 5952 规范形式保存（`2001:0DB8:0::/48` 存为 `2001:db8::/48`）。出口暂不授权 IPv6 目标，这样的规则目前不放行任何流，管理页会提示。
 - `domainRules` 按名字放行，只对消费端按域名规则发来的流（见第五节）起作用：`example.com` 只放行这个名字，`*.example.com` 放行它的子域、不含它本身。出口自己解析名字，解析出的地址仍要过下面的永远拒绝清单与 `scope`，所以一个解析到回环或内网的名字照样被拒。只按地址到达的流不看它。站点用 CDN、地址不固定时用它，不必为此放行 `0.0.0.0/0`。
 - `scope` 取 `PUBLIC`（公网地址）或 `LAN`（RFC 1918 私有地址与 RFC 6598 共享地址），两者互不隐含。
 - 实际允许的消费端是 `allowedConsumerClientIds` 与基础 Peer ACL 的**交集**，出口在每次建立连接前还会再校验一次。
@@ -113,7 +114,8 @@ Content-Type: application/json
 | `direct` | 本地直连。不安装路由，与未匹配的流量走同一个机制 |
 | `block` | 阻断。会安装路由把包捕获下来再丢弃 |
 
-- **前缀更长的规则优先**，同样长时先写的优先。单个地址等于 `/32`。
+- **前缀更长的规则优先**，同样长时先写的优先。单个地址等于 `/32`（IPv6 为 `/128`）。IPv4 与 IPv6 规则各管各的地址，互不比较。
+- IPv6 只写十六进制（如 `2001:db8::/32`，大小写与零组写法不影响含义），不写区域（`%eth0`）、方括号或点分 IPv4 结尾；IPv4 映射地址（`::ffff:…`）请直接写成 IPv4。
 - **未匹配即本地直连。**
 - **命中 `egress` 规则但出口不可用时阻断**，不会改走本机。出口离线、授权被撤、建连失败都属于这一类。
 - 规则变更后，不再匹配或不再指向出口的已建连接会立即断开。
@@ -122,10 +124,10 @@ Content-Type: application/json
 
 | 错误码 | 原因 |
 | --- | --- |
-| `EGRESS_RULE_MALFORMED` | `match` 为空、不是合法 IPv4 地址或前缀、主机位非零（如 `203.0.113.1/24`），或 `action` 不认识 |
+| `EGRESS_RULE_MALFORMED` | `match` 为空、不是合法的 IPv4 或 IPv6 地址或前缀、主机位非零（如 `203.0.113.1/24`、`2001:db8::1/32`）、落在 IPv4 映射段 `::ffff:0:0/96` 内，或 `action` 不认识 |
 | `EGRESS_RULE_DOMAIN_UNSUPPORTED` | `match` 是域名，一期不支持 |
-| `EGRESS_RULE_IPV6_UNSUPPORTED` | `match` 是 IPv6，一期不支持 |
-| `EGRESS_RULE_DEFAULT_ROUTE` | `0.0.0.0/0`，一期不接管默认路由 |
+| `EGRESS_RULE_IPV6_UNSUPPORTED` | `match` 是写法正确的 IPv6，但客户端还不能承载 IPv6 流量，规则暂不生效 |
+| `EGRESS_RULE_DEFAULT_ROUTE` | `0.0.0.0/0` 或 `::/0`，一期不接管默认路由 |
 | `EGRESS_RULE_MESH_OVERLAP` | 与 Peer Mesh 虚拟网段重叠 |
 | `EGRESS_RULE_PORT_UNSUPPORTED` | 规则里写了 `port`。端口限制只在出口策略里配置 |
 | `EGRESS_RULE_MISSING_TARGET` | `action` 是 `egress` 但没有有效的 `egressClientId` |

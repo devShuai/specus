@@ -59,7 +59,21 @@ func ValidateRule(rule Rule, meshCIDR string) string {
 	if match == "" {
 		return CodeRuleMalformed
 	}
+	// A colon is unambiguous: the match is an IPv6 address or prefix, or it is malformed. A
+	// well-formed one is refused last, once everything about the rule itself is known to be right:
+	// what is missing is a consumer that carries IPv6, and none does yet.
 	if strings.ContainsRune(match, ':') {
+		cidr, _, ok := ParseCIDR6(match)
+		if !ok || cidr.Mapped() {
+			// An IPv4-mapped prefix reads but no packet is addressed to one, so it would never match.
+			return CodeRuleMalformed
+		}
+		if cidr.PrefixLen == 0 {
+			return CodeRuleDefaultRoute
+		}
+		if code := validateRuleTarget(rule); code != "" {
+			return code
+		}
 		return CodeRuleIPv6Unsupported
 	}
 	if looksLikeDomain(match) {
@@ -80,6 +94,12 @@ func ValidateRule(rule Rule, meshCIDR string) string {
 	if mesh, ok := ParseCIDR(meshCIDR); ok && cidr.Overlaps(mesh) {
 		return CodeRuleMeshOverlap
 	}
+	return validateRuleTarget(rule)
+}
+
+// validateRuleTarget is the part of the order after the match: no port, a known action, and the
+// egress an egress rule needs.
+func validateRuleTarget(rule Rule) string {
 	if rule.Port != nil {
 		return CodeRulePortUnsupported
 	}

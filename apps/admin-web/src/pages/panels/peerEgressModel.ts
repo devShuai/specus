@@ -88,6 +88,111 @@ export function parseCidr(input: string): Ipv4Cidr | { error: string } {
   return { base, prefix, text: `${formatIpv4(base)}/${prefix}` };
 }
 
+/** An IPv6 prefix as the egress parses it; base is the network as a 128-bit number. */
+export interface Ipv6Cidr {
+  base: bigint;
+  prefix: number;
+  text: string;
+}
+
+const HEX_GROUP = /^[0-9A-Fa-f]{1,4}$/;
+
+function hexGroups(part: string): number[] | null {
+  if (part === "") {
+    return [];
+  }
+  const groups: number[] = [];
+  for (const group of part.split(":")) {
+    if (!HEX_GROUP.test(group)) {
+      return null;
+    }
+    groups.push(parseInt(group, 16));
+  }
+  return groups;
+}
+
+/**
+ * An IPv6 address the way every implementation reads it (peer-egress.md, IPv6 写法; the ipv6Prefixes
+ * section of peer-egress-rules-v1.json): eight groups of one to four hex digits, at most one "::".
+ * No dotted IPv4 tail, no zone, no brackets.
+ */
+export function parseIpv6(text: string): bigint | null {
+  if (!text || text.length > 39 || !/^[0-9A-Fa-f:]+$/.test(text)) {
+    return null;
+  }
+  if (text.includes(":::") || text.split("::").length > 2) {
+    return null;
+  }
+  let groups: number[] | null;
+  const compressed = text.indexOf("::");
+  if (compressed >= 0) {
+    const high = hexGroups(text.slice(0, compressed));
+    const low = hexGroups(text.slice(compressed + 2));
+    if (!high || !low || high.length + low.length > 7) {
+      return null;
+    }
+    groups = [...high, ...new Array<number>(8 - high.length - low.length).fill(0), ...low];
+  } else {
+    groups = hexGroups(text);
+    if (!groups || groups.length !== 8) {
+      return null;
+    }
+  }
+  return groups.reduce((value, group) => (value << 16n) | BigInt(group), 0n);
+}
+
+/** RFC 5952 form, as the servers store an IPv6 destination: lower case, the longest zero run as "::". */
+export function formatIpv6(value: bigint): string {
+  const groups = Array.from({ length: 8 }, (_, index) => Number((value >> BigInt(112 - 16 * index)) & 0xffffn));
+  let bestStart = -1;
+  let bestLength = 0;
+  for (let index = 0; index < 8; ) {
+    if (groups[index] !== 0) {
+      index++;
+      continue;
+    }
+    let end = index;
+    while (end < 8 && groups[end] === 0) {
+      end++;
+    }
+    if (end - index > bestLength) {
+      bestStart = index;
+      bestLength = end - index;
+    }
+    index = end;
+  }
+  const hex = (from: number, to: number) => groups.slice(from, to).map((group) => group.toString(16)).join(":");
+  return bestLength < 2 ? hex(0, 8) : `${hex(0, bestStart)}::${hex(bestStart + bestLength, 8)}`;
+}
+
+/** An IPv6 address or prefix as the egress parses it: a bare address is a /128, host bits must be zero. */
+export function parseIpv6Cidr(input: string): Ipv6Cidr | { error: string } {
+  const text = input.trim();
+  const [address, prefixText, ...rest] = text.split("/");
+  const base = parseIpv6(address);
+  if (base == null || rest.length > 0) {
+    return { error: `${text}：不是有效的 IPv6 地址或网段（只写十六进制，不带区域、方括号或点分 IPv4）` };
+  }
+  let prefix = 128;
+  if (prefixText !== undefined) {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(prefixText) || Number(prefixText) > 128) {
+      return { error: `${text}：前缀长度应为 0–128` };
+    }
+    prefix = Number(prefixText);
+  }
+  const host = (1n << BigInt(128 - prefix)) - 1n;
+  if ((base & host) !== 0n) {
+    return { error: `${text}：主机位不为零，应写作 ${formatIpv6(base & ~host)}/${prefix}` };
+  }
+  return { base, prefix, text: `${formatIpv6(base)}/${prefix}` };
+}
+
+/** A destination rule's CIDR as the egress parses it: IPv6 when it has a colon, IPv4 otherwise. */
+export function parseDestinationCidr(input: string): Ipv4Cidr | Ipv6Cidr | { error: string } {
+  const text = input.trim();
+  return text.includes(":") ? parseIpv6Cidr(text) : parseCidr(text);
+}
+
 function cidrOf(text: string): Ipv4Cidr {
   const parsed = parseCidr(text);
   if ("error" in parsed) {
@@ -154,7 +259,7 @@ export function formatPorts(ranges: number[][] | null | undefined): string {
  * empty port list as every port denied, and never matches a CIDR it cannot parse.
  */
 export function storedRuleProblem(rule: PeerEgressDestinationRule): string {
-  const cidr = parseCidr(rule.cidr ?? "");
+  const cidr = parseDestinationCidr(rule.cidr ?? "");
   if ("error" in cidr) {
     return "网段无效，不会匹配";
   }
@@ -330,6 +435,13 @@ export function scopeLabel(scope: string): string {
  * anyway, and the parts the scope can never let through.
  */
 export function destinationNotes(cidrText: string, scope: string, meshCidr: string): string[] {
+  if (cidrText.includes(":")) {
+    // The servers store an IPv6 destination, but no egress client authorizes IPv6 targets yet:
+    // every address it would grant is refused with EGRESS_DEST_DENIED until one does.
+    return "error" in parseIpv6Cidr(cidrText)
+      ? []
+      : [`${cidrText.trim()} 是 IPv6：出口暂不授权 IPv6 目标，这条规则目前不会放行任何流量`];
+  }
   const parsed = parseCidr(cidrText);
   if ("error" in parsed) {
     return [];
@@ -469,7 +581,7 @@ export function checkPolicyDraft(draft: EgressPolicyDraft, meshCidr: string): Eg
   const rules: { cidr: string; protocols: string[]; portRanges: number[][] }[] = [];
   draft.rules.forEach((rule, index) => {
     const label = `目的规则 ${index + 1}`;
-    const cidr = parseCidr(rule.cidr);
+    const cidr = parseDestinationCidr(rule.cidr);
     if ("error" in cidr) {
       errors.push(`${label}：${cidr.error}`);
     }

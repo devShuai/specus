@@ -117,6 +117,35 @@ void st_egress_format_address(uint32_t value, char *out, size_t out_len);
 int st_egress_cidr_contains(const st_egress_cidr *cidr, uint32_t address);
 int st_egress_cidr_overlaps(const st_egress_cidr *left, const st_egress_cidr *right);
 
+#define ST_EGRESS_MAX_PREFIX6 128
+
+/*
+ * An IPv6 prefix with its host bits clear, read with the spelling protocol/spec/peer-egress.md pins
+ * (IPv6 写法) for a consumer rule's match and an egress policy's destination rule alike: RFC 4291
+ * 2.2 forms 1 and 2 only, so no dotted IPv4 tail, no zone and no brackets. The ipv6Prefixes section
+ * of protocol/test-vectors/peer-egress-rules-v1.json pins every refusal.
+ */
+typedef struct {
+    uint8_t network[16];
+    int prefix_length;
+} st_egress_cidr6;
+
+/* Reads an IPv6 address: eight groups of one to four hex digits, at most one "::". Returns 0 on success. */
+int st_egress_parse_address6(const char *text, uint8_t out[16]);
+/*
+ * Reads an IPv6 address or address/length, the length 0-128 without a leading zero and the host bits
+ * clear; a bare address is a /128. had_length, when not NULL, says whether a length was written.
+ * The text is not trimmed. Returns 0 on success.
+ */
+int st_egress_parse_cidr6(const char *text, st_egress_cidr6 *out, int *had_length);
+/*
+ * Writes RFC 5952 section 4: lower case, no leading zeros, the longest run of two or more zero groups
+ * (the leftmost of equal runs) as "::", never dotted. out_len must be at least 40.
+ */
+void st_egress_format_address6(const uint8_t address[16], char *out, size_t out_len);
+/* Whether the prefix lies in ::ffff:0:0/96, where IPv4 destinations are spelled in IPv6 APIs. */
+int st_egress_cidr6_mapped(const st_egress_cidr6 *cidr);
+
 /*
  * Clamps a client-announced version to what this build understands. Returns 0 when the client
  * cannot take part, in which case the server must not push egress-config or egress-catalog to it.

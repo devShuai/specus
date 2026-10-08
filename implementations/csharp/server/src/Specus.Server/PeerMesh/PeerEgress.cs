@@ -824,7 +824,8 @@ public sealed partial class PeerMeshService
     /// parse, a protocol other than tcp or udp, or a malformed port range never matches. Storing
     /// such a rule as given would turn a typo into a rule that silently does nothing, so what is
     /// only spelling is normalised here and what is wrong is refused. The CIDR is checked with the
-    /// parser the egress itself uses and kept as written after trimming; protocols are trimmed,
+    /// parser the egress itself uses and trimmed, an IPv4 one kept as written and an IPv6 one written
+    /// in RFC 5952 form (<see cref="Ipv6Cidr.StoredDestinationCidr"/>); protocols are trimmed,
     /// lowercased and de-duplicated in order; an absent list is stored as an empty one, which
     /// still means deny-all.
     /// </remarks>
@@ -842,12 +843,9 @@ public sealed partial class PeerMeshService
             // an explicit null field arrives here as null despite the declared types.
             var rule = rules[index]
                 ?? throw new ArgumentException($"destinationRules[{index}] must be an object");
-            var cidr = rule.Cidr?.Trim() ?? string.Empty;
-            if (!Ipv4Cidr.TryParse(cidr, out _))
-            {
-                throw new ArgumentException(
-                    $"destinationRules[{index}].cidr must be an IPv4 address or CIDR");
-            }
+            var cidr = Ipv6Cidr.StoredDestinationCidr(rule.Cidr?.Trim() ?? string.Empty)
+                ?? throw new ArgumentException(
+                    $"destinationRules[{index}].cidr must be an IPv4 or IPv6 address or CIDR");
             var field = $"destinationRules[{index}]";
             normalized.Add(new PeerEgressDestinationRule
             {

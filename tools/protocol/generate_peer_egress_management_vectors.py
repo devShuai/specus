@@ -11,6 +11,8 @@ import json
 import re
 from pathlib import Path
 
+import peer_egress_ipv6 as ipv6
+
 VECTORS = Path("protocol/test-vectors")
 MAX_RULES = 64
 MAX_PORT_RANGES = 32
@@ -20,6 +22,15 @@ OCTET = re.compile(r"^(0|[1-9][0-9]{0,2})$")
 
 class Refused(Exception):
     pass
+
+
+def stored_cidr(text):
+    """The CIDR as stored, or None when the egress could not read it. IPv4 is kept as written after
+    trimming, since it has one spelling; IPv6 is stored in RFC 5952 form, the /length kept only when
+    it was written (protocol/spec/peer-egress.md, IPv6 写法)."""
+    if ":" in text:
+        return ipv6.canonical(text)
+    return text if valid_cidr(text) else None
 
 
 def valid_cidr(text):
@@ -42,14 +53,15 @@ def valid_cidr(text):
 
 
 def normalize_rules(rules):
-    """The rules as stored, or Refused. The CIDR is kept as written after trimming; protocols are
-    trimmed, lowercased and de-duplicated in order; an absent list is an empty one."""
+    """The rules as stored, or Refused. The CIDR is trimmed, and an IPv6 one written in RFC 5952
+    form; protocols are trimmed, lowercased and de-duplicated in order; an absent list is an empty
+    one."""
     if len(rules) > MAX_RULES:
         raise Refused("too many rules")
     stored = []
     for rule in rules:
-        cidr = (rule.get("cidr") or "").strip()
-        if not valid_cidr(cidr):
+        cidr = stored_cidr((rule.get("cidr") or "").strip())
+        if cidr is None:
             raise Refused("cidr")
         protocols = []
         for protocol in rule.get("protocols") or []:
@@ -91,6 +103,11 @@ ACCEPT = [
     # Short rules, so the count is what is tested and not the stored size.
     ("most-rules", [rule(f"10.{index}.0.0/16", (), ()) for index in range(MAX_RULES)]),
     ("most-port-ranges", [rule(ranges=tuple((port, port) for port in range(1000, 1000 + MAX_PORT_RANGES)))]),
+    ("ipv6-prefix", [rule("2001:db8::/32")]),
+    ("ipv6-address", [rule("2001:db8::7", ("udp",), ((53, 53),))]),
+    ("ipv6-spelling-normalised", [rule(" 2001:0DB8:0000:0000::/48 ")]),
+    ("ipv6-whole-internet", [rule("::/0", ("tcp", "udp"), ((1, 65535),))]),
+    ("ipv4-and-ipv6", [rule("203.0.113.0/24"), rule("2001:db8:1::/48")]),
 ]
 
 REJECT = [
@@ -98,7 +115,14 @@ REJECT = [
     ("leading-zero", [rule("203.0.113.07")]),
     ("prefix-too-long", [rule("10.0.0.0/33")]),
     ("prefix-leading-zero", [rule("10.0.0.0/08")]),
-    ("ipv6", [rule("2001:db8::/32")]),
+    ("ipv6-host-bits-set", [rule("2001:db8::1/32")]),
+    ("ipv6-prefix-too-long", [rule("2001:db8::/129")]),
+    ("ipv6-prefix-leading-zero", [rule("2001:db8::/032")]),
+    ("ipv6-dotted-tail", [rule("::ffff:192.0.2.1")]),
+    ("ipv6-zone", [rule("fe80::1%eth0")]),
+    ("ipv6-brackets", [rule("[2001:db8::1]")]),
+    ("ipv6-two-compressions", [rule("2001::db8::1")]),
+    ("ipv6-group-too-long", [rule("2001:db8::12345")]),
     ("domain", [rule("example.com")]),
     ("empty-cidr", [rule("")]),
     ("missing-cidr", [{"protocols": ["tcp"], "portRanges": [[443, 443]]}]),
@@ -131,9 +155,13 @@ def build():
     assert by_name["spelling-normalised"] == [{"cidr": "10.0.0.0/8", "protocols": ["tcp", "udp"], "portRanges": [[80, 80], [8000, 8100]]}]
     assert by_name["absent-lists"] == [{"cidr": "198.51.100.0/24", "protocols": [], "portRanges": []}]
     assert by_name["bare-address"][0]["cidr"] == "203.0.113.7"
+    assert by_name["ipv6-spelling-normalised"][0]["cidr"] == "2001:db8::/48"
+    assert by_name["ipv6-address"][0]["cidr"] == "2001:db8::7"
     return {
         "description": "Destination rules of an egress policy saved through the management API: what the server "
-                       "stores and what it refuses with 400. See protocol/spec/peer-egress.md.",
+                       "stores and what it refuses with 400. An IPv4 CIDR is stored as written after trimming; an "
+                       "IPv6 one in RFC 5952 form, with the /length only when it was written (the spelling is "
+                       "pinned by ipv6Prefixes in peer-egress-rules-v1.json). See protocol/spec/peer-egress.md.",
         "limits": {"rules": MAX_RULES, "portRangesPerRule": MAX_PORT_RANGES, "storedJsonBytes": MAX_RULES_JSON_BYTES},
         "accept": accept,
         "reject": reject,

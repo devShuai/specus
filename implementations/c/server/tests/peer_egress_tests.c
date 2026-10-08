@@ -1120,6 +1120,78 @@ static int run_domain_policy_edges(void)
     return failures;
 }
 
+/*
+ * The IPv6 spelling against the ipv6Prefixes section of peer-egress-rules-v1.json, which the clients,
+ * the other servers and the admin page read too: each accepted text reads as the stated address and
+ * length and is stored as the canonical address (with the length only when written); each refused
+ * text is refused by the parser and by the management normalisation alike.
+ */
+static int run_ipv6_prefixes(const char *vector)
+{
+    char *section = st_json_get_top_level_raw(vector, "ipv6Prefixes");
+    char **accept = NULL;
+    char **reject = NULL;
+    size_t accept_len = 0U;
+    size_t reject_len = 0U;
+    int failures = 0;
+    if (section == NULL || st_json_get_raw_array(section, "accept", &accept, &accept_len) != 0 || accept_len == 0U
+        || st_json_get_raw_array(section, "reject", &reject, &reject_len) != 0 || reject_len == 0U) {
+        fprintf(stderr, "rules vector carried no ipv6Prefixes\n");
+        failures++;
+    }
+    for (size_t i = 0U; i < accept_len; i++) {
+        char *text = st_json_get_string(accept[i], "text");
+        char *address = st_json_get_string(accept[i], "address");
+        int length = -1;
+        st_json_get_int(accept[i], "prefixLength", &length);
+        st_egress_cidr6 cidr;
+        int had_length = 0;
+        char formatted[64] = {0};
+        if (text == NULL || address == NULL || st_egress_parse_cidr6(text, &cidr, &had_length) != 0) {
+            fprintf(stderr, "ipv6Prefixes accept %zu: %s refused\n", i, text == NULL ? "(missing)" : text);
+            failures++;
+        } else {
+            st_egress_format_address6(cidr.network, formatted, sizeof(formatted));
+            if (strcmp(formatted, address) != 0 || cidr.prefix_length != length) {
+                fprintf(stderr, "ipv6Prefixes %s: read as %s/%d, want %s/%d\n", text, formatted,
+                        cidr.prefix_length, address, length);
+                failures++;
+            }
+            char want[96];
+            if (had_length) {
+                snprintf(want, sizeof(want), "[{\"cidr\":\"%s/%d\",\"protocols\":[],\"portRanges\":[]}]", address, length);
+            } else {
+                snprintf(want, sizeof(want), "[{\"cidr\":\"%s\",\"protocols\":[],\"portRanges\":[]}]", address);
+            }
+            char request[128];
+            snprintf(request, sizeof(request), "[{\"cidr\":\"%s\"}]", text);
+            char *stored = NULL;
+            if (st_egress_normalize_destination_rules(request, &stored) != 0 || stored == NULL
+                || strcmp(stored, want) != 0) {
+                fprintf(stderr, "ipv6Prefixes %s: stored %s, want %s\n", text,
+                        stored == NULL ? "(refused)" : stored, want);
+                failures++;
+            }
+            free(stored);
+        }
+        free(text);
+        free(address);
+    }
+    for (size_t i = 0U; i < reject_len; i++) {
+        char *text = st_json_get_string(reject[i], "text");
+        st_egress_cidr6 cidr;
+        if (text == NULL || st_egress_parse_cidr6(text, &cidr, NULL) == 0) {
+            fprintf(stderr, "ipv6Prefixes reject %zu: %s read\n", i, text == NULL ? "(missing)" : text);
+            failures++;
+        }
+        free(text);
+    }
+    st_json_free_string_array(accept, accept_len);
+    st_json_free_string_array(reject, reject_len);
+    free(section);
+    return failures;
+}
+
 int main(void)
 {
     char *authz = read_vector("peer-egress-authz-v1.json");
@@ -1140,6 +1212,7 @@ int main(void)
     failures += run_forced_deny_cases(authz);
     failures += run_rule_matching(rules);
     failures += run_rule_validation(rules);
+    failures += run_ipv6_prefixes(rules);
     failures += run_parser_boundaries();
     failures += run_storage_round_trip();
     failures += run_domain_target_declaration();
