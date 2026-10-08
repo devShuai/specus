@@ -2,7 +2,7 @@
 
 本文规定管理后台账号（`specus_management_user`）的身份模型：登录名在租户内唯一，不同租户可以有同名账号；登录、token、每次请求的身份解析、OIDC 绑定和所有以账号为键的数据都以 **（租户，登录名）** 为身份。四个服务端按本文实现。
 
-关联 [issue #183](https://github.com/devShuai/specus/issues/183)；账号删除与 token 的账号键声明见 [issue #199](https://github.com/devShuai/specus/issues/199)，删除账号时按登录名记录的数据怎样处理见 [issue #225](https://github.com/devShuai/specus/issues/225)。参考实现是 Java server：`ManagementUser`、`ManagementUserService`、`ManagementUserSchemaMigrator`、`AuthController`、`ManagementContextResolver`、`LocalTokenService`，测试 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`。
+关联 [issue #183](https://github.com/devShuai/specus/issues/183)；账号删除与 token 的账号键声明见 [issue #199](https://github.com/devShuai/specus/issues/199)，删除账号时按登录名记录的数据怎样处理见 [issue #225](https://github.com/devShuai/specus/issues/225)，账号的访问权变化时管理 WebSocket 怎样失效见 [issue #236](https://github.com/devShuai/specus/issues/236)。参考实现是 Java server：`ManagementUser`、`ManagementUserService`、`ManagementUserSchemaMigrator`、`AuthController`、`ManagementContextResolver`、`LocalTokenService`，测试 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`。
 
 **状态：四个服务端已实现。** 第 11 节列出各端的书面差异。
 
@@ -165,12 +165,44 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 
 删除提交之后：
 
-- 结束该身份在本实例上打开的管理 WebSocket：客户端消息（[client-messages.md](client-messages.md) 的 `(tenantId, username)` 订阅，即 `admin:<username>`）与连接事件。连接在握手时记下身份，之后不再重新解析账号；不关闭的话，被删账号已打开的页面仍能收发消息，同租户再建同名账号后还会收到发给新账号的消息与事件。
+- 结束该身份的管理 WebSocket：客户端消息（[client-messages.md](client-messages.md) 的 `(tenantId, username)` 订阅，即 `admin:<username>`）与连接事件，并作废它尚未使用的 ticket（7.2 节）。连接在握手时记下身份，之后不再重新解析账号；不关闭的话，被删账号已打开的页面仍能收发消息，同租户再建同名账号后还会收到发给新账号的消息与事件。
 - 删除产品指标进度（[product-metrics.md](product-metrics.md)）。
 
 不随账号删除的记录：连接记录、连接事件存档、流量统计、HTTP 访问审计、分享审计里的执行人、产品指标与各开关、共享设置的 `updated_by`。它们是历史与审计，不授予任何访问：普通用户只能按自己当前拥有的客户端看到连接与流量记录，删除账号前它的客户端已经转走或删除，同名新账号看不到。
 
-已知限制：管理 WebSocket 的一次性 ticket（45 秒）同样在签发时记下身份；删除前签发、删除后才用来握手的 ticket 仍能建立连接。多实例部署时只关闭处理删除请求的实例上的连接。
+### 7.2 管理 WebSocket 的身份失效
+
+管理 WebSocket（`/ws/client-messages`、`/ws/connections`）用 `POST /api/admin/ws-tickets` 签发的一次性 ticket 握手（[client-messages.md](client-messages.md) 第 1 节，45 秒有效）。ticket 记下签发请求解析出的身份：租户、登录名、是否管理员，以及账号键（与 token 的 `uid` 相同；内置管理员没有）。连接之后按握手时的这份身份收发和过滤：普通用户只收到自己客户端的连接事件、只能给自己的客户端发消息，`admin:<username>` 的消息投给登录名相同的连接。连接不逐条重新解析账号，所以账号的访问权变化时，服务端要主动作废 ticket、关闭连接（[issue #236](https://github.com/devShuai/specus/issues/236)）。
+
+**哪些变化使身份失效**
+
+| 账号的变化 | 失效 |
+| --- | --- |
+| 删除（7.1 节） | 是 |
+| 停用：`enabled` 由 `true` 改为 `false` | 是 |
+| 角色改变：`ADMIN` 改为 `USER`（降级），或 `USER` 改为 `ADMIN` | 是 |
+| 只改口令；提交与原来相同的角色或启用状态；启用已停用的账号 | 否。改口令不吊销已签发的 token（第 5、6 节），连接同样保留；已停用的账号在停用时就没有连接和 ticket 了 |
+| 改名 | 不适用：没有修改登录名的接口，登录名创建后不变。以后增加时按失效处理 |
+
+**降级一律关闭，不按新权限继续。** 客户端用 token 重新换 ticket、重新连接，理由：
+
+- 连接的权限是握手时的快照，每条事件、每条消息都按它判断（Java `ConnectionEventsWebSocketHandler.canReceive`、`ClientMessagesWebSocketHandler.canAccess`，其他三端相同）。按新权限继续，要么每条消息都重新读账号，要么把新角色推到每个实例的每条连接上，多出一条比关闭更容易出错的路径。
+- 管理前端每次建连后先用 REST 读一遍快照，再回放实时事件（[public-transfer-cluster.md](public-transfer-cluster.md) 5.1 节）。降级前以管理员身份读到的别人的连接留在页面上，只有重连才按新权限重读。
+- 前端在关闭码不是 `4401` 时就重新签发 ticket 重连（`apps/admin-web` 的 `useConnectionsFeed`、`AdminMessagesPanel`），token 每次请求都按账号记录解析（第 6 节），新 ticket 自然带新角色，不需要改前端。账号被删除或停用时签发失败，前端按原有退避重试。
+
+升级（`USER` 改为 `ADMIN`）同样关闭：握手检查要求角色与 ticket 一致（见下），连接与 ticket 用同一条规则；重连后才收到全部事件。
+
+**失效时服务端做的事**
+
+1. 与账号的修改或删除在**同一事务**里，删除该身份尚未使用的管理 ticket：scope 为 `connections` 或 `client-messages`，租户与登录名都与账号逐字相等。Java、Go、.NET 的 ticket 存在共享数据库的 `specus_websocket_ticket` 里，这一步对所有实例都生效；C 存在进程内存里。
+2. 提交之后，以 `1008` 关闭本实例上该身份（租户与登录名逐字相等）的 `/ws/client-messages` 与 `/ws/connections`，原因文本为 `account deleted`、`account disabled` 或 `account role changed`。其他身份的连接不受影响，另一租户的同名身份也不受影响。
+3. 集群模式（Java、Go、.NET 的 `cluster-enabled=true`）：经公共互传协调的 Redis 事件频道发布 STCE kind 5（[public-transfer-cluster.md](public-transfer-cluster.md) 第 4 节与 5.2 节），各实例（含发布者自己）按第 2 步关闭本地连接。发布失败只记日志，账号的修改照常成功。
+
+**握手时再校验。** 消费 ticket 之后、升级之前，按第 6 节解析 ticket 记下的身份，等于解析一个 `sub` 为 ticket 的登录名、`tenant_id` 为 ticket 的租户、`uid` 为 ticket 的账号键（没有时不带）的 token。解析不到（账号不存在、已停用、账号键不符；内置管理员已关闭密码登录），或解析出的是否管理员与 ticket 记下的不同，都答复 `403`，`X-Auth-Reason: identity revoked`，ticket 照样算已消费。账号键不符覆盖「删除后又在同一租户建了同名账号」。本版本之前签发、不带账号键的 ticket（升级时至多 45 秒）按不带 `uid` 解析，与 token 相同。
+
+连接登记之后再检查一次，不通过时以 `1008`（`identity revoked`）关闭。握手检查可能与另一个请求的失效交错：检查读到旧状态，第 2 步的关闭（或别的实例收到的 kind 5）又在登记之前跑完；登记之后的检查读到的是已提交的新状态。
+
+已知限制：Redis Pub/Sub 不保证送达。发布失败、或某个实例当时与 Redis 断开时，该实例上已打开的连接要等断开才结束；新的握手仍被上面的检查拒绝。新旧版本混部时，旧版本实例把 kind 5 当作未知 kind 丢弃，它上面的连接同样不关闭。
 
 ## 8. 邮件注册
 
@@ -200,8 +232,8 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 | 服务工作台 | `management_workbench_item.username` | 删除 |
 | 临时 HTTP 分享 | `created_by`、`revoked_by`、审计的 `actor` | 有效分享结束；审计保留 |
 | 产品指标进度 | `product_metrics_onboarding_progress.username`；开关的 `updated_by` | 进度删除；`updated_by` 保留 |
-| 客户端消息订阅 | `admin:<username>` 与（租户，用户名）订阅 | 提交后关闭连接 |
-| 连接事件、连接与审计记录 | 按（租户，`owner_username`）过滤；审计里的执行人 | 订阅关闭；记录保留 |
+| 客户端消息订阅 | `admin:<username>` 与（租户，用户名）订阅 | 提交后关闭连接，未用的 ticket 作废（7.2 节；停用与改角色同样如此） |
+| 连接事件、连接与审计记录 | 按（租户，`owner_username`）过滤；审计里的执行人 | 订阅关闭（同上）；记录保留 |
 
 迁移不改写这些列：旧账号的登录名等于原用户名，已有的值仍然指向同一个账号。凡是要从这些列找回账号的地方（例如 HTTP 分享重新读取创建者），都按（行的租户，规范登录名）查找，不得跨租户按名字查找。
 
@@ -212,7 +244,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 | Java | 参考实现 |
 | Go | 规范登录名用 `strings.ToLower`（Unicode 简单大小写映射），与 Java 的 `Locale.ROOT` 在少数字符上可能不同 |
 | .NET | 规范登录名用 `ToLowerInvariant()`，同上 |
-| C | 只用 SQLite。规范登录名只折叠 ASCII 字母（与既有的 SQLite `lower()` 一致），非 ASCII 字母区分大小写；token 的租户声明最长 63 字节；限流键的分隔符是 `\x1f` 而不是 `\0`（C 字符串不能含 `\0`），效果相同 |
+| C | 只用 SQLite。规范登录名只折叠 ASCII 字母（与既有的 SQLite `lower()` 一致），非 ASCII 字母区分大小写；token 的租户声明最长 63 字节；限流键的分隔符是 `\x1f` 而不是 `\0`（C 字符串不能含 `\0`），效果相同。管理面按单实例部署：管理 WebSocket 的 ticket 在进程内存里，身份失效（7.2 节）只关闭本进程的连接，不发布也不处理 STCE kind 5（[c-server-api-inventory.md](../../docs/cross-language/alignment/c-server-api-inventory.md) 第 8 节） |
 
 MySQL 上（Java、Go、.NET）：库的默认排序规则（如 `utf8mb4_0900_ai_ci`）不区分大小写和重音，`tenant_id = ?` 与唯一索引在这种库上也就不区分，`Tenant-A` 与 `tenant-a`、`élise` 与 `elise` 会被当成同一个。这与第 1 节「租户区分大小写」不符，属于已知差异；需要严格语义的部署应为这两列使用二进制或区分大小写的排序规则。
 
@@ -235,5 +267,11 @@ MySQL 上（Java、Go、.NET）：库的默认排序规则（如 `utf8mb4_0900_a
 
 - 共享向量的 `accountDeletion`（7.1 节）：在单独的库里按其中的账号与行建好数据，逐步重放：仍拥有客户端或凭证时 `409` 且计数准确、什么都不改；客户端转走或删除、凭证删除后删除成功；个人数据删除、附件过期、ACL 与出口策略转给执行删除的管理员、另一租户的同名身份不受影响；同名新账号读到的绘图文档、ACL、设备都是空的（Java `ManagementAccountsHttpTests.replaysTheAccountDeletionVector`）。
 - 删除账号后，该身份已打开的客户端消息与连接事件 WebSocket 被关闭，其他身份的不受影响（Java `ManagementAccountsHttpTests.deletingAnAccountClosesItsManagementWebSockets`）。
+
+[issue #236](https://github.com/devShuai/specus/issues/236) 起另有（7.2 节）：
+
+- 共享向量的 `webSocketRevocation`：停用、降级、升级、删除后，目标已打开的两种连接以 `1008` 关闭、它未用的 ticket 握手得 `403`；只改口令、提交相同角色与启用状态时连接保留、ticket 可用；旁观者（执行操作的管理员、另一租户的同名账号）的连接始终保留（Java `ManagementAccountsHttpTests.replaysTheWebSocketRevocationVector`）。
+- 握手再校验：签发 ticket 后直接在库里停用账号、改角色、删除后重建同名账号，握手都得 `403`；账号不变时照常连接（Java `ManagementAccountsHttpTests.aTicketWhoseAccountChangedIsRefusedAtTheHandshake`）。
+- 集群：两个连到同一 Redis 的实例，一个发布 kind 5，另一个关闭该身份的本地连接、不动其他身份（Java `PublicTransferCoordinationRedisIT.managementRevocationClosesTheIdentityOnAnotherInstance`）；STCE kind 5 的编码与共享向量 `canonicalManagementRevocation` 逐字节一致（各端 `PublicTransferClusterFrameTests`）。
 
 其他三端的对应：Go `internal/management/management_accounts_test.go` 与 `internal/store/management_user_schema_test.go`；.NET `ManagementAccountLifecycleTests` 与 `ManagementLoginNameMigrationTests.StartupStepRemovesEmailRecordsOfDeletedAccounts`；C ctest `management_accounts_tests`（`tests/management_accounts_tests.c`）。关闭 WebSocket 的用例：Go `internal/server/client_messages_ws_test.go` 的 `TestDeletingAnAccountClosesItsManagementWebSockets`，.NET `ManagementAccountLifecycleTests.DeletingAnAccountClosesItsManagementWebSockets`，C ctest `client_messages_tests`。

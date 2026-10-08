@@ -219,5 +219,37 @@
       {"accountKey": "a05c6d7e-8091-4a3b-8ebf-3a4b5c6d7e8f", "loginName": "bob", "tenantId": "tenant-d"},
       {"accountKey": "9e4b5c6d-7f80-4192-bdae-2f3a4b5c6d7e", "loginName": "bob", "tenantId": "tenant-e"}
     ]
+  },
+  "webSocketRevocation": {
+    "description": "Section 7.2: the management WebSockets of an account whose access changed. Run it in a database of its own: seed these accounts (not the top-level ones) with exactly these account keys and sign every token from its claims (iss/iat/exp as above). Before the first case each bystander asks POST /api/admin/ws-tickets for its endpoint and opens that socket. For each case the target does the same for client-messages and for connections, then asks for one more connections ticket and keeps it unused. The actor then sends request (PUT /api/admin/users/{username} with the JSON body, or DELETE): expect status. revoked true: both of the target's sockets close with 1008, and upgrading with the unused ticket answers 403. revoked false: both sockets still answer a ping and the unused ticket opens a connection. After the last case every bystander still answers a ping; one of them is an account of the same login name as a revoked target, in another tenant.",
+    "actor": {"sub": "iris", "tenant_id": "tenant-f", "role": "ADMIN", "uid": "a111f5c1-d0a5-412d-aa48-854c4aa93afa"},
+    "accounts": [
+      {"accountKey": "a111f5c1-d0a5-412d-aa48-854c4aa93afa", "loginName": "iris", "tenantId": "tenant-f", "role": "ADMIN", "enabled": true},
+      {"accountKey": "fa05abf1-5c6a-4338-9113-d2a1d9f81ffa", "loginName": "kim", "tenantId": "tenant-f", "role": "USER", "enabled": true},
+      {"accountKey": "f2acda3e-94db-4a40-b111-66cc4020a9fc", "loginName": "lee", "tenantId": "tenant-f", "role": "ADMIN", "enabled": true},
+      {"accountKey": "0824c5fc-0bab-4a7b-ba03-eec2f2824fc9", "loginName": "max", "tenantId": "tenant-f", "role": "USER", "enabled": true},
+      {"accountKey": "a8436736-dd4a-4f45-9575-373e2ba8b066", "loginName": "ned", "tenantId": "tenant-f", "role": "USER", "enabled": true},
+      {"accountKey": "b6d28d04-ac5c-46ee-a43b-42846c114fc7", "loginName": "oli", "tenantId": "tenant-f", "role": "USER", "enabled": true},
+      {"accountKey": "d5322c9c-a470-41bf-9769-e76b6d1ee62e", "loginName": "pat", "tenantId": "tenant-f", "role": "ADMIN", "enabled": true},
+      {"accountKey": "95e5a6be-9daf-4d79-9ff7-07a423b802f6", "loginName": "kim", "tenantId": "tenant-g", "role": "USER", "enabled": true}
+    ],
+    "bystanders": [
+      {"claims": {"sub": "iris", "tenant_id": "tenant-f", "role": "ADMIN", "uid": "a111f5c1-d0a5-412d-aa48-854c4aa93afa"}, "endpoint": "client-messages"},
+      {"claims": {"sub": "kim", "tenant_id": "tenant-g", "role": "USER", "uid": "95e5a6be-9daf-4d79-9ff7-07a423b802f6"}, "endpoint": "connections"}
+    ],
+    "cases": [
+      {"name": "disabling closes", "target": {"sub": "kim", "tenant_id": "tenant-f", "role": "USER", "uid": "fa05abf1-5c6a-4338-9113-d2a1d9f81ffa"},
+        "request": {"method": "PUT", "username": "kim", "body": {"enabled": false}}, "expect": {"status": 200, "revoked": true}},
+      {"name": "demoting closes", "target": {"sub": "lee", "tenant_id": "tenant-f", "role": "ADMIN", "uid": "f2acda3e-94db-4a40-b111-66cc4020a9fc"},
+        "request": {"method": "PUT", "username": "lee", "body": {"role": "USER"}}, "expect": {"status": 200, "revoked": true}},
+      {"name": "promoting closes", "target": {"sub": "max", "tenant_id": "tenant-f", "role": "USER", "uid": "0824c5fc-0bab-4a7b-ba03-eec2f2824fc9"},
+        "request": {"method": "PUT", "username": "max", "body": {"role": "ADMIN"}}, "expect": {"status": 200, "revoked": true}},
+      {"name": "deleting closes", "target": {"sub": "ned", "tenant_id": "tenant-f", "role": "USER", "uid": "a8436736-dd4a-4f45-9575-373e2ba8b066"},
+        "request": {"method": "DELETE", "username": "ned"}, "expect": {"status": 204, "revoked": true}},
+      {"name": "a new password does not close", "target": {"sub": "oli", "tenant_id": "tenant-f", "role": "USER", "uid": "b6d28d04-ac5c-46ee-a43b-42846c114fc7"},
+        "request": {"method": "PUT", "username": "oli", "body": {"password": "Revocation-password-2"}}, "expect": {"status": 200, "revoked": false}},
+      {"name": "the same role and enabled state do not close", "target": {"sub": "pat", "tenant_id": "tenant-f", "role": "ADMIN", "uid": "d5322c9c-a470-41bf-9769-e76b6d1ee62e"},
+        "request": {"method": "PUT", "username": "pat", "body": {"role": "ADMIN", "enabled": true}}, "expect": {"status": 200, "revoked": false}}
+    ]
   }
 }

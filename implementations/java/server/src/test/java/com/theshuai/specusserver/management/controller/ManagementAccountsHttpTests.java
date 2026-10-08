@@ -305,6 +305,86 @@ class ManagementAccountsHttpTests {
         hanaMessages.socket().abort();
     }
 
+    @Test
+    void replaysTheWebSocketRevocationVector() throws Exception {
+        JsonNode revocation = readVector().get("webSocketRevocation");
+        for (JsonNode account : revocation.get("accounts")) {
+            seed(account.get("accountKey").asText(), account.get("loginName").asText(),
+                    account.get("tenantId").asText(), ManagementRole.valueOf(account.get("role").asText()));
+        }
+        String actor = sign(revocation.get("actor"));
+        List<Socket> bystanders = new ArrayList<>();
+        for (JsonNode bystander : revocation.get("bystanders")) {
+            bystanders.add(openManagementSocket(sign(bystander.get("claims")), bystander.get("endpoint").asText()));
+        }
+        for (JsonNode testCase : revocation.get("cases")) {
+            String name = testCase.get("name").asText();
+            String target = sign(testCase.get("target"));
+            Socket messages = openManagementSocket(target, "client-messages");
+            Socket events = openManagementSocket(target, "connections");
+            String unused = ticket(target, "connections");
+            JsonNode request = testCase.get("request");
+            String path = "/api/admin/users/" + request.get("username").asText();
+            HttpResponse<String> response = "DELETE".equals(request.get("method").asText())
+                    ? send("DELETE", path, actor, null)
+                    : send("PUT", path, actor, request.get("body").toString());
+            JsonNode expect = testCase.get("expect");
+            assertThat(response.statusCode()).as(name + " " + response.body()).isEqualTo(expect.get("status").asInt());
+            if (expect.get("revoked").asBoolean()) {
+                assertThat(messages.closed().get(10, java.util.concurrent.TimeUnit.SECONDS)).as(name).isEqualTo(1008);
+                assertThat(events.closed().get(10, java.util.concurrent.TimeUnit.SECONDS)).as(name).isEqualTo(1008);
+                assertThat(refusedHandshake("connections", unused).statusCode()).as(name).isEqualTo(403);
+            } else {
+                messages.ping().get(10, java.util.concurrent.TimeUnit.SECONDS);
+                events.ping().get(10, java.util.concurrent.TimeUnit.SECONDS);
+                assertThat(messages.closed()).as(name).isNotDone();
+                assertThat(events.closed()).as(name).isNotDone();
+                openWithTicket("connections", unused).socket().abort();
+                messages.socket().abort();
+                events.socket().abort();
+            }
+        }
+        for (Socket bystander : bystanders) {
+            bystander.ping().get(10, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(bystander.closed()).isNotDone();
+            bystander.socket().abort();
+        }
+    }
+
+    @Test
+    void aTicketWhoseAccountChangedIsRefusedAtTheHandshake() throws Exception {
+        String firstKey = "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f";
+        ManagementUser quinn = seed(firstKey, "quinn", "tenant-h", ManagementRole.USER);
+        String token = sign(Map.of("sub", "quinn", "tenant_id", "tenant-h", "role", "USER",
+                LocalTokenService.ACCOUNT_KEY_CLAIM, firstKey));
+        // Changed straight in the database: no request deletes the tickets, only the handshake sees it.
+        openManagementSocket(token, "connections").socket().abort();
+
+        String beforeDisable = ticket(token, "client-messages");
+        quinn.setEnabled(false);
+        quinn = userRepository.saveAndFlush(quinn);
+        HttpResponse<?> refused = refusedHandshake("client-messages", beforeDisable);
+        assertThat(refused.statusCode()).isEqualTo(403);
+        assertThat(refused.headers().firstValue("X-Auth-Reason")).hasValue("identity revoked");
+
+        quinn.setEnabled(true);
+        quinn = userRepository.saveAndFlush(quinn);
+        String asUser = ticket(token, "connections");
+        quinn.setRole(ManagementRole.ADMIN);
+        userRepository.saveAndFlush(quinn);
+        assertThat(refusedHandshake("connections", asUser).statusCode()).isEqualTo(403);
+
+        String beforeRecreate = ticket(token, "connections");
+        userRepository.deleteById(firstKey);
+        String secondKey = "d2e3f4a5-b6c7-4d8e-9fa0-1b2c3d4e5f6a";
+        seed(secondKey, "quinn", "tenant-h", ManagementRole.ADMIN);
+        assertThat(refusedHandshake("connections", beforeRecreate).statusCode()).isEqualTo(403);
+
+        String recreated = sign(Map.of("sub", "quinn", "tenant_id", "tenant-h", "role", "ADMIN",
+                LocalTokenService.ACCOUNT_KEY_CLAIM, secondKey));
+        openManagementSocket(recreated, "connections").socket().abort();
+    }
+
     // -- fixture ----------------------------------------------------------------------------------
 
     /** An open management WebSocket whose server side is known to be registered. */
@@ -320,10 +400,32 @@ class ManagementAccountsHttpTests {
     }
 
     private Socket openManagementSocket(String token, String endpoint) throws Exception {
+        return openWithTicket(endpoint, ticket(token, endpoint));
+    }
+
+    private String ticket(String token, String endpoint) throws IOException {
         HttpResponse<String> issued = send("POST", "/api/admin/ws-tickets", token,
                 "{\"endpoint\":\"" + endpoint + "\"}");
         assertThat(issued.statusCode()).as(issued.body()).isEqualTo(200);
-        String ticket = JSON.readTree(issued.body()).get("ticket").asText();
+        return JSON.readTree(issued.body()).get("ticket").asText();
+    }
+
+    /** The upgrade's answer to a ticket that the server refuses: the handshake response. */
+    private HttpResponse<?> refusedHandshake(String endpoint, String ticket) throws Exception {
+        try {
+            java.net.http.WebSocket socket = httpClient.newWebSocketBuilder()
+                    .buildAsync(URI.create("ws://localhost:" + port + "/ws/" + endpoint + "?ticket=" + ticket),
+                            new java.net.http.WebSocket.Listener() { })
+                    .get(10, java.util.concurrent.TimeUnit.SECONDS);
+            socket.abort();
+            throw new AssertionError("the " + endpoint + " upgrade was accepted");
+        } catch (java.util.concurrent.ExecutionException failed) {
+            assertThat(failed.getCause()).isInstanceOf(java.net.http.WebSocketHandshakeException.class);
+            return ((java.net.http.WebSocketHandshakeException) failed.getCause()).getResponse();
+        }
+    }
+
+    private Socket openWithTicket(String endpoint, String ticket) throws Exception {
         java.util.concurrent.CompletableFuture<Integer> closed = new java.util.concurrent.CompletableFuture<>();
         java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pong =
                 new java.util.concurrent.atomic.AtomicReference<>(new java.util.concurrent.CompletableFuture<>());

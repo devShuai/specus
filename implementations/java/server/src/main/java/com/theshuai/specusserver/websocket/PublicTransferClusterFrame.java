@@ -13,6 +13,8 @@ final class PublicTransferClusterFrame {
     static final byte KIND_TEXT = 2;
     static final byte KIND_BINARY = 3;
     static final byte KIND_MANAGEMENT = 4;
+    /** An account's management WebSockets end on every instance (management-accounts.md 7.2). */
+    static final byte KIND_MANAGEMENT_REVOCATION = 5;
     static final byte FLAG_EXCLUDE_SOURCE = 1;
     private static final byte[] MAGIC = {'S', 'T', 'C', 'E'};
     private static final byte VERSION = 2;
@@ -43,7 +45,7 @@ final class PublicTransferClusterFrame {
         if (event.kind() == KIND_BINARY && target.length == 0) {
             throw new IllegalArgumentException("binary event target is required");
         }
-        if (event.kind() == KIND_MANAGEMENT && (payload.length == 0 || target.length != 0
+        if (isManagement(event.kind()) && (payload.length == 0 || target.length != 0
                 || sourceLease.length != 0 || event.revision() != 0 || event.excludeSource())) {
             throw new IllegalArgumentException("management event shape is invalid");
         }
@@ -108,7 +110,7 @@ final class PublicTransferClusterFrame {
         if (kind == KIND_BINARY && targetPeerId.isBlank()) {
             throw new IllegalArgumentException("binary event target is required");
         }
-        if (kind == KIND_MANAGEMENT && (payloadLength == 0 || !targetPeerId.isEmpty()
+        if (isManagement(kind) && (payloadLength == 0 || !targetPeerId.isEmpty()
                 || !sourceLeaseId.isEmpty() || revision != 0 || (flags & FLAG_EXCLUDE_SOURCE) != 0)) {
             throw new IllegalArgumentException("management event shape is invalid");
         }
@@ -136,9 +138,14 @@ final class PublicTransferClusterFrame {
 
     private static void validateKind(byte kind) {
         if (kind != KIND_ROSTER && kind != KIND_TEXT && kind != KIND_BINARY
-                && kind != KIND_MANAGEMENT) {
+                && kind != KIND_MANAGEMENT && kind != KIND_MANAGEMENT_REVOCATION) {
             throw new IllegalArgumentException("unsupported cluster event kind");
         }
+    }
+
+    /** Both management kinds carry only a group (the tenant's) and a payload. */
+    private static boolean isManagement(byte kind) {
+        return kind == KIND_MANAGEMENT || kind == KIND_MANAGEMENT_REVOCATION;
     }
 
     private static void validateLength(String field, int length, int maximum) {

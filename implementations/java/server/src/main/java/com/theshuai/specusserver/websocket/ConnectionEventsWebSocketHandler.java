@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -37,6 +38,8 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
 
     private final ClientAccountRepository clientAccountRepository;
     private final PublicTransferCoordinationService coordination;
+    /** Checks the identity again once the session is registered; absent only in isolated unit tests. */
+    private final ManagementWebSocketIdentity identity;
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final ObjectMapper objectMapper = new ObjectMapper()
             // null 字段省略，前端不需要看到全是 null 的列；体积也更小
@@ -46,14 +49,29 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
 
     public ConnectionEventsWebSocketHandler(ClientAccountRepository clientAccountRepository,
                                             PublicTransferCoordinationService coordination) {
+        this(clientAccountRepository, coordination, null);
+    }
+
+    @Autowired
+    public ConnectionEventsWebSocketHandler(ClientAccountRepository clientAccountRepository,
+                                            PublicTransferCoordinationService coordination,
+                                            ManagementWebSocketIdentity identity) {
         this.clientAccountRepository = clientAccountRepository;
         this.coordination = coordination;
+        this.identity = identity;
         coordination.addListener(this::handleClusterEvent);
     }
 
     @Override
-    public void afterConnectionEstablished(WebSocketSession session) {
+    public void afterConnectionEstablished(WebSocketSession session) throws IOException {
         sessions.add(session);
+        // Registered first, checked second: a revocation that committed before this check is seen
+        // here, one that commits after it finds the session (management-accounts.md 7.2).
+        if (identity != null && !identity.current(session.getAttributes())) {
+            sessions.remove(session);
+            session.close(CloseStatus.POLICY_VIOLATION.withReason(ManagementWebSocketIdentity.REVOKED));
+            return;
+        }
         log.debug("ws session established: {} (total={})", session.getId(), sessions.size());
     }
 
@@ -149,10 +167,12 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
     }
 
     /**
-     * The account of this identity was deleted: its open sessions end. A session keeps the identity
-     * it was opened with, so it would otherwise receive the events of a later account of the same name.
+     * The account of this identity was deleted, disabled or given another role: its open sessions
+     * end (management-accounts.md 7.2). A session keeps the identity and rights it was opened with,
+     * so it would otherwise go on filtering by the old role, or receive the events of a later
+     * account of the same name.
      */
-    public void closeIdentity(String tenantId, String username) {
+    public void closeIdentity(String tenantId, String username, String reason) {
         for (WebSocketSession session : sessions) {
             if (!tenantId.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID))
                     || !username.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_USER))) {
@@ -160,7 +180,7 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
             }
             sessions.remove(session);
             try {
-                session.close(CloseStatus.POLICY_VIOLATION.withReason("account deleted"));
+                session.close(CloseStatus.POLICY_VIOLATION.withReason(reason));
             } catch (IOException | IllegalStateException e) {
                 log.debug("ws close failed for {}: {}", session.getId(), e.toString());
             }
