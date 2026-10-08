@@ -206,10 +206,18 @@ final class PeerMeshEngine implements Closeable {
             if (context == null) {
                 return;
             }
-            android.content.Intent intent = new android.content.Intent(PeerServiceEvents.ACTION_SERVICES);
-            intent.setPackage(context.getPackageName());
-            intent.putExtra(PeerServiceEvents.EXTRA_JSON, json);
-            context.sendBroadcast(intent);
+            // The snapshot only informs the UI, and it is published from control-connection work
+            // (login, catalog updates). A broadcast the platform refuses -- ContextImpl rethrows a
+            // binder failure such as TransactionTooLargeException as a RuntimeException -- must
+            // not fail that work and drop the connection. The UI still reads the latest snapshot
+            // from PeerServiceRuntime.lastSnapshotJson(), and every later one is complete.
+            try {
+                android.content.Intent intent = new android.content.Intent(PeerServiceEvents.ACTION_SERVICES);
+                intent.setPackage(context.getPackageName());
+                intent.putExtra(PeerServiceEvents.EXTRA_JSON, json);
+                context.sendBroadcast(intent);
+            } catch (RuntimeException ignored) {
+            }
         });
     }
 
