@@ -1,0 +1,104 @@
+{
+  "name": "management-accounts-v1",
+  "spec": "protocol/spec/management-accounts.md",
+  "description": "Local-token resolution with the uid account-key claim (sections 5 and 6) and the built-in administrator in the user list (section 7). Seed the accounts with exactly these account keys, sign every claims object with the server's HS256 key after adding iss=specus, iat=now and exp=now+600, then replay each case through GET /api/admin/me, POST /auth/refresh and GET /api/admin/users.",
+  "auth": {
+    "adminUsername": "admin",
+    "defaultTenant": "default"
+  },
+  "accounts": [
+    {"accountKey": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f", "loginName": "alice", "tenantId": "tenant-a", "role": "USER", "enabled": true},
+    {"accountKey": "8c7b6a59-4d3e-4f2a-8b1c-0d9e8f7a6b5c", "loginName": "alice", "tenantId": "tenant-b", "role": "USER", "enabled": true},
+    {"accountKey": "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d", "loginName": "erin", "tenantId": "tenant-a", "role": "ADMIN", "enabled": true},
+    {"accountKey": "9e8d7c6b-5a4f-4e3d-a2c1-b0a9f8e7d6c5", "loginName": "dora", "tenantId": "default", "role": "ADMIN", "enabled": true},
+    {"accountKey": "carol", "loginName": "carol", "tenantId": "tenant-c", "role": "USER", "enabled": true}
+  ],
+  "tokenResolution": [
+    {
+      "name": "uid-matches-the-account",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"},
+      "expect": {"username": "alice", "tenantId": "tenant-a", "builtIn": false, "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"}
+    },
+    {
+      "name": "uid-of-a-deleted-account-with-the-same-login-name",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e"},
+      "expect": null
+    },
+    {
+      "name": "uid-of-the-same-login-name-in-another-tenant",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "8c7b6a59-4d3e-4f2a-8b1c-0d9e8f7a6b5c"},
+      "expect": null
+    },
+    {
+      "name": "uid-is-compared-exactly",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "3F6C1D2E-8A4B-4C5D-9E6F-7A8B9C0D1E2F"},
+      "expect": null
+    },
+    {
+      "name": "token-without-uid-resolves-by-tenant-and-login-name",
+      "claims": {"sub": "ALICE", "tenant_id": "tenant-a", "role": "USER"},
+      "expect": {"username": "alice", "tenantId": "tenant-a", "builtIn": false, "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"}
+    },
+    {
+      "name": "empty-uid-counts-as-absent",
+      "claims": {"sub": "alice", "tenant_id": "tenant-b", "role": "USER", "uid": ""},
+      "expect": {"username": "alice", "tenantId": "tenant-b", "builtIn": false, "uid": "8c7b6a59-4d3e-4f2a-8b1c-0d9e8f7a6b5c"}
+    },
+    {
+      "name": "token-without-tenant-names-the-account-key",
+      "claims": {"sub": "carol", "role": "USER"},
+      "expect": {"username": "carol", "tenantId": "tenant-c", "builtIn": false, "uid": "carol"}
+    },
+    {
+      "name": "token-without-tenant-matches-the-account-key-exactly",
+      "claims": {"sub": "Carol", "role": "USER"},
+      "expect": null
+    },
+    {
+      "name": "token-without-tenant-with-the-matching-uid",
+      "claims": {"sub": "carol", "role": "USER", "uid": "carol"},
+      "expect": {"username": "carol", "tenantId": "tenant-c", "builtIn": false, "uid": "carol"}
+    },
+    {
+      "name": "token-without-tenant-with-another-uid",
+      "claims": {"sub": "carol", "role": "USER", "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"},
+      "expect": null
+    },
+    {
+      "name": "built-in-admin-token-carries-no-uid",
+      "claims": {"sub": "admin", "tenant_id": "default", "role": "ADMIN"},
+      "expect": {"username": "admin", "tenantId": "default", "builtIn": true, "uid": null}
+    },
+    {
+      "name": "a-token-with-uid-is-never-the-built-in-admin",
+      "claims": {"sub": "admin", "tenant_id": "default", "role": "ADMIN", "uid": "admin"},
+      "expect": null
+    }
+  ],
+  "userLists": [
+    {
+      "name": "built-in-admin-lists-itself-in-the-default-tenant",
+      "caller": {"sub": "admin", "tenant_id": "default", "role": "ADMIN"},
+      "expect": [
+        {"username": "admin", "tenantId": "default", "builtIn": true},
+        {"username": "dora", "tenantId": "default", "builtIn": false}
+      ]
+    },
+    {
+      "name": "default-tenant-administrator-sees-the-built-in-admin",
+      "caller": {"sub": "dora", "tenant_id": "default", "role": "ADMIN", "uid": "9e8d7c6b-5a4f-4e3d-a2c1-b0a9f8e7d6c5"},
+      "expect": [
+        {"username": "admin", "tenantId": "default", "builtIn": true},
+        {"username": "dora", "tenantId": "default", "builtIn": false}
+      ]
+    },
+    {
+      "name": "other-tenant-administrator-sees-only-its-tenant",
+      "caller": {"sub": "erin", "tenant_id": "tenant-a", "role": "ADMIN", "uid": "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d"},
+      "expect": [
+        {"username": "alice", "tenantId": "tenant-a", "builtIn": false},
+        {"username": "erin", "tenantId": "tenant-a", "builtIn": false}
+      ]
+    }
+  ]
+}

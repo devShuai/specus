@@ -4,6 +4,7 @@ import com.theshuai.specusserver.config.AuthProperties;
 import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.model.ManagementUser;
 import com.theshuai.specusserver.management.model.ManagementUserView;
+import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
@@ -37,21 +38,25 @@ public class ManagementUserService {
     private final HttpShareService httpShareService;
     /** Forgets a deleted account's workbench lists; absent only in isolated unit tests. */
     private final WorkbenchReferences workbenchReferences;
+    /** Releases a deleted account's registered email; absent only in isolated unit tests. */
+    private final ManagementUserEmailRepository userEmailRepository;
 
     public ManagementUserService(ManagementUserRepository repository,
                                  AuthProperties authProperties) {
-        this(repository, authProperties, null, null);
+        this(repository, authProperties, null, null, null);
     }
 
     @Autowired
     public ManagementUserService(ManagementUserRepository repository,
                                  AuthProperties authProperties,
                                  HttpShareService httpShareService,
-                                 WorkbenchReferences workbenchReferences) {
+                                 WorkbenchReferences workbenchReferences,
+                                 ManagementUserEmailRepository userEmailRepository) {
         this.repository = repository;
         this.authProperties = authProperties;
         this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
+        this.userEmailRepository = userEmailRepository;
     }
 
     @Transactional(readOnly = true)
@@ -241,6 +246,18 @@ public class ManagementUserService {
 
     @Transactional(readOnly = true)
     public Optional<LoginUser> resolveLocalTokenUser(String username, String tenantId) {
+        return resolveLocalTokenUser(username, tenantId, null);
+    }
+
+    /**
+     * {@code accountKey} is the token's {@code uid} claim. With one, the token resolves only to the
+     * account row whose key is exactly that value, never to the built-in administrator: a token
+     * of a deleted account must not pass to a later account of the same login name. Without one
+     * (tokens issued before the claim existed, and the built-in administrator's) the subject and
+     * tenant resolve as before, until the token expires.
+     */
+    @Transactional(readOnly = true)
+    public Optional<LoginUser> resolveLocalTokenUser(String username, String tenantId, String accountKey) {
         if (!StringUtils.hasText(username)) {
             return Optional.empty();
         }
@@ -258,8 +275,10 @@ public class ManagementUserService {
                 return Optional.empty();
             }
         }
+        boolean boundToAccount = StringUtils.hasText(accountKey);
         String defaultTenant = TenantContext.normalize(authProperties.getTenantId());
-        if (normalized.equalsIgnoreCase(authProperties.getUsername())
+        if (!boundToAccount
+                && normalized.equalsIgnoreCase(authProperties.getUsername())
                 && (requestedTenant == null || requestedTenant.equals(defaultTenant))) {
             if (!isAdminPasswordLoginEnabled()) {
                 return Optional.empty();
@@ -281,6 +300,8 @@ public class ManagementUserService {
         }
         return candidate
                 .filter(ManagementUser::isEnabled)
+                // Compared here rather than in SQL, so a case-insensitive collation cannot relax it.
+                .filter(user -> !boundToAccount || accountKey.equals(user.getUsername()))
                 .map(this::toLoginUser);
     }
 
@@ -316,16 +337,21 @@ public class ManagementUserService {
     public List<ManagementUserView> listUsers(ManagementContext context) {
         requireAdmin(context);
         List<ManagementUserView> views = new ArrayList<>();
-        String now = Instant.now().toString();
-        views.add(new ManagementUserView(
-                authProperties.getUsername(),
-                context.tenant().tenantId(),
-                ManagementRole.ADMIN,
-                true,
-                true,
-                true,
-                now,
-                now));
+        String defaultTenant = TenantContext.normalize(authProperties.getTenantId());
+        // The built-in administrator belongs to the default tenant only: it signs in there and its
+        // tokens resolve there, so another tenant's list must not show it as one of its accounts.
+        if (defaultTenant.equals(context.tenant().tenantId())) {
+            String now = Instant.now().toString();
+            views.add(new ManagementUserView(
+                    authProperties.getUsername(),
+                    defaultTenant,
+                    ManagementRole.ADMIN,
+                    true,
+                    true,
+                    true,
+                    now,
+                    now));
+        }
         repository.findByTenantIdOrderByLoginNameAsc(context.tenant().tenantId()).stream()
                 .map(this::toView)
                 .forEach(views::add);
@@ -438,6 +464,11 @@ public class ManagementUserService {
         // the management context carries: tenant and canonical login name of the account record.
         if (workbenchReferences != null) {
             workbenchReferences.forgetIdentity(TenantContext.normalize(user.getTenantId()), loginName(user));
+        }
+        // The registered email points at the account key and goes with the account, in this
+        // transaction, so the address can register again once the delete commits.
+        if (userEmailRepository != null) {
+            userEmailRepository.deleteByAccountKey(user.getUsername());
         }
         repository.delete(user);
         endSharesWithoutCreatorAccess(context, user);
@@ -575,6 +606,11 @@ public class ManagementUserService {
             String accountKey) {
         public LoginUser(String username, String tenantId, ManagementRole role, boolean builtInAdmin) {
             this(username, tenantId, role, builtInAdmin, username);
+        }
+
+        /** The {@code uid} claim of a token for this user: the account key, none for the built-in admin. */
+        public String tokenAccountKey() {
+            return builtInAdmin ? null : accountKey;
         }
     }
 

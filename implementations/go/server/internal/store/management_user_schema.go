@@ -25,7 +25,9 @@ var managementLoginNameIndexColumns = []string{"tenant_id", "login_name_normaliz
 //     accounts of one tenant would share a normalized login name;
 //  3. backfills both columns;
 //  4. creates the unique index on (tenant_id, login_name_normalized) and refuses to start when an
-//     index of that name exists with another definition.
+//     index of that name exists with another definition;
+//  5. deletes the email records whose account key no account has any more (accounts deleted before
+//     the delete took their email along), so those addresses can register again.
 func (db *DB) migrateManagementLoginNames() error {
 	if err := db.ensureColumn(managementUserTable, "login_name", "VARCHAR(80)"); err != nil {
 		return err
@@ -97,7 +99,14 @@ func (db *DB) migrateManagementLoginNames() error {
 		strings.Join(managementLoginNameIndexColumns, ", ")); err != nil {
 		return err
 	}
-	return db.verifyManagementLoginNameIndex()
+	if err := db.verifyManagementLoginNameIndex(); err != nil {
+		return err
+	}
+	if _, err := db.sql.Exec(`DELETE FROM specus_management_user_email WHERE username NOT IN (SELECT username FROM ` +
+		managementUserTable + `)`); err != nil {
+		return fmt.Errorf("remove email records of deleted management accounts: %w", err)
+	}
+	return nil
 }
 
 // verifyManagementLoginNameIndex reads the index back: "CREATE ... IF NOT EXISTS" keeps an index of

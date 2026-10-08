@@ -202,9 +202,15 @@ func (db *DB) DeleteManagementUser(ctx context.Context, user ManagementUser) err
 
 // deleteManagementUserOn deletes the account row by its key and the workbench rows of its identity:
 // the tenant and the login name as the account record spells it (Java WorkbenchReferences.forgetIdentity).
+// The registered email points at the account key and goes with the account, so the address can
+// register again once the transaction commits.
 func (db *DB) deleteManagementUserOn(ctx context.Context, runner sqlRunner, user ManagementUser) error {
 	if _, err := runner.ExecContext(ctx, db.rebind(`DELETE FROM management_workbench_item
 		WHERE tenant_id = ? AND username = ?`), defaultTenant(user.TenantID), user.Username); err != nil {
+		return err
+	}
+	if _, err := runner.ExecContext(ctx, db.rebind(`DELETE FROM specus_management_user_email WHERE username = ?`),
+		user.AccountKey); err != nil {
 		return err
 	}
 	_, err := runner.ExecContext(ctx, db.rebind(`DELETE FROM specus_management_user WHERE username = ?`),
