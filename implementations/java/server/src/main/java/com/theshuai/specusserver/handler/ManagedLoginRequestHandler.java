@@ -139,7 +139,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                 if (finalAuthentication.success()) {
                     if (!dataConnection) {
                         // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
-                        submit(() -> natControlService.pushOnLogin(packet.getClientName()));
+                        submit(() -> pushNatControlOnLogin(packet.getClientName()));
                         submit(() -> peerSignalService.pushOnLogin(finalAuthentication.account()));
                         submit(() -> productMetrics.clientOnline(finalAuthentication.account()));
                     }
@@ -202,6 +202,19 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         log.debug("exceptionCaught on channel {}: {}", ctx.channel().id().asLongText(),
                 cause == null ? "null" : cause.toString());
         super.exceptionCaught(ctx, cause);
+    }
+
+    /**
+     * The NAT_CONTROL login push. Whatever keeps it from being sent, a database error included, is
+     * only logged: the connection stays and the Peer Mesh login push, a task of its own, still runs.
+     * See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+     */
+    private void pushNatControlOnLogin(String clientName) {
+        try {
+            natControlService.pushOnLogin(clientName);
+        } catch (RuntimeException failure) {
+            log.error("[nat-control] push to {} on login failed; the connection is kept", clientName, failure);
+        }
     }
 
     private void submit(Runnable task) {

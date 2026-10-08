@@ -1652,6 +1652,13 @@ func (a *API) handleNatControl(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, conflict(nat.ErrNatControlNotSent.Error()))
 		return
 	}
+	if errors.Is(err, nat.ErrNatControlWriteFailed) {
+		// The connection cannot be written, so the client is as good as offline: the 409 of an
+		// offline client, never a push reported as done. Its next login push carries the
+		// configuration. See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+		a.logger.Warn("NAT_CONTROL push failed", "client", account.ClientName, "err", err)
+		online, err = false, nil
+	}
 	if err != nil {
 		a.fail(w, err)
 		return

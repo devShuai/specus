@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.theshuai.common.clientauth.ClientAuthLoginRequest;
 import com.theshuai.common.clientauth.ClientAuthSigner;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.common.session.Session;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.management.model.HttpRouteMapping;
 import com.theshuai.specusserver.management.model.ManagementRole;
@@ -14,6 +15,12 @@ import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.server.NettyServer;
+import com.theshuai.specusserver.session.SessionUtil;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -30,7 +37,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
@@ -161,6 +170,78 @@ class NatControlPushFailureVectorTests {
             if (client != null) {
                 client.close();
             }
+        }
+    }
+
+    /**
+     * Replays {@code writeFailure} of {@code protocol/test-vectors/nat-control-size-v1.json}: a client
+     * that is online, but whose control connection cannot be written. The manual pushes answer the 409
+     * of an offline client, and route changes, whose push fails the same way, are stored and answered as
+     * usual. Before, the manual push answered 200 without waiting for its write, reporting a NAT_CONTROL
+     * that never left.
+     */
+    @Test
+    void writeFailureAnswersAsAnOfflineClient() throws Exception {
+        JsonNode scenario = readVector().get("writeFailure");
+        String errorContains = scenario.get("errorContains").asText();
+
+        ensureAdmin();
+        String adminToken = tokens.issueToken(ADMIN, TENANT, ManagementRole.ADMIN);
+        JsonNode credential = ok(201, send("POST", "/api/admin/client-credentials",
+                "{\"enabled\":true,\"maxOnlineInstances\":2}", adminToken));
+        JsonNode login = ok(200, send("POST", "/api/client/auth/login", JsonUtil.objectToString(loginRequest(
+                credential.get("credential").get("apiKey").asText(), credential.get("secret").asText())), null));
+        long clientId = login.get("clientId").asLong();
+        String clientName = login.get("clientName").asText();
+
+        // A logged-in control connection whose every write fails, as one the client has already dropped.
+        AtomicInteger writes = new AtomicInteger();
+        EmbeddedChannel broken = new EmbeddedChannel(new ChannelOutboundHandlerAdapter() {
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                writes.incrementAndGet();
+                ReferenceCountUtil.release(msg);
+                promise.setFailure(new IOException("Broken pipe"));
+            }
+        });
+        SessionUtil.bindControlSession(new Session(clientName), broken);
+        try {
+            Map<String, Long> routes = new HashMap<>();
+            int index = 0;
+            for (JsonNode step : scenario.get("steps")) {
+                String op = step.get("op").asText();
+                String label = "step " + index++ + " " + op;
+                int writesBefore = writes.get();
+                HttpResponse<String> response = switch (op) {
+                    case "createRoute" -> send("POST", "/api/admin/clients/" + clientId + "/http-routes",
+                            JSON.createObjectNode()
+                                    .put("route", step.get("route").asText())
+                                    .put("targetBaseUrl", step.get("targetBaseUrl").asText())
+                                    .put("enabled", step.get("enabled").asBoolean())
+                                    .toString(), adminToken);
+                    case "deleteRoute" -> send("DELETE", "/api/admin/http-routes/"
+                            + routes.get(step.get("route").asText()), null, adminToken);
+                    case "pushNatControl" -> send("POST", "/api/admin/clients/" + clientId + "/nat-control",
+                            null, adminToken);
+                    case "forceRefreshPortMapping" -> send("POST",
+                            "/api/admin/clients/" + clientId + "/force-refresh-port-mapping", null, adminToken);
+                    default -> throw new IllegalStateException(label + ": unknown op");
+                };
+                assertThat(response.statusCode()).as("%s: %s", label, response.body())
+                        .isEqualTo(step.get("expect").asInt());
+                if (response.statusCode() == 409) {
+                    assertThat(JSON.readTree(response.body()).get("error").asText()).as(label)
+                            .contains(errorContains);
+                }
+                if ("createRoute".equals(op)) {
+                    routes.put(step.get("route").asText(), JSON.readTree(response.body()).get("id").asLong());
+                }
+                assertThat(writes.get()).as("%s: a write to the control connection, so its failure was met", label)
+                        .isGreaterThan(writesBefore);
+            }
+        } finally {
+            SessionUtil.unBindSession(broken);
+            broken.finishAndReleaseAll();
         }
     }
 

@@ -138,8 +138,9 @@ typedef void (*st_admin_direct_ws_close_handler)(void *ctx,
                                                  const char *reason);
 /*
  * Reloads a client's routes into its connections and sends it a NAT_CONTROL: 0 when sent, -1 when the
- * client is offline, ST_ADMIN_NAT_CONTROL_NOT_SENT when its NAT_CONTROL does not fit one MESSAGE (the
- * routes are reloaded, nothing is sent and the connection is kept), and -2 on any other failure.
+ * client is offline or its control connection cannot be written, ST_ADMIN_NAT_CONTROL_NOT_SENT when its
+ * NAT_CONTROL does not fit one MESSAGE (the routes are reloaded, nothing is sent and the connection is
+ * kept), and -2 on any other failure.
  */
 #define ST_ADMIN_NAT_CONTROL_NOT_SENT (-3)
 typedef int (*st_admin_nat_control_handler)(void *ctx,

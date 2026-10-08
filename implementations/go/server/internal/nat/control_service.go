@@ -36,7 +36,8 @@ type PushResult struct {
 }
 
 // PushToName pushes the current snapshot to an online client by name; returns false if offline.
-// An error wrapping ErrNatControlNotSent means the client is online but its NAT_CONTROL was not sent.
+// An error wrapping ErrNatControlNotSent means the client is online but its NAT_CONTROL was not sent;
+// one wrapping ErrNatControlWriteFailed means its control connection could not be written.
 func (s *ControlService) PushToName(ctx context.Context, clientName string) (PushResult, bool, error) {
 	account, err := s.db.FindClientByName(ctx, clientName)
 	if err != nil {
@@ -82,8 +83,10 @@ func (s *ControlService) pushSnapshot(ctx context.Context, clientID int64, clien
 		return PushResult{}, true, fmt.Errorf("%w: %d tcp + %d http route(s) take %d bytes, over the %d-byte MESSAGE body limit",
 			ErrNatControlNotSent, len(mappings), len(httpRoutes), len(body), MessageBodyLimit)
 	}
+	// A NAT_CONTROL within the MESSAGE body limit always fits the frame limit (netty.maxFrameSize is
+	// at least the header plus that body), so what fails here is the write itself.
 	if err := bound.Send(message); err != nil {
-		return PushResult{}, false, err
+		return PushResult{}, false, fmt.Errorf("%w: %v", ErrNatControlWriteFailed, err)
 	}
 	return PushResult{SpecusMappings: len(mappings), HTTPRoutes: len(httpRoutes)}, true, nil
 }
@@ -159,6 +162,12 @@ var ErrNatControlTooLarge = errors.New(
 // with 409 and every other push only logs it.
 var ErrNatControlNotSent = errors.New(
 	"客户端的 TCP 映射和 HTTP route 超过单条 NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端")
+
+// ErrNatControlWriteFailed is wrapped by a push whose write to the client's control connection
+// failed, the connection being closed, reset or otherwise gone. The manual push answers it as an
+// offline client, with 409, and every other push only logs it. See "NAT_CONTROL 写失败与数据库错误"
+// in protocol/spec/control-protocol.md.
+var ErrNatControlWriteFailed = errors.New("NAT_CONTROL write to the control connection failed")
 
 // The client's name when a NAT_CONTROL is sized: 120 characters of 4 UTF-8 bytes each in the
 // clientName field, and of a 6-byte \uXXXX escape each in the JSON. No name a rename allows takes
