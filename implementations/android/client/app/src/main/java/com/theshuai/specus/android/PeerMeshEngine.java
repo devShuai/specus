@@ -395,6 +395,28 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
+    /** The peers this device knows from the server's roster, by name, for status views. */
+    List<RosterEntry> rosterSnapshot() {
+        List<RosterEntry> roster = new ArrayList<>();
+        for (PeerInfo peer : peers.values()) {
+            roster.add(new RosterEntry(peer.clientName, peer.virtualIp, peer.online));
+        }
+        roster.sort(Comparator.comparing(entry -> entry.clientName));
+        return roster;
+    }
+
+    static final class RosterEntry {
+        final String clientName;
+        final String virtualIp;
+        final boolean online;
+
+        RosterEntry(String clientName, String virtualIp, boolean online) {
+            this.clientName = clientName == null ? "" : clientName;
+            this.virtualIp = virtualIp == null ? "" : virtualIp;
+            this.online = online;
+        }
+    }
+
     private void updateRoster(JSONArray array) throws Exception {
         Map<Long, PeerInfo> previous = new HashMap<>(peers);
         peers.clear();

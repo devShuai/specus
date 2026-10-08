@@ -320,7 +320,9 @@ jobs:
             timeout --preserve-status 180s bash implementations/c/server/scripts/peer_mesh_e2e.sh
       # The Android client core (SpecusCore.Runtime) on this JVM: :app:jvmClientLauncher writes a
       # launcher for JvmClientMain from its unit-test sources, which takes the same arguments as the
-      # other clients. The runner image ships the Android SDK the Gradle build needs.
+      # other clients (and answers `peers` for the Peer Mesh roster checks). It runs without a VPN
+      # platform, as peerMeshDevice=noop; foreground service, VpnService/TUN and UI stay with the
+      # device tests. The runner image ships the Android SDK the Gradle build needs.
       - name: Set up Gradle for the Android client
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         uses: gradle/actions/setup-gradle@v4
@@ -329,12 +331,36 @@ jobs:
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         working-directory: implementations/android/client
         run: ./gradlew :app:jvmClientLauncher --no-daemon
+      - name: Android client NAT, heartbeat and Direct HTTP/WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+      - name: Android client SQLite runtime configuration E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: Android client Direct HTTP and WebSocket E2E
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
         run: |
           SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
           SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
+      - name: Android client control TLS E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/tls_client_e2e.sh
+      - name: Android client Peer Mesh signalling and TURN relay E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/peer_mesh_e2e.sh
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh

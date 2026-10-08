@@ -181,6 +181,29 @@ final class StreamFlowScheduler implements Closeable {
         }
     }
 
+    /** What a WINDOW_UPDATE did to its stream; see {@link #creditIfOpen}. */
+    enum Credit {
+        ADDED,
+        NOT_OPEN,
+        INVALID
+    }
+
+    /**
+     * Returns credit to a stream that is still open, in one step. A stream whose terminal frame
+     * went out is released by the thread that sent it, possibly while the peer's WINDOW_UPDATE for
+     * its last DATA is on the way: the update then finds no stream and is ignored. Asking
+     * {@link #contains} first and calling {@link #addCredit} after would race that release and
+     * take the late update for an invalid one.
+     */
+    Credit creditIfOpen(int streamId, long bytes) {
+        synchronized (lock) {
+            if (!streams.containsKey(streamId)) {
+                return Credit.NOT_OPEN;
+            }
+            return addCredit(streamId, bytes) ? Credit.ADDED : Credit.INVALID;
+        }
+    }
+
     void closeStream(int streamId) {
         try {
             terminate(streamId, () -> { }, true);
