@@ -114,7 +114,7 @@
 
 ## 阶段 4：Peer Mesh 控制面与数据面
 
-状态：Go、.NET server 的控制面和标准 STUN/TURN relay 已对齐 Java；C server 的同类能力只有进程内测试证据（`peer_mesh_tests`、`stun_turn_tests`，TURN Refresh/ChannelBind/ChannelData/过期清理未测），没有任何客户端（包括 Android）× C server 的 Peer Mesh 或 TURN 端到端运行；Go client 与 .NET client 已补齐 Linux TUN / Windows Wintun / macOS utun、X25519/HKDF/AES-GCM frame 与 UDP 数据面接入；Android client 已完成控制通道、VpnService、加密 UDP direct/TURN relay 的源码与 JVM 协议测试，真机验收仍单列保留。
+状态：Go、.NET server 的控制面和标准 STUN/TURN relay 已对齐 Java；C server 的同类能力只有进程内测试证据（`peer_mesh_tests`、`stun_turn_tests`，TURN Refresh/ChannelBind/ChannelData/过期清理未测），端到端只有 `peer_mesh_e2e.sh` 以 noop 模式让 Java/Go/.NET/Android client 对 C server 跑 roster、session grant、候选交换、loopback 上的 DIRECT 与经 C TURN 分配的 RELAY（Android 自 PR #238 起），不产生 SPM2 数据帧；Go client 与 .NET client 已补齐 Linux TUN / Windows Wintun / macOS utun、X25519/HKDF/AES-GCM frame 与 UDP 数据面接入；Android client 已完成控制通道、VpnService、加密 UDP direct/TURN relay 的源码与 JVM 协议测试，真机验收仍单列保留。
 
 - Go server：
   - 新增 `Specus:PeerMesh` / `SPECUS_PEER_MESH_*` 配置，默认关闭，默认网段 `100.96.0.0/11`。
@@ -186,7 +186,7 @@
   - `PEER_CONTROL` 数据面校验 source/target/tenant/ACL 后转发 offer/answer/candidates/close，持久化 session、path/traffic/NAT/virtual-device report；未知 route、过期 session、禁用设备与撤销 ACL 均失败关闭。service catalog 带 revision/TTL，管理 mutation 会即时 refresh，断线会撤销 publisher catalog。
   - 内置 UDP listener 支持 RFC 5389 Binding、RFC 5780 `CHANGE-REQUEST`/`OTHER-ADDRESS` NAT probe，以及 RFC 5766 Allocate/Refresh/CreatePermission/ChannelBind/Send/Data/ChannelData。TURN 使用 long-term credential、realm/nonce、MESSAGE-INTEGRITY、relay 端口池、每地址/全局 allocation 与字节配额，支持同客户端两个 allocation，并定时清理 allocation/permission/channel。
   - 证据：`peer_mesh_tests` 以回调替身覆盖登录配置/roster 推送、虚拟 IP 分配、service catalog 推送/撤回/权限刷新/过期、candidate/session 转发、path/traffic/device 报告、拒绝 ACL 与离线目标、close 和 logout；`stun_turn_tests` 在回环 UDP 上覆盖 Binding、RFC 5780 change-request、401 challenge、Allocate、CreatePermission、跨 allocation relay、Send/Data indication 与 allocation 配额。TURN Refresh、ChannelBind/ChannelData 与 allocation/permission/channel 过期清理只有源码。
-  - C server 不提供 C client 或虚拟网卡；SPM2 加密数据、TUN/VPN、direct 打洞与 relay fallback 由客户端负责，但还没有任何客户端（Java/Go/.NET/Android）对 C server 跑过 Peer Mesh 信令、打洞或 relay。真实跨 NAT、真机 VPN/TUN 和长流量仍属于发布环境门禁。
+  - C server 不提供 C client 或虚拟网卡；SPM2 加密数据、TUN/VPN、direct 打洞与 relay fallback 由客户端负责，Java/Go/.NET/Android client 已在 CI 中以 noop 模式对 C server 跑通 Peer Mesh 信令、loopback 上的 DIRECT 与经 C TURN 的 RELAY（`peer_mesh_e2e.sh`；Android 自 PR #238 起），但没有 SPM2 数据帧、虚拟网卡与跨 NAT 打洞。真实跨 NAT、真机 VPN/TUN 和长流量仍属于发布环境门禁。
 
 ### 打洞成功率优化对齐（H-1 / H-2 / H-3 / H-6）
 

@@ -80,7 +80,7 @@ Run the local JVM protocol suite with:
 .\gradlew.bat clean test --no-problems-report
 ```
 
-Current local JVM result: 225/225 tests across 28 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, strict update-catalogue parsing and scheduling, TLS timeout/cancellation, and state-machine behavior. `test` and `lint` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
+Current local JVM result: 226/226 tests across 28 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, strict update-catalogue parsing and scheduling, TLS timeout/cancellation, and state-machine behavior. `test` and `lint` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
 
 ### The client core as a command on a plain JVM
 
