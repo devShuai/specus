@@ -2513,6 +2513,14 @@ static int endpoint_nat_push(void *ctx, long long client_id, const char *client_
     return 0;
 }
 
+static int endpoint_nat_not_sent(void *ctx, long long client_id, const char *client_name)
+{
+    (void)ctx;
+    (void)client_id;
+    (void)client_name;
+    return ST_ADMIN_NAT_CONTROL_NOT_SENT;
+}
+
 static long long endpoint_runtime_client_id = 0;
 
 static int endpoint_runtime_status(void *ctx, long long client_id, const char *client_name,
@@ -2682,6 +2690,13 @@ static int test_admin_endpoint_contracts(void)
         len = endpoint_call("POST", path, "root-b", "tenant-b", "ADMIN", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh from another tenant") != 0
             || endpoint_push_calls != 2;
+    }
+    /* A NAT_CONTROL that does not fit one MESSAGE was not sent: 409, never a reported push. */
+    st_admin_set_nat_control_handler(endpoint_nat_not_sent, NULL);
+    if (!failed) {
+        len = endpoint_call("POST", path, "alice", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "NAT_CONTROL",
+                                 "force refresh of a NAT_CONTROL past the limit") != 0;
     }
     st_admin_set_nat_control_handler(NULL, NULL);
 
