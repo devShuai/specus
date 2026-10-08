@@ -220,6 +220,21 @@ public final class SpecusCore {
             current.sendClientMessage(toClientName, message);
         }
 
+        /**
+         * The Peer Mesh roster of the current control connection: empty while disconnected or
+         * before the server enabled this device. JvmClientMain answers {@code peers} with it.
+         */
+        List<PeerMeshEngine.RosterEntry> peerRoster() {
+            ControlConnection current = connection;
+            return current == null ? List.of() : current.peerRoster();
+        }
+
+        /** Whether the current control connection has logged in. */
+        boolean controlConnected() {
+            ControlConnection current = connection;
+            return current != null && current.loginSucceeded();
+        }
+
         /** Fails before any STXFER frame is emitted when the authoritative roster disallows it. */
         public void requireFileTransferTarget(String toClientName, long size) {
             if (!running.get()) {
@@ -1960,6 +1975,10 @@ public final class SpecusCore {
 
         boolean loginSucceeded() {
             return loginSucceeded;
+        }
+
+        List<PeerMeshEngine.RosterEntry> peerRoster() {
+            return peerMeshEngine.rosterSnapshot();
         }
 
         ControlExitAction exitAction() {
