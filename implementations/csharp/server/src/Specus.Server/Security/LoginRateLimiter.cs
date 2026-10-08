@@ -33,7 +33,7 @@ public sealed class LoginRateLimiter
     /// Records one attempt and reports whether it may proceed. When the result is false the caller
     /// must answer 429 with the returned Retry-After seconds.
     /// </summary>
-    public bool TryAcquire(string? clientIp, string? username, out long retryAfterSeconds)
+    public bool TryAcquire(string? clientIp, string? account, out long retryAfterSeconds)
     {
         retryAfterSeconds = 0;
         var options = _options.Value;
@@ -50,7 +50,7 @@ public sealed class LoginRateLimiter
             Purge(_accounts, now, window);
             // Count both dimensions before deciding so an exceeded dimension cannot mask the other.
             var ipWindow = Record(_ips, IpKey(clientIp), now, window);
-            var accountWindow = Record(_accounts, AccountKey(username), now, window);
+            var accountWindow = Record(_accounts, AccountKey(account), now, window);
 
             var ipExceeded = ipWindow.Count > Math.Max(1, options.LoginRateLimitPerIp);
             var accountExceeded = accountWindow.Count > Math.Max(1, options.LoginRateLimitPerAccount);
@@ -71,7 +71,7 @@ public sealed class LoginRateLimiter
     /// Clears the account budget after a successful login. The source IP budget is kept so cracking
     /// one account does not unlock the whole source.
     /// </summary>
-    public void RecordSuccess(string? username)
+    public void RecordSuccess(string? account)
     {
         if (!_options.Value.LoginRateLimitEnabled)
         {
@@ -79,7 +79,7 @@ public sealed class LoginRateLimiter
         }
         lock (_sync)
         {
-            _accounts.Remove(AccountKey(username));
+            _accounts.Remove(AccountKey(account));
         }
     }
 
@@ -118,8 +118,17 @@ public sealed class LoginRateLimiter
     private static string IpKey(string? clientIp) =>
         string.IsNullOrWhiteSpace(clientIp) ? "unknown" : clientIp.Trim();
 
-    private static string AccountKey(string? username) =>
-        string.IsNullOrWhiteSpace(username) ? "unknown" : username.Trim().ToLowerInvariant();
+    /// <summary>
+    /// The account dimension of a password login: the requested tenant and the login name, each
+    /// trimmed and lower-cased, joined by NUL (Java <c>AuthController.loginIdentity</c>). The same
+    /// name in two tenants has two budgets, and a success clears only its own.
+    /// </summary>
+    public static string LoginIdentity(string? tenantId, string? username) =>
+        (tenantId?.Trim().ToLowerInvariant() ?? string.Empty) + '\0'
+        + (username?.Trim().ToLowerInvariant() ?? string.Empty);
+
+    private static string AccountKey(string? account) =>
+        string.IsNullOrWhiteSpace(account) ? "unknown" : account.Trim().ToLowerInvariant();
 
     private sealed class Window
     {

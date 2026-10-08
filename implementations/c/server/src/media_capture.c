@@ -2135,7 +2135,7 @@ static int media_list_response(const char *path,
         if (client_id > 0) sqlite3_bind_int64(stmt, index++, client_id);
         if (route != NULL && *route != '\0') sqlite3_bind_text(stmt, index++, route, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, index++, size);
-        sqlite3_bind_int(stmt, index++, page * size);
+        sqlite3_bind_int64(stmt, index++, (sqlite3_int64)page * size);
         int first = 1;
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             st_media_capture_row row;
@@ -3057,6 +3057,9 @@ static char *media_decode_manifest_text(const uint8_t *data, size_t len, const c
             if (rc != ST_DECOMPRESSION_OK)
                 rc = st_decompress_bounded(current, current_len, ST_DECOMPRESSION_RAW_DEFLATE,
                                            &decoded, &decoded_len);
+        } else if (token_len == 2U && strncasecmp(token, "br", 2U) == 0) {
+            /* Decoded when the build has libbrotlidec (Java HttpBodyDataCodec); else kept as stored. */
+            rc = st_decompress_bounded(current, current_len, ST_DECOMPRESSION_BROTLI, &decoded, &decoded_len);
         }
         if (rc != ST_DECOMPRESSION_OK) {
             free(decoded);

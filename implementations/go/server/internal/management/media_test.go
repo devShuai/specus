@@ -59,7 +59,7 @@ func TestAdminNestedManifestUsesNestedCaptureAsAssetAnchor(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertManagementUser(context.Background(), store.ManagementUser{
+	if _, err := db.InsertManagementUser(context.Background(), store.ManagementUser{
 		Username: "alice", TenantID: "tenant-a", PasswordHash: "test-password-hash",
 		Role: store.ManagementRoleUser, Enabled: true, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {

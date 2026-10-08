@@ -66,6 +66,45 @@ public sealed class SpecusDbContext : DbContext
         Set<ProductMetricsOnboardingDaily>();
     public DbSet<ProductMetricsTransferDaily> ProductMetricsTransferDaily => Set<ProductMetricsTransferDaily>();
 
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        StampManagementLoginNames();
+        return base.SaveChanges(acceptAllChangesOnSuccess);
+    }
+
+    public override Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess,
+        CancellationToken cancellationToken = default)
+    {
+        StampManagementLoginNames();
+        return base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+    }
+
+    /// <summary>
+    /// Keeps <c>login_name_normalized</c> derived from <c>login_name</c> on every write, and gives a
+    /// row written without a login name its account key as one — the same value the
+    /// AddManagementLoginNames migration backfills for accounts that predate login names.
+    /// </summary>
+    private void StampManagementLoginNames()
+    {
+        foreach (var entry in ChangeTracker.Entries<ManagementUser>())
+        {
+            if (entry.State is not (EntityState.Added or EntityState.Modified))
+            {
+                continue;
+            }
+            var user = entry.Entity;
+            if (string.IsNullOrWhiteSpace(user.LoginName))
+            {
+                user.LoginName = user.Username;
+            }
+            var normalized = ManagementUser.NormalizeLoginName(user.LoginName);
+            if (!string.Equals(user.LoginNameNormalized, normalized, StringComparison.Ordinal))
+            {
+                user.LoginNameNormalized = normalized;
+            }
+        }
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -228,6 +267,8 @@ public sealed class SpecusDbContext : DbContext
             b.ToTable("specus_management_user");
             b.HasKey(x => x.Username);
             b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.LoginName).HasColumnName("login_name").HasMaxLength(80);
+            b.Property(x => x.LoginNameNormalized).HasColumnName("login_name_normalized").HasMaxLength(80);
             b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
             b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64).IsRequired();
             b.Property(x => x.OidcIssuer).HasColumnName("oidc_issuer").HasMaxLength(255);
@@ -242,6 +283,9 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_management_user_tenant");
             b.HasIndex(x => x.Role).HasDatabaseName("idx_management_user_role");
+            // Login names are unique per tenant, never globally (protocol/spec/management-accounts.md).
+            b.HasIndex(x => new { x.TenantId, x.LoginNameNormalized }).IsUnique()
+                .HasDatabaseName("uq_management_user_tenant_login_name");
             b.HasIndex(x => x.OidcIdentityKey).IsUnique()
                 .HasDatabaseName("uq_management_user_oidc_identity_key");
         });

@@ -222,21 +222,6 @@ func (db *DB) getClientByID(ctx context.Context, runner sqlRunner, id int64) (*C
 	return &account, nil
 }
 
-func (db *DB) findManagementUser(ctx context.Context, runner sqlRunner, username string) (*ManagementUser, error) {
-	query := db.rebind(`SELECT username, tenant_id, password_hash,
-		COALESCE(oidc_issuer, ''), COALESCE(oidc_subject, ''), COALESCE(oidc_identity_key, ''),
-		role, enabled, created_at, updated_at
-		FROM specus_management_user WHERE LOWER(username) = LOWER(?)`)
-	user, err := scanManagementUser(runner.QueryRowContext(ctx, query, username))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &user, nil
-}
-
 func (db *DB) snapshotFor(ctx context.Context, runner sqlRunner, share HTTPShare) (HTTPShareSnapshot, error) {
 	snapshot := HTTPShareSnapshot{Share: share}
 	route, err := db.getHTTPRouteByID(ctx, runner, share.RouteID)
@@ -249,7 +234,8 @@ func (db *DB) snapshotFor(ctx context.Context, runner sqlRunner, share HTTPShare
 			return snapshot, err
 		}
 	}
-	snapshot.Creator, err = db.findManagementUser(ctx, runner, share.CreatedBy)
+	// The creator is recorded by login name, which is unique only inside the share's tenant.
+	snapshot.Creator, err = db.findManagementUserByLogin(ctx, runner, share.TenantID, share.CreatedBy)
 	return snapshot, err
 }
 
@@ -612,15 +598,11 @@ func (db *DB) UpdateManagementUserAudited(ctx context.Context, user ManagementUs
 		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, db.rebind(`UPDATE specus_management_user SET password_hash = ?, oidc_issuer = ?,
-		oidc_subject = ?, oidc_identity_key = ?, role = ?, enabled = ?, updated_at = ?
-		WHERE LOWER(username) = LOWER(?)`), user.PasswordHash, nullIfBlank(user.OIDCIssuer),
-		nullIfBlank(user.OIDCSubject), nullIfBlank(user.OIDCIdentityKey), normalizeManagementRole(user.Role),
-		boolToInt(user.Enabled), formatTime(user.UpdatedAt), user.Username); err != nil {
+	if err := db.updateManagementUserOn(ctx, tx, user); err != nil {
 		return nil, err
 	}
-	revoked, err := db.revokeActiveShares(ctx, tx, `LOWER(created_by) = LOWER(?)`, []any{user.Username}, now,
-		nullableActor(actor), "creator-lost-access", lapse)
+	revoked, err := db.revokeActiveShares(ctx, tx, `tenant_id = ? AND LOWER(created_by) = LOWER(?)`,
+		[]any{defaultTenant(user.TenantID), user.Username}, now, nullableActor(actor), "creator-lost-access", lapse)
 	if err != nil {
 		return nil, err
 	}
@@ -628,25 +610,26 @@ func (db *DB) UpdateManagementUserAudited(ctx context.Context, user ManagementUs
 }
 
 // DeleteManagementUserAudited deletes a user and revokes the user's active shares in the same
-// transaction, so a later user of the same name never inherits them.
-func (db *DB) DeleteManagementUserAudited(ctx context.Context, username, actor string, now int64,
+// transaction, so a later user of the same name never inherits them. Shares record their creator
+// by login name, which is unique only inside the tenant.
+func (db *DB) DeleteManagementUserAudited(ctx context.Context, user ManagementUser, actor string, now int64,
 	lapse ShareLapseFunc) ([]string, error) {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	// An account that still owns clients or credentials is refused; the rest of what its identity
+	// owns goes or changes hands with it (management-accounts.md section 7.1).
+	if err := db.forgetAccountDataOn(ctx, tx, user, actor); err != nil {
+		return nil, err
+	}
 	// The account's workbench lists are personal history and go with it.
-	if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM management_workbench_item WHERE username IN
-		(SELECT username FROM specus_management_user WHERE LOWER(username) = LOWER(?))`), username); err != nil {
+	if err := db.deleteManagementUserOn(ctx, tx, user); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx,
-		db.rebind(`DELETE FROM specus_management_user WHERE LOWER(username) = LOWER(?)`), username); err != nil {
-		return nil, err
-	}
-	revoked, err := db.revokeActiveShares(ctx, tx, `LOWER(created_by) = LOWER(?)`, []any{username}, now,
-		nullableActor(actor), "creator-lost-access", lapse)
+	revoked, err := db.revokeActiveShares(ctx, tx, `tenant_id = ? AND LOWER(created_by) = LOWER(?)`,
+		[]any{defaultTenant(user.TenantID), user.Username}, now, nullableActor(actor), "creator-lost-access", lapse)
 	if err != nil {
 		return nil, err
 	}

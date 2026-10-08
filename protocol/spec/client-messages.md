@@ -26,8 +26,10 @@ tenant 和来源地址，只能原子消费一次。
 /ws/client-messages?ticket=<one-time-ticket>
 ```
 
-原始管理 JWT、Bearer header 和 `token=` query 都不属于协议。缺失或无效 ticket 在 Upgrade 前返回 `403`，并分别设置
-`X-Auth-Reason: missing ticket` 或 `invalid ticket`。ticket 重用、过期、scope 不符或来源地址不符都必须拒绝。
+原始管理 JWT、Bearer header 和 `token=` query 都不属于协议。缺失或无效 ticket 在 Upgrade 前返回 `403`：query 不是恰好一个
+`ticket` 参数时设置 `X-Auth-Reason: single-use ticket required`，ticket 无法消费时设置
+`X-Auth-Reason: invalid or consumed ticket`（Java `WebSocketTicketHandshakeInterceptor` 与 C 的取值）。ticket 重用、过期、
+scope 不符或来源地址不符都必须拒绝。
 
 ## 2. 建连 hello
 
@@ -108,7 +110,7 @@ MessageResponsePacket
 
 | error | 条件 |
 | --- | --- |
-| `invalid-json` | JSON 无法解析；不含 messageId |
+| `invalid-json` | JSON 无法解析，或无法映射为 `type`/`messageId`/`toClientName`/`message` 四个字符串字段（含未知成员、对象或数组值）；不含 messageId |
 | `unsupported-type` | type 不是 `message` |
 | `target-and-message-required` | 目标或正文为空 |
 | `target-not-found` | 账号不存在、停用或无权限 |
@@ -129,7 +131,8 @@ MessageRequestPacket
   message = <body>
 ```
 
-`admin:` 前缀匹配不区分大小写；其后的 username 去空白后必须与管理订阅完全相等，tenant 必须与来源客户端相同。
+`admin:` 前缀匹配不区分大小写；其后的 username 去空白后必须与管理订阅完全相等，tenant 必须与来源客户端相同。来源账号
+必须仍存在且启用（每条消息都查），`fromClientName` 与 tenant 取账号的存储值。
 服务端向全部匹配管理连接发送：
 
 ```json
@@ -179,8 +182,11 @@ C server 已实现 endpoint 绑定的一次性 ticket、`/ws/client-messages` he
 上限；能力检查遍历全部 `NETTY_ONLINE` session。
 
 `admin_http_tests` 的 `test_client_messages_websocket` 经真实 socket 覆盖 ticket/Upgrade/hello、管理端到客户端与客户端到
-管理端的投递、异步写入回执，以及 65,536 / 65,537 UTF-16 code unit 边界（后者以 `1009` 关闭）。没有任何客户端进程
-× C server 的消息端到端证据。
+管理端的投递、异步写入回执，以及 65,536 / 65,537 UTF-16 code unit 边界（后者以 `1009` 关闭）。ctest
+`client_messages_tests` 对真实 `specus-server-c` 进程按协议登录客户端（control 连接）并打开两个管理 WebSocket：管理端消息以
+`MessageResponsePacket` 写到客户端 control 连接并回 `written`，客户端回复 fan-out 到同一管理员的两个会话，来源账号被停用
+期间不投递，无法映射的命令回 `invalid-json`，检查通过后写入失败回 `failed`/`target-write-failed`。它不是 Java/Go/.NET
+客户端进程，真实客户端 × C server 的消息端到端仍未覆盖。
 
 管理端附件 REST（`/api/admin/client-messages/attachments/presign-upload`、`/{attachmentId}/complete`、
 `/{attachmentId}/presign-download`）与公开互传附件共用 `src/object_storage.c` 的数据面，只支持 `aliyun-oss` provider。

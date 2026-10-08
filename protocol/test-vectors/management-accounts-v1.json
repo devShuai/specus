@@ -1,0 +1,223 @@
+{
+  "name": "management-accounts-v1",
+  "spec": "protocol/spec/management-accounts.md",
+  "description": "Local-token resolution with the uid account-key claim (sections 5 and 6) and the built-in administrator in the user list (section 7). Seed the accounts with exactly these account keys, sign every claims object with the server's HS256 key after adding iss=specus, iat=now and exp=now+600, then replay each case through GET /api/admin/me, POST /auth/refresh and GET /api/admin/users. accountDeletion (section 7.1) has its own accounts and runs in a database of its own.",
+  "auth": {
+    "adminUsername": "admin",
+    "defaultTenant": "default"
+  },
+  "accounts": [
+    {"accountKey": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f", "loginName": "alice", "tenantId": "tenant-a", "role": "USER", "enabled": true},
+    {"accountKey": "8c7b6a59-4d3e-4f2a-8b1c-0d9e8f7a6b5c", "loginName": "alice", "tenantId": "tenant-b", "role": "USER", "enabled": true},
+    {"accountKey": "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d", "loginName": "erin", "tenantId": "tenant-a", "role": "ADMIN", "enabled": true},
+    {"accountKey": "9e8d7c6b-5a4f-4e3d-a2c1-b0a9f8e7d6c5", "loginName": "dora", "tenantId": "default", "role": "ADMIN", "enabled": true},
+    {"accountKey": "carol", "loginName": "carol", "tenantId": "tenant-c", "role": "USER", "enabled": true}
+  ],
+  "tokenResolution": [
+    {
+      "name": "uid-matches-the-account",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"},
+      "expect": {"username": "alice", "tenantId": "tenant-a", "builtIn": false, "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"}
+    },
+    {
+      "name": "uid-of-a-deleted-account-with-the-same-login-name",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e"},
+      "expect": null
+    },
+    {
+      "name": "uid-of-the-same-login-name-in-another-tenant",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "8c7b6a59-4d3e-4f2a-8b1c-0d9e8f7a6b5c"},
+      "expect": null
+    },
+    {
+      "name": "uid-is-compared-exactly",
+      "claims": {"sub": "alice", "tenant_id": "tenant-a", "role": "USER", "uid": "3F6C1D2E-8A4B-4C5D-9E6F-7A8B9C0D1E2F"},
+      "expect": null
+    },
+    {
+      "name": "token-without-uid-resolves-by-tenant-and-login-name",
+      "claims": {"sub": "ALICE", "tenant_id": "tenant-a", "role": "USER"},
+      "expect": {"username": "alice", "tenantId": "tenant-a", "builtIn": false, "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"}
+    },
+    {
+      "name": "empty-uid-counts-as-absent",
+      "claims": {"sub": "alice", "tenant_id": "tenant-b", "role": "USER", "uid": ""},
+      "expect": {"username": "alice", "tenantId": "tenant-b", "builtIn": false, "uid": "8c7b6a59-4d3e-4f2a-8b1c-0d9e8f7a6b5c"}
+    },
+    {
+      "name": "token-without-tenant-names-the-account-key",
+      "claims": {"sub": "carol", "role": "USER"},
+      "expect": {"username": "carol", "tenantId": "tenant-c", "builtIn": false, "uid": "carol"}
+    },
+    {
+      "name": "token-without-tenant-matches-the-account-key-exactly",
+      "claims": {"sub": "Carol", "role": "USER"},
+      "expect": null
+    },
+    {
+      "name": "token-without-tenant-with-the-matching-uid",
+      "claims": {"sub": "carol", "role": "USER", "uid": "carol"},
+      "expect": {"username": "carol", "tenantId": "tenant-c", "builtIn": false, "uid": "carol"}
+    },
+    {
+      "name": "token-without-tenant-with-another-uid",
+      "claims": {"sub": "carol", "role": "USER", "uid": "3f6c1d2e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"},
+      "expect": null
+    },
+    {
+      "name": "built-in-admin-token-carries-no-uid",
+      "claims": {"sub": "admin", "tenant_id": "default", "role": "ADMIN"},
+      "expect": {"username": "admin", "tenantId": "default", "builtIn": true, "uid": null}
+    },
+    {
+      "name": "a-token-with-uid-is-never-the-built-in-admin",
+      "claims": {"sub": "admin", "tenant_id": "default", "role": "ADMIN", "uid": "admin"},
+      "expect": null
+    }
+  ],
+  "userLists": [
+    {
+      "name": "built-in-admin-lists-itself-in-the-default-tenant",
+      "caller": {"sub": "admin", "tenant_id": "default", "role": "ADMIN"},
+      "expect": [
+        {"username": "admin", "tenantId": "default", "builtIn": true},
+        {"username": "dora", "tenantId": "default", "builtIn": false}
+      ]
+    },
+    {
+      "name": "default-tenant-administrator-sees-the-built-in-admin",
+      "caller": {"sub": "dora", "tenant_id": "default", "role": "ADMIN", "uid": "9e8d7c6b-5a4f-4e3d-a2c1-b0a9f8e7d6c5"},
+      "expect": [
+        {"username": "admin", "tenantId": "default", "builtIn": true},
+        {"username": "dora", "tenantId": "default", "builtIn": false}
+      ]
+    },
+    {
+      "name": "other-tenant-administrator-sees-only-its-tenant",
+      "caller": {"sub": "erin", "tenant_id": "tenant-a", "role": "ADMIN", "uid": "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d"},
+      "expect": [
+        {"username": "alice", "tenantId": "tenant-a", "builtIn": false},
+        {"username": "erin", "tenantId": "tenant-a", "builtIn": false}
+      ]
+    }
+  ],
+  "accountDeletion": {
+    "description": "Section 7.1: what deleting an account does to the data its identity (tenant, login name) owns. Run it in a database of its own: seed these accounts (not the top-level ones) with exactly these account keys, write the seed rows straight into storage (fill the columns the vector leaves out with any valid value; attachments and grants are unexpired, PENDING ones with an unexpired upload URL), then replay the steps in order. A deleteUser step is DELETE /api/admin/users/{name} with a token signed from actor (iss/iat/exp as above): expect.status is the HTTP status, and on 409 the body has a non-empty error and exactly these clients/credentials counts. A fixture step changes storage directly: transfer-client sets the client's owner_username and that of its Peer Mesh device row (there is no API for it), delete-client and delete-credential remove the row as their delete endpoints would, create-account seeds one more account. A get step requests the path with a token signed from as and compares the JSON body. Afterwards, of the seeded ids exactly those listed in rowsAfter remain, each with the listed owner (username for grants and usage); an attachment is active when expires_at is later than now and, for a PENDING one, upload_expires_at is too. accountsAfter lists the accounts of these tenants that exist at the end, by account key.",
+    "actor": {"sub": "hana", "tenant_id": "tenant-d", "role": "ADMIN", "uid": "6b1e2f3a-4c5d-4e6f-8a7b-9c0d1e2f3a4b"},
+    "accounts": [
+      {"accountKey": "6b1e2f3a-4c5d-4e6f-8a7b-9c0d1e2f3a4b", "loginName": "hana", "tenantId": "tenant-d", "role": "ADMIN", "enabled": true},
+      {"accountKey": "7c2f3a4b-5d6e-4f70-9b8c-0d1e2f3a4b5c", "loginName": "bob", "tenantId": "tenant-d", "role": "USER", "enabled": true},
+      {"accountKey": "8d3a4b5c-6e7f-4081-ac9d-1e2f3a4b5c6d", "loginName": "gina", "tenantId": "tenant-d", "role": "ADMIN", "enabled": true},
+      {"accountKey": "9e4b5c6d-7f80-4192-bdae-2f3a4b5c6d7e", "loginName": "bob", "tenantId": "tenant-e", "role": "USER", "enabled": true}
+    ],
+    "seed": {
+      "clients": [
+        {"id": 7101, "tenantId": "tenant-d", "owner": "bob", "clientName": "acct-del-bob-1"},
+        {"id": 7102, "tenantId": "tenant-d", "owner": "bob", "clientName": "acct-del-bob-2"},
+        {"id": 7103, "tenantId": "tenant-e", "owner": "bob", "clientName": "acct-del-bob-e"},
+        {"id": 7104, "tenantId": "tenant-d", "owner": "hana", "clientName": "acct-del-hana"}
+      ],
+      "credentials": [
+        {"id": 7201, "tenantId": "tenant-d", "owner": "bob"},
+        {"id": 7202, "tenantId": "tenant-d", "owner": "gina"},
+        {"id": 7203, "tenantId": "tenant-e", "owner": "bob"}
+      ],
+      "diagrams": [
+        {"id": 7301, "tenantId": "tenant-d", "owner": "bob"},
+        {"id": 7302, "tenantId": "tenant-d", "owner": "gina"},
+        {"id": 7303, "tenantId": "tenant-e", "owner": "bob"}
+      ],
+      "attachments": [
+        {"id": 7401, "tenantId": "tenant-d", "owner": "bob", "status": "UPLOADED"},
+        {"id": 7402, "tenantId": "tenant-d", "owner": "bob", "status": "PENDING"},
+        {"id": 7403, "tenantId": "tenant-d", "owner": "hana", "status": "UPLOADED"},
+        {"id": 7404, "tenantId": "tenant-e", "owner": "bob", "status": "UPLOADED"}
+      ],
+      "downloadGrants": [
+        {"id": 7501, "tenantId": "tenant-d", "username": "bob", "attachmentId": 7403},
+        {"id": 7502, "tenantId": "tenant-d", "username": "hana", "attachmentId": 7401},
+        {"id": 7503, "tenantId": "tenant-e", "username": "bob", "attachmentId": 7404}
+      ],
+      "downloadUsage": [
+        {"id": 7601, "tenantId": "tenant-d", "username": "bob", "attachmentId": 7403},
+        {"id": 7602, "tenantId": "tenant-d", "username": "hana", "attachmentId": 7401},
+        {"id": 7603, "tenantId": "tenant-e", "username": "bob", "attachmentId": 7404}
+      ],
+      "acls": [
+        {"id": 7701, "tenantId": "tenant-d", "owner": "bob", "sourceClientId": 7101, "targetClientId": 7102},
+        {"id": 7702, "tenantId": "tenant-d", "owner": "gina", "sourceClientId": 7104, "targetClientId": 7101},
+        {"id": 7703, "tenantId": "tenant-e", "owner": "bob", "sourceClientId": 7103, "targetClientId": 7104}
+      ],
+      "egressPolicies": [
+        {"id": 7801, "tenantId": "tenant-d", "owner": "bob", "egressClientId": 7104},
+        {"id": 7802, "tenantId": "tenant-e", "owner": "bob", "egressClientId": 7103}
+      ],
+      "devices": [
+        {"id": 7901, "tenantId": "tenant-d", "owner": "bob", "clientId": 7101},
+        {"id": 7902, "tenantId": "tenant-d", "owner": "bob", "clientId": 7102},
+        {"id": 7903, "tenantId": "tenant-e", "owner": "bob", "clientId": 7103}
+      ]
+    },
+    "steps": [
+      {"note": "gina owns no client but still owns a credential", "deleteUser": "gina", "expect": {"status": 409, "clients": 0, "credentials": 1}},
+      {"note": "the same login name in tenant-e is not counted", "deleteUser": "bob", "expect": {"status": 409, "clients": 2, "credentials": 1}},
+      {"fixture": "transfer-client", "id": 7101, "owner": "hana"},
+      {"fixture": "delete-client", "id": 7102},
+      {"deleteUser": "bob", "expect": {"status": 409, "clients": 0, "credentials": 1}},
+      {"fixture": "delete-credential", "id": 7201},
+      {"deleteUser": "bob", "expect": {"status": 204}},
+      {"fixture": "create-account", "accountKey": "a05c6d7e-8091-4a3b-8ebf-3a4b5c6d7e8f", "loginName": "bob", "tenantId": "tenant-d", "role": "USER"},
+      {"note": "the recreated account starts without the old account's data", "get": "/api/admin/diagrams", "as": {"sub": "bob", "tenant_id": "tenant-d", "role": "USER", "uid": "a05c6d7e-8091-4a3b-8ebf-3a4b5c6d7e8f"}, "expect": {"status": 200, "body": []}},
+      {"get": "/api/admin/peer-mesh/acls", "as": {"sub": "bob", "tenant_id": "tenant-d", "role": "USER", "uid": "a05c6d7e-8091-4a3b-8ebf-3a4b5c6d7e8f"}, "expect": {"status": 200, "body": []}},
+      {"get": "/api/admin/peer-mesh/devices", "as": {"sub": "bob", "tenant_id": "tenant-d", "role": "USER", "uid": "a05c6d7e-8091-4a3b-8ebf-3a4b5c6d7e8f"}, "expect": {"status": 200, "body": []}}
+    ],
+    "rowsAfter": {
+      "clients": [
+        {"id": 7101, "owner": "hana"},
+        {"id": 7103, "owner": "bob"},
+        {"id": 7104, "owner": "hana"}
+      ],
+      "credentials": [
+        {"id": 7202, "owner": "gina"},
+        {"id": 7203, "owner": "bob"}
+      ],
+      "diagrams": [
+        {"id": 7302, "owner": "gina"},
+        {"id": 7303, "owner": "bob"}
+      ],
+      "attachments": [
+        {"id": 7401, "owner": "bob", "active": false},
+        {"id": 7402, "owner": "bob", "active": false},
+        {"id": 7403, "owner": "hana", "active": true},
+        {"id": 7404, "owner": "bob", "active": true}
+      ],
+      "downloadGrants": [
+        {"id": 7502, "username": "hana"},
+        {"id": 7503, "username": "bob"}
+      ],
+      "downloadUsage": [
+        {"id": 7602, "username": "hana"},
+        {"id": 7603, "username": "bob"}
+      ],
+      "acls": [
+        {"id": 7701, "owner": "hana"},
+        {"id": 7702, "owner": "gina"},
+        {"id": 7703, "owner": "bob"}
+      ],
+      "egressPolicies": [
+        {"id": 7801, "owner": "hana"},
+        {"id": 7802, "owner": "bob"}
+      ],
+      "devices": [
+        {"id": 7901, "owner": "hana"},
+        {"id": 7903, "owner": "bob"}
+      ]
+    },
+    "accountsAfter": [
+      {"accountKey": "6b1e2f3a-4c5d-4e6f-8a7b-9c0d1e2f3a4b", "loginName": "hana", "tenantId": "tenant-d"},
+      {"accountKey": "8d3a4b5c-6e7f-4081-ac9d-1e2f3a4b5c6d", "loginName": "gina", "tenantId": "tenant-d"},
+      {"accountKey": "a05c6d7e-8091-4a3b-8ebf-3a4b5c6d7e8f", "loginName": "bob", "tenantId": "tenant-d"},
+      {"accountKey": "9e4b5c6d-7f80-4192-bdae-2f3a4b5c6d7e", "loginName": "bob", "tenantId": "tenant-e"}
+    ]
+  }
+}

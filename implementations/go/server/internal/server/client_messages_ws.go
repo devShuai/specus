@@ -195,6 +195,21 @@ func (h *clientMessagesHub) deliverFromClient(source store.ClientAccount, target
 	return delivered
 }
 
+// closeIdentity ends the open subscriptions of one identity, whose account was deleted. A connection
+// keeps the identity it was opened with, so it would otherwise go on sending as the deleted account
+// and receive what clients send to a later account of the same name (management-accounts.md 7.1).
+func (h *clientMessagesHub) closeIdentity(tenantID, username string) {
+	key := adminSocketKey(tenantID, username)
+	h.mu.Lock()
+	sockets := h.sockets[key]
+	delete(h.sockets, key)
+	h.mu.Unlock()
+	for socket := range sockets {
+		// The close handshake waits for the peer; the caller does not.
+		go socket.conn.Close(websocket.StatusPolicyViolation, "account deleted")
+	}
+}
+
 func (h *clientMessagesHub) unregister(key string, socket *clientMessageSocket) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

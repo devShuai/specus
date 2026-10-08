@@ -12,12 +12,18 @@ public sealed class DirectHttpDispatcher
         _nat = nat;
     }
 
+    /// <param name="discardResponseBody">
+    /// True for a caller that only reads the response head: the stream drops the response body
+    /// from the moment it is registered, before OPEN is even written.
+    /// </param>
     internal async Task<HttpSpecusStream> OpenAsync(string clientName,
-        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken,
+        bool discardResponseBody = false)
     {
         try
         {
-            return await _nat.OpenHttpStreamAsync(clientName, metadata, cancellationToken)
+            return await _nat.OpenHttpStreamAsync(clientName, metadata, cancellationToken,
+                    discardResponseBody)
                 .ConfigureAwait(false);
         }
         catch (InvalidOperationException ex)

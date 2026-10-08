@@ -58,13 +58,14 @@ public sealed class NatServerHandler
     }
 
     internal Task<HttpSpecusStream> OpenHttpStreamAsync(string clientName,
-        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken,
+        bool discardResponseBody = false)
     {
         if (!_sessionsByName.TryGetValue(clientName, out var session))
         {
             throw new InvalidOperationException($"client is offline: {clientName}");
         }
-        return session.OpenHttpStreamAsync(metadata, cancellationToken);
+        return session.OpenHttpStreamAsync(metadata, cancellationToken, discardResponseBody);
     }
 
     internal Task<WebSocketSpecusStream> OpenWebSocketStreamAsync(string clientName,

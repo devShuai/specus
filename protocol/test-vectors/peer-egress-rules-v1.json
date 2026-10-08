@@ -237,7 +237,7 @@
         "egressClientId": 2
       },
       "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
-      "reason": "一期数据面只有 IPv4；拒绝而不是静默忽略，否则会静默走本地形成泄漏"
+      "reason": "写法合法的 IPv6 规则，但消费端还没有 IPv6 数据面；拒绝而不是静默忽略，否则会静默走本地形成泄漏"
     },
     {
       "name": "ipv6-single",
@@ -246,6 +246,64 @@
         "action": "block"
       },
       "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
+      "reason": "同上"
+    },
+    {
+      "name": "ipv6-host-bits-set",
+      "rule": {
+        "match": "2001:db8::1/32",
+        "action": "block"
+      },
+      "code": "EGRESS_RULE_MALFORMED",
+      "reason": "IPv6 与 IPv4 同一条：主机位非零拒绝，不做隐式掩码。写错的规则先报写错，而不是笼统的「不支持」"
+    },
+    {
+      "name": "ipv6-dotted-tail",
+      "rule": {
+        "match": "::ffff:192.0.2.1",
+        "action": "block"
+      },
+      "code": "EGRESS_RULE_MALFORMED",
+      "reason": "不接受末尾内嵌点分 IPv4 的写法；IPv6 只写十六进制"
+    },
+    {
+      "name": "ipv6-mapped",
+      "rule": {
+        "match": "::ffff:cb00:7100/120",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_MALFORMED",
+      "reason": "IPv4 映射段 ::ffff:0:0/96 是 IPv4 目标在 IPv6 接口里的写法，线上不出现，这条规则永远不会命中；写成 IPv4"
+    },
+    {
+      "name": "ipv6-default-route",
+      "rule": {
+        "match": "::/0",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      "code": "EGRESS_RULE_DEFAULT_ROUTE",
+      "reason": "与 0.0.0.0/0 同理，不接管 IPv6 默认路由"
+    },
+    {
+      "name": "ipv6-port-outranks-ipv6-unsupported",
+      "rule": {
+        "match": "2001:db8::/32",
+        "action": "egress",
+        "egressClientId": 2,
+        "port": 443
+      },
+      "code": "EGRESS_RULE_PORT_UNSUPPORTED",
+      "reason": "规则本身的问题先于本机能力：IPv6 不受支持排在全部内容检查之后"
+    },
+    {
+      "name": "ipv6-missing-target-outranks-ipv6-unsupported",
+      "rule": {
+        "match": "2001:db8::/32",
+        "action": "egress"
+      },
+      "code": "EGRESS_RULE_MISSING_TARGET",
       "reason": "同上"
     },
     {
@@ -307,14 +365,14 @@
       "reason": "消费端按路由分流，路由只能选目的地址。端口与协议限制只存在于出口策略，在建流时执行"
     },
     {
-      "name": "ipv6-outranks-domain",
+      "name": "colon-outranks-domain",
       "rule": {
         "match": "*.example.com:443",
         "action": "egress",
         "egressClientId": 2
       },
-      "code": "EGRESS_RULE_IPV6_UNSUPPORTED",
-      "reason": "冒号是无歧义信号，先于域名判断，否则带冒号的通配串在各实现里会被归成不同类"
+      "code": "EGRESS_RULE_MALFORMED",
+      "reason": "冒号是无歧义信号，先于域名判断：带冒号的就按 IPv6 读，读不出即写错，否则带冒号的通配串在各实现里会被归成不同类"
     },
     {
       "name": "domain-outranks-port",
@@ -553,5 +611,660 @@
         }
       }
     ]
+  },
+  "ipv6Prefixes": {
+    "description": "IPv6 地址与前缀的写法，消费端规则的 match 与出口策略的目的规则共用。address 为 RFC 5952 规范形式，prefixLength 为前缀长度（单地址为 128）。reject 中的写法一律读不出：消费端规则报 EGRESS_RULE_MALFORMED，服务端保存策略以 400 拒绝。",
+    "accept": [
+      {
+        "text": "2001:db8::/32",
+        "address": "2001:db8::",
+        "prefixLength": 32,
+        "reason": "前缀"
+      },
+      {
+        "text": "2001:DB8:0:0::/32",
+        "address": "2001:db8::",
+        "prefixLength": 32,
+        "reason": "大小写与零组只是写法，按数值读"
+      },
+      {
+        "text": "2001:0db8:0000:0000:0000:0000:0000:0001",
+        "address": "2001:db8::1",
+        "prefixLength": 128,
+        "reason": "完整写法；每组前导零可写可不写"
+      },
+      {
+        "text": "2001:db8::7/128",
+        "address": "2001:db8::7",
+        "prefixLength": 128,
+        "reason": "带 /128 的单地址"
+      },
+      {
+        "text": "::",
+        "address": "::",
+        "prefixLength": 128,
+        "reason": "全零地址"
+      },
+      {
+        "text": "::/0",
+        "address": "::",
+        "prefixLength": 0,
+        "reason": "全零前缀；作为消费端规则是默认路由，另行拒绝"
+      },
+      {
+        "text": "::1",
+        "address": "::1",
+        "prefixLength": 128,
+        "reason": "回环"
+      },
+      {
+        "text": "1::",
+        "address": "1::",
+        "prefixLength": 128,
+        "reason": "压缩在末尾"
+      },
+      {
+        "text": "1:2:3:4:5:6:7::",
+        "address": "1:2:3:4:5:6:7:0",
+        "prefixLength": 128,
+        "reason": "压缩只代表一组零也合法；规范形式不压缩单组零"
+      },
+      {
+        "text": "1:0:0:2:0:0:0:3",
+        "address": "1:0:0:2::3",
+        "prefixLength": 128,
+        "reason": "规范形式压缩最长的一段零"
+      },
+      {
+        "text": "1:0:0:2:0:0:3:4",
+        "address": "1::2:0:0:3:4",
+        "prefixLength": 128,
+        "reason": "等长时压缩靠左的一段"
+      },
+      {
+        "text": "fe80::/10",
+        "address": "fe80::",
+        "prefixLength": 10,
+        "reason": "链路本地"
+      },
+      {
+        "text": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "address": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        "prefixLength": 128,
+        "reason": "最大地址"
+      },
+      {
+        "text": "::ffff:0:0/96",
+        "address": "::ffff:0:0",
+        "prefixLength": 96,
+        "reason": "IPv4 映射段写法本身合法；消费端规则另行拒绝"
+      },
+      {
+        "text": "64:ff9b::/96",
+        "address": "64:ff9b::",
+        "prefixLength": 96,
+        "reason": "NAT64 前缀"
+      }
+    ],
+    "reject": [
+      {
+        "text": "2001:db8::1/32",
+        "reason": "主机位非零"
+      },
+      {
+        "text": "2001:db8::/129",
+        "reason": "前缀长度越界"
+      },
+      {
+        "text": "2001:db8::/032",
+        "reason": "前缀长度有前导零"
+      },
+      {
+        "text": "2001:db8::/",
+        "reason": "斜杠后为空"
+      },
+      {
+        "text": "2001:db8::/-1",
+        "reason": "前缀长度带符号"
+      },
+      {
+        "text": "2001:db8::/32/64",
+        "reason": "两个斜杠"
+      },
+      {
+        "text": "2001:db8::/３２",
+        "reason": "全角数字不是数字"
+      },
+      {
+        "text": "２001:db8::1",
+        "reason": "同上，在地址里"
+      },
+      {
+        "text": "::ffff:192.0.2.1",
+        "reason": "末尾内嵌点分 IPv4"
+      },
+      {
+        "text": "64:ff9b::192.0.2.1/120",
+        "reason": "同上，带前缀"
+      },
+      {
+        "text": "fe80::1%eth0",
+        "reason": "区域标识"
+      },
+      {
+        "text": "[2001:db8::1]",
+        "reason": "方括号"
+      },
+      {
+        "text": "2001:db8::12345",
+        "reason": "一组超过四位"
+      },
+      {
+        "text": "2001:db8:::1",
+        "reason": "三个冒号"
+      },
+      {
+        "text": "2001::db8::1",
+        "reason": "两处压缩"
+      },
+      {
+        "text": "1:2:3:4:5:6:7:8:9",
+        "reason": "九组"
+      },
+      {
+        "text": "1:2:3:4:5:6:7",
+        "reason": "不压缩时不足八组"
+      },
+      {
+        "text": "1:2:3:4:5:6:7:8::",
+        "reason": "压缩之外已有八组"
+      },
+      {
+        "text": "::1:2:3:4:5:6:7:8",
+        "reason": "同上，压缩在开头"
+      },
+      {
+        "text": ":1:2:3:4:5:6:7:8",
+        "reason": "单冒号开头"
+      },
+      {
+        "text": "1:2:3:4:5:6:7:8:",
+        "reason": "单冒号结尾"
+      },
+      {
+        "text": "2001:db8 ::1",
+        "reason": "中间有空白"
+      },
+      {
+        "text": "g::1",
+        "reason": "非十六进制字符"
+      },
+      {
+        "text": ":",
+        "reason": "单个冒号"
+      }
+    ]
+  },
+  "ipv6": {
+    "description": "有 IPv6 数据面的消费端如何校验与匹配 IPv6 规则。三个客户端目前都没有 IPv6 数据面，按上面各节的结果执行（合法的 IPv6 规则报 EGRESS_RULE_IPV6_UNSUPPORTED，不参与匹配）；本节钉住数据面交付之后的语义，供实现在测试里以「承载 IPv6」运行。code 为 null 即生效。",
+    "notes": [
+      "地址族分开匹配：IPv4 目的只看 IPv4 规则，IPv6 目的只看 IPv6 规则；族内最长前缀优先，等长先配置者胜。两族规则从不竞争，也不与域名规则竞争（fake-IP 池是 IPv4）。",
+      "规则与目的地址都按数值比较，写法（大小写、前导零、:: 的位置）不影响结果。",
+      "IPv6 规则不与 Peer Mesh 网段或 fake-IP 池比较重叠：两者都是 IPv4。",
+      "校验失败与停用的规则同样不参与匹配。"
+    ],
+    "ipv6DataPlane": true,
+    "rules": [
+      {
+        "index": 0,
+        "match": "2001:db8::/32",
+        "action": "direct"
+      },
+      {
+        "index": 1,
+        "match": "2001:db8:8000::/33",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      {
+        "index": 2,
+        "match": "2001:DB8:1:0::/48",
+        "action": "egress",
+        "egressClientId": 3
+      },
+      {
+        "index": 3,
+        "match": "2001:db8:1::50",
+        "action": "block"
+      },
+      {
+        "index": 4,
+        "match": "203.0.113.0/24",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      {
+        "index": 5,
+        "match": "2001:db8:2::/48",
+        "action": "egress",
+        "egressClientId": 2
+      },
+      {
+        "index": 6,
+        "match": "2001:db8:2::/48",
+        "action": "block"
+      },
+      {
+        "index": 7,
+        "match": "2001:db8:3::1/48",
+        "action": "block"
+      },
+      {
+        "index": 8,
+        "match": "::ffff:cb00:7100/120",
+        "action": "block"
+      },
+      {
+        "index": 9,
+        "match": "2001:db8:4::/48",
+        "action": "block",
+        "enabled": false
+      },
+      {
+        "index": 10,
+        "match": "2000::/3",
+        "action": "egress",
+        "egressClientId": 3
+      }
+    ],
+    "refusedRules": [
+      {
+        "index": 7,
+        "code": "EGRESS_RULE_MALFORMED",
+        "reason": "主机位非零"
+      },
+      {
+        "index": 8,
+        "code": "EGRESS_RULE_MALFORMED",
+        "reason": "IPv4 映射段，永远不会命中"
+      },
+      {
+        "index": 9,
+        "code": "EGRESS_RULE_DISABLED",
+        "reason": "用户停用"
+      }
+    ],
+    "cases": [
+      {
+        "name": "longest-prefix-beats-order",
+        "destination": "2001:db8:8000::1",
+        "description": "更长的 /33 胜出，尽管 /32 排在前面",
+        "expect": {
+          "action": "egress",
+          "matchedRuleIndex": 1,
+          "reason": "matched",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "shorter-prefix-when-no-longer-match",
+        "destination": "2001:db8::1",
+        "description": "不在 /33 内，落到 /32 的 direct",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": 0,
+          "reason": "matched"
+        }
+      },
+      {
+        "name": "host-route-beats-covering-rule",
+        "destination": "2001:db8:1::50",
+        "description": "/128 胜过覆盖它的 /48",
+        "expect": {
+          "action": "block",
+          "matchedRuleIndex": 3,
+          "reason": "matched"
+        }
+      },
+      {
+        "name": "rule-matches-by-value-not-spelling",
+        "destination": "2001:db8:1::51",
+        "description": "规则写作 2001:DB8:1:0::/48，按数值与目的地址比较",
+        "expect": {
+          "action": "egress",
+          "matchedRuleIndex": 2,
+          "reason": "matched",
+          "egressClientId": 3
+        }
+      },
+      {
+        "name": "destination-spelling-is-read-by-value",
+        "destination": "2001:0DB8:0001:0000:0000:0000:0000:0050",
+        "description": "目的地址的写法同样按数值读",
+        "expect": {
+          "action": "block",
+          "matchedRuleIndex": 3,
+          "reason": "matched"
+        }
+      },
+      {
+        "name": "equal-prefix-first-wins",
+        "destination": "2001:db8:2::9",
+        "description": "前缀长度相同时先匹配者胜",
+        "expect": {
+          "action": "egress",
+          "matchedRuleIndex": 5,
+          "reason": "matched",
+          "egressClientId": 2
+        }
+      },
+      {
+        "name": "refused-host-bits-does-not-steer",
+        "destination": "2001:db8:3::1",
+        "description": "覆盖它的 /48 因主机位非零被拒，落回 /32",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": 0,
+          "reason": "matched"
+        }
+      },
+      {
+        "name": "disabled-rule-does-not-steer",
+        "destination": "2001:db8:4::1",
+        "description": "覆盖它的 /48 已停用，落回 /32",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": 0,
+          "reason": "matched"
+        }
+      },
+      {
+        "name": "broad-rule-for-other-global-addresses",
+        "destination": "2001:db9::1",
+        "description": "落在 2000::/3 内",
+        "expect": {
+          "action": "egress",
+          "matchedRuleIndex": 10,
+          "reason": "matched",
+          "egressClientId": 3
+        }
+      },
+      {
+        "name": "unmatched-falls-through-to-direct",
+        "destination": "fd00::1",
+        "description": "不在任何规则内，本地直连",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "name": "mapped-destination-is-not-an-ipv4-destination",
+        "destination": "::ffff:cb00:7109",
+        "description": "IPv4 映射写法的目的地址按 IPv6 读，IPv4 规则 203.0.113.0/24 不覆盖它；线上的 IPv4 包按 IPv4 规则走",
+        "expect": {
+          "action": "direct",
+          "matchedRuleIndex": null,
+          "reason": "default"
+        }
+      },
+      {
+        "name": "ipv4-destination-ignores-ipv6-rules",
+        "destination": "203.0.113.9",
+        "description": "IPv4 目的只看 IPv4 规则，两族规则从不竞争",
+        "expect": {
+          "action": "egress",
+          "matchedRuleIndex": 4,
+          "reason": "matched",
+          "egressClientId": 2
+        }
+      }
+    ],
+    "configValidation": [
+      {
+        "name": "ipv6-cidr",
+        "rule": {
+          "match": "2001:db8::/32",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        "code": null
+      },
+      {
+        "name": "ipv6-single",
+        "rule": {
+          "match": "2001:db8::1",
+          "action": "block"
+        },
+        "code": null
+      },
+      {
+        "name": "ipv6-host-bits-set",
+        "rule": {
+          "match": "2001:db8::1/32",
+          "action": "block"
+        },
+        "code": "EGRESS_RULE_MALFORMED"
+      },
+      {
+        "name": "ipv6-dotted-tail",
+        "rule": {
+          "match": "::ffff:192.0.2.1",
+          "action": "block"
+        },
+        "code": "EGRESS_RULE_MALFORMED"
+      },
+      {
+        "name": "ipv6-mapped",
+        "rule": {
+          "match": "::ffff:cb00:7100/120",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        "code": "EGRESS_RULE_MALFORMED"
+      },
+      {
+        "name": "ipv6-default-route",
+        "rule": {
+          "match": "::/0",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        "code": "EGRESS_RULE_DEFAULT_ROUTE"
+      },
+      {
+        "name": "ipv6-port-outranks-ipv6-unsupported",
+        "rule": {
+          "match": "2001:db8::/32",
+          "action": "egress",
+          "egressClientId": 2,
+          "port": 443
+        },
+        "code": "EGRESS_RULE_PORT_UNSUPPORTED"
+      },
+      {
+        "name": "ipv6-missing-target-outranks-ipv6-unsupported",
+        "rule": {
+          "match": "2001:db8::/32",
+          "action": "egress"
+        },
+        "code": "EGRESS_RULE_MISSING_TARGET"
+      },
+      {
+        "name": "colon-outranks-domain",
+        "rule": {
+          "match": "*.example.com:443",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        "code": "EGRESS_RULE_MALFORMED"
+      },
+      {
+        "name": "ipv6-in-force",
+        "rule": {
+          "match": "2001:db8::/32",
+          "action": "egress",
+          "egressClientId": 2
+        },
+        "code": null
+      },
+      {
+        "name": "ipv6-direct-in-force",
+        "rule": {
+          "match": "2001:db8::1",
+          "action": "direct"
+        },
+        "code": null
+      }
+    ],
+    "withoutIpv6DataPlane": {
+      "description": "同一份规则在没有 IPv6 数据面的消费端（三个客户端目前都是）：IPv6 规则全部不生效，IPv6 目的地址一律未匹配；IPv4 规则照常。code 为 null 即生效。",
+      "ruleCodes": [
+        {
+          "index": 0,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        },
+        {
+          "index": 1,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        },
+        {
+          "index": 2,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        },
+        {
+          "index": 3,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        },
+        {
+          "index": 4,
+          "code": null
+        },
+        {
+          "index": 5,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        },
+        {
+          "index": 6,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        },
+        {
+          "index": 7,
+          "code": "EGRESS_RULE_MALFORMED"
+        },
+        {
+          "index": 8,
+          "code": "EGRESS_RULE_MALFORMED"
+        },
+        {
+          "index": 9,
+          "code": "EGRESS_RULE_DISABLED"
+        },
+        {
+          "index": 10,
+          "code": "EGRESS_RULE_IPV6_UNSUPPORTED"
+        }
+      ],
+      "cases": [
+        {
+          "destination": "2001:db8:8000::1",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db8::1",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db8:1::50",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db8:1::51",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:0DB8:0001:0000:0000:0000:0000:0050",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db8:2::9",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db8:3::1",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db8:4::1",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "2001:db9::1",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "fd00::1",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "::ffff:cb00:7109",
+          "expect": {
+            "action": "direct",
+            "matchedRuleIndex": null,
+            "reason": "default"
+          }
+        },
+        {
+          "destination": "203.0.113.9",
+          "expect": {
+            "action": "egress",
+            "matchedRuleIndex": 4,
+            "reason": "matched",
+            "egressClientId": 2
+          }
+        }
+      ]
+    }
   }
 }

@@ -71,7 +71,9 @@ func (s *registrationService) Request(
 	if err != nil {
 		return registrationChallengeResponse{}, err
 	}
-	if existing, findErr := s.db.FindManagementUserByUsername(ctx, username); findErr != nil {
+	// Registration opens accounts in the default tenant only, so only its login names conflict.
+	if existing, findErr := s.db.FindManagementUserByLogin(ctx, normalizeTenant(s.config.TenantID),
+		username); findErr != nil {
 		return registrationChallengeResponse{}, findErr
 	} else if existing != nil {
 		return registrationChallengeResponse{}, conflict("用户名已存在: " + username)
@@ -175,7 +177,8 @@ func (s *registrationService) Verify(
 		}
 		return store.ManagementUser{}, validation("验证码无效或已过期")
 	}
-	if existing, findErr := s.db.FindManagementUserByUsername(ctx, challenge.Username); findErr != nil {
+	if existing, findErr := s.db.FindManagementUserByLogin(ctx, normalizeTenant(s.config.TenantID),
+		challenge.Username); findErr != nil {
 		return store.ManagementUser{}, findErr
 	} else if existing != nil {
 		return store.ManagementUser{}, conflict("用户名已存在: " + challenge.Username)
@@ -195,12 +198,13 @@ func (s *registrationService) Verify(
 		UpdatedAt:    now,
 	}
 	userEmail := store.ManagementUserEmail{
-		Username: user.Username, Email: challenge.Email, VerifiedAt: now, CreatedAt: now, UpdatedAt: now,
+		Email: challenge.Email, VerifiedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := s.db.CompleteVerifiedRegistration(ctx, *challenge, user, userEmail); err != nil {
+	created, err := s.db.CompleteVerifiedRegistration(ctx, *challenge, user, userEmail)
+	if err != nil {
 		return store.ManagementUser{}, conflict("用户名或邮箱已被注册")
 	}
-	return user, nil
+	return created, nil
 }
 
 func (s *registrationService) RunCleanup(ctx context.Context) {

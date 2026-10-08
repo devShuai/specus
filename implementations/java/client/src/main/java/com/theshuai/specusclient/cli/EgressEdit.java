@@ -130,8 +130,8 @@ public final class EgressEdit {
     static String explanation(String code) {
         return switch (code) {
             case PeerEgressCodes.RULE_DOMAIN_UNSUPPORTED -> "domain rules are not supported yet; use an IPv4 address or CIDR range";
-            case PeerEgressCodes.RULE_IPV6_UNSUPPORTED -> "IPv6 rules are not supported; use an IPv4 address or CIDR range";
-            case PeerEgressCodes.RULE_MALFORMED -> "not an IPv4 address or CIDR range with zero host bits, or an unknown action";
+            case PeerEgressCodes.RULE_IPV6_UNSUPPORTED -> "IPv6 rules are not in force yet: this client cannot carry IPv6 traffic";
+            case PeerEgressCodes.RULE_MALFORMED -> "not an IPv4 or IPv6 address or CIDR range with zero host bits (IPv4-mapped IPv6 is written as IPv4), or an unknown action";
             case PeerEgressCodes.RULE_DEFAULT_ROUTE -> "0.0.0.0/0 would take over the default route, which is not allowed";
             case PeerEgressCodes.RULE_MESH_OVERLAP -> "overlaps the Peer Mesh network";
             case PeerEgressCodes.RULE_FAKE_IP_OVERLAP -> "overlaps the fake-IP pool (peerEgressFakeIpCidr), whose addresses only domain rules hand out";

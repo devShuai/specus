@@ -83,6 +83,11 @@ final class NettyHttpTransport {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Object lifecycleLock = new Object();
     private volatile Channel channel;
+    // How far the exchange got, so a failure can be placed in its phase (see HttpRouteFailure).
+    private volatile boolean connected;
+    private volatile boolean handshakeComplete;
+    private volatile boolean responseHeadSeen;
+    private volatile String failureClassification;
 
     NettyHttpTransport(URI target, String method, List<String> requestHeaders,
                        String boundedRange, long contentLength, List<String> requestTrailerNames,
@@ -105,11 +110,12 @@ final class NettyHttpTransport {
         String host = target == null ? null : target.getHost();
         if (host == null || scheme == null
                 || !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
-            fail(new IOException("invalid HTTP target"));
+            fail(new IOException("invalid HTTP target"), HttpRouteFailure.TARGET_INVALID);
             return;
         }
         int port = target.getPort() >= 0 ? target.getPort()
                 : "https".equalsIgnoreCase(scheme) ? 443 : 80;
+        handshakeComplete = !"https".equalsIgnoreCase(scheme);
         Bootstrap bootstrap = new Bootstrap()
                 .group(EVENT_LOOPS)
                 .channelFactory(ProtectedNioSocketChannel::new)
@@ -121,8 +127,13 @@ final class NettyHttpTransport {
                     protected void initChannel(SocketChannel socketChannel) throws Exception {
                         protect(socketChannel);
                         if ("https".equalsIgnoreCase(scheme)) {
-                            socketChannel.pipeline().addLast(
-                                    tlsHandler(socketChannel, host, port));
+                            io.netty.handler.ssl.SslHandler tls = tlsHandler(socketChannel, host, port);
+                            tls.handshakeFuture().addListener(handshake -> {
+                                if (handshake.isSuccess()) {
+                                    handshakeComplete = true;
+                                }
+                            });
+                            socketChannel.pipeline().addLast(tls);
                         }
                         socketChannel.pipeline().addLast(new HttpClientCodec());
                         socketChannel.pipeline().addLast(new ResponseHandler());
@@ -142,6 +153,7 @@ final class NettyHttpTransport {
                         ? new IOException("HTTP upstream connect failed") : future.cause());
                 return;
             }
+            connected = true;
             try {
                 synchronized (lifecycleLock) {
                     if (closed.get()) {
@@ -170,7 +182,7 @@ final class NettyHttpTransport {
             return;
         }
         Channel active = requireActive();
-        active.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(data))).sync();
+        write(active, new DefaultHttpContent(Unpooled.wrappedBuffer(data)));
     }
 
     void finishRequest(List<String> trailers) throws Exception {
@@ -178,7 +190,20 @@ final class NettyHttpTransport {
         Channel active = requireActive();
         DefaultLastHttpContent last = new DefaultLastHttpContent(Unpooled.EMPTY_BUFFER);
         appendTrailers(last.trailingHeaders(), trailers, requestTrailerNames);
-        active.writeAndFlush(last).sync();
+        write(active, last);
+    }
+
+    /**
+     * Writes part of the request. A write the connection refuses is the exchange failing, recorded
+     * here before the caller hears of it: the event loop may not have reported it yet.
+     */
+    private void write(Channel active, Object message) throws Exception {
+        try {
+            active.writeAndFlush(message).sync();
+        } catch (Exception error) {
+            fail(error);
+            throw error;
+        }
     }
 
     void awaitCompletion() throws Exception {
@@ -247,7 +272,11 @@ final class NettyHttpTransport {
             }
             throw new IOException("HTTP upstream failed", cause);
         } catch (TimeoutException error) {
-            throw new IOException("HTTP upstream connect timed out", error);
+            IOException timedOut = new IOException("HTTP upstream connect timed out", error);
+            // Still connecting or in the TLS handshake: the connect timeout. A request head the
+            // target never takes is no connect failure.
+            fail(timedOut, connected && handshakeComplete ? null : HttpRouteFailure.CONNECT_TIMEOUT);
+            throw timedOut;
         }
     }
 
@@ -258,7 +287,10 @@ final class NettyHttpTransport {
         }
         Channel active = channel;
         if (active == null || !active.isActive()) {
-            throw new IOException("HTTP upstream is closed");
+            // Closed by the target before the event loop said so; recorded as its failure here.
+            IOException closedError = new IOException("HTTP upstream is closed");
+            fail(closedError);
+            throw closedError;
         }
         return active;
     }
@@ -315,6 +347,13 @@ final class NettyHttpTransport {
         @Override
         protected void channelRead0(ChannelHandlerContext context, HttpObject message) {
             try {
+                // The decoder does not throw on bytes it cannot use: it hands on a message marked as
+                // failed -- a made-up "999 Unknown" head for an unusable status line, or a last
+                // chunk for a broken body. Neither came from the target.
+                if (message.decoderResult().isFailure()) {
+                    throw new IOException("invalid upstream HTTP response",
+                            message.decoderResult().cause());
+                }
                 if (message instanceof HttpResponse response) {
                     int status = response.status().code();
                     informational = status >= 100 && status < 200 && status != 101;
@@ -323,6 +362,7 @@ final class NettyHttpTransport {
                             throw new IOException("duplicate upstream HTTP response head");
                         }
                         responseStarted = true;
+                        responseHeadSeen = true;
                         declaredTrailers = declaredTrailerNames(response.headers());
                         listener.onResponseHead(status, flattenHeaders(response.headers()), declaredTrailers);
                     }
@@ -374,11 +414,26 @@ final class NettyHttpTransport {
         }
     }
 
+    /**
+     * Why the exchange failed before any response head arrived, in the closed set of
+     * {@link HttpRouteFailure}, or null: it has not failed, a head had arrived, it was closed from
+     * this side, or the failure could not be placed.
+     */
+    String failureClassification() {
+        return failureClassification;
+    }
+
     private void fail(Throwable error) {
+        fail(error, null);
+    }
+
+    private void fail(Throwable error, String classification) {
         Throwable cause = error == null ? new IOException("HTTP upstream failed") : error;
         if (!failure.compareAndSet(null, cause)) {
             return;
         }
+        // Set before anyone hears of the failure, so whoever does can read it.
+        failureClassification = classification != null ? classification : classify(cause);
         try {
             listener.onFailure(cause);
         } catch (Throwable ignored) {
@@ -390,6 +445,19 @@ final class NettyHttpTransport {
         if (active != null) {
             active.close();
         }
+    }
+
+    private String classify(Throwable cause) {
+        if (responseHeadSeen || closed.get()) {
+            return null;
+        }
+        if (!connected) {
+            return HttpRouteFailure.connectFailure(cause);
+        }
+        if (!handshakeComplete) {
+            return HttpRouteFailure.handshakeFailure(cause);
+        }
+        return HttpRouteFailure.exchangeFailure(cause);
     }
 
     static List<String> validTrailerNames(List<String> names) {

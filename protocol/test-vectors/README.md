@@ -21,6 +21,14 @@ implementations/java/common/src/test/java/com/theshuai/common/tools/WireFixtureG
 更新 schema 后必须重新生成整个目录，并让 Java、Go、.NET、C 的 decoder 与 roundtrip 测试同时通过。
 `login_request.bin` 固定包含 `connectionRole=control`。
 
+`nat-control-size-v1.json` 描述单条 `NAT_CONTROL` 的 1 MiB 上限在管理接口上如何执行，语义见
+[`protocol/spec/control-protocol.md`](../spec/control-protocol.md) 的「NAT_CONTROL 的大小」。`sizing` 给出
+空串客户端名下的 JSON 字节数与为改名预留后的 MESSAGE body 字节数；`management` 是在恰好 1 MiB 的边界上新建、
+启用、修改映射和 route 的步骤与期望状态码。Java、Go、.NET 服务端的测试直接读取并重放这两部分。
+`existingOversize` 是数据库里已有超限配置的场景：control 登录不断开、Peer Mesh 登录推送照常、手动下发返回 `409`、
+变更接口照常生效；四个服务端的测试都按它重放。`writeFailure` 是客户端在线、control 连接却写不进去的场景：
+手动下发按不在线返回 `409`，变更接口照常返回；语义见同一文档的「NAT_CONTROL 写失败与数据库错误」。
+
 ## Peer Mesh
 
 - `peer-mesh-spm2.json`：固定 session key、方向 traffic key、nonce、明文和完整 SPM2 帧。
@@ -100,12 +108,24 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
 
 - `http-route-lifecycle-v1.json`：route 何时不再可达、客户端何时得知。`server.scenarios` 用真实管理 API、一个仍对任何
   route 名都回 200 的假客户端和公网入口重放：删除在线客户端的最后一条受保护 route、客户端离线时删除后凭 token 重连、
-  停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除客户端、删除后同名重建；期望是每一步的登录推送与
+  停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除客户端、删除后同名重建，以及删除、停用或改名后凭旧
+  token 重连（`reconnect`：被拒，或登录成改名后的账户而不是同名新账户，见
+  [`protocol/spec/client-auth.md`](../spec/client-auth.md)）；期望是每一步的登录推送与
   变更推送里的 route 集合（空数组也必须出现）、连接是否被关闭，以及入口状态码、`no-store`、Basic 质询和请求是否到达
   客户端。`client.cases` 给出登录快照和一串真实 `NAT_CONTROL` 原文，期望是每步之后的 route 表；缺省与 `null` 都表示
   清空。由 `tools/protocol/generate_http_route_lifecycle_vectors.py` 生成，语义见
   [`protocol/spec/http-route.md`](../spec/http-route.md) 第 1、2 节。Java、Go、.NET 与 C 服务端重放全部
   `server.scenarios`，Java、Go、.NET 与 Android 客户端重放全部 `client.cases`。
+
+## 管理账号
+
+- `management-accounts-v1.json`：本地 token 的账号键声明 `uid` 与用户列表里的内置管理员。给出带固定账号键的账号、
+  一组 token 声明（带或不带 `tenant_id`、`uid`）与期望解析到的账号（`null` 表示解析不到），以及三种调用者看到的
+  用户列表；`accountDeletion` 另有自己的账号与按登录名归属的各类行，逐步重放删除账号（仍拥有客户端或凭证时
+  `409`、转走或删除后成功）并给出删除后剩下的行。手写，语义见
+  [`protocol/spec/management-accounts.md`](../spec/management-accounts.md) 第 5–7 节，重放方法见其第 12 节。
+  Java、Go、.NET 与 C 服务端经真实 HTTP 处理代码（`/api/admin/me`、`/auth/refresh`、`/api/admin/users`、
+  `DELETE /api/admin/users/{username}`）重放全部用例。
 
 ## 拒绝规则
 

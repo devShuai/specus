@@ -2,7 +2,9 @@
 
 Install runtime/build dependencies including hiredis and utf8proc (`libhiredis-dev` and
 `libutf8proc-dev` on Ubuntu). Redis itself may run on a separate host; install `redis-server` only
-when this machine owns that service or when running the integration tests.
+when this machine owns that service or when running the integration tests. `libbrotli-dev` is
+optional: with it the build decodes `Content-Encoding: br` in traffic details and media manifests,
+as the Java server does; without it those bodies are shown as stored.
 
 ```bash
 make -C implementations/c/server release

@@ -379,7 +379,7 @@ func (h *productMetricsHarness) addActor(actor pmVectorActor) {
 		return
 	}
 	now := time.Now()
-	if err := h.db.InsertManagementUser(h.ctx, store.ManagementUser{Username: actor.Username,
+	if _, err := h.db.InsertManagementUser(h.ctx, store.ManagementUser{Username: actor.Username,
 		TenantID: actor.TenantID, PasswordHash: "unused", Role: actor.Role, Enabled: true, CreatedAt: now,
 		UpdatedAt: now}); err != nil {
 		h.t.Fatalf("insert user %s: %v", actor.Username, err)

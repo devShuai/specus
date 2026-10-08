@@ -80,7 +80,7 @@ final class PeerEgressFlowTable {
          * for a flow to a name, the resolved address it was authorised for, while the key keeps the
          * consumer's fake address. Re-authorization judges this one, as the opening did.
          */
-        int address;
+        String address;
 
         /**
          * Whatever the caller attached: a connection, a socket, a cancellation handle. Stored so
@@ -94,7 +94,7 @@ final class PeerEgressFlowTable {
             this.consumer = consumer;
             this.openedAtMs = nowMs;
             this.lastSeenMs = nowMs;
-            this.address = key.remoteIp();
+            this.address = Ipv4Cidr.format(key.remoteIp());
         }
     }
 
@@ -333,7 +333,7 @@ final class PeerEgressFlowTable {
             boolean allowed = peerAclAllows == null || peerAclAllows.test(flow.consumer);
             PeerEgressRequest request = new PeerEgressRequest();
             request.setConsumerClientId(flow.consumer);
-            request.setDestinationIp(Ipv4Cidr.format(flow.address));
+            request.setDestinationIp(flow.address);
             request.setName(flow.name);
             request.setDestinationPort(flow.key.remotePort());
             request.setProtocol(flow.key.protocolName());

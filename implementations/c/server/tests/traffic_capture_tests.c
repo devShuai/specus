@@ -2,13 +2,15 @@
  * Java TrafficInspectionServiceTests and HttpTrafficExchangeStoreTests for the C capture path:
  * the capture switch (off by default), the HTTP previews (gzip decoded, binary bodies without a
  * text preview, cut to the preview size), the body type classifier, TCP frames stored in full with
- * a short preview, and the SQLite summary that neither reads nor returns headers and previews.
+ * a short preview, the SQLite summary that neither reads nor returns headers, previews and bodies,
+ * and the detail that shows a stored body as Java's HttpBodyDataCodec does.
  *
- * C keeps previews rather than HTTP bodies, so Java's assertions on the stored body bytes have no
- * counterpart; requestTruncated/responseTruncated say whether the preview holds the whole body.
+ * C keeps the first 64 KiB of each body where Java keeps all of it; requestTruncated and
+ * responseTruncated say the body was longer than what was kept.
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include "decompression_limits.h"
 #include "storage.h"
 #include "traffic_capture.h"
 
@@ -297,12 +299,20 @@ static void test_store(void)
                    detail->response_preview_text);
             EXPECT(strncmp(detail->response_preview_hex, "1F 8B 08", 8U) == 0, "gzip hex %s",
                    detail->response_preview_hex);
+            /* Both bodies were kept whole, so neither is truncated, however short the previews. */
             EXPECT(strcmp(detail->request_preview_text, "ping") == 0 && !detail->request_truncated
-                       && detail->response_truncated,
+                       && !detail->response_truncated,
                    "request preview %s, truncated %d/%d", detail->request_preview_text, detail->request_truncated,
                    detail->response_truncated);
             EXPECT(strstr(detail->response_headers, "Content-Encoding: gzip") != NULL, "detail headers %s",
                    detail->response_headers);
+            /* gzipHttpBodyIsDecodedBeforeStored: the stored body is the bytes as they came. */
+            EXPECT(detail->response_body_data_len == gzip_len
+                       && memcmp(detail->response_body_data, gzip, gzip_len) == 0
+                       && detail->request_body_data_len == 4U && memcmp(detail->request_body_data, "ping", 4U) == 0,
+                   "stored bodies: %zu response bytes of %zu, %zu request bytes", detail->response_body_data_len,
+                   gzip_len, detail->request_body_data_len);
+            st_storage_http_exchange_free_bodies(detail);
         }
         found = 1;
         EXPECT(st_storage_get_http_exchange_visible(path, summary->id, "tenant-a", "bob", 0, detail, &found) == 0
@@ -336,8 +346,8 @@ static void test_store(void)
     st_storage_tcp_frame frames[1];
     memset(frames, 0, sizeof(frames));
     count = 0U;
-    EXPECT(recorded && st_storage_list_tcp_frames_visible(path, 0, 0, "tenant-a", "alice", 0, 0, 10, frames, 1U,
-                                                          &count, &total) == 0 && count == 1U,
+    EXPECT(recorded && st_storage_list_tcp_frames_visible(path, 0, ST_STORAGE_ANY_LISTEN_PORT, "tenant-a", "alice", 0,
+                                                          0, 10, frames, 1U, &count, &total) == 0 && count == 1U,
            "TCP frame record or list failed");
     if (count == 1U) {
         st_storage_tcp_frame frame;
@@ -358,6 +368,181 @@ static void test_store(void)
     unlink(path);
 }
 
+static void display(const char *name, const void *body, size_t len, const char *content_type,
+                    const char *headers, const char *fallback, const char *expected)
+{
+    char *text = st_traffic_body_display_text((const uint8_t *)body, len, content_type, headers, fallback);
+    EXPECT(text != NULL && strcmp(text, expected) == 0, "%s: display text \"%s\", expected \"%s\"", name,
+           text == NULL ? "(null)" : text, expected);
+    free(text);
+}
+
+/*
+ * HttpBodyDataCodec.toDisplayText, the detail's view of a stored body (HttpTrafficExchangeStoreTests
+ * binary bodies as data: URLs): text is shown whole and sanitized whatever the preview size, a
+ * binary body as data:<media type>;base64, a Content-Encoding decoded first, and an encoding that
+ * cannot be decoded as the raw bytes under application/octet-stream.
+ */
+static void test_body_display(void)
+{
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    static const uint8_t mp4[] = {0x00, 0x00, 0x00, 0x18};
+    display("PNG", png, sizeof(png), "image/png", "Content-Type: image/png", "fallback",
+            "data:image/png;base64,iVBORw0KGgo=");
+    display("PNG with parameters", png, sizeof(png), "image/png;charset=UTF-8", "", "",
+            "data:image/png;base64,iVBORw0KGgo=");
+    display("MP4", mp4, sizeof(mp4), "video/mp4", "Content-Type: video/mp4", "fallback",
+            "data:video/mp4;base64,AAAAGA==");
+    display("binary without a type", png, sizeof(png), NULL, NULL, "",
+            "data:application/octet-stream;base64,iVBORw0KGgo=");
+    display("binary with a malformed type", png, sizeof(png), "not a type", NULL, "",
+            "data:application/octet-stream;base64,iVBORw0KGgo=");
+    display("nothing stored", NULL, 0U, "text/plain", "", "fallback", "fallback");
+    display("text, longer than any preview", "0123456789abcdefghij", 20U, "text/plain", "", "0123",
+            "0123456789abcdefghij");
+    display("text sniffed without a type", "plain words\r\n", 13U, NULL, "", "", "plain words\r\n");
+    display("controls in text", "a\x01" "b", 3U, "text/plain", "", "", "a.b");
+
+    const char *json = "{\"ok\":true,\"message\":\"gzip response\"}";
+    size_t gzip_len = 0U;
+    size_t deflate_len = 0U;
+    uint8_t *gzip = compress_with((const uint8_t *)json, strlen(json), 16 + MAX_WBITS, &gzip_len);
+    uint8_t *raw_deflate = compress_with((const uint8_t *)json, strlen(json), -MAX_WBITS, &deflate_len);
+    EXPECT(gzip != NULL && raw_deflate != NULL, "compression failed");
+    if (gzip != NULL && raw_deflate != NULL) {
+        display("gzip", gzip, gzip_len, "application/json",
+                "Content-Type: application/json\nContent-Encoding: gzip", "", json);
+        display("raw deflate, header name in any case", raw_deflate, deflate_len, "application/json",
+                "content-encoding:  deflate ", "", json);
+        display("identity only", json, strlen(json), "application/json", "Content-Encoding: identity", "", json);
+        if (!st_decompression_brotli_supported()) {
+            /* Without libbrotlidec br is an encoding C cannot undo: the raw bytes as octet-stream. */
+            char *unreadable = st_traffic_body_display_text(gzip, gzip_len, "application/json",
+                                                            "Content-Encoding: br", "");
+            EXPECT(unreadable != NULL
+                       && strncmp(unreadable, "data:application/octet-stream;base64,H4sI", 41U) == 0,
+                   "br without libbrotlidec must show the raw bytes as octet-stream: %s",
+                   unreadable == NULL ? "(null)" : unreadable);
+            free(unreadable);
+        }
+        /*
+         * A real br body (RFC 7932 by hand: one uncompressed meta-block holding "hello brotli"):
+         * decoded like Java's org.brotli:dec when the build has libbrotlidec, else shown as stored.
+         */
+        static const uint8_t brotli[] = {
+            0xB0U, 0x00U, 0x10U, 'h', 'e', 'l', 'l', 'o', ' ', 'b', 'r', 'o', 't', 'l', 'i', 0x03U
+        };
+        if (st_decompression_brotli_supported()) {
+            display("br", brotli, sizeof(brotli), "text/plain", "Content-Encoding: br", "", "hello brotli");
+            http_text("br preview", brotli, sizeof(brotli), "text/plain", "br", 5U, "hello");
+        } else {
+            display("br without libbrotlidec", brotli, sizeof(brotli), "text/plain", "Content-Encoding: br", "",
+                    "data:application/octet-stream;base64,sAAQaGVsbG8gYnJvdGxpAw==");
+        }
+        uint8_t corrupt[8] = {0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef};
+        display("corrupt gzip", corrupt, sizeof(corrupt), "application/json", "Content-Encoding: gzip", "",
+                "data:application/octet-stream;base64,H4sIAN6tvu8=");
+    }
+    free(gzip);
+    free(raw_deflate);
+}
+
+/*
+ * TrafficInspectionServiceTests.httpBodiesAreStoredAsBinaryWithShortSearchPreview and
+ * binaryHttpBodyIsStoredAsBinaryWithoutTextPreview on the SQLite store: the bodies are kept (the
+ * first 64 KiB of a longer one, then truncated), the previews stay short, a PNG response has no
+ * text preview and its detail is a data: URL; the summary list carries no body.
+ */
+static void test_stored_bodies(void)
+{
+    char path[] = "/tmp/specus_c_traffic_bodies.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        ++failures;
+        return;
+    }
+    close(fd);
+    st_storage_client client;
+    if (st_storage_init(path, 0) != 0
+        || st_storage_upsert_client(path, 0, "tenant-a", "Demo", "alice", 1, 60, &client) != 0) {
+        ++failures;
+        unlink(path);
+        return;
+    }
+    size_t request_len = 36U * 4096U;
+    uint8_t *request_body = (uint8_t *)malloc(request_len);
+    for (size_t i = 0; request_body != NULL && i < request_len; ++i) {
+        request_body[i] = (uint8_t)"0123456789abcdefghijklmnopqrstuvwxyz"[i % 36U];
+    }
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    setenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES", "8", 1);
+    st_storage_http_exchange_record record = {
+        .tenant_id = "tenant-a",
+        .client_id = client.id,
+        .client_name = "Demo",
+        .route = "api",
+        .method = "POST",
+        .relative_path = "/orders",
+        .status_code = 200,
+        .success = 1,
+        .request_bytes = (long long)request_len,
+        .response_bytes = (long long)sizeof(png),
+        .request_content_type = "text/plain",
+        .response_content_type = "image/png;charset=UTF-8",
+        .request_headers = "Content-Type: text/plain",
+        .response_headers = "Content-Type: image/png;charset=UTF-8",
+        .request_body = request_body,
+        .request_body_len = request_len,
+        .response_body = png,
+        .response_body_len = sizeof(png),
+        .captured_at = "2026-10-07T00:00:00Z"
+    };
+    int recorded = request_body != NULL && st_storage_record_http_exchange(path, &record) == 0;
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES");
+    EXPECT(recorded, "HTTP exchange with bodies was not recorded");
+
+    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(2U, sizeof(*items));
+    size_t count = 0U;
+    long long total = 0;
+    int listed = recorded && items != NULL
+        && st_storage_list_http_exchanges_visible(path, 0, NULL, NULL, NULL, NULL, "tenant-a", "alice", 0, 0, 10,
+                                                  items, 2U, &count, &total) == 0 && count == 1U;
+    EXPECT(listed, "HTTP exchange list failed");
+    if (listed) {
+        EXPECT(items[0].request_body_data == NULL && items[0].response_body_data == NULL,
+               "the summary list read the bodies");
+        int found = 0;
+        st_storage_http_exchange *detail = &items[1];
+        EXPECT(st_storage_get_http_exchange_visible(path, items[0].id, "tenant-a", "alice", 0, detail, &found) == 0
+                   && found, "detail lookup failed");
+        if (found) {
+            EXPECT(detail->request_body_data_len == ST_TRAFFIC_BODY_CAPTURE_BYTES
+                       && memcmp(detail->request_body_data, request_body, ST_TRAFFIC_BODY_CAPTURE_BYTES) == 0
+                       && detail->request_bytes == (long long)request_len && detail->request_truncated,
+                   "request body: %zu bytes kept of %lld, truncated %d", detail->request_body_data_len,
+                   detail->request_bytes, detail->request_truncated);
+            EXPECT(strcmp(detail->request_preview_text, "01234567") == 0, "request preview %s",
+                   detail->request_preview_text);
+            EXPECT(detail->response_body_data_len == sizeof(png)
+                       && memcmp(detail->response_body_data, png, sizeof(png)) == 0 && !detail->response_truncated
+                       && detail->response_preview_text[0] == '\0'
+                       && strcmp(detail->response_body_type, "image") == 0,
+                   "PNG response: %zu bytes, truncated %d, preview \"%s\", type %s", detail->response_body_data_len,
+                   detail->response_truncated, detail->response_preview_text, detail->response_body_type);
+            char *shown = st_traffic_body_display_text(detail->response_body_data, detail->response_body_data_len,
+                                                       detail->response_content_type, detail->response_headers,
+                                                       detail->response_preview_text);
+            EXPECT(shown != NULL && strcmp(shown, "data:image/png;base64,iVBORw0KGgo=") == 0, "PNG detail %s",
+                   shown == NULL ? "(null)" : shown);
+            free(shown);
+            st_storage_http_exchange_free_bodies(detail);
+        }
+    }
+    free(items);
+    free(request_body);
+    unlink(path);
+}
+
 int main(void)
 {
     test_capture_switch_and_preview_size();
@@ -365,6 +550,8 @@ int main(void)
     test_text_sanitizing();
     test_body_types();
     test_store();
+    test_body_display();
+    test_stored_bodies();
     if (failures != 0) {
         fprintf(stderr, "%d traffic capture check(s) failed\n", failures);
         return 1;

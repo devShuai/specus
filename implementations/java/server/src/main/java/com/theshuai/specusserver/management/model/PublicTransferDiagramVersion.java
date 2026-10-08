@@ -11,6 +11,7 @@ import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.Length;
 
 @Entity
 @Table(name = "public_transfer_diagram_version",
@@ -34,8 +35,9 @@ public class PublicTransferDiagramVersion {
     @Column(name = "author_peer_id", nullable = false, length = 120)
     private String authorPeerId;
 
+    // A @Lob column keeps @Column's default length of 255, which MySQL turns into tinyblob.
     @Lob
-    @Column(name = "snapshot_data", nullable = false)
+    @Column(name = "snapshot_data", nullable = false, length = Length.LONG32)
     private byte[] snapshotData;
 
     @Column(name = "size_bytes", nullable = false)

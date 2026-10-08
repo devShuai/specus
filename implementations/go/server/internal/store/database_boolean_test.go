@@ -50,7 +50,7 @@ func TestScanManagementUserAcceptsMySQLBit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scanManagementUser: %v", err)
 	}
-	if !user.Enabled || user.Username != "test-user" || user.TenantID != "default" {
+	if !user.Enabled || user.Username != "test-user" || user.AccountKey != "account-key" || user.TenantID != "default" {
 		t.Fatalf("unexpected management user: %+v", user)
 	}
 }
@@ -58,17 +58,18 @@ func TestScanManagementUserAcceptsMySQLBit(t *testing.T) {
 type managementUserBitScanner struct{}
 
 func (managementUserBitScanner) Scan(dest ...any) error {
-	*dest[0].(*string) = "test-user"
-	*dest[1].(*string) = "default"
-	*dest[2].(*string) = "hash"
-	*dest[3].(*string) = ""
+	*dest[0].(*string) = "account-key"
+	*dest[1].(*string) = "test-user"
+	*dest[2].(*string) = "default"
+	*dest[3].(*string) = "hash"
 	*dest[4].(*string) = ""
 	*dest[5].(*string) = ""
-	*dest[6].(*string) = ManagementRoleUser
-	if err := dest[7].(sql.Scanner).Scan([]byte{1}); err != nil {
+	*dest[6].(*string) = ""
+	*dest[7].(*string) = ManagementRoleUser
+	if err := dest[8].(sql.Scanner).Scan([]byte{1}); err != nil {
 		return err
 	}
-	*dest[8].(*string) = "2026-07-23T00:00:00.0000000Z"
 	*dest[9].(*string) = "2026-07-23T00:00:00.0000000Z"
+	*dest[10].(*string) = "2026-07-23T00:00:00.0000000Z"
 	return nil
 }

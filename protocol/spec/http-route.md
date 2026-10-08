@@ -102,7 +102,8 @@ header 或 body 中；它只用于服务端诊断：写入日志（以及实现�
 `protocol/test-vectors/http-route-lifecycle-v1.json`（由 `tools/protocol/generate_http_route_lifecycle_vectors.py`
 生成）固定本节与第 1 节的跨实现行为：Java、Go、.NET 与 C server 重放其中的 server 场景（删除在线客户端的最后一条
 受保护 route、客户端离线时删除后凭 token 重连、停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除
-客户端、删除后同名重建），Java、Go、.NET 与 Android 客户端重放 client 用例。
+客户端、删除后同名重建，以及删除、停用或改名后凭旧 token 重连：token 只登录签发它的账户，见
+[`client-auth.md`](client-auth.md)），Java、Go、.NET 与 Android 客户端重放 client 用例。
 
 ## 3. 请求流
 
@@ -243,7 +244,7 @@ data frame 可在 16 MiB 上限内规范化为一组 SWS2：首段保留 opcode/
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
 | .NET | `DirectHttpEndpoints`、`HttpSpecusStream`、`WebSocketSpecusStream` | `HttpStreamChannel`、`WebSocketSpecusChannel` |
 | Android | — | `SpecusCore.HttpStreamForwarder`、`SpecusCore.LocalWebSocketSpecus` |
-| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET）。请求体（定长或 chunked）先完整缓冲再以已知 `contentLength` 发送，chunked 的请求 trailers 被丢弃、不声明 `trailerNames` | 使用 Java/Go/.NET/Android v2 客户端 |
+| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET）。请求体（定长或 chunked）先完整缓冲再以已知 `contentLength` 发送；`Trailer` 头声明的合法名称放入 `trailerNames`，chunked 请求中已声明的 trailers 随 FIN 发送 | 使用 Java/Go/.NET/Android v2 客户端 |
 
 中央合法与 malformed NAT frame 位于 `protocol/test-vectors/control-v2/frames`；SWS2 的 canonical 与 malformed 样例位于
 `protocol/test-vectors/application-protocol-v2.json` 的 `webSocket`。

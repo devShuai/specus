@@ -15,7 +15,7 @@ namespace Specus.Server.Hosting;
 /// "initialize database" action. It mirrors Java's <c>DatabaseInitializer</c> while using
 /// EF Core migrations as the schema authority.
 /// </summary>
-public sealed class DatabaseInitializer
+public sealed partial class DatabaseInitializer
 {
     public const string DemoClientName = "Demo client";
     public const string DemoCredentialApiKey = "demo-client";
@@ -51,8 +51,10 @@ public sealed class DatabaseInitializer
         var normalizedOwner = string.IsNullOrWhiteSpace(ownerUsername) ? "admin" : ownerUsername.Trim();
         await using var scope = _services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        await CheckManagementLoginNamesBeforeMigrationAsync(db, cancellationToken).ConfigureAwait(false);
         await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
         await EnsureManagementUserTableAsync(db, cancellationToken).ConfigureAwait(false);
+        await EnsureManagementLoginNamesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureManagementRegistrationTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureClientDownloadLinkTableAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureClientMessageCapabilityColumnsAsync(db, cancellationToken).ConfigureAwait(false);
@@ -220,6 +222,8 @@ public sealed class DatabaseInitializer
         db.Database.ExecuteSqlRawAsync("""
             CREATE TABLE IF NOT EXISTS specus_management_user (
               username VARCHAR(80) PRIMARY KEY,
+              login_name VARCHAR(80),
+              login_name_normalized VARCHAR(80),
               tenant_id VARCHAR(80) NOT NULL,
               password_hash VARCHAR(64) NOT NULL,
               role VARCHAR(20) NOT NULL,

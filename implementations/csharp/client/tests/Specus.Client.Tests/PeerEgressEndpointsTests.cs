@@ -76,7 +76,9 @@ public class PeerEgressEndpointsTests
     {
         foreach (var cidr in PeerEgressEndpoints.LocalInterfaceCidrs())
         {
-            Assert.True(Ipv4Cidr.TryParse(cidr, out _),
+            // IPv6 networks are reported too; the parser refuses host bits and any spelling it would
+            // not read back.
+            Assert.True(cidr.Contains(':') ? Ipv6Cidr.TryParse(cidr, out _) : Ipv4Cidr.TryParse(cidr, out _),
                 $"{cidr} is not a prefix the judgment layer can read");
         }
     }

@@ -1404,6 +1404,16 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasColumnType("tinyint(1)")
                         .HasColumnName("enabled");
 
+                    b.Property<string>("LoginName")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("login_name");
+
+                    b.Property<string>("LoginNameNormalized")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("login_name_normalized");
+
                     b.Property<string>("OidcIdentityKey")
                         .HasMaxLength(64)
                         .HasColumnType("varchar(64)")
@@ -1454,6 +1464,10 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.HasIndex("TenantId")
                         .HasDatabaseName("idx_management_user_tenant");
+
+                    b.HasIndex("TenantId", "LoginNameNormalized")
+                        .IsUnique()
+                        .HasDatabaseName("uq_management_user_tenant_login_name");
 
                     b.ToTable("specus_management_user", (string)null);
                 });

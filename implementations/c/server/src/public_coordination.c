@@ -22,8 +22,8 @@
 #include <unistd.h>
 
 #define ST_CLUSTER_EVENT_HEADER_BYTES 26U
-#define ST_CLUSTER_EVENT_MAX_GROUP_BYTES 128U
-#define ST_CLUSTER_EVENT_MAX_ID_BYTES 512U
+#define ST_CLUSTER_EVENT_MAX_GROUP_BYTES ST_PUBLIC_CLUSTER_EVENT_GROUP_BYTES
+#define ST_CLUSTER_EVENT_MAX_ID_BYTES ST_PUBLIC_CLUSTER_EVENT_ID_BYTES
 #define ST_CLUSTER_EVENT_MAX_PAYLOAD_BYTES (256U * 1024U)
 #define ST_CLUSTER_REVISION_TTL_MS 604800000LL
 
@@ -1063,9 +1063,16 @@ static int cluster_net_groups(const st_public_cluster_participant *recipient,
     return 0;
 }
 
+/*
+ * Java PublicTransferCoordinationService.sameNetAddress: an empty, blank or "unknown" address is
+ * not identifiable, so two such participants never share a net even when the strings are equal.
+ */
 static int cluster_address_known(const char *address)
 {
-    return address != NULL && *address != '\0' && strcasecmp(address, "unknown") != 0;
+    if (address == NULL || strcasecmp(address, "unknown") == 0) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)address; *cursor != '\0'; ++cursor)
+        if (!isspace(*cursor)) return 1;
+    return 0;
 }
 
 static int cluster_visible(const st_public_cluster_participant *recipient,
@@ -1336,6 +1343,49 @@ static uint64_t cluster_read_u64(const uint8_t *data)
     return value;
 }
 
+/* Java Character.isWhitespace: separators other than the no-break spaces, plus TAB..CR and FS..US. */
+static int cluster_java_whitespace(utf8proc_int32_t codepoint)
+{
+    if ((codepoint >= 0x09 && codepoint <= 0x0d) || (codepoint >= 0x1c && codepoint <= 0x1f)) return 1;
+    if (codepoint == 0xa0 || codepoint == 0x2007 || codepoint == 0x202f) return 0;
+    utf8proc_category_t category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_ZS || category == UTF8PROC_CATEGORY_ZL
+        || category == UTF8PROC_CATEGORY_ZP;
+}
+
+/*
+ * An STCE identity as Java's REPORT decoder reads it: strict UTF-8 (no overlong forms, surrogates
+ * or code points above U+10FFFF). NUL is refused as well, since C compares identities as strings.
+ * *blank reports String.isBlank() of the decoded text.
+ */
+static int cluster_event_text(const uint8_t *data, size_t len, int *blank)
+{
+    int all_whitespace = 1;
+    size_t offset = 0U;
+    while (offset < len) {
+        utf8proc_int32_t codepoint = 0;
+        utf8proc_ssize_t consumed = utf8proc_iterate(data + offset,
+                                                     (utf8proc_ssize_t)(len - offset),
+                                                     &codepoint);
+        if (consumed <= 0 || codepoint == 0) return -1;
+        if (!cluster_java_whitespace(codepoint)) all_whitespace = 0;
+        offset += (size_t)consumed;
+    }
+    if (blank != NULL) *blank = all_whitespace;
+    return 0;
+}
+
+/* Java PublicTransferClusterFrame: a management event carries only a group and a payload. */
+static int cluster_management_shape_valid(size_t target_len,
+                                          size_t source_len,
+                                          int exclude_source,
+                                          uint64_t revision,
+                                          size_t payload_len)
+{
+    return payload_len > 0U && target_len == 0U && source_len == 0U
+        && revision == 0U && !exclude_source;
+}
+
 static int cluster_event_encode(uint8_t kind,
                                 const char *group_id,
                                 const char *target_peer_id,
@@ -1357,7 +1407,10 @@ static int cluster_event_encode(uint8_t kind,
         || payload_len > ST_CLUSTER_EVENT_MAX_PAYLOAD_BYTES
         || (payload_len > 0U && payload == NULL)
         || (kind == ST_PUBLIC_CLUSTER_EVENT_ROSTER && payload_len != 0U)
-        || (kind == ST_PUBLIC_CLUSTER_EVENT_BINARY && target_len == 0U)) return -1;
+        || (kind == ST_PUBLIC_CLUSTER_EVENT_BINARY && target_len == 0U)
+        || (kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+            && !cluster_management_shape_valid(target_len, source_len, exclude_source,
+                                               revision, payload_len))) return -1;
     size_t total = ST_CLUSTER_EVENT_HEADER_BYTES + group_len + target_len + source_len + payload_len;
     uint8_t *result = (uint8_t *)calloc(total, 1U);
     if (result == NULL) return -1;
@@ -1398,13 +1451,23 @@ static int cluster_event_decode(const uint8_t *encoded,
     if (kind < ST_PUBLIC_CLUSTER_EVENT_ROSTER || kind > ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
         || (flags & ~1U) != 0U || encoded[7] != 0U
         || group_len == 0U || group_len > ST_CLUSTER_EVENT_MAX_GROUP_BYTES
-        || target_len > ST_PUBLIC_CLUSTER_PEER_BYTES
-        || source_len > ST_PUBLIC_CLUSTER_LEASE_BYTES
+        || target_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
+        || source_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
         || payload_len > ST_CLUSTER_EVENT_MAX_PAYLOAD_BYTES
         || ST_CLUSTER_EVENT_HEADER_BYTES + group_len + target_len + source_len + payload_len
             != encoded_len
         || (kind == ST_PUBLIC_CLUSTER_EVENT_ROSTER && payload_len != 0U)
-        || (kind == ST_PUBLIC_CLUSTER_EVENT_BINARY && target_len == 0U)) return -1;
+        || (kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+            && !cluster_management_shape_valid(target_len, source_len, (flags & 1U) != 0U,
+                                               cluster_read_u64(encoded + 8U), payload_len))) return -1;
+    const uint8_t *group = encoded + ST_CLUSTER_EVENT_HEADER_BYTES;
+    const uint8_t *target = group + group_len;
+    int group_blank = 0;
+    int target_blank = 0;
+    if (cluster_event_text(group, group_len, &group_blank) != 0 || group_blank
+        || cluster_event_text(target, target_len, &target_blank) != 0
+        || (kind == ST_PUBLIC_CLUSTER_EVENT_BINARY && target_blank)
+        || cluster_event_text(target + target_len, source_len, NULL) != 0) return -1;
     memset(event, 0, sizeof(*event));
     event->kind = kind;
     event->exclude_source = (flags & 1U) != 0U;
@@ -1426,6 +1489,30 @@ static int cluster_event_decode(const uint8_t *encoded,
     }
     event->payload_len = payload_len;
     return 0;
+}
+
+int st_public_cluster_event_encode(const st_public_cluster_event *event,
+                                   uint8_t **encoded,
+                                   size_t *encoded_len)
+{
+    if (event == NULL || encoded == NULL || encoded_len == NULL) return -1;
+    return cluster_event_encode(event->kind,
+                                event->group_id,
+                                event->target_peer_id,
+                                event->source_lease_id,
+                                event->exclude_source,
+                                event->revision,
+                                event->payload,
+                                event->payload_len,
+                                encoded,
+                                encoded_len);
+}
+
+int st_public_cluster_event_decode(const uint8_t *encoded,
+                                   size_t encoded_len,
+                                   st_public_cluster_event *event)
+{
+    return cluster_event_decode(encoded, encoded_len, event);
 }
 
 static int cluster_publish(uint8_t kind,

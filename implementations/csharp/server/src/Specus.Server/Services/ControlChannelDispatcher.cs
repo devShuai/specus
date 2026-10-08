@@ -464,26 +464,44 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                     .ConfigureAwait(false);
             }
 
+            // The NAT_CONTROL and the Peer Mesh login pushes each only log what goes wrong, as Java and
+            // Go do: neither closes the connection nor stops the other. A NAT_CONTROL that does not fit
+            // one MESSAGE, or a connection that cannot be written, is logged inside and does not throw;
+            // a database error leaves a healthy connection, and closing it only had the client log in
+            // again. A connection that cannot be written closed itself on the failed write, and the
+            // pushes after it write nothing. See "NAT_CONTROL 写失败与数据库错误" and "帧写入失败" in
+            // protocol/spec/control-protocol.md.
             try
             {
                 var natControl = scope.ServiceProvider.GetRequiredService<NatControlService>();
                 await natControl.PushOnLoginAsync(packet.ClientName!, context.Lifetime)
                     .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (context.Lifetime.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[{ChannelId}] NAT_CONTROL push failed for {ClientName}; the connection is kept",
+                    context.ChannelId, packet.ClientName);
+            }
+
+            try
+            {
                 var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
                 if (result.Account is not null)
                 {
                     await peerMesh.PushOnLoginAsync(result.Account, context.Lifetime).ConfigureAwait(false);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (context.Lifetime.IsCancellationRequested)
             {
-                return;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[{ChannelId}] NAT_CONTROL push failed", context.ChannelId);
-                context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
-                context.CloseAsync();
+                _logger.LogError(ex, "[{ChannelId}] Peer Mesh login push failed for {ClientName}; the connection is kept",
+                    context.ChannelId, packet.ClientName);
             }
         }
         else

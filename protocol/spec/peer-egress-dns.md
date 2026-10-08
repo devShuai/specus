@@ -433,8 +433,10 @@ Windows 不改网卡 DNS：多网卡时系统会同时问各网卡的 DNS 并取
 
 1. 规范、共享向量（名字校验与匹配、DNS 应答判定、映射寿命与隔离、`name-bind` 编解码、出口解析后的授权）。已交付。
 2. 出口侧：`name-bind` 登记、解析、逐地址授权、能力上报。三端，已交付。
-   IPv6 目标连接暂不交付：出站 socket 绑定物理网卡的实现只有 IPv4，三端都不声明 `ipv6TargetCapable`，
-   解析只取 A 记录；按上文规则，只有 AAAA 的名字报 `EGRESS_NAME_UNRESOLVED`。
+   IPv6 目标连接随后交付（#42）：三端声明 `ipv6TargetCapable`，没有 A 记录的名字按 AAAA 记录逐个授权
+   （IPv6 的强制拒绝清单与 `LAN` 段见 [peer-egress.md](peer-egress.md#强制拒绝清单)）并以 IPv6 拨号；
+   消费端那一段仍是 IPv4 fake-IP，回程包的源地址照旧写 fake-IP。IPv6 socket 不绑定接口，理由见
+   [出站 socket](peer-egress.md#出站-socket)。
 3. 消费端数据面：二期开关与池校验、读 `egress-catalog`、带接管与能力的规则校验、fake-IP 池与映射、
    池内流量的判定与应答、`name-bind` 发送、fake-IP 流的清除、池段路由、状态。三端。
    出口侧补一条：收到 `name-bind` 时关闭名字到达之前按地址建立的流。

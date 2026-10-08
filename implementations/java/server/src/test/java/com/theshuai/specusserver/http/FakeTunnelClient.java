@@ -52,11 +52,13 @@ final class FakeTunnelClient implements AutoCloseable {
 
     private final EventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
     private final List<JsonNode> natControls = new CopyOnWriteArrayList<>();
+    private final List<JsonNode> peerControls = new CopyOnWriteArrayList<>();
     private final Set<Integer> httpStreams = ConcurrentHashMap.newKeySet();
     private final AtomicInteger opens;
     private final Response response;
     private Channel control;
     private Channel data;
+    private String controlLoginName;
 
     private FakeTunnelClient(AtomicInteger opens, Response response) {
         this.opens = opens;
@@ -71,8 +73,11 @@ final class FakeTunnelClient implements AutoCloseable {
                                     AtomicInteger opens, Response response) throws Exception {
         FakeTunnelClient client = new FakeTunnelClient(opens, response);
         try {
-            client.control = client.login(nettyPort, clientName, clientSessionId, accessToken, ConnectionRole.CONTROL);
-            client.data = client.login(nettyPort, clientName, clientSessionId, accessToken, ConnectionRole.DATA);
+            Answer control = client.login(nettyPort, clientName, clientSessionId, accessToken, ConnectionRole.CONTROL);
+            client.control = accepted(control, ConnectionRole.CONTROL);
+            client.controlLoginName = control.response().getClientName();
+            client.data = accepted(client.login(nettyPort, clientName, clientSessionId, accessToken,
+                    ConnectionRole.DATA), ConnectionRole.DATA);
             return client;
         } catch (Exception | AssertionError failure) {
             client.close();
@@ -80,9 +85,39 @@ final class FakeTunnelClient implements AutoCloseable {
         }
     }
 
+    /**
+     * One control login with the token, whose answer is returned whatever it is; the connection is
+     * closed afterwards and no data connection follows.
+     */
+    static LoginResponsePacket controlLoginAnswer(int nettyPort, String clientName, long clientSessionId,
+                                                  String accessToken) throws Exception {
+        FakeTunnelClient client = new FakeTunnelClient(new AtomicInteger(), new Response(200, List.of(), ""));
+        try {
+            return client.login(nettyPort, clientName, clientSessionId, accessToken, ConnectionRole.CONTROL)
+                    .response();
+        } finally {
+            client.close();
+        }
+    }
+
+    /** The client name the server answered the control login with: the name it bound the connection under. */
+    String controlLoginName() {
+        return controlLoginName;
+    }
+
     /** Every NAT_CONTROL body received on the control connection, in order. */
     List<JsonNode> natControls() {
         return natControls;
+    }
+
+    /** Every PEER_CONTROL body received on the control connection, in order. */
+    List<JsonNode> peerControls() {
+        return peerControls;
+    }
+
+    /** Whether the control connection is still open. */
+    boolean controlOpen() {
+        return control.isActive();
     }
 
     /** Whether the server closed both connections within {@code timeout}. */
@@ -103,7 +138,18 @@ final class FakeTunnelClient implements AutoCloseable {
         group.shutdownGracefully(0, 1, TimeUnit.SECONDS).awaitUninterruptibly(5, TimeUnit.SECONDS);
     }
 
-    private Channel login(int nettyPort, String clientName, long clientSessionId, String accessToken, String role)
+    private record Answer(Channel channel, LoginResponsePacket response) {
+    }
+
+    private static Channel accepted(Answer answer, String role) {
+        if (!answer.response().isSuccess()) {
+            answer.channel().close();
+            throw new AssertionError(role + " login refused: " + answer.response().getReason());
+        }
+        return answer.channel();
+    }
+
+    private Answer login(int nettyPort, String clientName, long clientSessionId, String accessToken, String role)
             throws Exception {
         CompletableFuture<LoginResponsePacket> answer = new CompletableFuture<>();
         Channel channel = new Bootstrap()
@@ -125,12 +171,7 @@ final class FakeTunnelClient implements AutoCloseable {
         login.setAccessToken(accessToken);
         login.setConnectionRole(role);
         channel.writeAndFlush(login);
-        LoginResponsePacket result = answer.get(LOGIN_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        if (!result.isSuccess()) {
-            channel.close();
-            throw new AssertionError(role + " login refused: " + result.getReason());
-        }
-        return channel;
+        return new Answer(channel, answer.get(LOGIN_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
     }
 
     private void onNatMessage(ChannelHandlerContext ctx, NatMessagePacket packet) {
@@ -177,6 +218,9 @@ final class FakeTunnelClient implements AutoCloseable {
             } else if (packet instanceof MessageResponsePacket message
                     && message.getMessageType() == MessageType.NAT_CONTROL) {
                 natControls.add(JSON.readTree(message.getMessage()));
+            } else if (packet instanceof MessageResponsePacket message
+                    && message.getMessageType() == MessageType.PEER_CONTROL) {
+                peerControls.add(JSON.readTree(message.getMessage()));
             } else if (packet instanceof NatMessagePacket nat) {
                 onNatMessage(ctx, nat);
             }

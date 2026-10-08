@@ -101,7 +101,10 @@ public sealed class Phase5SecurityTests
         await using (var scope = server.HostServices.CreateAsyncScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
-            var user = await db.ManagementUsers.SingleAsync(row => row.Username == "oidc-user@example.com");
+            var user = await db.ManagementUsers.SingleAsync(row => row.LoginName == "oidc-user@example.com");
+            // A provisioned account is keyed by a random UUID, never by the IdP's preferred_username.
+            Assert.True(Guid.TryParseExact(user.Username, "D", out _));
+            Assert.Equal("default", user.TenantId);
             Assert.Equal("https://issuer.example", user.OidcIssuer);
             Assert.Equal("oidc-user", user.OidcSubject);
             Assert.False(string.IsNullOrWhiteSpace(user.OidcIdentityKey));
@@ -470,7 +473,8 @@ public sealed class Phase5SecurityTests
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
         await using var scope = server.HostServices.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
-        Assert.False(await db.ManagementUsers.AnyAsync(item => item.Username == "admin"));
+        Assert.False(await db.ManagementUsers.AnyAsync(item =>
+            item.Username == "admin" || item.LoginNameNormalized == "admin"));
     }
 
     [Fact]
@@ -479,7 +483,8 @@ public sealed class Phase5SecurityTests
         await using var server = await TestServerFixture.StartAsync();
         await CreateLocalUserAsync(server, "dynamic-user", "tenant-current", ManagementRole.User);
         var tokens = server.HostServices.GetRequiredService<LocalTokenService>();
-        var stale = tokens.IssueToken("dynamic-user", "tenant-stale", ManagementRole.Admin);
+        // The role claim is stale: role and enabled state come from the account record.
+        var stale = tokens.IssueToken("dynamic-user", "tenant-current", ManagementRole.Admin);
         using var client = server.CreateClient();
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", stale);
 
@@ -492,14 +497,60 @@ public sealed class Phase5SecurityTests
         refresh.EnsureSuccessStatusCode();
         var body = await refresh.Content.ReadFromJsonAsync<OidcTokenBody>(JsonOptions);
         var refreshed = tokens.Validate(body!.AccessToken);
-        Assert.Equal("tenant-current", refreshed!.FindFirst("tenant_id")!.Value);
+        Assert.Equal("dynamic-user", refreshed!.Identity!.Name);
+        Assert.Equal("tenant-current", refreshed.FindFirst("tenant_id")!.Value);
         Assert.Equal("USER", refreshed.FindFirst("role")!.Value);
+
+        // tenant_id scopes the lookup: the login name in a tenant that has no such account is no one.
+        using (var otherTenant = server.CreateClient())
+        {
+            otherTenant.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",
+                tokens.IssueToken("dynamic-user", "tenant-stale", ManagementRole.Admin));
+            Assert.Equal(HttpStatusCode.Unauthorized, (await otherTenant.GetAsync("/api/admin/me")).StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized,
+                (await otherTenant.PostAsync("/auth/refresh", content: null)).StatusCode);
+        }
+
+        // A token minted before tenant-scoped login names has no tenant_id: its sub is an account
+        // key, matched exactly, and the tenant comes from the record.
+        using (var legacy = server.CreateClient())
+        {
+            legacy.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",
+                LegacyLocalToken("dynamic-user"));
+            var legacyMe = await legacy.GetFromJsonAsync<CurrentUserBody>("/api/admin/me", JsonOptions);
+            Assert.Equal("tenant-current", legacyMe!.TenantId);
+            Assert.Equal("dynamic-user", legacyMe.Username);
+            legacy.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",
+                LegacyLocalToken("Dynamic-User"));
+            Assert.Equal(HttpStatusCode.Unauthorized, (await legacy.GetAsync("/api/admin/me")).StatusCode);
+        }
 
         await SetUserEnabledAsync(server, "dynamic-user", enabled: false);
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await client.GetAsync("/api/admin/me")).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await client.PostAsync("/auth/refresh", content: null)).StatusCode);
+    }
+
+    /// <summary>
+    /// A local token as releases before tenant-scoped login names minted it: no tenant_id claim.
+    /// Signed with the fixture's JWT secret.
+    /// </summary>
+    private static string LegacyLocalToken(string subject)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var header = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new { alg = "HS256", typ = "JWT" }));
+        var payload = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            iss = LocalTokenService.Issuer,
+            sub = subject,
+            role = "USER",
+            iat = now.ToUnixTimeSeconds(),
+            exp = now.AddMinutes(5).ToUnixTimeSeconds(),
+        }));
+        var key = SHA256.HashData(Encoding.UTF8.GetBytes("integration-test-secret"));
+        var signature = Base64UrlEncode(HMACSHA256.HashData(key, Encoding.ASCII.GetBytes($"{header}.{payload}")));
+        return $"{header}.{payload}.{signature}";
     }
 
     [Fact]
@@ -888,7 +939,7 @@ public sealed class Phase5SecurityTests
             preferredUsername, CancellationToken.None);
         Assert.NotNull(login);
         var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
-        var entity = await db.ManagementUsers.SingleAsync(item => item.Username == preferredUsername);
+        var entity = await db.ManagementUsers.SingleAsync(item => item.LoginName == preferredUsername);
         entity.TenantId = tenantId;
         entity.Role = role;
         entity.Enabled = enabled;
@@ -920,7 +971,7 @@ public sealed class Phase5SecurityTests
     {
         await using var scope = server.HostServices.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
-        var user = await db.ManagementUsers.SingleAsync(item => item.Username == username);
+        var user = await db.ManagementUsers.SingleAsync(item => item.LoginName == username);
         user.Enabled = enabled;
         user.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();

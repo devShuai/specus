@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -139,8 +140,15 @@ func (t *egressNameTable) dropConsumer(consumer int64) {
 
 func (t *egressNameTable) size() int { return t.order.Len() }
 
-// egressResolveFunc resolves a name to IPv4 addresses in the order they should be tried.
-type egressResolveFunc func(name string) ([]uint32, error)
+// egressResolveFunc resolves a name to the addresses a flow to it may be dialled to, in the order
+// they should be tried.
+type egressResolveFunc func(name string) ([]netip.Addr, error)
+
+// egressIPv6TargetCapable says this egress connects to IPv6 targets, and so announces
+// ipv6TargetCapable: a name with no A record is dialled over its AAAA records
+// (protocol/spec/peer-egress-dns.md). Only the egress's own socket is IPv6; the consumer still
+// reaches the flow at its IPv4 fake address.
+const egressIPv6TargetCapable = true
 
 // egressNameResolveTimeout bounds a lookup. It is charged against the flow's own connect, which
 // the consumer's application is waiting on either way.
@@ -148,29 +156,63 @@ const egressNameResolveTimeout = 5 * time.Second
 
 // defaultEgressResolve uses this device's own resolver: the egress resolves in its own network,
 // which is the point of sending the name rather than an address.
-func defaultEgressResolve(name string) ([]uint32, error) {
+//
+// A records first; AAAA only for a name that has none. An address of either family then goes
+// through the same authorization, so a name rebound to an IPv6 loopback or private address is
+// refused like an IPv4 one.
+func defaultEgressResolve(name string) ([]netip.Addr, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), egressNameResolveTimeout)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", name)
-	if err != nil {
-		return nil, err
-	}
-	addresses := make([]uint32, 0, len(ips))
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			addresses = append(addresses, uint32(v4[0])<<24|uint32(v4[1])<<16|uint32(v4[2])<<8|uint32(v4[3]))
+	found, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", name)
+	a := make([]netip.Addr, 0, len(found))
+	for _, address := range found {
+		if address = address.Unmap(); address.Is4() {
+			a = append(a, address)
 		}
 	}
-	return addresses, nil
+	if len(a) > 0 || !egressIPv6TargetCapable {
+		return a, err
+	}
+	found, err6 := net.DefaultResolver.LookupNetIP(ctx, "ip6", name)
+	aaaa := make([]netip.Addr, 0, len(found))
+	for _, address := range found {
+		// An IPv4-mapped answer stays mapped: the forced-deny list refuses it as such rather than
+		// letting an AAAA record stand in for an IPv4 address.
+		if address.Is6() {
+			aaaa = append(aaaa, address)
+		}
+	}
+	if len(aaaa) == 0 && err != nil {
+		return nil, err
+	}
+	return aaaa, err6
+}
+
+// egressDialCandidates is the order a name's addresses are tried in: its A records, or, when it has
+// none and this egress connects to IPv6 targets, its AAAA records.
+func egressDialCandidates(a, aaaa []netip.Addr, ipv6Capable bool) []netip.Addr {
+	if len(a) > 0 || !ipv6Capable {
+		return a
+	}
+	return aaaa
+}
+
+// formatEgressNetAddr writes an address the way the judgment reads it: dotted for IPv4 and RFC 5952
+// for IPv6, never the dotted form net/netip uses for an IPv4-mapped address.
+func formatEgressNetAddr(address netip.Addr) string {
+	if address.Is4() {
+		return address.String()
+	}
+	return formatEgressAddress6(address.As16())
 }
 
 // chooseEgressAddress picks the address a named flow is dialled to: the first resolved address the
 // authorization allows. With none allowed, the first address's refusal is the answer, so the code
 // the consumer sees is about the address it would have gone to. With nothing resolved, the name
 // did not resolve.
-func chooseEgressAddress(addresses []uint32, authorize func(uint32) string) (uint32, string) {
+func chooseEgressAddress(addresses []netip.Addr, authorize func(netip.Addr) string) (netip.Addr, string) {
 	if len(addresses) == 0 {
-		return 0, egressCodeNameUnresolved
+		return netip.Addr{}, egressCodeNameUnresolved
 	}
 	first := ""
 	for _, address := range addresses {
@@ -182,5 +224,5 @@ func chooseEgressAddress(addresses []uint32, authorize func(uint32) string) (uin
 			first = code
 		}
 	}
-	return 0, first
+	return netip.Addr{}, first
 }

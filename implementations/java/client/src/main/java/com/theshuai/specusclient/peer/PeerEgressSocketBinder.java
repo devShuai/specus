@@ -111,11 +111,26 @@ class PeerEgressSocketBinder {
         if (marker != null) {
             marker.mark(channel);
         }
-        if (applier == null) {
+        if (applier == null || leftUnbound(target.getAddress())) {
             return;
         }
         String chosen = choose(target.getAddress().getHostAddress());
         applier.apply(PeerEgressSocketHandles.of(channel), chosen);
+    }
+
+    /**
+     * Whether a socket to the target is dialled without an interface binding: one to an IPv6 target.
+     *
+     * <p>The binding keeps forwarded traffic off routes this node's own tunnel installed, and the
+     * tunnel installs no IPv6 route: the mesh is IPv4, and IPv6 consumer rules are not in force
+     * ({@code EGRESS_RULE_IPV6_UNSUPPORTED}). IP_UNICAST_IF and IP_BOUND_IF are IPv4 options besides.
+     * The consumer's IPv6 data plane, which will route IPv6 into the tunnel, has to bring
+     * IPV6_UNICAST_IF and IPV6_BOUND_IF with it. Java never hands back an IPv4-mapped address as an
+     * {@link java.net.Inet6Address}, so every IPv4 target still goes through the choice. The Linux
+     * mark is applied either way.
+     */
+    static boolean leftUnbound(java.net.InetAddress target) {
+        return target instanceof java.net.Inet6Address;
     }
 
     String choose(String destination) throws IOException {

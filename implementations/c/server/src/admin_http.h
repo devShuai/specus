@@ -17,6 +17,14 @@ typedef struct {
     const uint8_t *body;
     size_t body_len;
     /*
+     * The trailer names the request's Trailer header declared and the declared trailer fields of
+     * a chunked body as name:value (http-route.md section 3); both empty when there are none.
+     */
+    char **trailer_names;
+    size_t trailer_names_len;
+    char **trailers;
+    size_t trailers_len;
+    /*
      * The client account whose record let the request in (http-route.md section 1), or 0 when no
      * account record was involved. The forwarder only uses a data connection that logged in as
      * this account; one still bound under the name for another account is treated as offline.
@@ -128,6 +136,13 @@ typedef void (*st_admin_direct_ws_close_handler)(void *ctx,
                                                  const char *channel_id,
                                                  uint32_t reset_code,
                                                  const char *reason);
+/*
+ * Reloads a client's routes into its connections and sends it a NAT_CONTROL: 0 when sent, -1 when the
+ * client is offline or its control connection cannot be written, ST_ADMIN_NAT_CONTROL_NOT_SENT when its
+ * NAT_CONTROL does not fit one MESSAGE (the routes are reloaded, nothing is sent and the connection is
+ * kept), and -2 on any other failure.
+ */
+#define ST_ADMIN_NAT_CONTROL_NOT_SENT (-3)
 typedef int (*st_admin_nat_control_handler)(void *ctx,
                                             long long client_id,
                                             const char *client_name);
@@ -150,6 +165,13 @@ typedef int (*st_admin_client_message_handler)(void *ctx,
 typedef int (*st_admin_peer_mesh_refresh_handler)(void *ctx,
                                                   const char *tenant_id);
 /*
+ * Sends one PEER_CONTROL message from "server" to a client's control connection; -1 when the client
+ * is not online. The management API uses it to tell both ends of a session it closed.
+ */
+typedef int (*st_admin_peer_control_send_handler)(void *ctx,
+                                                  const char *target_client_name,
+                                                  const char *message);
+/*
  * Closes the online control and data connections of a client account an admin disabled, renamed
  * or deleted. client_name is the name they logged in with (the account's name before the change)
  * and reason the disconnect reason they are recorded with: ADMIN_DISABLED, ADMIN_RENAMED or
@@ -158,6 +180,14 @@ typedef int (*st_admin_peer_mesh_refresh_handler)(void *ctx,
 typedef int (*st_admin_client_disconnect_handler)(void *ctx,
                                                   const char *client_name,
                                                   const char *reason);
+/*
+ * The overview's public-connection counters of one tenant (Java RemotePortServerManager): how many
+ * public TCP connections are open now, and how many a connection limit refused since start.
+ */
+typedef void (*st_admin_external_connection_stats_handler)(void *ctx,
+                                                           const char *tenant_id,
+                                                           long long *active,
+                                                           long long *rejected);
 
 typedef struct {
     int port;
@@ -227,7 +257,10 @@ void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_h
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
 void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx);
+void st_admin_set_peer_control_send_handler(st_admin_peer_control_send_handler handler, void *ctx);
 void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx);
+void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,
+                                                    void *ctx);
 /*
  * The device side of POST /api/admin/http-routes/{id}/connectivity-check: presence and the probe
  * through the client's data connection (service-connectivity-check.md). Without it the endpoint
