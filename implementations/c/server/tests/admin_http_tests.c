@@ -3035,16 +3035,23 @@ static int test_tenant_scoped_admin_mutations(void)
         }
         if (failed) fprintf(stderr, "tenant scope resource fixture setup failed\n");
     }
+    /* Credentials and mappings answer as Java, 400 "<kind> not found: <id>"; routes and Peer services 404. */
     struct {
         const char *prefix;
         long long id;
         const char *body;
         const char *label;
+        const char *status;
+        const char *message;
     } resources[] = {
-        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential"},
-        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping"},
-        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route"},
-        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service"},
+        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential",
+         "HTTP/1.1 400 ", "credential not found: "},
+        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping",
+         "HTTP/1.1 400 ", "mapping not found: "},
+        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route",
+         "HTTP/1.1 404 ", NULL},
+        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service",
+         "HTTP/1.1 404 ", NULL},
     };
     resources[0].id = credential.id;
     resources[1].id = mapping.id;
@@ -3056,11 +3063,11 @@ static int test_tenant_scoped_admin_mutations(void)
         snprintf(label, sizeof(label), "PUT of another tenant's %s", resources[i].label);
         len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN", resources[i].body,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        failed = endpoint_expect(len, response, resources[i].status, resources[i].message, label) != 0;
         snprintf(label, sizeof(label), "DELETE of another tenant's %s", resources[i].label);
         len = failed ? -1 : tenant_scope_call("DELETE", path, "root-a", "tenant-a", "ADMIN", NULL,
                                               response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        failed = failed || endpoint_expect(len, response, resources[i].status, resources[i].message, label) != 0;
     }
     if (!failed) {
         st_storage_client_credential stored_credential;
@@ -6286,13 +6293,18 @@ int main(void)
     setenv("SPECUS_AUTH_TENANT_ID", "tenant-admin", 1);
     setenv("SPECUS_AUTH_USERNAME", "admin-user", 1);
     len = st_admin_build_response("POST", "/api/admin/database/initialize", response, sizeof(response));
+    /* Java DatabaseInitializer: the demo client is seeded into the caller's tenant. */
+    st_storage_client initialized_demo;
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"initialized\":true")
         || !contains(response, "\"tenantId\":\"tenant-admin\"")
         || !contains(response, "\"orm\":\"sqlite3\"")
         || !contains(response, "\"dialect\":\"sqlite\"")
-        || !contains(response, "\"clients\":0")) {
-        fprintf(stderr, "database initialize response mismatch\n");
+        || !contains(response, "\"clients\":1")
+        || st_storage_get_client_by_name(db_path, "Demo client", &initialized_demo) != 0
+        || strcmp(initialized_demo.tenant_id, "tenant-admin") != 0
+        || strcmp(initialized_demo.owner_username, "admin-user") != 0) {
+        fprintf(stderr, "database initialize response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/me", response, sizeof(response));
@@ -6968,9 +6980,10 @@ int main(void)
         fprintf(stderr, "management user delete response mismatch\n");
         return 1;
     }
+    /* The demo client was seeded into SPECUS_AUTH_TENANT_ID, the built-in administrator's tenant. */
     len = st_admin_build_response("GET", "/api/admin/clients", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || contains(response, "\"clientName\":\"Demo client\"")) {
+        || !contains(response, "\"clientName\":\"Demo client\"")) {
         fprintf(stderr, "clients list response mismatch\n");
         return 1;
     }

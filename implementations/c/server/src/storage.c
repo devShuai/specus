@@ -82,6 +82,30 @@ static int add_column_if_missing(sqlite3 *db, const char *table, const char *col
     return exec_sql(db, sql);
 }
 
+/*
+ * The tenant of a traffic usage row, as Java's TrafficUsage and ResourceTrafficUsage keep it: an
+ * administrator's list is the tenant's rows, those of clients deleted since included, which a join
+ * with client_account cannot find. Rows written before the column existed take their client's
+ * tenant once; rows of clients already gone stay without one and are listed to no one.
+ */
+static int add_usage_tenant_column(sqlite3 *db, const char *table)
+{
+    int has_column = table_has_column(db, table, "tenant_id");
+    if (has_column != 0) {
+        return has_column < 0 ? -1 : 0;
+    }
+    char sql[512];
+    int written = snprintf(sql, sizeof(sql),
+        "ALTER TABLE %s ADD COLUMN tenant_id TEXT;"
+        "UPDATE %s SET tenant_id = (SELECT c.tenant_id FROM client_account c WHERE c.rowid = %s.client_id "
+        "OR (%s.client_id IS NULL AND c.client_name = %s.client_name) LIMIT 1)",
+        table, table, table, table, table);
+    if (written < 0 || (size_t)written >= sizeof(sql)) {
+        return -1;
+    }
+    return exec_sql(db, sql);
+}
+
 static int open_db(const char *path, sqlite3 **db)
 {
     int rc = sqlite3_open(path, db);
@@ -655,6 +679,55 @@ int st_storage_migrate_management_login_names(const char *path, char *error, siz
     int rc = migrate_management_login_names(db, error, error_len);
     sqlite3_close(db);
     return rc;
+}
+
+/* A configured name as Java reads it: trimmed, the fallback when unset or blank. */
+static void storage_configured_text(const char *name, const char *fallback, char *out, size_t out_len)
+{
+    const char *value = getenv(name);
+    while (value != NULL && *value != '\0' && (unsigned char)*value <= ' ') ++value;
+    size_t len = value == NULL ? 0U : strlen(value);
+    while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+    if (len == 0U) {
+        snprintf(out, out_len, "%s", fallback);
+    } else {
+        snprintf(out, out_len, "%.*s", (int)len, value);
+    }
+}
+
+/*
+ * Java DatabaseInitializer's demo seed: a "Demo client" in tenant_id, owned by owner, unless the
+ * tenant has one. Client names are unique across tenants, so when another tenant holds the name
+ * Java's insert fails on the unique column: 1 here. 0 when the tenant has it afterwards, -1 on a
+ * storage error.
+ */
+static int seed_demo_client_on_db(sqlite3 *db, const char *tenant_id, const char *owner)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT tenant_id FROM client_account WHERE client_name = 'Demo client'",
+                           -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int step = sqlite3_step(stmt);
+    int result = step == SQLITE_ROW
+        ? (strcmp((const char *)sqlite3_column_text(stmt, 0) == NULL ? ""
+                  : (const char *)sqlite3_column_text(stmt, 0), tenant_id) == 0 ? 0 : 1)
+        : (step == SQLITE_DONE ? 2 : -1);
+    sqlite3_finalize(stmt);
+    if (result != 2) {
+        return result;
+    }
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO client_account(tenant_id, client_name, owner_username, enabled) "
+            "VALUES(?,'Demo client',?,1)",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, owner, -1, SQLITE_TRANSIENT);
+    result = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(stmt);
+    return result;
 }
 
 int st_storage_init(const char *path, int seed_demo_client)
@@ -1343,6 +1416,12 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "traffic_usage", "updated_at", "TEXT");
     }
     if (rc == 0) {
+        rc = add_usage_tenant_column(db, "traffic_usage");
+    }
+    if (rc == 0) {
+        rc = add_usage_tenant_column(db, "resource_traffic_usage");
+    }
+    if (rc == 0) {
         rc = add_column_if_missing(db, "peer_mesh_acl", "direction", "TEXT NOT NULL DEFAULT 'OUTBOUND'");
     }
     if (rc == 0) {
@@ -1521,23 +1600,27 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit(tenant_id, route_id, id);");
     }
     if (rc == 0 && seed_demo_client) {
-        sqlite3_stmt *stmt = NULL;
-        rc = sqlite3_prepare_v2(db,
-            "INSERT OR IGNORE INTO client_account(tenant_id, client_name, owner_username, enabled) VALUES('default',?,'admin',1)",
-            -1,
-            &stmt,
-            NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, "Demo client", -1, SQLITE_STATIC);
-            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-        } else {
-            rc = -1;
-        }
-        sqlite3_finalize(stmt);
+        /* Java DatabaseInitializer at startup: the default tenant, owned by the built-in administrator. */
+        char tenant_id[81];
+        char owner[81];
+        storage_configured_text("SPECUS_AUTH_TENANT_ID", "default", tenant_id, sizeof(tenant_id));
+        storage_configured_text("SPECUS_AUTH_USERNAME", "admin", owner, sizeof(owner));
+        rc = seed_demo_client_on_db(db, tenant_id, owner) < 0 ? -1 : 0;
     }
 
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
+}
+
+int st_storage_seed_demo_client(const char *path, const char *tenant_id, const char *owner_username)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    int rc = seed_demo_client_on_db(db, normalize_tenant_id(tenant_id), owner_username == NULL ? "" : owner_username);
+    sqlite3_close(db);
+    return rc;
 }
 
 int st_storage_client_enabled(const char *path, const char *client_name)
@@ -3460,6 +3543,48 @@ int st_storage_upsert_client_credential(const char *path,
     return out_credential == NULL ? 0 : st_storage_get_client_credential_by_api_key(path, api_key, out_credential);
 }
 
+int st_storage_insert_client_credential(const char *path,
+                                        const char *tenant_id,
+                                        const char *owner_username,
+                                        const char *api_key,
+                                        const char *secret_hash,
+                                        int enabled,
+                                        int max_online_instances,
+                                        st_storage_client_credential *out_credential)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO specus_client_credential(tenant_id, owner_username, api_key, secret_hash, enabled, "
+        "max_online_instances, created_at, updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, owner_username == NULL ? "" : owner_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, api_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, secret_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 5, enabled ? 1 : 0);
+        sqlite3_bind_int(stmt, 6, max_online_instances);
+        int step = sqlite3_step(stmt);
+        rc = step == SQLITE_DONE ? 0
+            : (sqlite3_extended_errcode(db) == SQLITE_CONSTRAINT_UNIQUE ? 1 : -1);
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (rc != 0) {
+        return rc;
+    }
+    return out_credential == NULL || st_storage_get_client_credential_by_api_key(path, api_key, out_credential) == 0
+        ? 0 : -1;
+}
+
 int st_storage_delete_client_credential(const char *path, long long id)
 {
     sqlite3 *db = NULL;
@@ -4899,6 +5024,33 @@ int st_storage_get_mapping_by_client_port(const char *path,
     return load_mapping_by_client_port(path, client_name, listen_port, mapping);
 }
 
+int st_storage_find_mapping_by_listen_port(const char *path, int listen_port, st_storage_mapping *mapping)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT m.id, COALESCE(c.rowid, 0), m.client_name, m.listen_port, m.target_address, m.target_port, "
+        "m.enabled, m.detail_capture_enabled, m.created_at, m.updated_at "
+        "FROM specus_mapping m LEFT JOIN client_account c ON c.client_name = m.client_name "
+        "WHERE m.listen_port = ? ORDER BY m.id LIMIT 1",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_int(stmt, 1, listen_port);
+    rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_ROW ? (scan_mapping(stmt, mapping) == 0 ? 0 : -1) : (rc == SQLITE_DONE ? 1 : -1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return result;
+}
+
 int st_storage_upsert_mapping(const char *path,
                               const char *client_name,
                               int listen_port,
@@ -6271,10 +6423,12 @@ int st_storage_record_traffic_usage(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO traffic_usage(client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at) "
-        "VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) "
+        "INSERT INTO traffic_usage(client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at, "
+        "tenant_id) "
+        "VALUES(?1,?2,?3,?4,?5,CURRENT_TIMESTAMP,(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
         "ON CONFLICT(client_name, usage_date) DO UPDATE SET "
         "client_id = COALESCE(traffic_usage.client_id, excluded.client_id), "
+        "tenant_id = COALESCE(traffic_usage.tenant_id, excluded.tenant_id), "
         "upload_bytes = upload_bytes + excluded.upload_bytes, "
         "download_bytes = download_bytes + excluded.download_bytes, "
         "updated_at = excluded.updated_at",
@@ -6366,17 +6520,20 @@ int st_storage_list_traffic_usage_visible(const char *path,
     if (open_db(path, &db) != 0) {
         return -1;
     }
+    /* An administrator reads the tenant's rows (Java findByTenantId…), deleted clients' included;
+     * anyone else the rows of the clients they own. */
     char sql[1024];
     int written = snprintf(sql,
                            sizeof(sql),
                            "SELECT t.id, t.client_id, t.client_name, t.usage_date, "
                            "t.upload_bytes, t.download_bytes, t.updated_at "
-                           "FROM traffic_usage t "
-                           "JOIN client_account c ON c.rowid = t.client_id OR "
-                           "(t.client_id IS NULL AND c.client_name = t.client_name) "
-                           "WHERE c.tenant_id = ?%s%s "
+                           "FROM traffic_usage t %s%s "
                            "ORDER BY t.usage_date DESC, t.id DESC LIMIT ?",
-                           include_all_clients ? "" : " AND c.owner_username = ?",
+                           include_all_clients
+                               ? "WHERE t.tenant_id = ?"
+                               : "JOIN client_account c ON c.rowid = t.client_id OR "
+                                 "(t.client_id IS NULL AND c.client_name = t.client_name) "
+                                 "WHERE c.tenant_id = ? AND c.owner_username = ?",
                            client_id > 0 ? " AND t.client_id = ?" : "");
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         sqlite3_close(db);
@@ -6428,10 +6585,12 @@ int st_storage_record_resource_traffic_usage(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO resource_traffic_usage(client_id, client_name, resource_type, resource_key, resource_id, "
-        "resource_name, usage_date, upload_bytes, download_bytes, updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+        "resource_name, usage_date, upload_bytes, download_bytes, updated_at, tenant_id) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,CURRENT_TIMESTAMP,"
+        "(SELECT tenant_id FROM client_account WHERE client_name = ?2)) "
         "ON CONFLICT(client_name, resource_type, resource_key, usage_date) DO UPDATE SET "
         "client_id = COALESCE(resource_traffic_usage.client_id, excluded.client_id), "
+        "tenant_id = COALESCE(resource_traffic_usage.tenant_id, excluded.tenant_id), "
         "resource_id = COALESCE(resource_traffic_usage.resource_id, excluded.resource_id), "
         "resource_name = excluded.resource_name, "
         "upload_bytes = upload_bytes + excluded.upload_bytes, "
@@ -6551,18 +6710,20 @@ int st_storage_list_resource_traffic_usage_visible(const char *path,
         return -1;
     }
     int has_type_filter = resource_type != NULL && *resource_type != '\0';
+    /* As st_storage_list_traffic_usage_visible. */
     char sql[1200];
     int written = snprintf(sql,
                            sizeof(sql),
                            "SELECT r.id, r.client_id, r.client_name, r.resource_type, r.resource_key, "
                            "r.resource_id, r.resource_name, r.usage_date, r.upload_bytes, "
                            "r.download_bytes, r.updated_at "
-                           "FROM resource_traffic_usage r "
-                           "JOIN client_account c ON c.rowid = r.client_id OR "
-                           "(r.client_id IS NULL AND c.client_name = r.client_name) "
-                           "WHERE c.tenant_id = ?%s%s%s "
+                           "FROM resource_traffic_usage r %s%s%s "
                            "ORDER BY r.usage_date DESC, r.id DESC LIMIT ?",
-                           include_all_clients ? "" : " AND c.owner_username = ?",
+                           include_all_clients
+                               ? "WHERE r.tenant_id = ?"
+                               : "JOIN client_account c ON c.rowid = r.client_id OR "
+                                 "(r.client_id IS NULL AND c.client_name = r.client_name) "
+                                 "WHERE c.tenant_id = ? AND c.owner_username = ?",
                            client_id > 0 ? " AND r.client_id = ?" : "",
                            has_type_filter ? " AND r.resource_type = ?" : "");
     if (written < 0 || (size_t)written >= sizeof(sql)) {

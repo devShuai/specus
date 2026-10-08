@@ -69,7 +69,8 @@ typedef struct {
     long long id;
     char tenant_id[64];
     char owner_username[128];
-    char api_key[128];
+    /* Java's 120 characters (UTF-16 code units), at most 3 UTF-8 bytes each. */
+    char api_key[361];
     char secret_hash[65];
     int enabled;
     int max_online_instances;
@@ -536,6 +537,13 @@ typedef struct {
 
 int st_storage_init(const char *path, int seed_demo_client);
 /*
+ * The demo seed of Java DatabaseInitializer.initialize(tenant): a "Demo client" in tenant_id owned
+ * by owner_username unless the tenant has one. 0 when the tenant has it afterwards, 1 when another
+ * tenant holds the name (client names are unique across tenants), -1 on a storage error.
+ * st_storage_init seeds SPECUS_AUTH_TENANT_ID's, owned by SPECUS_AUTH_USERNAME, the same way.
+ */
+int st_storage_seed_demo_client(const char *path, const char *tenant_id, const char *owner_username);
+/*
  * Java ManagementUserSchemaMigrator, which st_storage_init runs too: adds login_name and
  * login_name_normalized, refuses (before writing anything) a login name that is blank or longer
  * than 80 characters and two accounts of one tenant with the same normalized login name, backfills
@@ -693,6 +701,18 @@ int st_storage_list_client_credentials(const char *path,
                                        size_t *credential_count);
 int st_storage_upsert_client_credential(const char *path,
                                         long long id,
+                                        const char *tenant_id,
+                                        const char *owner_username,
+                                        const char *api_key,
+                                        const char *secret_hash,
+                                        int enabled,
+                                        int max_online_instances,
+                                        st_storage_client_credential *out_credential);
+/*
+ * A new credential, never replacing one: 0 with *out_credential, 1 when another credential holds
+ * api_key (the unique column refused it), -1 on a storage error.
+ */
+int st_storage_insert_client_credential(const char *path,
                                         const char *tenant_id,
                                         const char *owner_username,
                                         const char *api_key,
@@ -859,6 +879,8 @@ int st_storage_get_mapping_by_client_port(const char *path,
                                           const char *client_name,
                                           int listen_port,
                                           st_storage_mapping *mapping);
+/* The mapping of any client on listen_port (the oldest if several): 0 found, 1 none, -1 on error. */
+int st_storage_find_mapping_by_listen_port(const char *path, int listen_port, st_storage_mapping *mapping);
 int st_storage_upsert_mapping(const char *path,
                               const char *client_name,
                               int listen_port,
