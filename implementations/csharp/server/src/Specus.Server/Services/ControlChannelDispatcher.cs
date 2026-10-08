@@ -463,8 +463,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             // Go do: neither closes the connection nor stops the other. A NAT_CONTROL that does not fit
             // one MESSAGE, or a connection that cannot be written, is logged inside and does not throw;
             // a database error leaves a healthy connection, and closing it only had the client log in
-            // again. A connection that cannot be written is left to its own I/O handling. See
-            // "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+            // again. A connection that cannot be written closed itself on the failed write, and the
+            // pushes after it write nothing. See "NAT_CONTROL 写失败与数据库错误" and "帧写入失败" in
+            // protocol/spec/control-protocol.md.
             try
             {
                 var natControl = scope.ServiceProvider.GetRequiredService<NatControlService>();

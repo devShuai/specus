@@ -18,6 +18,8 @@
 #include "protocol.h"
 #include "storage.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1362,6 +1364,195 @@ static int test_push_into_reset_control_answers_offline(test_server *server)
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------- */
+/* A write cut short                                                                             */
+
+/*
+ * The cut-write scenario's server runs with a one-second write timeout. The public connections
+ * opened through one registered port can, with their streams' send windows, carry far more than the
+ * data connection, the server's send buffer and the client's small receive buffer hold. A send that
+ * times out after the receiver let a few bytes through still returns them, so a write can take a few
+ * timeouts to fail: the client waits up to CUT_WRITE_STALL_MAX_MS for the server to log it.
+ */
+#define CUT_WRITE_STREAMS 16
+#define CUT_WRITE_STREAM_BYTES (1024U * 1024U)
+#define CUT_WRITE_FEED_MS 1000
+#define CUT_WRITE_STALL_MAX_MS 20000
+#define CUT_WRITE_DRAIN_MS 15000
+#define CUT_WRITE_LOGGED "[data] write failed"
+
+/*
+ * A connection to the server that receives into a small buffer, so the server's writes to it block
+ * as soon as the test stops reading. SO_RCVBUF is set before connecting, so the window is never
+ * scaled past it.
+ */
+static int connect_local_small_window(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int size = 4096;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0
+        || connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Writes up to len bytes into each public connection, without blocking, until deadline; returns
+ * how many the server took in all. */
+static size_t feed_public_connections(const int *fds, size_t count, size_t len, long long deadline)
+{
+    static uint8_t chunk[64U * 1024U];
+    size_t remaining[CUT_WRITE_STREAMS];
+    size_t fed = 0U;
+    for (size_t i = 0; i < count; ++i) {
+        remaining[i] = len;
+    }
+    while (monotonic_ms() < deadline) {
+        int progressed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (remaining[i] == 0U) {
+                continue;
+            }
+            ssize_t sent = send(fds[i], chunk, remaining[i] < sizeof(chunk) ? remaining[i] : sizeof(chunk),
+                                MSG_DONTWAIT);
+            if (sent > 0) {
+                remaining[i] -= (size_t)sent;
+                fed += (size_t)sent;
+                progressed = 1;
+            }
+        }
+        if (!progressed) {
+            sleep_ms(20);
+        }
+    }
+    return fed;
+}
+
+/*
+ * Reads a connection until it ends. 0 when the server closed it, having written whole frames up to
+ * then, the last one possibly cut short by the close; -1, with what happened in what, when a frame
+ * was out of step or the connection stayed open.
+ */
+static int read_until_closed(int fd, int timeout_ms, size_t *frames, char *what, size_t what_len)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+    *frames = 0U;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        int rc = remaining <= 0 ? -2 : read_frame(fd, (int)remaining, &header, &body);
+        if (rc == 1) {
+            free(body);
+            ++*frames;
+            continue;
+        }
+        if (rc == 0) {
+            return 0;
+        }
+        if (rc == -2) {
+            snprintf(what, what_len, "still open %d ms after the client read again, after %zu whole frame(s)",
+                     timeout_ms, *frames);
+        } else {
+            snprintf(what, what_len, "frame %zu is out of step: it does not start with a frame header", *frames);
+        }
+        return -1;
+    }
+}
+
+/* Waits until the server's log has a line with text in it: 0, or -1 after timeout_ms. */
+static int wait_server_log(const test_server *server, const char *text, int timeout_ms)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+    for (;;) {
+        char *log = read_text_file(server->log_path);
+        int found = log != NULL && strstr(log, text) != NULL;
+        free(log);
+        if (found) {
+            return 0;
+        }
+        if (monotonic_ms() >= deadline) {
+            return -1;
+        }
+        sleep_ms(100);
+    }
+}
+
+/*
+ * A write the server's write timeout cuts short leaves part of a frame on the wire, and nothing may
+ * follow it ("帧写入失败" in protocol/spec/control-protocol.md). The client stops reading its data
+ * connection while public connections pour into it; once a write times out partway, the server
+ * writes no other frame there and closes the connection, so the client reads whole frames, then at
+ * most the start of one, then the end. Before, the other streams went on writing after the cut frame
+ * and the connection stayed open. The control connection is not affected.
+ */
+static int test_cut_write_closes_the_connection(test_server *server)
+{
+    char reason[256];
+    char what[200];
+    runtime_session runtime;
+    int control = -1, data = -1;
+    int public_fds[CUT_WRITE_STREAMS];
+    for (size_t i = 0; i < CUT_WRITE_STREAMS; ++i) {
+        public_fds[i] = -1;
+    }
+    int public_port = pick_free_port();
+    CHECK(public_port > 0, "no free port for the public mapping");
+    CHECK(create_credential(server->db_path, "ck_cut_write", "cut-write-secret", 2) == 0,
+          "credential ck_cut_write not stored");
+    CHECK(http_client_login(server, "ck_cut_write", "cut-write-secret", "machine-cut-write", "gina", &runtime) == 0,
+          "http login (status and body above)");
+    CHECK(create_mapping(server->db_path, runtime.client_id, public_port) == 0,
+          "mapping of port %d not stored", public_port);
+    CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
+          "control: %s", reason);
+    data = connect_local_small_window(server->control_port);
+    CHECK(data >= 0 && send_login_request(data, &runtime, "data") == 0, "data login not sent");
+    int command = 0;
+    int success = 0;
+    CHECK(read_login_response(data, IO_TIMEOUT_MS, &command, &success, reason, sizeof(reason)) == 1 && success,
+          "data login: %s", reason);
+    CHECK(TIMED(nat_register(data, runtime.client_name, public_port, 9)) == 0,
+          "REGISTER of port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    for (size_t i = 0; i < CUT_WRITE_STREAMS; ++i) {
+        CHECK(open_public_stream(data, public_port, &public_fds[i]) == 0,
+              "no OPEN for public connection %zu to port %d", i, public_port);
+    }
+
+    /* The client reads nothing more until a write has timed out, or for long enough that one has. */
+    size_t fed = feed_public_connections(public_fds, CUT_WRITE_STREAMS, CUT_WRITE_STREAM_BYTES,
+                                         monotonic_ms() + CUT_WRITE_FEED_MS);
+    int logged = wait_server_log(server, CUT_WRITE_LOGGED, CUT_WRITE_STALL_MAX_MS);
+    /* Then it reads fast: the window was fixed small at connect time, the buffer need not stay so. */
+    int drain_buffer = 256 * 1024;
+    (void)setsockopt(data, SOL_SOCKET, SO_RCVBUF, &drain_buffer, sizeof(drain_buffer));
+    size_t frames = 0U;
+    CHECK(read_until_closed(data, CUT_WRITE_DRAIN_MS, &frames, what, sizeof(what)) == 0,
+          "data connection after %zu byte(s) were fed through %d public connections: %s",
+          fed, CUT_WRITE_STREAMS, what);
+    CHECK(frames > 0U, "the data connection closed before any DATA frame reached the client");
+    CHECK(logged == 0, "the data connection closed, but no failed write was logged in %d ms",
+          CUT_WRITE_STALL_MAX_MS);
+    CHECK(TIMED(expect_channel_alive(control)) == 0, "control not served after its data connection was closed: %s",
+          timed_outcome(IO_TIMEOUT_MS));
+
+    for (size_t i = 0; i < CUT_WRITE_STREAMS; ++i) {
+        close_fd(&public_fds[i]);
+    }
+    close_fd(&data);
+    close_fd(&control);
+    return 0;
+}
+
 /* Counts the client's closed connection records with the given disconnect reason, or -1. */
 static int connection_reason_count(const char *db_path, const char *client_name, const char *reason)
 {
@@ -1550,6 +1741,9 @@ int main(int argc, char **argv)
     failures += run_on_fresh_server("connection roles refuse the other role's frames", test_connection_roles, NULL);
     failures += run_on_fresh_server("SIGTERM shutdown and restart cleanup", scenario_shutdown_and_restart, NULL);
     failures += run_on_fresh_server("consumed login nonces survive a restart", scenario_nonce_survives_restart, NULL);
+    static const char *const short_write_timeout[] = {"SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS=1", NULL};
+    failures += run_on_fresh_server("a write cut short by the write timeout closes the connection, nothing follows it",
+                                    test_cut_write_closes_the_connection, short_write_timeout);
 
     const char *tmp = getenv("TMPDIR");
     snprintf(login_gate_dir, sizeof(login_gate_dir), "%s/specus-c-login-gate-XXXXXX",
