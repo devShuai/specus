@@ -3,6 +3,7 @@
 #include "json.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1030,21 +1031,6 @@ static int is_absent_value(const char *raw)
     return raw == NULL || strcmp(raw, "null") == 0;
 }
 
-/*
- * Decodes a raw JSON string. Anything else fails, and so does an escaped NUL: the C string would
- * end there, and "tcp\u0000x" would be stored as "tcp" -- a value the request never contained.
- */
-static char *decode_text(const char *raw)
-{
-    size_t len = 0U;
-    char *value = st_json_decode_string(raw, &len);
-    if (value != NULL && strlen(value) != len) {
-        free(value);
-        return NULL;
-    }
-    return value;
-}
-
 /* Splits a raw JSON array into its raw elements. Returns 0 on success; a non-array fails. */
 static int raw_array_items(const char *raw, char ***items, size_t *items_len)
 {
@@ -1106,44 +1092,205 @@ static int normalize_port_range(const char *raw, int *low, int *high)
     return 0;
 }
 
-static int normalize_cidr(const char *rule_raw, st_egress_destination_rule *out)
+/*
+ * Java PeerEgressService names what it refuses: IllegalArgumentException messages built from the
+ * rule's field path and the value as Java holds it. A NULL error buffer asks for no message.
+ */
+static void rule_error(char *error, size_t error_len, const char *format, ...)
+{
+    if (error == NULL || error_len == 0U) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    vsnprintf(error, error_len, format, args);
+    va_end(args);
+}
+
+/*
+ * A raw JSON scalar as Jackson binds it into a String: the decoded text of a string, the literal of a
+ * number or boolean, NULL for null (and for an object or array, which bind no String). The caller
+ * frees it. *nul_free (when given) is 0 for a string with an escaped NUL, whose C text would end
+ * there: "tcp\u0000x" must not be read as "tcp".
+ */
+static char *scalar_text(const char *raw, int *nul_free)
+{
+    if (nul_free != NULL) {
+        *nul_free = 1;
+    }
+    if (raw == NULL || strcmp(raw, "null") == 0 || raw[0] == '{' || raw[0] == '[') {
+        return NULL;
+    }
+    if (raw[0] == '"') {
+        size_t len = 0U;
+        char *text = st_json_decode_string(raw, &len);
+        if (text != NULL && strlen(text) != len && nul_free != NULL) {
+            *nul_free = 0;
+        }
+        return text;
+    }
+    size_t len = strlen(raw);
+    char *copy = (char *)malloc(len + 1U);
+    if (copy != NULL) {
+        memcpy(copy, raw, len + 1U);
+    }
+    return copy;
+}
+
+/*
+ * Appends raw JSON as Java's toString shows the value Jackson made of it for an untyped port bound:
+ * an Integer, Long or Double, a String unquoted, true or false, null, a List as [a, b] and a Map as
+ * {k=v}. A fraction keeps at least one decimal (443.0).
+ */
+static void append_java_text(char *out, size_t out_len, const char *raw)
+{
+    size_t used = strlen(out);
+    if (used >= out_len) {
+        return;
+    }
+    if (raw[0] == '[' || raw[0] == '{') {
+        int list = raw[0] == '[';
+        char **items = NULL;
+        size_t items_len = 0U;
+        snprintf(out + used, out_len - used, "%s", list ? "[" : "{");
+        if (list && raw_array_items(raw, &items, &items_len) == 0) {
+            for (size_t i = 0U; i < items_len; i++) {
+                if (i > 0U) {
+                    size_t at = strlen(out);
+                    snprintf(out + at, at < out_len ? out_len - at : 0U, ", ");
+                }
+                append_java_text(out, out_len, items[i]);
+            }
+            st_json_free_string_array(items, items_len);
+        } else if (!list) {
+            /* A map: its members as written, which is all a refusal needs to point at. */
+            size_t at = strlen(out);
+            snprintf(out + at, at < out_len ? out_len - at : 0U, "%.*s", (int)(strlen(raw) - 2U), raw + 1);
+        }
+        size_t at = strlen(out);
+        snprintf(out + at, at < out_len ? out_len - at : 0U, "%s", list ? "]" : "}");
+        return;
+    }
+    if (raw[0] == '"') {
+        char *text = scalar_text(raw, NULL);
+        snprintf(out + used, out_len - used, "%s", text == NULL ? "" : text);
+        free(text);
+        return;
+    }
+    if (strpbrk(raw, ".eE") != NULL && (raw[0] == '-' || (raw[0] >= '0' && raw[0] <= '9'))) {
+        double value = strtod(raw, NULL);
+        char text[64];
+        for (int precision = 1; precision <= 17; precision++) {
+            snprintf(text, sizeof(text), "%.*f", precision, value);
+            if (strtod(text, NULL) == value) {
+                break;
+            }
+        }
+        snprintf(out + used, out_len - used, "%s", text);
+        return;
+    }
+    snprintf(out + used, out_len - used, "%s", raw);
+}
+
+/*
+ * Whether a rule list binds into Java's List<DestinationRuleMutation> or List<DomainRuleMutation> at
+ * all: Spring answers 400 before PeerEgressService sees a list that does not. Every element is an
+ * object or null; its text field (cidr or match) is a scalar; protocols is an array of scalars;
+ * portRanges is an array whose elements are arrays or null. Unknown members are ignored.
+ */
+static int rules_bind(const char *json, const char *text_field)
+{
+    char **items = NULL;
+    size_t items_len = 0U;
+    if (raw_array_items(json, &items, &items_len) != 0) {
+        return 0;
+    }
+    int ok = 1;
+    for (size_t i = 0U; ok && i < items_len; i++) {
+        if (strcmp(items[i], "null") == 0) {
+            continue;
+        }
+        if (items[i][0] != '{') {
+            ok = 0;
+            break;
+        }
+        char *text = st_json_get_top_level_raw(items[i], text_field);
+        ok = text == NULL || (text[0] != '{' && text[0] != '[');
+        free(text);
+        char *protocols = ok ? st_json_get_top_level_raw(items[i], "protocols") : NULL;
+        if (ok && !is_absent_value(protocols)) {
+            char **values = NULL;
+            size_t values_len = 0U;
+            ok = raw_array_items(protocols, &values, &values_len) == 0;
+            for (size_t v = 0U; ok && v < values_len; v++) {
+                ok = values[v][0] != '{' && values[v][0] != '[';
+            }
+            st_json_free_string_array(values, values_len);
+        }
+        free(protocols);
+        char *ranges = ok ? st_json_get_top_level_raw(items[i], "portRanges") : NULL;
+        if (ok && !is_absent_value(ranges)) {
+            char **pairs = NULL;
+            size_t pairs_len = 0U;
+            ok = raw_array_items(ranges, &pairs, &pairs_len) == 0;
+            for (size_t p = 0U; ok && p < pairs_len; p++) {
+                ok = strcmp(pairs[p], "null") == 0 || pairs[p][0] == '[';
+            }
+            st_json_free_string_array(pairs, pairs_len);
+        }
+        free(ranges);
+    }
+    st_json_free_string_array(items, items_len);
+    return ok;
+}
+
+static int normalize_cidr(const char *rule_raw, st_egress_destination_rule *out, const char *field, char *error,
+                          size_t error_len)
 {
     char *raw = st_json_get_top_level_raw(rule_raw, "cidr");
-    /* Absent, null and non-string all fail here; an empty string fails the parse below. */
-    char *cidr = decode_text(raw);
+    /* Absent and null are Java's null; a number or boolean is its literal text. */
+    int nul_free = 1;
+    char *cidr = scalar_text(raw, &nul_free);
     free(raw);
-    if (cidr == NULL) {
-        return 1;
-    }
-    const char *trimmed = trim_in_place(cidr);
-    int ok;
-    if (strchr(trimmed, ':') != NULL) {
-        /* IPv6 is stored in RFC 5952 form, the /length kept only when it was written. */
-        st_egress_cidr6 parsed6;
-        int had_length = 0;
-        ok = st_egress_parse_cidr6(trimmed, &parsed6, &had_length) == 0;
-        if (ok) {
-            char stored[64];
-            st_egress_format_address6(parsed6.network, stored, sizeof(stored));
-            if (had_length) {
-                size_t used = strlen(stored);
-                snprintf(stored + used, sizeof(stored) - used, "/%d", parsed6.prefix_length);
+    int ok = 0;
+    char *copy = cidr == NULL || !nul_free ? NULL : (char *)malloc(strlen(cidr) + 1U);
+    if (copy != NULL) {
+        strcpy(copy, cidr);
+        const char *trimmed = trim_in_place(copy);
+        if (strchr(trimmed, ':') != NULL) {
+            /* IPv6 is stored in RFC 5952 form, the /length kept only when it was written. */
+            st_egress_cidr6 parsed6;
+            int had_length = 0;
+            ok = st_egress_parse_cidr6(trimmed, &parsed6, &had_length) == 0;
+            if (ok) {
+                char stored[64];
+                st_egress_format_address6(parsed6.network, stored, sizeof(stored));
+                if (had_length) {
+                    size_t used = strlen(stored);
+                    snprintf(stored + used, sizeof(stored) - used, "/%d", parsed6.prefix_length);
+                }
+                copy_bounded(out->cidr, sizeof(out->cidr), stored);
             }
-            copy_bounded(out->cidr, sizeof(out->cidr), stored);
+        } else {
+            st_egress_cidr parsed;
+            ok = strlen(trimmed) < sizeof(out->cidr) && st_egress_parse_cidr(trimmed, &parsed) == 0;
+            if (ok) {
+                /* Kept as written: a bare address stays bare, so the operator reads back what they typed. */
+                copy_bounded(out->cidr, sizeof(out->cidr), trimmed);
+            }
         }
-    } else {
-        st_egress_cidr parsed;
-        ok = strlen(trimmed) < sizeof(out->cidr) && st_egress_parse_cidr(trimmed, &parsed) == 0;
-        if (ok) {
-            /* Kept as written: a bare address stays bare, so the operator reads back what they typed. */
-            copy_bounded(out->cidr, sizeof(out->cidr), trimmed);
-        }
+        free(copy);
+    }
+    if (!ok) {
+        rule_error(error, error_len, "%s.cidr is not an IPv4 or IPv6 address or CIDR: %s", field,
+                   cidr == NULL ? "null" : cidr);
     }
     free(cidr);
     return ok ? 0 : 1;
 }
 
-static int normalize_protocols(const char *rule_raw, st_egress_destination_rule *out)
+static int normalize_protocols(const char *rule_raw, st_egress_destination_rule *out, const char *field,
+                               char *error, size_t error_len)
 {
     char *raw = st_json_get_top_level_raw(rule_raw, "protocols");
     if (is_absent_value(raw)) {
@@ -1155,18 +1302,19 @@ static int normalize_protocols(const char *rule_raw, st_egress_destination_rule 
     int rc = raw_array_items(raw, &items, &items_len);
     free(raw);
     for (size_t i = 0U; rc == 0 && i < items_len; i++) {
-        char *value = decode_text(items[i]);
-        if (value == NULL) {
-            rc = 1;
-            break;
-        }
-        char *protocol = trim_in_place(value);
-        for (char *p = protocol; *p != '\0'; p++) {
+        int nul_free = 1;
+        char *value = scalar_text(items[i], &nul_free);
+        char *protocol = value == NULL || !nul_free ? NULL : trim_in_place(value);
+        for (char *p = protocol; p != NULL && *p != '\0'; p++) {
             if (*p >= 'A' && *p <= 'Z') {
                 *p = (char)(*p - 'A' + 'a');
             }
         }
-        if (strcmp(protocol, "tcp") != 0 && strcmp(protocol, "udp") != 0) {
+        if (protocol == NULL || (strcmp(protocol, "tcp") != 0 && strcmp(protocol, "udp") != 0)) {
+            char *as_sent = scalar_text(items[i], NULL);
+            rule_error(error, error_len, "%s.protocols may contain only tcp and udp: %s", field,
+                       as_sent == NULL ? "null" : as_sent);
+            free(as_sent);
             rc = 1;
         } else if (!rule_allows_protocol(out, protocol) && out->protocols_len < ST_EGRESS_MAX_PROTOCOLS) {
             copy_bounded(out->protocols[out->protocols_len], sizeof(out->protocols[0]), protocol);
@@ -1178,7 +1326,8 @@ static int normalize_protocols(const char *rule_raw, st_egress_destination_rule 
     return rc;
 }
 
-static int normalize_port_ranges(const char *rule_raw, st_egress_destination_rule *out)
+static int normalize_port_ranges(const char *rule_raw, st_egress_destination_rule *out, const char *field,
+                                 char *error, size_t error_len)
 {
     char *raw = st_json_get_top_level_raw(rule_raw, "portRanges");
     if (is_absent_value(raw)) {
@@ -1190,6 +1339,8 @@ static int normalize_port_ranges(const char *rule_raw, st_egress_destination_rul
     int rc = raw_array_items(raw, &items, &items_len);
     free(raw);
     if (rc == 0 && items_len > ST_EGRESS_MAX_PORT_RANGES) {
+        rule_error(error, error_len, "%s.portRanges has %zu ranges (at most %d)", field, items_len,
+                   ST_EGRESS_MAX_PORT_RANGES);
         rc = 1;
     }
     for (size_t i = 0U; rc == 0 && i < items_len; i++) {
@@ -1200,45 +1351,61 @@ static int normalize_port_ranges(const char *rule_raw, st_egress_destination_rul
             out->port_ranges[out->port_ranges_len][0] = low;
             out->port_ranges[out->port_ranges_len][1] = high;
             out->port_ranges_len++;
+        } else if (error != NULL && error_len > 0U) {
+            int written = snprintf(error, error_len,
+                                   "%s.portRanges entries must be [low, high] integers with "
+                                   "0 <= low <= high <= 65535: ", field);
+            if (written > 0 && (size_t)written < error_len) {
+                append_java_text(error, error_len, items[i]);
+            }
         }
     }
     st_json_free_string_array(items, items_len);
     return rc;
 }
 
-static int normalize_destination_rule(const char *raw, st_egress_destination_rule *out)
+static int normalize_destination_rule(const char *raw, st_egress_destination_rule *out, const char *field,
+                                      char *error, size_t error_len)
 {
     memset(out, 0, sizeof(*out));
     if (!st_json_is_valid_object(raw)) {
+        rule_error(error, error_len, "%s must be an object", field);
         return 1;
     }
-    if (normalize_cidr(raw, out) != 0
-        || normalize_protocols(raw, out) != 0
-        || normalize_port_ranges(raw, out) != 0) {
+    if (normalize_cidr(raw, out, field, error, error_len) != 0
+        || normalize_protocols(raw, out, field, error, error_len) != 0
+        || normalize_port_ranges(raw, out, field, error, error_len) != 0) {
         return 1;
     }
     return 0;
 }
 
-int st_egress_normalize_destination_rules(const char *json, char **out_json)
+int st_egress_normalize_destination_rules_explained(const char *json, char **out_json, char *error,
+                                                    size_t error_len)
 {
     if (out_json == NULL) {
-        return 1;
+        return 2;
     }
     *out_json = NULL;
+    rule_error(error, error_len, "%s", "");
     if (json == NULL || !st_json_is_valid(json)) {
-        return 1;
+        return 2;
     }
     while (is_trim_space(*json)) {
         json++;
     }
+    if (!rules_bind(json, "cidr")) {
+        return 2;
+    }
     char **items = NULL;
     size_t items_len = 0U;
     if (raw_array_items(json, &items, &items_len) != 0) {
-        return 1;
+        return 2;
     }
     /* Counted before anything is parsed, so an oversized list is refused, never truncated. */
     if (items_len > ST_EGRESS_MAX_DESTINATION_RULES) {
+        rule_error(error, error_len, "too many destination rules: %zu (at most %d)", items_len,
+                   ST_EGRESS_MAX_DESTINATION_RULES);
         st_json_free_string_array(items, items_len);
         return 1;
     }
@@ -1250,16 +1417,27 @@ int st_egress_normalize_destination_rules(const char *json, char **out_json)
     }
     int rc = 0;
     for (size_t i = 0U; rc == 0 && i < items_len; i++) {
-        rc = normalize_destination_rule(items[i], &rules[i]);
+        char field[48];
+        snprintf(field, sizeof(field), "destinationRules[%zu]", i);
+        rc = normalize_destination_rule(items[i], &rules[i], field, error, error_len);
     }
     st_json_free_string_array(items, items_len);
     if (rc == 0) {
         /* The encoder refuses a result over the stored byte limit, which is the last check. */
         *out_json = st_egress_encode_destination_rules(rules, items_len);
-        rc = *out_json == NULL ? 1 : 0;
+        if (*out_json == NULL) {
+            rule_error(error, error_len, "destination rules exceed %d bytes once stored",
+                       ST_EGRESS_MAX_DESTINATION_RULES_BYTES);
+            rc = 1;
+        }
     }
     free(rules);
     return rc;
+}
+
+int st_egress_normalize_destination_rules(const char *json, char **out_json)
+{
+    return st_egress_normalize_destination_rules_explained(json, out_json, NULL, 0U) == 0 ? 0 : 1;
 }
 
 /* Appends text within capacity. Returns 0, or 1 when it does not fit. */
@@ -1432,25 +1610,37 @@ typedef struct {
     st_egress_destination_rule traffic;
 } egress_domain_rule;
 
-static int normalize_domain_rule(const char *raw, egress_domain_rule *out)
+static int normalize_domain_rule(const char *raw, egress_domain_rule *out, const char *field, char *error,
+                                 size_t error_len)
 {
     memset(out, 0, sizeof(*out));
     if (!st_json_is_valid_object(raw)) {
+        rule_error(error, error_len, "%s must be an object", field);
         return 1;
     }
-    char *field = st_json_get_top_level_raw(raw, "match");
-    /* Absent, null and non-string all fail here; an empty string fails the syntax check. */
-    char *text = decode_text(field);
-    free(field);
-    if (text == NULL) {
-        return 1;
+    char *member = st_json_get_top_level_raw(raw, "match");
+    /* Absent and null are Java's null, which matches nothing; an empty string fails the syntax check. */
+    int nul_free = 1;
+    char *text = scalar_text(member, &nul_free);
+    free(member);
+    int rc = 1;
+    if (text != NULL && nul_free) {
+        char *copy = (char *)malloc(strlen(text) + 1U);
+        if (copy != NULL) {
+            strcpy(copy, text);
+            rc = normalize_domain_match(trim_in_place(copy), out->match, sizeof(out->match));
+            free(copy);
+        }
     }
-    int rc = normalize_domain_match(trim_in_place(text), out->match, sizeof(out->match));
-    free(text);
     if (rc != 0) {
+        rule_error(error, error_len, "%s.match must be a name or *.name with at least two labels: %s", field,
+                   text == NULL ? "null" : text);
+        free(text);
         return 1;
     }
-    return normalize_protocols(raw, &out->traffic) != 0 || normalize_port_ranges(raw, &out->traffic) != 0 ? 1 : 0;
+    free(text);
+    return normalize_protocols(raw, &out->traffic, field, error, error_len) != 0
+        || normalize_port_ranges(raw, &out->traffic, field, error, error_len) != 0 ? 1 : 0;
 }
 
 /* Serialises normalised domain rules, or NULL when they exceed the stored byte limit. */
@@ -1481,25 +1671,31 @@ static char *encode_domain_rules(const egress_domain_rule *rules, size_t rules_l
     return out;
 }
 
-int st_egress_normalize_domain_rules(const char *json, char **out_json)
+int st_egress_normalize_domain_rules_explained(const char *json, char **out_json, char *error, size_t error_len)
 {
     if (out_json == NULL) {
-        return 1;
+        return 2;
     }
     *out_json = NULL;
+    rule_error(error, error_len, "%s", "");
     if (json == NULL || !st_json_is_valid(json)) {
-        return 1;
+        return 2;
     }
     while (is_trim_space(*json)) {
         json++;
     }
+    if (!rules_bind(json, "match")) {
+        return 2;
+    }
     char **items = NULL;
     size_t items_len = 0U;
     if (raw_array_items(json, &items, &items_len) != 0) {
-        return 1;
+        return 2;
     }
     /* Counted before anything is parsed, so an oversized list is refused, never truncated. */
     if (items_len > ST_EGRESS_MAX_DOMAIN_RULES) {
+        rule_error(error, error_len, "too many domain rules: %zu (at most %d)", items_len,
+                   ST_EGRESS_MAX_DOMAIN_RULES);
         st_json_free_string_array(items, items_len);
         return 1;
     }
@@ -1510,16 +1706,26 @@ int st_egress_normalize_domain_rules(const char *json, char **out_json)
     }
     int rc = 0;
     for (size_t i = 0U; rc == 0 && i < items_len; i++) {
-        rc = normalize_domain_rule(items[i], &rules[i]);
+        char field[48];
+        snprintf(field, sizeof(field), "domainRules[%zu]", i);
+        rc = normalize_domain_rule(items[i], &rules[i], field, error, error_len);
     }
     st_json_free_string_array(items, items_len);
     if (rc == 0) {
         /* The encoder refuses a result over the stored byte limit, which is the last check. */
         *out_json = encode_domain_rules(rules, items_len);
-        rc = *out_json == NULL ? 1 : 0;
+        if (*out_json == NULL) {
+            rule_error(error, error_len, "domain rules exceed %d bytes once stored", ST_EGRESS_MAX_DOMAIN_RULES_BYTES);
+            rc = 1;
+        }
     }
     free(rules);
     return rc;
+}
+
+int st_egress_normalize_domain_rules(const char *json, char **out_json)
+{
+    return st_egress_normalize_domain_rules_explained(json, out_json, NULL, 0U) == 0 ? 0 : 1;
 }
 
 size_t st_egress_collect_protocols(const st_egress_destination_rule *rules,

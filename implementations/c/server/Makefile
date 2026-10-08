@@ -3,6 +3,19 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 CPPFLAGS ?= -Isrc
 LDFLAGS ?= -lpthread -lz -lsqlite3 -lssl -lcrypto -lcurl -lhiredis -lutf8proc
 
+# libbrotlidec is optional, as in CMakeLists.txt: with its pkg-config file, Content-Encoding br is
+# decoded (ST_HAVE_BROTLI); libbrotlienc, when present too, lets the tests compress br fixtures.
+BROTLIDEC_LIBS := $(shell pkg-config --libs libbrotlidec 2>/dev/null)
+BROTLIENC_LIBS := $(shell pkg-config --libs libbrotlienc 2>/dev/null)
+ifneq ($(BROTLIDEC_LIBS),)
+CPPFLAGS += -DST_HAVE_BROTLI $(shell pkg-config --cflags libbrotlidec 2>/dev/null)
+LDFLAGS += $(BROTLIDEC_LIBS)
+ifneq ($(BROTLIENC_LIBS),)
+BROTLI_TEST_FLAGS := -DST_HAVE_BROTLI_ENCODER $(shell pkg-config --cflags libbrotlienc 2>/dev/null)
+BROTLI_TEST_LIBS := $(BROTLIENC_LIBS)
+endif
+endif
+
 BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_auth_nonce.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/oidc.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/traffic_capture.o $(BUILD_DIR)/turn_auth.o $(BUILD_DIR)/stream_tombstones.o $(BUILD_DIR)/workbench.o $(BUILD_DIR)/http_share.o $(BUILD_DIR)/product_metrics.o $(BUILD_DIR)/upstream_browser_headers.o
 SERVER := $(BUILD_DIR)/specus-server-c
@@ -44,6 +57,7 @@ TRAFFIC_DETAIL_API_TESTS := $(BUILD_DIR)/specus_c_traffic_detail_api_tests
 CLIENT_MESSAGES_TESTS := $(BUILD_DIR)/specus_c_client_messages_tests
 MANAGEMENT_LISTS_TESTS := $(BUILD_DIR)/specus_c_management_lists_tests
 MANAGEMENT_CRUD_TESTS := $(BUILD_DIR)/specus_c_management_crud_tests
+PEER_MESH_API_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_api_tests
 MANAGEMENT_OVERVIEW_TESTS := $(BUILD_DIR)/specus_c_management_overview_tests
 HTTP_WEBSOCKET_ROUTING_TESTS := $(BUILD_DIR)/specus_c_http_websocket_routing_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
@@ -56,7 +70,7 @@ UPSTREAM_BROWSER_HEADERS_TESTS := $(BUILD_DIR)/specus_c_upstream_browser_headers
 WORKBENCH_TESTS := $(BUILD_DIR)/specus_c_workbench_tests
 MANAGEMENT_ACCOUNTS_TESTS := $(BUILD_DIR)/specus_c_management_accounts_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIENT_AUTH_NONCE_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(OIDC_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS) $(WORKBENCH_TESTS) $(MANAGEMENT_ACCOUNTS_TESTS) $(HTTP_SHARE_TESTS) $(SEMANTIC_VERSION_TESTS) $(TRAFFIC_CAPTURE_TESTS) $(TURNSTILE_VERIFIER_TESTS) $(UPSTREAM_BROWSER_HEADERS_TESTS) $(CLIENT_PACKAGE_TESTS) $(PUBLIC_CLUSTER_CODEC_TESTS) $(PUBLIC_TRANSFER_TESTS)
-ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
+ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 
 .PHONY: all test release clean
@@ -91,7 +105,7 @@ $(CRYPTO_TESTS): $(CORE_OBJS) tests/crypto_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/crypto_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(DECOMPRESSION_LIMITS_TESTS): $(CORE_OBJS) tests/decompression_limits_tests.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/decompression_limits_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(BROTLI_TEST_FLAGS) $(CFLAGS) tests/decompression_limits_tests.c $(CORE_OBJS) $(LDFLAGS) $(BROTLI_TEST_LIBS) -o $@
 
 $(ELASTICSEARCH_TRAFFIC_TESTS): $(CORE_OBJS) tests/elasticsearch_traffic_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/elasticsearch_traffic_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -186,6 +200,9 @@ $(MANAGEMENT_LISTS_TESTS): $(CORE_OBJS) tests/management_lists_tests.c tests/ser
 $(MANAGEMENT_CRUD_TESTS): $(CORE_OBJS) tests/management_crud_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_crud_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(PEER_MESH_API_TESTS): $(CORE_OBJS) tests/peer_mesh_api_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_mesh_api_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_overview_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -238,6 +255,7 @@ test: all
 	$(CLIENT_MESSAGES_TESTS) $(SERVER)
 	$(MANAGEMENT_LISTS_TESTS)
 	$(MANAGEMENT_CRUD_TESTS)
+	$(PEER_MESH_API_TESTS)
 	$(MANAGEMENT_OVERVIEW_TESTS) $(SERVER)
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)

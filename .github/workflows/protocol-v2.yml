@@ -205,7 +205,7 @@ jobs:
       - name: Refresh package metadata
         run: sudo apt-get update
       - name: Install native dependencies
-        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev redis-server
+        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev libbrotli-dev redis-server
       - name: Configure
         run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release
       - name: Build

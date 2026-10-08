@@ -1029,7 +1029,8 @@ int st_storage_init(const char *path, int seed_demo_client)
         "remote_endpoint TEXT,"
         "direct_bytes INTEGER NOT NULL DEFAULT 0,"
         "relay_bytes INTEGER NOT NULL DEFAULT 0,"
-        "last_traffic_at TEXT"
+        "last_traffic_at TEXT,"
+        "last_keepalive_at TEXT"
         ");");
     }
     if (rc == 0) {
@@ -1435,6 +1436,9 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "peer_mesh_device", "nat_behavior_discovery", "TEXT");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "peer_mesh_session", "last_keepalive_at", "TEXT");
     }
     if (rc == 0) {
         rc = exec_sql(db,
@@ -2072,7 +2076,8 @@ static int scan_peer_mesh_session(sqlite3_stmt *stmt, st_storage_peer_mesh_sessi
         || copy_text_column(stmt, 11, session->closed_at, sizeof(session->closed_at)) != 0
         || copy_text_column(stmt, 13, session->local_endpoint, sizeof(session->local_endpoint)) != 0
         || copy_text_column(stmt, 14, session->remote_endpoint, sizeof(session->remote_endpoint)) != 0
-        || copy_text_column(stmt, 17, session->last_traffic_at, sizeof(session->last_traffic_at)) != 0) {
+        || copy_text_column(stmt, 17, session->last_traffic_at, sizeof(session->last_traffic_at)) != 0
+        || copy_text_column(stmt, 18, session->last_keepalive_at, sizeof(session->last_keepalive_at)) != 0) {
         return -1;
     }
     return 0;
@@ -5107,15 +5112,10 @@ int st_storage_create_mapping_for_client(const char *path,
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
+    /* A new mapping, never a replacement: Java's create refuses a public port any mapping holds. */
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO specus_mapping(client_name, listen_port, target_address, target_port, enabled, detail_capture_enabled) "
-        "VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(client_name, listen_port) DO UPDATE SET "
-        "target_address = excluded.target_address,"
-        "target_port = excluded.target_port,"
-        "enabled = excluded.enabled,"
-        "detail_capture_enabled = excluded.detail_capture_enabled,"
-        "updated_at = CURRENT_TIMESTAMP",
+        "VALUES(?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -6961,7 +6961,8 @@ int st_storage_ensure_peer_mesh_device(const char *path,
         db,
         "INSERT INTO peer_mesh_device(tenant_id, owner_username, client_id, client_name, enabled, "
         "virtual_ip, cidr, nat_type, virtual_device_mode, virtual_device_status, updated_at) "
-        "VALUES (?, ?, ?, ?, 0, ?, ?, 'UNKNOWN', 'AUTO', 'DOWN', CURRENT_TIMESTAMP) "
+        /* Nothing reported yet: Java leaves the NAT type and virtual device fields null. */
+        "VALUES (?, ?, ?, ?, 0, ?, ?, '', '', '', CURRENT_TIMESTAMP) "
         "ON CONFLICT(tenant_id, client_id) DO UPDATE SET "
         "owner_username = excluded.owner_username, client_name = excluded.client_name, "
         "virtual_ip = CASE WHEN peer_mesh_device.virtual_ip IS NULL OR peer_mesh_device.virtual_ip='' "
@@ -7054,6 +7055,150 @@ int st_storage_get_peer_mesh_device_by_client(const char *path,
     int rc = read_peer_mesh_device(db, tenant_id, client_id, out_device);
     sqlite3_close(db);
     return rc;
+}
+
+/*
+ * Java PeerMeshService.listDevices: the devices of the tenant, or of the tenant and owner, by client
+ * name. Only clients that have a device row are listed: one is made when a client logs in or talks
+ * Peer Mesh, never by listing.
+ */
+int st_storage_list_peer_mesh_devices_visible(const char *path,
+                                              const char *tenant_id,
+                                              const char *owner_username,
+                                              int include_all_clients,
+                                              st_storage_peer_mesh_device **devices,
+                                              size_t *device_count)
+{
+    if (devices == NULL || device_count == NULL) return -1;
+    *devices = NULL;
+    *device_count = 0U;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    char sql[1024];
+    int written = snprintf(sql, sizeof(sql),
+        "SELECT id, tenant_id, owner_username, client_id, client_name, enabled, "
+        "virtual_ip, cidr, public_key, nat_type, nat_mapping_behavior, "
+        "nat_filtering_behavior, nat_behavior_discovery, last_endpoint, virtual_device_mode, "
+        "virtual_device_name, virtual_device_status, virtual_device_error, "
+        "virtual_device_updated_at, last_seen_at, updated_at "
+        "FROM peer_mesh_device WHERE tenant_id = ?%s ORDER BY client_name, id",
+        include_all_clients ? "" : " AND owner_username = ?");
+    sqlite3_stmt *stmt = NULL;
+    int rc = written > 0 && (size_t)written < sizeof(sql)
+        ? sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) : SQLITE_ERROR;
+    st_storage_peer_mesh_device *items = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        if (!include_all_clients) {
+            sqlite3_bind_text(stmt, 2, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
+        }
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (storage_reserve((void **)&items, count, &capacity, sizeof(*items)) != 0) {
+                rc = SQLITE_NOMEM;
+                break;
+            }
+            memset(&items[count], 0, sizeof(items[count]));
+            if (scan_peer_mesh_device(stmt, &items[count]) != 0) {
+                rc = SQLITE_ERROR;
+                break;
+            }
+            ++count;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (rc != SQLITE_DONE) {
+        free(items);
+        return -1;
+    }
+    *devices = items;
+    *device_count = count;
+    return 0;
+}
+
+/*
+ * Java PeerMeshService.updateDevice on an existing device row: enabled < 0 leaves the flag as it is,
+ * and the update time moves either way. 1 when the tenant has no device for the client.
+ */
+int st_storage_set_peer_mesh_device_enabled(const char *path,
+                                            const char *tenant_id,
+                                            long long client_id,
+                                            int enabled,
+                                            st_storage_peer_mesh_device *out_device)
+{
+    sqlite3 *db = NULL;
+    if (client_id <= 0 || open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE peer_mesh_device SET enabled = CASE WHEN ? < 0 THEN enabled ELSE ? END, "
+        "updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND client_id = ?",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, enabled);
+        sqlite3_bind_int(stmt, 2, enabled > 0 ? 1 : 0);
+        sqlite3_bind_text(stmt, 3, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, client_id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? (sqlite3_changes(db) == 1 ? 0 : 1) : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0 && out_device != NULL) {
+        rc = read_peer_mesh_device(db, tenant_id, client_id, out_device);
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+/* The tenant's sessions that are not closed, most recently updated first. */
+int st_storage_list_open_peer_mesh_sessions(const char *path,
+                                            const char *tenant_id,
+                                            st_storage_peer_mesh_session **sessions,
+                                            size_t *session_count)
+{
+    if (sessions == NULL || session_count == NULL) return -1;
+    *sessions = NULL;
+    *session_count = 0U;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT s.id, s.tenant_id, s.source_client_id, s.source_client_name, "
+        "s.target_client_id, s.target_client_name, s.path_type, s.status, "
+        "s.started_at, s.updated_at, s.expires_at, s.closed_at, s.rtt_millis, "
+        "s.local_endpoint, s.remote_endpoint, s.direct_bytes, s.relay_bytes, "
+        "s.last_traffic_at, s.last_keepalive_at FROM peer_mesh_session s "
+        "WHERE s.tenant_id = ? AND s.status <> 'CLOSED' ORDER BY s.updated_at DESC, s.id DESC",
+        -1, &stmt, NULL);
+    st_storage_peer_mesh_session *items = NULL;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (storage_reserve((void **)&items, count, &capacity, sizeof(*items)) != 0) {
+                rc = SQLITE_NOMEM;
+                break;
+            }
+            memset(&items[count], 0, sizeof(items[count]));
+            if (scan_peer_mesh_session(stmt, &items[count]) != 0) {
+                rc = SQLITE_ERROR;
+                break;
+            }
+            ++count;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (rc != SQLITE_DONE) {
+        free(items);
+        return -1;
+    }
+    *sessions = items;
+    *session_count = count;
+    return 0;
 }
 
 int st_storage_update_peer_mesh_device_report(const char *path,
@@ -7392,7 +7537,7 @@ static int read_peer_mesh_session_visible(sqlite3 *db,
                            "s.target_client_id, s.target_client_name, s.path_type, s.status, "
                            "s.started_at, s.updated_at, s.expires_at, s.closed_at, s.rtt_millis, "
                            "s.local_endpoint, s.remote_endpoint, s.direct_bytes, s.relay_bytes, "
-                           "s.last_traffic_at FROM peer_mesh_session s%s AND s.id = ?",
+                           "s.last_traffic_at, s.last_keepalive_at FROM peer_mesh_session s%s AND s.id = ?",
                            where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         return -1;
@@ -7447,7 +7592,7 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
                            "s.target_client_id, s.target_client_name, s.path_type, s.status, "
                            "s.started_at, s.updated_at, s.expires_at, s.closed_at, s.rtt_millis, "
                            "s.local_endpoint, s.remote_endpoint, s.direct_bytes, s.relay_bytes, "
-                           "s.last_traffic_at FROM peer_mesh_session s%s "
+                           "s.last_traffic_at, s.last_keepalive_at FROM peer_mesh_session s%s "
                            "ORDER BY s.updated_at DESC, s.id DESC LIMIT ?",
                            where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
@@ -7524,7 +7669,7 @@ int st_storage_page_peer_mesh_sessions_visible(const char *path,
                                 "s.target_client_id, s.target_client_name, s.path_type, s.status, "
                                 "s.started_at, s.updated_at, s.expires_at, s.closed_at, s.rtt_millis, "
                                 "s.local_endpoint, s.remote_endpoint, s.direct_bytes, s.relay_bytes, "
-                                "s.last_traffic_at FROM peer_mesh_session s%s "
+                                "s.last_traffic_at, s.last_keepalive_at FROM peer_mesh_session s%s "
                                 "ORDER BY s.updated_at DESC, s.id DESC LIMIT ? OFFSET ?",
                                 where);
     if (count_written < 0 || (size_t)count_written >= sizeof(count_sql)
@@ -7991,7 +8136,7 @@ static int read_peer_mesh_session(sqlite3 *db,
     int rc = sqlite3_prepare_v2(db,
         "SELECT id,tenant_id,source_client_id,source_client_name,target_client_id,target_client_name,"
         "path_type,status,started_at,updated_at,expires_at,closed_at,rtt_millis,local_endpoint,"
-        "remote_endpoint,direct_bytes,relay_bytes,last_traffic_at FROM peer_mesh_session "
+        "remote_endpoint,direct_bytes,relay_bytes,last_traffic_at,last_keepalive_at FROM peer_mesh_session "
         "WHERE tenant_id=? AND id=?", -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
     sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
@@ -8206,6 +8351,9 @@ int st_storage_report_peer_mesh_session(const char *path,
                 "local_endpoint=COALESCE(?6,local_endpoint),remote_endpoint=COALESCE(?7,remote_endpoint),"
                 "direct_bytes=" PEER_SESSION_ADD_DIRECT_SQL ",relay_bytes=" PEER_SESSION_ADD_RELAY_SQL ","
                 "last_traffic_at=CASE WHEN ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP ELSE last_traffic_at END,"
+                /* Java: every path-report is a keepalive; a traffic report is one when it counts bytes. */
+                "last_keepalive_at=CASE WHEN ?4<>'' OR ?1>0 OR ?2>0 THEN CURRENT_TIMESTAMP "
+                "ELSE last_keepalive_at END,"
                 "updated_at=CURRENT_TIMESTAMP "
                 "WHERE id=?8 AND status<>'CLOSED' AND NOT " PEER_SESSION_EXPIRED_SQL,
                 -1, &stmt, NULL);
@@ -8269,9 +8417,12 @@ int st_storage_authorize_peer_mesh_relay(const char *path,
                       "CASE WHEN status<>'ACTIVE' THEN 'RELAY' ELSE " PEER_SESSION_CURRENT_PATH_SQL " END") ","
                   "status='ACTIVE',relay_bytes=" PEER_SESSION_ADD_RELAY_SQL ","
                   "last_traffic_at=CASE WHEN ?2>0 THEN CURRENT_TIMESTAMP ELSE last_traffic_at END,"
+                  "last_keepalive_at=CASE WHEN ?2>0 OR status<>'ACTIVE' THEN CURRENT_TIMESTAMP "
+                  "ELSE last_keepalive_at END,"
                   "updated_at=CURRENT_TIMESTAMP "
                   "WHERE id=?3 AND status<>'CLOSED' AND NOT " PEER_SESSION_EXPIRED_SQL
-                : "UPDATE peer_mesh_session SET path_type='RELAY',status='ACTIVE',updated_at=CURRENT_TIMESTAMP "
+                : "UPDATE peer_mesh_session SET path_type='RELAY',status='ACTIVE',"
+                  "last_keepalive_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP "
                   "WHERE id=?3 AND status<>'CLOSED' AND status<>'ACTIVE' AND NOT " PEER_SESSION_EXPIRED_SQL,
             -1, &stmt, NULL);
         if (rc == SQLITE_OK) {

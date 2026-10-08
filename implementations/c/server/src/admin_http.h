@@ -165,6 +165,13 @@ typedef int (*st_admin_client_message_handler)(void *ctx,
 typedef int (*st_admin_peer_mesh_refresh_handler)(void *ctx,
                                                   const char *tenant_id);
 /*
+ * Sends one PEER_CONTROL message from "server" to a client's control connection; -1 when the client
+ * is not online. The management API uses it to tell both ends of a session it closed.
+ */
+typedef int (*st_admin_peer_control_send_handler)(void *ctx,
+                                                  const char *target_client_name,
+                                                  const char *message);
+/*
  * Closes the online control and data connections of a client account an admin disabled, renamed
  * or deleted. client_name is the name they logged in with (the account's name before the change)
  * and reason the disconnect reason they are recorded with: ADMIN_DISABLED, ADMIN_RENAMED or
@@ -250,6 +257,7 @@ void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_h
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
 void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx);
+void st_admin_set_peer_control_send_handler(st_admin_peer_control_send_handler handler, void *ctx);
 void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx);
 void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,
                                                     void *ctx);

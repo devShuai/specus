@@ -241,7 +241,7 @@ static int test_peer_mesh_lists(const char *token, long long first)
              first);
     char *answer = NULL;
     int status = request("POST", "/api/admin/peer-mesh/services", body, token, &answer);
-    int saved = status == 201 && answer != NULL && strstr(answer, "\"serviceId\":\"svc-saved\"") != NULL;
+    int saved = status == 200 && answer != NULL && strstr(answer, "\"serviceId\":\"svc-saved\"") != NULL;
     if (!saved) fprintf(stderr, "service save: %d %.300s\n", status, answer == NULL ? "" : answer);
     free(answer);
     if (!saved) return -1;
