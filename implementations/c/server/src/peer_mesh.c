@@ -960,44 +960,68 @@ static void pm_trim_lower(const char *value, char *out, size_t out_len)
     out[len] = '\0';
 }
 
-static int pm_normalize_local_host(const char *value, char out[256])
+/*
+ * Java PeerServiceDiscovery.requireTargetHost, step by step, with the message each refusal carries:
+ * a blank value, anything shaped like a URL, a name other than localhost, an address that is not
+ * written canonically (Java compares the text with InetAddress.getHostAddress), the wildcard and
+ * multicast addresses, and an address that is not loopback, link-local, site-local or unique-local.
+ */
+const char *st_peer_mesh_local_host_refusal(const char *value, char out[256])
 {
     char host[256];
     const char *start = value == NULL ? "" : value;
-    while (isspace((unsigned char)*start)) ++start;
+    while ((unsigned char)*start <= ' ' && *start != '\0') ++start;
     const char *end = start + strlen(start);
-    while (end > start && isspace((unsigned char)end[-1])) --end;
-    if (end == start || (size_t)(end - start) >= sizeof(host)) return -1;
+    while (end > start && (unsigned char)end[-1] <= ' ') --end;
+    if (end == start) return "targetHost is required";
+    if ((size_t)(end - start) >= sizeof(host)) return "targetHost must be a unicast IP or localhost";
     memcpy(host, start, (size_t)(end - start));
     host[end - start] = '\0';
-    if (host[0] == '[' && end - start > 2 && host[end - start - 1] == ']') {
-        memmove(host, host + 1, (size_t)(end - start - 2));
-        host[end - start - 2] = '\0';
+    if (strpbrk(host, "/\\@?#") != NULL) return "targetHost must be a local address, not a URL";
+    size_t len = strlen(host);
+    if (host[0] == '[' && len >= 2U && host[len - 1U] == ']') {
+        memmove(host, host + 1, len - 2U);
+        host[len - 2U] = '\0';
     }
     if (strcasecmp(host, "localhost") == 0) {
         snprintf(out, 256U, "127.0.0.1");
-        return 0;
+        return NULL;
     }
+    int numeric = strchr(host, ':') != NULL || (host[0] != '\0' && strspn(host, "0123456789.") == strlen(host));
+    if (!numeric) return "targetHost must be a numeric local address or localhost";
     struct in_addr ipv4;
-    if (inet_pton(AF_INET, host, &ipv4) == 1) {
+    if (strchr(host, ':') == NULL) {
+        if (inet_pton(AF_INET, host, &ipv4) != 1 || inet_ntop(AF_INET, &ipv4, out, 256U) == NULL
+            || strcmp(out, host) != 0) {
+            return "targetHost must be a unicast IP or localhost";
+        }
         uint32_t address = ntohl(ipv4.s_addr);
+        if (address == 0U || (address >> 28U) == 0xEU) return "targetHost cannot be wildcard or multicast";
         int local = (address >> 24U) == 127U || (address >> 24U) == 10U
             || (address >> 20U) == 0xAC1U || (address >> 16U) == 0xC0A8U
             || (address >> 16U) == 0xA9FEU;
-        if (!local || address == 0U || (address >> 28U) == 0xEU) return -1;
-        return inet_ntop(AF_INET, &ipv4, out, 256U) == NULL ? -1 : 0;
+        return local ? NULL : "targetHost must be loopback or a local interface address";
     }
     struct in6_addr ipv6;
-    if (inet_pton(AF_INET6, host, &ipv6) != 1) return -1;
+    if (inet_pton(AF_INET6, host, &ipv6) != 1) return "targetHost must be a unicast IP or localhost";
+    if (IN6_IS_ADDR_UNSPECIFIED(&ipv6) || IN6_IS_ADDR_MULTICAST(&ipv6)) {
+        return "targetHost cannot be wildcard or multicast";
+    }
     const unsigned char *bytes = ipv6.s6_addr;
     int loopback = IN6_IS_ADDR_LOOPBACK(&ipv6);
     int link_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0x80U;
     /* fec0::/10, which Java's isSiteLocalAddress still counts as local. */
     int site_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0xc0U;
     int unique_local = (bytes[0] & 0xfeU) == 0xfcU;
-    if ((!loopback && !link_local && !site_local && !unique_local) || IN6_IS_ADDR_UNSPECIFIED(&ipv6)
-        || IN6_IS_ADDR_MULTICAST(&ipv6)) return -1;
-    return inet_ntop(AF_INET6, &ipv6, out, 256U) == NULL ? -1 : 0;
+    if (!loopback && !link_local && !site_local && !unique_local) {
+        return "targetHost must be loopback or a local interface address";
+    }
+    return inet_ntop(AF_INET6, &ipv6, out, 256U) == NULL ? "targetHost must be a unicast IP or localhost" : NULL;
+}
+
+static int pm_normalize_local_host(const char *value, char out[256])
+{
+    return st_peer_mesh_local_host_refusal(value, out) == NULL ? 0 : -1;
 }
 
 int st_peer_mesh_normalize_local_host(const char *value, char out[256])
