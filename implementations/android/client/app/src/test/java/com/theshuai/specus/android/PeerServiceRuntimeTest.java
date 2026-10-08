@@ -400,6 +400,41 @@ public class PeerServiceRuntimeTest {
         }
     }
 
+    /**
+     * A flow the bridge accepted right before close() could start its splice after close() had gone
+     * through the registered flows; it then reached the target and kept forwarding for a withdrawn
+     * service. Closing right after the caller connects lands in that window now and then.
+     */
+    @Test
+    public void tcpBridgeClosedRightAfterAcceptForwardsNothing() throws Exception {
+        int[] ports = freePorts(2);
+        SpecusCore.LocalPeerService local = new SpecusCore.LocalPeerService();
+        local.serviceId = "svc-late-splice";
+        local.targetHost = "127.0.0.1";
+        local.targetPort = ports[0];
+        local.allowedPeerVirtualIps = List.of("127.0.0.1");
+        try (ServerSocket target = listen(ports[0])) {
+            target.setSoTimeout(50);
+            for (int round = 0; round < 200; round++) {
+                local.publishedPort = ports[1];
+                PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local);
+                try (Socket caller = new Socket("127.0.0.1", ports[1])) {
+                    bridge.close();
+                    caller.setSoTimeout(1_000);
+                    assertTrue("round " + round + ": the caller of a closed bridge stayed open", readClosed(caller));
+                }
+                // A flow registered before the close may have reached the target, but the close
+                // ended it; one that reached the target and stayed open is a late splice.
+                try (Socket forwarded = target.accept()) {
+                    forwarded.setSoTimeout(1_000);
+                    assertTrue("round " + round + ": a closed bridge kept forwarding a flow", readClosed(forwarded));
+                } catch (SocketTimeoutException nothingReachedTheTarget) {
+                    // expected most rounds
+                }
+            }
+        }
+    }
+
     @Test
     public void tcpBridgeSeparatesThreePeersAndRevocationClosesTheActiveFlow() throws Exception {
         int[] ports = freePorts(2);
