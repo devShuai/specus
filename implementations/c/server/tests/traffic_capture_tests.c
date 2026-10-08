@@ -10,6 +10,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include "decompression_limits.h"
 #include "storage.h"
 #include "traffic_capture.h"
 
@@ -414,12 +415,30 @@ static void test_body_display(void)
         display("raw deflate, header name in any case", raw_deflate, deflate_len, "application/json",
                 "content-encoding:  deflate ", "", json);
         display("identity only", json, strlen(json), "application/json", "Content-Encoding: identity", "", json);
-        char *unreadable = st_traffic_body_display_text(gzip, gzip_len, "application/json",
-                                                        "Content-Encoding: br", "");
-        EXPECT(unreadable != NULL && strncmp(unreadable, "data:application/octet-stream;base64,H4sI", 41U) == 0,
-               "br (not decoded in C) must show the raw bytes as octet-stream: %s",
-               unreadable == NULL ? "(null)" : unreadable);
-        free(unreadable);
+        if (!st_decompression_brotli_supported()) {
+            /* Without libbrotlidec br is an encoding C cannot undo: the raw bytes as octet-stream. */
+            char *unreadable = st_traffic_body_display_text(gzip, gzip_len, "application/json",
+                                                            "Content-Encoding: br", "");
+            EXPECT(unreadable != NULL
+                       && strncmp(unreadable, "data:application/octet-stream;base64,H4sI", 41U) == 0,
+                   "br without libbrotlidec must show the raw bytes as octet-stream: %s",
+                   unreadable == NULL ? "(null)" : unreadable);
+            free(unreadable);
+        }
+        /*
+         * A real br body (RFC 7932 by hand: one uncompressed meta-block holding "hello brotli"):
+         * decoded like Java's org.brotli:dec when the build has libbrotlidec, else shown as stored.
+         */
+        static const uint8_t brotli[] = {
+            0xB0U, 0x00U, 0x10U, 'h', 'e', 'l', 'l', 'o', ' ', 'b', 'r', 'o', 't', 'l', 'i', 0x03U
+        };
+        if (st_decompression_brotli_supported()) {
+            display("br", brotli, sizeof(brotli), "text/plain", "Content-Encoding: br", "", "hello brotli");
+            http_text("br preview", brotli, sizeof(brotli), "text/plain", "br", 5U, "hello");
+        } else {
+            display("br without libbrotlidec", brotli, sizeof(brotli), "text/plain", "Content-Encoding: br", "",
+                    "data:application/octet-stream;base64,sAAQaGVsbG8gYnJvdGxpAw==");
+        }
         uint8_t corrupt[8] = {0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef};
         display("corrupt gzip", corrupt, sizeof(corrupt), "application/json", "Content-Encoding: gzip", "",
                 "data:application/octet-stream;base64,H4sIAN6tvu8=");

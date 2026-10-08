@@ -3057,6 +3057,9 @@ static char *media_decode_manifest_text(const uint8_t *data, size_t len, const c
             if (rc != ST_DECOMPRESSION_OK)
                 rc = st_decompress_bounded(current, current_len, ST_DECOMPRESSION_RAW_DEFLATE,
                                            &decoded, &decoded_len);
+        } else if (token_len == 2U && strncasecmp(token, "br", 2U) == 0) {
+            /* Decoded when the build has libbrotlidec (Java HttpBodyDataCodec); else kept as stored. */
+            rc = st_decompress_bounded(current, current_len, ST_DECOMPRESSION_BROTLI, &decoded, &decoded_len);
         }
         if (rc != ST_DECOMPRESSION_OK) {
             free(decoded);
