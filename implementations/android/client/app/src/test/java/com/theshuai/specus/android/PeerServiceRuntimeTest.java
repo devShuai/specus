@@ -423,11 +423,13 @@ public class PeerServiceRuntimeTest {
                     caller.setSoTimeout(1_000);
                     assertTrue("round " + round + ": the caller of a closed bridge stayed open", readClosed(caller));
                 }
-                // Nothing reached the target after the close: a late splice would connect here.
+                // A flow registered before the close may have reached the target, but the close
+                // ended it; one that reached the target and stayed open is a late splice.
                 try (Socket forwarded = target.accept()) {
-                    throw new AssertionError("round " + round + ": a closed bridge forwarded a flow");
-                } catch (SocketTimeoutException expected) {
-                    // expected
+                    forwarded.setSoTimeout(1_000);
+                    assertTrue("round " + round + ": a closed bridge kept forwarding a flow", readClosed(forwarded));
+                } catch (SocketTimeoutException nothingReachedTheTarget) {
+                    // expected most rounds
                 }
             }
         }
