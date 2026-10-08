@@ -92,6 +92,59 @@ public sealed class PeerEgressIpv6VectorTests
         }
     }
 
+    /// <summary>
+    /// Egress-side authorization of IPv6 destinations against the <c>ipv6</c> section of
+    /// peer-egress-authz-v1.json.
+    /// </summary>
+    [Fact]
+    public void AuthorizationOfIpv6DestinationsMatchesSharedVector()
+    {
+        using var vector = ReadVector("peer-egress-authz-v1.json");
+        var section = vector.RootElement.GetProperty("ipv6");
+        Assert.Equal(Strings(section, "forcedDenyCidrs"), PeerEgressAuthorization.ForcedDenyCidrs6);
+        Assert.Equal(Strings(section, "cloudMetadataCidrs"), PeerEgressAuthorization.CloudMetadataCidrs6);
+        Assert.Equal(Strings(section, "lanCidrs"), PeerEgressAuthorization.LanCidrs6);
+        var policy = section.GetProperty("policy").Deserialize<PeerEgressPolicy>()!;
+        var context = new PeerEgressContext();
+        var cases = section.GetProperty("cases").EnumerateArray()
+            .Concat(section.GetProperty("policyVariantCases").EnumerateArray()).ToList();
+        Assert.NotEmpty(cases);
+        foreach (var testCase in cases)
+        {
+            var applied = policy;
+            if (testCase.TryGetProperty("policyOverride", out var overrides))
+            {
+                applied = policy with
+                {
+                    Scope = overrides.GetProperty("scope").GetString()!,
+                    DestinationRules = overrides.GetProperty("destinationRules").Deserialize<List<PeerEgressDestinationRule>>()!,
+                };
+            }
+            var request = testCase.GetProperty("request").Deserialize<PeerEgressRequest>()!;
+            var decision = PeerEgressAuthorization.Authorize(request, applied, true, context);
+            var expect = testCase.GetProperty("expect");
+            Assert.True(expect.GetProperty("code").GetString() == decision.Code,
+                $"{testCase.GetProperty("name").GetString()}: {decision.Code}");
+            Assert.Equal(expect.GetProperty("allowed").GetBoolean(), decision.Allowed);
+        }
+        // Every forced-deny entry holds against the broad ::/0 rule in the vector's policy.
+        foreach (var text in Strings(section, "forcedDenyCidrs").Concat(Strings(section, "cloudMetadataCidrs")))
+        {
+            Assert.True(Ipv6Cidr.TryParse(text, out var cidr), text);
+            var decision = PeerEgressAuthorization.Authorize(new PeerEgressRequest
+            {
+                ConsumerClientId = 1,
+                DestinationIp = Ipv6Cidr.FormatAddress(cidr.Network),
+                DestinationPort = 443,
+                Protocol = "tcp",
+            }, policy, true, context);
+            Assert.True(decision.Code == PeerEgressCodes.ForbiddenDestination, text);
+        }
+    }
+
+    private static List<string> Strings(JsonElement section, string name) =>
+        section.GetProperty(name).EnumerateArray().Select(entry => entry.GetString()!).ToList();
+
     private static List<PeerEgressRule> Rules(JsonElement section)
     {
         var rules = section.GetProperty("rules").EnumerateArray()
@@ -117,17 +170,17 @@ public sealed class PeerEgressIpv6VectorTests
         }
     }
 
-    private static JsonDocument ReadVector()
+    private static JsonDocument ReadVector(string name = "peer-egress-rules-v1.json")
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         for (var depth = 0; directory is not null && depth < 12; depth++, directory = directory.Parent)
         {
-            var candidate = Path.Combine(directory.FullName, "protocol", "test-vectors", "peer-egress-rules-v1.json");
+            var candidate = Path.Combine(directory.FullName, "protocol", "test-vectors", name);
             if (File.Exists(candidate))
             {
                 return JsonDocument.Parse(File.ReadAllText(candidate));
             }
         }
-        throw new FileNotFoundException("peer-egress-rules-v1.json");
+        throw new FileNotFoundException(name);
     }
 }

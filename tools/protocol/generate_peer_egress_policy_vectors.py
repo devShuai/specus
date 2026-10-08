@@ -812,6 +812,173 @@ authz_vector = {
 
 authz_vector["crossLanguageCases"] = build_cross_language_cases()
 
+# --------------------------------------------------------------------------
+# Egress-side authorization of IPv6 destinations
+#
+# The same order and codes as for IPv4, with the IPv6 counterparts of the forced-deny list and of
+# the LAN scope. Destination rules of one family never cover an address of the other: 0.0.0.0/0 is
+# not every IPv6 address and ::/0 is not every IPv4 one. The IPv4 entries above are unchanged.
+# --------------------------------------------------------------------------
+
+IPV6_FORCED_DENY = [
+    "::/128",
+    "::1/128",
+    # A socket connected to an IPv4-mapped address reaches the IPv4 address; letting it through
+    # would bypass every IPv4 entry above.
+    "::ffff:0:0/96",
+    # Prefixes that embed an IPv4 address the network translates or tunnels to: through a NAT64
+    # gateway or a 6to4 relay they reach any IPv4 address, metadata and private ranges included.
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "2002::/16",
+    "fe80::/10",
+    "fec0::/10",
+    "ff00::/8",
+]
+IPV6_CLOUD_METADATA = ["fd00:ec2::254/128"]
+IPV6_LAN = ["fc00::/7"]
+
+
+def address_of(text):
+    """(family, value) for a destination as the egress reads it, or None."""
+    if ":" in text:
+        value = ipv6.parse_address(text)
+        return None if value is None else (6, value)
+    try:
+        return 4, int(ipaddress.IPv4Address(text))
+    except ipaddress.AddressValueError:
+        return None
+
+
+def covered(address, cidrs):
+    """Whether any prefix of the address's family in cidrs contains it; the other family's are skipped."""
+    family, value = address
+    for text in cidrs:
+        if family == 6:
+            parsed = ipv6.parse_prefix(text.strip()) if ":" in text else None
+            if parsed is not None and ipv6.contains(parsed[0], parsed[1], value):
+                return True
+        elif ":" not in text and ipaddress.IPv4Address(value) in ipaddress.IPv4Network(text):
+            return True
+    return False
+
+
+def evaluate_any(req, policy, peer_acl_allows=True):
+    """evaluate() for either family. Gives evaluate()'s answer for every IPv4 request."""
+    if req.get("hop"):
+        return {"allowed": False, "code": "EGRESS_HOP_NOT_ALLOWED"}
+    if not policy["enabled"]:
+        return {"allowed": False, "code": "EGRESS_DISABLED"}
+    if not peer_acl_allows:
+        return {"allowed": False, "code": "EGRESS_PEER_ACL_DENIED"}
+    if req["consumerClientId"] not in policy["allowedConsumerClientIds"]:
+        return {"allowed": False, "code": "EGRESS_CONSUMER_DENIED"}
+    address = address_of(req["destinationIp"])
+    if address is None:
+        return {"allowed": False, "code": "EGRESS_DEST_DENIED"}
+    denied = FORCED_DENY + CLOUD_METADATA + IPV6_FORCED_DENY + IPV6_CLOUD_METADATA + req.get("localInterfaceCidrs", [])
+    if covered(address, denied):
+        return {"allowed": False, "code": "EGRESS_FORBIDDEN_DESTINATION"}
+    scope = "LAN" if covered(address, LAN_RANGES + IPV6_LAN) else "PUBLIC"
+    if scope != policy["scope"]:
+        return {"allowed": False, "code": "EGRESS_SCOPE_DENIED"}
+    address_matches = [r for r in policy["destinationRules"] if covered(address, [r["cidr"]])]
+    if not address_matches:
+        return {"allowed": False, "code": "EGRESS_DEST_DENIED"}
+    protocol_matches = [r for r in address_matches if req["protocol"] in r["protocols"]]
+    if not protocol_matches:
+        return {"allowed": False, "code": "EGRESS_PROTOCOL_DENIED"}
+    port = req["destinationPort"]
+    if not any(lo <= port <= hi for r in protocol_matches for lo, hi in r["portRanges"]):
+        return {"allowed": False, "code": "EGRESS_PORT_DENIED"}
+    if req.get("activeFlowsForConsumer", 0) >= policy["limits"]["maxFlowsPerConsumer"]:
+        return {"allowed": False, "code": "EGRESS_LIMIT_EXCEEDED"}
+    if req.get("activeFlowsTotal", 0) >= policy["limits"]["maxConcurrentFlows"]:
+        return {"allowed": False, "code": "EGRESS_LIMIT_EXCEEDED"}
+    return {"allowed": True, "code": "EGRESS_ALLOWED"}
+
+
+# The generalisation must not move a single IPv4 answer.
+for case in authz_vector["cases"] + authz_vector["crossLanguageCases"]:
+    assert evaluate_any(case["request"], POLICY) == case["expect"], case["name"]
+
+IPV6_POLICY = dict(POLICY, destinationRules=[
+    {"cidr": "2001:db8:10::/48", "protocols": ["tcp"], "portRanges": [[80, 80], [443, 443]]},
+    {"cidr": "2001:db8:20::/48", "protocols": ["udp"], "portRanges": [[53, 53]]},
+    {"cidr": "::/0", "protocols": ["tcp"], "portRanges": [[443, 443]]},
+    {"cidr": "203.0.113.0/24", "protocols": ["tcp"], "portRanges": [[22, 22]]},
+])
+
+IPV6_AUTHZ_CASES = [
+    ("allowed", "2001:db8:10::5", 443, "tcp", {}, "允许：地址、协议与端口都命中 2001:db8:10::/48"),
+    ("port-denied", "2001:db8:10::5", 22, "tcp", {}, "/48 只开 80 与 443，::/0 只开 443"),
+    ("protocol-denied", "2001:db8:10::5", 443, "udp", {}, "覆盖它的两条规则都只允许 tcp"),
+    ("udp-allowed", "2001:db8:20::1", 53, "udp", {}, "允许：UDP 规则命中"),
+    ("broad-rule", "2001:db8:99::1", 443, "tcp", {}, "只被宽泛的 ::/0 覆盖"),
+    ("read-by-value", "2001:DB8:10:0:0:0:0:5", 443, "tcp", {}, "目的地址按数值读，写法不影响判定"),
+    ("loopback", "::1", 443, "tcp", {}, "回环；::/0 也覆盖它，强制清单仍然胜出"),
+    ("unspecified", "::", 443, "tcp", {}, "未指定地址"),
+    ("mapped-loopback", "::ffff:7f00:1", 443, "tcp", {}, "IPv4 映射的 127.0.0.1，连上去就是 IPv4 回环"),
+    ("mapped-public", "::ffff:cb00:710a", 22, "tcp", {},
+     "IPv4 映射的 203.0.113.10：即使 IPv4 规则允许它，映射写法也一律拒绝，IPv4 目标只能以 IPv4 授权"),
+    ("nat64-metadata", "64:ff9b::a9fe:a9fe", 443, "tcp", {}, "NAT64 前缀嵌着 169.254.169.254，经 NAT64 网关就到了元数据端点"),
+    ("nat64-local-use", "64:ff9b:1::a00:1", 443, "tcp", {}, "NAT64 本地前缀，同上"),
+    ("six-to-four", "2002:c000:204::1", 443, "tcp", {}, "6to4 嵌着 IPv4 地址"),
+    ("link-local", "fe80::1", 443, "tcp", {}, "链路本地"),
+    ("site-local", "fec0::1", 443, "tcp", {}, "已废弃的站点本地"),
+    ("multicast", "ff02::1", 443, "tcp", {}, "组播"),
+    ("cloud-metadata", "fd00:ec2::254", 443, "tcp", {}, "云元数据端点（AWS IMDS 的 IPv6 地址），先于 scope 被拒"),
+    ("ula-under-public", "fd12:3456::1", 443, "tcp", {}, "ULA 属于 LAN，策略只授权 PUBLIC"),
+    ("local-interface", "2001:db8:30::7", 443, "tcp", {"localInterfaceCidrs": ["2001:db8:30::/64"]},
+     "落在出口本机接口的 IPv6 网段内"),
+    ("ipv4-not-covered-by-ipv6-default", "192.0.2.10", 443, "tcp", {}, "::/0 不覆盖任何 IPv4 地址，两族规则互不覆盖"),
+    ("ipv4-rule-in-mixed-policy", "203.0.113.10", 22, "tcp", {}, "同一份策略里的 IPv4 规则照常生效"),
+    ("dotted-tail-is-malformed", "::ffff:192.0.2.1", 443, "tcp", {}, "点分尾的写法读不出，与写错的 IPv4 一样拒绝"),
+    ("zone-is-malformed", "fe80::1%eth0", 443, "tcp", {}, "带区域标识的写法读不出"),
+]
+
+
+def ipv6_authz_section():
+    cases = []
+    for name, destination, port, protocol, extra, description in IPV6_AUTHZ_CASES:
+        request = dict({"consumerClientId": 1, "destinationIp": destination, "destinationPort": port,
+                        "protocol": protocol}, **extra)
+        cases.append({"name": name, "request": request, "description": description,
+                      "expect": evaluate_any(request, IPV6_POLICY)})
+    by_name = {case["name"]: case["expect"]["code"] for case in cases}
+    assert by_name["allowed"] == "EGRESS_ALLOWED"
+    assert by_name["mapped-public"] == "EGRESS_FORBIDDEN_DESTINATION"
+    assert by_name["ipv4-not-covered-by-ipv6-default"] == "EGRESS_DEST_DENIED"
+    assert by_name["ula-under-public"] == "EGRESS_SCOPE_DENIED"
+    lan_rules = [{"cidr": "fd00::/8", "protocols": ["tcp"], "portRanges": [[443, 443]]}]
+    lan_policy = dict(IPV6_POLICY, scope="LAN", destinationRules=lan_rules)
+    variants = []
+    for name, destination, description in [
+        ("lan-scope-allows-ula", "fd12:3456::1", "显式授予 LAN scope 并覆盖该网段后，ULA 目标才被允许"),
+        ("lan-scope-still-refuses-metadata", "fd00:ec2::254", "LAN 策略覆盖了元数据地址，强制清单仍然先拒绝"),
+        ("lan-scope-refuses-global", "2001:db8:10::5", "LAN 策略不放行公网 IPv6 地址"),
+    ]:
+        request = {"consumerClientId": 1, "destinationIp": destination, "destinationPort": 443, "protocol": "tcp"}
+        variants.append({"name": name, "policyOverride": {"scope": "LAN", "destinationRules": lan_rules},
+                         "request": request, "description": description,
+                         "expect": evaluate_any(request, lan_policy)})
+    assert [v["expect"]["code"] for v in variants] == [
+        "EGRESS_ALLOWED", "EGRESS_FORBIDDEN_DESTINATION", "EGRESS_SCOPE_DENIED"]
+    return {
+        "description": "IPv6 目的地址的出口授权：判定顺序与错误码同 IPv4，强制拒绝清单与 LAN scope 换成 IPv6 的对应项。"
+                       "目的规则只覆盖同一族的地址（0.0.0.0/0 不含任何 IPv6 地址，::/0 不含任何 IPv4 地址）。"
+                       "上面各节的 IPv4 清单不变，一个实现两族的清单都要检查。",
+        "forcedDenyCidrs": IPV6_FORCED_DENY,
+        "cloudMetadataCidrs": IPV6_CLOUD_METADATA,
+        "lanCidrs": IPV6_LAN,
+        "policy": IPV6_POLICY,
+        "cases": cases,
+        "policyVariantCases": variants,
+    }
+
+
+authz_vector["ipv6"] = ipv6_authz_section()
+
 for path, payload in [
     ("protocol/test-vectors/peer-egress-rules-v1.json", rules_vector),
     ("protocol/test-vectors/peer-egress-authz-v1.json", authz_vector),

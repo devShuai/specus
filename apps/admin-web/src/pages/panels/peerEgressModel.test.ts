@@ -66,9 +66,12 @@ describe("IPv6 destinations", () => {
     expect(parseIpv6Cidr("2001:db8::1/32")).toEqual({ error: "2001:db8::1/32：主机位不为零，应写作 2001:db8::/32" });
     expect(parseIpv6Cidr("2001:db8::/129")).toEqual({ error: "2001:db8::/129：前缀长度应为 0–128" });
     expect(parseIpv6Cidr("::ffff:192.0.2.1")).toHaveProperty("error");
-    expect(destinationNotes("2001:db8::/32", "PUBLIC", mesh)).toEqual([
-      "2001:db8::/32 是 IPv6：出口暂不授权 IPv6 目标，这条规则目前不会放行任何流量",
-    ]);
+    expect(destinationNotes("2001:db8::/32", "PUBLIC", mesh)).toEqual([]);
+    expect(destinationNotes("::/0", "PUBLIC", mesh)[0]).toContain("回环地址");
+    expect(destinationNotes("::/0", "PUBLIC", mesh)[0]).toContain("NAT64 地址");
+    expect(destinationNotes("fd00::/8", "LAN", mesh)).toEqual(["fd00::/8 包含始终被拒绝的地址：云元数据地址"]);
+    expect(destinationNotes("fd12:3456::/32", "PUBLIC", mesh)[0]).toContain("局域网地址");
+    expect(destinationNotes("2001:db8::/32", "LAN", mesh)[0]).toContain("不在局域网范围内");
     expect(storedRuleProblem({ cidr: "2001:db8::/32", protocols: ["tcp"], portRanges: [[443, 443]] })).toBe("");
     expect(storedRuleProblem({ cidr: "2001:db8::1/32", protocols: ["tcp"], portRanges: [[443, 443]] })).toBe("网段无效，不会匹配");
   });

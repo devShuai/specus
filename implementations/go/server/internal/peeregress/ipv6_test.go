@@ -1,6 +1,9 @@
 package peeregress
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // The IPv6 spelling against the ipv6Prefixes section of peer-egress-rules-v1.json, which the
 // clients, the other servers and the admin page read too. What a server stores for an IPv6
@@ -45,6 +48,59 @@ func TestIPv6SpellingMatchesSharedVector(t *testing.T) {
 		}
 		if _, ok := StoredDestinationCIDR(testCase.Text); ok {
 			t.Errorf("%q: stored, want refused", testCase.Text)
+		}
+	}
+}
+
+// Egress-side authorization of IPv6 destinations against the ipv6 section of
+// peer-egress-authz-v1.json, which the clients and the C server read too.
+func TestIPv6AuthorizationMatchesSharedVector(t *testing.T) {
+	type authzCase struct {
+		Name           string `json:"name"`
+		PolicyOverride *struct {
+			Scope            string            `json:"scope"`
+			DestinationRules []DestinationRule `json:"destinationRules"`
+		} `json:"policyOverride"`
+		Request Request `json:"request"`
+		Expect  struct {
+			Allowed bool   `json:"allowed"`
+			Code    string `json:"code"`
+		} `json:"expect"`
+	}
+	var vector struct {
+		IPv6 struct {
+			ForcedDenyCIDRs    []string    `json:"forcedDenyCidrs"`
+			CloudMetadataCIDRs []string    `json:"cloudMetadataCidrs"`
+			LANCIDRs           []string    `json:"lanCidrs"`
+			Policy             Policy      `json:"policy"`
+			Cases              []authzCase `json:"cases"`
+			PolicyVariantCases []authzCase `json:"policyVariantCases"`
+		} `json:"ipv6"`
+	}
+	readVector(t, "peer-egress-authz-v1.json", &vector)
+	section := vector.IPv6
+	if len(section.Cases) == 0 {
+		t.Fatal("authorization vector carried no IPv6 cases")
+	}
+	for name, pair := range map[string][2][]string{
+		"forcedDenyCidrs":    {ForcedDenyCIDRs6, section.ForcedDenyCIDRs},
+		"cloudMetadataCidrs": {CloudMetadataCIDRs6, section.CloudMetadataCIDRs},
+		"lanCidrs":           {LANCIDRs6, section.LANCIDRs},
+	} {
+		if strings.Join(pair[0], ",") != strings.Join(pair[1], ",") {
+			t.Errorf("%s: %v, vector says %v", name, pair[0], pair[1])
+		}
+	}
+	for _, testCase := range append(append([]authzCase{}, section.Cases...), section.PolicyVariantCases...) {
+		policy := section.Policy
+		if testCase.PolicyOverride != nil {
+			policy.Scope = testCase.PolicyOverride.Scope
+			policy.DestinationRules = testCase.PolicyOverride.DestinationRules
+		}
+		decision := Authorize(testCase.Request, policy, true, DefaultContext())
+		if decision.Code != testCase.Expect.Code || decision.Allowed != testCase.Expect.Allowed {
+			t.Errorf("%s: got %s/%v, want %s/%v", testCase.Name, decision.Code, decision.Allowed,
+				testCase.Expect.Code, testCase.Expect.Allowed)
 		}
 	}
 }

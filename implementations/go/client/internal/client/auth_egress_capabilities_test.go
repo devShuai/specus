@@ -47,12 +47,11 @@ func TestLoginEnvironmentAnnouncesEgressCapabilities(t *testing.T) {
 		t.Errorf("consumerCapable = %v, but this build's route takeover support is %v",
 			caps.ConsumerCapable, egressRouteTakeoverSupported)
 	}
-	// The egress honours name-bind; IPv6 targets are not claimed, since claiming more would invite
-	// a server to send what this build refuses.
+	// The egress honours name-bind, and dials a name with no A record over IPv6.
 	if caps.DomainTargetCapable == nil || !*caps.DomainTargetCapable {
 		t.Error("domainTargetCapable must be present and true: the egress resolves bound names")
 	}
-	if caps.IPv6TargetCapable == nil || *caps.IPv6TargetCapable {
-		t.Error("ipv6TargetCapable must be present and false")
+	if caps.IPv6TargetCapable == nil || !*caps.IPv6TargetCapable {
+		t.Error("ipv6TargetCapable must be present and true: the egress dials AAAA-only names")
 	}
 }

@@ -305,6 +305,57 @@ uncovered = table_codes - used
 check(not undocumented, f"codes used in vectors but missing from the spec table: {sorted(undocumented)}")
 check(not uncovered, f"codes in the spec table with no vector case: {sorted(uncovered)}")
 
+# ---- IPv6 authorization -------------------------------------------------
+# An independent evaluation with ipaddress, for the steps an IPv6 case can differ on: the
+# destination has to read with the strict spelling (no dotted tail, no zone), the IPv6 lists decide
+# forcedDeny and scope, and a rule covers only its own family.
+authz6 = authz["ipv6"]
+
+
+def strict_address(text):
+    if any(mark in text for mark in (".", "%", "[")) and ":" in text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def in_networks(address, cidrs):
+    return any(address.version == network.version and address in network
+               for network in (ipaddress.ip_network(text) for text in cidrs))
+
+
+for case in authz6["cases"] + authz6["policyVariantCases"]:
+    request = case["request"]
+    policy = dict(authz6["policy"], **case.get("policyOverride", {}))
+    address = strict_address(request["destinationIp"])
+    if address is None:
+        want = "EGRESS_DEST_DENIED"
+    elif in_networks(address, authz["forcedDenyCidrs"] + authz["cloudMetadataCidrs"] + authz6["forcedDenyCidrs"]
+                     + authz6["cloudMetadataCidrs"] + request.get("localInterfaceCidrs", [])):
+        want = "EGRESS_FORBIDDEN_DESTINATION"
+    elif ("LAN" if in_networks(address, authz["lanCidrs"] + authz6["lanCidrs"]) else "PUBLIC") != policy["scope"]:
+        want = "EGRESS_SCOPE_DENIED"
+    else:
+        covering = [rule for rule in policy["destinationRules"] if in_networks(address, [rule["cidr"]])]
+        by_protocol = [rule for rule in covering if request["protocol"] in rule["protocols"]]
+        if not covering:
+            want = "EGRESS_DEST_DENIED"
+        elif not by_protocol:
+            want = "EGRESS_PROTOCOL_DENIED"
+        elif not any(low <= request["destinationPort"] <= high for rule in by_protocol for low, high in rule["portRanges"]):
+            want = "EGRESS_PORT_DENIED"
+        else:
+            want = "EGRESS_ALLOWED"
+    check(case["expect"]["code"] == want, f"authz/ipv6/{case['name']}: vector says {case['expect']['code']}, verifier {want}")
+for case in control["deploymentEndpoints"]["cases"]:
+    for entry in case["expect"]:
+        if ":" in entry:
+            network = ipaddress.IPv6Network(entry)
+            check(network.prefixlen == 128 and f"{network.network_address.compressed}/128" == entry,
+                  f"control/deploymentEndpoints/{case['name']}: {entry} is not a canonical /128")
+
 # ---- authz order sanity -------------------------------------------------
 order = authz["evaluationOrder"]
 check(order[:5] == ["hop", "enabled", "peerAcl", "consumer", "forcedDeny"],

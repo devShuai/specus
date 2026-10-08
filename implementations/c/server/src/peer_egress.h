@@ -316,6 +316,17 @@ extern const char *const ST_EGRESS_LAN_CIDRS[];
 extern const size_t ST_EGRESS_LAN_CIDRS_LEN;
 
 /*
+ * The IPv6 counterparts of the three lists above (protocol/spec/peer-egress.md, 强制拒绝清单). A
+ * destination is checked against both families' lists; only a prefix of its own family can contain it.
+ */
+extern const char *const ST_EGRESS_FORCED_DENY_CIDRS6[];
+extern const size_t ST_EGRESS_FORCED_DENY_CIDRS6_LEN;
+extern const char *const ST_EGRESS_CLOUD_METADATA_CIDRS6[];
+extern const size_t ST_EGRESS_CLOUD_METADATA_CIDRS6_LEN;
+extern const char *const ST_EGRESS_LAN_CIDRS6[];
+extern const size_t ST_EGRESS_LAN_CIDRS6_LEN;
+
+/*
  * Reads a stored allowlist. A row that cannot be parsed yields zero rules, which denies everything
  * rather than falling back to something permissive. Returns 0 when the input parsed cleanly.
  *

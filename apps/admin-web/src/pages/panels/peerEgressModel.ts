@@ -34,6 +34,23 @@ export const FORCED_DENY: ReadonlyArray<{ cidr: string; label: string }> = [
 /** What scope LAN covers; PUBLIC is every other address the forced-deny list leaves. */
 export const LAN_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"];
 
+/** The IPv6 counterparts the egress refuses whatever the policy says (peer-egress-authz-v1.json, ipv6). */
+export const FORCED_DENY6: ReadonlyArray<{ cidr: string; label: string }> = [
+  { cidr: "::/128", label: "未指定地址" },
+  { cidr: "::1/128", label: "回环地址" },
+  { cidr: "::ffff:0:0/96", label: "IPv4 映射地址" },
+  { cidr: "64:ff9b::/96", label: "NAT64 地址（嵌入 IPv4）" },
+  { cidr: "64:ff9b:1::/48", label: "NAT64 本地地址（嵌入 IPv4）" },
+  { cidr: "2002::/16", label: "6to4 地址（嵌入 IPv4）" },
+  { cidr: "fe80::/10", label: "链路本地地址" },
+  { cidr: "fec0::/10", label: "站点本地地址" },
+  { cidr: "ff00::/8", label: "组播地址" },
+  { cidr: "fd00:ec2::254/128", label: "云元数据地址" },
+];
+
+/** What scope LAN covers in IPv6: unique local addresses. */
+export const LAN_RANGES6 = ["fc00::/7"];
+
 export interface Ipv4Cidr {
   base: number;
   prefix: number;
@@ -436,11 +453,7 @@ export function scopeLabel(scope: string): string {
  */
 export function destinationNotes(cidrText: string, scope: string, meshCidr: string): string[] {
   if (cidrText.includes(":")) {
-    // The servers store an IPv6 destination, but no egress client authorizes IPv6 targets yet:
-    // every address it would grant is refused with EGRESS_DEST_DENIED until one does.
-    return "error" in parseIpv6Cidr(cidrText)
-      ? []
-      : [`${cidrText.trim()} 是 IPv6：出口暂不授权 IPv6 目标，这条规则目前不会放行任何流量`];
+    return ipv6DestinationNotes(cidrText, scope);
   }
   const parsed = parseCidr(cidrText);
   if ("error" in parsed) {
@@ -458,6 +471,48 @@ export function destinationNotes(cidrText: string, scope: string, meshCidr: stri
   const lan = LAN_RANGES.map(cidrOf);
   const insideLan = lan.some((range) => cidrWithin(parsed, range));
   const touchesLan = lan.some((range) => cidrOverlaps(parsed, range));
+  if (scope === "LAN" && !touchesLan) {
+    notes.push(`${parsed.text} 不在局域网范围内，范围为「局域网」时永远不会放行`);
+  } else if (scope === "PUBLIC" && insideLan) {
+    notes.push(`${parsed.text} 是局域网地址，范围为「公网」时不会放行；访问局域网请把范围设为「局域网」`);
+  }
+  return notes;
+}
+
+function span6(cidr: Ipv6Cidr): [bigint, bigint] {
+  return [cidr.base, cidr.base + (1n << BigInt(128 - cidr.prefix)) - 1n];
+}
+
+function cidr6Of(text: string): Ipv6Cidr {
+  const parsed = parseIpv6Cidr(text);
+  if ("error" in parsed) {
+    throw new Error(parsed.error);
+  }
+  return parsed;
+}
+
+/** destinationNotes for an IPv6 destination: the IPv6 forced-deny list and the unique local range. */
+function ipv6DestinationNotes(cidrText: string, scope: string): string[] {
+  const parsed = parseIpv6Cidr(cidrText);
+  if ("error" in parsed) {
+    return [];
+  }
+  const [low, high] = span6(parsed);
+  const overlaps = (other: Ipv6Cidr) => {
+    const [otherLow, otherHigh] = span6(other);
+    return low <= otherHigh && otherLow <= high;
+  };
+  const notes: string[] = [];
+  const denied = FORCED_DENY6.filter((entry) => overlaps(cidr6Of(entry.cidr))).map((entry) => entry.label);
+  if (denied.length > 0) {
+    notes.push(`${parsed.text} 包含始终被拒绝的地址：${denied.join("、")}`);
+  }
+  const lan = LAN_RANGES6.map(cidr6Of);
+  const insideLan = lan.some((range) => {
+    const [rangeLow, rangeHigh] = span6(range);
+    return low >= rangeLow && high <= rangeHigh;
+  });
+  const touchesLan = lan.some(overlaps);
   if (scope === "LAN" && !touchesLan) {
     notes.push(`${parsed.text} 不在局域网范围内，范围为「局域网」时永远不会放行`);
   } else if (scope === "PUBLIC" && insideLan) {
