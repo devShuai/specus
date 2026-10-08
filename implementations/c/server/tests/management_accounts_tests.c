@@ -5,7 +5,7 @@
  * counterpart of Java's ManagementAccountsHttpTests: replays
  * protocol/test-vectors/management-accounts-v1.json through the real management handlers, walks
  * the delete-then-recreate path with tokens /auth/login really issued, and checks that an account's
- * email record goes with it.
+ * email record goes with it and what becomes of the rest of its data (section 7.1, issue #225).
  */
 
 #include "admin_http.h"
@@ -503,6 +503,310 @@ static int test_deleting_an_account_releases_its_email(void)
     return failed ? 1 : 0;
 }
 
+/* The attachment tables as object storage creates them on first use (object_storage.c). */
+static const char attachment_schema[] =
+    "CREATE TABLE IF NOT EXISTS transfer_attachment ("
+    "id INTEGER PRIMARY KEY,tenant_id TEXT,scope TEXT NOT NULL,room_id TEXT,"
+    "room_token_hash TEXT,public_transfer_room_id INTEGER,owner_username TEXT,"
+    "target_client_id INTEGER,object_key TEXT NOT NULL UNIQUE,file_name TEXT NOT NULL,"
+    "mime_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,sha256 TEXT,status TEXT NOT NULL,"
+    "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,upload_expires_at TEXT NOT NULL,"
+    "expires_at TEXT NOT NULL,uploaded_at TEXT);"
+    "CREATE TABLE IF NOT EXISTS transfer_attachment_download_grant ("
+    "id INTEGER PRIMARY KEY,token_hash TEXT NOT NULL UNIQUE,tenant_id TEXT NOT NULL,"
+    "username TEXT NOT NULL,attachment_id INTEGER NOT NULL,created_at TEXT NOT NULL,"
+    "expires_at TEXT NOT NULL,consumed_at TEXT,updated_at TEXT);"
+    "CREATE TABLE IF NOT EXISTS transfer_attachment_download_usage ("
+    "id INTEGER PRIMARY KEY,tenant_id TEXT NOT NULL,username TEXT NOT NULL,"
+    "attachment_id INTEGER NOT NULL,size_bytes INTEGER NOT NULL,usage_month TEXT NOT NULL,"
+    "created_at TEXT NOT NULL);";
+
+static void utc_text(time_t value, char out[32])
+{
+    struct tm utc;
+    gmtime_r(&value, &utc);
+    strftime(out, 32U, "%Y-%m-%dT%H:%M:%SZ", &utc);
+}
+
+/* Field text of a vector row, "" when it has none (the caller frees nothing). */
+static const char *row_text(const char *row, const char *key, char *out, size_t out_len)
+{
+    char *value = st_json_get_top_level_string(row, key);
+    snprintf(out, out_len, "%s", value == NULL ? "" : value);
+    free(value);
+    return out;
+}
+
+static long long row_id(const char *row, const char *key)
+{
+    long long value = 0;
+    return st_json_get_i64(row, key, &value) == 0 ? value : -1;
+}
+
+/* Writes the accountDeletion seed rows of one table straight into storage. */
+static int seed_deletion_rows(const char *seed, const char *table, const char *later)
+{
+    char **rows = NULL;
+    size_t count = 0U;
+    if (st_json_get_raw_array(seed, table, &rows, &count) != 0) {
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        char tenant[96], owner[96], other[96], sql[1024];
+        long long id = row_id(rows[i], "id");
+        row_text(rows[i], "tenantId", tenant, sizeof(tenant));
+        row_text(rows[i], strcmp(table, "downloadGrants") == 0 || strcmp(table, "downloadUsage") == 0
+                              ? "username" : "owner", owner, sizeof(owner));
+        if (strcmp(table, "clients") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO client_account(id, tenant_id, client_name, owner_username) "
+                     "VALUES(%lld,'%s','%s','%s');", id, tenant, row_text(rows[i], "clientName", other, sizeof(other)),
+                     owner);
+        } else if (strcmp(table, "credentials") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO specus_client_credential(id, tenant_id, owner_username, api_key, "
+                     "secret_hash) VALUES(%lld,'%s','%s','acct-del-%lld','unused');", id, tenant, owner, id);
+        } else if (strcmp(table, "diagrams") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO user_diagram_document(id, tenant_id, owner_username, name, "
+                     "snapshot_data, size_bytes) VALUES(%lld,'%s','%s','acct-del-%lld',x'01',1);", id, tenant, owner, id);
+        } else if (strcmp(table, "attachments") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO transfer_attachment(id, tenant_id, scope, owner_username, object_key, "
+                     "file_name, mime_type, size_bytes, status, created_at, updated_at, upload_expires_at, expires_at) "
+                     "VALUES(%lld,'%s','ADMIN_CLIENT_MESSAGE','%s','acct-del/%lld','file.bin',"
+                     "'application/octet-stream',1,'%s','%s','%s','%s','%s');",
+                     id, tenant, owner, id, row_text(rows[i], "status", other, sizeof(other)), later, later, later, later);
+        } else if (strcmp(table, "downloadGrants") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO transfer_attachment_download_grant(id, token_hash, tenant_id, "
+                     "username, attachment_id, created_at, expires_at) VALUES(%lld,'%064lld','%s','%s',%lld,'%s','%s');",
+                     id, id, tenant, owner, row_id(rows[i], "attachmentId"), later, later);
+        } else if (strcmp(table, "downloadUsage") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO transfer_attachment_download_usage(id, tenant_id, username, "
+                     "attachment_id, size_bytes, usage_month, created_at) VALUES(%lld,'%s','%s',%lld,1,'%.7s','%s');",
+                     id, tenant, owner, row_id(rows[i], "attachmentId"), later, later);
+        } else if (strcmp(table, "acls") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO peer_mesh_acl(id, tenant_id, owner_username, source_client_id, "
+                     "source_client_name, target_client_id, target_client_name) VALUES(%lld,'%s','%s',%lld,'acct-del-s',"
+                     "%lld,'acct-del-t');", id, tenant, owner, row_id(rows[i], "sourceClientId"),
+                     row_id(rows[i], "targetClientId"));
+        } else if (strcmp(table, "egressPolicies") == 0) {
+            snprintf(sql, sizeof(sql), "INSERT INTO peer_mesh_egress_policy(id, tenant_id, owner_username, "
+                     "egress_client_id, egress_client_name) VALUES(%lld,'%s','%s',%lld,'acct-del-e');",
+                     id, tenant, owner, row_id(rows[i], "egressClientId"));
+        } else {
+            snprintf(sql, sizeof(sql), "INSERT INTO peer_mesh_device(id, tenant_id, owner_username, client_id, "
+                     "client_name, virtual_ip) VALUES(%lld,'%s','%s',%lld,'acct-del-d','10.77.0.%lld');",
+                     id, tenant, owner, row_id(rows[i], "clientId"), id % 250);
+        }
+        rc = exec_sql(sql);
+    }
+    st_json_free_string_array(rows, count);
+    return rc;
+}
+
+/* The owner text of one row (with " active"/" inactive" for an attachment): 1 found, 0 none, -1 error. */
+static int stored_owner(const char *table, long long id, const char *now, char *out, size_t out_len)
+{
+    char sql[512];
+    if (strcmp(table, "attachments") == 0) {
+        snprintf(sql, sizeof(sql), "SELECT owner_username || CASE WHEN expires_at > '%s' AND (status <> 'PENDING' "
+                 "OR upload_expires_at > '%s') THEN ' active' ELSE ' inactive' END FROM transfer_attachment "
+                 "WHERE id = %lld", now, now, id);
+    } else {
+        static const char *const names[][3] = {
+            {"clients", "client_account", "owner_username"},
+            {"credentials", "specus_client_credential", "owner_username"},
+            {"diagrams", "user_diagram_document", "owner_username"},
+            {"downloadGrants", "transfer_attachment_download_grant", "username"},
+            {"downloadUsage", "transfer_attachment_download_usage", "username"},
+            {"acls", "peer_mesh_acl", "owner_username"},
+            {"egressPolicies", "peer_mesh_egress_policy", "owner_username"},
+            {"devices", "peer_mesh_device", "owner_username"},
+        };
+        size_t i = 0U;
+        while (i < sizeof(names) / sizeof(names[0]) && strcmp(names[i][0], table) != 0) ++i;
+        if (i == sizeof(names) / sizeof(names[0])) return -1;
+        snprintf(sql, sizeof(sql), "SELECT %s FROM %s WHERE id = %lld", names[i][2], names[i][1], id);
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int found = -1;
+    if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        int step = sqlite3_step(stmt);
+        found = step == SQLITE_ROW ? 1 : step == SQLITE_DONE ? 0 : -1;
+        if (found == 1) snprintf(out, out_len, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return found;
+}
+
+/* Of the seeded ids of table, exactly those of rowsAfter remain, with their owners. */
+static int check_deletion_rows(const char *seed, const char *after, const char *table, const char *now)
+{
+    char **seeded = NULL, **expected = NULL;
+    size_t seeded_count = 0U, expected_count = 0U;
+    if (st_json_get_raw_array(seed, table, &seeded, &seeded_count) != 0
+        || st_json_get_raw_array(after, table, &expected, &expected_count) != 0) {
+        st_json_free_string_array(seeded, seeded_count);
+        fprintf(stderr, "accountDeletion: %s missing from the vector\n", table);
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0U; i < seeded_count; ++i) {
+        long long id = row_id(seeded[i], "id");
+        char want[128] = "", got[128] = "";
+        int listed = 0;
+        for (size_t j = 0U; !listed && j < expected_count; ++j) {
+            if (row_id(expected[j], "id") != id) continue;
+            listed = 1;
+            char owner[96];
+            row_text(expected[j], strcmp(table, "downloadGrants") == 0 || strcmp(table, "downloadUsage") == 0
+                                      ? "username" : "owner", owner, sizeof(owner));
+            int active = 0;
+            int has_active = st_json_get_bool(expected[j], "active", &active) == 0;
+            snprintf(want, sizeof(want), "%s%s", owner, !has_active ? "" : active ? " active" : " inactive");
+        }
+        int found = stored_owner(table, id, now, got, sizeof(got));
+        if (found < 0 || found != listed || (listed && strcmp(want, got) != 0)) {
+            fprintf(stderr, "accountDeletion: %s %lld is '%s' (found %d), want '%s' (listed %d)\n", table, id, got,
+                    found, want, listed);
+            rc = -1;
+        }
+    }
+    st_json_free_string_array(seeded, seeded_count);
+    st_json_free_string_array(expected, expected_count);
+    return rc;
+}
+
+static void trim_whitespace(const char *in, char *out, size_t out_len)
+{
+    size_t w = 0U;
+    for (; *in != '\0' && w + 1U < out_len; ++in) {
+        if (*in != ' ' && *in != '\n' && *in != '\r' && *in != '\t') out[w++] = *in;
+    }
+    out[w] = '\0';
+}
+
+/* Java ManagementAccountsHttpTests.replaysTheAccountDeletionVector (management-accounts.md 7.1). */
+static int test_account_deletion_vector(const char *vector)
+{
+    static const char *const tables[] = {"clients", "credentials", "diagrams", "attachments", "downloadGrants",
+                                         "downloadUsage", "acls", "egressPolicies", "devices"};
+    char *deletion = st_json_get_top_level_raw(vector, "accountDeletion");
+    char *seed = deletion == NULL ? NULL : st_json_get_top_level_raw(deletion, "seed");
+    char *after = deletion == NULL ? NULL : st_json_get_top_level_raw(deletion, "rowsAfter");
+    char *actor_claims = deletion == NULL ? NULL : st_json_get_top_level_raw(deletion, "actor");
+    char actor[2048];
+    char later[32];
+    utc_text(time(NULL) + 3600, later);
+    int failed = deletion == NULL || seed == NULL || after == NULL || actor_claims == NULL
+        || open_fresh_database("deletion") != 0 || exec_sql(attachment_schema) != 0
+        || seed_vector_accounts(deletion) != 0 || sign_claims(actor_claims, actor, sizeof(actor)) != 0;
+    for (size_t i = 0U; !failed && i < sizeof(tables) / sizeof(tables[0]); ++i) {
+        failed = seed_deletion_rows(seed, tables[i], later) != 0;
+    }
+    if (failed) fprintf(stderr, "account deletion fixture setup failed\n");
+    char **steps = NULL;
+    size_t step_count = 0U;
+    failed = failed || st_json_get_raw_array(deletion, "steps", &steps, &step_count) != 0 || step_count == 0U;
+    for (size_t i = 0U; !failed && i < step_count; ++i) {
+        const char *step = steps[i];
+        char *expect = st_json_get_top_level_raw(step, "expect");
+        char *delete_user = st_json_get_top_level_string(step, "deleteUser");
+        char *get = st_json_get_top_level_string(step, "get");
+        char *fixture = st_json_get_top_level_string(step, "fixture");
+        char path[256], sql[512], text[96], text2[96];
+        long long status = 0;
+        if (delete_user != NULL) {
+            snprintf(path, sizeof(path), "/api/admin/users/%s", delete_user);
+            snprintf(text, sizeof(text), "HTTP/1.1 %lld ",
+                     expect != NULL && st_json_get_i64(expect, "status", &status) == 0 ? status : 0LL);
+            failed = !status_is(call("DELETE", path, actor, NULL), text);
+            if (!failed && status == 409) {
+                long long clients = -1, credentials = -1, want_clients = -2, want_credentials = -2;
+                char *error = st_json_get_top_level_string(body_of_response(), "error");
+                failed = error == NULL || *error == '\0'
+                    || st_json_get_i64(body_of_response(), "clients", &clients) != 0
+                    || st_json_get_i64(body_of_response(), "credentials", &credentials) != 0
+                    || st_json_get_i64(expect, "clients", &want_clients) != 0
+                    || st_json_get_i64(expect, "credentials", &want_credentials) != 0
+                    || clients != want_clients || credentials != want_credentials;
+                free(error);
+            }
+        } else if (get != NULL) {
+            char *as = st_json_get_top_level_raw(step, "as");
+            char *body = expect == NULL ? NULL : st_json_get_top_level_raw(expect, "body");
+            char token[2048], want[256], got[256];
+            failed = as == NULL || body == NULL || sign_claims(as, token, sizeof(token)) != 0
+                || st_json_get_i64(expect, "status", &status) != 0;
+            snprintf(text, sizeof(text), "HTTP/1.1 %lld ", status);
+            if (!failed) {
+                failed = !status_is(call("GET", get, token, NULL), text);
+                trim_whitespace(body, want, sizeof(want));
+                trim_whitespace(body_of_response(), got, sizeof(got));
+                failed = failed || strcmp(want, got) != 0;
+            }
+            free(as);
+            free(body);
+        } else if (fixture != NULL && strcmp(fixture, "transfer-client") == 0) {
+            long long id = row_id(step, "id");
+            row_text(step, "owner", text, sizeof(text));
+            snprintf(sql, sizeof(sql), "UPDATE client_account SET owner_username = '%s' WHERE id = %lld;"
+                     "UPDATE peer_mesh_device SET owner_username = '%s' WHERE client_id = %lld;", text, id, text, id);
+            failed = exec_sql(sql) != 0;
+        } else if (fixture != NULL && strcmp(fixture, "delete-client") == 0) {
+            snprintf(sql, sizeof(sql), "DELETE FROM client_account WHERE id = %lld;", row_id(step, "id"));
+            failed = exec_sql(sql) != 0;
+        } else if (fixture != NULL && strcmp(fixture, "delete-credential") == 0) {
+            snprintf(sql, sizeof(sql), "DELETE FROM specus_client_credential WHERE id = %lld;", row_id(step, "id"));
+            failed = exec_sql(sql) != 0;
+        } else if (fixture != NULL && strcmp(fixture, "create-account") == 0) {
+            char key[96], role[16];
+            failed = seed_account(row_text(step, "accountKey", key, sizeof(key)),
+                                  row_text(step, "loginName", text, sizeof(text)),
+                                  row_text(step, "tenantId", text2, sizeof(text2)),
+                                  row_text(step, "role", role, sizeof(role)), 1) != 0;
+        } else {
+            failed = 1;
+        }
+        if (failed) fprintf(stderr, "accountDeletion step %zu %s: %s\n", i, step, response);
+        free(expect);
+        free(delete_user);
+        free(get);
+        free(fixture);
+    }
+    st_json_free_string_array(steps, step_count);
+    char now[32];
+    utc_text(time(NULL), now);
+    for (size_t i = 0U; !failed && i < sizeof(tables) / sizeof(tables[0]); ++i) {
+        failed = check_deletion_rows(seed, after, tables[i], now) != 0;
+    }
+    char **accounts = NULL;
+    size_t account_count = 0U;
+    if (!failed) {
+        failed = st_json_get_raw_array(deletion, "accountsAfter", &accounts, &account_count) != 0;
+        long long remaining = count_rows("SELECT COUNT(*) FROM specus_management_user "
+                                         "WHERE tenant_id IN ('tenant-d','tenant-e')");
+        failed = failed || remaining != (long long)account_count;
+        for (size_t i = 0U; !failed && i < account_count; ++i) {
+            char key[96], login_name[96], tenant[96], sql[512];
+            snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM specus_management_user WHERE username = '%s' "
+                     "AND login_name = '%s' AND tenant_id = '%s'",
+                     row_text(accounts[i], "accountKey", key, sizeof(key)),
+                     row_text(accounts[i], "loginName", login_name, sizeof(login_name)),
+                     row_text(accounts[i], "tenantId", tenant, sizeof(tenant)));
+            failed = count_rows(sql) != 1;
+        }
+        if (failed) fprintf(stderr, "accountDeletion: the accounts left do not match accountsAfter\n");
+    }
+    st_json_free_string_array(accounts, account_count);
+    free(deletion);
+    free(seed);
+    free(after);
+    free(actor_claims);
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 /* Java ManagementUserSchemaMigratorTests.removesEmailRecordsOfAccountsThatNoLongerExist. */
 static int test_init_removes_email_records_of_deleted_accounts(void)
 {
@@ -530,7 +834,8 @@ int main(void)
         | test_user_list_vector(vector)
         | test_deleted_account_tokens_do_not_pass_to_a_recreated_account()
         | test_deleting_an_account_releases_its_email()
-        | test_init_removes_email_records_of_deleted_accounts();
+        | test_init_removes_email_records_of_deleted_accounts()
+        | test_account_deletion_vector(vector);
     free(vector);
     unsetenv("SPECUS_DATABASE_PATH");
     unsetenv("SPECUS_AUTH_PASSWORD");

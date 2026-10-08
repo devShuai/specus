@@ -99,6 +99,11 @@ class WorkbenchCascadeTests extends WorkbenchHttpTestSupport {
 
     @Test
     void deletingAnAccountRemovesItsRowsAndTheSameNameStartsEmpty() {
+        // An account that still owns a client is not deleted (management-accounts.md 7.1): alice's
+        // client goes to root first, by data as no endpoint changes an owner.
+        assertThat(send("DELETE", "/api/admin/users/alice", root).statusCode()).isEqualTo(409);
+        aliceClient.setOwnerUsername("root");
+        clientAccountRepository.saveAndFlush(aliceClient);
         assertThat(send("DELETE", "/api/admin/users/alice", root).statusCode()).isEqualTo(204);
         assertThat(rows()).extracting(Row::username).containsOnly("bob", "root");
         assertThat(rows()).hasSize(12);

@@ -512,6 +512,88 @@ static int test_write_failure(void)
     return 0;
 }
 
+/* 1 when a ping on fd is answered with a pong before the timeout. */
+static int ws_ping_answered(int fd)
+{
+    if (ws_send_frame(fd, 0x9U, (const uint8_t *)"p", 1U) != 0) return 0;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    uint8_t header[2];
+    uint8_t payload[125];
+    if (recv_exact(fd, header, sizeof(header), deadline) != 1 || (header[1] & 0x7fU) > 125U) return 0;
+    size_t len = header[1] & 0x7fU;
+    return (header[0] & 0x0fU) == 0xAU && (len == 0U || recv_exact(fd, payload, len, deadline) == 1);
+}
+
+/*
+ * Java ManagementAccountsHttpTests.deletingAnAccountClosesItsManagementWebSockets
+ * (management-accounts.md 7.1): deleting an account closes its client-messages and connections
+ * sockets with 1008 and leaves another identity's socket open.
+ */
+static int test_account_deletion_closes_sockets(void)
+{
+    char dir[] = "/tmp/specus-c-account-deletion-ws-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "temporary directory");
+    char path[256];
+    snprintf(path, sizeof(path), "%s/accounts.db", dir);
+    static const char secret[] = "account-deletion-ws-jwt-secret-long-enough-2026";
+    setenv("SPECUS_ENV", "test", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    setenv("SPECUS_DATABASE_PATH", path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", secret, 1);
+    st_storage_management_user user;
+    CHECK(st_storage_init(path, 0) == 0
+              && st_storage_create_management_user(path, "hana", "default", "unused-password-hash", "ADMIN", 1,
+                                                   &user) == 0
+              && st_storage_create_management_user(path, "bob", "default", "unused-password-hash", "USER", 1,
+                                                   &user) == 0,
+          "accounts");
+    char hana[1024];
+    char bob[1024];
+    CHECK(st_security_issue_local_token("hana", "default", "ADMIN", secret, 600, hana, sizeof(hana)) == 0
+              && st_security_issue_local_token("bob", "default", "USER", secret, 600, bob, sizeof(bob)) == 0,
+          "tokens");
+    st_admin_server server;
+    memset(&server, 0, sizeof(server));
+    server.fd = -1;
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    CHECK(st_admin_server_start(&server, 0, "") == 0
+              && getsockname(server.fd, (struct sockaddr *)&address, &address_len) == 0,
+          "listener");
+    int port = ntohs(address.sin_port);
+    char text[4096];
+    int bob_messages = ws_open(port, bob, text, sizeof(text));
+    int bob_events = ws_open_endpoint(port, bob, "connections", NULL, 0U);
+    /* The connections socket answers a ping once its reading loop, after registration, runs. */
+    int events_ready = bob_events >= 0 && ws_ping_answered(bob_events);
+    int hana_messages = ws_open(port, hana, text, sizeof(text));
+    CHECK(bob_messages >= 0 && events_ready && hana_messages >= 0, "sockets");
+
+    int status = 0;
+    char *body = NULL;
+    CHECK(http_request(port, "DELETE", "/api/admin/users/bob", NULL, hana, &status, &body) == 0 && status == 204,
+          "delete bob: %d %s", status, body == NULL ? "" : body);
+    free(body);
+    int messages_code = ws_read_close_code(bob_messages);
+    int events_code = ws_read_close_code(bob_events);
+    int to_deleted = st_admin_deliver_client_message_to_admin("default", "deleted-account-client", "admin:bob",
+                                                              "to the deleted account");
+    int to_hana = st_admin_deliver_client_message_to_admin("default", "deleted-account-client", "admin:hana",
+                                                           "still here");
+    int hana_open = to_hana == 0 && ws_read_text(hana_messages, text, sizeof(text), IO_TIMEOUT_MS) == 1
+        && contains(text, "\"message\":\"still here\"");
+    close(bob_messages);
+    close(bob_events);
+    close(hana_messages);
+    unlink(path);
+    rmdir(dir);
+    CHECK(messages_code == 1008 && events_code == 1008,
+          "the deleted account's sockets must close 1008, got %d and %d", messages_code, events_code);
+    CHECK(to_deleted != 0, "a message for the deleted account was still delivered");
+    CHECK(hana_open, "another identity's socket must stay open: %s", text);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -523,6 +605,10 @@ int main(int argc, char **argv)
     if (!failed) {
         failed = test_write_failure();
         printf("%s a failed write after the checks\n", failed ? "FAIL" : "ok  ");
+    }
+    if (!failed) {
+        failed = test_account_deletion_closes_sockets();
+        printf("%s deleting an account closes its management sockets\n", failed ? "FAIL" : "ok  ");
     }
     if (failed) return 1;
     printf("client messages tests passed\n");

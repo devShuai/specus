@@ -3618,9 +3618,15 @@ static int test_tenant_qualified_login_and_refresh(void)
         if (failed) fprintf(stderr, "%s's alice saw another tenant's client\n", owners[i][0]);
     }
     if (!failed) {
+        /* An account that still owns a client is not deleted (management-accounts.md 7.1). */
         int len = tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN", NULL,
                                     response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "delete tenant-a's alice") != 0;
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "\"clients\":1",
+                                 "delete tenant-a's alice with a client") != 0
+            || test_exec_sql(db_path, "DELETE FROM client_account WHERE client_name = 'alice-a-client';") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN",
+                                              NULL, response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "delete tenant-a's alice") != 0;
     }
     if (!failed) {
         int me_len = tenant_token_call("GET", "/api/admin/me", token_a, NULL, response, sizeof(response));

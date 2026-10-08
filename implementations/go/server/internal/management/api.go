@@ -59,8 +59,13 @@ type API struct {
 	connectivity     *connectivity.Checker
 	productMetrics   *productmetrics.Service
 	clientTokens     *auth.SessionStore
+	accountDeleted   func(tenantID, username string)
 	logger           *slog.Logger
 }
+
+// SetAccountDeleted registers what runs once a management account's deletion has committed: the
+// server ends the identity's open management WebSockets there (management-accounts.md 7.1).
+func (a *API) SetAccountDeleted(hook func(tenantID, username string)) { a.accountDeleted = hook }
 
 // SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
 // long-standing NewAPI constructor used by integration tests.
@@ -774,11 +779,25 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	revoked, err := a.db.DeleteManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
 		a.shares.LapseReason)
+	var owned *store.AccountStillOwnsError
+	if errors.As(err, &owned) {
+		a.logger.Warn("management user delete refused: the account still owns clients or credentials",
+			"actor", principal.Username, "tenant", principal.TenantID, "target", user.Username,
+			"clients", owned.Clients, "credentials", owned.Credentials)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": owned.Error(), "clients": owned.Clients, "credentials": owned.Credentials,
+		})
+		return
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	a.shares.CutStreams(revoked)
+	// Committed: the identity's open management WebSockets end (management-accounts.md 7.1).
+	if a.accountDeleted != nil {
+		a.accountDeleted(normalizeTenant(user.TenantID), user.Username)
+	}
 	a.productMetrics.UserDeleted(r.Context(), normalizeTenant(user.TenantID), user.Username)
 	w.WriteHeader(http.StatusNoContent)
 }

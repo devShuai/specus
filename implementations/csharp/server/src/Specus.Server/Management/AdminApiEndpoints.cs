@@ -6,6 +6,7 @@ using Specus.Server.Hosting;
 using Specus.Server.PeerMesh;
 using Specus.Server.ProductMetrics;
 using Specus.Server.Security;
+using Specus.Server.WebSockets;
 
 namespace Specus.Server.Management;
 
@@ -410,11 +411,24 @@ public static class AdminApiEndpoints
         app.MapDelete("/api/admin/users/{username}",
             async (HttpContext context, string username, IOptions<AuthOptions> authOptions,
                 ManagementUserService service, ProductMetricsService productMetrics,
+                ClientMessagesHub clientMessages, ConnectionEventsHub connectionEvents,
                 CancellationToken cancellationToken) =>
             {
                 var caller = ManagementContext.From(context, authOptions.Value);
-                var deleted = await service.DeleteUserAsync(caller, username, cancellationToken)
-                    .ConfigureAwait(false);
+                (string TenantId, string Username) deleted;
+                try
+                {
+                    deleted = await service.DeleteUserAsync(caller, username, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (AccountStillOwnsResourcesException owned)
+                {
+                    return Results.Json(new { error = owned.Message, clients = owned.Clients,
+                        credentials = owned.Credentials }, statusCode: StatusCodes.Status409Conflict);
+                }
+                // Committed: the identity's open management WebSockets end (management-accounts.md 7.1).
+                await clientMessages.CloseIdentityAsync(deleted.TenantId, deleted.Username).ConfigureAwait(false);
+                await connectionEvents.CloseIdentityAsync(deleted.TenantId, deleted.Username).ConfigureAwait(false);
                 await productMetrics.UserDeletedAsync(deleted.TenantId, deleted.Username, cancellationToken)
                     .ConfigureAwait(false);
                 return Results.NoContent();

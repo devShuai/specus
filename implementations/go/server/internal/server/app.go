@@ -314,6 +314,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		})
 	}
 	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, addressResolver, logger)
+	api.SetAccountDeleted(func(tenantID, username string) {
+		wsHub.CloseIdentity(tenantID, username)
+		clientMessages.closeIdentity(tenantID, username)
+	})
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
 		_ = publicTransferDiscovery.Close()
