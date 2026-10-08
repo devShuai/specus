@@ -19,14 +19,16 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 88 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致 |
-| 有差异 | 12 | 见各节“说明”，可修的列入第 9 节 |
+| 一致 | 90 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致 |
+| 有差异 | 10 | 见各节“说明”，可修的列入第 9 节 |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
 | 未逐项对照 | 41 | Peer Mesh / Egress 27 个由 `fix/c-server-parity-peer` 对照；其余 14 个是管理 CRUD 等，见第 9 节 |
 
 C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /api/admin/metrics`（C 的映射计数快照）。
 
 本分支修正的偏差（第 10 节有提交）：Elasticsearch 搜索、可见范围、写入队列、节点列表与 `tcp-streams` 契约；TCP 帧采集顺序；超过 32 KiB 的管理读应答被静默丢弃；客户端、映射、路由、凭据、用户、客户端目录列表的固定行数上限（超过后 500 或静默截断，目录截断后客户端看不到最新版本）；概览字段；管理员看不到已删除客户端和未知名称的连接记录；流量统计 `limit` 上限；客户端到管理员消息不检查来源账号；写入失败回执；命令 JSON 映射严格性；`/ws/connections` 的二进制与未掩码帧。
+
+`fix/c-server-parity-edges` 修正的偏差（第 9 节第 2、3、6 项，提交见第 10 节末）：Peer Mesh 列表与全库客户端列表的固定行数上限、会话列表缺 Java 的分页形式；SQLite 流量搜索的字段、通配与 WHERE 长度，管理员看不到已删除客户端的流量；普通用户看到按名称匹配的失败登录；`listenPort=0`、`clientId` ≤ 0 不过滤；裁剪时 `total_data_set_size_in_bytes` 为 0 改读 `size_in_bytes`；`/ws/connections` 文本上限与 UTF-8 校验；命令成员为数字或布尔值时读作缺失。
 
 ## 1. 认证、身份与管理用户
 
@@ -87,15 +89,15 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 
 | 方法 | 路径 | 鉴权 | 请求 / 响应要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
-| GET | `/api/admin/connections` | Bearer | `clientId/success/from/to/page/size`（1..500），`{items,total,page,size,totalPages}` | 有差异 | **本分支**修正管理员视图：原先连接客户端表，已删除客户端的记录和未知名称的失败登录不显示，Java 按记录的租户过滤（`management_overview_tests`）。剩余差异：普通用户还能看到按名称匹配到自己客户端的失败登录（`client_id` 为空），Java 只按 `clientId` 匹配 |
+| GET | `/api/admin/connections` | Bearer | `clientId/success/from/to/page/size`（1..500），`{items,total,page,size,totalPages}` | 一致 | **本分支**修正管理员视图：原先连接客户端表，已删除客户端的记录和未知名称的失败登录不显示，Java 按记录的租户过滤（`management_overview_tests`）。`fix/c-server-parity-edges`：普通用户原先还能看到按名称匹配到自己客户端的失败登录（`client_id` 为空），现与 Java `clientId IN visibleClientIds` 相同，只按 `clientId` 匹配（`management_lists_tests`） |
 | GET | `/api/admin/connection-stats` | Bearer | 月度归档统计，`clientName`/`limit`（1..500） | 一致 | `ConnectionArchiveServiceTests` 覆盖（ctest `connection_archive_tests`） |
 | GET | `/api/admin/overview` | Bearer | Java `OverviewService` 八个字段 | 一致 | **本分支**：原先只回 `{server,status,onlineClients:0,tcpMappings}`，管理端界面读的八个字段都缺；现按 Java 计算，并在运行时维护每租户的公网连接计数（`management_overview_tests`，真实进程） |
 | POST | `/api/admin/database/initialize` | Bearer（admin） | 初始化演示数据 | 未逐项对照 | `admin_http_tests` 有 C 侧断言 |
 | GET | `/api/admin/traffic` | Bearer | 流量统计，`clientId`/`limit` | 未逐项对照 | **本分支**把 `limit` 改为 Java 的 1..500（原先最多 1000，超过 1000 回落到 100）；字段未逐项对照 |
 | GET | `/api/admin/traffic/resources` | Bearer | 按资源的流量统计，`type`/`clientId`/`limit` | 未逐项对照 | 同上 |
 | GET | `/api/admin/traffic/http-exchanges` | Bearer | 明细摘要分页 | 一致 | **本分支**（第 5 节）；ctest `traffic_detail_api_tests`、`elasticsearch_traffic_tests` |
-| GET | `/api/admin/traffic/http-exchanges/{id}` | Bearer | 明细含表头、预览与 body | 有差异 | `main` 上 C 只存预览不存 body，二进制 body 不显示为 `data:` URL；`fix/c-server-parity-rest` 补 body，合入后复核 |
-| GET | `/api/admin/traffic/tcp-frames` | Bearer | 帧摘要分页，`clientId`/`listenPort`/`page`/`size\|limit` | 一致 | **本分支**；`traffic_detail_api_tests` |
+| GET | `/api/admin/traffic/http-exchanges/{id}` | Bearer | 明细含表头、预览与 body | 有差异 | body 存储与 `data:` URL 显示已随 `fix/c-server-parity-rest` 对齐（test-map `HttpTrafficExchangeStoreTests` 覆盖），已存在的 Elasticsearch 索引补 binary 映射见第 5 节；`fix/c-server-parity-edges`：SQLite 下管理员原先读不到已删除客户端的明细，现按记录的租户查（`traffic_detail_api_tests`）。剩余差异：`br` 编码的 body C 不解码，按解不开处理 |
+| GET | `/api/admin/traffic/tcp-frames` | Bearer | 帧摘要分页，`clientId`/`listenPort`/`page`/`size\|limit` | 一致 | **本分支**；`traffic_detail_api_tests`。`fix/c-server-parity-edges`：`listenPort=0` 与 `clientId` ≤ 0 照 Java 过滤（空页），SQLite 下管理员看得到已删除客户端的帧 |
 | GET | `/api/admin/traffic/tcp-frames/{id}` | Bearer | 帧详情含 `payloadBase64` | 一致 | `elasticsearch_traffic_tests`、`traffic_capture_tests` |
 | GET | `/api/admin/traffic/tcp-streams` | Bearer | 按 `channelId` 的帧流 | 一致 | **本分支**（第 5 节） |
 | GET | `/api/admin/traffic/inspection-status` | Bearer | `{enabled,pendingHttp,pendingTcp,droppedHttp,droppedTcp,lastFlushedAt}` | 一致 | **本分支**：Elasticsearch 下为写入队列的真实计数；SQLite 同步写入，计数恒为 0（第 8 节） |
@@ -118,13 +120,13 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 节点列表 | 逗号分隔多节点；只取 scheme/host/port，无端口时 http 9200、https 443 | 有差异 | **本分支**：原先只用第一个节点、保留路径、无端口时连 80。现按 Java 解析，最多 8 个节点，连不上时按顺序换下一个；Java 客户端在节点间轮询，C 不轮询（第 8 节） |
 | 认证 | API key 或用户名口令 | 一致 | API key 优先 |
 | 索引名与映射 | `specus-http-traffic`/`specus-tcp-traffic`，字段类型同 `@Document` | 一致 | 同名环境变量；首次使用时建索引 |
-| 已存在 HTTP 索引补 body 的 binary 映射 | `putBinaryBodyMapping` | 有差异 | `main` 上 C 不存 body；`fix/c-server-parity-rest` 存 body 但只在建索引时带映射，合入后补（第 9 节） |
+| 已存在 HTTP 索引补 body 的 binary 映射 | `putBinaryBodyMapping` | 一致 | `es_ensure_index` 在索引已存在时 PUT `_mapping` 补上 `requestBodyData`/`responseBodyData` 的 binary 映射，被拒时记日志、照用原索引（#204）；`elasticsearch_traffic_tests` 用 fake 预置的两个旧索引验证 |
 | 文档 id | `(毫秒 << 20) \| 序号` | 一致 | `es_new_id` |
 | 写入路径 | 采集线程入队，后台每 2 s 以批（1000）写入，每类最多 20000 条待写，超出丢弃计数 | 一致 | **本分支**：原先每条明细、每个 TCP 帧在转发线程上同步 PUT（集群慢时每帧最多等 15 s）。现为同样的队列（`_bulk`），环境变量同名；C 另加 256 MiB 总量上限（第 8 节）。`traffic_detail_api_tests`：入队计数、未 flush 前搜不到 |
 | `flush=true` | 立即写一批 | 一致 | **本分支**；http-exchanges、tcp-frames、tcp-streams 都接受 |
 | 关停 | `flushBeforeShutdown` 写一批 | 一致 | **本分支**：SIGTERM 后写出队列中全部文档（Java 只写一批，第 8 节）；`traffic_detail_api_tests` 真实进程断言关停前入队的帧已在集群 |
 | 采集顺序 | 两个方向都在转发前采集，同一事件循环 | 一致 | **本分支**：原先公网到客户端的帧在转发与流量统计写库之后才采集，负载下帧序号会颠倒（实测 P0、C0、P1） |
-| 摘要排除大字段 | `SUMMARY_SOURCE_EXCLUDES` | 一致 | 表头、预览不读（body 字段随 parity-rest） |
+| 摘要排除大字段 | `SUMMARY_SOURCE_EXCLUDES` | 一致 | 表头、预览与 `requestBodyData`/`responseBodyData` 都已排除，摘要不读 |
 | 搜索字段 | `HttpTrafficSearchField.fromCode`：代码或常量名，忽略大小写，未知回落 summary | 一致 | **本分支**：原先自有别名（`headers`、`body`、`query`），`all` 不含表头与正文 |
 | 关键词 | 按空白切 token，每个 token 都须命中；text 字段 `multi_match`，keyword 字段大小写不敏感 `*token*` 通配（转义 `\ * ?`），数字匹配 id/clientId/statusCode/resourceId，method 为大写 term，无可匹配字段时不匹配 | 一致 | **本分支**：原先一个 `simple_query_string`，其运算符会改变语义，keyword 字段只能整值大小写敏感匹配，数字不匹配状态码 |
 | `responseBodyType` | 规范化（trim、小写、未知不过滤），匹配存储类型、空 body 或对应 Content-Type；空白时取 `responseDataType` | 一致 | **本分支**（SQLite 同样修正） |
@@ -132,11 +134,11 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 可见范围 | 管理员只按租户（含已删除客户端），其他人按拥有的客户端，`clientId` 不可见时空页 | 一致 | **本分支**：原先管理员也只看 SQLite 现存客户端 |
 | 分页 | `page>=0`，`size` 1..500，按 id 倒序，`total` 取 hits.total | 一致 | `from` 改为 64 位计算 |
 | 明细 | 租户 + id（+可见客户端），含表头与预览 | 一致 | body 见上 |
-| TCP 列表 | `clientId`、`listenPort`、分页、id 倒序 | 有差异 | `listenPort=0` 时 Java 按 0 过滤（空结果），C 视为不过滤；边缘 |
+| TCP 列表 | `clientId`、`listenPort`、分页、id 倒序 | 一致 | `fix/c-server-parity-edges`：`listenPort` 给出即过滤，0 也一样（原先 0 视为不过滤）；`elasticsearch_traffic_tests` |
 | TCP 流 | `exactText(channelId)`（term、`.keyword`、match_phrase），id 正序，`page`/`size`（默认 `limit` 500，1..1000），回 `channelId,items,total,page,size,limit,totalPages(>=1),truncated`；空白 channelId 为空页 | 一致 | **本分支**：原先忽略分页、`total` 为条数、缺 `page/size/totalPages`、按各方向的帧序号排序、SQLite 下 `limit` 超过 500 回 500 |
-| 保留期（按大小裁剪） | 每分钟最多一次；超过上限按 id 升序每批删 500 条、最多 20 批；`total_data_set_size_in_bytes` 优先 | 有差异 | 语义相同（C 用 `_bulk` 删除）；边缘：`total_data_set_size_in_bytes` 为 0 时 C 改读 `size_in_bytes`，Java 只要字段存在就用它 |
+| 保留期（按大小裁剪） | 每分钟最多一次；超过上限按 id 升序每批删 500 条、最多 20 批；`total_data_set_size_in_bytes` 优先 | 一致 | 语义相同（C 用 `_bulk` 删除）。`fix/c-server-parity-edges`：`total_data_set_size_in_bytes` 只要存在就用，0 也用（原先 0 时改读 `size_in_bytes`），缺字段才读 `size_in_bytes`；fake 对 `*-zero-dataset`、`*-no-dataset` 两种索引给出这两种回答，`elasticsearch_traffic_tests` 验证 |
 | 归档 | 流量明细没有归档，只有按大小裁剪；连接记录的月度归档见第 4 节 | 一致 | — |
-| SQLite 后端（对照 JPA store） | 与 ES 同一套字段与 token 语义；管理员按租户 | 有差异 | 不属于 ES 本身：C 的 SQLite 搜索保留自有字段别名，管理员视图连接客户端表，看不到已删除客户端的流量（第 9 节） |
+| SQLite 后端（对照 JPA store） | `JpaHttpTrafficExchangeStore`：字段同 `HttpTrafficSearchField`，字符串列 `lower(col) LIKE`、预览列 `col LIKE`，`% _ \` 转义；管理员按租户 | 一致 | `fix/c-server-parity-edges`：原先自有字段别名、`% _` 当通配符、WHERE 缓冲 4 KiB（十来个 token 后 SQL 被截断），管理员视图连接客户端表、看不到已删除客户端的流量。现按 JPA 的谓词逐条生成（`traffic_detail_api_tests` 的 SQLite 段）。大小写折叠只覆盖 ASCII，与 SQLite 自身的 `LOWER`/`LIKE` 相同 |
 
 ## 6. client-message 与 WebSocket 事件
 
@@ -145,8 +147,8 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 方法 | 路径 | 鉴权 | 要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
 | POST | `/api/admin/ws-tickets` | Bearer | `{"endpoint":"connections"\|"client-messages"}` → 45 s 单次 ticket，`no-store` | 一致 | `WebSocketTicketServiceTests` 覆盖 |
-| WS | `/ws/connections` | ticket | 推送 `{tenantId,type:created\|updated,connection}`，管理员收本租户全部，其他人只收自己客户端的 | 有差异 | 差异仅为 Redis 集群扇出（第 8 节平台差异）。**本分支**：二进制帧 1003、未掩码帧 1002（`client_messages_tests`）；边缘：Tomcat 文本消息超过 8 KiB 以 1009 关闭，C 的上限为 1 MiB |
-| WS | `/ws/client-messages` | ticket | 见下表 | 有差异 | 唯一剩余差异：`messageId` 为数字时 Java 读作字符串并回显，C 回显空串（边缘） |
+| WS | `/ws/connections` | ticket | 推送 `{tenantId,type:created\|updated,connection}`，管理员收本租户全部，其他人只收自己客户端的 | 有差异 | 差异仅为 Redis 集群扇出（第 8 节平台差异）。**本分支**：二进制帧 1003、未掩码帧 1002（`client_messages_tests`）。`fix/c-server-parity-edges`：文本消息按 Tomcat 默认缓冲 8192 个字符（UTF-16 code unit）计，超过 1009、非 UTF-8 1007（原先上限 1 MiB、不校验 UTF-8），`client_messages_tests` |
+| WS | `/ws/client-messages` | ticket | 见下表 | 一致 | `fix/c-server-parity-edges`：原先 `messageId` 为数字时回显空串；现与 Jackson 相同，四个成员为数字或布尔值时读作其字面文本 |
 | WS | `/ws/public-transfer/discovery` | 公共 ticket | 互传发现 | 一致 | `PublicTransferDiscoveryWebSocketHandlerTests` 覆盖 |
 | WS | `/http/**`（Upgrade） | 路由认证 | Direct WebSocket（SWS2） | 一致 | `WebSocketSpecusHandlerTests`、`WebSocketSpecusHandshakeInterceptorAuthenticationTests` 覆盖 |
 | WS | `/http-share/**`（Upgrade） | 分享 cookie | 分享 WebSocket | 一致 | 中央向量 `temporary-http-share-v1.json` |
@@ -163,6 +165,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 写入异步，不阻塞后续命令 | 一致 | `test_client_messages_websocket` |
 | 检查通过后写入失败回 `failed`/`target-write-failed` | 一致 | **本分支**：原先目标连接在检查后消失时回 `error`/`target-offline` |
 | 无法映射的命令（未知成员、对象/数组值、非对象）回 `invalid-json`，不带 messageId | 一致 | **本分支**：原先忽略未知成员、把非字符串值当缺失 |
+| 数字或布尔成员按 Jackson 转成字面文本（`42`、`-1.50`、`true`）：数字 `messageId` 原样回显，数字正文照常发送；`null` 视为缺失 | 一致 | `fix/c-server-parity-edges`：原先读作缺失，回显空串、数字正文当作空正文；`client_messages_tests` |
 | 客户端到管理员：`admin:` 前缀不区分大小写，用户名 trim，同租户；来源账号存在且启用；无订阅不持久化 | 一致 | **本分支**：原先不查来源账号，停用（未踢线）的账号仍能发给管理员；`client_messages_tests` |
 | 客户端到客户端备用通道：双方启用、Peer ACL、目标在线 | 一致 | 代码对照 `forward_runtime_client_message` 与 `MessageRequestHandler.clientToClient`；无单独测试 |
 | 65,536 UTF-16 code unit 上限（1009），二进制 1003 | 一致 | `test_client_messages_websocket` |
@@ -192,7 +195,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | GET/PUT/DELETE/POST/DELETE | `/api/admin/workbench`、`/favorites/{kind}/{id}`（PUT、DELETE）、`/favorites`（DELETE）、`/recents/{kind}/{id}`（POST、DELETE）、`/recents`（DELETE）（7 个） | Bearer | 一致 | 中央向量 `service-workbench-v1.json`（ctest `workbench_tests`），Java `WorkbenchVectorTests` 消费同一向量 |
 | GET/PUT/DELETE/POST/GET | `/api/admin/product-metrics/settings`（GET、PUT）、`/data`、`/transfer-outcomes`、`/summary`（5 个） | Bearer | 一致 | 中央向量 `product-metrics-v1.json`（ctest `product_metrics_tests`） |
 | GET/GET/POST/PUT/DELETE | `/api/admin/diagrams`、`/api/admin/diagrams/{id}`（5 个） | Bearer | 一致 | `UserDiagramDocumentServiceTests` 覆盖 |
-| GET/PUT/GET/POST/DELETE/GET/GET/DELETE/DELETE/GET/PUT/GET/POST/PUT/DELETE/POST/GET | `/api/admin/peer-mesh/status`、`/devices`、`/devices/{clientId}`、`/acls`、`/acls/{id}`、`/stats`、`/sessions`、`/sessions/{id}`、`/service-sharing`、`/services`、`/services/{id}`、`/services/import`、`/service-audit`（18 个） | Bearer | 未逐项对照 | 由 `fix/c-server-parity-peer` 对照（test-map `PeerMeshServiceTests`、`PeerServiceDiscoveryServiceTests` 为部分）。另见第 9 节：C 的 Peer 列表仍有固定上限 |
+| GET/PUT/GET/POST/DELETE/GET/GET/DELETE/DELETE/GET/PUT/GET/POST/PUT/DELETE/POST/GET | `/api/admin/peer-mesh/status`、`/devices`、`/devices/{clientId}`、`/acls`、`/acls/{id}`、`/stats`、`/sessions`、`/sessions/{id}`、`/service-sharing`、`/services`、`/services/{id}`、`/services/import`、`/service-audit`（18 个） | Bearer | 未逐项对照 | 由 `fix/c-server-parity-peer` 对照（test-map `PeerMeshServiceTests`、`PeerServiceDiscoveryServiceTests` 为部分）。`fix/c-server-parity-edges`：列表不再有固定上限（第 9 节第 2 项），`/sessions` 补上 Java 的 `page/size/openOnly` 分页形式，`limit` 夹到 1..200（`management_lists_tests`）；服务导入的目标去重范围与 Java 不同（第 9 节第 7 项） |
 | GET/PUT/GET/POST/GET/DELETE | `/api/admin/peer-mesh/egress/switch`（GET、PUT）、`/policies`（GET、POST）、`/activity`、`/policies/{id}`（6 个） | Bearer | 未逐项对照 | 同上（`PeerEgressResourceTests` 部分） |
 | GET | `/api/public/peer-mesh/stun-config`、`/api/public/transfer/ice-config`、`/api/public/peer-mesh/nat-probe-config`（3 个） | 公开 | 未逐项对照 | `PublicPeerMeshResourceTests` 部分（standalone STUN 三项未测） |
 | 全部 | `/http/{clientName}/{route}/**` | 路由认证 | 一致 | test-map 第 3 节 `HttpSpecusController*`、`HttpSpecusBodyLimitFilterTests` 等覆盖 |
@@ -211,11 +214,12 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 ## 9. 待办（按影响排序）
 
 1. ~~**每客户端 64 条 TCP 映射 / 64 条 HTTP 路由**~~（已完成，#191）：登录配置、`NAT_CONTROL` 推送、客户端详情与运行时会话里的映射和路由都改为动态分配；唯一的边界是单条 `NAT_CONTROL` 1 MiB，超出的新增或启用在创建时拒绝，其余三端的同一检查见 #197。
-2. **Peer Mesh 管理列表的固定上限**（`peer_mesh.c` 256 个客户端、`append_peer_mesh_egress_policy_view` 512 个客户端）：与上面已修的列表同类，留给 `fix/c-server-parity-peer` 合入后处理。
-3. **SQLite 流量明细搜索对照 JPA**：字段代码按 `HttpTrafficSearchField`、未知代码回落 summary、管理员按记录租户（看得到已删除客户端的流量）。
+2. ~~**Peer Mesh 管理列表的固定上限**~~（已完成，`fix/c-server-parity-edges`）：ACL（256 行）、服务（256 行，超过后连保存都失败，因为保存后从截断的列表里读回）、出口策略（管理列表 128 行、目录推送 64 行）、出口活动（128 行）、一次关闭全部打开会话（200 个，应答又受 32 KiB 缓冲限制），以及登录配置、roster、服务目录与出口策略视图读取的全库客户端列表（256、512、1024 个，跨租户合计），都改为按需扩容、不限行数；会话列表补上 Java 的 `page/size/openOnly` 分页形式（管理端界面用的就是它，C 原先只回数组），`limit` 按 Java 夹到 1..200，列表前先关闭本租户的过期会话（Java `expireIfStale`）。ctest `management_lists_tests`（300 条 ACL 与服务、140 条策略与活动、260 个会话、另一租户 1100 个客户端）、`peer_mesh_tests`（库里多 1100 个客户端时的登录配置与推送）。服务目录的内存表（4096 个在线发布方，每个 32 个服务）与 Java 的同一上限一致，未改。
+3. ~~**SQLite 流量明细搜索对照 JPA**~~（已完成，`fix/c-server-parity-edges`）：按 `JpaHttpTrafficExchangeStore.httpExchangePredicate` 逐条生成 SQL：字段表即 `HttpTrafficSearchField`（代码或常量名、忽略大小写、未知回落 summary），字符串列 `lower(col) LIKE`、预览列 `col LIKE`，`\ % _` 按字面转义，数字按字段匹配 id/clientId/statusCode/resourceId，`method` 整值比较，每个 token 都须命中且个数不限；HTTP、TCP 的列表与明细都按记录的租户过滤，管理员看得到已删除客户端的流量。ctest `traffic_detail_api_tests` 的 SQLite 段（与 ES 段同一组记录，逐个查询对照 Java 的结果）。
 4. ~~**`fix/c-server-parity-rest` 合入后复核**~~（已完成）：HTTP body 存储与详情显示、客户端登录 nonce 存库，以及 test-map 中 `TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 两行都已对应；已存在的 Elasticsearch HTTP 索引原先不补 binary body 映射，`fix/c-es-existing-index-body-mapping` 已按 Java `putBinaryBodyMapping` 补上（被拒时记日志、照用原索引），`elasticsearch_traffic_tests` 用 fake 预置的两个旧索引验证。
 5. **未逐项对照的 14 个管理端点**：注册两条、`/api/admin/me`、凭据 CRUD 四条、映射列表与改删三条、`database/initialize`、客户端名称可用性、流量统计两条——逐项对照校验规则、状态码与字段。
-6. 边缘差异：连接记录普通用户可见范围（按名称匹配的失败登录）、`listenPort=0`、裁剪时 `total_data_set_size_in_bytes` 为 0 的回退、`/ws/connections` 文本上限、数字 `messageId` 的回显。
+6. ~~边缘差异~~（已完成，`fix/c-server-parity-edges`）：连接记录普通用户只看 `clientId` 属于自己客户端的记录（`management_lists_tests`）；`listenPort` 给出即过滤、`clientId` ≤ 0 为空页，ES 与 SQLite 相同（`elasticsearch_traffic_tests`、`traffic_detail_api_tests`）；裁剪时 `total_data_set_size_in_bytes` 只要存在就用（`elasticsearch_traffic_tests`）；`/ws/connections` 与 `/ws/client-messages` 共用一个读帧循环，文本按 Tomcat 默认的 8192 个字符限长（1009）并校验 UTF-8（1007）；命令成员为数字或布尔值时按 Jackson 读作字面文本，数字 `messageId` 原样回显（`client_messages_tests`）。都不是平台差异。
+7. **Peer 服务导入的目标去重范围**（核对第 2 项时发现）：Java `importCandidates` 只拿本客户端已有服务的 `host:port` 去重，C 拿整个租户的服务，别的客户端已发布同一目标时 C 会跳过而 Java 会导入。
 
 ## 10. 本分支提交
 
@@ -233,3 +237,11 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | `fix(c-server): capture a TCP frame before it is relayed, as Java` | 采集顺序 |
 | `fix(c-server): client-message commands map like Java's ObjectMapper` | `invalid-json` 严格性 |
 | `test(c-server): unmappable client-message commands on a real server` | `client_messages_tests` 补充 |
+
+`fix/c-server-parity-edges`（第 9 节第 2、3、6 项）的提交：
+
+| 提交 | 内容 |
+| --- | --- |
+| `fix(c-server): Peer Mesh lists, SQLite traffic search and edge cases as Java` | Peer Mesh 列表与全库客户端列表不限行数、会话分页；SQLite 搜索按 JPA 谓词、按记录租户的可见范围；连接记录、`listenPort`/`clientId`、裁剪字段、两个 WebSocket 的文本读取与命令成员 |
+| `test(c-server): Peer Mesh lists, SQLite search, WebSocket text limits and scalar commands` | `management_lists_tests`、`traffic_detail_api_tests`、`elasticsearch_traffic_tests`、`client_messages_tests`、`peer_mesh_tests` 补充 |
+| `docs(alignment): C inventory items 2, 3 and 6 done` | 本文与 test-map |

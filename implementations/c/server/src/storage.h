@@ -550,6 +550,11 @@ int st_storage_list_clients(const char *path,
                             st_storage_client *clients,
                             size_t max_clients,
                             size_t *client_count);
+/*
+ * Every client of every tenant, as st_storage_list_clients, without a row bound: *clients is a heap
+ * array the caller frees (NULL when there is none).
+ */
+int st_storage_list_all_clients(const char *path, st_storage_client **clients, size_t *client_count);
 int st_storage_get_client(const char *path, long long id, st_storage_client *client);
 int st_storage_get_client_by_name(const char *path, const char *client_name, st_storage_client *client);
 int st_storage_client_has_online_receive_capability(const char *path,
@@ -1065,12 +1070,15 @@ int st_storage_list_resource_traffic_usage_visible(const char *path,
                                                    st_storage_resource_traffic_usage *items,
                                                    size_t max_items,
                                                    size_t *item_count);
+/*
+ * The Peer Mesh lists below have no row bound, as Java's: on success the array is a heap array of
+ * every matching row that the caller frees (NULL when there is none).
+ */
 int st_storage_list_peer_mesh_acls_visible(const char *path,
                                            const char *tenant_id,
                                            const char *owner_username,
                                            int include_all_clients,
-                                           st_storage_peer_mesh_acl *acls,
-                                           size_t max_acls,
+                                           st_storage_peer_mesh_acl **acls,
                                            size_t *acl_count);
 int st_storage_ensure_peer_mesh_device(const char *path,
                                        const st_storage_client *client,
@@ -1123,6 +1131,22 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
                                                st_storage_peer_mesh_session *sessions,
                                                size_t max_sessions,
                                                size_t *session_count);
+/*
+ * A page of the visible sessions, latest update first (Java PeerMeshService.listSessions and
+ * listSessionsPage): the tenant's sessions past their expiry are closed first, as expireIfStale;
+ * open_only leaves the closed ones out; *total_count counts every match. size must fit sessions.
+ */
+int st_storage_page_peer_mesh_sessions_visible(const char *path,
+                                               const char *tenant_id,
+                                               const char *owner_username,
+                                               int include_all_clients,
+                                               int open_only,
+                                               int page,
+                                               int size,
+                                               st_storage_peer_mesh_session *sessions,
+                                               size_t max_sessions,
+                                               size_t *session_count,
+                                               long long *total_count);
 /* One (effective path type, status) group of Java PeerMeshSessionRepository.aggregatePathTypes. */
 typedef struct {
     char path_type[32];
@@ -1194,8 +1218,7 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
                                                      const char *tenant_id,
                                                      const char *owner_username,
                                                      int include_all_clients,
-                                                     st_storage_peer_mesh_session *sessions,
-                                                     size_t max_sessions,
+                                                     st_storage_peer_mesh_session **sessions,
                                                      size_t *session_count);
 int st_storage_create_peer_mesh_session(const char *path,
                                         const st_storage_client *source,
@@ -1252,8 +1275,7 @@ int st_storage_list_peer_mesh_services_visible(const char *path,
                                                const char *tenant_id,
                                                const char *owner_username,
                                                int include_all_clients,
-                                               st_storage_peer_mesh_service *services,
-                                               size_t max_services,
+                                               st_storage_peer_mesh_service **services,
                                                size_t *service_count);
 int st_storage_get_peer_mesh_service_visible(const char *path,
                                              long long id,
@@ -1270,8 +1292,7 @@ int st_storage_delete_peer_mesh_service(const char *path,
 int st_storage_list_peer_mesh_egress_policies(const char *path,
                                               const char *tenant_id,
                                               int enabled_only,
-                                              st_storage_peer_mesh_egress_policy *policies,
-                                              size_t max_policies,
+                                              st_storage_peer_mesh_egress_policy **policies,
                                               size_t *policy_count);
 int st_storage_get_peer_mesh_egress_policy(const char *path,
                                            long long id,
@@ -1289,8 +1310,7 @@ int st_storage_delete_peer_mesh_egress_policy(const char *path,
                                               const char *tenant_id);
 int st_storage_list_peer_mesh_egress_activity(const char *path,
                                               const char *tenant_id,
-                                              st_storage_peer_mesh_egress_activity *rows,
-                                              size_t max_rows,
+                                              st_storage_peer_mesh_egress_activity **rows,
                                               size_t *row_count);
 int st_storage_find_peer_mesh_egress_activity(const char *path,
                                               const char *tenant_id,
@@ -1347,6 +1367,11 @@ int st_storage_get_http_exchange_visible(const char *path,
 /* Frees the bodies a detail lookup read into item; item itself stays the caller's. */
 void st_storage_http_exchange_free_bodies(st_storage_http_exchange *item);
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record);
+/*
+ * listen_port for a TCP frame list without a listenPort filter. Any other value filters, 0 and
+ * negative ports included, as Java's Integer listenPort does (they match no frame).
+ */
+#define ST_STORAGE_ANY_LISTEN_PORT INT32_MIN
 int st_storage_list_tcp_frames_visible(const char *path,
                                        long long client_id,
                                        int listen_port,
