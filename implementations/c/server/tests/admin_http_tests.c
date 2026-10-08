@@ -1908,13 +1908,14 @@ static int test_public_discovery_websocket(void)
     rejected = test_public_websocket_open(port, ticket_extra, "192.0.2.11", response, sizeof(response));
     free(ticket_extra);
     ticket_extra = NULL;
-    unsetenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM");
+    /* The server reads the limit when it registers the peer, after the 101: keep it until the answer. */
     if (rejected < 0 || test_websocket_read_text(rejected, payload, sizeof(payload)) != 0
         || !contains(payload, "room is full")) {
         fprintf(stderr, "public discovery room capacity was not enforced: %s\n", payload);
         if (rejected >= 0) close(rejected);
         goto cleanup;
     }
+    unsetenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM");
     close(rejected);
 
     char *near_ticket_a = NULL;

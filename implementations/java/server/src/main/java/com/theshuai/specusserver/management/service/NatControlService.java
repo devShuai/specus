@@ -1,7 +1,9 @@
 package com.theshuai.specusserver.management.service;
 
 import com.theshuai.common.protocol.MessageType;
+import com.theshuai.common.protocol.PacketCodec;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
+import com.theshuai.common.serialize.Serializer;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.session.SessionUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
@@ -44,6 +46,22 @@ import java.util.Map;
 @Service
 @Slf4j
 public class NatControlService {
+    /** The 1 MiB MESSAGE body of protocol/spec/control-protocol.md that a NAT_CONTROL travels in. */
+    static final int MESSAGE_BODY_LIMIT = PacketCodec.MAX_MESSAGE_BODY_BYTES;
+    /** The longest client name a rename allows. */
+    static final int CLIENT_NAME_RESERVE_CHARACTERS = 120;
+    static final String NAT_CONTROL_TOO_LARGE =
+            "客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端";
+    /*
+     * The client's name when a NAT_CONTROL is sized: 120 characters of 4 UTF-8 bytes each in the
+     * clientName field, and of a 6-byte backslash-u escape each in the JSON. No name a rename allows
+     * takes more in either place, so no later rename pushes an accepted configuration over.
+     */
+    private static final String LONGEST_FIELD_NAME =
+            Character.toString(0x10000).repeat(CLIENT_NAME_RESERVE_CHARACTERS);
+    private static final String LONGEST_JSON_NAME =
+            Character.toString(0x01).repeat(CLIENT_NAME_RESERVE_CHARACTERS);
+
     private final SpecusMappingRepository specusMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final ClientAccountRepository clientAccountRepository;
@@ -134,6 +152,9 @@ public class NatControlService {
         mapping.setCreatedAt(now);
         mapping.setUpdatedAt(now);
         SpecusMapping saved = specusMappingRepository.saveAndFlush(mapping);
+        if (saved.isEnabled()) {
+            requireNatControlFits(account);
+        }
         pushSnapshotIfOnline(account);
         return toView(saved);
     }
@@ -183,6 +204,9 @@ public class NatControlService {
 
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(saved.getClientId(), tenant.tenantId()).orElse(null);
         if (account != null) {
+            if (saved.isEnabled()) {
+                requireNatControlFits(account);
+            }
             pushSnapshotIfOnline(account);
         }
         return toView(saved);
@@ -293,6 +317,34 @@ public class NatControlService {
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
     }
 
+    /**
+     * Refuses, with the {@link IllegalArgumentException} the management API answers 400 to, a change
+     * after which the client's NAT_CONTROL no longer fits one MESSAGE. Call it in the change's
+     * transaction once the change is flushed and only when the change leaves the entry enabled: a
+     * change that leaves it disabled only shrinks the message. It counts the client's enabled
+     * entries, whether or not the client is enabled. See "NAT_CONTROL 的大小" in
+     * protocol/spec/control-protocol.md.
+     */
+    void requireNatControlFits(ClientAccount account) {
+        List<SpecusMapping> mappings = specusMappingRepository
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
+        if (reservedBodyBytes(mappings, loadEnabledHttpRoutes(account)) > MESSAGE_BODY_LIMIT) {
+            throw new IllegalArgumentException(NAT_CONTROL_TOO_LARGE);
+        }
+    }
+
+    /**
+     * The MESSAGE body of a NAT_CONTROL carrying these entries, encoded as it is sent, with the
+     * client's name counted at the longest a rename allows.
+     */
+    int reservedBodyBytes(List<SpecusMapping> mappings, List<HttpRouteMapping> httpRoutes) {
+        MessageResponsePacket packet = new MessageResponsePacket();
+        packet.setClientName(LONGEST_FIELD_NAME);
+        packet.setMessageType(MessageType.NAT_CONTROL);
+        packet.setMessage(messageJson(LONGEST_JSON_NAME, mappings, httpRoutes));
+        return Serializer.COMPACT_BINARY.serialize(packet).length;
+    }
+
     private boolean sendNatControl(String clientName,
                                    List<SpecusMapping> mappings,
                                    List<HttpRouteMapping> httpRoutes) {
@@ -301,6 +353,18 @@ public class NatControlService {
             return false;
         }
 
+        MessageResponsePacket packet = new MessageResponsePacket();
+        packet.setClientName(clientName);
+        packet.setMessageType(MessageType.NAT_CONTROL);
+        packet.setMessage(messageJson(clientName, mappings, httpRoutes));
+        channel.writeAndFlush(packet);
+        log.info("[nat-control] pushed {} tcp + {} http route(s) to {}",
+                mappings.size(), httpRoutes.size(), clientName);
+        return true;
+    }
+
+    /** The JSON text of clientName's NAT_CONTROL. */
+    String messageJson(String clientName, List<SpecusMapping> mappings, List<HttpRouteMapping> httpRoutes) {
         List<Map<String, Object>> specusConfigList = new ArrayList<>();
         for (SpecusMapping mapping : mappings) {
             Map<String, Object> specusConfig = new LinkedHashMap<>();
@@ -325,15 +389,7 @@ public class NatControlService {
             httpSpecusConfigList.add(entry);
         }
         specusBean.put("httpSpecusConfigList", httpSpecusConfigList);
-
-        MessageResponsePacket packet = new MessageResponsePacket();
-        packet.setClientName(clientName);
-        packet.setMessageType(MessageType.NAT_CONTROL);
-        packet.setMessage(JsonUtil.objectToString(specusBean));
-        channel.writeAndFlush(packet);
-        log.info("[nat-control] pushed {} tcp + {} http route(s) to {}",
-                mappings.size(), httpRoutes.size(), clientName);
-        return true;
+        return JsonUtil.objectToString(specusBean);
     }
 
     private ClientAccount findClient(long clientId) {
