@@ -3,6 +3,7 @@ package com.theshuai.specusserver.management.model;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 
 /**
  * Fixed-width text form for instants that queries compare as strings.
@@ -31,5 +32,20 @@ public final class SortableInstant {
     /** Rewrites any ISO-8601 instant, including the variable-width {@link Instant#toString()} form. */
     public static String normalize(String instant) {
         return format(Instant.parse(instant));
+    }
+
+    /**
+     * The {@link Instant#toString()} form that responses and messages carry for a stored value, so
+     * the fixed width stays a storage detail. Null, and text that does not parse, come back as stored.
+     */
+    public static String toInstantString(String stored) {
+        if (stored == null) {
+            return null;
+        }
+        try {
+            return Instant.parse(stored).toString();
+        } catch (DateTimeParseException unparseable) {
+            return stored;
+        }
     }
 }

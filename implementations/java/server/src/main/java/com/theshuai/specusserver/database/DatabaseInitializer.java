@@ -40,7 +40,7 @@ public class DatabaseInitializer {
     private final ManagementUserSchemaMigrator managementUserSchemaMigrator;
     private final ClientDownloadSchemaMigrator clientDownloadSchemaMigrator;
     private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
-    private final TransferTimestampMigrator transferTimestampMigrator;
+    private final SortableTimestampMigrator sortableTimestampMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
     private final SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator;
     private final boolean seedDemoClient;
@@ -55,7 +55,7 @@ public class DatabaseInitializer {
                                ManagementUserSchemaMigrator managementUserSchemaMigrator,
                                ClientDownloadSchemaMigrator clientDownloadSchemaMigrator,
                                PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
-                               TransferTimestampMigrator transferTimestampMigrator,
+                               SortableTimestampMigrator sortableTimestampMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
                                SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
@@ -70,7 +70,7 @@ public class DatabaseInitializer {
         this.managementUserSchemaMigrator = managementUserSchemaMigrator;
         this.clientDownloadSchemaMigrator = clientDownloadSchemaMigrator;
         this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
-        this.transferTimestampMigrator = transferTimestampMigrator;
+        this.sortableTimestampMigrator = sortableTimestampMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
         this.sqliteUniqueIndexMigrator = sqliteUniqueIndexMigrator;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
@@ -96,7 +96,7 @@ public class DatabaseInitializer {
         managementUserSchemaMigrator.migrate();
         clientDownloadSchemaMigrator.migrate();
         peerServiceDiscoverySchemaMigrator.migrate();
-        transferTimestampMigrator.migrate();
+        sortableTimestampMigrator.migrate();
         widenHttpBodyTextColumns();
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();

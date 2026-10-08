@@ -22,6 +22,7 @@ public class ClientAuthNonce {
     @Column(name = "api_key_hash", nullable = false, length = 64)
     private String apiKeyHash;
 
+    /** {@link SortableInstant} text: the expired-nonce purge compares it with "now" as a string. */
     @Column(name = "expires_at", nullable = false, length = 40)
     private String expiresAt;
 }
