@@ -841,14 +841,8 @@ class PeerEgressRuntimeTests {
                 PeerEgressFrame.encodeControl(PeerEgressFrame.Control.nameBind(address, name))), EPOCH);
     }
 
-    private static java.util.function.Function<String, List<Integer>> resolvingTo(String... addresses) {
-        return name -> {
-            List<Integer> resolved = new ArrayList<>();
-            for (String text : addresses) {
-                resolved.add(address(text));
-            }
-            return resolved;
-        };
+    private static java.util.function.Function<String, List<String>> resolvingTo(String... addresses) {
+        return name -> List.of(addresses);
     }
 
     /**
@@ -868,6 +862,49 @@ class PeerEgressRuntimeTests {
         List<PeerEgressSegment.Segment> segments = harness.segments();
         assertTrue(!segments.isEmpty() && segments.get(0).sourceIp() == address("198.18.0.5"),
                 "the SYN-ACK did not come from the fake address");
+    }
+
+    /**
+     * A name with no A record is dialled over IPv6 (peer-egress-dns.md): the egress's own socket goes
+     * to the first AAAA address the policy allows, while the consumer still sees the flow at its IPv4
+     * fake address. The rebound loopback ahead of it is refused by the IPv6 forced-deny list.
+     */
+    @Test
+    void dialsAnIpv6OnlyName() {
+        Harness harness = new Harness("::/0");
+        harness.runtime.resolve = resolvingTo("::1", "2001:db8::10");
+        bindName(harness, 7, "198.18.0.5", "v6only.example");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(List.of("2001:db8::10:443"), harness.dialed());
+        List<PeerEgressSegment.Segment> segments = harness.segments();
+        assertTrue(!segments.isEmpty() && segments.get(0).sourceIp() == address("198.18.0.5"),
+                "the SYN-ACK did not come from the fake address");
+    }
+
+    /** A name rebound to nothing but IPv6 loopback is refused before anything is dialled. */
+    @Test
+    void refusesANameThatResolvesToIpv6Loopback() {
+        Harness harness = new Harness("::/0");
+        harness.runtime.resolve = resolvingTo("::1");
+        bindName(harness, 7, "198.18.0.5", "rebind.example");
+
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                syn("100.96.0.1", 40000, "198.18.0.5", 443))), EPOCH);
+
+        assertEquals(0, harness.dialCount(), "a name resolving to IPv6 loopback was dialled");
+        assertEquals(List.of(PeerEgressCodes.FORBIDDEN_DESTINATION), harness.rejectCodes());
+    }
+
+    /** Only an IPv6 target is dialled unbound. */
+    @Test
+    void socketsToIpv6TargetsAreLeftUnbound() throws java.io.IOException {
+        assertTrue(PeerEgressSocketBinder.leftUnbound(java.net.InetAddress.getByName("2001:db8::10")));
+        assertTrue(!PeerEgressSocketBinder.leftUnbound(java.net.InetAddress.getByName("203.0.113.10")));
+        // Java reads an IPv4-mapped literal as the IPv4 address, which goes through the choice.
+        assertTrue(!PeerEgressSocketBinder.leftUnbound(java.net.InetAddress.getByName("::ffff:203.0.113.10")));
     }
 
     /**
@@ -1077,8 +1114,8 @@ class PeerEgressRuntimeTests {
                 "100.96.0.0/11", List.of("198.18.0.0/15"));
         Harness harness = new Harness();
         harness.runtime.applyPolicy(withDomainRule("example.com", "203.0.113.0/24"), ownPoolDenied, EPOCH);
-        harness.runtime.resolve = name -> List.of(address(
-                name.equals("example.com") ? "192.0.2.10" : "203.0.113.10"));
+        harness.runtime.resolve = name -> List.of(
+                name.equals("example.com") ? "192.0.2.10" : "203.0.113.10");
         bindName(harness, 7, "198.18.0.5", "example.com");
         bindName(harness, 7, "198.18.0.6", "other.example");
         harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(

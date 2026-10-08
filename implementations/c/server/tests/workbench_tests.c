@@ -1192,7 +1192,15 @@ static int test_workbench_cascades(void)
         fprintf(stderr, "client deletion did not cascade: %s\n", buffer);
         return 1;
     }
-    /* Deleting an account deletes its rows only; a token issued before is refused and writes nothing. */
+    /*
+     * Deleting an account deletes its rows only; a token issued before is refused and writes nothing.
+     * An account that still owns clients is not deleted (management-accounts.md 7.1): alice's go to
+     * root first, by data as no endpoint changes an owner.
+     */
+    failures += call("DELETE", "/api/admin/users/alice", root, NULL, buffer, sizeof(buffer), &response) != 0
+        || response.status != 409
+        || exec_sql("UPDATE client_account SET owner_username = 'root' "
+                    "WHERE tenant_id = 't1' AND owner_username = 'alice';") != 0;
     failures += call("DELETE", "/api/admin/users/alice", root, NULL, buffer, sizeof(buffer), &response) != 0
         || response.status != 204;
     failures += query_i64("SELECT COUNT(*) FROM management_workbench_item WHERE username = ?", "alice") != 0

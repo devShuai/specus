@@ -69,6 +69,9 @@ class WorkbenchResourceTests extends WorkbenchHttpTestSupport {
             storeUp();
         }
 
+        // An account that still owns a client is not deleted (management-accounts.md 7.1).
+        client.setOwnerUsername("workbench-fixture-admin");
+        clientAccountRepository.saveAndFlush(client);
         managementUserService.deleteUser(tenantAdmin("t1"), "alice");
         HttpResponse<String> rejected = send("GET", BASE, alice);
         assertThat(rejected.statusCode()).isEqualTo(403);

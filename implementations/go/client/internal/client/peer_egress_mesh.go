@@ -1064,11 +1064,18 @@ func egressDeploymentDenyCIDRs(baseURL, stunHost, turnHost, relayAddress string)
 		if parsed, _, err := net.SplitHostPort(host); err == nil {
 			host = parsed
 		}
+		// An IPv6 host without a port keeps its brackets, as a URL writes it.
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+		}
 		// Only literal addresses are added. A hostname would have to be resolved here, and a
 		// resolution taken at policy time can differ from the one the connect uses, which would
-		// make the block look enforced when it is not.
+		// make the block look enforced when it is not. An IPv6 one is written in RFC 5952 form, so
+		// the three clients derive the same list.
 		if _, ok := parseEgressAddress(host); ok {
 			denied = append(denied, host+"/32")
+		} else if address, ok := parseEgressAddress6(host); ok {
+			denied = append(denied, formatEgressAddress6(address)+"/128")
 		}
 	}
 	if parsed, err := url.Parse(strings.TrimSpace(baseURL)); err == nil {
@@ -1093,15 +1100,23 @@ func localInterfaceCIDRs() []string {
 	networks := make([]string, 0, len(addresses))
 	for _, address := range addresses {
 		network, ok := address.(*net.IPNet)
-		if !ok || network.IP.To4() == nil {
+		if !ok {
 			continue
 		}
 		prefix, bits := network.Mask.Size()
-		if bits != 32 {
+		if v4 := network.IP.To4(); v4 != nil {
+			if bits == 32 {
+				networks = append(networks, v4.Mask(network.Mask).String()+"/"+strconv.Itoa(prefix))
+			}
 			continue
 		}
-		masked := network.IP.To4().Mask(network.Mask)
-		networks = append(networks, masked.String()+"/"+strconv.Itoa(prefix))
+		// IPv6 networks too, now that IPv6 destinations are dialled: written the way the judgment
+		// reads them, never in the dotted form Go uses for an IPv4-mapped address.
+		if v6 := network.IP.To16(); v6 != nil && bits == 128 {
+			var masked [16]byte
+			copy(masked[:], v6.Mask(network.Mask))
+			networks = append(networks, formatEgressAddress6(masked)+"/"+strconv.Itoa(prefix))
+		}
 	}
 	return networks
 }

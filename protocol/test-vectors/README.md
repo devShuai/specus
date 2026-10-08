@@ -26,7 +26,8 @@ implementations/java/common/src/test/java/com/theshuai/common/tools/WireFixtureG
 空串客户端名下的 JSON 字节数与为改名预留后的 MESSAGE body 字节数；`management` 是在恰好 1 MiB 的边界上新建、
 启用、修改映射和 route 的步骤与期望状态码。Java、Go、.NET 服务端的测试直接读取并重放这两部分。
 `existingOversize` 是数据库里已有超限配置的场景：control 登录不断开、Peer Mesh 登录推送照常、手动下发返回 `409`、
-变更接口照常生效；四个服务端的测试都按它重放。
+变更接口照常生效；四个服务端的测试都按它重放。`writeFailure` 是客户端在线、control 连接却写不进去的场景：
+手动下发按不在线返回 `409`，变更接口照常返回；语义见同一文档的「NAT_CONTROL 写失败与数据库错误」。
 
 ## Peer Mesh
 
@@ -120,9 +121,11 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
 
 - `management-accounts-v1.json`：本地 token 的账号键声明 `uid` 与用户列表里的内置管理员。给出带固定账号键的账号、
   一组 token 声明（带或不带 `tenant_id`、`uid`）与期望解析到的账号（`null` 表示解析不到），以及三种调用者看到的
-  用户列表。手写，语义见 [`protocol/spec/management-accounts.md`](../spec/management-accounts.md) 第 5–7 节，
-  重放方法见其第 12 节。Java、Go、.NET 与 C 服务端经真实 HTTP 处理代码（`/api/admin/me`、`/auth/refresh`、
-  `/api/admin/users`）重放全部用例。
+  用户列表；`accountDeletion` 另有自己的账号与按登录名归属的各类行，逐步重放删除账号（仍拥有客户端或凭证时
+  `409`、转走或删除后成功）并给出删除后剩下的行。手写，语义见
+  [`protocol/spec/management-accounts.md`](../spec/management-accounts.md) 第 5–7 节，重放方法见其第 12 节。
+  Java、Go、.NET 与 C 服务端经真实 HTTP 处理代码（`/api/admin/me`、`/auth/refresh`、`/api/admin/users`、
+  `DELETE /api/admin/users/{username}`）重放全部用例。
 
 ## 拒绝规则
 

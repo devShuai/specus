@@ -32,7 +32,7 @@ route 的所有者或租户管理员，可以为**一条已有、受保护的 HT
 
 - route 可以改名（URL 随之改变），客户端也可以改名；route id 稳定。
 - 没有任何服务端提供修改客户端所有者的接口。
-- 删除用户只删用户行，其客户端与 route 保留，`owner_username` 悬空；Java 中新建的同名用户会「继承」这些客户端。
+- 仍拥有客户端或接入凭证的用户不能删除（`409`，[management-accounts.md](management-accounts.md) 7.1 节），所以删除用户时不会留下归属悬空的客户端与 route，之后新建的同名用户也不会「继承」它们。
 - Java、Go、.NET 每个管理请求都从库里重读用户，停用或删除立即生效。**C 只在登录时检查 `enabled`**，bearer 校验不读库，`/auth/refresh` 也不读库。
 - 删除客户端时，Go 与 C 删除其 route 行，Java 与 .NET 留下孤立的 route 行。
 

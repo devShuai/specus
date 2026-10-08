@@ -1,5 +1,6 @@
 package com.theshuai.specusserver.management.controller;
 
+import com.theshuai.specusserver.management.service.AccountStillOwnsResourcesException;
 import com.theshuai.specusserver.management.service.RateLimitedException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -53,5 +54,15 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<Map<String, String>> handleDataIntegrityViolation(DataIntegrityViolationException exception) {
         return ResponseEntity.badRequest().body(Map.of("error", "客户端名称已存在或数据不符合约束"));
+    }
+
+    /** An account still owning clients or credentials is not deleted: 409 with both counts. */
+    @ExceptionHandler(AccountStillOwnsResourcesException.class)
+    public ResponseEntity<Map<String, Object>> handleAccountStillOwnsResources(
+            AccountStillOwnsResourcesException exception) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                "error", exception.getMessage(),
+                "clients", exception.clients(),
+                "credentials", exception.credentials()));
     }
 }

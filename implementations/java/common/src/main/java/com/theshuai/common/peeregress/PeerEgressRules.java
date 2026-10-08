@@ -54,6 +54,23 @@ public final class PeerEgressRules {
      * a domain match is checked where phase one refused it, the pool after the mesh.
      */
     public static String validate(PeerEgressRule rule, String meshCidr, String fakeIpCidr) {
+        return validate(rule, meshCidr, fakeIpCidr, CONSUMER_CARRIES_IPV6);
+    }
+
+    /**
+     * Whether this consumer has an IPv6 data plane: IPv6 packets read from the TUN, IPv6 routes
+     * installed into it, and IPv6 carried to the egress. It does not yet, so a well-formed IPv6 rule
+     * is refused with {@code EGRESS_RULE_IPV6_UNSUPPORTED}: installing nothing for it and reporting it
+     * in force would send its destinations straight out of the local interface.
+     *
+     * <p>The rule is still read and checked in full first, so a mistake in it is reported as one, and
+     * how IPv6 rules match is pinned by the vector's {@code ipv6} section, which the tests run with
+     * this set.
+     */
+    public static final boolean CONSUMER_CARRIES_IPV6 = false;
+
+    /** As above, with the consumer's IPv6 data plane stated. */
+    public static String validate(PeerEgressRule rule, String meshCidr, String fakeIpCidr, boolean carriesIpv6) {
         if (rule == null) {
             return PeerEgressCodes.RULE_MALFORMED;
         }
@@ -66,8 +83,25 @@ public final class PeerEgressRules {
         if (match.isEmpty()) {
             return PeerEgressCodes.RULE_MALFORMED;
         }
+        // A colon is unambiguous: the match is an IPv6 address or prefix, or it is malformed. The
+        // mesh and the fake-IP pool are IPv4, so an IPv6 rule has neither to stay clear of.
         if (match.indexOf(':') >= 0) {
-            return PeerEgressCodes.RULE_IPV6_UNSUPPORTED;
+            Ipv6Cidr prefix = Ipv6Cidr.parse(match);
+            if (prefix == null || prefix.mapped()) {
+                // An IPv4-mapped prefix reads, but no packet is ever addressed to one: the rule would
+                // match nothing while its writer believed the IPv4 addresses covered.
+                return PeerEgressCodes.RULE_MALFORMED;
+            }
+            if (prefix.prefixLength() == 0) {
+                return PeerEgressCodes.RULE_DEFAULT_ROUTE;
+            }
+            String target = validateTarget(rule);
+            if (target != null) {
+                return target;
+            }
+            // Last: everything about the rule is right, and what is missing is this device's ability
+            // to carry IPv6 at all.
+            return carriesIpv6 ? null : PeerEgressCodes.RULE_IPV6_UNSUPPORTED;
         }
         Ipv4Cidr pool = fakeIpCidr == null ? null : Ipv4Cidr.parse(fakeIpCidr);
         boolean phaseTwo = fakeIpCidr != null;
@@ -98,6 +132,11 @@ public final class PeerEgressRules {
                 return PeerEgressCodes.RULE_FAKE_IP_OVERLAP;
             }
         }
+        return validateTarget(rule);
+    }
+
+    /** The part of the order after the match: no port, a known action, and an egress rule's egress. */
+    private static String validateTarget(PeerEgressRule rule) {
         if (rule.getPort() != null) {
             return PeerEgressCodes.RULE_PORT_UNSUPPORTED;
         }
@@ -140,8 +179,23 @@ public final class PeerEgressRules {
      * match an address, and an address rule the pool refuses takes no part, like any refused rule.
      */
     public static Match match(List<PeerEgressRule> rules, String destination, String meshCidr, String fakeIpCidr) {
-        Integer address = Ipv4Cidr.parseAddress(destination);
-        if (address == null || rules == null || rules.isEmpty()) {
+        return match(rules, destination, meshCidr, fakeIpCidr, CONSUMER_CARRIES_IPV6);
+    }
+
+    /**
+     * As above, with the consumer's IPv6 data plane stated.
+     *
+     * <p>The families never compete: an IPv4 destination is decided by IPv4 rules alone and an IPv6
+     * one by IPv6 rules alone, longest prefix within the family. Both are compared by value, so how a
+     * rule or a destination is spelled does not change the result.
+     */
+    public static Match match(List<PeerEgressRule> rules, String destination, String meshCidr, String fakeIpCidr,
+                              boolean carriesIpv6) {
+        String text = destination == null ? "" : destination.trim();
+        boolean ipv6 = text.indexOf(':') >= 0;
+        Integer address = ipv6 ? null : Ipv4Cidr.parseAddress(text);
+        long[] address6 = ipv6 ? Ipv6Cidr.parseAddress(text) : null;
+        if ((address == null && address6 == null) || rules == null || rules.isEmpty()) {
             return Match.unmatched();
         }
         PeerEgressRule best = null;
@@ -149,17 +203,26 @@ public final class PeerEgressRules {
         int bestPrefix = -1;
         for (int index = 0; index < rules.size(); index++) {
             PeerEgressRule rule = rules.get(index);
-            if (validate(rule, meshCidr, fakeIpCidr) != null || isDomain(rule)) {
+            if (validate(rule, meshCidr, fakeIpCidr, carriesIpv6) != null || isDomain(rule)) {
                 continue;
             }
-            Ipv4Cidr cidr = Ipv4Cidr.parse(rule.getMatch());
-            if (cidr == null || !cidr.contains(address)) {
-                continue;
+            String match = rule.getMatch().trim();
+            int prefixLength = -1;
+            if (match.indexOf(':') >= 0) {
+                Ipv6Cidr cidr = Ipv6Cidr.parse(match);
+                if (address6 != null && cidr != null && cidr.contains(address6)) {
+                    prefixLength = cidr.prefixLength();
+                }
+            } else {
+                Ipv4Cidr cidr = Ipv4Cidr.parse(match);
+                if (address != null && cidr != null && cidr.contains(address)) {
+                    prefixLength = cidr.prefixLength();
+                }
             }
-            if (cidr.prefixLength() > bestPrefix) {
+            if (prefixLength > bestPrefix) {
                 best = rule;
                 bestIndex = index;
-                bestPrefix = cidr.prefixLength();
+                bestPrefix = prefixLength;
             }
         }
         if (best == null) {

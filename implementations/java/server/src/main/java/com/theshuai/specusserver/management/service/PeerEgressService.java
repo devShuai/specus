@@ -4,7 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
-import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import com.theshuai.common.peeregress.PeerEgressCatalogEntry;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressPolicy;
@@ -722,13 +722,14 @@ public class PeerEgressService {
 
     private static String normalizeCidr(String raw, String field) {
         String cidr = raw == null ? "" : raw.strip();
-        // Whitespace is what is forgiven, not every control character. parse() trims on its own,
-        // so without the equality check a leading control character that strip() keeps would pass
-        // the parser and then be stored.
-        if (!cidr.equals(cidr.trim()) || Ipv4Cidr.parse(cidr) == null) {
-            throw new IllegalArgumentException(field + ".cidr is not an IPv4 address or CIDR: " + raw);
+        // Whitespace is what is forgiven, not every control character. Ipv4Cidr.parse() trims on
+        // its own, so without the equality check a leading control character that strip() keeps
+        // would pass the parser and then be stored. An IPv6 CIDR is stored in RFC 5952 form.
+        String stored = cidr.equals(cidr.trim()) ? Ipv6Cidr.storedDestinationCidr(cidr) : null;
+        if (stored == null) {
+            throw new IllegalArgumentException(field + ".cidr is not an IPv4 or IPv6 address or CIDR: " + raw);
         }
-        return cidr;
+        return stored;
     }
 
     private static List<String> normalizeProtocols(List<String> raw, String field) {

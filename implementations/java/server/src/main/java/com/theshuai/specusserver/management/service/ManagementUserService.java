@@ -40,10 +40,20 @@ public class ManagementUserService {
     private final WorkbenchReferences workbenchReferences;
     /** Releases a deleted account's registered email; absent only in isolated unit tests. */
     private final ManagementUserEmailRepository userEmailRepository;
+    /** Refuses or clears what a deleted account owns; absent only in isolated unit tests. */
+    private final AccountOwnedData accountOwnedData;
 
     public ManagementUserService(ManagementUserRepository repository,
                                  AuthProperties authProperties) {
-        this(repository, authProperties, null, null, null);
+        this(repository, authProperties, null, null, null, null);
+    }
+
+    public ManagementUserService(ManagementUserRepository repository,
+                                 AuthProperties authProperties,
+                                 HttpShareService httpShareService,
+                                 WorkbenchReferences workbenchReferences,
+                                 ManagementUserEmailRepository userEmailRepository) {
+        this(repository, authProperties, httpShareService, workbenchReferences, userEmailRepository, null);
     }
 
     @Autowired
@@ -51,12 +61,14 @@ public class ManagementUserService {
                                  AuthProperties authProperties,
                                  HttpShareService httpShareService,
                                  WorkbenchReferences workbenchReferences,
-                                 ManagementUserEmailRepository userEmailRepository) {
+                                 ManagementUserEmailRepository userEmailRepository,
+                                 AccountOwnedData accountOwnedData) {
         this.repository = repository;
         this.authProperties = authProperties;
         this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
         this.userEmailRepository = userEmailRepository;
+        this.accountOwnedData = accountOwnedData;
     }
 
     @Transactional(readOnly = true)
@@ -459,11 +471,24 @@ public class ManagementUserService {
             throw new IllegalArgumentException("内置 admin 用户不能删除");
         }
         ManagementUser user = requireMutableUserInTenant(context, normalized, "delete");
+        String tenantId = TenantContext.normalize(user.getTenantId());
+        // Clients and credentials carry tunnels in use: the administrator deletes or hands them over
+        // first, as a later account of the same name would own them (management-accounts.md 7.1).
+        if (accountOwnedData != null) {
+            AccountOwnedData.Owned owned = accountOwnedData.owned(tenantId, loginName(user));
+            if (owned.any()) {
+                log.warn("管理用户delete被拒绝: actor={}, tenant={}, target={}, reason=仍拥有客户端{}个、接入凭证{}个",
+                        context.username(), tenantId, loginName(user), owned.clients(), owned.credentials());
+                throw new AccountStillOwnsResourcesException(owned.clients(), owned.credentials());
+            }
+            // The rest of what the identity owns goes or changes hands in this transaction.
+            accountOwnedData.forget(tenantId, loginName(user), context.username(), Instant.now());
+        }
         // The workbench lists are personal history: they go with the account, in this transaction,
         // so an account created later under the same name starts empty. The identity is the one
         // the management context carries: tenant and canonical login name of the account record.
         if (workbenchReferences != null) {
-            workbenchReferences.forgetIdentity(TenantContext.normalize(user.getTenantId()), loginName(user));
+            workbenchReferences.forgetIdentity(tenantId, loginName(user));
         }
         // The registered email points at the account key and goes with the account, in this
         // transaction, so the address can register again once the delete commits.

@@ -2716,11 +2716,158 @@ int st_storage_update_management_user(const char *path,
     return out_user == NULL ? 0 : st_storage_get_management_user_in_tenant(path, tenant_id, username, out_user);
 }
 
-static int delete_management_user_on_db(sqlite3 *db, const char *tenant_id, const char *username)
+/* Runs sql with up to four text parameters (a NULL ends the list); 0 when it completes. */
+static int account_data_exec(sqlite3 *db, const char *sql, const char *a, const char *b, const char *c,
+                             const char *d)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    const char *values[4] = {a, b, c, d};
+    for (int i = 0; i < 4 && values[i] != NULL; ++i) {
+        sqlite3_bind_text(stmt, i + 1, values[i], -1, SQLITE_TRANSIENT);
+    }
+    int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int account_data_count(sqlite3 *db, const char *sql, const char *tenant_id, const char *owner,
+                              long long *out)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, owner, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            *out = sqlite3_column_int64(stmt, 0);
+            rc = 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* 1 when the table exists: the attachment tables appear only once object storage first opens them. */
+static int account_data_table_exists(sqlite3 *db, const char *table)
+{
+    sqlite3_stmt *stmt = NULL;
+    int exists = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", -1, &stmt,
+                           NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, table, -1, SQLITE_TRANSIENT);
+        exists = sqlite3_step(stmt) == SQLITE_ROW;
+    }
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+/*
+ * What the identity (tenant, login name as the account record spells it) owns besides its account
+ * row, in the caller's transaction (management-accounts.md section 7.1). ST_STORAGE_ACCOUNT_STILL_OWNS
+ * while clients or credentials remain, with *owned filled and nothing changed: they carry tunnels in
+ * use, and a later account of the same name would own them. Otherwise diagram documents, download
+ * grants and download usage go; attachments expire now, so nothing can complete, download or count
+ * them any more and the expiry scan deletes their objects (the row is the only record of the object);
+ * Peer device rows of clients that no longer exist go; Peer ACLs and egress policies, which decide how
+ * other people's clients connect, stay and are owned by actor from now on.
+ */
+static int forget_account_data_on_db(sqlite3 *db,
+                                     const char *tenant_id,
+                                     const char *key,
+                                     const char *actor,
+                                     st_storage_account_owned *owned)
+{
+    char login_name[256] = {0};
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COALESCE(NULLIF(login_name, ''), username) FROM specus_management_user "
+            "WHERE tenant_id = ? AND login_name_normalized = ?",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL) {
+            snprintf(login_name, sizeof(login_name), "%s", (const char *)sqlite3_column_text(stmt, 0));
+            rc = 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != 0 || login_name[0] == '\0' || actor == NULL || *actor == '\0') {
+        return -1;
+    }
+    st_storage_account_owned counted = {0};
+    if (account_data_count(db, "SELECT COUNT(*) FROM client_account WHERE tenant_id = ? AND owner_username = ?",
+                           tenant_id, login_name, &counted.clients) != 0
+        || account_data_count(db,
+                              "SELECT COUNT(*) FROM specus_client_credential "
+                              "WHERE tenant_id = ? AND owner_username = ?",
+                              tenant_id, login_name, &counted.credentials) != 0) {
+        return -1;
+    }
+    if (owned != NULL) {
+        *owned = counted;
+    }
+    if (counted.clients > 0 || counted.credentials > 0) {
+        return ST_STORAGE_ACCOUNT_STILL_OWNS;
+    }
+    rc = account_data_exec(db, "DELETE FROM user_diagram_document WHERE tenant_id = ? AND owner_username = ?",
+                           tenant_id, login_name, NULL, NULL);
+    if (rc == 0 && account_data_table_exists(db, "transfer_attachment")) {
+        /* Object storage writes these columns in this form, which compares as the time order. */
+        rc = account_data_exec(db,
+            "UPDATE transfer_attachment SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
+            "upload_expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE tenant_id = ? AND owner_username = ? AND status <> 'EXPIRED' "
+            "AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            tenant_id, login_name, NULL, NULL);
+    }
+    if (rc == 0 && account_data_table_exists(db, "transfer_attachment_download_grant")) {
+        rc = account_data_exec(db,
+            "DELETE FROM transfer_attachment_download_grant WHERE tenant_id = ? AND username = ?",
+            tenant_id, login_name, NULL, NULL);
+    }
+    if (rc == 0 && account_data_table_exists(db, "transfer_attachment_download_usage")) {
+        rc = account_data_exec(db,
+            "DELETE FROM transfer_attachment_download_usage WHERE tenant_id = ? AND username = ?",
+            tenant_id, login_name, NULL, NULL);
+    }
+    if (rc == 0) {
+        rc = account_data_exec(db,
+            "DELETE FROM peer_mesh_device WHERE tenant_id = ? AND owner_username = ? "
+            "AND NOT EXISTS (SELECT 1 FROM client_account c WHERE c.id = peer_mesh_device.client_id)",
+            tenant_id, login_name, NULL, NULL);
+    }
+    if (rc == 0) {
+        rc = account_data_exec(db,
+            "UPDATE peer_mesh_acl SET owner_username = ? WHERE tenant_id = ? AND owner_username = ?",
+            actor, tenant_id, login_name, NULL);
+    }
+    if (rc == 0) {
+        rc = account_data_exec(db,
+            "UPDATE peer_mesh_egress_policy SET owner_username = ? WHERE tenant_id = ? AND owner_username = ?",
+            actor, tenant_id, login_name, NULL);
+    }
+    return rc;
+}
+
+static int delete_management_user_on_db(sqlite3 *db,
+                                        const char *tenant_id,
+                                        const char *username,
+                                        const char *actor,
+                                        st_storage_account_owned *owned)
 {
     char key[256];
     if (username == NULL || management_login_name_key(username, key, sizeof(key)) != 0) {
         return -1;
+    }
+    int forgotten = forget_account_data_on_db(db, normalize_tenant_id(tenant_id), key, actor, owned);
+    if (forgotten != 0) {
+        return forgotten;
     }
     /*
      * The account's workbench rows go in the caller's transaction: favourites and recent opens are
@@ -2781,7 +2928,10 @@ static int delete_management_user_on_db(sqlite3 *db, const char *tenant_id, cons
     return rc;
 }
 
-int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username)
+int st_storage_delete_management_user(const char *path,
+                                      const char *tenant_id,
+                                      const char *username,
+                                      const char *actor)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -2791,14 +2941,14 @@ int st_storage_delete_management_user(const char *path, const char *tenant_id, c
         sqlite3_close(db);
         return -1;
     }
-    int rc = delete_management_user_on_db(db, tenant_id, username);
+    int rc = delete_management_user_on_db(db, tenant_id, username, actor, NULL);
     if (rc == 0) {
         rc = exec_sql(db, "COMMIT");
     } else {
         (void)exec_sql(db, "ROLLBACK");
     }
     sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    return rc == ST_STORAGE_ACCOUNT_STILL_OWNS ? rc : rc == 0 ? 0 : -1;
 }
 
 /* 0 with *user filled when a user is bound to identity_key, 1 when none is, -1 on a read failure. */
@@ -11953,7 +12103,8 @@ int st_storage_delete_management_user_audited(const char *path,
                                               const char *username,
                                               const char *actor,
                                               long long now_ms,
-                                              st_storage_share_ids *revoked)
+                                              st_storage_share_ids *revoked,
+                                              st_storage_account_owned *owned)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -11964,13 +12115,18 @@ int st_storage_delete_management_user_audited(const char *path,
     if (rc == 0) {
         rc = share_load_user_state(db, tenant_id, username, &before) == 0 ? 0 : -1;
     }
+    int refused = 0;
     if (rc == 0) {
-        rc = delete_management_user_on_db(db, tenant_id, username);
+        rc = delete_management_user_on_db(db, tenant_id, username, actor, owned);
+        refused = rc == ST_STORAGE_ACCOUNT_STILL_OWNS;
     }
     if (rc == 0) {
         rc = share_revoke_lost_creator(db, builtin, before.tenant_id, before.username, actor, now_ms, revoked);
     }
     rc = share_end(db, rc);
     sqlite3_close(db);
+    if (refused) {
+        return ST_STORAGE_ACCOUNT_STILL_OWNS;
+    }
     return rc == 0 ? 0 : -1;
 }

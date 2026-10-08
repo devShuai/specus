@@ -619,6 +619,11 @@ func (db *DB) DeleteManagementUserAudited(ctx context.Context, user ManagementUs
 		return nil, err
 	}
 	defer tx.Rollback()
+	// An account that still owns clients or credentials is refused; the rest of what its identity
+	// owns goes or changes hands with it (management-accounts.md section 7.1).
+	if err := db.forgetAccountDataOn(ctx, tx, user, actor); err != nil {
+		return nil, err
+	}
 	// The account's workbench lists are personal history and go with it.
 	if err := db.deleteManagementUserOn(ctx, tx, user); err != nil {
 		return nil, err

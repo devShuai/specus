@@ -622,7 +622,21 @@ int st_storage_update_management_user(const char *path,
                                       const char *role,
                                       int enabled,
                                       st_storage_management_user *out_user);
-int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username);
+/* What an account still owns that must go or change hands before the account is deleted. */
+typedef struct {
+    long long clients;
+    long long credentials;
+} st_storage_account_owned;
+#define ST_STORAGE_ACCOUNT_STILL_OWNS 1
+/*
+ * Deletes the account of tenant_id with this login name and what its identity owns, handing its
+ * tenant policies to actor (management-accounts.md 7.1). ST_STORAGE_ACCOUNT_STILL_OWNS, changing
+ * nothing, while it still owns clients or credentials; -1 when there is no such account.
+ */
+int st_storage_delete_management_user(const char *path,
+                                      const char *tenant_id,
+                                      const char *username,
+                                      const char *actor);
 /*
  * Java ManagementUserService.resolveOrProvisionOidcUser for a verified issuer/subject pair, in one
  * transaction: the user already bound to identity_key resolves when enabled; otherwise an enabled,
@@ -1752,12 +1766,18 @@ int st_storage_update_management_user_audited(const char *path,
                                               long long now_ms,
                                               st_storage_management_user *out_user,
                                               st_storage_share_ids *revoked);
+/*
+ * Deleting an account (management-accounts.md 7.1) answers ST_STORAGE_ACCOUNT_STILL_OWNS, changing
+ * nothing, while it still owns clients or credentials; *owned then holds both counts. Otherwise the
+ * rest of what its identity owns goes or changes hands to actor in the same transaction.
+ */
 int st_storage_delete_management_user_audited(const char *path,
                                               const st_storage_share_builtin_admin *builtin,
                                               const char *tenant_id,
                                               const char *username,
                                               const char *actor,
                                               long long now_ms,
-                                              st_storage_share_ids *revoked);
+                                              st_storage_share_ids *revoked,
+                                              st_storage_account_owned *owned);
 
 #endif

@@ -84,8 +84,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err := cfg.ValidateSecurityBaseline(); err != nil {
 		return nil, err
 	}
-	if cfg.Netty.MaxFrameSize < protocol.FrameHeaderSize {
-		return nil, fmt.Errorf("netty max frame size must be at least %d", protocol.FrameHeaderSize)
+	if cfg.Netty.MaxFrameSize < config.MinMaxFrameSize {
+		return nil, fmt.Errorf("netty max frame size must be at least %d", config.MinMaxFrameSize)
 	}
 	if err := security.ValidateTLSDeployment(cfg.TLS, cfg.Netty.BindAddress, cfg.ManagementAddr); err != nil {
 		return nil, err
@@ -314,6 +314,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		})
 	}
 	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, addressResolver, logger)
+	api.SetAccountDeleted(func(tenantID, username string) {
+		wsHub.CloseIdentity(tenantID, username)
+		clientMessages.closeIdentity(tenantID, username)
+	})
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
 		_ = publicTransferDiscovery.Close()

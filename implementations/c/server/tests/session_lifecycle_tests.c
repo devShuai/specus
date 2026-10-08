@@ -22,6 +22,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+
+#ifndef ST_NAT_CONTROL_SIZE_VECTOR_FILE
+#define ST_NAT_CONTROL_SIZE_VECTOR_FILE "../../../protocol/test-vectors/nat-control-size-v1.json"
+#endif
 
 /* An admin bearer token from the real /auth/login, or NULL; the caller frees it. */
 static char *admin_access_token(const test_server *server)
@@ -1220,6 +1225,143 @@ static int test_data_login_answered_before_stream_open(test_server *server)
     return 0;
 }
 
+static char *read_text_file(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    char *text = NULL;
+    long size = fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
+    if (size > 0 && fseek(file, 0, SEEK_SET) == 0) {
+        text = (char *)malloc((size_t)size + 1U);
+        if (text != NULL && fread(text, 1, (size_t)size, file) == (size_t)size) {
+            text[size] = '\0';
+        } else {
+            free(text);
+            text = NULL;
+        }
+    }
+    fclose(file);
+    return text;
+}
+
+/* Closes a socket with a TCP RST rather than a FIN, so the server's next write to it fails. */
+static void reset_fd(int *fd)
+{
+    struct linger reset = {.l_onoff = 1, .l_linger = 0};
+    (void)setsockopt(*fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    close_fd(fd);
+}
+
+/* The whole answer to a request sent with http_request_start, read until the server closes it. */
+static void http_response_text(int fd, char *out, size_t out_len)
+{
+    size_t used = 0U;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    uint8_t byte = 0U;
+    while (used + 1U < out_len && recv_exact(fd, &byte, 1U, deadline) == 1) {
+        out[used++] = (char)byte;
+    }
+    out[used] = '\0';
+}
+
+/*
+ * One manual push into a control connection that cannot be written. The push is sent while the
+ * control login is held at the gate, published but not yet answered, so it waits for the connection's
+ * send lock; the client then resets the connection and the login is let go, and the login response
+ * and then the push are written into a connection that is gone.
+ */
+static int push_into_reset_control(test_server *server, int index, const char *endpoint, int expect,
+                                   const char *error_contains)
+{
+    char key[64];
+    char secret[64];
+    char machine[64];
+    char what[160];
+    char answer[1024];
+    runtime_session runtime;
+    int control = -1;
+    snprintf(key, sizeof(key), "ck_write_failure_%d", index);
+    snprintf(secret, sizeof(secret), "write-failure-secret-%d", index);
+    snprintf(machine, sizeof(machine), "machine-write-failure-%d", index);
+    CHECK(create_credential(server->db_path, key, secret, 2) == 0, "credential %s not stored", key);
+    CHECK(http_client_login(server, key, secret, machine, "wanda", &runtime) == 0,
+          "http login (status and body above)");
+    char *token = admin_access_token(server);
+    CHECK(token != NULL, "admin login failed");
+
+    CHECK(start_held_login(server, &runtime, "control", &control) == 0,
+          "%s: the control login was never published and held at the gate", endpoint);
+    char path[192];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/%s", runtime.client_id, endpoint);
+    int push = http_request_start(server->admin_port, "POST", path, NULL, token);
+    free(token);
+    CHECK(push >= 0, "%s: request not sent", endpoint);
+    CHECK(expect_quiet_while_held(control, push, what, sizeof(what)) == 0,
+          "%s: control login held after publishing, NAT_CONTROL pushed at it: %s", endpoint, what);
+    reset_fd(&control);
+    sleep_ms(100);
+    char release[400];
+    login_gate_path("control", "release", release, sizeof(release));
+    int gate = open(release, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK(gate >= 0, "%s: cannot release the control login: %s", endpoint, strerror(errno));
+    close(gate);
+
+    http_response_text(push, answer, sizeof(answer));
+    close_fd(&push);
+    int status = -1;
+    CHECK(sscanf(answer, "HTTP/1.1 %d", &status) == 1 && status == expect,
+          "%s into a reset control connection answered %d, expected %d: %s", endpoint, status, expect, answer);
+    CHECK(status != 409 || strstr(answer, error_contains) != NULL,
+          "%s: the 409 does not name %s: %s", endpoint, error_contains, answer);
+    CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
+          "%s: session not DISCONNECTED after the client reset its connection", endpoint);
+    clear_login_gate();
+    return 0;
+}
+
+/*
+ * Replays writeFailure of protocol/test-vectors/nat-control-size-v1.json as far as the manual pushes
+ * go: a push that finds the client's control connection but cannot write to it answers the 409 of an
+ * offline client, as the other servers do, where it used to answer 500. Route changes ignore how their
+ * push went, so the vector's createRoute and deleteRoute are not replayed here.
+ */
+static int test_push_into_reset_control_answers_offline(test_server *server)
+{
+    char *vector = read_text_file(ST_NAT_CONTROL_SIZE_VECTOR_FILE);
+    char *scenario = vector == NULL ? NULL : st_json_get_top_level_raw(vector, "writeFailure");
+    free(vector);
+    char *error_contains = scenario == NULL ? NULL : st_json_get_string(scenario, "errorContains");
+    char **steps = NULL;
+    size_t step_count = 0U;
+    int loaded = error_contains != NULL && st_json_get_raw_array(scenario, "steps", &steps, &step_count) == 0;
+    free(scenario);
+    CHECK(loaded, "cannot read writeFailure of %s", ST_NAT_CONTROL_SIZE_VECTOR_FILE);
+
+    int failed = 0;
+    int replayed = 0;
+    for (size_t i = 0; i < step_count && !failed; ++i) {
+        char *op = st_json_get_string(steps[i], "op");
+        int expect = 0;
+        (void)st_json_get_int(steps[i], "expect", &expect);
+        const char *endpoint = op == NULL ? NULL
+            : strcmp(op, "pushNatControl") == 0 ? "nat-control"
+            : strcmp(op, "forceRefreshPortMapping") == 0 ? "force-refresh-port-mapping"
+            : NULL;
+        if (endpoint != NULL) {
+            failed = push_into_reset_control(server, (int)i, endpoint, expect, error_contains);
+            ++replayed;
+        }
+        free(op);
+    }
+    st_json_free_string_array(steps, step_count);
+    free(error_contains);
+    CHECK(!failed, "a manual push into a reset control connection (see above)");
+    CHECK(replayed == 2, "writeFailure has %d manual push step(s), expected 2", replayed);
+    return 0;
+}
+
 /* Counts the client's closed connection records with the given disconnect reason, or -1. */
 static int connection_reason_count(const char *db_path, const char *client_name, const char *reason)
 {
@@ -1426,6 +1568,9 @@ int main(int argc, char **argv)
     clear_login_gate();
     failures += run_on_fresh_server("data login answered before a stream OPEN sent once it is published",
                                     test_data_login_answered_before_stream_open, login_gate);
+    clear_login_gate();
+    failures += run_on_fresh_server("a manual NAT_CONTROL push into a reset control connection answers offline",
+                                    test_push_into_reset_control_answers_offline, login_gate);
     clear_login_gate();
     rmdir(login_gate_dir);
 

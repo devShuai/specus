@@ -50,39 +50,33 @@ public class PeerEgressNamesTests
     }
 
     /// <summary>
-    /// The egress dials the first resolved address the policy allows. This build resolves IPv4 only
-    /// and does not announce IPv6 targets, so a case that expects an AAAA address is one it answers as
-    /// unresolved; every other case must match the vector exactly.
+    /// The egress dials the first resolved address the policy allows: the A records, or the AAAA
+    /// records for a name with none when the egress connects to IPv6 targets, which this build does.
     /// </summary>
     [Fact]
     public void AddressChoiceMatchesTheSharedVector()
     {
+        Assert.True(PeerEgressRuntime.Ipv6TargetCapable, "the vector's AAAA cases depend on IPv6 targets");
         using var vector = Vector();
         foreach (var testCase in vector.RootElement.GetProperty("egressChoice").EnumerateArray())
         {
             var name = testCase.GetProperty("name").GetString();
-            var a = testCase.GetProperty("a").EnumerateArray().Select(item => Address(item.GetString()!)).ToList();
-            var aaaa = testCase.GetProperty("aaaa").GetArrayLength();
+            List<System.Net.IPAddress> Parse(string family) => testCase.GetProperty(family).EnumerateArray()
+                .Select(item => System.Net.IPAddress.Parse(item.GetString()!)).ToList();
+            var candidates = PeerEgressRuntime.DialCandidates(Parse("a"), Parse("aaaa"),
+                testCase.GetProperty("ipv6TargetCapable").GetBoolean());
             var decisions = testCase.GetProperty("decisions");
-            var choice = PeerEgressRuntime.ChooseAddress(a, address =>
+            var choice = PeerEgressRuntime.ChooseAddress(candidates, address =>
             {
-                var code = decisions.GetProperty(Ipv4Cidr.FormatAddress(address)).GetString();
+                var code = decisions.GetProperty(PeerEgressRuntime.FormatTarget(address)).GetString();
                 return code == PeerEgressCodes.Allowed ? null : code;
             });
-            if (a.Count == 0 && aaaa > 0 && testCase.GetProperty("ipv6TargetCapable").GetBoolean())
-            {
-                Assert.True(choice.Code == PeerEgressCodes.NameUnresolved,
-                    $"{name}: an IPv4-only egress should find nothing to dial, got {choice.Code}");
-                continue;
-            }
             Assert.True(testCase.GetProperty("code").GetString() == (choice.Code ?? PeerEgressCodes.Allowed),
                 $"{name}: code {choice.Code}");
             var expected = testCase.GetProperty("address");
-            if (expected.ValueKind == JsonValueKind.String)
-            {
-                Assert.True(expected.GetString() == Ipv4Cidr.FormatAddress(choice.Address),
-                    $"{name}: chose {Ipv4Cidr.FormatAddress(choice.Address)}");
-            }
+            var chosen = choice.Address is null ? null : PeerEgressRuntime.FormatTarget(choice.Address);
+            Assert.True((expected.ValueKind == JsonValueKind.String ? expected.GetString() : null) == chosen,
+                $"{name}: chose {chosen}");
         }
     }
 
@@ -225,7 +219,7 @@ public class PeerEgressNamesTests
                 {
                     _resolved.Add(name);
                 }
-                return [Address(Resolution)];
+                return [System.Net.IPAddress.Parse(Resolution)];
             };
             Runtime.ApplyPolicy(new PeerEgressPolicy
             {

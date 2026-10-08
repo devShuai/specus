@@ -2785,7 +2785,14 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
             log_nat_control_not_sent(client_name, tcp_routes, http_routes, json_bytes);
             result = ST_ADMIN_NAT_CONTROL_NOT_SENT;
         } else if (session_send_packet(control, &packet) != 0) {
-            result = -2;
+            /*
+             * The connection is closed, reset or no longer writable: the client is as good as offline,
+             * and the manual push answers it as one. See "NAT_CONTROL 写失败与数据库错误" in
+             * protocol/spec/control-protocol.md.
+             */
+            fprintf(stderr, "[nat-control] runtime push to %s failed: its control connection cannot be written\n",
+                    client_name);
+            result = -1;
         } else {
             printf("[nat-control] runtime push client=%s tcp=%zu http=%zu\n",
                    client_name,
@@ -5119,6 +5126,14 @@ static void *client_thread(void *arg)
                 record_login_success_event(session);
                 record_client_online_milestone(session);
                 if (nat_control_rc != 0) {
+                    /*
+                     * The control socket has a write timeout, so a failed write may have left half a
+                     * frame on the wire: anything written after it, the Peer Mesh push included, would
+                     * be read out of step. The connection is closed instead; the client logs in again
+                     * and gets its configuration then.
+                     */
+                    fprintf(stderr, "[nat-control] push to %s on login failed: its control connection cannot "
+                            "be written; closing it\n", session->config.client_name);
                     disconnect_reason = "IO_ERROR";
                     st_login_request_free(&request);
                     break;

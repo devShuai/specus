@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Specus.Protocol.PeerEgress;
@@ -137,7 +138,7 @@ internal sealed class PeerEgressRuntime
     // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
     private readonly PeerEgressNameTable _names = new();
     private readonly HashSet<PeerEgressFlowTable.Key> _resolving = [];
-    internal Func<string, IReadOnlyList<uint>> Resolve { get; set; } = ResolveName;
+    internal Func<string, IReadOnlyList<IPAddress>> Resolve { get; set; } = ResolveName;
     private long _totalFlows;
     private long _bytesIn;
     private long _bytesOut;
@@ -462,7 +463,7 @@ internal sealed class PeerEgressRuntime
             Monitor.Exit(_lock);
             return;
         }
-        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs, destination.Value.Name);
+        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address!, nowMs, destination.Value.Name);
         if (code is not null)
         {
             Monitor.Exit(_lock);
@@ -487,7 +488,7 @@ internal sealed class PeerEgressRuntime
         Exception? failure = null;
         try
         {
-            socket = _dialer.Dial("tcp", Ipv4Cidr.FormatAddress(destination.Value.Address), key.RemotePort, ConnectTimeoutMs);
+            socket = _dialer.Dial("tcp", FormatTarget(destination.Value.Address!), key.RemotePort, ConnectTimeoutMs);
         }
         catch (Exception error)
         {
@@ -710,7 +711,7 @@ internal sealed class PeerEgressRuntime
                 Monitor.Exit(_lock);
                 return;
             }
-            var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address, nowMs, destination.Value.Name);
+            var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address!, nowMs, destination.Value.Name);
             if (code is not null)
             {
                 Monitor.Exit(_lock);
@@ -731,7 +732,7 @@ internal sealed class PeerEgressRuntime
             Exception? failure = null;
             try
             {
-                socket = _dialer.Dial("udp", Ipv4Cidr.FormatAddress(destination.Value.Address), key.RemotePort, ConnectTimeoutMs);
+                socket = _dialer.Dial("udp", FormatTarget(destination.Value.Address!), key.RemotePort, ConnectTimeoutMs);
             }
             catch (Exception error)
             {
@@ -917,7 +918,7 @@ internal sealed class PeerEgressRuntime
     /// </remarks>
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) Reserve(
         long consumer, PeerEgressFlowTable.Key key, long nowMs) =>
-        ReserveTo(consumer, key, key.RemoteIp, nowMs);
+        ReserveTo(consumer, key, TargetOf(key.RemoteIp), nowMs);
 
     /// <summary>
     /// Reserve for a flow whose socket goes to destination, which differs from the key's remote
@@ -925,7 +926,7 @@ internal sealed class PeerEgressRuntime
     /// back from it, and the authorization is of the address actually dialled.
     /// </summary>
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) ReserveTo(
-        long consumer, PeerEgressFlowTable.Key key, uint destination, long nowMs, string? name = null)
+        long consumer, PeerEgressFlowTable.Key key, IPAddress destination, long nowMs, string? name = null)
     {
         if (AuthorizeTo(consumer, key, destination, name) is { } code)
         {
@@ -958,7 +959,7 @@ internal sealed class PeerEgressRuntime
     /// address. With it the policy's domain rules covering the name take part alongside the
     /// destination rules; the forced-deny list and the scope still judge the address alone.
     /// </remarks>
-    private string? AuthorizeTo(long consumer, PeerEgressFlowTable.Key key, uint destination, string? name)
+    private string? AuthorizeTo(long consumer, PeerEgressFlowTable.Key key, IPAddress destination, string? name)
     {
         if (_closed || !_enabled)
         {
@@ -970,7 +971,7 @@ internal sealed class PeerEgressRuntime
             new PeerEgressRequest
             {
                 ConsumerClientId = consumer,
-                DestinationIp = Ipv4Cidr.FormatAddress(destination),
+                DestinationIp = FormatTarget(destination),
                 DestinationPort = key.RemotePort,
                 Protocol = key.ProtocolName(),
                 Name = name,
@@ -986,18 +987,18 @@ internal sealed class PeerEgressRuntime
     /// Where a new flow goes: the address to dial, or the code that refuses it, and the name it is
     /// dialled for when the consumer bound one to the address.
     /// </summary>
-    internal readonly record struct Choice(uint Address, string? Code, string? Name = null);
+    internal readonly record struct Choice(IPAddress? Address, string? Code, string? Name = null);
 
     /// <summary>
     /// Picks the address a named flow is dialled to: the first resolved address the authorization
     /// allows. With none allowed, the first address's refusal is the answer, so the code the consumer
     /// sees is about the address it would have gone to. With nothing resolved, the name did not resolve.
     /// </summary>
-    internal static Choice ChooseAddress(IReadOnlyList<uint> addresses, Func<uint, string?> authorize)
+    internal static Choice ChooseAddress(IReadOnlyList<IPAddress> addresses, Func<IPAddress, string?> authorize)
     {
         if (addresses.Count == 0)
         {
-            return new Choice(0, PeerEgressCodes.NameUnresolved);
+            return new Choice(null, PeerEgressCodes.NameUnresolved);
         }
         string? first = null;
         foreach (var address in addresses)
@@ -1009,8 +1010,46 @@ internal sealed class PeerEgressRuntime
             }
             first ??= code;
         }
-        return new Choice(0, first);
+        return new Choice(null, first);
     }
+
+    /// <summary>
+    /// The order a name's addresses are tried in: its A records, or, when it has none and this egress
+    /// connects to IPv6 targets, its AAAA records (protocol/spec/peer-egress-dns.md).
+    /// </summary>
+    internal static IReadOnlyList<IPAddress> DialCandidates(
+        IReadOnlyList<IPAddress> a, IReadOnlyList<IPAddress> aaaa, bool ipv6Capable) =>
+        a.Count > 0 || !ipv6Capable ? a : aaaa;
+
+    /// <summary>
+    /// Whether this egress connects to IPv6 targets, and so announces <c>ipv6TargetCapable</c>: a name
+    /// with no A record is dialled over its AAAA records. Only the egress's own socket is IPv6; the
+    /// consumer still reaches the flow at its IPv4 fake address.
+    /// </summary>
+    internal const bool Ipv6TargetCapable = true;
+
+    /// <summary>
+    /// An address the way the judgment reads it: dotted for IPv4 and RFC 5952 for IPv6, never the
+    /// dotted form <see cref="IPAddress.ToString()"/> uses for an IPv4-mapped one, and without a scope.
+    /// </summary>
+    internal static string FormatTarget(IPAddress address)
+    {
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            return address.ToString();
+        }
+        var bytes = address.GetAddressBytes();
+        var value = UInt128.Zero;
+        foreach (var part in bytes)
+        {
+            value = (value << 8) | part;
+        }
+        return Ipv6Cidr.FormatAddress(value);
+    }
+
+    /// <summary>An IPv4 address as the flow keys hold it, in the form a dialled address takes.</summary>
+    internal static IPAddress TargetOf(uint address) =>
+        new([(byte)(address >> 24), (byte)(address >> 16), (byte)(address >> 8), (byte)address]);
 
     /// <summary>
     /// Decides where a new flow's socket goes. Most flows go where the packet says. A flow to an
@@ -1022,13 +1061,13 @@ internal sealed class PeerEgressRuntime
     private Choice? ResolveDestination(long consumer, PeerEgressFlowTable.Key key)
     {
         string? name;
-        Func<string, IReadOnlyList<uint>> resolver;
+        Func<string, IReadOnlyList<IPAddress>> resolver;
         lock (_lock)
         {
             name = _names.Lookup(consumer, key.RemoteIp);
             if (name is null)
             {
-                return new Choice(key.RemoteIp, null);
+                return new Choice(TargetOf(key.RemoteIp), null);
             }
             if (!_resolving.Add(key))
             {
@@ -1036,7 +1075,7 @@ internal sealed class PeerEgressRuntime
             }
             resolver = Resolve;
         }
-        IReadOnlyList<uint> addresses;
+        IReadOnlyList<IPAddress> addresses;
         try
         {
             addresses = resolver(name);
@@ -1062,19 +1101,28 @@ internal sealed class PeerEgressRuntime
 
     /// <summary>
     /// This device's own resolver: the egress resolves in its own network, which is the point of
-    /// sending the name rather than an address. IPv4 only, in the order the resolver returned them.
+    /// sending the name rather than an address. A records in the order the resolver returned them, and
+    /// AAAA records only for a name that has none (<see cref="DialCandidates"/>). An address of either
+    /// family then goes through the same authorization, so a name rebound to an IPv6 loopback or
+    /// private address is refused like an IPv4 one.
     /// </summary>
-    internal static IReadOnlyList<uint> ResolveName(string name)
+    internal static IReadOnlyList<IPAddress> ResolveName(string name)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var a = Lookup(name, System.Net.Sockets.AddressFamily.InterNetwork, timeout.Token);
+        if (a.Count > 0 || !Ipv6TargetCapable)
+        {
+            return a;
+        }
+        return Lookup(name, System.Net.Sockets.AddressFamily.InterNetworkV6, timeout.Token);
+    }
+
+    private static List<IPAddress> Lookup(string name, System.Net.Sockets.AddressFamily family, CancellationToken token)
     {
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            var addresses = System.Net.Dns.GetHostAddressesAsync(name, System.Net.Sockets.AddressFamily.InterNetwork, timeout.Token)
-                .GetAwaiter().GetResult();
-            return addresses
-                .Select(address => address.GetAddressBytes())
-                .Where(bytes => bytes.Length == 4)
-                .Select(bytes => (uint)bytes[0] << 24 | (uint)bytes[1] << 16 | (uint)bytes[2] << 8 | bytes[3])
+            return System.Net.Dns.GetHostAddressesAsync(name, family, token).GetAwaiter().GetResult()
+                .Where(address => address.AddressFamily == family)
                 .ToList();
         }
         catch (Exception error) when (error is System.Net.Sockets.SocketException or OperationCanceledException or ArgumentException)

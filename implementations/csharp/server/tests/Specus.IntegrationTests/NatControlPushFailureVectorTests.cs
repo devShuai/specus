@@ -6,15 +6,22 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Specus.Protocol;
 using Specus.Protocol.Codec;
 using Specus.Protocol.Packets;
 using Specus.Server.Authentication;
+using Specus.Server.Configuration;
+using Specus.Server.ControlChannel;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Hosting;
+using Specus.Server.Nat;
+using Specus.Server.Networking;
 using Specus.Server.PeerMesh;
 using Specus.Server.Security;
+using Specus.Server.Sessions;
 
 namespace Specus.IntegrationTests;
 
@@ -46,14 +53,7 @@ public sealed class NatControlPushFailureVectorTests
         // Peer Mesh on for its login push; without the STUN/TURN hosted service the test binds no UDP port.
         await using var server = await TestServerFixture.StartAsync(
             new Dictionary<string, string?> { ["Specus:PeerMesh:Enabled"] = "true" },
-            services =>
-            {
-                foreach (var stun in services.Where(s => s.ServiceType == typeof(IHostedService)
-                             && s.ImplementationType == typeof(StunTurnServer)).ToList())
-                {
-                    services.Remove(stun);
-                }
-            });
+            RemoveStunTurnServer);
         using var admin = server.CreateClient();
         admin.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",
             server.HostServices.GetRequiredService<LocalTokenService>()
@@ -161,6 +161,134 @@ public sealed class NatControlPushFailureVectorTests
         }
     }
 
+    /// <summary>
+    /// Replays <c>writeFailure</c> of protocol/test-vectors/nat-control-size-v1.json: a client that is
+    /// online, but whose control connection cannot be written. The manual pushes answer the 409 of an
+    /// offline client, and route changes, whose push fails the same way, are stored and answered as
+    /// usual. Before, the write's IOException escaped: every one of these answered 500, the changes
+    /// after they had been stored.
+    /// </summary>
+    [Fact]
+    public async Task WriteFailureAnswersAsAnOfflineClient()
+    {
+        using var vector = JsonDocument.Parse(await File.ReadAllTextAsync(VectorPath()));
+        var scenario = vector.RootElement.GetProperty("writeFailure");
+        var errorContains = scenario.GetProperty("errorContains").GetString()!;
+
+        await using var server = await TestServerFixture.StartAsync();
+        using var admin = server.CreateClient();
+        admin.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",
+            server.HostServices.GetRequiredService<LocalTokenService>()
+                .IssueToken("admin", Tenant, ManagementRole.Admin));
+        var (clientId, _) = await DemoSessionAsync(server);
+
+        var registry = server.HostServices.GetRequiredService<SessionRegistry>();
+        using var lifetime = new CancellationTokenSource();
+        var writer = new BrokenFrameWriter();
+        var broken = new SpecusConnectionContext("nat-control-write-failure-test", "127.0.0.1:12345", writer,
+            lifetime.Token, () => { }, new ReadGate(lifetime.Token), new WriteBackpressureGate(64 * 1024, 1024 * 1024));
+        broken.OnLoginSuccess(DatabaseInitializer.DemoClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            clientSessionId: 1);
+        registry.Replace(DatabaseInitializer.DemoClientName, broken);
+        try
+        {
+            var routes = new Dictionary<string, long>();
+            var index = 0;
+            foreach (var step in scenario.GetProperty("steps").EnumerateArray())
+            {
+                var op = step.GetProperty("op").GetString()!;
+                var label = $"step {index++} {op}";
+                var writesBefore = writer.Writes;
+                using var response = op switch
+                {
+                    "createRoute" => await admin.PostAsJsonAsync($"/api/admin/clients/{clientId}/http-routes", new
+                    {
+                        route = step.GetProperty("route").GetString(),
+                        targetBaseUrl = step.GetProperty("targetBaseUrl").GetString(),
+                        enabled = step.GetProperty("enabled").GetBoolean(),
+                    }),
+                    "deleteRoute" => await admin.DeleteAsync(
+                        $"/api/admin/http-routes/{routes[step.GetProperty("route").GetString()!]}"),
+                    "pushNatControl" => await admin.PostAsync($"/api/admin/clients/{clientId}/nat-control", null),
+                    "forceRefreshPortMapping" => await admin.PostAsync(
+                        $"/api/admin/clients/{clientId}/force-refresh-port-mapping", null),
+                    _ => throw new InvalidOperationException($"{label}: unknown op"),
+                };
+                var body = await response.Content.ReadAsStringAsync();
+                Assert.True(step.GetProperty("expect").GetInt32() == (int)response.StatusCode,
+                    $"{label}: {(int)response.StatusCode} {body}");
+                if (response.StatusCode == HttpStatusCode.Conflict)
+                {
+                    using var answer = JsonDocument.Parse(body);
+                    Assert.Contains(errorContains, answer.RootElement.GetProperty("error").GetString());
+                }
+                if (op == "createRoute")
+                {
+                    using var created = JsonDocument.Parse(body);
+                    routes[step.GetProperty("route").GetString()!] = created.RootElement.GetProperty("id").GetInt64();
+                }
+                Assert.True(writer.Writes > writesBefore,
+                    $"{label}: nothing was written to the control connection, so its failure was not met");
+            }
+        }
+        finally
+        {
+            registry.Unbind(DatabaseInitializer.DemoClientName, broken);
+        }
+    }
+
+    /// <summary>
+    /// A database error in the NAT_CONTROL login push is only logged, as in Java and Go: the login
+    /// stands, the connection stays and the Peer Mesh login push still arrives. Before, the dispatcher
+    /// closed the connection and skipped the Peer Mesh push, and the client logged in again.
+    /// </summary>
+    [Fact]
+    public async Task LoginPushDatabaseErrorKeepsTheConnectionAndThePeerMeshPush()
+    {
+        var missing = Path.Combine(Path.GetTempPath(), $"specus-missing-{Guid.NewGuid():N}", "specus.db");
+        await using var server = await TestServerFixture.StartAsync(
+            new Dictionary<string, string?> { ["Specus:PeerMesh:Enabled"] = "true" },
+            services =>
+            {
+                RemoveStunTurnServer(services);
+                foreach (var registration in services.Where(s => s.ServiceType == typeof(NatControlService)).ToList())
+                {
+                    services.Remove(registration);
+                }
+                // Its database cannot be opened, so the login push fails on its first query.
+                services.AddScoped(provider => new NatControlService(
+                    new SpecusDbContext(new DbContextOptionsBuilder<SpecusDbContext>()
+                        .UseSqlite($"Data Source={missing};Mode=ReadOnly").Options),
+                    provider.GetRequiredService<SessionRegistry>(),
+                    provider.GetRequiredService<IOptions<NettyServerOptions>>(),
+                    provider.GetRequiredService<IOptions<SpecusOptions>>(),
+                    provider.GetRequiredService<ILogger<NatControlService>>()));
+            });
+        var (_, session) = await DemoSessionAsync(server);
+
+        await using var control = await ControlConnection.LoginAsync(server.ControlPort, new LoginRequestPacket
+        {
+            ClientName = DatabaseInitializer.DemoClientName,
+            ClientSessionId = session.Id,
+            AccessToken = session.AccessToken,
+            ConnectionRole = ConnectionRole.Control,
+        });
+        await AwaitAsync("the Peer Mesh login push", () => control.PeerTypes.Contains("peer-config"));
+        await Task.Delay(Quiet);
+        Assert.True(control.NatControls.IsEmpty, "a NAT_CONTROL reached the client");
+        Assert.False(control.Closed.IsCompleted, "the control connection was closed");
+    }
+
+    /// <summary>Takes the STUN/TURN hosted service out, so a test with Peer Mesh on binds no UDP port.</summary>
+    private static void RemoveStunTurnServer(IServiceCollection services)
+    {
+        foreach (var stun in services.Where(s => s.ServiceType == typeof(IHostedService)
+                     && s.ImplementationType == typeof(StunTurnServer)).ToList())
+        {
+            services.Remove(stun);
+        }
+    }
+
     private static async Task AwaitAsync(string what, Func<bool> condition)
     {
         var deadline = DateTime.UtcNow + Wait;
@@ -247,6 +375,20 @@ public sealed class NatControlPushFailureVectorTests
             }
         }
         throw new FileNotFoundException("protocol/test-vectors/nat-control-size-v1.json not found");
+    }
+
+    /// <summary>A logged-in control connection whose every write fails, as one the client has already dropped.</summary>
+    private sealed class BrokenFrameWriter : IFrameWriter
+    {
+        private int _writes;
+
+        public int Writes => Volatile.Read(ref _writes);
+
+        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _writes);
+            return ValueTask.FromException(new IOException("Broken pipe"));
+        }
     }
 
     /// <summary>A control connection that keeps every NAT_CONTROL body and PEER_CONTROL type it receives.</summary>

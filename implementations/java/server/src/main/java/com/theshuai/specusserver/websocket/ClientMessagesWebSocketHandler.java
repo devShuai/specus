@@ -167,6 +167,25 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         return delivered;
     }
 
+    /**
+     * The account of this identity was deleted: its open subscriptions end. A connection keeps the
+     * identity it was opened with, so it would otherwise go on sending as the deleted account and
+     * receive what clients send to a later account of the same name.
+     */
+    public void closeIdentity(String tenantId, String username) {
+        Set<WebSocketSession> sessions = adminSessions.remove(adminSessionKey(tenantId, username));
+        if (sessions == null) {
+            return;
+        }
+        for (WebSocketSession session : sessions) {
+            try {
+                session.close(CloseStatus.POLICY_VIOLATION.withReason("account deleted"));
+            } catch (Exception e) {
+                log.debug("client-message websocket close failed: {}", e.getMessage());
+            }
+        }
+    }
+
     private boolean targetCanReceiveMessage(ClientAccount target) {
         List<ClientSession> sessions = clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
                 target.getTenantId(),

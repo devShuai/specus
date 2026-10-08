@@ -11,7 +11,7 @@
     "本文件的期望值出自 tools/protocol/generate_peer_egress_control_vectors.py 里的独立参考解码器，不是从任何一个实现录下来的。"
   ],
   "deploymentEndpoints": {
-    "description": "本部署自身的端点，进入强制拒绝清单。只收字面 IPv4 地址：域名在策略期解析出的结果可能和实际 connect 用的不一样，那会让阻断看起来生效而实际没有。三个客户端拿同一份配置必须导出同一份清单，漏掉一个端点的那个会把流量转发过去。",
+    "description": "本部署自身的端点，进入强制拒绝清单。只收字面地址（IPv4 为 /32，IPv6 为规范形式的 /128）：域名在策略期解析出的结果可能和实际 connect 用的不一样，那会让阻断看起来生效而实际没有。三个客户端拿同一份配置必须导出同一份清单，漏掉一个端点的那个会把流量转发过去。",
     "cases": [
       {
         "name": "all-four-literal",
@@ -80,11 +80,39 @@
         ]
       },
       {
-        "name": "ipv6-literal-is-skipped",
-        "reason": "一期数据面只有 IPv4，IPv6 端点没有可以拒绝的 IPv4 前缀",
+        "name": "ipv6-literals-are-denied",
+        "reason": "出口能连 IPv6 目标，所以字面 IPv6 端点同样进清单，写成 RFC 5952 规范形式的 /128；方括号与端口去掉，不带端口的裸地址也认",
         "input": {
           "serverBaseUrl": "https://[2001:db8::1]:8443",
+          "stunHost": "[2001:db8::7]:3478",
+          "turnHost": "2001:DB8:0::8",
+          "relayAddress": ""
+        },
+        "expect": [
+          "2001:db8::1/128",
+          "2001:db8::7/128",
+          "2001:db8::8/128"
+        ]
+      },
+      {
+        "name": "bracketed-ipv6-without-port",
+        "reason": "URL 里不带端口的 IPv6 主机仍带方括号，同样要认出来",
+        "input": {
+          "serverBaseUrl": "https://[2001:db8::1]/",
           "stunHost": "",
+          "turnHost": "",
+          "relayAddress": ""
+        },
+        "expect": [
+          "2001:db8::1/128"
+        ]
+      },
+      {
+        "name": "unreadable-ipv6-is-skipped",
+        "reason": "带区域标识的写法读不出，与域名一样跳过；链路本地本来就在强制拒绝清单里",
+        "input": {
+          "serverBaseUrl": "",
+          "stunHost": "[fe80::1%eth0]:3478",
           "turnHost": "",
           "relayAddress": ""
         },

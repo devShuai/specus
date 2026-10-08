@@ -2025,7 +2025,8 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
         }
         if (rc == 0) {
             /*
-             * ipv6TargetCapable stays false: no client declares it yet. egressVersion is written
+             * ipv6TargetCapable stays false: egresses declare it, but no consumer reads it while
+             * the consumer data plane carries IPv4 only. egressVersion is written
              * even when 0, because a consumer reads 0 as an egress that cannot take a flow but an
              * absent field as an old server it cannot judge.
              */

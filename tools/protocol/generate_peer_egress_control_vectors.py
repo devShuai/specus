@@ -12,6 +12,8 @@ neither `scope` nor `limits`, and every enabled push carries both.
 import json
 from pathlib import Path
 
+import peer_egress_ipv6 as ipv6
+
 VECTORS = Path("protocol/test-vectors")
 
 DEFAULT_MAX_CONCURRENT_FLOWS = 256
@@ -171,10 +173,11 @@ for name, text, reason in REJECT:
 
 
 def strip_port(host):
-    """Removes a :port suffix, leaving an IPv6 literal in brackets alone."""
+    """Removes a :port suffix, and the brackets around an IPv6 literal written with or without one."""
     host = (host or "").strip()
     if host.startswith("["):
-        return host
+        end = host.find("]")
+        return host[1:end] if end > 0 else host
     if host.count(":") == 1:
         return host.rsplit(":", 1)[0]
     return host
@@ -191,7 +194,8 @@ def is_ipv4_literal(text):
 
 
 def deny_cidrs(base_url, stun_host, turn_host, relay_address):
-    """The reference derivation: literal IPv4 endpoints only, each as a /32."""
+    """The reference derivation: literal endpoints only, an IPv4 one as a /32 and an IPv6 one, in
+    RFC 5952 form, as a /128."""
     hosts = []
     url = (base_url or "").strip()
     if "://" in url:
@@ -209,6 +213,8 @@ def deny_cidrs(base_url, stun_host, turn_host, relay_address):
         candidate = strip_port(host)
         if is_ipv4_literal(candidate):
             denied.append(candidate + "/32")
+        elif ipv6.parse_address(candidate) is not None:
+            denied.append(ipv6.format_address(ipv6.parse_address(candidate)) + "/128")
     return denied
 
 
@@ -229,9 +235,16 @@ ENDPOINT_CASES = [
     ("mixed-literal-and-name",
      "https://203.0.113.5:8443", "stun.example.com:3478", "198.51.100.8:3478", "",
      "字面地址进清单，域名跳过，两者不互相影响"),
-    ("ipv6-literal-is-skipped",
-     "https://[2001:db8::1]:8443", "", "", "",
-     "一期数据面只有 IPv4，IPv6 端点没有可以拒绝的 IPv4 前缀"),
+    ("ipv6-literals-are-denied",
+     "https://[2001:db8::1]:8443", "[2001:db8::7]:3478", "2001:DB8:0::8", "",
+     "出口能连 IPv6 目标，所以字面 IPv6 端点同样进清单，写成 RFC 5952 规范形式的 /128；"
+     "方括号与端口去掉，不带端口的裸地址也认"),
+    ("bracketed-ipv6-without-port",
+     "https://[2001:db8::1]/", "", "", "",
+     "URL 里不带端口的 IPv6 主机仍带方括号，同样要认出来"),
+    ("unreadable-ipv6-is-skipped",
+     "", "[fe80::1%eth0]:3478", "", "",
+     "带区域标识的写法读不出，与域名一样跳过；链路本地本来就在强制拒绝清单里"),
 ]
 
 endpoint_cases = []
@@ -266,7 +279,7 @@ vector = {
         "不是从任何一个实现录下来的。",
     ],
     "deploymentEndpoints": {
-        "description": "本部署自身的端点，进入强制拒绝清单。只收字面 IPv4 地址：域名在策略期解析出的结果"
+        "description": "本部署自身的端点，进入强制拒绝清单。只收字面地址（IPv4 为 /32，IPv6 为规范形式的 /128）：域名在策略期解析出的结果"
                        "可能和实际 connect 用的不一样，那会让阻断看起来生效而实际没有。"
                        "三个客户端拿同一份配置必须导出同一份清单，漏掉一个端点的那个会把流量转发过去。",
         "cases": endpoint_cases,
