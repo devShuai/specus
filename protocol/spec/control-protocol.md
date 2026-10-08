@@ -141,6 +141,27 @@ UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 
 停用或删除条目，直到配置回到上限以内，之后的自动推送或手动下发就会把配置发给客户端。共享向量见
 `protocol/test-vectors/nat-control-size-v1.json`，其中 `existingOversize` 是数据库里已有超限配置的场景。
 
+## NAT_CONTROL 写失败与数据库错误
+
+NAT_CONTROL 还可能因为另外两种原因发不出去：写客户端的 control 连接失败（连接已经断开、被对端重置、写超时等），
+或者登录推送读取该客户端的配置时数据库出错。四个服务端统一这样处理：
+
+- **手动下发**：`POST /api/admin/clients/{id}/nat-control` 和 `POST /api/admin/clients/{id}/force-refresh-port-mapping`
+  写 control 连接失败时，按客户端不在线处理：返回 `409`，`error` 为「客户端不在线，无法下发映射」，与客户端本来就
+  不在线时相同。不得返回 `200`，也不得以其它方式报告已经下发。写不进去的连接已经不能用，客户端重连后的登录推送
+  会带上已保存的配置。手动下发要知道这一帧写进连接还是写失败了再回答；写出由连接异步完成的实现（Java 的 Netty）
+  可以只等一段有限的时间，到时还没写完的帧仍排在这条连接的发送队列里，按已经下发回答。
+- **变更后的自动推送**：写 control 连接失败不改变这次变更的结果：变更照常保存，接口照常返回它本来的状态码，
+  只记一条日志。
+- **control 登录**：登录照常成功。登录后的 NAT_CONTROL 因数据库出错或写失败发不出去时，只记日志。
+  数据库出错时连接本身没有问题，必须保持，登录流程后面的步骤（例如 Peer Mesh 的登录推送）照常执行；断开它只会让
+  客户端重新登录。写失败的连接交给各实现原有的 I/O 错误处理：Java、Go、.NET 照常执行后面的步骤，连接由传输层
+  （Netty 在写失败时关闭 channel）、读循环或空闲检测收尾；C 服务端的 control socket 有写超时，写失败时可能已经
+  写出半帧，再写只会让客户端读错帧，所以它立刻按 `IO_ERROR` 关闭这条连接，不再往里写 Peer Mesh 推送。
+
+共享向量 `protocol/test-vectors/nat-control-size-v1.json` 的 `writeFailure` 是客户端在线、它的 control 连接却
+写不进去的场景。
+
 ## NAT stream v2
 
 `NAT_MESSAGE` body 由固定 16 字节头、可选 JSON object metadata 和原始 data 组成：

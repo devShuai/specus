@@ -1,3 +1,4 @@
+using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -68,7 +69,7 @@ public sealed class NatControlService
         // stands and the Peer Mesh push after it still runs. Closing the connection would only have
         // the client log in again into the same failure.
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
-        if (await SendNatControlAsync(clientName, mappings, httpRoutes, cancellationToken)
+        if (await SendNatControlAsync(clientName, mappings, httpRoutes)
                 .ConfigureAwait(false) == Delivery.Sent)
         {
             _logger.LogInformation("[nat-control] pushed {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
@@ -82,13 +83,15 @@ public sealed class NatControlService
             .FirstOrDefaultAsync(c => c.Id == clientId, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"client not found: {clientId}");
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
-        // Both failures are the InvalidOperationException the management API answers 409 to; a
-        // NAT_CONTROL that does not fit one MESSAGE was not sent and must not be reported as pushed.
-        var delivery = await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
+        // Every failure is the InvalidOperationException the management API answers 409 to; a
+        // NAT_CONTROL that does not fit one MESSAGE was not sent and must not be reported as pushed,
+        // and a control connection that cannot be written leaves the client as good as offline. See
+        // "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+        var delivery = await SendNatControlAsync(account.ClientName, mappings, httpRoutes)
             .ConfigureAwait(false);
         return delivery switch
         {
-            Delivery.Offline => throw new InvalidOperationException("客户端不在线，无法下发映射"),
+            Delivery.Offline or Delivery.WriteFailed => throw new InvalidOperationException("客户端不在线，无法下发映射"),
             Delivery.NotSent => throw new InvalidOperationException(NotSentMessage),
             _ => new PushResult(mappings.Count, httpRoutes.Count),
         };
@@ -104,10 +107,10 @@ public sealed class NatControlService
             return;
         }
 
-        // A NAT_CONTROL that does not fit one MESSAGE is only logged: the change that called this
-        // stands and answers as it would have.
+        // A NAT_CONTROL that does not fit one MESSAGE, or a control connection that cannot be written,
+        // is only logged: the change that called this stands and answers as it would have.
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
-        if (await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
+        if (await SendNatControlAsync(account.ClientName, mappings, httpRoutes)
                 .ConfigureAwait(false) == Delivery.Sent)
         {
             _logger.LogInformation("[nat-control] synchronized {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
@@ -140,18 +143,20 @@ public sealed class NatControlService
         Offline,
         /// <summary>The NAT_CONTROL does not fit one MESSAGE, or cannot be encoded: nothing was written.</summary>
         NotSent,
+        /// <summary>The write to the control connection failed: it is closed, reset or otherwise gone.</summary>
+        WriteFailed,
     }
 
     /// <summary>
     /// Writes <paramref name="clientName"/>'s NAT_CONTROL to its control connection. One that does not
     /// fit one MESSAGE is not handed to the connection, whose encoder would throw: it is logged once
     /// and the connection is kept, so the client goes on with the configuration it has. See
-    /// "NAT_CONTROL 的大小" in protocol/spec/control-protocol.md.
+    /// "NAT_CONTROL 的大小" in protocol/spec/control-protocol.md. One whose write fails is logged and
+    /// reported as <see cref="Delivery.WriteFailed"/>.
     /// </summary>
     private async Task<Delivery> SendNatControlAsync(string clientName,
         IReadOnlyList<SpecusMapping> mappings,
-        IReadOnlyList<HttpRouteMapping> httpRoutes,
-        CancellationToken cancellationToken)
+        IReadOnlyList<HttpRouteMapping> httpRoutes)
     {
         var context = _sessions.Find(clientName);
         if (context is null || !_sessions.HasLogin(context))
@@ -185,7 +190,22 @@ public sealed class NatControlService
             return Delivery.NotSent;
         }
 
-        await context.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+        // The write runs to the end, or until the connection goes down, whatever the caller's token
+        // says: a frame cut short would leave the client reading the rest of the stream out of step.
+        // A write that fails is logged and reported, not thrown, so no change and no login fails with
+        // it. See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+        try
+        {
+            await context.Writer.WriteAsync(packet, context.Lifetime).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException
+                                       || (ex is OperationCanceledException && context.Lifetime.IsCancellationRequested))
+        {
+            _logger.LogWarning(ex,
+                "[nat-control] push to {Client} failed: its control connection cannot be written",
+                clientName);
+            return Delivery.WriteFailed;
+        }
         return Delivery.Sent;
     }
 

@@ -26,7 +26,8 @@ implementations/java/common/src/test/java/com/theshuai/common/tools/WireFixtureG
 空串客户端名下的 JSON 字节数与为改名预留后的 MESSAGE body 字节数；`management` 是在恰好 1 MiB 的边界上新建、
 启用、修改映射和 route 的步骤与期望状态码。Java、Go、.NET 服务端的测试直接读取并重放这两部分。
 `existingOversize` 是数据库里已有超限配置的场景：control 登录不断开、Peer Mesh 登录推送照常、手动下发返回 `409`、
-变更接口照常生效；四个服务端的测试都按它重放。
+变更接口照常生效；四个服务端的测试都按它重放。`writeFailure` 是客户端在线、control 连接却写不进去的场景：
+手动下发按不在线返回 `409`，变更接口照常返回；语义见同一文档的「NAT_CONTROL 写失败与数据库错误」。
 
 ## Peer Mesh
 

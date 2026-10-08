@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +23,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
-// natControlPushFailureVector is the existingOversize part of
+// natControlPushFailureVector is the existingOversize and writeFailure parts of
 // protocol/test-vectors/nat-control-size-v1.json.
 type natControlPushFailureVector struct {
 	ErrorContains    string `json:"errorContains"`
@@ -37,6 +39,16 @@ type natControlPushFailureVector struct {
 			NatControl    bool   `json:"natControl"`
 		} `json:"steps"`
 	} `json:"existingOversize"`
+	WriteFailure struct {
+		ErrorContains string `json:"errorContains"`
+		Steps         []struct {
+			Op            string `json:"op"`
+			Route         string `json:"route"`
+			TargetBaseURL string `json:"targetBaseUrl"`
+			Enabled       bool   `json:"enabled"`
+			Expect        int    `json:"expect"`
+		} `json:"steps"`
+	} `json:"writeFailure"`
 }
 
 func readNatControlPushFailureVector(t *testing.T) natControlPushFailureVector {
@@ -281,6 +293,82 @@ func TestExistingOversizeNatControlIsNeitherSentNorDisconnecting(t *testing.T) {
 		}
 		if _, _, closed := recorder.state(); closed {
 			t.Fatalf("%s: the control connection was closed", label)
+		}
+	}
+}
+
+// brokenControlSession is a logged-in control session whose every write fails, as on a connection
+// the client has already dropped.
+type brokenControlSession struct {
+	name  string
+	sends atomic.Int32
+}
+
+func (s *brokenControlSession) ClientName() string { return s.name }
+func (*brokenControlSession) LoginTimeMs() int64   { return 1 }
+func (s *brokenControlSession) Send(protocol.Packet) error {
+	s.sends.Add(1)
+	return errors.New("write tcp 127.0.0.1:7010->127.0.0.1:50000: write: broken pipe")
+}
+func (*brokenControlSession) Close(string) {}
+
+// A client that is online, but whose control connection cannot be written: the manual pushes answer
+// the 409 of an offline client rather than 500, and route changes, whose push fails the same way, are
+// stored and answered as usual. Replays writeFailure of protocol/test-vectors/nat-control-size-v1.json.
+func TestNatControlWriteFailureAnswersAsAnOfflineClient(t *testing.T) {
+	scenario := readNatControlPushFailureVector(t).WriteFailure
+	app, _ := startTestApp(t)
+	_, ts := newHTTPTestServer(t, app)
+	token := adminToken(t, ts)
+	demo, err := app.db.FindClientByName(context.Background(), DemoClientName)
+	if err != nil || demo == nil {
+		t.Fatalf("load demo client: %+v %v", demo, err)
+	}
+	broken := &brokenControlSession{name: demo.ClientName}
+	app.sessions.Replace(broken)
+	defer app.sessions.Unbind(demo.ClientName, broken)
+
+	routeIDs := map[string]int64{}
+	for index, step := range scenario.Steps {
+		label := fmt.Sprintf("step %d %s", index, step.Op)
+		sendsBefore := broken.sends.Load()
+		var response *http.Response
+		switch step.Op {
+		case "createRoute":
+			body, _ := json.Marshal(map[string]any{"route": step.Route, "targetBaseUrl": step.TargetBaseURL,
+				"enabled": step.Enabled})
+			response = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(demo.ID)+"/http-routes",
+				token, string(body))
+		case "deleteRoute":
+			response = authRequest(t, ts, http.MethodDelete, "/api/admin/http-routes/"+itoa(routeIDs[step.Route]),
+				token, "")
+		case "pushNatControl":
+			response = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(demo.ID)+"/nat-control",
+				token, "")
+		case "forceRefreshPortMapping":
+			response = authRequest(t, ts, http.MethodPost,
+				"/api/admin/clients/"+itoa(demo.ID)+"/force-refresh-port-mapping", token, "")
+		default:
+			t.Fatalf("%s: unknown op", label)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != step.Expect {
+			t.Fatalf("%s: status %d %s, want %d", label, response.StatusCode, body, step.Expect)
+		}
+		var answer struct {
+			ID    int64  `json:"id"`
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(body, &answer)
+		if response.StatusCode == http.StatusConflict && !strings.Contains(answer.Error, scenario.ErrorContains) {
+			t.Fatalf("%s: error %s does not name %s", label, body, scenario.ErrorContains)
+		}
+		if step.Op == "createRoute" {
+			routeIDs[step.Route] = answer.ID
+		}
+		if broken.sends.Load() == sendsBefore {
+			t.Fatalf("%s: nothing was written to the control connection, so its failure was not met", label)
 		}
 	}
 }
