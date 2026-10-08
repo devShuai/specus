@@ -77,7 +77,7 @@ func TestEgressDomainPolicyMatchesSharedVector(t *testing.T) {
 		runtime.mu.Lock()
 		code := runtime.authorizeTo(testCase.Request.ConsumerClientID,
 			egressFlowKey{protocol: protocol, remotePort: uint16(testCase.Request.DestinationPort)},
-			testAddr(t, testCase.Request.DestinationIP), name)
+			testNetAddr(t, testCase.Request.DestinationIP), name)
 		runtime.mu.Unlock()
 		if code != testCase.Code {
 			t.Errorf("%s: the runtime got %s, want %s", testCase.Name, code, testCase.Code)
@@ -224,7 +224,7 @@ func TestEgressRuntimeGrantsANamedFlowThroughADomainRule(t *testing.T) {
 		harness.runtime.mu.Lock()
 		flow, open := harness.runtime.flows.lookup(key)
 		harness.runtime.mu.Unlock()
-		if !open || flow.Name != "www.example.com" || formatEgressAddress(flow.dialled()) != "192.0.2.10" {
+		if !open || flow.Name != "www.example.com" || formatEgressNetAddr(flow.dialled()) != "192.0.2.10" {
 			t.Fatalf("the flow is open=%v, want it open for www.example.com to 192.0.2.10", open)
 		}
 

@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,35 +54,40 @@ func TestNameBindMatchesTheSharedVector(t *testing.T) {
 	}
 }
 
-// The egress dials the first resolved address the policy allows. This build resolves IPv4 only and
-// does not announce IPv6 targets, so a case that expects an AAAA address is one it answers as
-// unresolved; every other case must match the vector exactly.
+// The egress dials the first resolved address the policy allows: the A records, or the AAAA records
+// for a name with none when the egress connects to IPv6 targets, which this build does.
 func TestEgressAddressChoiceMatchesTheSharedVector(t *testing.T) {
+	if !egressIPv6TargetCapable {
+		t.Fatal("this build announces IPv6 targets, and the vector's AAAA cases depend on it")
+	}
 	for _, c := range loadDNSVector(t).EgressChoice {
-		addresses := make([]uint32, 0, len(c.A))
-		for _, text := range c.A {
-			address, ok := parseEgressAddress(text)
-			if !ok {
-				t.Fatalf("%s: vector address %q", c.Name, text)
+		parse := func(texts []string) []netip.Addr {
+			addresses := make([]netip.Addr, 0, len(texts))
+			for _, text := range texts {
+				addresses = append(addresses, testNetAddr(t, text))
 			}
-			addresses = append(addresses, address)
+			return addresses
 		}
-		chosen, code := chooseEgressAddress(addresses, func(address uint32) string {
-			return c.Decisions[formatEgressAddress(address)]
+		candidates := egressDialCandidates(parse(c.A), parse(c.AAAA), c.IPv6TargetCapable)
+		chosen, code := chooseEgressAddress(candidates, func(address netip.Addr) string {
+			return c.Decisions[formatEgressNetAddr(address)]
 		})
-		if len(c.A) == 0 && len(c.AAAA) > 0 && c.IPv6TargetCapable {
-			if code != egressCodeNameUnresolved {
-				t.Errorf("%s: an IPv4-only egress should find nothing to dial, got %s", c.Name, code)
-			}
-			continue
-		}
 		if code != c.Code {
 			t.Errorf("%s: code %s, want %s", c.Name, code, c.Code)
 		}
-		if c.Address == nil && code == egressCodeAllowed || c.Address != nil && formatEgressAddress(chosen) != *c.Address {
-			t.Errorf("%s: chose %s, want %v", c.Name, formatEgressAddress(chosen), c.Address)
+		if c.Address == nil && chosen.IsValid() || c.Address != nil && formatEgressNetAddr(chosen) != *c.Address {
+			t.Errorf("%s: chose %v, want %v", c.Name, chosen, c.Address)
 		}
 	}
+}
+
+func testNetAddr(t *testing.T, text string) netip.Addr {
+	t.Helper()
+	address, err := netip.ParseAddr(text)
+	if err != nil {
+		t.Fatalf("%s did not parse: %v", text, err)
+	}
+	return address
 }
 
 func TestNameBindingsAreValidatedAndKeptByRecentUse(t *testing.T) {
@@ -124,14 +130,13 @@ func bindName(t *testing.T, harness *egressHarness, consumer int64, address, nam
 }
 
 func resolvingTo(addresses ...string) egressResolveFunc {
-	return func(string) ([]uint32, error) {
+	return func(string) ([]netip.Addr, error) {
 		if len(addresses) == 0 {
 			return nil, errors.New("no such host")
 		}
-		resolved := make([]uint32, 0, len(addresses))
+		resolved := make([]netip.Addr, 0, len(addresses))
 		for _, text := range addresses {
-			address, _ := parseEgressAddress(text)
-			resolved = append(resolved, address)
+			resolved = append(resolved, netip.MustParseAddr(text))
 		}
 		return resolved, nil
 	}

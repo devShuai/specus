@@ -62,12 +62,27 @@ internal class PeerEgressSocketBinder
     /// <summary>Binds <paramref name="socket"/>, before it connects, to the interface for <paramref name="target"/>.</summary>
     public void Bind(Socket socket, IPEndPoint target)
     {
-        if (_apply is null)
+        if (_apply is null || LeftUnbound(target.Address))
         {
             return;
         }
         _apply(socket, Choose(target.Address.ToString()));
     }
+
+    /// <summary>
+    /// Whether a socket to <paramref name="target"/> is dialled without an interface binding: one to an
+    /// IPv6 target.
+    /// </summary>
+    /// <remarks>
+    /// The binding keeps forwarded traffic off routes this node's own tunnel installed, and the tunnel
+    /// installs no IPv6 route: the mesh is IPv4, and IPv6 consumer rules are not in force
+    /// (EGRESS_RULE_IPV6_UNSUPPORTED). IP_UNICAST_IF and IP_BOUND_IF are IPv4 options besides. The
+    /// consumer's IPv6 data plane, which will route IPv6 into the tunnel, has to bring IPV6_UNICAST_IF
+    /// and IPV6_BOUND_IF with it. An IPv4-mapped target is not IPv6 here and goes through the IPv4
+    /// choice, which refuses it.
+    /// </remarks>
+    internal static bool LeftUnbound(IPAddress target) =>
+        target.AddressFamily == AddressFamily.InterNetworkV6 && !target.IsIPv4MappedToIPv6;
 
     public string Choose(string destination)
     {

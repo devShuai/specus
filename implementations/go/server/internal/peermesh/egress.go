@@ -599,7 +599,8 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 			Scope:               policy.Scope,
 			Protocols:           egressProtocols(DecodeEgressDestinationRules(policy.DestinationRules, s.logger)),
 			DomainTargetCapable: domainTargets,
-			// No client declares IPv6 targets yet; the data plane carries IPv4 only.
+			// Egresses declare IPv6 targets, but no consumer reads this yet: the consumer data plane
+			// carries IPv4 only. It is forwarded, as domainTargetCapable is, once that changes.
 			IPv6TargetCapable: false,
 			EgressVersion:     egressVersion,
 		})

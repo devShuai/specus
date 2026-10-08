@@ -70,7 +70,7 @@ internal sealed class PeerEgressFlowTable
         /// address; for a flow opened for a name, the address the name resolved to, while the key
         /// keeps the consumer's fake address. Re-authorization judges this one, as admission did.
         /// </summary>
-        public uint Dialed { get; set; } = key.RemoteIp;
+        public System.Net.IPAddress Dialed { get; set; } = PeerEgressRuntime.TargetOf(key.RemoteIp);
 
         /// <summary>
         /// A TCP flow in TIME_WAIT: its socket is closed and it no longer counts against the limits,
@@ -340,7 +340,7 @@ internal sealed class PeerEgressFlowTable
                 new PeerEgressRequest
                 {
                     ConsumerClientId = flow.Consumer,
-                    DestinationIp = Ipv4Cidr.FormatAddress(flow.Dialed),
+                    DestinationIp = PeerEgressRuntime.FormatTarget(flow.Dialed),
                     DestinationPort = flow.Key.RemotePort,
                     Protocol = flow.Key.ProtocolName(),
                     Name = flow.Name,

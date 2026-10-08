@@ -75,8 +75,12 @@ class PeerEgressEndpointsTests {
     @Test
     void localInterfacesAreReportedAsUsablePrefixes() {
         for (String cidr : PeerEgressEndpoints.localInterfaceCidrs()) {
-            assertTrue(com.theshuai.common.peeregress.Ipv4Cidr.parse(cidr) != null,
-                    cidr + " is not a prefix the judgment layer can read");
+            // IPv6 networks are reported too; the parser refuses host bits and any spelling it would
+            // not read back.
+            boolean readable = cidr.indexOf(':') >= 0
+                    ? com.theshuai.common.peeregress.Ipv6Cidr.parse(cidr) != null
+                    : com.theshuai.common.peeregress.Ipv4Cidr.parse(cidr) != null;
+            assertTrue(readable, cidr + " is not a prefix the judgment layer can read");
         }
     }
 

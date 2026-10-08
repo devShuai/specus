@@ -33,8 +33,8 @@ public class ClientEgressCapabilitiesTests
         Assert.True(capabilities.GetProperty("egressCapable").GetBoolean());
         Assert.Equal(PeerEgressRouteCommanders.TakeoverSupported(),
             capabilities.GetProperty("consumerCapable").GetBoolean());
-        // The egress honours name-bind; IPv6 targets are not claimed.
+        // The egress honours name-bind, and dials a name with no A record over IPv6.
         Assert.True(capabilities.GetProperty("domainTargetCapable").GetBoolean());
-        Assert.False(capabilities.GetProperty("ipv6TargetCapable").GetBoolean());
+        Assert.True(capabilities.GetProperty("ipv6TargetCapable").GetBoolean());
     }
 }

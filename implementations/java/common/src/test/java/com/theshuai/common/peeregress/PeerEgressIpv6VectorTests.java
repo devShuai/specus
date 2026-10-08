@@ -94,6 +94,57 @@ class PeerEgressIpv6VectorTests {
         }
     }
 
+    /**
+     * Egress-side authorization of IPv6 destinations against the {@code ipv6} section of
+     * {@code peer-egress-authz-v1.json}.
+     */
+    @Test
+    void authorizationOfIpv6DestinationsMatchesSharedVector() throws IOException {
+        JsonNode section = readVector("peer-egress-authz-v1.json").path("ipv6");
+        assertEquals(strings(section.path("forcedDenyCidrs")), PeerEgressAuthorization.FORCED_DENY_CIDRS6);
+        assertEquals(strings(section.path("cloudMetadataCidrs")), PeerEgressAuthorization.CLOUD_METADATA_CIDRS6);
+        assertEquals(strings(section.path("lanCidrs")), PeerEgressAuthorization.LAN_CIDRS6);
+        List<JsonNode> cases = new ArrayList<>();
+        section.path("cases").forEach(cases::add);
+        section.path("policyVariantCases").forEach(cases::add);
+        assertFalse(cases.isEmpty(), "authorization vector carried no IPv6 cases");
+        PeerEgressAuthorization.Context context = PeerEgressAuthorization.Context.defaults();
+        for (JsonNode node : cases) {
+            PeerEgressPolicy policy = JsonUtil.stringToObject(section.path("policy").toString(), PeerEgressPolicy.class);
+            JsonNode overrides = node.path("policyOverride");
+            if (!overrides.isMissingNode()) {
+                PeerEgressPolicy override = JsonUtil.stringToObject(overrides.toString(), PeerEgressPolicy.class);
+                policy.setScope(override.getScope());
+                policy.setDestinationRules(override.getDestinationRules());
+            }
+            PeerEgressRequest request = JsonUtil.stringToObject(node.path("request").toString(), PeerEgressRequest.class);
+            PeerEgressAuthorization.Decision decision = PeerEgressAuthorization.evaluate(request, policy, true, context);
+            assertEquals(node.path("expect").path("code").asText(), decision.code(), node.path("name").asText());
+            assertEquals(node.path("expect").path("allowed").asBoolean(), decision.allowed(), node.path("name").asText());
+        }
+        // Every forced-deny entry holds against the broad ::/0 rule in the vector's policy.
+        PeerEgressPolicy policy = JsonUtil.stringToObject(section.path("policy").toString(), PeerEgressPolicy.class);
+        List<String> denied = new ArrayList<>(strings(section.path("forcedDenyCidrs")));
+        denied.addAll(strings(section.path("cloudMetadataCidrs")));
+        for (String text : denied) {
+            Ipv6Cidr cidr = Ipv6Cidr.parse(text);
+            assertNotNull(cidr, text);
+            PeerEgressRequest request = new PeerEgressRequest();
+            request.setConsumerClientId(1L);
+            request.setDestinationIp(Ipv6Cidr.formatAddress(cidr.high(), cidr.low()));
+            request.setDestinationPort(443);
+            request.setProtocol("tcp");
+            assertEquals(PeerEgressCodes.FORBIDDEN_DESTINATION,
+                    PeerEgressAuthorization.evaluate(request, policy, true, context).code(), text);
+        }
+    }
+
+    private static List<String> strings(JsonNode array) {
+        List<String> values = new ArrayList<>();
+        array.forEach(node -> values.add(node.asText()));
+        return values;
+    }
+
     private static List<PeerEgressRule> rules(JsonNode section) throws IOException {
         List<PeerEgressRule> rules = new ArrayList<>();
         for (JsonNode node : section.path("rules")) {
@@ -119,13 +170,17 @@ class PeerEgressIpv6VectorTests {
     }
 
     private static JsonNode readVector() throws IOException {
+        return readVector("peer-egress-rules-v1.json");
+    }
+
+    private static JsonNode readVector(String fileName) throws IOException {
         Path current = Path.of("").toAbsolutePath();
         for (int depth = 0; current != null && depth < 8; depth++, current = current.getParent()) {
-            Path candidate = current.resolve("protocol/test-vectors/peer-egress-rules-v1.json");
+            Path candidate = current.resolve("protocol/test-vectors/" + fileName);
             if (Files.isRegularFile(candidate)) {
                 return JsonUtil.readString(Files.readString(candidate));
             }
         }
-        throw new IllegalStateException("cannot locate peer-egress-rules-v1.json");
+        throw new IllegalStateException("cannot locate " + fileName);
     }
 }

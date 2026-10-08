@@ -35,6 +35,39 @@ const char *const ST_EGRESS_LAN_CIDRS[] = {
 const size_t ST_EGRESS_LAN_CIDRS_LEN =
     sizeof(ST_EGRESS_LAN_CIDRS) / sizeof(ST_EGRESS_LAN_CIDRS[0]);
 
+const char *const ST_EGRESS_FORCED_DENY_CIDRS6[] = {
+    "::/128",
+    "::1/128",
+    /* A socket connected to an IPv4-mapped address reaches the IPv4 address, past every IPv4 entry. */
+    "::ffff:0:0/96",
+    /*
+     * Prefixes that embed an IPv4 address a NAT64 gateway or a 6to4 relay forwards to, metadata and
+     * private ranges included.
+     */
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "2002::/16",
+    "fe80::/10",
+    "fec0::/10",
+    "ff00::/8",
+};
+const size_t ST_EGRESS_FORCED_DENY_CIDRS6_LEN =
+    sizeof(ST_EGRESS_FORCED_DENY_CIDRS6) / sizeof(ST_EGRESS_FORCED_DENY_CIDRS6[0]);
+
+/* The IPv6 instance metadata endpoint, in the unique local range a LAN policy can grant. */
+const char *const ST_EGRESS_CLOUD_METADATA_CIDRS6[] = {
+    "fd00:ec2::254/128",
+};
+const size_t ST_EGRESS_CLOUD_METADATA_CIDRS6_LEN =
+    sizeof(ST_EGRESS_CLOUD_METADATA_CIDRS6) / sizeof(ST_EGRESS_CLOUD_METADATA_CIDRS6[0]);
+
+/* Unique local addresses, the IPv6 counterpart of the private ranges. */
+const char *const ST_EGRESS_LAN_CIDRS6[] = {
+    "fc00::/7",
+};
+const size_t ST_EGRESS_LAN_CIDRS6_LEN =
+    sizeof(ST_EGRESS_LAN_CIDRS6) / sizeof(ST_EGRESS_LAN_CIDRS6[0]);
+
 const char *const ST_EGRESS_ALL_CODES[] = {
     ST_EGRESS_CODE_ALLOWED,
     ST_EGRESS_CODE_HOP_NOT_ALLOWED, ST_EGRESS_CODE_DISABLED, ST_EGRESS_CODE_PEER_ACL_DENIED,
@@ -474,17 +507,6 @@ int st_egress_declares_domain_targets(const char *capabilities_json, int version
     return declared ? 1 : 0;
 }
 
-static int contained_in(uint32_t address, const char *const *cidrs, size_t cidrs_len)
-{
-    for (size_t i = 0U; i < cidrs_len; i++) {
-        st_egress_cidr cidr;
-        if (st_egress_parse_cidr(cidrs[i], &cidr) == 0 && st_egress_cidr_contains(&cidr, address)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static const char *validate_rule_target(const st_egress_rule *rule);
 
 /* Anything outside digits, dots and the prefix separator is treated as a name. */
@@ -646,36 +668,91 @@ static void deny(st_egress_decision *out, const char *code)
     out->code = code;
 }
 
+/* A destination as the judgment reads it, IPv4 or IPv6. */
+typedef struct {
+    int is6;
+    uint32_t v4;
+    uint8_t v6[16];
+} egress_target;
+
+/* IPv6 when the text has a colon, with the spelling the rules use; IPv4 otherwise. Returns 0 on success. */
+static int parse_target(const char *text, egress_target *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (text != NULL && strchr(text, ':') != NULL) {
+        out->is6 = 1;
+        return st_egress_parse_address6(text, out->v6);
+    }
+    return st_egress_parse_address(text, &out->v4);
+}
+
+/*
+ * Whether one prefix contains the target. A prefix of the other family, or one that does not read,
+ * contains nothing: a list can mix both.
+ */
+static int target_in_cidr(const egress_target *target, const char *text)
+{
+    if (text == NULL) {
+        return 0;
+    }
+    if (!target->is6) {
+        st_egress_cidr cidr;
+        return st_egress_parse_cidr(text, &cidr) == 0 && st_egress_cidr_contains(&cidr, target->v4);
+    }
+    char trimmed[64];
+    trim_into(trimmed, sizeof(trimmed), text);
+    if (strchr(trimmed, ':') == NULL) {
+        return 0;
+    }
+    st_egress_cidr6 cidr;
+    if (st_egress_parse_cidr6(trimmed, &cidr, NULL) != 0) {
+        return 0;
+    }
+    for (int i = 0; i < 16; i++) {
+        int bits = cidr.prefix_length - (i * 8);
+        unsigned mask = bits >= 8 ? 0xFFU : (bits <= 0 ? 0U : ((0xFFU << (8 - bits)) & 0xFFU));
+        if (((unsigned)target->v6[i] & mask) != (unsigned)cidr.network[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int target_in(const egress_target *target, const char *const *cidrs, size_t cidrs_len)
+{
+    for (size_t i = 0U; i < cidrs_len; i++) {
+        if (target_in_cidr(target, cidrs[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int forced_deny_hit(const st_egress_request *request,
                            const st_egress_context *context,
-                           uint32_t destination)
+                           const egress_target *destination)
 {
-    if (contained_in(destination, ST_EGRESS_FORCED_DENY_CIDRS, ST_EGRESS_FORCED_DENY_CIDRS_LEN)) {
-        return 1;
-    }
-    if (contained_in(destination, ST_EGRESS_CLOUD_METADATA_CIDRS, ST_EGRESS_CLOUD_METADATA_CIDRS_LEN)) {
+    if (target_in(destination, ST_EGRESS_FORCED_DENY_CIDRS, ST_EGRESS_FORCED_DENY_CIDRS_LEN)
+        || target_in(destination, ST_EGRESS_CLOUD_METADATA_CIDRS, ST_EGRESS_CLOUD_METADATA_CIDRS_LEN)
+        || target_in(destination, ST_EGRESS_FORCED_DENY_CIDRS6, ST_EGRESS_FORCED_DENY_CIDRS6_LEN)
+        || target_in(destination, ST_EGRESS_CLOUD_METADATA_CIDRS6, ST_EGRESS_CLOUD_METADATA_CIDRS6_LEN)) {
         return 1;
     }
     const char *mesh = (context == NULL || context->mesh_cidr[0] == '\0')
         ? ST_EGRESS_DEFAULT_MESH_CIDR
         : context->mesh_cidr;
-    st_egress_cidr mesh_cidr;
-    if (st_egress_parse_cidr(mesh, &mesh_cidr) == 0 && st_egress_cidr_contains(&mesh_cidr, destination)) {
+    if (target_in_cidr(destination, mesh)) {
         return 1;
     }
     if (context != NULL) {
         for (size_t i = 0U; i < context->deployment_deny_cidrs_len; i++) {
-            st_egress_cidr entry;
-            if (st_egress_parse_cidr(context->deployment_deny_cidrs[i], &entry) == 0
-                && st_egress_cidr_contains(&entry, destination)) {
+            if (target_in_cidr(destination, context->deployment_deny_cidrs[i])) {
                 return 1;
             }
         }
     }
     for (size_t i = 0U; i < request->local_interface_cidrs_len; i++) {
-        st_egress_cidr entry;
-        if (st_egress_parse_cidr(request->local_interface_cidrs[i], &entry) == 0
-            && st_egress_cidr_contains(&entry, destination)) {
+        if (target_in_cidr(destination, request->local_interface_cidrs[i])) {
             return 1;
         }
     }
@@ -739,17 +816,18 @@ void st_egress_authorize(const st_egress_request *request,
         return;
     }
 
-    uint32_t destination = 0U;
-    if (st_egress_parse_address(request->destination_ip, &destination) != 0) {
+    egress_target destination;
+    if (parse_target(request->destination_ip, &destination) != 0) {
         deny(out, ST_EGRESS_CODE_DEST_DENIED);
         return;
     }
-    if (forced_deny_hit(request, context, destination)) {
+    if (forced_deny_hit(request, context, &destination)) {
         deny(out, ST_EGRESS_CODE_FORBIDDEN_DESTINATION);
         return;
     }
 
-    const char *scope = contained_in(destination, ST_EGRESS_LAN_CIDRS, ST_EGRESS_LAN_CIDRS_LEN)
+    const char *scope = target_in(&destination, ST_EGRESS_LAN_CIDRS, ST_EGRESS_LAN_CIDRS_LEN)
+            || target_in(&destination, ST_EGRESS_LAN_CIDRS6, ST_EGRESS_LAN_CIDRS6_LEN)
         ? ST_EGRESS_SCOPE_LAN
         : ST_EGRESS_SCOPE_PUBLIC;
     if (strcmp(scope, policy->scope) != 0) {
@@ -762,8 +840,8 @@ void st_egress_authorize(const st_egress_request *request,
     int port_matched = 0;
     for (size_t i = 0U; i < policy->destination_rules_len; i++) {
         const st_egress_destination_rule *rule = &policy->destination_rules[i];
-        st_egress_cidr cidr;
-        if (st_egress_parse_cidr(rule->cidr, &cidr) != 0 || !st_egress_cidr_contains(&cidr, destination)) {
+        /* A rule covers addresses of its own family only: 0.0.0.0/0 grants no IPv6 address. */
+        if (!target_in_cidr(&destination, rule->cidr)) {
             continue;
         }
         address_matched = 1;

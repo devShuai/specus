@@ -2134,5 +2134,515 @@
         "code": "EGRESS_DEST_DENIED"
       }
     }
-  ]
+  ],
+  "ipv6": {
+    "description": "IPv6 目的地址的出口授权：判定顺序与错误码同 IPv4，强制拒绝清单与 LAN scope 换成 IPv6 的对应项。目的规则只覆盖同一族的地址（0.0.0.0/0 不含任何 IPv6 地址，::/0 不含任何 IPv4 地址）。上面各节的 IPv4 清单不变，一个实现两族的清单都要检查。",
+    "forcedDenyCidrs": [
+      "::/128",
+      "::1/128",
+      "::ffff:0:0/96",
+      "64:ff9b::/96",
+      "64:ff9b:1::/48",
+      "2002::/16",
+      "fe80::/10",
+      "fec0::/10",
+      "ff00::/8"
+    ],
+    "cloudMetadataCidrs": [
+      "fd00:ec2::254/128"
+    ],
+    "lanCidrs": [
+      "fc00::/7"
+    ],
+    "policy": {
+      "egressClientId": 2,
+      "enabled": true,
+      "allowedConsumerClientIds": [
+        1,
+        5
+      ],
+      "scope": "PUBLIC",
+      "destinationRules": [
+        {
+          "cidr": "2001:db8:10::/48",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              80,
+              80
+            ],
+            [
+              443,
+              443
+            ]
+          ]
+        },
+        {
+          "cidr": "2001:db8:20::/48",
+          "protocols": [
+            "udp"
+          ],
+          "portRanges": [
+            [
+              53,
+              53
+            ]
+          ]
+        },
+        {
+          "cidr": "::/0",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        },
+        {
+          "cidr": "203.0.113.0/24",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              22,
+              22
+            ]
+          ]
+        }
+      ],
+      "limits": {
+        "maxConcurrentFlows": 256,
+        "maxFlowsPerConsumer": 64,
+        "idleTimeoutSeconds": 60
+      }
+    },
+    "cases": [
+      {
+        "name": "allowed",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:10::5",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "允许：地址、协议与端口都命中 2001:db8:10::/48",
+        "expect": {
+          "allowed": true,
+          "code": "EGRESS_ALLOWED"
+        }
+      },
+      {
+        "name": "port-denied",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:10::5",
+          "destinationPort": 22,
+          "protocol": "tcp"
+        },
+        "description": "/48 只开 80 与 443，::/0 只开 443",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_PORT_DENIED"
+        }
+      },
+      {
+        "name": "protocol-denied",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:10::5",
+          "destinationPort": 443,
+          "protocol": "udp"
+        },
+        "description": "覆盖它的两条规则都只允许 tcp",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_PROTOCOL_DENIED"
+        }
+      },
+      {
+        "name": "udp-allowed",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:20::1",
+          "destinationPort": 53,
+          "protocol": "udp"
+        },
+        "description": "允许：UDP 规则命中",
+        "expect": {
+          "allowed": true,
+          "code": "EGRESS_ALLOWED"
+        }
+      },
+      {
+        "name": "broad-rule",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:99::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "只被宽泛的 ::/0 覆盖",
+        "expect": {
+          "allowed": true,
+          "code": "EGRESS_ALLOWED"
+        }
+      },
+      {
+        "name": "read-by-value",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:DB8:10:0:0:0:0:5",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "目的地址按数值读，写法不影响判定",
+        "expect": {
+          "allowed": true,
+          "code": "EGRESS_ALLOWED"
+        }
+      },
+      {
+        "name": "loopback",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "回环；::/0 也覆盖它，强制清单仍然胜出",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "unspecified",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "::",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "未指定地址",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "mapped-loopback",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "::ffff:7f00:1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "IPv4 映射的 127.0.0.1，连上去就是 IPv4 回环",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "mapped-public",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "::ffff:cb00:710a",
+          "destinationPort": 22,
+          "protocol": "tcp"
+        },
+        "description": "IPv4 映射的 203.0.113.10：即使 IPv4 规则允许它，映射写法也一律拒绝，IPv4 目标只能以 IPv4 授权",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "nat64-metadata",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "64:ff9b::a9fe:a9fe",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "NAT64 前缀嵌着 169.254.169.254，经 NAT64 网关就到了元数据端点",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "nat64-local-use",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "64:ff9b:1::a00:1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "NAT64 本地前缀，同上",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "six-to-four",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2002:c000:204::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "6to4 嵌着 IPv4 地址",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "link-local",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fe80::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "链路本地",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "site-local",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fec0::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "已废弃的站点本地",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "multicast",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "ff02::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "组播",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "cloud-metadata",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fd00:ec2::254",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "云元数据端点（AWS IMDS 的 IPv6 地址），先于 scope 被拒",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "ula-under-public",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fd12:3456::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "ULA 属于 LAN，策略只授权 PUBLIC",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_SCOPE_DENIED"
+        }
+      },
+      {
+        "name": "local-interface",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:30::7",
+          "destinationPort": 443,
+          "protocol": "tcp",
+          "localInterfaceCidrs": [
+            "2001:db8:30::/64"
+          ]
+        },
+        "description": "落在出口本机接口的 IPv6 网段内",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "ipv4-not-covered-by-ipv6-default",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "192.0.2.10",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "::/0 不覆盖任何 IPv4 地址，两族规则互不覆盖",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_DEST_DENIED"
+        }
+      },
+      {
+        "name": "ipv4-rule-in-mixed-policy",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "203.0.113.10",
+          "destinationPort": 22,
+          "protocol": "tcp"
+        },
+        "description": "同一份策略里的 IPv4 规则照常生效",
+        "expect": {
+          "allowed": true,
+          "code": "EGRESS_ALLOWED"
+        }
+      },
+      {
+        "name": "dotted-tail-is-malformed",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "::ffff:192.0.2.1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "点分尾的写法读不出，与写错的 IPv4 一样拒绝",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_DEST_DENIED"
+        }
+      },
+      {
+        "name": "zone-is-malformed",
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fe80::1%eth0",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "带区域标识的写法读不出",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_DEST_DENIED"
+        }
+      }
+    ],
+    "policyVariantCases": [
+      {
+        "name": "lan-scope-allows-ula",
+        "policyOverride": {
+          "scope": "LAN",
+          "destinationRules": [
+            {
+              "cidr": "fd00::/8",
+              "protocols": [
+                "tcp"
+              ],
+              "portRanges": [
+                [
+                  443,
+                  443
+                ]
+              ]
+            }
+          ]
+        },
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fd12:3456::1",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "显式授予 LAN scope 并覆盖该网段后，ULA 目标才被允许",
+        "expect": {
+          "allowed": true,
+          "code": "EGRESS_ALLOWED"
+        }
+      },
+      {
+        "name": "lan-scope-still-refuses-metadata",
+        "policyOverride": {
+          "scope": "LAN",
+          "destinationRules": [
+            {
+              "cidr": "fd00::/8",
+              "protocols": [
+                "tcp"
+              ],
+              "portRanges": [
+                [
+                  443,
+                  443
+                ]
+              ]
+            }
+          ]
+        },
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "fd00:ec2::254",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "LAN 策略覆盖了元数据地址，强制清单仍然先拒绝",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_FORBIDDEN_DESTINATION"
+        }
+      },
+      {
+        "name": "lan-scope-refuses-global",
+        "policyOverride": {
+          "scope": "LAN",
+          "destinationRules": [
+            {
+              "cidr": "fd00::/8",
+              "protocols": [
+                "tcp"
+              ],
+              "portRanges": [
+                [
+                  443,
+                  443
+                ]
+              ]
+            }
+          ]
+        },
+        "request": {
+          "consumerClientId": 1,
+          "destinationIp": "2001:db8:10::5",
+          "destinationPort": 443,
+          "protocol": "tcp"
+        },
+        "description": "LAN 策略不放行公网 IPv6 地址",
+        "expect": {
+          "allowed": false,
+          "code": "EGRESS_SCOPE_DENIED"
+        }
+      }
+    ]
+  }
 }
