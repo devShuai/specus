@@ -94,7 +94,8 @@ class SqliteLobColumnTests {
     void theLobColumnsKeepTheirSqliteTypes() {
         assertThat(columnType("specus_http_traffic_exchange", "request_body_data")).isEqualTo("blob");
         assertThat(columnType("specus_http_traffic_exchange", "response_body_data")).isEqualTo("blob");
-        assertThat(columnType("specus_http_traffic_exchange", "request_preview_text")).isEqualTo("clob");
+        // No longer a @Lob: a string column like the headers, of the same TEXT affinity as clob.
+        assertThat(columnType("specus_http_traffic_exchange", "request_preview_text")).isEqualTo("varchar(2147483647)");
         assertThat(columnType("specus_tcp_traffic_frame", "payload_data")).isEqualTo("blob");
         assertThat(columnType("public_transfer_diagram_version", "snapshot_data")).isEqualTo("blob");
         assertThat(columnType("specus_websocket_ticket", "attributes_json")).isEqualTo("clob");

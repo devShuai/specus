@@ -101,16 +101,24 @@ class MariaDbSchemaTests {
     }
 
     @Test
-    void theWidestHttpExchangeRoundTripsAndItsHeadersAreSearchable() {
+    void theWidestHttpExchangeRoundTripsAndItsHeadersAndBodiesAreSearchable() {
         HttpTrafficExchangeRepository repository = context.getBean(HttpTrafficExchangeRepository.class);
-        HttpTrafficExchange exchange = repository.save(WidestHttpTrafficExchange.create());
+        HttpTrafficExchange exchange = WidestHttpTrafficExchange.create();
+        exchange.setResponsePreviewText(exchange.getResponsePreviewText() + " Response-Body");
+        exchange = repository.save(exchange);
 
         assertThat(repository.findById(exchange.getId()).orElseThrow())
                 .usingRecursiveComparison()
                 .isEqualTo(exchange);
-        assertThat(context.getBean(HttpTrafficExchangeStore.class)
-                .search(TenantContext.defaultTenant(), null, null, null, null,
+        HttpTrafficExchangeStore store = context.getBean(HttpTrafficExchangeStore.class);
+        assertThat(store.search(TenantContext.defaultTenant(), null, null, null, null,
                         HttpTrafficSearchField.REQUEST_HEADERS, "x-request", PageRequest.of(0, 20))
+                .getContent())
+                .extracting(HttpTrafficExchangeView::id)
+                .containsExactly(exchange.getId().toString());
+        // A preview is searched lower-cased, as every other field is.
+        assertThat(store.search(TenantContext.defaultTenant(), null, null, null, null,
+                        HttpTrafficSearchField.RESPONSE_BODY, "response-body", PageRequest.of(0, 20))
                 .getContent())
                 .extracting(HttpTrafficExchangeView::id)
                 .containsExactly(exchange.getId().toString());
