@@ -347,6 +347,13 @@ final class NettyHttpTransport {
         @Override
         protected void channelRead0(ChannelHandlerContext context, HttpObject message) {
             try {
+                // The decoder does not throw on bytes it cannot use: it hands on a message marked as
+                // failed -- a made-up "999 Unknown" head for an unusable status line, or a last
+                // chunk for a broken body. Neither came from the target.
+                if (message.decoderResult().isFailure()) {
+                    throw new IOException("invalid upstream HTTP response",
+                            message.decoderResult().cause());
+                }
                 if (message instanceof HttpResponse response) {
                     int status = response.status().code();
                     informational = status >= 100 && status < 200 && status != 101;

@@ -142,6 +142,44 @@ public class HttpRouteFailureTest {
         }
     }
 
+    /**
+     * Netty's decoder turns bytes that are no HTTP response into a "999 Unknown" response marked as
+     * failed. That is no head the target sent, and the client never makes one up.
+     */
+    @Test
+    public void anAnswerThatIsNoHttpIsAProtocolErrorNotAResponse() throws Exception {
+        try (Target target = new Target(socket -> {
+            readHead(socket.getInputStream());
+            socket.getOutputStream().write("SSH-2.0-OpenSSH_9.6\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            socket.getOutputStream().flush();
+            drain(socket.getInputStream());
+        })) {
+            AtomicInteger heads = new AtomicInteger();
+            NettyHttpTransport transport = failedExchange(
+                    "http://127.0.0.1:" + target.port() + "/", "GET", heads);
+            assertEquals("no response head may be forwarded", 0, heads.get());
+            assertEquals(HttpRouteFailure.PROTOCOL_ERROR, transport.failureClassification());
+        }
+    }
+
+    /** A body the decoder rejects after the head is a failed response, never a complete one. */
+    @Test
+    public void aBrokenBodyAfterTheHeadFailsTheResponse() throws Exception {
+        try (Target target = new Target(socket -> {
+            readHead(socket.getInputStream());
+            socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + "5\r\nhello\r\nnot-a-chunk-size\r\n").getBytes(StandardCharsets.ISO_8859_1));
+            socket.getOutputStream().flush();
+            drain(socket.getInputStream());
+        })) {
+            AtomicInteger heads = new AtomicInteger();
+            NettyHttpTransport transport = failedExchange(
+                    "http://127.0.0.1:" + target.port() + "/", "GET", heads);
+            assertEquals(1, heads.get());
+            assertNull(transport.failureClassification());
+        }
+    }
+
     @Test
     public void aFailureAfterTheHeadIsNotClassified() throws Exception {
         try (Target target = new Target(socket -> {
