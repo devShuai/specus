@@ -11,6 +11,7 @@
 - **没有**：C 没有对应实现。
 - **未逐项对照**：C 有对应路由，鉴权与主要形状已核对，但请求校验、状态码等细节没有逐项对照 Java，也没有对照测试；列为待办（第 9 节），不算作一致。
 - **本分支**：本分支修正过的行，提交见第 10 节。
+- Spring 在进入 controller 之前拒绝的请求（必填参数缺失、参数转不成 `Long`/`int`、必需的请求体缺失或不是对象）回 400，Spring Boot 的错误体以 `"error":"Bad Request"` 表示状态；C 回同样的 400 与 `{"error":"Bad Request"}`，不带 `timestamp`、`path` 等字段。`fix/c-server-parity-crud` 按此处理了它对照的端点，其他端点的类型不符仍可能被 C 忽略。
 - 鉴权：「公开」= `SecurityConfig` 中 `permitAll`；「Bearer」= 需要管理端本地 HS256 token（C 每次请求按 SQLite 重新读取用户）；「Bearer（任意）」= `/api/public/transfer/attachments/**`，任何已认证主体；「ticket」= WebSocket 一次性 ticket。
 
 ## 汇总
@@ -19,14 +20,16 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 90 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致 |
-| 有差异 | 10 | 见各节“说明”，可修的列入第 9 节 |
+| 一致 | 102 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致 |
+| 有差异 | 12 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`） |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
-| 未逐项对照 | 41 | Peer Mesh / Egress 27 个由 `fix/c-server-parity-peer` 对照；其余 14 个是管理 CRUD 等，见第 9 节 |
+| 未逐项对照 | 27 | Peer Mesh / Egress 27 个，由 `fix/c-server-parity-peer` 对照 |
 
 C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /api/admin/metrics`（C 的映射计数快照）。
 
 本分支修正的偏差（第 10 节有提交）：Elasticsearch 搜索、可见范围、写入队列、节点列表与 `tcp-streams` 契约；TCP 帧采集顺序；超过 32 KiB 的管理读应答被静默丢弃；客户端、映射、路由、凭据、用户、客户端目录列表的固定行数上限（超过后 500 或静默截断，目录截断后客户端看不到最新版本）；概览字段；管理员看不到已删除客户端和未知名称的连接记录；流量统计 `limit` 上限；客户端到管理员消息不检查来源账号；写入失败回执；命令 JSON 映射严格性；`/ws/connections` 的二进制与未掩码帧。
+
+`fix/c-server-parity-crud` 修正的偏差（第 9 节第 5、7 项，提交见第 10 节末）：凭据与映射的找不到、apiKey 重复原先回 404/409，Java 是 400 并带 id；凭据的 `maxOnlineInstances` 不限范围、生成的 apiKey 与 secret 形状不同、更新应答不带 `"secret":null`；映射更新的字段原先可省略、省略 `enabled` 时保留原值、公网端口只在同一客户端内查重；映射列表与两个流量统计的 `clientId` ≤ 0 不过滤，非数字参数被忽略；名称可用性的 `excludeClientId` 不可见时 404；`/me` 的时间戳为空串；初始化把演示客户端写进固定的 `default` 租户；管理员看不到已删除客户端的流量统计，资源类型不规范化；注册先校验字段再做人机验证、文案与 Java 不同、长度按字节计；Peer 服务导入按整个租户去重；这几类视图的时间戳是 SQLite 的 `YYYY-MM-DD HH:MM:SS`。
 
 `fix/c-server-parity-edges` 修正的偏差（第 9 节第 2、3、6 项，提交见第 10 节末）：Peer Mesh 列表与全库客户端列表的固定行数上限、会话列表缺 Java 的分页形式；SQLite 流量搜索的字段、通配与 WHERE 长度，管理员看不到已删除客户端的流量；普通用户看到按名称匹配的失败登录；`listenPort=0`、`clientId` ≤ 0 不过滤；裁剪时 `total_data_set_size_in_bytes` 为 0 改读 `size_in_bytes`；`/ws/connections` 文本上限与 UTF-8 校验；命令成员为数字或布尔值时读作缺失。
 
@@ -35,13 +38,13 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 方法 | 路径 | 鉴权 | 请求 / 响应要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
 | POST | `/auth/login` | 公开 | `{username,password,turnstileToken?,tenantId?}` → 本地 token | 一致 | test-map 第 1 节 `LoginRateLimiterTests`、`PasswordServiceTests`、`TurnstileVerifierTests`、`ManagementContextResolverTests` 均为覆盖 |
-| POST | `/auth/register` | 公开 | 注册申请（邮箱验证码） | 未逐项对照 | `src/registration.c`；`admin_http_tests` 有 C 侧断言，Java 没有对应测试类 |
-| POST | `/auth/register/verify` | 公开 | `{registrationId,code}` | 未逐项对照 | 同上 |
+| POST | `/auth/register` | 公开 | 注册申请（邮箱验证码），202 `{registrationId,emailMasked,expiresAt,resendAfterSeconds}` | 有差异 | `fix/c-server-parity-crud` 对照 `AuthController.register` 与 `RegistrationService.requestRegistration`（ctest `management_crud_tests`）：原先先校验字段、最后才做人机验证，现与 Java 相同先验证 Turnstile，再依次查用户名、保留名、口令、邮箱；超长用户名与口令原先报 `… cannot be blank`、空邮箱报格式无效、已有登录名不带名字，现为 Java 的 `username is too long`、`password is too long`、`邮箱不能为空`、`用户名已存在: <名>`；长度按 Java 的 UTF-16 单元计；邮箱原先接受多个 `@`、`a@.com`、连续的点，现按 Java 的正则与 `InternetAddress` 严格解析的规则拒绝。剩余差异：C 的登录名在存储与 token 中占 80 字节（`POST /api/admin/users` 同样），超过 80 字节但不超过 80 个字符的非 ASCII 用户名 Java 接受、C 回 `username is too long`；带引号的本地部分与 `[…]` 域名 Java 接受、C 拒绝；`expiresAt` 精确到秒（Java 的 `Instant.toString` 可带小数秒） |
+| POST | `/auth/register/verify` | 公开 | `{registrationId,code}` → 本地 token | 一致 | `fix/c-server-parity-crud`（`management_crud_tests`）：`registrationId` 按发送的原文限 64 个字符再 trim（原先先 trim 再计长）；登录名与邮箱都已被占用时先报 `用户名已存在: <名>`（原先先报邮箱） |
 | POST | `/auth/refresh` | Bearer | 续期本地 token；IdP token 400 | 一致 | `AuthControllerRefreshTests` 覆盖 |
 | GET | `/oidc-config` | 公开 | OIDC、注册、Turnstile 配置 | 一致 | `OidcControllerTests` 覆盖 |
 | POST | `/oidc/token` | 公开 | code → 本地 token | 一致 | `OidcControllerTests`、`SecurityConfigOidcTests` 覆盖（ctest `oidc_tests`） |
 | POST | `/api/client/auth/login` | 公开（HMAC 签名） | 客户端 HTTP 登录，返回会话 token 与配置 | 有差异 | 已消费的 nonce 存进程内存，多实例不共享（`ClientAuthNonceServiceIntegrationTests` 部分）。`fix/c-server-parity-rest` 改为存库，合入后复核 |
-| GET | `/api/admin/me` | Bearer | 当前管理用户 | 未逐项对照 | `admin_http_tests`、`oidc_tests` 有 C 侧断言 |
+| GET | `/api/admin/me` | Bearer | 当前管理用户 | 一致 | `fix/c-server-parity-crud` 对照 `ManagementUserService.currentUser`（`management_crud_tests`）：内置管理员以配置的用户名、调用者的租户、`ADMIN`、创建与更新时间为当前时刻；数据库用户取其账号行（含 `createdAt`/`updatedAt`）。原先两个时间戳都是空串 |
 | GET | `/api/admin/users` | Bearer | 本租户用户列表 | 有差异 | **本分支**去掉 128 行上限（ctest `management_lists_tests`）。差异同 test-map `ManagementUserServiceTests`：username 是全局主键，不同租户同名用户不存在 |
 | POST | `/api/admin/users` | Bearer（admin） | 创建用户 | 有差异 | 其他租户已有同名用户时 C 回 409，Java 允许（同上） |
 | PUT | `/api/admin/users/{username}` | Bearer（admin） | 改角色、启用、口令 | 有差异 | 其他租户的用户 C 回 404，Java 回 400（`ManagementUserServiceIntegrationTests` 部分） |
@@ -52,20 +55,20 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 方法 | 路径 | 鉴权 | 请求 / 响应要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
 | GET | `/api/admin/clients` | Bearer | 可见客户端列表（管理员为本租户） | 一致 | `ClientAccountServiceTests` 覆盖可见性；**本分支**去掉 128 行上限（原先全库超过 128 个客户端时所有租户都得 500），`management_lists_tests` |
-| GET | `/api/admin/clients/name-availability` | Bearer | 名称是否可用 | 未逐项对照 | `admin_http_tests` 有 C 侧断言 |
+| GET | `/api/admin/clients/name-availability` | Bearer | 名称是否可用 | 一致 | `fix/c-server-parity-crud`（`management_crud_tests`，规则另见 `ClientAccountServiceTests` 行）：缺 `clientName`、`excludeClientId` 不是数字时 400；空白名称为 `clientName cannot be blank`（原先 `clientName is required`）；`excludeClientId` 不可见（含 0 与负数）时 400 `client not found: <id>`（原先 404，0 与负数被忽略） |
 | GET | `/api/admin/clients/{id}` | Bearer | `{client, specusMappings, httpRoutes}` | 一致 | 原先单个客户端超过 64 条 TCP 映射或 64 条 HTTP 路由时读取失败；#191 起不限条数（`client_route_scale_tests`） |
 | POST | `/api/admin/clients/{id}/force-refresh-port-mapping` | Bearer | 推送 NAT_CONTROL，回 `{specusMappings,httpRoutes}` | 有差异 | C 多回一个 `pushed`（兼容字段，无害）；每客户端 64 条的上限已在 #191 去掉 |
 | POST | `/api/admin/clients` | Bearer | 创建客户端，201 | 一致 | `ClientAccountServiceTests` 覆盖 |
 | PUT | `/api/admin/clients/{id}` | Bearer | 改名、停用（踢下线） | 一致 | `ClientAccountServiceTests` 覆盖 |
 | DELETE | `/api/admin/clients/{id}` | Bearer | 删除并踢下线，204 | 一致 | `ClientAccountServiceTests` 覆盖 |
-| GET | `/api/admin/client-credentials` | Bearer | 本租户凭据 | 未逐项对照 | **本分支**修正：原先超过 128 条时静默截断（`management_lists_tests`）；可见性规则未对照 Java |
-| POST | `/api/admin/client-credentials` | Bearer | 创建凭据，201 | 未逐项对照 | `admin_http_tests` 有 C 侧断言 |
-| PUT | `/api/admin/client-credentials/{id}` | Bearer | 更新凭据 | 未逐项对照 | 同上 |
-| DELETE | `/api/admin/client-credentials/{id}` | Bearer | 删除，204 | 未逐项对照 | 同上 |
-| GET | `/api/admin/specus-mappings` | Bearer | 可见 TCP 映射，可按 `clientId` | 未逐项对照 | **本分支**修正：原先全库超过 64 条映射时 500（`management_lists_tests`） |
-| POST | `/api/admin/clients/{id}/specus-mappings` | Bearer | 创建映射，201，推送 NAT_CONTROL | 有差异 | 不限条数（#191）；会让该客户端的 `NAT_CONTROL` 超过单条消息 1 MiB 上限的新增或启用以 400 拒绝，Java 不检查（#197） |
-| PUT | `/api/admin/specus-mappings/{specusId}` | Bearer | 更新映射并推送 | 未逐项对照 | `session_lifecycle_tests`、`runtime_config_e2e.sh` 覆盖推送 |
-| DELETE | `/api/admin/specus-mappings/{specusId}` | Bearer | 删除并推送，204 | 未逐项对照 | 同上 |
+| GET | `/api/admin/client-credentials` | Bearer | 本租户凭据 | 一致 | **本分支**修正：原先超过 128 条时静默截断（`management_lists_tests`）。`fix/c-server-parity-crud` 对照 `ClientCredentialService.list`（`management_crud_tests`）：管理员看本租户全部、其他人只看自己的，按 id 倒序；视图七个字段同 `ClientCredentialView`，时间戳原先是 SQLite 的 `YYYY-MM-DD HH:MM:SS`，现为 ISO-8601（`…T…Z`） |
+| POST | `/api/admin/client-credentials` | Bearer | 创建凭据，201 `{credential,secret}` | 一致 | `fix/c-server-parity-crud`（`management_crud_tests`）：没有请求体或不是对象 400；apiKey 按 Java trim 后 3–120 个字符（UTF-16），省略时生成 `ck_` + UUID v4 的 32 位小写十六进制（原先 120 字符的哈希串）；secret 省略时生成 Java 字母表的 18 个字符（原先 `sk_` + 哈希串）；`maxOnlineInstances` 须在 1–10000（原先 ≤ 0 回落到默认值、不设上限），不是数字 400；apiKey 已存在 400 `apiKey already exists`（原先 409）；与并发创建争同一 apiKey 时不再覆盖对方（原先 `ON CONFLICT` 改写已有凭据的租户与 secret），回 Java 唯一约束的 400。凭据 id 是 SQLite 自增，Java 是随机的 53 位整数（不透明，客户端不解析） |
+| PUT | `/api/admin/client-credentials/{id}` | Bearer | 更新凭据，回 `{credential,secret}` | 一致 | `fix/c-server-parity-crud`（`management_crud_tests`）：只改请求带来的字段；没换 secret 时应答 `"secret":null`（原先省略该字段）；找不到或不可见 400 `credential not found: <id>`（原先 404 不带 id）；apiKey 重复 400（原先 409）；`maxOnlineInstances` 越界 400（原先 ≤ 0 回落到默认值、不设上限） |
+| DELETE | `/api/admin/client-credentials/{id}` | Bearer | 删除，204 | 一致 | 同上：找不到或不可见 400 `credential not found: <id>` |
+| GET | `/api/admin/specus-mappings` | Bearer | 可见 TCP 映射，可按 `clientId` | 一致 | **本分支**修正：原先全库超过 64 条映射时 500（`management_lists_tests`）。`fix/c-server-parity-crud` 对照 `NatControlService.listMappings`（`management_crud_tests`）：`clientId` 为 0、负数或不可见时为空列表（原先 ≤ 0 当作不过滤），不是数字 400，空值与 Spring 一样当作未给；时间戳为 ISO-8601 |
+| POST | `/api/admin/clients/{id}/specus-mappings` | Bearer | 创建映射，201，推送 NAT_CONTROL | 有差异 | 不限条数（#191）；会让该客户端的 `NAT_CONTROL` 超过单条消息 1 MiB 上限的新增或启用以 400 拒绝，Java `requireNatControlFits` 同样拒绝（#197）。`fix/c-server-parity-crud` 对照更新时发现、未改（不在第 9 节第 5 项内）：C 的新增是同一客户端同一端口的 upsert，公网端口只在同一客户端内唯一（`UNIQUE(client_name, listen_port)`），Java 对任何已占用的公网端口回 400 `公网端口 N 已被占用`；字段校验文案与客户端找不到（404）也未按 Java 改 |
+| PUT | `/api/admin/specus-mappings/{specusId}` | Bearer | 更新映射并推送 | 一致 | `fix/c-server-parity-crud` 对照 `NatControlService.updateMapping`（`management_crud_tests`；推送另见 `session_lifecycle_tests`、`runtime_config_e2e.sh`）：三个字段都必填，按 Java 的顺序与文案校验（端口 1–65535、`targetAddress` trim 后非空且不超过 255 个字符），原先省略的字段保留原值；省略 `enabled` 时启用（原先保留原值），`detailCaptureEnabled` 省略时不变；换到其他映射（任何客户端、任何租户）占用的公网端口 400 `公网端口 N 已被占用`（原先只在同一客户端内由唯一约束拦下，回 409）；找不到或不可见 400 `mapping not found: <id>`（原先 404） |
+| DELETE | `/api/admin/specus-mappings/{specusId}` | Bearer | 删除并推送，204 | 一致 | 同上：找不到或不可见 400 `mapping not found: <id>`；同一事务删掉工作台引用（Java `workbenchReferences.forgetObject`） |
 | POST | `/api/admin/clients/{id}/nat-control` | Bearer | 手动推送，回 `{pushed,specusMappings,httpRoutes}` | 一致 | 每客户端 64 条的上限已在 #191 去掉 |
 
 ## 3. HTTP 路由、临时分享、访问审计与连通性检查
@@ -92,11 +95,11 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | GET | `/api/admin/connections` | Bearer | `clientId/success/from/to/page/size`（1..500），`{items,total,page,size,totalPages}` | 一致 | **本分支**修正管理员视图：原先连接客户端表，已删除客户端的记录和未知名称的失败登录不显示，Java 按记录的租户过滤（`management_overview_tests`）。`fix/c-server-parity-edges`：普通用户原先还能看到按名称匹配到自己客户端的失败登录（`client_id` 为空），现与 Java `clientId IN visibleClientIds` 相同，只按 `clientId` 匹配（`management_lists_tests`） |
 | GET | `/api/admin/connection-stats` | Bearer | 月度归档统计，`clientName`/`limit`（1..500） | 一致 | `ConnectionArchiveServiceTests` 覆盖（ctest `connection_archive_tests`） |
 | GET | `/api/admin/overview` | Bearer | Java `OverviewService` 八个字段 | 一致 | **本分支**：原先只回 `{server,status,onlineClients:0,tcpMappings}`，管理端界面读的八个字段都缺；现按 Java 计算，并在运行时维护每租户的公网连接计数（`management_overview_tests`，真实进程） |
-| POST | `/api/admin/database/initialize` | Bearer（admin） | 初始化演示数据 | 未逐项对照 | `admin_http_tests` 有 C 侧断言 |
-| GET | `/api/admin/traffic` | Bearer | 流量统计，`clientId`/`limit` | 未逐项对照 | **本分支**把 `limit` 改为 Java 的 1..500（原先最多 1000，超过 1000 回落到 100）；字段未逐项对照 |
-| GET | `/api/admin/traffic/resources` | Bearer | 按资源的流量统计，`type`/`clientId`/`limit` | 未逐项对照 | 同上 |
+| POST | `/api/admin/database/initialize` | Bearer（admin） | 初始化演示数据，`{initialized,tenantId,orm,dialect,clients}` | 有差异 | `fix/c-server-parity-crud` 对照 `DatabaseInitializer.initialize(tenant)`（`management_crud_tests`、`admin_http_tests`）：允许演示数据时把 `Demo client`（属内置管理员）建在调用者的租户，名字已被其他租户占用时与 Java 的唯一约束一样回 400 `客户端名称已存在或数据不符合约束`；原先只在固定的 `default` 租户建、属固定的 `admin`。启动时的种子同样改为 `SPECUS_AUTH_TENANT_ID` 租户、`SPECUS_AUTH_USERNAME` 所有。非管理员 403 `需要 admin 权限`。剩余差异见第 8 节：`orm`/`dialect` 报 C 自己的实现（`sqlite3`/`sqlite`），不建 Java 的公开演示凭据 `demo-client` |
+| GET | `/api/admin/traffic` | Bearer | 流量统计，`clientId`/`limit` | 一致 | **本分支**把 `limit` 改为 Java 的 1..500（原先最多 1000，超过 1000 回落到 100）。`fix/c-server-parity-crud` 对照 `TrafficResource` 与 `TrafficViewService.listTraffic`（`management_crud_tests`）：`clientId` 为 0、负数或调用者看不到的客户端（含已删除的）时为空列表（原先 ≤ 0 当作不过滤），`clientId`、`limit` 不是数字 400；管理员按记录的租户列出，已删除客户端的统计也在内（原先连接客户端表，删了就看不到），为此两张统计表补 `tenant_id` 列，旧行在加列时按客户端回填；视图七个字段同 `TrafficUsageView`，`updatedAt` 为 ISO-8601。`flush=true` 在 C 无事可做（第 8 节） |
+| GET | `/api/admin/traffic/resources` | Bearer | 按资源的流量统计，`type`/`clientId`/`limit` | 一致 | 同上；`type` 按 Java trim 并转大写（原先区分大小写、不 trim） |
 | GET | `/api/admin/traffic/http-exchanges` | Bearer | 明细摘要分页 | 一致 | **本分支**（第 5 节）；ctest `traffic_detail_api_tests`、`elasticsearch_traffic_tests` |
-| GET | `/api/admin/traffic/http-exchanges/{id}` | Bearer | 明细含表头、预览与 body | 有差异 | body 存储与 `data:` URL 显示已随 `fix/c-server-parity-rest` 对齐（test-map `HttpTrafficExchangeStoreTests` 覆盖），已存在的 Elasticsearch 索引补 binary 映射见第 5 节；`fix/c-server-parity-edges`：SQLite 下管理员原先读不到已删除客户端的明细，现按记录的租户查（`traffic_detail_api_tests`）。剩余差异：`br` 编码的 body C 不解码，按解不开处理 |
+| GET | `/api/admin/traffic/http-exchanges/{id}` | Bearer | 明细含表头、预览与 body | 有差异 | body 存储与 `data:` URL 显示已随 `fix/c-server-parity-rest` 对齐（test-map `HttpTrafficExchangeStoreTests` 覆盖），已存在的 Elasticsearch 索引补 binary 映射见第 5 节；`fix/c-server-parity-edges`：SQLite 下管理员原先读不到已删除客户端的明细，现按记录的租户查（`traffic_detail_api_tests`）。剩余差异：`br` 编码的 body C 不解码，按解不开处理（显示原字节的 `data:application/octet-stream;base64,…`），Java `HttpBodyDataCodec` 用 brotli 解码；构建环境没有 libbrotlidec 的开发文件，见第 8 节 |
 | GET | `/api/admin/traffic/tcp-frames` | Bearer | 帧摘要分页，`clientId`/`listenPort`/`page`/`size\|limit` | 一致 | **本分支**；`traffic_detail_api_tests`。`fix/c-server-parity-edges`：`listenPort=0` 与 `clientId` ≤ 0 照 Java 过滤（空页），SQLite 下管理员看得到已删除客户端的帧 |
 | GET | `/api/admin/traffic/tcp-frames/{id}` | Bearer | 帧详情含 `payloadBase64` | 一致 | `elasticsearch_traffic_tests`、`traffic_capture_tests` |
 | GET | `/api/admin/traffic/tcp-streams` | Bearer | 按 `channelId` 的帧流 | 一致 | **本分支**（第 5 节） |
@@ -195,7 +198,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | GET/PUT/DELETE/POST/DELETE | `/api/admin/workbench`、`/favorites/{kind}/{id}`（PUT、DELETE）、`/favorites`（DELETE）、`/recents/{kind}/{id}`（POST、DELETE）、`/recents`（DELETE）（7 个） | Bearer | 一致 | 中央向量 `service-workbench-v1.json`（ctest `workbench_tests`），Java `WorkbenchVectorTests` 消费同一向量 |
 | GET/PUT/DELETE/POST/GET | `/api/admin/product-metrics/settings`（GET、PUT）、`/data`、`/transfer-outcomes`、`/summary`（5 个） | Bearer | 一致 | 中央向量 `product-metrics-v1.json`（ctest `product_metrics_tests`） |
 | GET/GET/POST/PUT/DELETE | `/api/admin/diagrams`、`/api/admin/diagrams/{id}`（5 个） | Bearer | 一致 | `UserDiagramDocumentServiceTests` 覆盖 |
-| GET/PUT/GET/POST/DELETE/GET/GET/DELETE/DELETE/GET/PUT/GET/POST/PUT/DELETE/POST/GET | `/api/admin/peer-mesh/status`、`/devices`、`/devices/{clientId}`、`/acls`、`/acls/{id}`、`/stats`、`/sessions`、`/sessions/{id}`、`/service-sharing`、`/services`、`/services/{id}`、`/services/import`、`/service-audit`（18 个） | Bearer | 未逐项对照 | 由 `fix/c-server-parity-peer` 对照（test-map `PeerMeshServiceTests`、`PeerServiceDiscoveryServiceTests` 为部分）。`fix/c-server-parity-edges`：列表不再有固定上限（第 9 节第 2 项），`/sessions` 补上 Java 的 `page/size/openOnly` 分页形式，`limit` 夹到 1..200（`management_lists_tests`）；服务导入的目标去重范围与 Java 不同（第 9 节第 7 项） |
+| GET/PUT/GET/POST/DELETE/GET/GET/DELETE/DELETE/GET/PUT/GET/POST/PUT/DELETE/POST/GET | `/api/admin/peer-mesh/status`、`/devices`、`/devices/{clientId}`、`/acls`、`/acls/{id}`、`/stats`、`/sessions`、`/sessions/{id}`、`/service-sharing`、`/services`、`/services/{id}`、`/services/import`、`/service-audit`（18 个） | Bearer | 未逐项对照 | 由 `fix/c-server-parity-peer` 对照（test-map `PeerMeshServiceTests`、`PeerServiceDiscoveryServiceTests` 为部分）。`fix/c-server-parity-edges`：列表不再有固定上限（第 9 节第 2 项），`/sessions` 补上 Java 的 `page/size/openOnly` 分页形式，`limit` 夹到 1..200（`management_lists_tests`）；`fix/c-server-parity-crud`：服务导入的目标去重范围原先是整个租户，现与 Java `importCandidates` 相同只看本客户端已有服务的 `host:port`（第 9 节第 7 项，`management_crud_tests`） |
 | GET/PUT/GET/POST/GET/DELETE | `/api/admin/peer-mesh/egress/switch`（GET、PUT）、`/policies`（GET、POST）、`/activity`、`/policies/{id}`（6 个） | Bearer | 未逐项对照 | 同上（`PeerEgressResourceTests` 部分） |
 | GET | `/api/public/peer-mesh/stun-config`、`/api/public/transfer/ice-config`、`/api/public/peer-mesh/nat-probe-config`（3 个） | 公开 | 未逐项对照 | `PublicPeerMeshResourceTests` 部分（standalone STUN 三项未测） |
 | 全部 | `/http/{clientName}/{route}/**` | 路由认证 | 一致 | test-map 第 3 节 `HttpSpecusController*`、`HttpSpecusBodyLimitFilterTests` 等覆盖 |
@@ -210,6 +213,10 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | Elasticsearch 待写队列另有 256 MiB 总量上限 | C 服务常跑在小内存设备上；Java 只按条数（每类 20000）限制 |
 | 关停时写出全部待写文档，Java 只写一批 | 只会少丢数据 |
 | Elasticsearch 节点按顺序故障转移，不轮询 | libcurl 单连接；轮询只影响负载分布，不影响结果 |
+| `br`（brotli）编码的 HTTP body 在明细详情里不解码，按解不开显示原字节；`br` 编码的媒体清单同样不解码 | Java 用 `org.brotli:dec`。C 只链接 zlib：CI（`protocol-v2.yml`、`release.yml`）与本机构建环境装的是 `zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev`，只有 libcurl 带进来的运行库 `libbrotli1`，没有 `libbrotli-dev` 的头文件与 `libbrotlidec.so`/`.pc`，接入要新增系统依赖。方案：两个工作流的 apt 依赖加 `libbrotli-dev`；`CMakeLists.txt` 用 `pkg_check_modules(BROTLIDEC libbrotlidec)` 可选检测，找到时定义 `ST_HAVE_BROTLI` 并链接，`Makefile` 同样可选；`traffic_capture.c`（明细显示）与 `media_capture.c`（清单）在 gzip/deflate 旁加 `br`，用 `BrotliDecoderDecompressStream` 按 `decompression_limits` 的同一上限流式解码，超限按解不开处理；没装库的构建保持现状 |
+| `database/initialize` 的 `orm`/`dialect` 为 `sqlite3`/`sqlite` | 报的是实际实现：C 直接用 sqlite3 API，没有 JPA 与 Hibernate 方言 |
+| 不建 Java 的演示凭据 `demo-client`（secret `test1234`） | 公开的固定凭据，C 从不写入（test-map `LegacyDemoCredentialSanitizerIntegrationTests` 行）；演示客户端照常建 |
+| 流量统计同步写库，`/api/admin/traffic*` 的 `flush=true` 无事可做 | Java 在内存累计、定时写库，`flush` 先写出；C 每次转发即写 SQLite |
 
 ## 9. 待办（按影响排序）
 
@@ -217,9 +224,9 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 2. ~~**Peer Mesh 管理列表的固定上限**~~（已完成，`fix/c-server-parity-edges`）：ACL（256 行）、服务（256 行，超过后连保存都失败，因为保存后从截断的列表里读回）、出口策略（管理列表 128 行、目录推送 64 行）、出口活动（128 行）、一次关闭全部打开会话（200 个，应答又受 32 KiB 缓冲限制），以及登录配置、roster、服务目录与出口策略视图读取的全库客户端列表（256、512、1024 个，跨租户合计），都改为按需扩容、不限行数；会话列表补上 Java 的 `page/size/openOnly` 分页形式（管理端界面用的就是它，C 原先只回数组），`limit` 按 Java 夹到 1..200，列表前先关闭本租户的过期会话（Java `expireIfStale`）。ctest `management_lists_tests`（300 条 ACL 与服务、140 条策略与活动、260 个会话、另一租户 1100 个客户端）、`peer_mesh_tests`（库里多 1100 个客户端时的登录配置与推送）。服务目录的内存表（4096 个在线发布方，每个 32 个服务）与 Java 的同一上限一致，未改。
 3. ~~**SQLite 流量明细搜索对照 JPA**~~（已完成，`fix/c-server-parity-edges`）：按 `JpaHttpTrafficExchangeStore.httpExchangePredicate` 逐条生成 SQL：字段表即 `HttpTrafficSearchField`（代码或常量名、忽略大小写、未知回落 summary），字符串列 `lower(col) LIKE`、预览列 `col LIKE`，`\ % _` 按字面转义，数字按字段匹配 id/clientId/statusCode/resourceId，`method` 整值比较，每个 token 都须命中且个数不限；HTTP、TCP 的列表与明细都按记录的租户过滤，管理员看得到已删除客户端的流量。ctest `traffic_detail_api_tests` 的 SQLite 段（与 ES 段同一组记录，逐个查询对照 Java 的结果）。
 4. ~~**`fix/c-server-parity-rest` 合入后复核**~~（已完成）：HTTP body 存储与详情显示、客户端登录 nonce 存库，以及 test-map 中 `TrafficInspectionServiceTests`、`HttpTrafficExchangeStoreTests` 两行都已对应；已存在的 Elasticsearch HTTP 索引原先不补 binary body 映射，`fix/c-es-existing-index-body-mapping` 已按 Java `putBinaryBodyMapping` 补上（被拒时记日志、照用原索引），`elasticsearch_traffic_tests` 用 fake 预置的两个旧索引验证。
-5. **未逐项对照的 14 个管理端点**：注册两条、`/api/admin/me`、凭据 CRUD 四条、映射列表与改删三条、`database/initialize`、客户端名称可用性、流量统计两条——逐项对照校验规则、状态码与字段。
+5. ~~**未逐项对照的 14 个管理端点**~~（已完成，`fix/c-server-parity-crud`）：注册两条、`/api/admin/me`、凭据 CRUD 四条、映射列表与改删三条、`database/initialize`、客户端名称可用性、流量统计两条，逐项对照了 Java 的 controller、service、DTO、校验与 `GlobalExceptionHandler` 的映射，差异见第 1、2、4 节各行。12 个改为一致；`/auth/register` 剩 C 登录名 80 字节的存储上限与少数邮箱写法，`database/initialize` 剩第 8 节的两项。ctest `management_crud_tests`（新增，经进程内管理监听器的真实 HTTP 与真实 token），`admin_http_tests` 的租户范围与初始化断言随之改为 Java 的 400 与调用者租户。对照中发现但不在本项内、未改的：映射新增的 upsert 与公网端口唯一范围（第 2 节该行）；客户端、路由、ACL 等其余视图的时间戳仍是 SQLite 的 `YYYY-MM-DD HH:MM:SS`（本项只改了凭据、映射与流量统计三类视图）。
 6. ~~边缘差异~~（已完成，`fix/c-server-parity-edges`）：连接记录普通用户只看 `clientId` 属于自己客户端的记录（`management_lists_tests`）；`listenPort` 给出即过滤、`clientId` ≤ 0 为空页，ES 与 SQLite 相同（`elasticsearch_traffic_tests`、`traffic_detail_api_tests`）；裁剪时 `total_data_set_size_in_bytes` 只要存在就用（`elasticsearch_traffic_tests`）；`/ws/connections` 与 `/ws/client-messages` 共用一个读帧循环，文本按 Tomcat 默认的 8192 个字符限长（1009）并校验 UTF-8（1007）；命令成员为数字或布尔值时按 Jackson 读作字面文本，数字 `messageId` 原样回显（`client_messages_tests`）。都不是平台差异。
-7. **Peer 服务导入的目标去重范围**（核对第 2 项时发现）：Java `importCandidates` 只拿本客户端已有服务的 `host:port` 去重，C 拿整个租户的服务，别的客户端已发布同一目标时 C 会跳过而 Java 会导入。
+7. ~~**Peer 服务导入的目标去重范围**~~（已完成，`fix/c-server-parity-crud`）：Java `importCandidates` 与 `importMdns` 只拿本客户端已有服务的 `host:port` 去重，C 原先拿整个租户的服务，别的客户端已发布同一目标时 C 会跳过而 Java 会导入；现在两条导入路径都只看本客户端的服务。ctest `management_crud_tests`：另一客户端已发布同一目标时照常导入，第二次导入因本客户端已有而跳过。
 
 ## 10. 本分支提交
 
@@ -245,3 +252,12 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | `fix(c-server): Peer Mesh lists, SQLite traffic search and edge cases as Java` | Peer Mesh 列表与全库客户端列表不限行数、会话分页；SQLite 搜索按 JPA 谓词、按记录租户的可见范围；连接记录、`listenPort`/`clientId`、裁剪字段、两个 WebSocket 的文本读取与命令成员 |
 | `test(c-server): Peer Mesh lists, SQLite search, WebSocket text limits and scalar commands` | `management_lists_tests`、`traffic_detail_api_tests`、`elasticsearch_traffic_tests`、`client_messages_tests`、`peer_mesh_tests` 补充 |
 | `docs(alignment): C inventory items 2, 3 and 6 done` | 本文与 test-map |
+
+`fix/c-server-parity-crud`（第 9 节第 5、7 项）的提交：
+
+| 提交 | 内容 |
+| --- | --- |
+| `fix(c-server): management CRUD endpoints and Peer service import as Java` | 凭据、映射列表与改删、名称可用性、`/me`、`database/initialize`、两个流量统计（统计表补 `tenant_id`）；Peer 服务导入的去重范围 |
+| `fix(c-server): self-registration checks in Java's order and wording` | `/auth/register` 与 `/verify` |
+| `test(c-server): the management CRUD endpoints against Java` | ctest `management_crud_tests`；`admin_http_tests` 随之调整 |
+| `docs(alignment): C inventory items 5 and 7 done` | 本文与 test-map |
