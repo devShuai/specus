@@ -14,6 +14,7 @@ The first Android version focuses on the normal specus-client path:
 - TCP NAT registration plus v2 `OPEN/DATA/FIN/RST/WINDOW_UPDATE` forwarding, including independent directional half-close
 - invalid or duplicate `OPEN`, unknown `DATA/FIN`, and invalid per-stream half-close transitions emit a stream-level `RST` without closing unrelated streams; local dial/I/O failure also emits `RST`, pending TCP/WebSocket dials are globally capped at 1024, recent closed-stream tombstones make late `RST` idempotent, while a `RST` for a never-opened stream remains a data-connection protocol violation
 - Direct HTTP route forwarding from public route to Android-reachable upstreams through a protected streaming Netty transport; request bodies are preserved for every method, early responses are read while upload is still active, and request/response trailers are restricted to the safe declared-name intersection
+- the login declares `clientHttpRouteCapabilities.version=1`: an HTTP route stream that fails before its response OPEN carries the closed-set `failure` on its RST (`route-not-loaded`, `target-invalid`, `connect-refused`, `connect-timeout`, `dns-failed`, `tls-failed`, `unreachable`, `protocol-error`; see `protocol/spec/service-connectivity-check.md` section 6), placed by phase and exception type in `HttpRouteFailure`, never by message text; an upstream answer the HTTP decoder rejects is a failure, never a forwarded response
 - Direct HTTP-route WebSocket proxying over `ws://` and `wss://`, including protected sockets, filtered handshake headers and `SWS2` envelopes for continuation/text/binary/close/ping/pong with original message FIN/RSV and close semantics; physical data frames up to 16 MiB are normalized into `64 KiB - 12` continuation chunks, control frames remain atomic, pending Netty writes are bounded, and receive credit is returned only after the write future completes
 - JSONC config editing inside the app, using the public schema URL
 - dashboard-style control UI with connection actions, config summary, JSONC editor, and runtime events
@@ -79,11 +80,11 @@ Run the local JVM protocol suite with:
 .\gradlew.bat clean test --no-problems-report
 ```
 
-Current local JVM result: 153/153 tests across 16 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, strict update-catalogue parsing and scheduling, TLS timeout/cancellation, and state-machine behavior. `test` and `lint` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
+Current local JVM result: 225/225 tests across 28 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, strict update-catalogue parsing and scheduling, TLS timeout/cancellation, and state-machine behavior. `test` and `lint` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
 
 ### The client core as a command on a plain JVM
 
-The C server's end-to-end scripts run each client as a command (`SPECUS_CLIENT_COMMAND`) with `run --config <client.jsonc> --no-update-check`. `JvmClientMain` in the unit-test sources gives the Android client the same entry: it runs `SpecusCore.Runtime` -- HTTP login, control/data, Direct HTTP and WebSocket -- with an in-memory stand-in for `Context` and no VPN platform (`peerMeshDevice=noop`), on the unit-test classpath (Netty, org.json and the mockable `android.jar`).
+The C server's end-to-end scripts run each client as a command (`SPECUS_CLIENT_COMMAND`) with `run --config <client.jsonc> --no-update-check [--debug]`. `JvmClientMain` in the unit-test sources gives the Android client the same entry: it runs `SpecusCore.Runtime` -- HTTP login, control/data, Direct HTTP and WebSocket, control TLS, and the Peer Mesh control and UDP path -- with a stand-in for `Context` and no VPN platform (`peerMeshDevice=noop`), on the unit-test classpath (Netty, org.json and the mockable `android.jar`). Like the app, it keeps its machine id and Peer Mesh key pair across restarts, in `~/.specus-android-jvm` under `user.home`, so a restarted client is the same device. While it runs it publishes its state once a second (in `SPECUS_CLI_STATE_DIR` or `~/.specus-cli`, as the other clients do), and `peers --config <client.jsonc> [--json]` prints the roster the server pushed to it.
 
 ```sh
 ./gradlew :app:jvmClientLauncher
@@ -91,7 +92,7 @@ SPECUS_CLIENT_COMMAND="$PWD/app/build/jvm-client/specus-android-jvm-client" SPEC
   bash ../../c/server/scripts/direct_route_e2e.sh
 ```
 
-`app/build/jvm-client/classpath.txt` holds the same classpath with the platform separator for other launchers. CI runs `direct_route_e2e.sh` this way in the C server (Linux) job. Nothing Android-specific (services, VPN, UI broadcasts) is exercised.
+`app/build/jvm-client/classpath.txt` holds the same classpath with the platform separator for other launchers. CI runs every client E2E script this way in the C server (Linux) job: `nat_e2e_smoke.sh`, `runtime_config_e2e.sh`, `direct_route_e2e.sh`, `tls_client_e2e.sh` and `peer_mesh_e2e.sh` (two noop clients, DIRECT over loopback and then RELAY through the C TURN server). Nothing Android-specific (foreground service, `VpnService`/TUN, UI broadcasts, device networks) is exercised.
 
 ## Run
 
