@@ -195,17 +195,31 @@ func (c *Conn) Close(reason string) {
 // from multiple goroutines. A write that fails closes the connection with IO_ERROR (see
 // writeFrame); a packet that cannot be encoded writes nothing and leaves it open.
 func (c *Conn) Send(packet protocol.Packet) error {
-	return c.send(packet, store.ReasonIOError)
+	return c.send(nil, packet, store.ReasonIOError)
 }
 
-func (c *Conn) send(packet protocol.Packet, failureReason string) error {
+// CommitAndSend runs commit and then writes packet while holding the write lock across both,
+// so a frame another goroutine sends because of what commit published (such as a stream OPEN
+// on a connection commit just registered) always follows packet on the wire. commit must not
+// write to c. When packet cannot be encoded, commit does not run. A write that fails closes
+// the connection with IO_ERROR, as Send does.
+func (c *Conn) CommitAndSend(commit func(), packet protocol.Packet) error {
+	return c.send(commit, packet, store.ReasonIOError)
+}
+
+func (c *Conn) send(commit func(), packet protocol.Packet, failureReason string) error {
 	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
 	if err != nil {
 		return err
 	}
 	trackedBytes := c.WriteBackpressure.AddPending(len(frame))
 	defer c.WriteBackpressure.ReleasePending(trackedBytes)
-	return c.writeFrame(frame, failureReason)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if commit != nil {
+		commit()
+	}
+	return c.writeFrameLocked(frame, failureReason)
 }
 
 // SendPriority queues a small flow-control packet without blocking the read loop on a
@@ -233,6 +247,10 @@ func (c *Conn) SendPriority(packet protocol.Packet) error {
 func (c *Conn) writeFrame(frame []byte, failureReason string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeFrameLocked(frame, failureReason)
+}
+
+func (c *Conn) writeFrameLocked(frame []byte, failureReason string) error {
 	if _, err := c.writer.Write(frame); err != nil {
 		c.Close(failureReason)
 		return err
@@ -343,7 +361,7 @@ func (c *Conn) idleWatchdog() {
 		}
 		if time.Duration(now-c.lastWriteUnixNano.Load()) >= writerIdle {
 			// Java's SocketIdleStateHandler sends a HeartbeatResponse as keep-alive bytes.
-			if err := c.send(protocol.HeartbeatResponse{}, store.ReasonHeartbeatWriteFail); err != nil {
+			if err := c.send(nil, protocol.HeartbeatResponse{}, store.ReasonHeartbeatWriteFail); err != nil {
 				c.MarkReason(store.ReasonHeartbeatWriteFail)
 				c.cancel()
 				return
