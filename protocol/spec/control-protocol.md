@@ -121,8 +121,25 @@ UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 
 `482 + 1 + 1 + varint(J + 721) + J + 720` 字节。其中 482 是 480 字节的名字加 2 字节长度，两个 1 分别是
 `toClientName` 和 `messageType`，`varint(J + 721)` 是 JSON 长度前缀。`J` 不超过 1,047,369 时 body 不会超出上限。
 
-本规则生效之前写入的超限配置，只能靠停用或删除条目回到上限以内；在那之前，登录和运行时推送仍按各实现
-原来的方式失败。共享向量见 `protocol/test-vectors/nat-control-size-v1.json`。
+上面的检查只拦新的修改。本规则生效之前写入的超限配置、不经管理接口直接写进数据库的配置，以及其它任何原因，
+都可能让某个客户端的 NAT_CONTROL 按它真实的名字编码后仍放不进一条 MESSAGE（body 超过 1,048,576 字节或编码出错）。
+这样的 NAT_CONTROL 下发时，四个服务端统一这样处理：
+
+- **不发、记日志、不断开**：不写出这一帧，也不写出它的任何部分；记一条 error 级日志，写明客户端名，能算出 body
+  大小时一并写明；control 连接保持原样，客户端继续用它手里已有的配置。断开连接没有用：客户端重连后的登录推送
+  还会失败，只会形成重连循环。
+- **control 登录**：登录照常成功。登录后的 NAT_CONTROL 发不出去只记日志，登录流程后面的步骤（例如 Peer Mesh
+  的登录推送）照常执行。
+- **变更后的自动推送**：新建、修改、删除 TCP 映射或 HTTP route 后的自动推送发不出去，不改变这次变更的结果：
+  变更照常保存，接口照常返回它本来的状态码。新建和启用仍按上面的规则检查；停用和删除不检查，是回到上限以内
+  的办法。服务端自己按已保存的配置转发和校验，与这次推送成没成功无关。
+- **手动下发**：`POST /api/admin/clients/{id}/nat-control` 和 `POST /api/admin/clients/{id}/force-refresh-port-mapping`
+  在客户端在线、NAT_CONTROL 却发不出去时返回 `409`，`error` 为「客户端的 TCP 映射和 HTTP route 超过单条
+  NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端」。调用方只应依赖其中的 `NAT_CONTROL`。不得返回 `200`，也不得
+  以其它方式报告已经下发。客户端不在线时照旧返回 `409`「客户端不在线，无法下发映射」。
+
+停用或删除条目，直到配置回到上限以内，之后的自动推送或手动下发就会把配置发给客户端。共享向量见
+`protocol/test-vectors/nat-control-size-v1.json`，其中 `existingOversize` 是数据库里已有超限配置的场景。
 
 ## NAT stream v2
 

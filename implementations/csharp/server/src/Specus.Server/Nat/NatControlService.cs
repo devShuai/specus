@@ -23,6 +23,10 @@ public sealed class NatControlService
     public const string TooLargeMessage =
         "客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端";
 
+    /// <summary>The 409 of a manual push whose NAT_CONTROL, as stored, does not fit one MESSAGE.</summary>
+    public const string NotSentMessage =
+        "客户端的 TCP 映射和 HTTP route 超过单条 NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端";
+
     // The client's name when a NAT_CONTROL is sized: 120 characters of 4 UTF-8 bytes each in the
     // clientName field, and of a 6-byte \uXXXX escape each in the JSON. No name a rename allows takes
     // more in either place, so no later rename pushes an accepted configuration over.
@@ -60,9 +64,12 @@ public sealed class NatControlService
         // Always the full snapshot, empty lists included: a client that reconnects with its access
         // token gets no new HTTP login snapshot, so if its last route was deleted while it was
         // offline, this push is the only way it learns to stop forwarding that route.
+        // A NAT_CONTROL that does not fit one MESSAGE is only logged and does not throw: the login
+        // stands and the Peer Mesh push after it still runs. Closing the connection would only have
+        // the client log in again into the same failure.
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
         if (await SendNatControlAsync(clientName, mappings, httpRoutes, cancellationToken)
-                .ConfigureAwait(false))
+                .ConfigureAwait(false) == Delivery.Sent)
         {
             _logger.LogInformation("[nat-control] pushed {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
                 mappings.Count, httpRoutes.Count, clientName);
@@ -75,12 +82,16 @@ public sealed class NatControlService
             .FirstOrDefaultAsync(c => c.Id == clientId, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"client not found: {clientId}");
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
-        if (!await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
-                .ConfigureAwait(false))
+        // Both failures are the InvalidOperationException the management API answers 409 to; a
+        // NAT_CONTROL that does not fit one MESSAGE was not sent and must not be reported as pushed.
+        var delivery = await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
+            .ConfigureAwait(false);
+        return delivery switch
         {
-            throw new InvalidOperationException("客户端不在线，无法下发映射");
-        }
-        return new PushResult(mappings.Count, httpRoutes.Count);
+            Delivery.Offline => throw new InvalidOperationException("客户端不在线，无法下发映射"),
+            Delivery.NotSent => throw new InvalidOperationException(NotSentMessage),
+            _ => new PushResult(mappings.Count, httpRoutes.Count),
+        };
     }
 
     public async Task PushSnapshotIfOnlineAsync(long clientId, CancellationToken cancellationToken)
@@ -93,9 +104,11 @@ public sealed class NatControlService
             return;
         }
 
+        // A NAT_CONTROL that does not fit one MESSAGE is only logged: the change that called this
+        // stands and answers as it would have.
         var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
         if (await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
-                .ConfigureAwait(false))
+                .ConfigureAwait(false) == Delivery.Sent)
         {
             _logger.LogInformation("[nat-control] synchronized {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
                 mappings.Count, httpRoutes.Count, account.ClientName);
@@ -119,7 +132,23 @@ public sealed class NatControlService
         return (mappings, httpRoutes);
     }
 
-    private async Task<bool> SendNatControlAsync(string clientName,
+    /// <summary>What became of one NAT_CONTROL push.</summary>
+    private enum Delivery
+    {
+        Sent,
+        /// <summary>The client has no logged-in control connection.</summary>
+        Offline,
+        /// <summary>The NAT_CONTROL does not fit one MESSAGE, or cannot be encoded: nothing was written.</summary>
+        NotSent,
+    }
+
+    /// <summary>
+    /// Writes <paramref name="clientName"/>'s NAT_CONTROL to its control connection. One that does not
+    /// fit one MESSAGE is not handed to the connection, whose encoder would throw: it is logged once
+    /// and the connection is kept, so the client goes on with the configuration it has. See
+    /// "NAT_CONTROL 的大小" in protocol/spec/control-protocol.md.
+    /// </summary>
+    private async Task<Delivery> SendNatControlAsync(string clientName,
         IReadOnlyList<SpecusMapping> mappings,
         IReadOnlyList<HttpRouteMapping> httpRoutes,
         CancellationToken cancellationToken)
@@ -127,18 +156,37 @@ public sealed class NatControlService
         var context = _sessions.Find(clientName);
         if (context is null || !_sessions.HasLogin(context))
         {
-            return false;
+            return Delivery.Offline;
         }
 
         var packet = new MessageResponsePacket
         {
             ClientName = clientName,
             MessageType = MessageType.NatControl,
-            Message = MessageJson(clientName, mappings, httpRoutes),
         };
+        int bodyBytes;
+        try
+        {
+            packet.Message = MessageJson(clientName, mappings, httpRoutes);
+            bodyBytes = CompactBinarySerializer.Serialize(packet).Length;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex,
+                "[nat-control] not pushed to {Client}: its NAT_CONTROL of {TcpCount} tcp + {HttpCount} http route(s) cannot be encoded; the connection is kept",
+                clientName, mappings.Count, httpRoutes.Count);
+            return Delivery.NotSent;
+        }
+        if (bodyBytes > MessageBodyLimit)
+        {
+            _logger.LogError(
+                "[nat-control] not pushed to {Client}: its NAT_CONTROL of {TcpCount} tcp + {HttpCount} http route(s) takes {BodyBytes} bytes, over the {Limit}-byte MESSAGE body limit; the connection is kept, disable or delete entries to bring it back within the limit",
+                clientName, mappings.Count, httpRoutes.Count, bodyBytes, MessageBodyLimit);
+            return Delivery.NotSent;
+        }
 
         await context.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
-        return true;
+        return Delivery.Sent;
     }
 
     /// <summary>

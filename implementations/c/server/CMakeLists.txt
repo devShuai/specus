@@ -349,10 +349,13 @@ add_test(NAME http_route_lifecycle_tests
 set_tests_properties(http_route_lifecycle_tests PROPERTIES TIMEOUT 180)
 
 # More than 64 TCP mappings and HTTP routes on one client, and the NAT_CONTROL message limit, on a
-# real server process: login answer, NAT_CONTROL, runtime push, client detail and lists.
+# real server process: login answer, NAT_CONTROL, runtime push, client detail and lists; and a
+# configuration already past the limit (nat-control-size-v1.json existingOversize).
 add_executable(specus_c_client_route_scale_tests tests/client_route_scale_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_client_route_scale_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_route_scale_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_client_route_scale_tests PRIVATE
+    ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
 add_test(NAME client_route_scale_tests
     COMMAND specus_c_client_route_scale_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(client_route_scale_tests PROPERTIES TIMEOUT 180)

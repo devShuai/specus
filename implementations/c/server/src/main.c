@@ -2701,6 +2701,21 @@ static void apply_runtime_route_config(specus_session *session, server_config *r
 static pthread_mutex_t runtime_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
+ * The error a NAT_CONTROL that does not fit one MESSAGE leaves: it was not sent, and the connection is
+ * kept, since a client that logged in again would only meet the same failure. See "NAT_CONTROL 的大小"
+ * in protocol/spec/control-protocol.md.
+ */
+static void log_nat_control_not_sent(const char *client_name, size_t tcp_routes, size_t http_routes,
+                                     size_t json_bytes)
+{
+    fprintf(stderr,
+            "[nat-control] not pushed to %s: its NAT_CONTROL of %zu tcp + %zu http route(s), %zu bytes of JSON, "
+            "does not fit the %u-byte MESSAGE body; the connection is kept, disable or delete entries to bring "
+            "it back within the limit\n",
+            client_name, tcp_routes, http_routes, json_bytes, (unsigned)ST_MAX_MESSAGE_BODY_SIZE);
+}
+
+/*
  * Reloads a client's routes into its published control and data connections, then sends the
  * control the new NAT_CONTROL. The route set is replaced before the send waits for send_lock, so
  * on a control whose login is still writing its response and first NAT_CONTROL (client_thread)
@@ -2752,21 +2767,24 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
     int result = prepare_runtime_route_config(&control_current, &refreshed_control) == 0
         && (data == NULL || prepare_runtime_route_config(&data_current, &refreshed_data) == 0)
         ? 0 : -2;
-    st_buffer packet = {0};
     if (result == 0) {
-        packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
-        if (packet.data == NULL) {
-            result = -2;
-        }
-    }
-    if (result == 0) {
+        /*
+         * The reloaded routes take effect on the server whether or not the NAT_CONTROL can be sent:
+         * they are what it forwards and accepts registrations by. One that does not fit one MESSAGE
+         * is not sent, and the client goes on with the configuration it has.
+         */
+        st_buffer packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
         size_t tcp_routes = refreshed_control.mapping_count;
         size_t http_routes = refreshed_control.http_route_count;
+        size_t json_bytes = refreshed_control.nat_control_json == NULL ? 0U : strlen(refreshed_control.nat_control_json);
         apply_runtime_route_config(control, &refreshed_control);
         if (data != NULL) {
             apply_runtime_route_config(data, &refreshed_data);
         }
-        if (session_send_packet(control, &packet) != 0) {
+        if (packet.data == NULL) {
+            log_nat_control_not_sent(client_name, tcp_routes, http_routes, json_bytes);
+            result = ST_ADMIN_NAT_CONTROL_NOT_SENT;
+        } else if (session_send_packet(control, &packet) != 0) {
             result = -2;
         } else {
             printf("[nat-control] runtime push client=%s tcp=%zu http=%zu\n",
@@ -2775,7 +2793,6 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
                    http_routes);
         }
     } else {
-        st_buffer_free(&packet);
         /* An unprepared copy holds nothing and a prepared one only its own set: both can be released. */
         config_release_routes(&refreshed_control);
         config_release_routes(&refreshed_data);
@@ -5029,6 +5046,8 @@ static void *client_thread(void *arg)
             int control_login = !session->is_data_connection;
             st_buffer nat_control = {0};
             size_t nat_control_tcp_routes = 0U;
+            size_t nat_control_http_routes = 0U;
+            size_t nat_control_json_bytes = 0U;
             if (control_login) {
                 pthread_mutex_lock(&control_admission_lock);
             }
@@ -5037,6 +5056,9 @@ static void *client_thread(void *arg)
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                              session->config.nat_control_json);
                 nat_control_tcp_routes = session->config.mapping_count;
+                nat_control_http_routes = session->config.http_route_count;
+                nat_control_json_bytes = session->config.nat_control_json == NULL
+                    ? 0U : strlen(session->config.nat_control_json);
             }
             pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
@@ -5058,7 +5080,9 @@ static void *client_thread(void *arg)
                 reason);
             int response_rc = session_send_packet_locked(session, &response);
             int nat_control_rc = 0;
-            if (response_rc == 0 && logged_in && control_login) {
+            /* A NAT_CONTROL that does not fit one MESSAGE could not be encoded; it is not sent. */
+            int nat_control_sent = nat_control.data != NULL;
+            if (response_rc == 0 && logged_in && control_login && nat_control_sent) {
                 nat_control_rc = session_send_packet_locked(session, &nat_control);
             } else {
                 st_buffer_free(&nat_control);
@@ -5092,8 +5116,17 @@ static void *client_thread(void *arg)
                     st_login_request_free(&request);
                     break;
                 }
-                printf("[nat-control] pushed %zu tcp route(s) to %s\n",
-                       nat_control_tcp_routes, session->config.client_name);
+                /*
+                 * One that was not sent is only logged: the login stands and the Peer Mesh push below
+                 * still runs. Closing the connection had the client log in again into the same failure.
+                 */
+                if (nat_control_sent) {
+                    printf("[nat-control] pushed %zu tcp route(s) to %s\n",
+                           nat_control_tcp_routes, session->config.client_name);
+                } else {
+                    log_nat_control_not_sent(session->config.client_name, nat_control_tcp_routes,
+                                             nat_control_http_routes, nat_control_json_bytes);
+                }
                 if (session->config.database_path[0] != '\0') {
                     st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
                     if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {

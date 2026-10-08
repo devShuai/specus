@@ -8051,16 +8051,19 @@ static int handle_peer_mesh_acl_delete(const st_admin_context *context, long lon
  * NAT_CONTROL reaches the client as one MESSAGE_RESPONSE, whose body protocol/spec/control-protocol.md
  * caps at 1 MiB (ST_MAX_MESSAGE_BODY_SIZE). main.c builds it (build_nat_control_json) from the
  * client's enabled mappings and routes plus SPECUS_TCP_MAPPINGS and SPECUS_HTTP_ROUTES. A change
- * that takes it past the cap could be stored but never sent, and every control login of the
- * client would then fail, so the management API refuses that change instead. The client's name is
- * counted at the longest a rename can make it, 120 characters of up to 4 UTF-8 bytes in the
- * message and up to 6 bytes (a backslash-u escape) in the JSON, so no later rename pushes an
- * accepted configuration over.
+ * that takes it past the cap could be stored but never sent, so the management API refuses that
+ * change instead. The client's name is counted at the longest a rename can make it, 120 characters
+ * of up to 4 UTF-8 bytes in the message and up to 6 bytes (a backslash-u escape) in the JSON, so no
+ * later rename pushes an accepted configuration over. A configuration stored past the cap before
+ * this check, or straight to the database, is not sent: the login and the runtime push only log it,
+ * and the manual push answers 409 with ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY.
  */
 #define ST_ADMIN_NAT_CONTROL_NAME_BYTES (120U * 4U)
 #define ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES (120U * 6U)
 #define ST_ADMIN_NAT_CONTROL_TOO_LARGE_BODY \
     "{\"error\":\"客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端\"}"
+#define ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY \
+    "{\"error\":\"客户端的 TCP 映射和 HTTP route 超过单条 NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端\"}"
 
 static size_t admin_varint_size(size_t value)
 {
@@ -8293,6 +8296,10 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
                  "{\"pushed\":%d,\"specusMappings\":%d,\"httpRoutes\":%d}",
                  enabled_mappings, enabled_mappings, route_count == 0U ? -1 : enabled_routes);
         return write_response(out, out_len, 200, "OK", response);
+    }
+    if (push_result == ST_ADMIN_NAT_CONTROL_NOT_SENT) {
+        /* Nothing was sent and the connection is kept; the caller must not take it as pushed. */
+        return write_response(out, out_len, 409, "Conflict", ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY);
     }
     return push_result == -1
         ? write_response(out,

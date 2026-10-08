@@ -28,6 +28,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#ifndef ST_NAT_CONTROL_SIZE_VECTOR_FILE
+#define ST_NAT_CONTROL_SIZE_VECTOR_FILE "../../../protocol/test-vectors/nat-control-size-v1.json"
+#endif
+
 #define CREDENTIAL_KEY "ck_route_scale"
 #define CREDENTIAL_SECRET "route-scale-secret"
 #define FINGERPRINT "machine-route-scale"
@@ -651,6 +655,235 @@ static int scenario_nat_control_message_limit(test_server *server)
     return 0;
 }
 
+static char *read_file(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    char *text = NULL;
+    long size = fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
+    if (size > 0 && fseek(file, 0, SEEK_SET) == 0) {
+        text = (char *)malloc((size_t)size + 1U);
+        if (text != NULL && fread(text, 1, (size_t)size, file) == (size_t)size) {
+            text[size] = '\0';
+        } else {
+            free(text);
+            text = NULL;
+        }
+    }
+    fclose(file);
+    return text;
+}
+
+/*
+ * A heartbeat round trip on the control connection: 0 once its answer arrives, -1 when the
+ * connection closed or nothing came in time. NAT_CONTROL frames that came before the answer are
+ * added to *nat_controls, the first one's JSON kept in *first_nat_json, and *peer_config is set when
+ * a Peer Mesh peer-config came. The server writes a push before it answers a later heartbeat, so a
+ * round after a management call sees whatever that call sent.
+ */
+static int control_round(int fd, int *nat_controls, int *peer_config, char **first_nat_json)
+{
+    st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
+    if (send_buffer(fd, &heartbeat) != 0) {
+        return -1;
+    }
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0) {
+            return -1;
+        }
+        st_frame_header header;
+        uint8_t *body = NULL;
+        if (read_frame(fd, (int)remaining, &header, &body) != 1) {
+            return -1;
+        }
+        if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
+            free(body);
+            return 0;
+        }
+        st_message_response message;
+        if (header.command != ST_CMD_MESSAGE_RESPONSE
+            || st_protocol_decode_message_response(body, header.length, &message) != 0) {
+            free(body);
+            continue;
+        }
+        free(body);
+        if (message.message_type == ST_MESSAGE_TYPE_NAT_CONTROL) {
+            ++*nat_controls;
+            if (*first_nat_json == NULL) {
+                *first_nat_json = message.message;
+                message.message = NULL;
+            }
+        } else if (message.message_type == ST_MESSAGE_TYPE_PEER_CONTROL && message.message != NULL) {
+            char *type = st_json_get_top_level_string(message.message, "type");
+            *peer_config = *peer_config || (type != NULL && strcmp(type, "peer-config") == 0);
+            free(type);
+        }
+        st_message_response_free(&message);
+    }
+}
+
+/*
+ * Replays existingOversize of protocol/test-vectors/nat-control-size-v1.json: routes written straight
+ * to the database take the client's NAT_CONTROL past the 1 MiB MESSAGE body. The control login stands
+ * and the Peer Mesh login push still arrives, the manual pushes answer 409, route changes are stored
+ * and answered as usual, and nothing reaches the connection, which stays open, until the configuration
+ * is back within the limit. Before, the login closed the connection without the Peer Mesh push, and
+ * the client logged in again into the same failure.
+ */
+static int scenario_existing_oversize_nat_control(test_server *server)
+{
+    char *vector = read_file(ST_NAT_CONTROL_SIZE_VECTOR_FILE);
+    char *scenario = vector == NULL ? NULL : st_json_get_top_level_raw(vector, "existingOversize");
+    char *error_contains = vector == NULL ? NULL : st_json_get_top_level_string(vector, "errorContains");
+    free(vector);
+    int json_bytes = 0;
+    int target_bytes = 0;
+    char **steps = NULL;
+    size_t step_count = 0U;
+    int loaded = scenario != NULL && error_contains != NULL
+        && st_json_get_int(scenario, "jsonBytesWithEmptyClientName", &json_bytes) == 0
+        && st_json_get_int(scenario, "fillTargetBaseUrlMaxBytes", &target_bytes) == 0
+        && st_json_get_raw_array(scenario, "steps", &steps, &step_count) == 0;
+    free(scenario);
+    CHECK(loaded && json_bytes > 0 && target_bytes > 32 && target_bytes < 512,
+          "cannot read existingOversize of %s", ST_NAT_CONTROL_SIZE_VECTOR_FILE);
+
+    scale_client c;
+    scale_client_init(&c, server);
+    CHECK(admin_login(&c) == 0, "admin login");
+    CHECK(create_credential(server->db_path, CREDENTIAL_KEY, CREDENTIAL_SECRET, 2) == 0, "credential not stored");
+    char *login = NULL;
+    CHECK(client_login(&c, &login) == 0, "client HTTP login");
+    free(login);
+
+    /* Enough routes that their targets alone take the NAT_CONTROL JSON past jsonBytes. */
+    char target[512];
+    const char *origin = "http://127.0.0.1:8080/";
+    size_t origin_len = strlen(origin);
+    memcpy(target, origin, origin_len);
+    memset(target + origin_len, 'f', (size_t)target_bytes - origin_len);
+    target[target_bytes] = '\0';
+    int fill_count = (json_bytes + target_bytes - 1) / target_bytes;
+    CHECK(insert_routes(server->db_path, c.runtime.client_name, "fill", fill_count, target, 1) == 0,
+          "routes could not be written to the database");
+
+    int nat_controls = 0;
+    int peer_config = 0;
+    char *first_nat = NULL;
+    int next_fill = 1;
+    int failed = 0;
+    for (size_t i = 0; i < step_count && !failed; ++i) {
+        char *op = st_json_get_string(steps[i], "op");
+        int expect = 0;
+        int nat_control_expected = 0;
+        (void)st_json_get_int(steps[i], "expect", &expect);
+        (void)st_json_get_bool(steps[i], "natControl", &nat_control_expected);
+        char path[192];
+        int status = 0;
+        char *answer = NULL;
+        int called = 0;
+        if (op != NULL && strcmp(op, "connect") == 0) {
+            char reason[256];
+            int rc = channel_login(server->control_port, &c.runtime, "control", &c.control, reason, sizeof(reason));
+            if (rc != 1) {
+                fprintf(stderr, "FAIL step %zu: control login: %s\n", i, reason);
+                failed = 1;
+            }
+        } else if (op != NULL && (strcmp(op, "pushNatControl") == 0 || strcmp(op, "forceRefreshPortMapping") == 0)) {
+            snprintf(path, sizeof(path), "/api/admin/clients/%lld/%s", c.runtime.client_id,
+                     strcmp(op, "pushNatControl") == 0 ? "nat-control" : "force-refresh-port-mapping");
+            called = http_request(server->admin_port, "POST", path, NULL, c.admin_token, &status, &answer) == 0;
+        } else if (op != NULL && strcmp(op, "createRoute") == 0) {
+            char *route = st_json_get_string(steps[i], "route");
+            char *route_target = st_json_get_string(steps[i], "targetBaseUrl");
+            int enabled = 1;
+            (void)st_json_get_bool(steps[i], "enabled", &enabled);
+            char body[512];
+            snprintf(body, sizeof(body), "{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"enabled\":%s}",
+                     route == NULL ? "" : route, route_target == NULL ? "" : route_target,
+                     enabled ? "true" : "false");
+            free(route);
+            free(route_target);
+            snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", c.runtime.client_id);
+            called = http_request(server->admin_port, "POST", path, body, c.admin_token, &status, &answer) == 0;
+        } else if (op != NULL && strcmp(op, "deleteFillRoute") == 0) {
+            char route[32];
+            long long route_id = 0;
+            snprintf(route, sizeof(route), "fill-%04d", next_fill++);
+            if (find_route_id(server->db_path, c.runtime.client_name, route, &route_id) != 0) {
+                fprintf(stderr, "FAIL step %zu: %s has no id\n", i, route);
+                failed = 1;
+            } else {
+                snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", route_id);
+                called = http_request(server->admin_port, "DELETE", path, NULL, c.admin_token, &status, &answer) == 0;
+            }
+        } else if (op != NULL && strcmp(op, "shrinkInStore") == 0) {
+            sqlite3 *db = NULL;
+            sqlite3_stmt *stmt = NULL;
+            int rc = -1;
+            if (sqlite3_open(server->db_path, &db) == SQLITE_OK) {
+                sqlite3_busy_timeout(db, 5000);
+                if (sqlite3_prepare_v2(db,
+                                       "UPDATE http_route_mapping SET enabled = 0 "
+                                       "WHERE client_name = ? AND route LIKE 'fill-%'",
+                                       -1, &stmt, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, c.runtime.client_name, -1, SQLITE_TRANSIENT);
+                    rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+                }
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            if (rc != 0) {
+                fprintf(stderr, "FAIL step %zu: the routes could not be disabled in the database\n", i);
+                failed = 1;
+            }
+        } else {
+            fprintf(stderr, "FAIL step %zu: unknown op %s\n", i, op == NULL ? "(none)" : op);
+            failed = 1;
+        }
+
+        if (!failed && expect != 0) {
+            if (!called || status != expect) {
+                fprintf(stderr, "FAIL step %zu %s: answered %d, expected %d: %.300s\n", i, op, status, expect,
+                        answer == NULL ? "(no response)" : answer);
+                failed = 1;
+            } else if (status == 409 && (answer == NULL || strstr(answer, error_contains) == NULL)) {
+                fprintf(stderr, "FAIL step %zu %s: the 409 does not name %s: %.300s\n", i, op, error_contains,
+                        answer == NULL ? "" : answer);
+                failed = 1;
+            }
+        }
+        free(answer);
+        if (!failed && control_round(c.control, &nat_controls, &peer_config, &first_nat) != 0) {
+            fprintf(stderr, "FAIL step %zu %s: the control connection is no longer served\n", i, op);
+            failed = 1;
+        }
+        if (!failed && strcmp(op, "connect") == 0 && !peer_config) {
+            fprintf(stderr, "FAIL step %zu: no Peer Mesh login push arrived\n", i);
+            failed = 1;
+        }
+        if (!failed && nat_control_expected
+            && (nat_controls == 0 || first_nat == NULL || strstr(first_nat, "\"fill-") != NULL)) {
+            fprintf(stderr, "FAIL step %zu %s: %d NAT_CONTROL(s), the first %s\n", i, op, nat_controls,
+                    first_nat == NULL ? "missing" : "still listing the database routes");
+            failed = 1;
+        } else if (!failed && !nat_control_expected && nat_controls != 0) {
+            fprintf(stderr, "FAIL step %zu %s: %d NAT_CONTROL(s) reached the client\n", i, op, nat_controls);
+            failed = 1;
+        }
+        free(op);
+    }
+    free(first_nat);
+    free(error_contains);
+    st_json_free_string_array(steps, step_count);
+    scale_client_close(&c);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -665,6 +898,13 @@ int main(int argc, char **argv)
     int failures = 0;
     failures += run_on_fresh_server("hundred-mappings-and-routes", scenario_hundred_mappings_and_routes, NULL);
     failures += run_on_fresh_server("nat-control-message-limit", scenario_nat_control_message_limit, NULL);
+    /* Peer Mesh on for its login push, its STUN/TURN listener on an ephemeral loopback port. */
+    static const char *const peer_mesh[] = {
+        "SPECUS_PEER_MESH_ENABLED=true", "SPECUS_PEER_MESH_STUN_TURN_PORT=0",
+        "SPECUS_PEER_MESH_BIND_ADDRESS=127.0.0.1", NULL,
+    };
+    failures += run_on_fresh_server("nat-control-existing-oversize", scenario_existing_oversize_nat_control,
+                                    peer_mesh);
     if (failures != 0) {
         fprintf(stderr, "%d client route scale scenario(s) failed\n", failures);
         return 1;

@@ -3310,6 +3310,8 @@ public final class SpecusCore {
         private boolean requestEnded;
         private volatile NettyHttpTransport connection;
         private volatile boolean responseCompleted;
+        /** Completes once the response FIN has been written; set before responseCompleted. */
+        private volatile CompletableFuture<Void> responseFin;
 
         /**
          * A queued response chunk failed to reach the control channel. The upstream connection is
@@ -3463,12 +3465,13 @@ public final class SpecusCore {
 
                             @Override
                             public void onResponseEnd(List<String> trailers) throws Exception {
-                                control.submitHttpFin(streamId, trailers)
-                                        .whenComplete((ignored, error) -> {
-                                            if (error != null) {
-                                                failResponseWrite(error);
-                                            }
-                                        });
+                                CompletableFuture<Void> fin = control.submitHttpFin(streamId, trailers);
+                                fin.whenComplete((ignored, error) -> {
+                                    if (error != null) {
+                                        failResponseWrite(error);
+                                    }
+                                });
+                                responseFin = fin;
                                 responseCompleted = true;
                                 requestQueue.clear();
                                 requestQueue.offer(RequestChunk.CANCELLED);
@@ -3492,10 +3495,24 @@ public final class SpecusCore {
                 if (opened != null) {
                     opened.close();
                 }
-                if (completed && upstreamLifecycle.close()
-                        && closed.compareAndSet(false, true)) {
-                    control.completeHttpStream(streamId, this);
+                if (completed) {
+                    // The FIN is queued behind response DATA that may still be waiting for the
+                    // peer's credit. Completing the stream closes its send window, which discards
+                    // whatever is still queued, so it has to wait until the FIN is out. A FIN that
+                    // fails was overtaken by a reset or a closing connection, and whoever did that
+                    // releases the stream.
+                    responseFin.whenComplete((ignored, error) -> {
+                        if (error == null) {
+                            completeAfterResponse();
+                        }
+                    });
                 }
+            }
+        }
+
+        private void completeAfterResponse() {
+            if (upstreamLifecycle.close() && closed.compareAndSet(false, true)) {
+                control.completeHttpStream(streamId, this);
             }
         }
 

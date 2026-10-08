@@ -328,16 +328,20 @@ final class StreamFlowScheduler implements Closeable {
                     throw new IOException("stream send window closed");
                 }
                 if (!state.abortTerminal) {
+                    Pending graceful = terminal;
+                    // The reset becomes the stream's terminal before the graceful one is failed:
+                    // failing it runs submitFinish's release, which would otherwise find a done
+                    // terminal and an empty queue, drop the stream, and strand the reset.
+                    terminal = Pending.terminal(action);
+                    state.terminal = terminal;
+                    state.abortTerminal = true;
                     IOException superseded = new IOException(
                             "stream reset superseded graceful close");
                     failPending(state, superseded);
                     // The graceful terminal may already have been dequeued by the worker. Its
                     // physical FIN cannot be unsent, but the RST must still follow it instead of
                     // being silently discarded.
-                    terminal.completion.completeExceptionally(superseded);
-                    terminal = Pending.terminal(action);
-                    state.terminal = terminal;
-                    state.abortTerminal = true;
+                    graceful.completion.completeExceptionally(superseded);
                     state.pending.addLast(terminal);
                     schedule(streamId, state);
                     lock.notifyAll();

@@ -52,6 +52,7 @@ final class FakeTunnelClient implements AutoCloseable {
 
     private final EventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
     private final List<JsonNode> natControls = new CopyOnWriteArrayList<>();
+    private final List<JsonNode> peerControls = new CopyOnWriteArrayList<>();
     private final Set<Integer> httpStreams = ConcurrentHashMap.newKeySet();
     private final AtomicInteger opens;
     private final Response response;
@@ -107,6 +108,16 @@ final class FakeTunnelClient implements AutoCloseable {
     /** Every NAT_CONTROL body received on the control connection, in order. */
     List<JsonNode> natControls() {
         return natControls;
+    }
+
+    /** Every PEER_CONTROL body received on the control connection, in order. */
+    List<JsonNode> peerControls() {
+        return peerControls;
+    }
+
+    /** Whether the control connection is still open. */
+    boolean controlOpen() {
+        return control.isActive();
     }
 
     /** Whether the server closed both connections within {@code timeout}. */
@@ -207,6 +218,9 @@ final class FakeTunnelClient implements AutoCloseable {
             } else if (packet instanceof MessageResponsePacket message
                     && message.getMessageType() == MessageType.NAT_CONTROL) {
                 natControls.add(JSON.readTree(message.getMessage()));
+            } else if (packet instanceof MessageResponsePacket message
+                    && message.getMessageType() == MessageType.PEER_CONTROL) {
+                peerControls.add(JSON.readTree(message.getMessage()));
             } else if (packet instanceof NatMessagePacket nat) {
                 onNatMessage(ctx, nat);
             }

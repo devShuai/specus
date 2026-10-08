@@ -81,6 +81,18 @@ Run the local JVM protocol suite with:
 
 Current local JVM result: 153/153 tests across 16 suites. This covers protocol/codec, runtime-session reconnect policy, bounded pre-connect buffering/tombstones, strict stream credit/outstanding accounting, DATA/FIN/RST ordering and identity reuse, 16 MiB WebSocket frame normalization, pending-write bounds and pre-start cancellation, UDP probe time/replay checks and endpoint hysteresis, port-mapping stop/acquire/renew races and late-winner cleanup, strict update-catalogue parsing and scheduling, TLS timeout/cancellation, and state-machine behavior. `test` and `lint` also pass with zero lint errors. It does not cover Android hardware/VPN or cross-NAT validation.
 
+### The client core as a command on a plain JVM
+
+The C server's end-to-end scripts run each client as a command (`SPECUS_CLIENT_COMMAND`) with `run --config <client.jsonc> --no-update-check`. `JvmClientMain` in the unit-test sources gives the Android client the same entry: it runs `SpecusCore.Runtime` -- HTTP login, control/data, Direct HTTP and WebSocket -- with an in-memory stand-in for `Context` and no VPN platform (`peerMeshDevice=noop`), on the unit-test classpath (Netty, org.json and the mockable `android.jar`).
+
+```sh
+./gradlew :app:jvmClientLauncher
+SPECUS_CLIENT_COMMAND="$PWD/app/build/jvm-client/specus-android-jvm-client" SPECUS_CLIENT_LABEL=Android \
+  bash ../../c/server/scripts/direct_route_e2e.sh
+```
+
+`app/build/jvm-client/classpath.txt` holds the same classpath with the platform separator for other launchers. CI runs `direct_route_e2e.sh` this way in the C server (Linux) job. Nothing Android-specific (services, VPN, UI broadcasts) is exercised.
+
 ## Run
 
 Install `app/build/outputs/apk/debug/app-debug.apk`, open **specus**, paste a `client.jsonc`-compatible config, save, then press **Start**. Android shows the system VPN permission dialog only when `peerMeshDevice` is not `noop`; TCP/HTTP-only and `noop` starts go directly to the foreground service.

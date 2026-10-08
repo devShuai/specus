@@ -3,6 +3,7 @@ package com.theshuai.common.protocol;
 import com.theshuai.common.command.Command;
 import com.theshuai.common.protocol.request.HeartBeatRequestPacket;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
+import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.serialize.SerializerAlgorithm;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -74,6 +75,26 @@ class PacketCodecV2Tests {
                     ProtocolException.class,
                     () -> PacketCodec.INSTANCE.encode(encoded, packet));
             assertEquals(ProtocolException.Reason.INVALID_LENGTH, exception.getReason());
+        } finally {
+            encoded.release();
+        }
+    }
+
+    // A MESSAGE over the 1 MiB body limit, such as a NAT_CONTROL past it, leaves no header behind.
+    @Test
+    void shouldLeaveTheBufferAsItWasWhenAMessageIsTooLarge() {
+        MessageResponsePacket packet = new MessageResponsePacket();
+        packet.setClientName("client");
+        packet.setMessageType(MessageType.NAT_CONTROL);
+        packet.setMessage("x".repeat(PacketCodec.MAX_MESSAGE_BODY_BYTES));
+        ByteBuf encoded = Unpooled.buffer();
+        try {
+            encoded.writeByte(7);
+            ProtocolException exception = assertThrows(
+                    ProtocolException.class,
+                    () -> PacketCodec.INSTANCE.encode(encoded, packet));
+            assertEquals(ProtocolException.Reason.INVALID_LENGTH, exception.getReason());
+            assertEquals(1, encoded.writerIndex());
         } finally {
             encoded.release();
         }

@@ -22,7 +22,13 @@ public class PacketCodecHandler extends MessageToMessageCodec<ByteBuf, Packet> {
     @Override
     protected void encode(ChannelHandlerContext ctx, Packet packet, List<Object> out) throws Exception {
         ByteBuf byteBuf = ctx.channel().alloc().ioBuffer();
-        PacketCodec.INSTANCE.encode(byteBuf, packet);
+        try {
+            PacketCodec.INSTANCE.encode(byteBuf, packet);
+        } catch (Exception failure) {
+            // Not handed on, so nothing else would release it; the write fails with the exception.
+            byteBuf.release();
+            throw failure;
+        }
         out.add(byteBuf);
     }
 
