@@ -943,6 +943,71 @@ static void query_text(const char *path, const char *sql, char *out, size_t out_
     sqlite3_close(db);
 }
 
+/* The file change counter of the database header: one up for every transaction that wrote. */
+static long file_change_counter(const char *path)
+{
+    unsigned char header[28];
+    FILE *file = fopen(path, "rb");
+    size_t got = file == NULL ? 0U : fread(header, 1U, sizeof(header), file);
+    if (file != NULL) {
+        fclose(file);
+    }
+    return got == sizeof(header)
+        ? (long)(((unsigned long)header[24] << 24) | ((unsigned long)header[25] << 16)
+                 | ((unsigned long)header[26] << 8) | (unsigned long)header[27])
+        : -1L;
+}
+
+/*
+ * st_storage_init runs before many requests, every Direct HTTP one among them, and each write it
+ * makes waits for its journal syncs. A new database is therefore created in one transaction, and a
+ * current one is not written at all: the seeded demo client draws no id from the AUTOINCREMENT
+ * sequence, and a connection record whose tenant is right is not rewritten. One whose tenant is
+ * not, as recorded by name before its client was known, is still moved to its client's tenant.
+ */
+static int test_init_writes_nothing_on_a_current_database(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "init-writes");
+    int failed = st_storage_init(path, 1) != 0;
+    long counter = failed ? -1L : file_change_counter(path);
+    if (!failed && counter != 1L) {
+        fprintf(stderr, "a new database took %ld write transactions, expected 1\n", counter);
+        failed = 1;
+    }
+    st_storage_client acme;
+    failed = failed || st_storage_upsert_client(path, 0, "acme", "acme-client", "admin", 1, 60, &acme) != 0
+        || st_storage_record_connection(path, "Demo client", 1, NULL, "2026-10-08T00:00:00.000Z") != 0
+        || st_storage_record_connection(path, "acme-client", 1, NULL, "2026-10-08T00:00:01.000Z") != 0
+        || st_storage_init(path, 1) != 0;
+    char tenant[64];
+    query_text(path, "SELECT tenant_id FROM connection_record WHERE client_name = 'acme-client'", tenant,
+               sizeof(tenant));
+    if (!failed && strcmp(tenant, "acme") != 0) {
+        fprintf(stderr, "a record stored under the default tenant was not moved to acme, got '%s'\n", tenant);
+        failed = 1;
+    }
+    counter = file_change_counter(path);
+    long long sequence = query_int(path, "SELECT seq FROM sqlite_sequence WHERE name = 'client_account'");
+    for (int i = 0; !failed && i < 3; ++i) {
+        failed = st_storage_init(path, 1) != 0;
+    }
+    long after = file_change_counter(path);
+    long long sequence_after = query_int(path, "SELECT seq FROM sqlite_sequence WHERE name = 'client_account'");
+    if (!failed && (after != counter || sequence_after != sequence)) {
+        fprintf(stderr, "init wrote to a current database: change counter %ld -> %ld, id sequence %lld -> %lld\n",
+                counter, after, sequence, sequence_after);
+        failed = 1;
+    }
+    if (!failed && (query_int(path, "SELECT COUNT(*) FROM client_account WHERE client_name = 'Demo client'") != 1
+                    || query_int(path, "SELECT COUNT(*) FROM connection_record WHERE tenant_id = 'default'") != 1)) {
+        fprintf(stderr, "the demo client or its default-tenant record changed\n");
+        failed = 1;
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
 /*
  * client_account used to be keyed by client_name with the rowid as account id, and SQLite gives a
  * freed newest rowid to the next account. The migration keeps every id, retires the ids other
@@ -1274,6 +1339,9 @@ int main(void)
         return 1;
     }
     if (test_connection_archive_window() != 0) {
+        return 1;
+    }
+    if (test_init_writes_nothing_on_a_current_database() != 0) {
         return 1;
     }
     if (test_client_session_lifecycle_queries() != 0) {

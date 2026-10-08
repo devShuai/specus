@@ -1731,7 +1731,7 @@ static int check_pending_stream_limit(test_server *server, client_pair *pair)
         failed = send_nat(pair->data, ST_NAT_FIN, 0U, streams[i], 0U, NULL, NULL, 0U) != 0;
     }
     for (size_t i = 0U; !failed && i < PENDING_STREAM_LIMIT; ++i) {
-        /* Every finished request writes its traffic records at once, so closing can take a while. */
+        /* All 1024 responses finish at once, so the later ones get more than the usual I/O timeout. */
         failed = expect_browser_status_within(browsers[i], 60000, 200, NULL, 1) != 0;
         if (failed) {
             fprintf(stderr, "pending stream %zu did not complete\n", i);

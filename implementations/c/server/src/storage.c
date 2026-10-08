@@ -586,7 +586,9 @@ static int migrate_management_login_names(sqlite3 *db, char *error, size_t error
             return 0;
         }
     }
-    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) {
+    /* Inside the transaction st_storage_init creates a new database in, a savepoint of its own. */
+    int nested = !sqlite3_get_autocommit(db);
+    if (exec_sql(db, nested ? "SAVEPOINT login_names" : "BEGIN IMMEDIATE") != 0) {
         set_migration_error(error, error_len, "cannot lock the database");
         return -1;
     }
@@ -610,14 +612,24 @@ static int migrate_management_login_names(sqlite3 *db, char *error, size_t error
         rc = -1;
     }
     free_login_name_rows(rows, count);
-    if (rc == 0 && exec_sql(db, "COMMIT") != 0) {
+    if (rc == 0 && exec_sql(db, nested ? "RELEASE login_names" : "COMMIT") != 0) {
         set_migration_error(error, error_len, "cannot commit the login-name backfill");
         rc = -1;
     }
     if (rc != 0) {
-        (void)exec_sql(db, "ROLLBACK");
+        (void)exec_sql(db, nested ? "ROLLBACK TO login_names; RELEASE login_names" : "ROLLBACK");
     }
     return rc;
+}
+
+/* 1 when the database holds no table, index or view yet, 0 when it does, -1 when it cannot be read. */
+static int database_is_empty(sqlite3 *db)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master LIMIT 1", -1, &stmt, NULL) == SQLITE_OK
+        ? sqlite3_step(stmt) : SQLITE_ERROR;
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 1 : rc == SQLITE_ROW ? 0 : -1;
 }
 
 int st_storage_migrate_management_login_names(const char *path, char *error, size_t error_len)
@@ -632,10 +644,31 @@ int st_storage_migrate_management_login_names(const char *path, char *error, siz
     return rc;
 }
 
+/* The tenant a connection record belongs to: its client's, found by id or, for old rows, by name. */
+#define CONNECTION_RECORD_CLIENT_TENANT                                                              \
+    "COALESCE(("                                                                                     \
+    "SELECT c.tenant_id FROM client_account c "                                                      \
+    "WHERE c.rowid = connection_record.client_id LIMIT 1"                                            \
+    "), ("                                                                                           \
+    "SELECT c.tenant_id FROM client_account c "                                                      \
+    "WHERE connection_record.client_id IS NULL AND c.client_name = connection_record.client_name LIMIT 1" \
+    "), tenant_id, 'default')"
+
 int st_storage_init(const char *path, int seed_demo_client)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    /*
+     * A new database gets its whole schema in one write transaction: one journal and one round of
+     * syncs instead of one per statement, about a hundred. An existing database runs every step on
+     * its own as before, since a transaction around a migration with nothing to do would only hold
+     * the other writers off.
+     */
+    int fresh = database_is_empty(db);
+    if (fresh < 0 || (fresh && exec_sql(db, "BEGIN IMMEDIATE") != 0)) {
+        sqlite3_close(db);
         return -1;
     }
 
@@ -1330,16 +1363,16 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "peer_mesh_device", "nat_behavior_discovery", "TEXT");
     }
     if (rc == 0) {
+        /*
+         * Only rows whose tenant changes are written: setting a row to the tenant it already has
+         * is still a write, and every Direct HTTP request runs this function, so each one would
+         * otherwise rewrite every default-tenant record and wait for its journal syncs.
+         */
         rc = exec_sql(db,
             "UPDATE connection_record "
-            "SET tenant_id = COALESCE(("
-            "SELECT c.tenant_id FROM client_account c "
-            "WHERE c.rowid = connection_record.client_id LIMIT 1"
-            "), ("
-            "SELECT c.tenant_id FROM client_account c "
-            "WHERE connection_record.client_id IS NULL AND c.client_name = connection_record.client_name LIMIT 1"
-            "), tenant_id, 'default') "
-            "WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default';");
+            "SET tenant_id = " CONNECTION_RECORD_CLIENT_TENANT " "
+            "WHERE (tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default') "
+            "AND tenant_id IS NOT " CONNECTION_RECORD_CLIENT_TENANT ";");
     }
     if (rc == 0) {
         rc = exec_sql(db,
@@ -1493,9 +1526,14 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit(tenant_id, route_id, id);");
     }
     if (rc == 0 && seed_demo_client) {
+        /*
+         * Not a plain INSERT OR IGNORE: an ignored row still draws an id from the AUTOINCREMENT
+         * sequence, so every call would burn a client id and write sqlite_sequence.
+         */
         sqlite3_stmt *stmt = NULL;
         rc = sqlite3_prepare_v2(db,
-            "INSERT OR IGNORE INTO client_account(tenant_id, client_name, owner_username, enabled) VALUES('default',?,'admin',1)",
+            "INSERT OR IGNORE INTO client_account(tenant_id, client_name, owner_username, enabled) "
+            "SELECT 'default',?1,'admin',1 WHERE NOT EXISTS (SELECT 1 FROM client_account WHERE client_name = ?1)",
             -1,
             &stmt,
             NULL);
@@ -1506,6 +1544,12 @@ int st_storage_init(const char *path, int seed_demo_client)
             rc = -1;
         }
         sqlite3_finalize(stmt);
+    }
+    if (fresh && rc == 0) {
+        rc = exec_sql(db, "COMMIT");
+    }
+    if (fresh && rc != 0) {
+        (void)exec_sql(db, "ROLLBACK");
     }
 
     sqlite3_close(db);
