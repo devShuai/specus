@@ -3,11 +3,31 @@ package com.theshuai.specusserver.management.controller;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
+import com.theshuai.specusserver.management.model.ClientAccount;
+import com.theshuai.specusserver.management.model.ClientCredential;
 import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.model.ManagementUser;
 import com.theshuai.specusserver.management.model.ManagementUserEmail;
+import com.theshuai.specusserver.management.model.PeerMeshAcl;
+import com.theshuai.specusserver.management.model.PeerMeshDevice;
+import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
+import com.theshuai.specusserver.management.model.SortableInstant;
+import com.theshuai.specusserver.management.model.TransferAttachment;
+import com.theshuai.specusserver.management.model.TransferAttachmentDownloadGrant;
+import com.theshuai.specusserver.management.model.TransferAttachmentDownloadUsage;
+import com.theshuai.specusserver.management.model.UserDiagramDocument;
+import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.repository.ClientCredentialRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
+import com.theshuai.specusserver.management.repository.TransferAttachmentDownloadGrantRepository;
+import com.theshuai.specusserver.management.repository.TransferAttachmentDownloadUsageRepository;
+import com.theshuai.specusserver.management.repository.TransferAttachmentRepository;
+import com.theshuai.specusserver.management.repository.UserDiagramDocumentRepository;
+import com.theshuai.specusserver.management.service.TransferAttachmentService;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.PasswordService;
 import org.junit.jupiter.api.BeforeEach;
@@ -65,6 +85,15 @@ class ManagementAccountsHttpTests {
     @Autowired private LocalTokenService localTokenService;
     @Autowired private ManagementUserRepository userRepository;
     @Autowired private ManagementUserEmailRepository emailRepository;
+    @Autowired private ClientAccountRepository clients;
+    @Autowired private ClientCredentialRepository credentials;
+    @Autowired private UserDiagramDocumentRepository diagrams;
+    @Autowired private TransferAttachmentRepository attachments;
+    @Autowired private TransferAttachmentDownloadGrantRepository grants;
+    @Autowired private TransferAttachmentDownloadUsageRepository usage;
+    @Autowired private PeerMeshAclRepository acls;
+    @Autowired private PeerMeshEgressPolicyRepository policies;
+    @Autowired private PeerMeshDeviceRepository devices;
 
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
@@ -181,7 +210,306 @@ class ManagementAccountsHttpTests {
         assertThat(userRepository.findById("0f1e2d3c-4b5a-4968-8776-655443322110")).isEmpty();
     }
 
+    @Test
+    void replaysTheAccountDeletionVector() throws IOException {
+        JsonNode deletion = readVector().get("accountDeletion");
+        for (JsonNode account : deletion.get("accounts")) {
+            seed(account.get("accountKey").asText(), account.get("loginName").asText(),
+                    account.get("tenantId").asText(), ManagementRole.valueOf(account.get("role").asText()));
+        }
+        JsonNode rows = deletion.get("seed");
+        seedDeletionRows(rows);
+        String actor = sign(deletion.get("actor"));
+        int index = 0;
+        for (JsonNode step : deletion.get("steps")) {
+            String name = "step " + index++ + " " + step;
+            JsonNode expect = step.get("expect");
+            if (step.has("deleteUser")) {
+                HttpResponse<String> response =
+                        send("DELETE", "/api/admin/users/" + step.get("deleteUser").asText(), actor, null);
+                assertThat(response.statusCode()).as(name + " " + response.body())
+                        .isEqualTo(expect.get("status").asInt());
+                if (response.statusCode() == 409) {
+                    JsonNode body = JSON.readTree(response.body());
+                    assertThat(body.path("error").asText()).as(name).isNotBlank();
+                    assertThat(body.path("clients").asLong(-1)).as(name).isEqualTo(expect.get("clients").asLong());
+                    assertThat(body.path("credentials").asLong(-1)).as(name)
+                            .isEqualTo(expect.get("credentials").asLong());
+                }
+            } else if (step.has("get")) {
+                HttpResponse<String> response = send("GET", step.get("get").asText(), sign(step.get("as")), null);
+                assertThat(response.statusCode()).as(name + " " + response.body())
+                        .isEqualTo(expect.get("status").asInt());
+                assertThat(JSON.readTree(response.body())).as(name).isEqualTo(expect.get("body"));
+            } else {
+                applyDeletionFixture(step);
+            }
+        }
+
+        JsonNode after = deletion.get("rowsAfter");
+        assertRows(rows, after, "clients", id -> clients.findById(id).map(ClientAccount::getOwnerUsername));
+        assertRows(rows, after, "credentials",
+                id -> credentials.findById(id).map(ClientCredential::getOwnerUsername));
+        assertRows(rows, after, "diagrams", id -> diagrams.findById(id).map(UserDiagramDocument::getOwnerUsername));
+        assertRows(rows, after, "downloadGrants",
+                id -> grants.findById(id).map(TransferAttachmentDownloadGrant::getUsername));
+        assertRows(rows, after, "downloadUsage",
+                id -> usage.findById(id).map(TransferAttachmentDownloadUsage::getUsername));
+        assertRows(rows, after, "acls", id -> acls.findById(id).map(PeerMeshAcl::getOwnerUsername));
+        assertRows(rows, after, "egressPolicies",
+                id -> policies.findById(id).map(PeerMeshEgressPolicy::getOwnerUsername));
+        assertRows(rows, after, "devices", id -> devices.findById(id).map(PeerMeshDevice::getOwnerUsername));
+        String now = SortableInstant.format(Instant.now());
+        assertRows(rows, after, "attachments", id -> attachments.findById(id).map(attachment -> {
+            boolean active = attachment.getExpiresAt().compareTo(now) > 0
+                    && (!"PENDING".equals(attachment.getStatus()) || attachment.getUploadExpiresAt().compareTo(now) > 0);
+            return attachment.getOwnerUsername() + (active ? " active" : " inactive");
+        }));
+
+        Map<String, List<String>> accounts = new java.util.TreeMap<>();
+        Map<String, List<String>> expectedAccounts = new java.util.TreeMap<>();
+        for (JsonNode account : deletion.get("accountsAfter")) {
+            expectedAccounts.computeIfAbsent(account.get("tenantId").asText(), tenant -> new ArrayList<>())
+                    .add(account.get("loginName").asText() + "=" + account.get("accountKey").asText());
+        }
+        for (String tenant : expectedAccounts.keySet()) {
+            for (ManagementUser user : userRepository.findByTenantIdOrderByLoginNameAsc(tenant)) {
+                accounts.computeIfAbsent(tenant, ignored -> new ArrayList<>())
+                        .add(user.getLoginName() + "=" + user.getUsername());
+            }
+        }
+        expectedAccounts.values().forEach(java.util.Collections::sort);
+        accounts.values().forEach(java.util.Collections::sort);
+        assertThat(accounts).isEqualTo(expectedAccounts);
+    }
+
+    @Test
+    void deletingAnAccountClosesItsManagementWebSockets() throws Exception {
+        seed("6b1e2f3a-4c5d-4e6f-8a7b-9c0d1e2f3a4b", "hana", "tenant-d", ManagementRole.ADMIN);
+        seed("7c2f3a4b-5d6e-4f70-9b8c-0d1e2f3a4b5c", "bob", "tenant-d", ManagementRole.USER);
+        String hana = sign(Map.of("sub", "hana", "tenant_id", "tenant-d", "role", "ADMIN",
+                LocalTokenService.ACCOUNT_KEY_CLAIM, "6b1e2f3a-4c5d-4e6f-8a7b-9c0d1e2f3a4b"));
+        String bob = sign(Map.of("sub", "bob", "tenant_id", "tenant-d", "role", "USER",
+                LocalTokenService.ACCOUNT_KEY_CLAIM, "7c2f3a4b-5d6e-4f70-9b8c-0d1e2f3a4b5c"));
+        Socket bobMessages = openManagementSocket(bob, "client-messages");
+        Socket bobEvents = openManagementSocket(bob, "connections");
+        Socket hanaMessages = openManagementSocket(hana, "client-messages");
+
+        assertThat(send("DELETE", "/api/admin/users/bob", hana, null).statusCode()).isEqualTo(204);
+
+        assertThat(bobMessages.closed().get(10, java.util.concurrent.TimeUnit.SECONDS)).isNotNull();
+        assertThat(bobEvents.closed().get(10, java.util.concurrent.TimeUnit.SECONDS)).isNotNull();
+        // Another identity's connection stays open: it still answers a ping.
+        hanaMessages.ping().get(10, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(hanaMessages.closed()).isNotDone();
+        hanaMessages.socket().abort();
+    }
+
     // -- fixture ----------------------------------------------------------------------------------
+
+    /** An open management WebSocket whose server side is known to be registered. */
+    private record Socket(java.net.http.WebSocket socket,
+                          java.util.concurrent.CompletableFuture<Integer> closed,
+                          java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pong) {
+        java.util.concurrent.CompletableFuture<Void> ping() {
+            java.util.concurrent.CompletableFuture<Void> next = new java.util.concurrent.CompletableFuture<>();
+            pong.set(next);
+            socket.sendPing(java.nio.ByteBuffer.allocate(0));
+            return next;
+        }
+    }
+
+    private Socket openManagementSocket(String token, String endpoint) throws Exception {
+        HttpResponse<String> issued = send("POST", "/api/admin/ws-tickets", token,
+                "{\"endpoint\":\"" + endpoint + "\"}");
+        assertThat(issued.statusCode()).as(issued.body()).isEqualTo(200);
+        String ticket = JSON.readTree(issued.body()).get("ticket").asText();
+        java.util.concurrent.CompletableFuture<Integer> closed = new java.util.concurrent.CompletableFuture<>();
+        java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pong =
+                new java.util.concurrent.atomic.AtomicReference<>(new java.util.concurrent.CompletableFuture<>());
+        java.net.http.WebSocket socket = httpClient.newWebSocketBuilder()
+                .buildAsync(URI.create("ws://localhost:" + port + "/ws/" + endpoint + "?ticket=" + ticket),
+                        new java.net.http.WebSocket.Listener() {
+                            @Override
+                            public java.util.concurrent.CompletionStage<?> onPong(java.net.http.WebSocket webSocket,
+                                                                                 java.nio.ByteBuffer message) {
+                                pong.get().complete(null);
+                                webSocket.request(1);
+                                return null;
+                            }
+
+                            @Override
+                            public java.util.concurrent.CompletionStage<?> onClose(java.net.http.WebSocket webSocket,
+                                                                                  int statusCode, String reason) {
+                                closed.complete(statusCode);
+                                return null;
+                            }
+
+                            @Override
+                            public void onError(java.net.http.WebSocket webSocket, Throwable error) {
+                                closed.complete(-1);
+                            }
+                        })
+                .get(10, java.util.concurrent.TimeUnit.SECONDS);
+        Socket opened = new Socket(socket, closed, pong);
+        // The container answers a ping only once the handler has registered the session.
+        opened.ping().get(10, java.util.concurrent.TimeUnit.SECONDS);
+        return opened;
+    }
+
+    private void seedDeletionRows(JsonNode rows) {
+        Instant now = Instant.now();
+        String later = SortableInstant.format(now.plusSeconds(3600));
+        for (JsonNode row : rows.get("clients")) {
+            ClientAccount client = new ClientAccount();
+            client.setId(row.get("id").asLong());
+            client.setTenantId(row.get("tenantId").asText());
+            client.setOwnerUsername(row.get("owner").asText());
+            client.setClientName(row.get("clientName").asText());
+            client.setPasswordHash("0".repeat(64));
+            client.setCreatedAt(now.toString());
+            client.setUpdatedAt(now.toString());
+            clients.saveAndFlush(client);
+        }
+        for (JsonNode row : rows.get("credentials")) {
+            ClientCredential credential = new ClientCredential();
+            credential.setId(row.get("id").asLong());
+            credential.setTenantId(row.get("tenantId").asText());
+            credential.setOwnerUsername(row.get("owner").asText());
+            credential.setApiKey("acct-del-" + row.get("id").asLong());
+            credential.setSecretHash("0".repeat(64));
+            credential.setCreatedAt(now.toString());
+            credential.setUpdatedAt(now.toString());
+            credentials.saveAndFlush(credential);
+        }
+        for (JsonNode row : rows.get("diagrams")) {
+            UserDiagramDocument document = new UserDiagramDocument();
+            document.setId(row.get("id").asLong());
+            document.setTenantId(row.get("tenantId").asText());
+            document.setOwnerUsername(row.get("owner").asText());
+            document.setName("acct-del-" + row.get("id").asLong());
+            document.setSnapshotData(new byte[] {1});
+            document.setSizeBytes(1);
+            document.setRevision(1);
+            document.setCreatedAt(now.toString());
+            document.setUpdatedAt(now.toString());
+            diagrams.saveAndFlush(document);
+        }
+        for (JsonNode row : rows.get("attachments")) {
+            TransferAttachment attachment = new TransferAttachment();
+            attachment.setId(row.get("id").asLong());
+            attachment.setTenantId(row.get("tenantId").asText());
+            attachment.setScope(TransferAttachmentService.SCOPE_ADMIN_CLIENT_MESSAGE);
+            attachment.setOwnerUsername(row.get("owner").asText());
+            attachment.setObjectKey("acct-del/" + row.get("id").asLong());
+            attachment.setFileName("file.bin");
+            attachment.setMimeType("application/octet-stream");
+            attachment.setSizeBytes(1);
+            attachment.setStatus(row.get("status").asText());
+            attachment.setCreatedAt(now.toString());
+            attachment.setUpdatedAt(now.toString());
+            attachment.setUploadExpiresAt(later);
+            attachment.setExpiresAt(later);
+            attachments.saveAndFlush(attachment);
+        }
+        for (JsonNode row : rows.get("downloadGrants")) {
+            TransferAttachmentDownloadGrant grant = new TransferAttachmentDownloadGrant();
+            grant.setId(row.get("id").asLong());
+            grant.setTokenHash(String.format("%064d", row.get("id").asLong()));
+            grant.setTenantId(row.get("tenantId").asText());
+            grant.setUsername(row.get("username").asText());
+            grant.setAttachmentId(row.get("attachmentId").asLong());
+            grant.setCreatedAt(now.toString());
+            grant.setExpiresAt(later);
+            grants.saveAndFlush(grant);
+        }
+        for (JsonNode row : rows.get("downloadUsage")) {
+            TransferAttachmentDownloadUsage used = new TransferAttachmentDownloadUsage();
+            used.setId(row.get("id").asLong());
+            used.setTenantId(row.get("tenantId").asText());
+            used.setUsername(row.get("username").asText());
+            used.setAttachmentId(row.get("attachmentId").asLong());
+            used.setSizeBytes(1);
+            used.setUsageMonth(java.time.YearMonth.now(java.time.ZoneOffset.UTC).toString());
+            used.setCreatedAt(now.toString());
+            usage.saveAndFlush(used);
+        }
+        for (JsonNode row : rows.get("acls")) {
+            PeerMeshAcl acl = new PeerMeshAcl();
+            acl.setId(row.get("id").asLong());
+            acl.setTenantId(row.get("tenantId").asText());
+            acl.setOwnerUsername(row.get("owner").asText());
+            acl.setSourceClientId(row.get("sourceClientId").asLong());
+            acl.setSourceClientName("acct-del-" + row.get("sourceClientId").asLong());
+            acl.setTargetClientId(row.get("targetClientId").asLong());
+            acl.setTargetClientName("acct-del-" + row.get("targetClientId").asLong());
+            acl.setCreatedAt(now.toString());
+            acl.setUpdatedAt(now.toString());
+            acls.saveAndFlush(acl);
+        }
+        for (JsonNode row : rows.get("egressPolicies")) {
+            PeerMeshEgressPolicy policy = new PeerMeshEgressPolicy();
+            policy.setId(row.get("id").asLong());
+            policy.setTenantId(row.get("tenantId").asText());
+            policy.setOwnerUsername(row.get("owner").asText());
+            policy.setEgressClientId(row.get("egressClientId").asLong());
+            policy.setEgressClientName("acct-del-" + row.get("egressClientId").asLong());
+            policy.setCreatedAt(now.toString());
+            policy.setUpdatedAt(now.toString());
+            policies.saveAndFlush(policy);
+        }
+        for (JsonNode row : rows.get("devices")) {
+            PeerMeshDevice device = new PeerMeshDevice();
+            device.setId(row.get("id").asLong());
+            device.setTenantId(row.get("tenantId").asText());
+            device.setOwnerUsername(row.get("owner").asText());
+            device.setClientId(row.get("clientId").asLong());
+            device.setClientName("acct-del-" + row.get("clientId").asLong());
+            device.setVirtualIp("10.77.0." + (row.get("id").asLong() % 250));
+            device.setCidr("10.77.0.0/16");
+            device.setCreatedAt(now.toString());
+            device.setUpdatedAt(now.toString());
+            devices.saveAndFlush(device);
+        }
+    }
+
+    private void applyDeletionFixture(JsonNode step) {
+        switch (step.get("fixture").asText()) {
+            case "transfer-client" -> {
+                ClientAccount client = clients.findById(step.get("id").asLong()).orElseThrow();
+                client.setOwnerUsername(step.get("owner").asText());
+                clients.saveAndFlush(client);
+                devices.findByTenantIdAndClientId(client.getTenantId(), client.getId()).ifPresent(device -> {
+                    device.setOwnerUsername(step.get("owner").asText());
+                    devices.saveAndFlush(device);
+                });
+            }
+            case "delete-client" -> clients.deleteById(step.get("id").asLong());
+            case "delete-credential" -> credentials.deleteById(step.get("id").asLong());
+            case "create-account" -> seed(step.get("accountKey").asText(), step.get("loginName").asText(),
+                    step.get("tenantId").asText(), ManagementRole.valueOf(step.get("role").asText()));
+            default -> throw new IllegalArgumentException("unknown fixture " + step);
+        }
+    }
+
+    /** Of the seeded ids of {@code table}, exactly those of rowsAfter remain, with their owners. */
+    private static void assertRows(JsonNode seed, JsonNode after, String table,
+                                   java.util.function.LongFunction<java.util.Optional<String>> owner) {
+        Map<Long, String> expected = new java.util.TreeMap<>();
+        for (JsonNode row : after.get(table)) {
+            String value = row.has("owner") ? row.get("owner").asText() : row.get("username").asText();
+            if (row.has("active")) {
+                value += row.get("active").asBoolean() ? " active" : " inactive";
+            }
+            expected.put(row.get("id").asLong(), value);
+        }
+        Map<Long, String> actual = new java.util.TreeMap<>();
+        for (JsonNode row : seed.get(table)) {
+            long id = row.get("id").asLong();
+            owner.apply(id).ifPresent(value -> actual.put(id, value));
+        }
+        assertThat(actual).as(table).isEqualTo(expected);
+    }
 
     private void seedAccounts(JsonNode vector) {
         for (JsonNode account : vector.get("accounts")) {

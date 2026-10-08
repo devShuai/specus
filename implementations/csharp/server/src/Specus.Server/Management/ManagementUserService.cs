@@ -9,6 +9,17 @@ using Specus.Server.Data.Entities;
 
 namespace Specus.Server.Management;
 
+/// <summary>
+/// An account that still owns clients or access credentials is not deleted (management-accounts.md
+/// section 7.1): answered 409 with both counts, so the administrator knows what to delete or hand over.
+/// </summary>
+public sealed class AccountStillOwnsResourcesException(long clients, long credentials)
+    : Exception($"该账号仍拥有 {clients} 个客户端、{credentials} 个接入凭证，需先转移或删除")
+{
+    public long Clients { get; } = clients;
+    public long Credentials { get; } = credentials;
+}
+
 public sealed class ManagementUserService
 {
     private readonly SpecusDbContext _db;
@@ -488,8 +499,26 @@ public sealed class ManagementUserService
         // the same name must not inherit them.
         await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        // Unlike the account's other data, its workbench lists are personal history: they go with the
-        // account row, so an account created later under the same name starts empty.
+        // Clients and credentials carry tunnels in use: the administrator deletes or hands them over
+        // first, as a later account of the same name would own them (management-accounts.md 7.1).
+        var clients = await _db.ClientAccounts
+            .LongCountAsync(client => client.TenantId == tenantId && client.OwnerUsername == loginName,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var credentials = await _db.ClientCredentials
+            .LongCountAsync(credential => credential.TenantId == tenantId && credential.OwnerUsername == loginName,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (clients > 0 || credentials > 0)
+        {
+            _logger?.LogWarning(
+                "管理用户delete被拒绝: actor={Actor}, tenant={Tenant}, target={Target}, reason=仍拥有客户端{Clients}个、接入凭证{Credentials}个",
+                context.Username, tenantId, loginName, clients, credentials);
+            throw new AccountStillOwnsResourcesException(clients, credentials);
+        }
+        await ForgetOwnedDataAsync(tenantId, loginName, context.Username, cancellationToken).ConfigureAwait(false);
+        // The workbench lists are personal history: they go with the account row, so an account
+        // created later under the same name starts empty.
         await WorkbenchService.DeleteIdentityAsync(_db, tenantId, loginName, cancellationToken)
             .ConfigureAwait(false);
         // The registered email points at the account key and goes with the account, so the address
@@ -506,6 +535,50 @@ public sealed class ManagementUserService
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
         return (tenantId, loginName);
+    }
+
+    /// <summary>
+    /// The rest of what a deleted account's identity owns, in the deletion's transaction
+    /// (management-accounts.md section 7.1). Diagram documents, download grants and download usage
+    /// go. Attachments expire now, so nothing can complete, download or count them any more and the
+    /// expiry scan deletes their objects (the row is the only record of the object). Peer device rows
+    /// of clients that no longer exist go. Peer ACLs and egress policies decide how other people's
+    /// clients connect: they stay, owned by <paramref name="actor"/> from now on.
+    /// </summary>
+    private async Task ForgetOwnedDataAsync(string tenantId, string loginName, string actor,
+        CancellationToken cancellationToken)
+    {
+        await _db.UserDiagramDocuments
+            .Where(document => document.TenantId == tenantId && document.OwnerUsername == loginName)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        await _db.TransferAttachments
+            .Where(attachment => attachment.TenantId == tenantId && attachment.OwnerUsername == loginName
+                && attachment.Status != TransferAttachmentService.StatusExpired && attachment.ExpiresAt > now)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(attachment => attachment.ExpiresAt, now)
+                .SetProperty(attachment => attachment.UploadExpiresAt, now)
+                .SetProperty(attachment => attachment.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+        await _db.TransferAttachmentDownloadGrants
+            .Where(grant => grant.TenantId == tenantId && grant.Username == loginName)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.TransferAttachmentDownloadUsages
+            .Where(usage => usage.TenantId == tenantId && usage.Username == loginName)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.PeerMeshDevices
+            .Where(device => device.TenantId == tenantId && device.OwnerUsername == loginName
+                && !_db.ClientAccounts.Any(client => client.Id == device.ClientId))
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.PeerMeshAcls
+            .Where(acl => acl.TenantId == tenantId && acl.OwnerUsername == loginName)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(acl => acl.OwnerUsername, actor), cancellationToken)
+            .ConfigureAwait(false);
+        await _db.PeerMeshEgressPolicies
+            .Where(policy => policy.TenantId == tenantId && policy.OwnerUsername == loginName)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(policy => policy.OwnerUsername, actor),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public static void RequireAdmin(ManagementContext context)

@@ -218,6 +218,71 @@ func (db *DB) deleteManagementUserOn(ctx context.Context, runner sqlRunner, user
 	return err
 }
 
+// AccountStillOwnsError refuses to delete an account that still owns clients or access credentials
+// (management-accounts.md section 7.1): they carry tunnels in use, and a later account of the same
+// name would own them. The administrator deletes or hands them over first.
+type AccountStillOwnsError struct {
+	Clients     int64
+	Credentials int64
+}
+
+func (e *AccountStillOwnsError) Error() string {
+	return fmt.Sprintf("该账号仍拥有 %d 个客户端、%d 个接入凭证，需先转移或删除", e.Clients, e.Credentials)
+}
+
+// forgetAccountDataOn deals, in the deletion's transaction, with the rows the account's identity
+// (tenant, login name) owns besides the account row (management-accounts.md section 7.1). It refuses
+// with *AccountStillOwnsError while clients or credentials remain. Otherwise diagram documents,
+// download grants and download usage go; attachments expire now, so nothing can complete, download
+// or count them any more and the expiry scan deletes their objects (the row is the only record of
+// the object); Peer device rows of clients that no longer exist go; Peer ACLs and egress policies,
+// which decide how other people's clients connect, stay and are owned by actor from now on.
+func (db *DB) forgetAccountDataOn(ctx context.Context, runner sqlRunner, user ManagementUser, actor string) error {
+	tenantID := defaultTenant(user.TenantID)
+	owned := &AccountStillOwnsError{}
+	if err := runner.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM specus_client_account
+		WHERE COALESCE(tenant_id, 'default') = ? AND owner_username = ?`), tenantID, user.Username).
+		Scan(&owned.Clients); err != nil {
+		return err
+	}
+	if err := runner.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM specus_client_credential
+		WHERE tenant_id = ? AND owner_username = ?`), tenantID, user.Username).Scan(&owned.Credentials); err != nil {
+		return err
+	}
+	if owned.Clients > 0 || owned.Credentials > 0 {
+		return owned
+	}
+	now := time.Now()
+	cutoff := formatTime(now)
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM user_diagram_document WHERE tenant_id = ? AND owner_username = ?`, nil},
+		{`UPDATE transfer_attachment SET expires_at = ?, upload_expires_at = ?, updated_at = ?
+			WHERE tenant_id = ? AND owner_username = ? AND status <> 'EXPIRED' AND expires_at > ?`,
+			[]any{cutoff, cutoff, cutoff, tenantID, user.Username, cutoff}},
+		{`DELETE FROM transfer_attachment_download_grant WHERE tenant_id = ? AND username = ?`, nil},
+		{`DELETE FROM transfer_attachment_download_usage WHERE tenant_id = ? AND username = ?`, nil},
+		{`DELETE FROM peer_mesh_device WHERE tenant_id = ? AND owner_username = ?
+			AND NOT EXISTS (SELECT 1 FROM specus_client_account c WHERE c.id = peer_mesh_device.client_id)`, nil},
+		{`UPDATE peer_mesh_acl SET owner_username = ? WHERE tenant_id = ? AND owner_username = ?`,
+			[]any{actor, tenantID, user.Username}},
+		{`UPDATE peer_mesh_egress_policy SET owner_username = ? WHERE tenant_id = ? AND owner_username = ?`,
+			[]any{actor, tenantID, user.Username}},
+	}
+	for _, statement := range statements {
+		args := statement.args
+		if args == nil {
+			args = []any{tenantID, user.Username}
+		}
+		if _, err := runner.ExecContext(ctx, db.rebind(statement.query), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ResolveOrProvisionOIDCUser atomically resolves an issuer/subject binding, links an enabled
 // unbound user of tenantID with the imported login name, or creates a least-privilege USER there.
 // Users of other tenants never take part: a same-named user elsewhere neither binds nor blocks the

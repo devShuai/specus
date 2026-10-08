@@ -148,6 +148,25 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
         return sessions.size();
     }
 
+    /**
+     * The account of this identity was deleted: its open sessions end. A session keeps the identity
+     * it was opened with, so it would otherwise receive the events of a later account of the same name.
+     */
+    public void closeIdentity(String tenantId, String username) {
+        for (WebSocketSession session : sessions) {
+            if (!tenantId.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID))
+                    || !username.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_USER))) {
+                continue;
+            }
+            sessions.remove(session);
+            try {
+                session.close(CloseStatus.POLICY_VIOLATION.withReason("account deleted"));
+            } catch (IOException | IllegalStateException e) {
+                log.debug("ws close failed for {}: {}", session.getId(), e.toString());
+            }
+        }
+    }
+
     private boolean canReceive(WebSocketSession session, String tenantId, Object payload) {
         if (Boolean.TRUE.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN))) {
             return true;

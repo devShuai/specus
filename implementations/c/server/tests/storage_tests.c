@@ -1371,7 +1371,7 @@ int main(void)
         || st_storage_get_management_user_in_tenant(path, "tenant-other", "alice", &foreign_view) == 0
         || st_storage_update_management_user(path, "tenant-other", "ALICE", "taken-over", "ADMIN", 0,
                                              &foreign_view) == 0
-        || st_storage_delete_management_user(path, "tenant-other", "alice") == 0
+        || st_storage_delete_management_user(path, "tenant-other", "alice", "admin") == 0
         || st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) != 0
         || strcmp(created_user.tenant_id, "default") != 0
         || strcmp(created_user.password_hash, "hash-value") != 0
@@ -1405,7 +1405,7 @@ int main(void)
         unlink(path);
         return 1;
     }
-    if (st_storage_delete_management_user(path, "default", "alice") != 0
+    if (st_storage_delete_management_user(path, "default", "alice", "admin") != 0
         || st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) == 0) {
         fprintf(stderr, "management user delete mismatch\n");
         unlink(path);

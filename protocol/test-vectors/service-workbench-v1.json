@@ -2372,13 +2372,13 @@
     },
     {
       "name": "account-deletion-cascades",
-      "note": "Deleting an account deletes its rows. A token issued before the deletion is refused by the shared authentication layer (sessionRejected: 401 or 403 depending on the server), so it cannot write rows back. An account created later under the same name starts with empty lists.",
+      "note": "Deleting an account deletes its rows. A token issued before the deletion is refused by the shared authentication layer (sessionRejected: 401 or 403 depending on the server), so it cannot write rows back. An account created later under the same name starts with empty lists. alice is an administrator who owns no client: an account that still owns one cannot be deleted (management-accounts.md section 7.1).",
       "users": [
-        {"tenantId": "t1", "username": "alice", "admin": false},
+        {"tenantId": "t1", "username": "alice", "admin": true},
         {"tenantId": "t1", "username": "bob", "admin": false}
       ],
       "objects": [
-        {"kind": "http-route", "id": 1, "tenantId": "t1", "ownerUsername": "alice"},
+        {"kind": "http-route", "id": 1, "tenantId": "t1", "ownerUsername": "bob"},
         {"kind": "http-route", "id": 2, "tenantId": "t1", "ownerUsername": "bob"}
       ],
       "rows": [],

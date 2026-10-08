@@ -258,6 +258,7 @@ static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream);
 static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
+static void admin_ws_close_identity(const char *tenant_id, const char *username);
 static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_ticket *admin_ws_tickets = NULL;
 static pthread_mutex_t admin_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -11701,12 +11702,28 @@ static int handle_management_user_delete(const st_admin_context *context, const 
                                                                username, &target) == 0;
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     st_storage_share_ids revoked = {0};
-    /* Deleting the user ends its shares in the same transaction, so a later namesake never inherits them. */
+    st_storage_account_owned owned = {0};
+    /*
+     * Deleting the user ends its shares in the same transaction, so a later namesake never inherits
+     * them; an account still owning clients or credentials is refused (management-accounts.md 7.1).
+     */
     int rc = st_storage_delete_management_user_audited(database_path, &builtin, context->tenant_id, username,
-                                                       context->username, st_http_share_now_ms(), &revoked);
+                                                       context->username, st_http_share_now_ms(), &revoked,
+                                                       &owned);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_ACCOUNT_STILL_OWNS) {
+        free(username);
+        char refusal[256];
+        snprintf(refusal, sizeof(refusal),
+                 "{\"error\":\"the account still owns %lld clients and %lld credentials: delete or transfer them "
+                 "first\",\"clients\":%lld,\"credentials\":%lld}",
+                 owned.clients, owned.credentials, owned.clients, owned.credentials);
+        return write_response(out, out_len, 409, "Conflict", refusal);
+    }
     if (rc == 0 && have_target) {
+        /* Committed: the identity's open management WebSockets end. */
+        admin_ws_close_identity(target.tenant_id, target.username);
         (void)st_product_metrics_user_deleted(database_path, target.tenant_id, target.username);
     }
     int response_len = rc != 0
@@ -16021,6 +16038,31 @@ static int admin_ws_send_frame(st_admin_ws_client *client,
     int rc = admin_send_websocket_frame(client->fd, opcode, payload, payload_len);
     pthread_mutex_unlock(&client->send_lock);
     return rc;
+}
+
+/*
+ * The account of this identity was deleted (management-accounts.md 7.1): its client-messages and
+ * connections sockets end. A socket keeps the identity it was opened with, so it would otherwise go
+ * on as the deleted account and receive what is meant for a later account of the same name. The
+ * reading thread of each socket sees the shutdown and removes it.
+ */
+static void admin_ws_close_identity(const char *tenant_id, const char *username)
+{
+    if (tenant_id == NULL || username == NULL) {
+        return;
+    }
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(1008U, "account deleted", payload);
+    pthread_mutex_lock(&admin_ws_lock);
+    for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
+        if (!client->closing && strcmp(client->tenant_id, tenant_id) == 0
+            && strcmp(client->username, username) == 0) {
+            client->closing = 1;
+            (void)admin_ws_send_frame(client, 0x8U, payload, payload_len);
+            shutdown(client->fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&admin_ws_lock);
 }
 
 static int admin_ws_reserve_client_message_write(st_admin_ws_client *client)

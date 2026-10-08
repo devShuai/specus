@@ -120,9 +120,11 @@ Java、Go 与 .NET 服务端必须直接读取 `public-transfer-cluster-v2.json`
 
 - `management-accounts-v1.json`：本地 token 的账号键声明 `uid` 与用户列表里的内置管理员。给出带固定账号键的账号、
   一组 token 声明（带或不带 `tenant_id`、`uid`）与期望解析到的账号（`null` 表示解析不到），以及三种调用者看到的
-  用户列表。手写，语义见 [`protocol/spec/management-accounts.md`](../spec/management-accounts.md) 第 5–7 节，
-  重放方法见其第 12 节。Java、Go、.NET 与 C 服务端经真实 HTTP 处理代码（`/api/admin/me`、`/auth/refresh`、
-  `/api/admin/users`）重放全部用例。
+  用户列表；`accountDeletion` 另有自己的账号与按登录名归属的各类行，逐步重放删除账号（仍拥有客户端或凭证时
+  `409`、转走或删除后成功）并给出删除后剩下的行。手写，语义见
+  [`protocol/spec/management-accounts.md`](../spec/management-accounts.md) 第 5–7 节，重放方法见其第 12 节。
+  Java、Go、.NET 与 C 服务端经真实 HTTP 处理代码（`/api/admin/me`、`/auth/refresh`、`/api/admin/users`、
+  `DELETE /api/admin/users/{username}`）重放全部用例。
 
 ## 拒绝规则
 
