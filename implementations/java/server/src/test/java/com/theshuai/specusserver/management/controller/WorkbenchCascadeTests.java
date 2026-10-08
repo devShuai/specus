@@ -90,10 +90,20 @@ class WorkbenchCascadeTests extends WorkbenchHttpTestSupport {
         var orphan = send("PUT", BASE + "/favorites/http-route/11", root);
         assertThat(orphan.statusCode()).isEqualTo(404);
         assertThat(json(orphan).path("code").asText()).isEqualTo("WORKBENCH_TARGET_NOT_FOUND");
+        // Its Peer service row stays and the Peer service list still shows it to an administrator,
+        // so an administrator may add it, as on the other servers; its former owner may not.
+        assertThat(send("PUT", BASE + "/favorites/peer-service/13", root).statusCode()).isEqualTo(200);
+        assertThat(send("POST", BASE + "/recents/peer-service/13", root).statusCode()).isEqualTo(200);
+        assertThat(send("PUT", BASE + "/favorites/peer-service/13", alice).statusCode()).isEqualTo(404);
     }
 
     @Test
     void deletingAnAccountRemovesItsRowsAndTheSameNameStartsEmpty() {
+        // An account that still owns a client is not deleted (management-accounts.md 7.1): alice's
+        // client goes to root first, by data as no endpoint changes an owner.
+        assertThat(send("DELETE", "/api/admin/users/alice", root).statusCode()).isEqualTo(409);
+        aliceClient.setOwnerUsername("root");
+        clientAccountRepository.saveAndFlush(aliceClient);
         assertThat(send("DELETE", "/api/admin/users/alice", root).statusCode()).isEqualTo(204);
         assertThat(rows()).extracting(Row::username).containsOnly("bob", "root");
         assertThat(rows()).hasSize(12);

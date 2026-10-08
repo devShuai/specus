@@ -350,6 +350,68 @@ public sealed class HttpShareHttpTests : IAsyncLifetime
             JsonNode.Parse(await hidden.Content.ReadAsStringAsync())!["code"]!.GetValue<string>());
     }
 
+    [Fact]
+    public async Task UnauthenticatedShareManagementAnswersArePrivate()
+    {
+        (HttpMethod Method, string Path)[] endpoints =
+        [
+            (HttpMethod.Post, "/api/admin/http-routes/42/shares"),
+            (HttpMethod.Get, "/api/admin/http-routes/42/shares"),
+            (HttpMethod.Get, "/api/admin/http-routes/42/shares/WlpaWlpaWlpaWlpa"),
+            (HttpMethod.Post, "/api/admin/http-routes/42/shares/WlpaWlpaWlpaWlpa/revoke"),
+            (HttpMethod.Get, "/api/admin/http-routes/42/access-audit"),
+            (HttpMethod.Get, "/api/admin/http-access-audit"),
+        ];
+        using var client = _host.CreateClient();
+        foreach (var (method, path) in endpoints)
+        {
+            foreach (var bearer in new[] { null, "not-a-token" })
+            {
+                using var request = new HttpRequestMessage(method, path)
+                {
+                    Content = new StringContent("""{"expiresInSeconds": 3600}""", Encoding.UTF8, "application/json"),
+                };
+                if (bearer is not null)
+                {
+                    request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + bearer);
+                }
+                using var response = await client.SendAsync(request);
+                Assert.True(response.StatusCode == HttpStatusCode.Unauthorized,
+                    $"{method} {path} with bearer {bearer ?? "(none)"}: {(int)response.StatusCode}");
+                Assert.Equal("private, no-store", Assert.Single(RawHeaders(response, "Cache-Control")));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CreationsRacingForTheLastSlotStopAtTheLimit()
+    {
+        for (var i = 0; i < HttpShareProtocol.MaxActiveSharesPerRoute - 1; i++)
+        {
+            await CreateShareAsync("alice", 42, """{"expiresInSeconds": 3600}""");
+        }
+
+        const int racers = 8;
+        using var alice = _host.CreateClient("alice");
+        var answers = await Task.WhenAll(Enumerable.Range(0, racers).Select(async _ =>
+        {
+            using var response = await alice.PostAsync("/api/admin/http-routes/42/shares",
+                new StringContent("""{"expiresInSeconds": 3600}""", Encoding.UTF8, "application/json"));
+            var body = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+            return (response.StatusCode, Code: body["code"]?.GetValue<string>(),
+                CacheControl: RawHeaders(response, "Cache-Control"));
+        }));
+
+        Assert.Single(answers, answer => answer.StatusCode == HttpStatusCode.Created);
+        Assert.Equal(racers - 1, answers.Count(answer => answer.StatusCode == HttpStatusCode.Conflict
+                                                         && answer.Code == HttpShareCodes.LimitReached));
+        Assert.All(answers, answer => Assert.Equal("private, no-store", Assert.Single(answer.CacheControl)));
+        var nowSeconds = HttpShareTestHost.VectorNow.ToUnixTimeSeconds();
+        var active = await _host.WithDbAsync(db => db.HttpShares.AsNoTracking()
+            .CountAsync(s => s.RouteId == 42 && s.RevokedAt == null && s.ExpiresAt > nowSeconds));
+        Assert.Equal(HttpShareProtocol.MaxActiveSharesPerRoute, active);
+    }
+
     private async Task<(string ShareId, string Token)> CreateShareAsync(string caller, long routeId, string body)
     {
         using var client = _host.CreateClient(caller);

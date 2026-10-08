@@ -29,10 +29,19 @@ type TokenResponse struct {
 
 // Claims is the local management JWT identity used by the admin API.
 type Claims struct {
+	// Username is the subject: the login name of the account (or the built-in admin's name).
 	Username string
+	// TenantID is the tenant claim, or the configured default tenant when the token has none.
 	TenantID string
-	Role     string
-	Expires  int64
+	// HasTenant says the token carried a tenant claim. Every token issued since tenant-scoped login
+	// names does; one without it predates them and names its account by the account key.
+	HasTenant bool
+	// AccountKey is the uid claim: the key of the account the token was issued for, so the token
+	// never passes to a later account that reuses the login name. Empty for the built-in admin's
+	// tokens and for tokens issued before the claim existed.
+	AccountKey string
+	Role       string
+	Expires    int64
 }
 
 // LocalTokenService issues and validates HS256 admin tokens and checks admin credentials.
@@ -102,8 +111,14 @@ func (s *LocalTokenService) IssueBody(username string) TokenResponse {
 
 // IssueBodyForUser mints a token with tenant/role claims and wraps it in the API response body.
 func (s *LocalTokenService) IssueBodyForUser(username, tenantID, role string) TokenResponse {
+	return s.IssueBodyForAccount(username, tenantID, role, "")
+}
+
+// IssueBodyForAccount is IssueBodyForUser with the account key as the uid claim; accountKey is
+// empty only for the built-in admin, who has no account row.
+func (s *LocalTokenService) IssueBodyForAccount(username, tenantID, role, accountKey string) TokenResponse {
 	return TokenResponse{
-		AccessToken: s.IssueForUser(username, tenantID, role),
+		AccessToken: s.IssueForAccount(username, tenantID, role, accountKey),
 		TokenType:   "Bearer",
 		ExpiresIn:   s.TTLSeconds(),
 	}
@@ -114,18 +129,28 @@ func (s *LocalTokenService) Issue(username string) string {
 	return s.IssueForUser(username, s.auth.TenantID, "ADMIN")
 }
 
-// IssueForUser mints a signed HS256 JWT for a management user.
+// IssueForUser mints a signed HS256 JWT for a management user, without the uid claim.
 func (s *LocalTokenService) IssueForUser(username, tenantID, role string) string {
+	return s.IssueForAccount(username, tenantID, role, "")
+}
+
+// IssueForAccount mints a signed HS256 JWT for an account; a non-empty accountKey becomes the uid
+// claim (protocol/spec/management-accounts.md section 5).
+func (s *LocalTokenService) IssueForAccount(username, tenantID, role, accountKey string) string {
 	now := time.Now()
 	header := encodeSegment(map[string]any{"alg": "HS256", "typ": "JWT"})
-	payload := encodeSegment(map[string]any{
+	claims := map[string]any{
 		"iss":       Issuer,
 		"sub":       username,
 		"tenant_id": normalizeTenant(tenantID),
 		"role":      normalizeRole(role),
 		"iat":       now.Unix(),
 		"exp":       now.Add(time.Duration(s.TTLSeconds()) * time.Second).Unix(),
-	})
+	}
+	if accountKey != "" {
+		claims["uid"] = accountKey
+	}
+	payload := encodeSegment(claims)
 	signingInput := header + "." + payload
 	signature := base64URL(sign(s.key, signingInput))
 	return signingInput + "." + signature
@@ -176,6 +201,7 @@ func (s *LocalTokenService) ValidateClaims(token string) (Claims, bool) {
 		Iss      string `json:"iss"`
 		Sub      string `json:"sub"`
 		TenantID string `json:"tenant_id"`
+		UID      string `json:"uid"`
 		Role     string `json:"role"`
 		Exp      int64  `json:"exp"`
 	}
@@ -190,10 +216,12 @@ func (s *LocalTokenService) ValidateClaims(token string) (Claims, bool) {
 	}
 	role := normalizeRole(claims.Role)
 	return Claims{
-		Username: claims.Sub,
-		TenantID: normalizeTenant(firstNonBlank(claims.TenantID, s.auth.TenantID)),
-		Role:     role,
-		Expires:  claims.Exp,
+		Username:   claims.Sub,
+		TenantID:   normalizeTenant(firstNonBlank(claims.TenantID, s.auth.TenantID)),
+		HasTenant:  strings.TrimSpace(claims.TenantID) != "",
+		AccountKey: claims.UID,
+		Role:       role,
+		Expires:    claims.Exp,
 	}, true
 }
 

@@ -1,11 +1,75 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "elasticsearch_traffic.h"
+#include "http_client.h"
 #include "storage.h"
+#include "traffic_capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * Stores one exchange in an HTTP index the fake Elasticsearch had before the server started, then
+ * reads that index's mapping back: requestBodyData must have body_type ("binary" when the update
+ * was taken, "text" when the fields were text already and the update was refused).
+ */
+static int check_existing_http_index(const char *path, const st_storage_http_exchange_record *http,
+                                     long long client_id, const char *index, const char *body_type)
+{
+    if (setenv("SPECUS_ELASTICSEARCH_HTTP_INDEX", index, 1) != 0) return -1;
+    st_elasticsearch_traffic_reset_for_tests();
+    if (st_storage_record_http_exchange(path, http) != 0) return -1;
+    st_elasticsearch_traffic_flush();
+    st_storage_http_exchange exchanges[2];
+    size_t exchange_count = 0;
+    long long total = 0;
+    if (st_storage_list_http_exchanges_visible(path, client_id, NULL, NULL, NULL, NULL, "default", "admin", 1,
+                                               0, 10, exchanges, 2, &exchange_count, &total) != 0
+        || total != 1 || exchange_count != 1) {
+        fprintf(stderr, "Elasticsearch existing index %s did not store the exchange\n", index);
+        return -1;
+    }
+    char endpoint[512];
+    snprintf(endpoint, sizeof(endpoint), "%s/%s/_mapping", getenv("SPECUS_ELASTICSEARCH_URIS"), index);
+    st_http_client_options options = {5000, 64U * 1024U, NULL};
+    long status = 0;
+    char *mapping = NULL;
+    char expected[2][96];
+    snprintf(expected[0], sizeof(expected[0]), "\"requestBodyData\":{\"type\":\"%s\"}", body_type);
+    snprintf(expected[1], sizeof(expected[1]), "\"responseBodyData\":{\"type\":\"%s\"}", body_type);
+    int ok = st_http_get_json(endpoint, &options, &status, &mapping) == 0 && status == 200 && mapping != NULL
+        && strstr(mapping, expected[0]) != NULL && strstr(mapping, expected[1]) != NULL;
+    if (!ok) fprintf(stderr, "Elasticsearch existing index %s mapping mismatch: %s\n", index, mapping ? mapping : "");
+    free(mapping);
+    return ok ? 0 : -1;
+}
+
+/*
+ * Stores one exchange in a fresh HTTP index whose store size must be cut to 1 byte, then counts
+ * what is left. The fake cluster reports total_data_set_size_in_bytes as 0 for an index named
+ * *-zero-dataset and leaves it out for *-no-dataset; size_in_bytes is the documents' size.
+ */
+static int check_trim(const char *path, const st_storage_http_exchange_record *http, long long client_id,
+                      const char *index, long long expected_left)
+{
+    if (setenv("SPECUS_ELASTICSEARCH_HTTP_INDEX", index, 1) != 0
+        || setenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE", "1", 1) != 0) {
+        return -1;
+    }
+    st_elasticsearch_traffic_reset_for_tests();
+    if (st_storage_record_http_exchange(path, http) != 0) return -1;
+    st_elasticsearch_traffic_flush();
+    st_storage_http_exchange exchanges[2];
+    size_t exchange_count = 0;
+    long long total = -1;
+    int ok = st_storage_list_http_exchanges_visible(path, client_id, NULL, NULL, NULL, NULL, "default", "admin", 1,
+                                                    0, 10, exchanges, 2, &exchange_count, &total) == 0
+        && total == expected_left;
+    if (!ok) fprintf(stderr, "Elasticsearch trimming of %s left %lld exchanges, expected %lld\n", index, total,
+                     expected_left);
+    return unsetenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE") == 0 && ok ? 0 : -1;
+}
 
 int main(int argc, char **argv)
 {
@@ -43,6 +107,8 @@ int main(int argc, char **argv)
         .captured_at = "2026-08-28T01:02:03Z"
     };
     if (st_storage_record_http_exchange(argv[1], &http) != 0) return 1;
+    /* The writer sends queued documents in the background; flush=true sends them now. */
+    st_elasticsearch_traffic_flush();
 
     st_storage_http_exchange exchanges[4];
     size_t exchange_count = 0;
@@ -53,6 +119,80 @@ int main(int argc, char **argv)
         || total != 1 || exchange_count != 1 || exchanges[0].status_code != 201
         || strcmp(exchanges[0].relative_path, "/v1/items") != 0) {
         fprintf(stderr, "Elasticsearch HTTP traffic round trip mismatch\n");
+        return 1;
+    }
+    /* HttpTrafficExchangeStoreTests.elasticsearchSummaryExcludesLargeAndDetailOnlyFields: the list
+     * asks Elasticsearch to leave headers and previews out; the detail of one exchange reads them. */
+    if (exchanges[0].request_headers[0] != '\0' || exchanges[0].response_headers[0] != '\0'
+        || exchanges[0].request_preview_hex[0] != '\0' || exchanges[0].request_preview_text[0] != '\0'
+        || exchanges[0].response_preview_hex[0] != '\0' || exchanges[0].response_preview_text[0] != '\0') {
+        fprintf(stderr, "Elasticsearch HTTP summary carried headers or previews\n");
+        return 1;
+    }
+    st_storage_http_exchange *exchange_detail = (st_storage_http_exchange *)calloc(1U, sizeof(*exchange_detail));
+    int exchange_found = 0;
+    int detail_ok = exchange_detail != NULL
+        && st_storage_get_http_exchange_visible(argv[1], exchanges[0].id, "default", "admin", 1,
+                                                exchange_detail, &exchange_found) == 0
+        && exchange_found
+        && strcmp(exchange_detail->request_headers, "Content-Type: text/plain") == 0
+        && strcmp(exchange_detail->response_preview_text, "{\"items\":[1]}") == 0
+        && strcmp(exchange_detail->request_preview_hex, "72 65 71 75 65 73 74 2D 69 74 65 6D 73") == 0;
+    if (exchange_detail != NULL) st_storage_http_exchange_free_bodies(exchange_detail);
+    free(exchange_detail);
+    if (!detail_ok) {
+        fprintf(stderr, "Elasticsearch HTTP detail lookup mismatch\n");
+        return 1;
+    }
+
+    /* HttpTrafficExchangeStoreTests.elasticsearchSummaryDoesNotEncodeBinaryBody: a PNG body is kept
+     * as binary requestBodyData/responseBodyData, left out of the summary, and its detail shows it
+     * as a data: URL. */
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    st_storage_http_exchange_record image = http;
+    image.route = "images";
+    image.method = "GET";
+    image.request_bytes = 0;
+    image.request_body = NULL;
+    image.request_body_len = 0U;
+    image.response_bytes = (long long)sizeof(png);
+    image.response_content_type = "image/png";
+    image.response_headers = "Content-Type: image/png";
+    image.response_body = png;
+    image.response_body_len = sizeof(png);
+    if (st_storage_record_http_exchange(argv[1], &image) != 0) return 1;
+    st_elasticsearch_traffic_flush();
+    exchange_count = 0;
+    if (st_storage_list_http_exchanges_visible(argv[1], client.id, "images", NULL, NULL, NULL,
+                                               "default", "admin", 1, 0, 10,
+                                               exchanges, 4, &exchange_count, &total) != 0
+        || exchange_count != 1 || exchanges[0].response_body_data != NULL
+        || exchanges[0].response_preview_hex[0] != '\0' || exchanges[0].response_headers[0] != '\0') {
+        fprintf(stderr, "Elasticsearch HTTP summary carried the binary body\n");
+        return 1;
+    }
+    exchange_detail = (st_storage_http_exchange *)calloc(1U, sizeof(*exchange_detail));
+    exchange_found = 0;
+    char *shown = NULL;
+    detail_ok = exchange_detail != NULL
+        && st_storage_get_http_exchange_visible(argv[1], exchanges[0].id, "default", "admin", 1,
+                                                exchange_detail, &exchange_found) == 0
+        && exchange_found
+        && exchange_detail->response_body_data_len == sizeof(png)
+        && memcmp(exchange_detail->response_body_data, png, sizeof(png)) == 0
+        && strcmp(exchange_detail->response_headers, "Content-Type: image/png") == 0
+        && strcmp(exchange_detail->response_preview_hex, "89 50 4E 47 0D 0A 1A 0A") == 0
+        && (shown = st_traffic_body_display_text(exchange_detail->response_body_data,
+                                                 exchange_detail->response_body_data_len,
+                                                 exchange_detail->response_content_type,
+                                                 exchange_detail->response_headers,
+                                                 exchange_detail->response_preview_text)) != NULL
+        && strcmp(shown, "data:image/png;base64,iVBORw0KGgo=") == 0;
+    free(shown);
+    if (exchange_detail != NULL) st_storage_http_exchange_free_bodies(exchange_detail);
+    free(exchange_detail);
+    if (!detail_ok) {
+        fprintf(stderr, "Elasticsearch HTTP binary body detail mismatch\n");
         return 1;
     }
 
@@ -78,6 +218,7 @@ int main(int argc, char **argv)
         .frame_time = "2026-08-28T01:02:04Z"
     };
     if (st_storage_record_tcp_frame(argv[1], &tcp) != 0) return 1;
+    st_elasticsearch_traffic_flush();
     st_storage_tcp_frame frames[4];
     size_t frame_count = 0;
     total = 0;
@@ -85,6 +226,19 @@ int main(int argc, char **argv)
                                            0, 10, frames, 4, &frame_count, &total) != 0
         || total != 1 || frame_count != 1 || frames[0].payload_bytes != (long long)sizeof(payload)) {
         fprintf(stderr, "Elasticsearch TCP traffic list mismatch\n");
+        return 1;
+    }
+    /* Java's Integer listenPort filters whenever it is given: 0 matches no frame. */
+    long long any_total = 0;
+    long long zero_total = -1;
+    size_t other_count = 0;
+    st_storage_tcp_frame other_frames[4];
+    if (st_storage_list_tcp_frames_visible(argv[1], client.id, ST_STORAGE_ANY_LISTEN_PORT, "default", "admin", 1,
+                                           0, 10, other_frames, 4, &other_count, &any_total) != 0
+        || st_storage_list_tcp_frames_visible(argv[1], client.id, 0, "default", "admin", 1,
+                                              0, 10, other_frames, 4, &other_count, &zero_total) != 0
+        || any_total != 1 || zero_total != 0) {
+        fprintf(stderr, "Elasticsearch TCP listenPort filter: any %lld, 0 %lld\n", any_total, zero_total);
         return 1;
     }
     long long frame_id = frames[0].id;
@@ -99,7 +253,7 @@ int main(int argc, char **argv)
     st_storage_tcp_frame_free(&detail);
     frame_count = 0;
     if (st_storage_list_tcp_stream_visible(argv[1], "channel-es-1", "default", "admin", 1,
-                                           10, frames, 4, &frame_count) != 0
+                                           0, 4, frames, 4, &frame_count, &total) != 0
         || frame_count != 1 || frames[0].frame_index != 2) {
         fprintf(stderr, "Elasticsearch TCP stream mismatch\n");
         return 1;
@@ -109,6 +263,8 @@ int main(int argc, char **argv)
     if (setenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE", "1", 1) != 0) return 1;
     st_elasticsearch_traffic_reset_for_tests();
     if (st_storage_record_http_exchange(argv[1], &http) != 0) return 1;
+    /* The writer sends queued documents in the background; flush=true sends them now. */
+    st_elasticsearch_traffic_flush();
     exchange_count = 0;
     total = -1;
     if (st_storage_list_http_exchanges_visible(argv[1], client.id, NULL, NULL, NULL, NULL,
@@ -116,6 +272,21 @@ int main(int argc, char **argv)
                                                exchanges, 4, &exchange_count, &total) != 0
         || total != 0 || exchange_count != 0) {
         fprintf(stderr, "Elasticsearch size retention did not delete oldest documents\n");
+        return 1;
+    }
+
+    /* HttpTrafficExchangeStore puts the binary body fields on an HTTP index that exists already;
+     * an index where they are text refuses that, and the server goes on with the index as it is. */
+    if (unsetenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE") != 0
+        || check_existing_http_index(argv[1], &http, client.id, "specus-http-legacy", "binary") != 0
+        || check_existing_http_index(argv[1], &http, client.id, "specus-http-text-bodies", "text") != 0) {
+        return 1;
+    }
+
+    /* Java currentStoreBytes: total_data_set_size_in_bytes whenever it is there, also when 0;
+     * size_in_bytes only without it. */
+    if (check_trim(argv[1], &http, client.id, "specus-http-zero-dataset", 1) != 0
+        || check_trim(argv[1], &http, client.id, "specus-http-no-dataset", 0) != 0) {
         return 1;
     }
     puts("elasticsearch traffic tests passed");

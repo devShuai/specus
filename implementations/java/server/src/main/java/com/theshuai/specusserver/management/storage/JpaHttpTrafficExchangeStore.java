@@ -301,10 +301,6 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
                 for (String stringField : searchField.jpaStringFields()) {
                     tokenPredicates.add(cb.like(cb.lower(stringPath(root.get(stringField))), pattern, '\\'));
                 }
-                // Hibernate maps these @Lob fields to CLOB, so lower() is not portable.
-                for (String clobField : searchField.jpaClobFields()) {
-                    tokenPredicates.add(cb.like(stringPath(root.get(clobField)), pattern, '\\'));
-                }
             }
             Long number = parseLong(token);
             if (number != null) {

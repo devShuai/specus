@@ -5,6 +5,8 @@
 
 #include "crypto.h"
 
+#include <openssl/rand.h>
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,12 +28,19 @@
 #define ST_PACKAGE_PART_HEADERS_MAX 8192U
 #define ST_PACKAGE_RATE_TABLE_CAPACITY 100003U
 #define ST_PACKAGE_RATE_SOURCE_MAX 127U
+/* Spring HttpRange.MAX_RANGES. */
+#define ST_PACKAGE_MAX_RANGES 100
 
 typedef struct {
     char source[ST_PACKAGE_RATE_SOURCE_MAX + 1U];
     time_t started_at;
     unsigned int count;
 } st_package_rate_window;
+
+typedef struct {
+    long long start;
+    long long end;
+} st_package_range;
 
 static pthread_mutex_t package_rate_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_package_rate_window *package_rate_windows = NULL;
@@ -116,9 +125,17 @@ int st_client_package_rate_limit(const char *remote_address,
         "SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_PER_IP", 120ULL, 1ULL, UINT_MAX);
     time_t window_seconds = (time_t)package_env_u64(
         "SPECUS_CLIENT_PACKAGE_PUBLIC_RATE_LIMIT_WINDOW_SECONDS", 60ULL, 1ULL, INT_MAX);
-    const char *source = remote_address;
-    if (source == NULL || *source == '\0' || strlen(source) > ST_PACKAGE_RATE_SOURCE_MAX) {
-        source = "unknown";
+    /* Java ClientPackageRateLimiter: the trimmed address, or "unknown" when there is none. */
+    char source[ST_PACKAGE_RATE_SOURCE_MAX + 1U];
+    const char *address = remote_address == NULL ? "" : remote_address;
+    while (*address != '\0' && (unsigned char)*address <= ' ') ++address;
+    size_t source_len = strlen(address);
+    while (source_len > 0U && (unsigned char)address[source_len - 1U] <= ' ') --source_len;
+    if (source_len == 0U || source_len > ST_PACKAGE_RATE_SOURCE_MAX) {
+        snprintf(source, sizeof(source), "%s", "unknown");
+    } else {
+        memcpy(source, address, source_len);
+        source[source_len] = '\0';
     }
     time_t now = time(NULL);
     if (retry_after_seconds != NULL) *retry_after_seconds = 1;
@@ -537,7 +554,7 @@ static int package_validate_form(st_package_form *form,
     unsigned int required = ST_PACKAGE_SEEN_IMPLEMENTATION | ST_PACKAGE_SEEN_PLATFORM
         | ST_PACKAGE_SEEN_ARCH | ST_PACKAGE_SEEN_VERSION | ST_PACKAGE_SEEN_DISPLAY_NAME
         | ST_PACKAGE_SEEN_FILE;
-    if ((form->seen & required) != required || form->file_len == 0U) {
+    if ((form->seen & required) != required) {
         package_error(error, error_len, "file and required package metadata are required");
         return -1;
     }
@@ -645,15 +662,36 @@ static int package_path_for(long long id, char out[PATH_MAX])
     return written > 0 && written < PATH_MAX ? 0 : -1;
 }
 
+/*
+ * Java ClientDownloadLinkService.downloadFileName, computed from the row as it is now: the trimmed
+ * display name without ISO control characters (C0, DEL and the UTF-8 encoded C1 range), with
+ * \ / : * ? " < > | replaced by '_', trimmed again and stripped of trailing dots;
+ * "specus-client-<id>" when nothing is left; a universal Android APK always ends in ".apk".
+ */
 static void package_download_name(const st_storage_client_download_link *link, char out[256])
 {
     size_t written = 0U;
-    const char *source = link->display_name[0] == '\0' ? "specus-client" : link->display_name;
-    for (const unsigned char *p = (const unsigned char *)source; *p != '\0' && written < 160U; ++p) {
+    const unsigned char *source = (const unsigned char *)link->display_name;
+    while (*source != '\0' && *source <= ' ') ++source;
+    for (const unsigned char *p = source; *p != '\0' && written < 160U; ++p) {
         if (*p < 0x20U || *p == 0x7fU) continue;
+        if (p[0] == 0xc2U && p[1] >= 0x80U && p[1] <= 0x9fU) {
+            ++p;
+            continue;
+        }
         out[written++] = strchr("\\/:*?\"<>|", (char)*p) == NULL ? (char)*p : '_';
     }
-    while (written > 0U && (out[written - 1U] == '.' || isspace((unsigned char)out[written - 1U]))) --written;
+    for (;;) {
+        while (written > 0U && (unsigned char)out[written - 1U] <= ' ') --written;
+        if (written == 0U || out[written - 1U] != '.') break;
+        --written;
+    }
+    size_t leading = 0U;
+    while (leading < written && (unsigned char)out[leading] <= ' ') ++leading;
+    if (leading > 0U) {
+        memmove(out, out + leading, written - leading);
+        written -= leading;
+    }
     if (written == 0U) written = (size_t)snprintf(out, 256U, "specus-client-%lld", link->id);
     out[written] = '\0';
     if (strcmp(link->implementation, "android") == 0 && strcmp(link->platform, "android") == 0
@@ -661,6 +699,61 @@ static void package_download_name(const st_storage_client_download_link *link, c
         size_t len = strlen(out);
         if ((len < 4U || strcasecmp(out + len - 4U, ".apk") != 0) && len + 4U < 256U) strcat(out, ".apk");
     }
+}
+
+/*
+ * The Content-Disposition value Spring's ContentDisposition.attachment().filename(name, UTF_8)
+ * writes: filename= carries the name converted to ISO-8859-1 (a code point beyond it, or a byte
+ * that is not UTF-8, becomes '_'), filename*= the RFC 5987 percent-encoded UTF-8 name.
+ */
+static int package_content_disposition(const char *name, char *out, size_t out_len)
+{
+    static const char attr_chars[] = "!#$&+-.^_`|~";
+    static const char hex[] = "0123456789ABCDEF";
+    size_t used = 0U;
+    int written = snprintf(out, out_len, "attachment; filename=\"");
+    if (written <= 0 || (size_t)written >= out_len) return -1;
+    used = (size_t)written;
+    const unsigned char *p = (const unsigned char *)name;
+    while (*p != '\0') {
+        unsigned int code_point = 0U;
+        size_t length = 1U;
+        if (*p < 0x80U) {
+            code_point = *p;
+        } else if ((*p & 0xe0U) == 0xc0U && (p[1] & 0xc0U) == 0x80U) {
+            code_point = ((unsigned int)(*p & 0x1fU) << 6) | (p[1] & 0x3fU);
+            length = 2U;
+        } else if ((*p & 0xf0U) == 0xe0U && (p[1] & 0xc0U) == 0x80U && (p[2] & 0xc0U) == 0x80U) {
+            code_point = 0x800U;
+            length = 3U;
+        } else if ((*p & 0xf8U) == 0xf0U && (p[1] & 0xc0U) == 0x80U && (p[2] & 0xc0U) == 0x80U
+                   && (p[3] & 0xc0U) == 0x80U) {
+            code_point = 0x10000U;
+            length = 4U;
+        } else {
+            code_point = 0x100U;
+        }
+        if (used + 3U >= out_len) return -1;
+        unsigned char latin1 = code_point < 0x100U ? (unsigned char)code_point : (unsigned char)'_';
+        if (latin1 == '"' || latin1 == '\\') out[used++] = '\\';
+        out[used++] = (char)latin1;
+        p += length;
+    }
+    written = snprintf(out + used, out_len - used, "\"; filename*=UTF-8''");
+    if (written <= 0 || (size_t)written >= out_len - used) return -1;
+    used += (size_t)written;
+    for (p = (const unsigned char *)name; *p != '\0'; ++p) {
+        if (used + 4U >= out_len) return -1;
+        if (isalnum(*p) || (*p < 0x80U && strchr(attr_chars, (char)*p) != NULL)) {
+            out[used++] = (char)*p;
+        } else {
+            out[used++] = '%';
+            out[used++] = hex[*p >> 4];
+            out[used++] = hex[*p & 0x0fU];
+        }
+    }
+    out[used] = '\0';
+    return 0;
 }
 
 static int package_write_all(int fd, const uint8_t *data, size_t len)
@@ -696,9 +789,16 @@ int st_client_package_upload(const char *database_path,
     st_storage_client_download_link metadata;
     int latest = 0;
     if (package_validate_form(&form, &metadata, &latest, error, error_len) != 0) return -1;
+    /* Java ClientPackageStorage.stage: the bytes actually received are what the limit applies to. */
     if (form.file_len > package_max_bytes()) {
         if (http_status != NULL) *http_status = 413;
-        package_error(error, error_len, "file exceeds max package size");
+        char message[96];
+        snprintf(message, sizeof(message), "file exceeds max package size of %zu bytes", package_max_bytes());
+        package_error(error, error_len, message);
+        return -1;
+    }
+    if (form.file_len == 0U) {
+        package_error(error, error_len, "file cannot be empty");
         return -1;
     }
     if (database_path == NULL || st_storage_init(database_path, 0) != 0) {
@@ -706,27 +806,31 @@ int st_client_package_upload(const char *database_path,
         package_error(error, error_len, "client package database unavailable");
         return -1;
     }
+    /*
+     * Java wraps every staging and publishing I/O failure in IllegalStateException, which its
+     * GlobalExceptionHandler answers with 409.
+     */
     char root[PATH_MAX];
-    if (package_root(root) != 0) {
-        if (http_status != NULL) *http_status = 500;
-        package_error(error, error_len, "cannot prepare client package directory");
+    char temporary[PATH_MAX];
+    int temp_written = package_root(root) == 0
+        ? snprintf(temporary, sizeof(temporary), "%s/.upload-XXXXXX", root) : -1;
+    if (temp_written <= 0 || (size_t)temp_written >= sizeof(temporary)) {
+        if (http_status != NULL) *http_status = 409;
+        package_error(error, error_len, "cannot stage client package");
         return -1;
     }
-    char temporary[PATH_MAX];
-    int temp_written = snprintf(temporary, sizeof(temporary), "%s/.upload-XXXXXX", root);
-    if (temp_written <= 0 || (size_t)temp_written >= sizeof(temporary)) return -1;
     int file_fd = mkstemp(temporary);
     if (file_fd < 0 || fchmod(file_fd, 0600) != 0
         || package_write_all(file_fd, form.file, form.file_len) != 0 || fsync(file_fd) != 0) {
         if (file_fd >= 0) close(file_fd);
         unlink(temporary);
-        if (http_status != NULL) *http_status = 500;
+        if (http_status != NULL) *http_status = 409;
         package_error(error, error_len, "cannot stage client package");
         return -1;
     }
     if (close(file_fd) != 0) {
         unlink(temporary);
-        if (http_status != NULL) *http_status = 500;
+        if (http_status != NULL) *http_status = 409;
         package_error(error, error_len, "cannot stage client package");
         return -1;
     }
@@ -752,14 +856,22 @@ int st_client_package_upload(const char *database_path,
     int url_written = snprintf(download_url, sizeof(download_url),
                                "/api/public/client-packages/%lld/download", pending.id);
     struct stat existing;
+    int already_exists = final_written > 0 && (size_t)final_written < sizeof(final_path)
+        && lstat(final_path, &existing) == 0;
     if (final_written <= 0 || (size_t)final_written >= sizeof(final_path)
         || url_written <= 0 || (size_t)url_written >= sizeof(download_url)
-        || (lstat(final_path, &existing) == 0 || errno != ENOENT)
+        || already_exists || errno != ENOENT
         || rename(temporary, final_path) != 0) {
         unlink(temporary);
         (void)st_storage_delete_client_download_link(database_path, pending.id);
-        if (http_status != NULL) *http_status = 500;
-        package_error(error, error_len, "cannot publish client package");
+        if (http_status != NULL) *http_status = 409;
+        if (already_exists) {
+            char message[96];
+            snprintf(message, sizeof(message), "package file already exists: %lld", pending.id);
+            package_error(error, error_len, message);
+        } else {
+            package_error(error, error_len, "cannot publish client package");
+        }
         return -1;
     }
     st_storage_client_download_link published;
@@ -845,11 +957,137 @@ static int package_parse_download_path(const char *path, long long *id)
     return 0;
 }
 
+/* Java Long.parseLong over [begin, end): an optional sign, then decimal digits that fit. */
+static int package_parse_long(const char *begin, const char *end, long long *out)
+{
+    int negative = 0;
+    if (begin < end && (*begin == '+' || *begin == '-')) {
+        negative = *begin == '-';
+        ++begin;
+    }
+    if (begin >= end) return -1;
+    long long value = 0;
+    for (const char *p = begin; p < end; ++p) {
+        if (*p < '0' || *p > '9') return -1;
+        int digit = *p - '0';
+        if (value > (LLONG_MAX - digit) / 10) return -1;
+        value = value * 10 + digit;
+    }
+    *out = negative ? -value : value;
+    return 0;
+}
+
+/*
+ * Spring HttpRange.parseRanges followed by toResourceRegions: "bytes=" then comma-separated
+ * tokens, trimmed and with empty ones skipped, at most 100 of them. "first-last" ends at the last
+ * byte when last is beyond it, "first-" runs to the end, "-n" is the last n bytes. A range that
+ * starts at or after the end, a malformed token, and several ranges that together cover the whole
+ * resource are not satisfiable. Returns the number of ranges, 0 for no token, -1 otherwise.
+ */
+static int package_parse_ranges(const char *header,
+                                long long length,
+                                st_package_range *ranges,
+                                size_t capacity)
+{
+    static const char prefix[] = "bytes=";
+    if (*header == '\0') return 0;
+    if (strncmp(header, prefix, sizeof(prefix) - 1U) != 0) return -1;
+    const char *cursor = header + sizeof(prefix) - 1U;
+    size_t count = 0U;
+    while (*cursor != '\0') {
+        const char *token_end = strchr(cursor, ',');
+        if (token_end == NULL) token_end = cursor + strlen(cursor);
+        const char *begin = cursor;
+        const char *end = token_end;
+        while (begin < end && (unsigned char)*begin <= ' ') ++begin;
+        while (end > begin && (unsigned char)end[-1] <= ' ') --end;
+        cursor = *token_end == ',' ? token_end + 1 : token_end;
+        if (begin == end) continue;
+        if (count == capacity) return -1;
+        const char *dash = memchr(begin, '-', (size_t)(end - begin));
+        if (dash == NULL) return -1;
+        long long start = 0;
+        long long last = length - 1;
+        if (dash > begin) {
+            if (package_parse_long(begin, dash, &start) != 0 || start < 0) return -1;
+            if (dash + 1 < end) {
+                long long requested_last = 0;
+                if (package_parse_long(dash + 1, end, &requested_last) != 0
+                    || requested_last < start) return -1;
+                if (requested_last < length) last = requested_last;
+            }
+        } else {
+            long long suffix = 0;
+            if (package_parse_long(dash + 1, end, &suffix) != 0 || suffix < 0) return -1;
+            start = suffix < length ? length - suffix : 0;
+        }
+        if (start >= length) return -1;
+        ranges[count].start = start;
+        ranges[count].end = last;
+        ++count;
+    }
+    if (count > 1U) {
+        long long total = 0;
+        for (size_t i = 0U; i < count; ++i) total += ranges[i].end - ranges[i].start + 1;
+        if (total >= length) return -1;
+    }
+    return (int)count;
+}
+
+/*
+ * Spring ServletWebRequest.checkNotModified for a GET or HEAD: If-None-Match lists quoted entity
+ * tags, each optionally weak ("W/"), and any of them equal to ours (weak comparison) answers 304.
+ * A wildcard does not match on a safe method, and parsing stops at the first unexpected character.
+ */
+static int package_if_none_match(const char *header, const char *etag_value)
+{
+    size_t etag_len = strlen(etag_value);
+    const char *p = header;
+    while (*p != '\0') {
+        if (isspace((unsigned char)*p) || *p == ',') {
+            ++p;
+            continue;
+        }
+        if (*p == '*') {
+            ++p;
+            continue;
+        }
+        if (p[0] == 'W' && p[1] == '/' && p[2] == '"') p += 2;
+        if (*p != '"') return 0;
+        const char *tag = ++p;
+        const char *close = strchr(tag, '"');
+        if (close == NULL) return 0;
+        if ((size_t)(close - tag) == etag_len && strncmp(tag, etag_value, etag_len) == 0) return 1;
+        p = close + 1;
+    }
+    return 0;
+}
+
+static int package_send_range(int out_fd, int file_fd, long long start, long long count)
+{
+    uint8_t buffer[64U * 1024U];
+    while (count > 0) {
+        size_t want = count < (long long)sizeof(buffer) ? (size_t)count : sizeof(buffer);
+        ssize_t read_len = pread(file_fd, buffer, want, (off_t)start);
+        if (read_len < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (read_len == 0) return -1;
+        if (package_send_all(out_fd, buffer, (size_t)read_len) != 0) return -1;
+        start += read_len;
+        count -= read_len;
+    }
+    return 0;
+}
+
 int st_client_package_send_download(int fd,
                                     const char *method,
                                     const char *path,
                                     const char *database_path,
-                                    const char *remote_address)
+                                    const char *remote_address,
+                                    const char *range_header,
+                                    const char *if_none_match)
 {
     long long id = 0;
     if ((strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
@@ -870,49 +1108,129 @@ int st_client_package_send_download(int fd,
         return 1;
     }
     st_storage_client_download_link link;
-    if (database_path == NULL || st_storage_get_client_download_link(database_path, id, &link) != 0
-        || !link.enabled || !link.hosted || !st_client_package_is_readable(&link)) {
-        package_send_error(fd, 404, "Not Found", "client package not found");
-        return 1;
-    }
     char path_buffer[PATH_MAX];
-    if (package_path_for(id, path_buffer) != 0) {
+    if (database_path == NULL || st_storage_get_client_download_link(database_path, id, &link) != 0
+        || !link.enabled || !link.hosted || package_path_for(id, path_buffer) != 0) {
         package_send_error(fd, 404, "Not Found", "client package not found");
         return 1;
     }
     int file_fd = open(path_buffer, O_RDONLY | O_NOFOLLOW);
-    if (file_fd < 0) {
+    struct stat file_stat;
+    if (file_fd < 0 || fstat(file_fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+        if (file_fd >= 0) close(file_fd);
         package_send_error(fd, 404, "Not Found", "client package not found");
         return 1;
     }
+    long long length = (long long)file_stat.st_size;
+    if (length != link.file_size || length <= 0) {
+        /* Java answers IllegalStateException (409) when the bytes no longer match the catalogue. */
+        close(file_fd);
+        package_send_error(fd, 409, "Conflict", "client package size no longer matches its catalogue metadata");
+        return 1;
+    }
     char file_name[256];
-    snprintf(file_name, sizeof(file_name), "%s", link.package_file_name);
-    if (file_name[0] == '\0') package_download_name(&link, file_name);
-    char header[1024];
-    int header_len = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-        "Content-Length: %lld\r\nCache-Control: no-store\r\n"
-        "Content-Disposition: attachment; filename=\"%s\"\r\n"
-        "ETag: \"sha256-%s\"\r\nX-Checksum-SHA256: %s\r\n"
-        "X-Content-Type-Options: nosniff\r\n\r\n",
-        link.file_size, file_name, link.sha256, link.sha256);
-    int ok = header_len > 0 && (size_t)header_len < sizeof(header)
-        && package_send_all(fd, header, (size_t)header_len) == 0;
-    if (ok && strcmp(method, "HEAD") != 0) {
-        uint8_t buffer[64U * 1024U];
-        for (;;) {
-            ssize_t read_len = read(file_fd, buffer, sizeof(buffer));
-            if (read_len == 0) break;
-            if (read_len < 0) {
-                if (errno == EINTR) continue;
-                ok = 0;
-                break;
-            }
-            if (package_send_all(fd, buffer, (size_t)read_len) != 0) {
-                ok = 0;
-                break;
-            }
+    package_download_name(&link, file_name);
+    char disposition[1400];
+    char entity_headers[2048];
+    int entity_len = -1;
+    if (package_content_disposition(file_name, disposition, sizeof(disposition)) == 0) {
+        entity_len = link.sha256[0] != '\0'
+            ? snprintf(entity_headers, sizeof(entity_headers),
+                       "Cache-Control: no-store\r\nContent-Disposition: %s\r\n"
+                       "ETag: \"sha256-%s\"\r\nX-Checksum-SHA256: %s\r\n"
+                       "X-Content-Type-Options: nosniff\r\n",
+                       disposition, link.sha256, link.sha256)
+            : snprintf(entity_headers, sizeof(entity_headers),
+                       "Cache-Control: no-store\r\nContent-Disposition: %s\r\n"
+                       "X-Content-Type-Options: nosniff\r\n",
+                       disposition);
+    }
+    if (entity_len <= 0 || (size_t)entity_len >= sizeof(entity_headers)) {
+        close(file_fd);
+        package_send_error(fd, 500, "Internal Server Error", "client package response failed");
+        return 1;
+    }
+    int head_only = strcmp(method, "HEAD") == 0;
+    char header[4096];
+    int header_len = -1;
+    int ok = 1;
+    char etag_value[80];
+    snprintf(etag_value, sizeof(etag_value), "sha256-%s", link.sha256);
+    if (link.sha256[0] != '\0' && if_none_match != NULL && package_if_none_match(if_none_match, etag_value)) {
+        header_len = snprintf(header, sizeof(header), "HTTP/1.1 304 Not Modified\r\n%s\r\n", entity_headers);
+        ok = header_len > 0 && (size_t)header_len < sizeof(header)
+            && package_send_all(fd, header, (size_t)header_len) == 0;
+        close(file_fd);
+        return ok ? 1 : -1;
+    }
+    st_package_range ranges[ST_PACKAGE_MAX_RANGES];
+    int range_count = 0;
+    if (range_header != NULL) {
+        range_count = package_parse_ranges(range_header, length, ranges, ST_PACKAGE_MAX_RANGES);
+    }
+    if (range_count < 0) {
+        /* Spring keeps the entity headers and adds Content-Range: bytes * / length. */
+        header_len = snprintf(header, sizeof(header),
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/octet-stream\r\n"
+            "Accept-Ranges: bytes\r\nContent-Range: bytes */%lld\r\n%sContent-Length: 0\r\n\r\n",
+            length, entity_headers);
+        ok = header_len > 0 && (size_t)header_len < sizeof(header)
+            && package_send_all(fd, header, (size_t)header_len) == 0;
+    } else if (range_count == 1) {
+        long long count = ranges[0].end - ranges[0].start + 1;
+        header_len = snprintf(header, sizeof(header),
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\n"
+            "Accept-Ranges: bytes\r\nContent-Range: bytes %lld-%lld/%lld\r\n%sContent-Length: %lld\r\n\r\n",
+            ranges[0].start, ranges[0].end, length, entity_headers, count);
+        ok = header_len > 0 && (size_t)header_len < sizeof(header)
+            && package_send_all(fd, header, (size_t)header_len) == 0
+            && (head_only || package_send_range(fd, file_fd, ranges[0].start, count) == 0);
+    } else if (range_count > 1) {
+        /* ResourceRegionHttpMessageConverter: multipart/byteranges, one part per requested range. */
+        uint8_t random[16];
+        char boundary[2U * sizeof(random) + 1U];
+        if (RAND_bytes(random, (int)sizeof(random)) != 1) {
+            close(file_fd);
+            package_send_error(fd, 500, "Internal Server Error", "client package response failed");
+            return 1;
         }
+        st_hex_encode(random, sizeof(random), boundary);
+        long long total = 0;
+        char part_header[256];
+        for (int i = 0; i < range_count; ++i) {
+            int part_len = snprintf(part_header, sizeof(part_header),
+                "\r\n--%s\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes %lld-%lld/%lld\r\n\r\n",
+                boundary, ranges[i].start, ranges[i].end, length);
+            if (part_len <= 0 || (size_t)part_len >= sizeof(part_header)) ok = 0;
+            total += part_len + (ranges[i].end - ranges[i].start + 1);
+        }
+        total += (long long)strlen(boundary) + 6;
+        header_len = snprintf(header, sizeof(header),
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: multipart/byteranges; boundary=%s\r\n"
+            "Accept-Ranges: bytes\r\n%sContent-Length: %lld\r\n\r\n",
+            boundary, entity_headers, total);
+        ok = ok && header_len > 0 && (size_t)header_len < sizeof(header)
+            && package_send_all(fd, header, (size_t)header_len) == 0;
+        for (int i = 0; ok && !head_only && i < range_count; ++i) {
+            int part_len = snprintf(part_header, sizeof(part_header),
+                "\r\n--%s\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes %lld-%lld/%lld\r\n\r\n",
+                boundary, ranges[i].start, ranges[i].end, length);
+            ok = package_send_all(fd, part_header, (size_t)part_len) == 0
+                && package_send_range(fd, file_fd, ranges[i].start, ranges[i].end - ranges[i].start + 1) == 0;
+        }
+        if (ok && !head_only) {
+            char closing[64];
+            int closing_len = snprintf(closing, sizeof(closing), "\r\n--%s--", boundary);
+            ok = package_send_all(fd, closing, (size_t)closing_len) == 0;
+        }
+    } else {
+        header_len = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            "Accept-Ranges: bytes\r\n%sContent-Length: %lld\r\n\r\n",
+            entity_headers, length);
+        ok = header_len > 0 && (size_t)header_len < sizeof(header)
+            && package_send_all(fd, header, (size_t)header_len) == 0
+            && (head_only || package_send_range(fd, file_fd, 0, length) == 0);
     }
     close(file_fd);
     return ok ? 1 : -1;

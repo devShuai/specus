@@ -779,10 +779,8 @@ public class SpecusCoreProtocolTest {
                 .put("httpSpecusConfigList", new JSONArray().put(route("initial", "http://127.0.0.1:8080")));
         SpecusCore.SpecusSession session = SpecusCore.SpecusSession.fromLoginJson(login);
 
+        // A NAT_CONTROL is the full route set: a missing list means no routes, not "keep the old ones".
         session.applyRuntimeJson(new JSONObject().put("specusConfigList", new JSONArray()).toString());
-        assertEquals("http://127.0.0.1:8080", session.routeMap().get("initial"));
-
-        session.applyRuntimeJson(new JSONObject().put("httpSpecusConfigList", new JSONArray()).toString());
         assertTrue(session.routeMap().isEmpty());
 
         session.applyRuntimeJson(new JSONObject()
@@ -791,6 +789,15 @@ public class SpecusCoreProtocolTest {
         assertEquals(1, session.routeMap().size());
         assertEquals("https://10.0.0.2/base", session.routeMap().get("next"));
         assertFalse(session.routeMap().containsKey("initial"));
+
+        session.applyRuntimeJson(new JSONObject().put("httpSpecusConfigList", new JSONArray()).toString());
+        assertTrue(session.routeMap().isEmpty());
+
+        session.applyRuntimeJson(new JSONObject()
+                .put("httpSpecusConfigList", new JSONArray().put(route("next", "https://10.0.0.2/base")))
+                .toString());
+        session.applyRuntimeJson(new JSONObject().put("httpSpecusConfigList", JSONObject.NULL).toString());
+        assertTrue(session.routeMap().isEmpty());
     }
 
     @Test

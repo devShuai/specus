@@ -61,6 +61,7 @@ typedef struct {
     char *jwks;
     int jwks_status;
     int jwks_hits;
+    int jwks_delay_ms;
     int token_requests;
     char *last_token_request;
     idp_code codes[IDP_MAX_CODES];
@@ -240,7 +241,12 @@ static void idp_handle(int client)
         int status = idp.jwks_status;
         char *body = duplicate(status == 200 ? idp.jwks : "{\"error\":\"unavailable\"}");
         ++idp.jwks_hits;
+        int delay_ms = idp.jwks_delay_ms;
         pthread_mutex_unlock(&idp.lock);
+        if (delay_ms > 0) {
+            struct timespec pause = {delay_ms / 1000, (long)(delay_ms % 1000) * 1000000L};
+            nanosleep(&pause, NULL);
+        }
         idp_respond(client, status, body);
         free(body);
     } else if (strncmp(request, "POST /token ", strlen("POST /token ")) == 0) {
@@ -794,9 +800,9 @@ static void test_login_issues_local_token(void)
 
     char expected_key[65];
     CHECK(st_oidc_identity_key(issuer, "subject-alice", expected_key) == 0, "identity key failed");
-    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE username = ?", "alice");
-    char *stored_issuer = db_text("SELECT oidc_issuer FROM specus_management_user WHERE username = ?", "alice");
-    char *hash = db_text("SELECT password_hash FROM specus_management_user WHERE username = ?", "alice");
+    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE login_name = ?", "alice");
+    char *stored_issuer = db_text("SELECT oidc_issuer FROM specus_management_user WHERE login_name = ?", "alice");
+    char *hash = db_text("SELECT password_hash FROM specus_management_user WHERE login_name = ?", "alice");
     CHECK(stored_key != NULL && strcmp(stored_key, expected_key) == 0, "binding key is not SHA-256(iss NUL sub)");
     CHECK(stored_issuer != NULL && strcmp(stored_issuer, issuer) == 0, "binding issuer not stored");
     CHECK(hash != NULL && strncmp(hash, "$pbkdf2-sha256$v=1$i=", strlen("$pbkdf2-sha256$v=1$i=")) == 0,
@@ -818,7 +824,7 @@ static void test_binding_follows_subject(void)
     st_security_token_claims claims;
     CHECK(local_claims_of(renamed, &claims) == 0 && strcmp(claims.username, "alice") == 0,
           "a renamed identity provider account did not keep its bound user");
-    char *row = db_text("SELECT username FROM specus_management_user WHERE username = ?", "alice-renamed");
+    char *row = db_text("SELECT username FROM specus_management_user WHERE login_name = ?", "alice-renamed");
     CHECK(row == NULL, "a rename created a second account");
     /* Subjects are case-sensitive: a different subject is a different identity. */
     char *upper = login_token("SUBJECT-ALICE", "alice-upper");
@@ -839,7 +845,7 @@ static void test_binds_existing_user_once(void)
           "first OIDC login did not link the existing local user with its role");
     char expected_key[65];
     st_oidc_identity_key(issuer, "subject-bob", expected_key);
-    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE username = ?", "bob");
+    char *stored_key = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE login_name = ?", "bob");
     CHECK(stored_key != NULL && strcmp(stored_key, expected_key) == 0, "existing user was not bound");
     claims_spec intruder = id_claims("subject-intruder", "bob", "nonce-intruder");
     CHECK(login_claims(key_main, "k1", &intruder) == 403
@@ -887,7 +893,7 @@ static void test_disabled_users_are_refused(void)
     create_user("carol", "default", "USER", 0);
     claims_spec carol = id_claims("subject-carol", "carol", "nonce-carol");
     CHECK(login_claims(key_main, "k1", &carol) == 403, "a disabled unbound user was linked");
-    char *bound = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE username = ?", "carol");
+    char *bound = db_text("SELECT oidc_identity_key FROM specus_management_user WHERE login_name = ?", "carol");
     CHECK(bound == NULL || *bound == '\0', "a disabled user was bound");
 
     char *alice = login_token("subject-alice", "alice");
@@ -910,14 +916,13 @@ static void test_refused_usernames(void)
     memset(long_name, 'x', 81U);
     long_name[81] = '\0';
     create_user("dora", "tenant-b", "USER", 1);
-    const char *names[] = {"admin", "ADMIN", NULL, "   ", long_name, "dora"};
+    const char *names[] = {"admin", "ADMIN", NULL, "   ", long_name};
     const char *labels[] = {
         "preferred_username equal to the built-in admin was accepted",
         "preferred_username equal to the built-in admin in other case was accepted",
         "an ID token without preferred_username was accepted",
         "a blank preferred_username was accepted",
-        "an 81-character preferred_username was accepted",
-        "a same-named user of another tenant was linked or duplicated"
+        "an 81-character preferred_username was accepted"
     };
     for (size_t i = 0U; i < sizeof(names) / sizeof(names[0]); ++i) {
         char *subject = format("subject-refused-%zu", i);
@@ -927,9 +932,19 @@ static void test_refused_usernames(void)
               labels[i]);
         free(subject);
     }
-    char *dora_tenant = db_text("SELECT tenant_id FROM specus_management_user WHERE username = ?", "dora");
-    CHECK(dora_tenant != NULL && strcmp(dora_tenant, "tenant-b") == 0, "the other tenant's user changed");
-    free(dora_tenant);
+    /*
+     * Login names are unique per tenant only: a same-named user of another tenant is neither linked
+     * nor in the way. The first login provisions a USER of the default tenant (Java
+     * resolveOrProvisionOidcUser looks in the default tenant only) and tenant-b's dora is untouched.
+     */
+    claims_spec dora = id_claims("subject-dora", "Dora", "nonce-dora");
+    CHECK(login_claims(key_main, "k1", &dora) == 200, "a same-named user of another tenant blocked the login");
+    char *dora_rows = db_text("SELECT group_concat(tenant_id || ':' || COALESCE(oidc_subject, '-'), ',') FROM "
+                              "(SELECT tenant_id, oidc_subject FROM specus_management_user "
+                              "WHERE login_name_normalized = ? ORDER BY tenant_id)", "dora");
+    CHECK(dora_rows != NULL && strcmp(dora_rows, "default:subject-dora,tenant-b:-") == 0,
+          "the other tenant's user was linked, or no default-tenant account was provisioned");
+    free(dora_rows);
 
     /* Java stores issuer and subject in 255-character columns and refuses longer values. */
     char long_subject[257];
@@ -937,7 +952,7 @@ static void test_refused_usernames(void)
     long_subject[256] = '\0';
     claims_spec long_spec = id_claims(long_subject, "long-subject-user", "nonce-long");
     CHECK(login_claims(key_main, "k1", &long_spec) == 403, "a 256-character subject was bound");
-    char *created = db_text("SELECT username FROM specus_management_user WHERE username = ?", "long-subject-user");
+    char *created = db_text("SELECT username FROM specus_management_user WHERE login_name = ?", "long-subject-user");
     CHECK(created == NULL, "a refused identity still created an account");
     free(created);
 }
@@ -1158,6 +1173,94 @@ static void test_key_rotation_and_refetch_cooldown(void)
     idp_publish(jwk_ec, jwk_weak, NULL, NULL);
     CHECK(login_claims(key_main, "k1", &spec) == 502, "a JWKS without usable RSA keys verified a token");
 
+    st_oidc_jwks_reset();
+    idp_publish(jwk_main, jwk_next, jwk_weak, jwk_ec);
+}
+
+static void idp_set_jwks_delay_ms(int delay_ms)
+{
+    pthread_mutex_lock(&idp.lock);
+    idp.jwks_delay_ms = delay_ms;
+    pthread_mutex_unlock(&idp.lock);
+}
+
+static long long elapsed_ms(const struct timespec *since)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)(now.tv_sec - since->tv_sec) * 1000LL + (now.tv_nsec - since->tv_nsec) / 1000000L;
+}
+
+typedef struct {
+    char *token;
+    int result;
+    long long elapsed_ms;
+} slow_validation;
+
+static void *validate_while_the_idp_is_slow(void *arg)
+{
+    slow_validation *validation = (slow_validation *)arg;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    st_oidc_identity identity;
+    validation->result = st_oidc_validate_id_token(validation->token, "nonce-slow", &identity);
+    if (validation->result == ST_OIDC_OK) {
+        st_oidc_identity_free(&identity);
+    }
+    validation->elapsed_ms = elapsed_ms(&start);
+    return NULL;
+}
+
+/*
+ * A refetch for an unknown kid must not hold up tokens a cached key verifies: an identity provider
+ * that hangs, or a stream of random kids, would otherwise stall every OIDC sign-in behind it.
+ */
+static void test_slow_refetch_does_not_block_cached_keys(void)
+{
+    st_oidc_jwks_reset();
+    st_oidc_jwks_set_refresh_cooldown_ms(0);
+    idp_publish(jwk_main, NULL, NULL, NULL);
+    claims_spec spec = id_claims("subject-alice", "alice", "nonce-slow");
+    char *cached = make_token(key_main, "k1", &spec);
+    st_oidc_identity identity;
+    CHECK(st_oidc_validate_id_token(cached, "nonce-slow", &identity) == ST_OIDC_OK,
+          "the cached key did not verify before the slow refetch");
+    st_oidc_identity_free(&identity);
+
+    /* k2 is not published yet: its token sends the server to the identity provider, which hangs. */
+    idp_set_jwks_delay_ms(2000);
+    int hits = idp_jwks_hits();
+    slow_validation unknown = {make_token(key_next, "k2", &spec), -1, 0LL};
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, validate_while_the_idp_is_slow, &unknown) == 0, "slow thread");
+    while (idp_jwks_hits() == hits) {
+        struct timespec pause = {0, 10L * 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int cached_result = st_oidc_validate_id_token(cached, "nonce-slow", &identity);
+    long long cached_ms = elapsed_ms(&start);
+    if (cached_result == ST_OIDC_OK) {
+        st_oidc_identity_free(&identity);
+    }
+    CHECK(cached_result == ST_OIDC_OK && cached_ms < 500LL,
+          "a token of a cached key waited for a refetch in flight");
+
+    /* A second miss during the fetch waits for that fetch rather than issuing its own. */
+    slow_validation second = {make_token(key_next, "k2", &spec), -1, 0LL};
+    pthread_t second_thread;
+    CHECK(pthread_create(&second_thread, NULL, validate_while_the_idp_is_slow, &second) == 0, "second thread");
+    pthread_join(thread, NULL);
+    pthread_join(second_thread, NULL);
+    CHECK(unknown.result != ST_OIDC_OK && second.result != ST_OIDC_OK,
+          "a key the identity provider does not publish verified");
+    CHECK(idp_jwks_hits() == hits + 1, "concurrent misses fetched the JWKS more than once");
+
+    idp_set_jwks_delay_ms(0);
+    free(cached);
+    free(unknown.token);
+    free(second.token);
     st_oidc_jwks_reset();
     idp_publish(jwk_main, jwk_next, jwk_weak, jwk_ec);
 }
@@ -1467,6 +1570,7 @@ int main(void)
     test_expiry_and_not_before();
     test_signature_and_key_selection();
     test_key_rotation_and_refetch_cooldown();
+    test_slow_refetch_does_not_block_cached_keys();
     test_callback_replay_is_refused();
     test_tenant_claim_does_not_choose_tenant();
     test_direct_bearer_tokens();

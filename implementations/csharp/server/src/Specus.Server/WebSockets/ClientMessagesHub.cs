@@ -151,6 +151,45 @@ public sealed class ClientMessagesHub
         return delivered;
     }
 
+    /// <summary>
+    /// The account of this identity was deleted: its open subscriptions end (management-accounts.md
+    /// section 7.1). A connection keeps the identity it was opened with, so it would otherwise go on
+    /// sending as the deleted account and receive what clients send to a later account of the same name.
+    /// </summary>
+    public async Task CloseIdentityAsync(string tenantId, string username)
+    {
+        foreach (var subscription in _subscriptions.Values)
+        {
+            if (!ManagementContext.SameTenant(subscription.TenantId, tenantId)
+                || !string.Equals(subscription.Username, username, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            _subscriptions.TryRemove(subscription.Id, out _);
+            try
+            {
+                await subscription.SendLock.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (subscription.Socket.State == WebSocketState.Open)
+                    {
+                        await subscription.Socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
+                            "account deleted", CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    subscription.SendLock.Release();
+                }
+            }
+            catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException
+                or InvalidOperationException)
+            {
+                subscription.Socket.Abort();
+            }
+        }
+    }
+
     private async Task HandleMessageAsync(Subscription source, string json, CancellationToken cancellationToken)
     {
         ClientMessageCommand? command;

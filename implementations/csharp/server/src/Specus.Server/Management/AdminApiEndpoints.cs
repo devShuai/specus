@@ -6,6 +6,7 @@ using Specus.Server.Hosting;
 using Specus.Server.PeerMesh;
 using Specus.Server.ProductMetrics;
 using Specus.Server.Security;
+using Specus.Server.WebSockets;
 
 namespace Specus.Server.Management;
 
@@ -95,6 +96,10 @@ public static class AdminApiEndpoints
                 {
                     context.Response.Headers.CacheControl = ConnectivityCheck.CacheControl;
                 }
+                else if (HttpShareEndpoints.IsManagementPath(context.Request.Path))
+                {
+                    context.Response.Headers.CacheControl = HttpShareEndpoints.ManagementCacheControl;
+                }
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 await context.Response.WriteAsJsonAsync(new { error = "未授权" }).ConfigureAwait(false);
                 return;
@@ -120,9 +125,12 @@ public static class AdminApiEndpoints
             }
             // Throttle before the captcha and credential check so deployments without Turnstile are
             // still bounded. Forwarded addresses are accepted only from configured trusted proxies.
+            // The account budget belongs to the tenant-qualified login name, so the same name in
+            // two tenants is counted, and cleared, separately.
+            var loginIdentity = LoginRateLimiter.LoginIdentity(request.TenantId, request.Username);
             if (!loginRateLimiter.TryAcquire(
                     addressResolver.Resolve(httpContext),
-                    request.Username,
+                    loginIdentity,
                     out var retryAfterSeconds))
             {
                 httpContext.Response.Headers.RetryAfter =
@@ -133,7 +141,9 @@ public static class AdminApiEndpoints
             await turnstile.VerifyAsync(request.TurnstileToken, TurnstileVerifier.LoginAction,
                     cancellationToken)
                 .ConfigureAwait(false);
-            var user = await users.AuthenticateAsync(request.Username, request.Password, cancellationToken)
+            // Only the body's tenantId selects the tenant; never the host or another header.
+            var user = await users.AuthenticateAsync(request.Username, request.Password, request.TenantId,
+                    cancellationToken)
                 .ConfigureAwait(false);
             if (user is null)
             {
@@ -141,13 +151,13 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status401Unauthorized);
             }
 
-            loginRateLimiter.RecordSuccess(request.Username);
+            loginRateLimiter.RecordSuccess(loginIdentity);
             if (!user.BuiltInAdmin)
             {
                 await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
                     cancellationToken).ConfigureAwait(false);
             }
-            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
+            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role, user.AccountKey));
         });
 
         app.MapPost("/auth/register", async (RegistrationRequest? request,
@@ -188,7 +198,7 @@ public static class AdminApiEndpoints
                 cancellationToken).ConfigureAwait(false);
             await productMetrics.MilestoneAsync(user.TenantId, user.Username, ProductMetricsModel.StepSignedIn,
                 cancellationToken).ConfigureAwait(false);
-            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
+            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role, user.AccountKey));
         });
 
         app.MapPost("/auth/refresh", async (HttpContext context, LocalTokenService tokens,
@@ -202,8 +212,10 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
+            // The bearer was already re-resolved to the account's login name, tenant and account key.
             var principal = ManagementContext.From(context, authOptions.Value);
-            var current = await users.ResolveRefreshUserAsync(principal.Username, cancellationToken)
+            var current = await users.ResolveLocalTokenUserAsync(principal.Username, principal.TenantId,
+                    context.User.FindFirst(LocalTokenService.AccountKeyClaim)?.Value, cancellationToken)
                 .ConfigureAwait(false);
             if (current is null)
             {
@@ -211,7 +223,7 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status401Unauthorized);
             }
             return Results.Ok(tokens.IssueTokenBody(current.Username, current.TenantId,
-                current.Role));
+                current.Role, current.AccountKey));
         });
 
         app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens,
@@ -399,11 +411,24 @@ public static class AdminApiEndpoints
         app.MapDelete("/api/admin/users/{username}",
             async (HttpContext context, string username, IOptions<AuthOptions> authOptions,
                 ManagementUserService service, ProductMetricsService productMetrics,
+                ClientMessagesHub clientMessages, ConnectionEventsHub connectionEvents,
                 CancellationToken cancellationToken) =>
             {
                 var caller = ManagementContext.From(context, authOptions.Value);
-                var deleted = await service.DeleteUserAsync(caller, username, cancellationToken)
-                    .ConfigureAwait(false);
+                (string TenantId, string Username) deleted;
+                try
+                {
+                    deleted = await service.DeleteUserAsync(caller, username, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (AccountStillOwnsResourcesException owned)
+                {
+                    return Results.Json(new { error = owned.Message, clients = owned.Clients,
+                        credentials = owned.Credentials }, statusCode: StatusCodes.Status409Conflict);
+                }
+                // Committed: the identity's open management WebSockets end (management-accounts.md 7.1).
+                await clientMessages.CloseIdentityAsync(deleted.TenantId, deleted.Username).ConfigureAwait(false);
+                await connectionEvents.CloseIdentityAsync(deleted.TenantId, deleted.Username).ConfigureAwait(false);
                 await productMetrics.UserDeletedAsync(deleted.TenantId, deleted.Username, cancellationToken)
                     .ConfigureAwait(false);
                 return Results.NoContent();

@@ -192,16 +192,22 @@ func (c *Conn) Close(reason string) {
 }
 
 // Send serializes and writes a packet, updating the write-idle timestamp. It is safe to call
-// from multiple goroutines.
+// from multiple goroutines. A write that fails closes the connection with IO_ERROR (see
+// writeFrame); a packet that cannot be encoded writes nothing and leaves it open.
 func (c *Conn) Send(packet protocol.Packet) error {
-	return c.CommitAndSend(nil, packet)
+	return c.send(nil, packet, store.ReasonIOError)
 }
 
 // CommitAndSend runs commit and then writes packet while holding the write lock across both,
 // so a frame another goroutine sends because of what commit published (such as a stream OPEN
 // on a connection commit just registered) always follows packet on the wire. commit must not
-// write to c. When packet cannot be encoded, commit does not run.
+// write to c. When packet cannot be encoded, commit does not run. A write that fails closes
+// the connection with IO_ERROR, as Send does.
 func (c *Conn) CommitAndSend(commit func(), packet protocol.Packet) error {
+	return c.send(commit, packet, store.ReasonIOError)
+}
+
+func (c *Conn) send(commit func(), packet protocol.Packet, failureReason string) error {
 	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
 	if err != nil {
 		return err
@@ -213,7 +219,7 @@ func (c *Conn) CommitAndSend(commit func(), packet protocol.Packet) error {
 	if commit != nil {
 		commit()
 	}
-	return c.writeFrameLocked(frame)
+	return c.writeFrameLocked(frame, failureReason)
 }
 
 // SendPriority queues a small flow-control packet without blocking the read loop on a
@@ -234,17 +240,23 @@ func (c *Conn) SendPriority(packet protocol.Packet) error {
 	}
 }
 
-func (c *Conn) writeFrame(frame []byte) error {
+// writeFrame writes one whole frame, or closes the connection with failureReason: a write that
+// fails may have put part of the frame on the wire, and any frame after it would be read out of
+// step ("帧写入失败" in protocol/spec/control-protocol.md). The buffered writer keeps the error, so
+// a write that races the close fails too and writes nothing.
+func (c *Conn) writeFrame(frame []byte, failureReason string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.writeFrameLocked(frame)
+	return c.writeFrameLocked(frame, failureReason)
 }
 
-func (c *Conn) writeFrameLocked(frame []byte) error {
+func (c *Conn) writeFrameLocked(frame []byte, failureReason string) error {
 	if _, err := c.writer.Write(frame); err != nil {
+		c.Close(failureReason)
 		return err
 	}
 	if err := c.writer.Flush(); err != nil {
+		c.Close(failureReason)
 		return err
 	}
 	c.lastWriteUnixNano.Store(time.Now().UnixNano())
@@ -255,10 +267,9 @@ func (c *Conn) priorityWriteLoop() {
 	for {
 		select {
 		case queued := <-c.priorityWrites:
-			err := c.writeFrame(queued.frame)
+			err := c.writeFrame(queued.frame, store.ReasonIOError)
 			c.WriteBackpressure.ReleasePending(queued.tracked)
 			if err != nil {
-				c.Close(store.ReasonIOError)
 				return
 			}
 		case <-c.ctx.Done():
@@ -350,7 +361,7 @@ func (c *Conn) idleWatchdog() {
 		}
 		if time.Duration(now-c.lastWriteUnixNano.Load()) >= writerIdle {
 			// Java's SocketIdleStateHandler sends a HeartbeatResponse as keep-alive bytes.
-			if err := c.Send(protocol.HeartbeatResponse{}); err != nil {
+			if err := c.send(nil, protocol.HeartbeatResponse{}, store.ReasonHeartbeatWriteFail); err != nil {
 				c.MarkReason(store.ReasonHeartbeatWriteFail)
 				c.cancel()
 				return

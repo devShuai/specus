@@ -12,6 +12,13 @@ public sealed class LocalTokenService
 {
     public const string Issuer = "specus";
 
+    /// <summary>
+    /// The account key of the account a token was issued for. A login name can be reused once its
+    /// account is deleted; the key cannot, so a token never outlives the account row it names. The
+    /// built-in administrator has no account row and its tokens carry no such claim.
+    /// </summary>
+    public const string AccountKeyClaim = "uid";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly AuthOptions _options;
@@ -44,14 +51,19 @@ public sealed class LocalTokenService
         "Bearer",
         TtlSeconds);
 
-    public TokenResponse IssueTokenBody(string username, string tenantId, ManagementRole role) => new(
-        IssueToken(username, tenantId, role),
-        "Bearer",
-        TtlSeconds);
+    public TokenResponse IssueTokenBody(string username, string tenantId, ManagementRole role) =>
+        IssueTokenBody(username, tenantId, role, accountKey: null);
+
+    /// <summary>A token for an account; <paramref name="accountKey"/> is null only for the built-in admin.</summary>
+    public TokenResponse IssueTokenBody(string username, string tenantId, ManagementRole role, string? accountKey) =>
+        new(IssueToken(username, tenantId, role, accountKey), "Bearer", TtlSeconds);
 
     public string IssueToken(string username) => IssueToken(username, _options.TenantId, ManagementRole.Admin);
 
-    public string IssueToken(string username, string tenantId, ManagementRole role)
+    public string IssueToken(string username, string tenantId, ManagementRole role) =>
+        IssueToken(username, tenantId, role, accountKey: null);
+
+    public string IssueToken(string username, string tenantId, ManagementRole role, string? accountKey)
     {
         var now = DateTimeOffset.UtcNow;
         var header = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new
@@ -59,15 +71,20 @@ public sealed class LocalTokenService
             alg = "HS256",
             typ = "JWT",
         }, JsonOptions));
-        var payload = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new
+        var claims = new Dictionary<string, object>
         {
-            iss = Issuer,
-            sub = username,
-            tenant_id = NormalizeTenant(tenantId),
-            role = RoleWire(role),
-            iat = now.ToUnixTimeSeconds(),
-            exp = now.AddSeconds(TtlSeconds).ToUnixTimeSeconds(),
-        }, JsonOptions));
+            ["iss"] = Issuer,
+            ["sub"] = username,
+            ["tenant_id"] = NormalizeTenant(tenantId),
+            ["role"] = RoleWire(role),
+            ["iat"] = now.ToUnixTimeSeconds(),
+            ["exp"] = now.AddSeconds(TtlSeconds).ToUnixTimeSeconds(),
+        };
+        if (!string.IsNullOrEmpty(accountKey))
+        {
+            claims[AccountKeyClaim] = accountKey;
+        }
+        var payload = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(claims, JsonOptions));
         var signingInput = $"{header}.{payload}";
         var signature = Base64UrlEncode(HMACSHA256.HashData(_key, Encoding.ASCII.GetBytes(signingInput)));
         return $"{signingInput}.{signature}";
@@ -133,7 +150,11 @@ public sealed class LocalTokenService
             {
                 return null;
             }
-            var tenantId = TryGetString(payload.RootElement, "tenant_id") ?? _options.TenantId;
+            // Absent from tokens minted before tenant-scoped login names; the principal then has no
+            // tenant_id claim, which tells the account resolution that sub is an account key.
+            var tenantId = TryGetString(payload.RootElement, "tenant_id");
+            // Absent from the built-in admin's tokens and from tokens minted before the claim existed.
+            var accountKey = TryGetString(payload.RootElement, AccountKeyClaim);
             var role = ParseRole(TryGetString(payload.RootElement, "role"));
             var exp = payload.RootElement.GetProperty("exp").GetInt64();
             if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= exp)
@@ -145,7 +166,14 @@ public sealed class LocalTokenService
             identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, subject));
             identity.AddClaim(new Claim(ClaimTypes.Name, subject));
             identity.AddClaim(new Claim("iss", Issuer));
-            identity.AddClaim(new Claim("tenant_id", NormalizeTenant(tenantId)));
+            if (!string.IsNullOrWhiteSpace(tenantId))
+            {
+                identity.AddClaim(new Claim("tenant_id", NormalizeTenant(tenantId)));
+            }
+            if (!string.IsNullOrEmpty(accountKey))
+            {
+                identity.AddClaim(new Claim(AccountKeyClaim, accountKey));
+            }
             identity.AddClaim(new Claim(ClaimTypes.Role, RoleWire(role)));
             identity.AddClaim(new Claim("role", RoleWire(role)));
             return new ClaimsPrincipal(identity);

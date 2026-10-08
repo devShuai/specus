@@ -56,14 +56,7 @@ header 或 body 中；它只用于服务端诊断：写入日志（以及实现�
 或传全空白字符串表示保留原密码；首次启用认证必须同时具备用户名和密码。关闭认证保留已有凭据，便于之后
 重新启用。
 
-入口认证仅属于 server 公网边界，不进入 `httpSpecusConfigList`，客户端也不持有访问密码。客户端不在本地定义
-route，只使用 HTTP 登录快照与 `NAT_CONTROL.httpSpecusConfigList` 下发的列表，所以不存在需要按公开入口兼容的
-"客户端本地 route"。C server 的 `SPECUS_HTTP_ROUTES` 是服务端自身配置、下发给所有客户端的公开 route，属于服务端
-记录：无数据库时只放行这些 route；有数据库时它们同样公开，但客户端账户仍须存在且已启用。
-
-服务端每次下发 `NAT_CONTROL` 都必须携带该客户端当前已启用 route 的完整列表；没有任何 route 时（例如删除了最后一条）
-发送空数组，客户端据此整体替换并停止转发被删除的 route。客户端仍把字段缺省理解为"本次不更新 route"，因此服务端不得
-用缺省表达"没有 route"。客户端在收到新列表之前可能仍转发旧 route，这正是第 1 节要求入口 fail closed 的原因。
+入口认证仅属于 server 公网边界，不进入 `httpSpecusConfigList`，客户端也不持有访问密码。
 
 目标 URI 由 `targetBaseUrl + relativePath + ?rawQuery` 构造。base URL 不能包含 query/fragment，相对路径不能
 含控制字符。HTTP 客户端不自动跟随 redirect，响应原样返回给公网调用方。
@@ -71,6 +64,46 @@ route，只使用 HTTP 登录快照与 `NAT_CONTROL.httpSpecusConfigList` 下发
 `insecureSkipVerify` 会随登录快照和 `NAT_CONTROL.httpSpecusConfigList` 热更新到客户端。字段缺省或为
 `false` 时，Java 客户端使用已配置的 upstream TLS 策略并校验证书；为 `true` 时接受任意证书并关闭主机名
 校验，只应用于可信内网中的自签名目标。
+
+### 2.1 route 下发
+
+客户端不在本地定义 route，它的 route 表只来自 HTTP 登录响应里的快照和控制连接上的
+`NAT_CONTROL.httpSpecusConfigList`。服务端每次下发 `NAT_CONTROL` 都必须携带该客户端当前已启用 route 的完整列表；
+没有任何 route 时（例如删除了最后一条）发送空数组，不得省略字段：旧客户端仍把缺省理解为"本次不更新"（见 2.2），
+省略会让它们继续转发已删除的 route。下发时机：
+
+- 每次控制连接登录成功之后，即使该客户端的 TCP 映射与 HTTP route 都为空。客户端断线后凭已有 access token 重连，
+  不会重新走 HTTP 登录，客户端离线期间删除或停用的 route 只能靠这次推送告知；不能以"HTTP 登录响应已带同样的空快照"
+  为由跳过；
+- route 新建、更新、启用、停用或删除之后，客户端在线时。
+
+停用、改名或删除客户端账户时，服务端立即关闭该客户端在线的控制与数据连接（断开原因分别为 `ADMIN_DISABLED`、
+`ADMIN_RENAMED`、`ADMIN_DELETED`），不在已不存在的名字或 route 集合下继续服务。之后即使有新账户使用同一名字，
+它的请求也只会进入新账户自己的连接。
+
+### 2.2 客户端 route 表
+
+客户端收到每条 `NAT_CONTROL` 都用 `httpSpecusConfigList` 整体替换 route 表，HTTP 与 WebSocket 共用这张表。
+空数组、`null` 与字段缺省都表示"没有 route"：客户端没有本地 route，缺省时也就没有任何应当保留的东西。早期客户端
+把缺省理解为"本次不更新 route"，用来保留客户端本地配置的 route；本地 route 移除后该兼容已无用处，且会让删除最后
+一条 route 后省略字段的旧服务端无法让客户端停止转发，所以 Java、Go、.NET 与 Android 客户端都已删除它。
+
+客户端在收到新列表之前（推送在途、连接刚断开）仍可能转发旧 route，所以客户端的 route 表从不构成访问授权，入口按
+第 1 节 fail closed。
+
+### 2.3 保留的兼容
+
+唯一保留的非数据库 route 是 C server 的 `SPECUS_HTTP_ROUTES`：它是服务端自身的配置，下发给所有客户端，属于服务端
+记录，供不接数据库的轻量部署使用。无数据库时入口只放行这些 route；有数据库时它们同样公开，但客户端账户仍须存在且
+已启用。除此之外，任何实现都不得把"没有服务端记录"当作公开 route，也不得用缺省字段表达"没有 route"。
+
+### 2.4 一致性向量
+
+`protocol/test-vectors/http-route-lifecycle-v1.json`（由 `tools/protocol/generate_http_route_lifecycle_vectors.py`
+生成）固定本节与第 1 节的跨实现行为：Java、Go、.NET 与 C server 重放其中的 server 场景（删除在线客户端的最后一条
+受保护 route、客户端离线时删除后凭 token 重连、停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除
+客户端、删除后同名重建，以及删除、停用或改名后凭旧 token 重连：token 只登录签发它的账户，见
+[`client-auth.md`](client-auth.md)），Java、Go、.NET 与 Android 客户端重放 client 用例。
 
 ## 3. 请求流
 
@@ -211,7 +244,7 @@ data frame 可在 16 MiB 上限内规范化为一组 SWS2：首段保留 opcode/
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
 | .NET | `DirectHttpEndpoints`、`HttpSpecusStream`、`WebSocketSpecusStream` | `HttpStreamChannel`、`WebSocketSpecusChannel` |
 | Android | — | `SpecusCore.HttpStreamForwarder`、`SpecusCore.LocalWebSocketSpecus` |
-| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET）。请求体（定长或 chunked）先完整缓冲再以已知 `contentLength` 发送，chunked 的请求 trailers 被丢弃、不声明 `trailerNames` | 使用 Java/Go/.NET/Android v2 客户端 |
+| C server | `admin_http.c`、`main.c`：v2 NAT + 完整 SWS2，中央向量全部样例重放，严格消息/关闭状态机由 `tests/direct_websocket_tests.c` 覆盖；客户端分片按原边界写给浏览器（同 .NET）。请求体（定长或 chunked）先完整缓冲再以已知 `contentLength` 发送；`Trailer` 头声明的合法名称放入 `trailerNames`，chunked 请求中已声明的 trailers 随 FIN 发送 | 使用 Java/Go/.NET/Android v2 客户端 |
 
 中央合法与 malformed NAT frame 位于 `protocol/test-vectors/control-v2/frames`；SWS2 的 canonical 与 malformed 样例位于
 `protocol/test-vectors/application-protocol-v2.json` 的 `webSocket`。

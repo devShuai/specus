@@ -438,6 +438,15 @@ int st_tls_connection_write_all(st_tls_connection *connection, const uint8_t *bu
         }
         int ssl_error = SSL_get_error(connection->ssl, 0);
         if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            /*
+             * The socket is blocking, so a retry is asked for only when a call was interrupted or
+             * its timeout (SO_SNDTIMEO, SO_RCVTIMEO) ran out. A timeout fails the write, as it does
+             * on a plain socket; retrying it would keep a peer that stopped reading on the line for
+             * good, with the connection's send lock held.
+             */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return -1;
+            }
             continue;
         }
         return -1;

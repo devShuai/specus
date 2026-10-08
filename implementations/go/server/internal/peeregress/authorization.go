@@ -1,5 +1,7 @@
 package peeregress
 
+import "strings"
+
 // Policy scopes. Public and LAN access are authorised separately; neither implies the other.
 const (
 	ScopePublic = "PUBLIC"
@@ -32,6 +34,35 @@ var LANCIDRs = []string{
 	"172.16.0.0/12",
 	"192.168.0.0/16",
 	"100.64.0.0/10",
+}
+
+// ForcedDenyCIDRs6 are the IPv6 counterparts of ForcedDenyCIDRs (protocol/spec/peer-egress.md,
+// 强制拒绝清单). A destination is checked against both lists; only a prefix of its own family can
+// contain it.
+var ForcedDenyCIDRs6 = []string{
+	"::/128",
+	"::1/128",
+	// A socket connected to an IPv4-mapped address reaches the IPv4 address, past every IPv4 entry.
+	"::ffff:0:0/96",
+	// Prefixes that embed an IPv4 address a NAT64 gateway or a 6to4 relay forwards to, metadata
+	// and private ranges included.
+	"64:ff9b::/96",
+	"64:ff9b:1::/48",
+	"2002::/16",
+	"fe80::/10",
+	"fec0::/10",
+	"ff00::/8",
+}
+
+// CloudMetadataCIDRs6 is the IPv6 instance metadata endpoint, in the unique local range a LAN policy
+// can grant.
+var CloudMetadataCIDRs6 = []string{
+	"fd00:ec2::254/128",
+}
+
+// LANCIDRs6 is the unique local range, the IPv6 counterpart of the private ranges.
+var LANCIDRs6 = []string{
+	"fc00::/7",
 }
 
 // DestinationRule is one entry of an egress policy allowlist.
@@ -120,25 +151,27 @@ func Authorize(request Request, policy Policy, peerACLAllows bool, context Conte
 		return deny(CodeConsumerDenied)
 	}
 
-	destination, ok := ParseAddress(request.DestinationIP)
+	destination, ok := parseTarget(request.DestinationIP)
 	if !ok {
 		return deny(CodeDestinationDenied)
 	}
-	if containedIn(destination, forcedDenyFor(context, request)) {
+	if destination.in(forcedDenyFor(context, request)) {
 		return deny(CodeForbiddenDestType)
 	}
 
 	scope := ScopePublic
-	if containedIn(destination, LANCIDRs) {
+	if destination.in(LANCIDRs) || destination.in(LANCIDRs6) {
 		scope = ScopeLAN
 	}
 	if scope != policy.Scope {
 		return deny(CodeScopeDenied)
 	}
 
+	// A rule covers addresses of its own family only: 0.0.0.0/0 grants no IPv6 address and ::/0
+	// no IPv4 one.
 	addressMatches := make([]DestinationRule, 0, len(policy.DestinationRules))
 	for _, rule := range policy.DestinationRules {
-		if cidr, ok := ParseCIDR(rule.CIDR); ok && cidr.Contains(destination) {
+		if destination.in([]string{rule.CIDR}) {
 			addressMatches = append(addressMatches, rule)
 		}
 	}
@@ -175,10 +208,12 @@ func Authorize(request Request, policy Policy, peerACLAllows bool, context Conte
 }
 
 func forcedDenyFor(context Context, request Request) []string {
-	denied := make([]string, 0, len(ForcedDenyCIDRs)+len(CloudMetadataCIDRs)+
-		len(context.DeploymentDenyCIDRs)+len(request.LocalInterfaceCIDRs)+1)
+	denied := make([]string, 0, len(ForcedDenyCIDRs)+len(CloudMetadataCIDRs)+len(ForcedDenyCIDRs6)+
+		len(CloudMetadataCIDRs6)+len(context.DeploymentDenyCIDRs)+len(request.LocalInterfaceCIDRs)+1)
 	denied = append(denied, ForcedDenyCIDRs...)
 	denied = append(denied, CloudMetadataCIDRs...)
+	denied = append(denied, ForcedDenyCIDRs6...)
+	denied = append(denied, CloudMetadataCIDRs6...)
 	mesh := context.MeshCIDR
 	if mesh == "" {
 		mesh = DefaultMeshCIDR
@@ -204,6 +239,42 @@ func portAllowed(rules []DestinationRule, port int) bool {
 			if len(span) == 2 && port >= span[0] && port <= span[1] {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// target is a destination as the judgment reads it, IPv4 or IPv6.
+type target struct {
+	v4  uint32
+	v6  [16]byte
+	is6 bool
+}
+
+// parseTarget reads a destination: IPv6 when it has a colon, with the spelling the rules use, IPv4
+// otherwise.
+func parseTarget(text string) (target, bool) {
+	if strings.Contains(text, ":") {
+		address, ok := ParseAddress6(text)
+		return target{v6: address, is6: true}, ok
+	}
+	address, ok := ParseAddress(text)
+	return target{v4: address}, ok
+}
+
+// in reports whether a prefix of the target's own family in cidrs contains it. Prefixes of the other
+// family, and anything that does not read, are passed over: a list can mix both.
+func (t target) in(cidrs []string) bool {
+	if !t.is6 {
+		return containedIn(t.v4, cidrs)
+	}
+	for _, text := range cidrs {
+		text = strings.TrimSpace(text)
+		if !strings.Contains(text, ":") {
+			continue
+		}
+		if cidr, _, ok := ParseCIDR6(text); ok && cidr.Contains(t.v6) {
+			return true
 		}
 	}
 	return false

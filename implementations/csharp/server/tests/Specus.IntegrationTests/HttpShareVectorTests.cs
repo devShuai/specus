@@ -193,12 +193,12 @@ public sealed class HttpShareVectorTests : IClassFixture<HttpShareVectorFixture>
         _host.Store.Fail = false;
 
         Assert.Equal(expect.GetProperty("httpStatus").GetInt32(), (int)response.StatusCode);
+        Assert.Equal("private, no-store", RawHeader(response, "Cache-Control"));
         if (response.StatusCode == HttpStatusCode.Unauthorized)
         {
             Assert.Empty(await _host.AuditAsync());
             return;
         }
-        Assert.Equal("private, no-store", RawHeader(response, "Cache-Control"));
         var body = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
         if (expect.TryGetProperty("code", out var code))
         {

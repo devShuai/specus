@@ -2,6 +2,7 @@ package productmetrics
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -87,8 +88,13 @@ func (s *Service) collecting(row *store.ProductMetricsSwitch) bool {
 	return s.allowed.Load() && row != nil && row.Enabled
 }
 
+// errorClass is what a log line may say about an error (section 14): its Go type, never its text,
+// which a database driver may fill with column values.
+func errorClass(err error) string { return fmt.Sprintf("%T", err) }
+
 func (s *Service) unavailable(operation, tenantID string, err error) Response {
-	s.logger.Warn("product metrics storage failed", "operation", operation, "tenant", tenantID, "err", err)
+	s.logger.Warn("product metrics storage failed", "operation", operation, "tenant", tenantID,
+		"error", errorClass(err))
 	return Response{Status: http.StatusServiceUnavailable, Body: codeBody(CodeUnavailable)}
 }
 
@@ -123,7 +129,9 @@ func (s *Service) Settings(ctx context.Context, actor Actor) Response {
 }
 
 // PutSettings answers PUT /settings. Switching off drops the tenant's progress rows (they are not
-// folded into counts); switching on clears the purge mark. An unchanged state keeps updatedAt/By.
+// folded into counts). Any change of state clears the purge mark, so while the switch is off the
+// mark only stands for a purge made after switching off; an unchanged state keeps updatedAt/By and
+// the mark.
 func (s *Service) PutSettings(ctx context.Context, actor Actor, body []byte) Response {
 	if !actor.Admin {
 		return Response{Status: http.StatusForbidden}
@@ -151,10 +159,7 @@ func (s *Service) PutSettings(ctx context.Context, actor Actor, body []byte) Res
 		}
 		if row.Enabled != update.Enabled {
 			username := actor.Username
-			row.Enabled, row.UpdatedBy, row.UpdatedAtMs = update.Enabled, &username, &now
-			if update.Enabled {
-				row.PurgedAtMs = nil
-			}
+			row.Enabled, row.UpdatedBy, row.UpdatedAtMs, row.PurgedAtMs = update.Enabled, &username, &now, nil
 		}
 		if err := tx.SaveSwitch(ctx, *row); err != nil {
 			return err
@@ -297,7 +302,7 @@ func (s *Service) Milestone(ctx context.Context, tenantID, username, step string
 	tenant := tenantOf(tenantID)
 	effect, err := s.milestone(ctx, tenant, username, step)
 	if err != nil {
-		s.logger.Warn("product metrics milestone failed", "tenant", tenant, "step", step, "err", err)
+		s.logger.Warn("product metrics milestone failed", "tenant", tenant, "step", step, "error", errorClass(err))
 		return "ignored"
 	}
 	return effect
@@ -387,7 +392,7 @@ func (s *Service) UserDeleted(ctx context.Context, tenantID, username string) st
 	tenant := tenantOf(tenantID)
 	removed, err := s.db.ProductMetrics().DeleteProgress(ctx, tenant, username)
 	if err != nil {
-		s.logger.Warn("product metrics progress removal failed", "tenant", tenant, "err", err)
+		s.logger.Warn("product metrics progress removal failed", "tenant", tenant, "error", errorClass(err))
 		return "ignored"
 	}
 	if removed > 0 {
@@ -399,14 +404,22 @@ func (s *Service) UserDeleted(ctx context.Context, tenantID, username string) st
 // -- retention (9) -----------------------------------------------------------------------------
 
 // Sweep runs the four retention steps of section 9. It is idempotent, its result does not depend
-// on when it runs, and any number of instances may run it.
+// on when it runs, and any number of instances may run it. Step 4 only reaches tenants purged since
+// they switched off: switching off clears the mark a purge made while collecting.
 func (s *Service) Sweep(ctx context.Context) error {
-	now := s.nowMs()
-	metrics := s.db.ProductMetrics()
-	switches, err := metrics.Switches(ctx)
+	switches, err := s.db.ProductMetrics().Switches(ctx)
 	if err != nil {
 		return err
 	}
+	return s.sweep(ctx, switches)
+}
+
+// sweep runs the four steps on switches read beforehand. They only pick the candidates of steps 1
+// and 4: each delete checks the switch again when it runs, so a tenant switched back on since the
+// read keeps what it collects from then on.
+func (s *Service) sweep(ctx context.Context, switches []store.ProductMetricsSwitch) error {
+	now := s.nowMs()
+	metrics := s.db.ProductMetrics()
 	enabled := map[string]bool{}
 	for index := range switches {
 		enabled[switches[index].TenantID] = s.collecting(&switches[index])
@@ -424,7 +437,7 @@ func (s *Service) Sweep(ctx context.Context) error {
 	for _, row := range progress {
 		switch {
 		case !enabled[row.TenantID]:
-			if _, err := metrics.DeleteProgress(ctx, row.TenantID, row.Username); err != nil {
+			if err := s.dropProgress(ctx, metrics, row); err != nil {
 				return err
 			}
 		case now >= row.StartedAtMs+windowMs:
@@ -439,15 +452,26 @@ func (s *Service) Sweep(ctx context.Context) error {
 	}
 	for _, row := range switches {
 		if !row.Enabled && row.PurgedAtMs != nil {
-			if err := metrics.DeleteTenantCounts(ctx, row.TenantID); err != nil {
-				return err
-			}
-			if err := metrics.DeleteTenantProgress(ctx, row.TenantID); err != nil {
+			if err := metrics.DeletePurgedTenantRows(ctx, row.TenantID); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// dropProgress is step 1 for one row of a tenant that was not collecting when the sweep read the
+// switches. The delete checks the switch again, so a tenant switched on since keeps the row; when
+// the deployment does not allow metrics no tenant collects and the row goes regardless.
+func (s *Service) dropProgress(ctx context.Context, metrics *store.ProductMetricsStore,
+	row store.ProductMetricsProgress) error {
+	var err error
+	if s.allowed.Load() {
+		_, err = metrics.DeleteProgressUnlessEnabled(ctx, row.TenantID, row.Username)
+	} else {
+		_, err = metrics.DeleteProgress(ctx, row.TenantID, row.Username)
+	}
+	return err
 }
 
 // Run sweeps a minute after start and then every hour until ctx ends.
@@ -461,7 +485,7 @@ func (s *Service) Run(ctx context.Context) {
 		case <-timer.C:
 		}
 		if err := s.Sweep(ctx); err != nil && ctx.Err() == nil {
-			s.logger.Warn("product metrics sweep failed", "err", err)
+			s.logger.Warn("product metrics sweep failed", "error", errorClass(err))
 		}
 		timer.Reset(sweepInterval)
 	}

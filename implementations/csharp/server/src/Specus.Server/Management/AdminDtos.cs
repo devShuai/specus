@@ -1,6 +1,11 @@
 namespace Specus.Server.Management;
 
-public sealed record AdminLoginRequest(string? Username, string? Password, string? TurnstileToken = null);
+/// <summary>
+/// Password login. <see cref="TenantId"/> is optional: blank means the default tenant first, then
+/// an account that predates login names (protocol/spec/management-accounts.md section 4).
+/// </summary>
+public sealed record AdminLoginRequest(string? Username, string? Password, string? TurnstileToken = null,
+    string? TenantId = null);
 
 public sealed record RegistrationRequest(
     string? Username,

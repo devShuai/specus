@@ -220,6 +220,21 @@ public final class SpecusCore {
             current.sendClientMessage(toClientName, message);
         }
 
+        /**
+         * The Peer Mesh roster of the current control connection: empty while disconnected or
+         * before the server enabled this device. JvmClientMain answers {@code peers} with it.
+         */
+        List<PeerMeshEngine.RosterEntry> peerRoster() {
+            ControlConnection current = connection;
+            return current == null ? List.of() : current.peerRoster();
+        }
+
+        /** Whether the current control connection has logged in. */
+        boolean controlConnected() {
+            ControlConnection current = connection;
+            return current != null && current.loginSucceeded();
+        }
+
         /** Fails before any STXFER frame is emitted when the authoritative roster disallows it. */
         public void requireFileTransferTarget(String toClientName, long size) {
             if (!running.get()) {
@@ -943,6 +958,10 @@ public final class SpecusCore {
             json.put("peerPublicKey", peerPublicKey);
             json.put("clientMessageCapabilities", clientMessageCapabilities.toJson());
             json.put("clientPeerServiceCapabilities", clientPeerServiceCapabilities.toJson());
+            // An HTTP route stream that fails before its response OPEN says why on its RST
+            // (protocol/spec/service-connectivity-check.md section 6.1).
+            json.put("clientHttpRouteCapabilities",
+                    new JSONObject().put("version", HttpRouteFailure.CAPABILITY_VERSION));
             json.put("localAddresses", new JSONArray(localAddresses));
             json.put("startedAt", startedAt);
             return json;
@@ -1196,10 +1215,9 @@ public final class SpecusCore {
             if (specusArray != null) {
                 specusMappings = parseSpecusMappings(specusArray);
             }
-            JSONArray routeArray = json.optJSONArray("httpSpecusConfigList");
-            if (routeArray != null) {
-                httpRoutes = parseHttpRoutes(routeArray);
-            }
+            // Every NAT_CONTROL carries the full HTTP route set; a missing or null list means no
+            // routes. Keeping the old list there kept a deleted route forwarding until a reconnect.
+            httpRoutes = parseHttpRoutes(json.optJSONArray("httpSpecusConfigList"));
             String nextName = json.optString("clientName", "");
             if (!nextName.trim().isEmpty()) {
                 clientName = nextName;
@@ -1883,8 +1901,8 @@ public final class SpecusCore {
                         + Integer.toUnsignedString(packet.streamId));
             }
             if (packet.type == NatMessageType.WINDOW_UPDATE) {
-                if (streamFlow.contains(packet.streamId)
-                        && !streamFlow.addCredit(packet.streamId, packet.value)) {
+                if (streamFlow.creditIfOpen(packet.streamId, packet.value)
+                        == StreamFlowScheduler.Credit.INVALID) {
                     throw new IOException("invalid WINDOW_UPDATE credit");
                 }
                 return;
@@ -1957,6 +1975,10 @@ public final class SpecusCore {
 
         boolean loginSucceeded() {
             return loginSucceeded;
+        }
+
+        List<PeerMeshEngine.RosterEntry> peerRoster() {
+            return peerMeshEngine.rosterSnapshot();
         }
 
         ControlExitAction exitAction() {
@@ -2097,12 +2119,12 @@ public final class SpecusCore {
         }
 
         void resetHttpStream(int streamId, HttpStreamForwarder expected,
-                             long errorCode, String reason) {
+                             long errorCode, String reason, String failure) {
             if (!httpStreams.remove(streamId, expected)) {
                 return;
             }
             try {
-                sendReset(streamId, errorCode, reason);
+                sendReset(streamId, errorCode, resetMetadata(reason, failure));
             } catch (Exception ignored) {
             }
         }
@@ -2165,8 +2187,13 @@ public final class SpecusCore {
         }
 
         private void sendReset(int streamId, long errorCode, String reason) throws Exception {
+            sendReset(streamId, errorCode, resetMetadata(reason, null));
+        }
+
+        private void sendReset(int streamId, long errorCode, Map<String, Object> metadata)
+                throws Exception {
             NatMessage reset = Packet.stream(NatMessageType.RST, streamId, errorCode, null);
-            reset.meta = Map.of("reason", reason);
+            reset.meta = metadata;
             try {
                 streamFlow.reset(streamId, () -> sendData(reset));
             } finally {
@@ -3311,6 +3338,8 @@ public final class SpecusCore {
         private boolean requestEnded;
         private volatile NettyHttpTransport connection;
         private volatile boolean responseCompleted;
+        /** Completes once the response FIN has been written; set before responseCompleted. */
+        private volatile CompletableFuture<Void> responseFin;
 
         /**
          * A queued response chunk failed to reach the control channel. The upstream connection is
@@ -3424,7 +3453,7 @@ public final class SpecusCore {
             NettyHttpTransport opened = null;
             try {
                 String route = asString(metadata.get("route"));
-                URI target = DirectHttpForwarder.buildTarget(routes.get(route),
+                URI target = HttpRouteFailure.target(route == null ? null : routes.get(route),
                         asString(metadata.get("relativePath")), asString(metadata.get("rawQuery")));
                 String method = firstText(asString(metadata.get("method")), "GET");
                 List<String> requestHeaders = stringList(metadata.get("headers"));
@@ -3464,12 +3493,13 @@ public final class SpecusCore {
 
                             @Override
                             public void onResponseEnd(List<String> trailers) throws Exception {
-                                control.submitHttpFin(streamId, trailers)
-                                        .whenComplete((ignored, error) -> {
-                                            if (error != null) {
-                                                failResponseWrite(error);
-                                            }
-                                        });
+                                CompletableFuture<Void> fin = control.submitHttpFin(streamId, trailers);
+                                fin.whenComplete((ignored, error) -> {
+                                    if (error != null) {
+                                        failResponseWrite(error);
+                                    }
+                                });
+                                responseFin = fin;
                                 responseCompleted = true;
                                 requestQueue.clear();
                                 requestQueue.offer(RequestChunk.CANCELLED);
@@ -3487,16 +3517,35 @@ public final class SpecusCore {
             } catch (Throwable error) {
                 completed = responseCompleted;
                 if (!closed.get() && !responseCompleted) {
-                    fail(22, message(error));
+                    // Read before anything here closes the upstream, which is no failure of it.
+                    String failure = HttpRouteFailure.carried(error);
+                    if (failure == null && opened != null) {
+                        failure = opened.failureClassification();
+                    }
+                    fail(22, message(error), failure);
                 }
             } finally {
                 if (opened != null) {
                     opened.close();
                 }
-                if (completed && upstreamLifecycle.close()
-                        && closed.compareAndSet(false, true)) {
-                    control.completeHttpStream(streamId, this);
+                if (completed) {
+                    // The FIN is queued behind response DATA that may still be waiting for the
+                    // peer's credit. Completing the stream closes its send window, which discards
+                    // whatever is still queued, so it has to wait until the FIN is out. A FIN that
+                    // fails was overtaken by a reset or a closing connection, and whoever did that
+                    // releases the stream.
+                    responseFin.whenComplete((ignored, error) -> {
+                        if (error == null) {
+                            completeAfterResponse();
+                        }
+                    });
                 }
+            }
+        }
+
+        private void completeAfterResponse() {
+            if (upstreamLifecycle.close() && closed.compareAndSet(false, true)) {
+                control.completeHttpStream(streamId, this);
             }
         }
 
@@ -3549,6 +3598,11 @@ public final class SpecusCore {
         }
 
         private void fail(long code, String reason) {
+            fail(code, reason, null);
+        }
+
+        /** Resets the stream; {@code failure} classifies a failure before the response OPEN. */
+        private void fail(long code, String reason, String failure) {
             if (!upstreamLifecycle.close() || !closed.compareAndSet(false, true)) {
                 return;
             }
@@ -3558,7 +3612,8 @@ public final class SpecusCore {
             }
             requestQueue.clear();
             requestQueue.offer(RequestChunk.CANCELLED);
-            control.resetHttpStream(streamId, this, code, firstText(reason, "HTTP stream failed"));
+            control.resetHttpStream(streamId, this, code, firstText(reason, "HTTP stream failed"),
+                    failure);
         }
 
         private static final class RequestChunk {
@@ -4684,6 +4739,19 @@ public final class SpecusCore {
             normalized = normalized.substring(0, normalized.length() - 1);
         }
         return normalized;
+    }
+
+    /**
+     * The metadata of a NAT RST: the reason it has always carried and, for an HTTP route stream that
+     * failed before its response OPEN, the classification in {@link HttpRouteFailure#METADATA_KEY}.
+     */
+    static Map<String, Object> resetMetadata(String reason, String failure) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("reason", reason);
+        if (failure != null) {
+            metadata.put(HttpRouteFailure.METADATA_KEY, failure);
+        }
+        return metadata;
     }
 
     private static String message(Throwable error) {

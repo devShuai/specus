@@ -418,7 +418,7 @@ func TestShareRevokeOnThisInstanceCutsInFlightStreamAtOnce(t *testing.T) {
 	fixture, shareID, cookie := fixtureWithShare(t, httpshare.AccessRead, "/")
 	response, resets := startStreaming(t, fixture, shareID, cookie)
 	defer response.Body.Close()
-	result := fixture.shares.Revoke(context.Background(), httpshare.Caller{Username: "alice"}, "42", shareID, nil)
+	result := fixture.shares.Revoke(context.Background(), httpshare.Caller{Username: "alice", TenantID: "t1"}, "42", shareID, nil)
 	if result.Status != http.StatusOK {
 		t.Fatalf("revoke %d %s", result.Status, result.Code)
 	}

@@ -217,11 +217,24 @@ internal sealed class HttpShareTestHost : IAsyncDisposable
         return client;
     }
 
-    /// <summary>A local bearer token; the server re-reads the user on every request anyway.</summary>
+    /// <summary>
+    /// A local bearer token for the user in its own tenant, as login would mint it: the token's tenant
+    /// selects whose login name <c>sub</c> is. The server re-reads the user on every request anyway.
+    /// </summary>
     public string TokenFor(string username)
     {
         var tokens = Service<LocalTokenService>();
-        return tokens.IssueTokenBody(username, "t1", ManagementRole.User).AccessToken;
+        string? tenant;
+        using (var scope = Server.HostServices.CreateScope())
+        {
+            tenant = scope.ServiceProvider.GetRequiredService<SpecusDbContext>().ManagementUsers.AsNoTracking()
+                .Where(u => u.Username == username)
+                .Select(u => u.TenantId)
+                .FirstOrDefault();
+        }
+        // The built-in administrator has no row and belongs to the default tenant.
+        tenant ??= string.Equals(username, BuiltInAdmin, StringComparison.OrdinalIgnoreCase) ? "default" : "t1";
+        return tokens.IssueTokenBody(username, tenant, ManagementRole.User).AccessToken;
     }
 
     public static string ClientName(long clientId) => "vector-client-" + clientId.ToString(CultureInfo.InvariantCulture);

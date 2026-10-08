@@ -196,6 +196,20 @@ func TestWorkbenchCascadesThroughDeleteEndpoints(t *testing.T) {
 	h.expectRefs("alice", left, left)
 	h.expectRefs("root", left, left)
 
+	// An account that still owns clients is not deleted (management-accounts.md 7.1): alice's
+	// remaining clients go to root first, by data as no endpoint changes an owner.
+	clients, err := h.db.ListClients(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range clients {
+		if client.TenantID == "t1" && client.OwnerUsername == "alice" {
+			client.OwnerUsername = "root"
+			if err := h.db.UpdateClient(h.ctx, client); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	// Deleting the account deletes its rows in the same request; a new account with the same name
 	// starts empty, and the old token cannot write rows back meanwhile.
 	h.expect2xx("delete account", http.MethodDelete, "/api/admin/users/alice", h.fixtureToken("t1"), nil)

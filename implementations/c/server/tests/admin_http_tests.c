@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "json.h"
 #include "login_rate_limiter.h"
+#include "password_hash.h"
 #include "public_discovery.h"
 #include "public_room.h"
 #include "registration.h"
@@ -19,9 +20,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -500,6 +503,9 @@ typedef struct {
     char http_relative_path[256];
     char ws_relative_path[256];
     char http_body[256];
+    /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
+    char http_browser_headers[512];
+    char ws_browser_headers[512];
 } route_auth_test_context;
 
 #define ROUTE_RESET_REASON \
@@ -548,7 +554,30 @@ static void route_auth_test_context_reset(route_auth_test_context *context)
     context->http_relative_path[0] = '\0';
     context->ws_relative_path[0] = '\0';
     context->http_body[0] = '\0';
+    context->http_browser_headers[0] = '\0';
+    context->ws_browser_headers[0] = '\0';
     pthread_mutex_unlock(&context->lock);
+}
+
+static void route_auth_test_capture_browser_headers(char *const *headers,
+                                                    size_t headers_len,
+                                                    char *out,
+                                                    size_t out_len)
+{
+    size_t used = 0U;
+    out[0] = '\0';
+    for (size_t i = 0; i < headers_len; ++i) {
+        if (headers[i] == NULL
+            || (strncasecmp(headers[i], "Origin:", 7U) != 0 && strncasecmp(headers[i], "Referer:", 8U) != 0
+                && strncasecmp(headers[i], "Sec-Fetch-Site:", 15U) != 0)) {
+            continue;
+        }
+        int written = snprintf(out + used, out_len - used, "%s%s", used == 0U ? "" : "|", headers[i]);
+        if (written < 0 || (size_t)written >= out_len - used) {
+            return;
+        }
+        used += (size_t)written;
+    }
 }
 
 static int route_auth_test_context_matches(route_auth_test_context *context,
@@ -632,6 +661,9 @@ static int route_auth_http_forwarder(void *ctx,
              "%.*s",
              request->body_len < sizeof(context->http_body) ? (int)request->body_len : 0,
              request->body == NULL ? "" : (const char *)request->body);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->http_browser_headers,
+                                            sizeof(context->http_browser_headers));
     pthread_mutex_unlock(&context->lock);
     if (request->relative_path != NULL && strcmp(request->relative_path, "/upstream-reset") == 0) {
         /* Plays a client whose upstream is unreachable: RST before any response OPEN. */
@@ -664,6 +696,9 @@ static int route_auth_ws_open(void *ctx, const st_admin_direct_ws_request *reque
              sizeof(context->ws_relative_path),
              "%s",
              request->relative_path == NULL ? "" : request->relative_path);
+    route_auth_test_capture_browser_headers(request->headers, request->headers_len,
+                                            context->ws_browser_headers,
+                                            sizeof(context->ws_browser_headers));
     pthread_mutex_unlock(&context->lock);
     return -3;
 }
@@ -1873,13 +1908,14 @@ static int test_public_discovery_websocket(void)
     rejected = test_public_websocket_open(port, ticket_extra, "192.0.2.11", response, sizeof(response));
     free(ticket_extra);
     ticket_extra = NULL;
-    unsetenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM");
+    /* The server reads the limit when it registers the peer, after the 101: keep it until the answer. */
     if (rejected < 0 || test_websocket_read_text(rejected, payload, sizeof(payload)) != 0
         || !contains(payload, "room is full")) {
         fprintf(stderr, "public discovery room capacity was not enforced: %s\n", payload);
         if (rejected >= 0) close(rejected);
         goto cleanup;
     }
+    unsetenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM");
     close(rejected);
 
     char *near_ticket_a = NULL;
@@ -2127,7 +2163,7 @@ static int test_client_messages_websocket(void)
         goto cleanup;
     }
     static const char boundary_prefix[] =
-        "{\"type\":\"unsupported\",\"messageId\":\"m-limit\",\"padding\":\"";
+        "{\"type\":\"unsupported\",\"messageId\":\"m-limit\",\"message\":\"";
     static const char boundary_suffix[] = "\"}";
     size_t boundary_len = 65536U;
     char *boundary = (char *)malloc(boundary_len + 2U);
@@ -2353,7 +2389,7 @@ static int connection_events_ensure_user(const char *username, const char *tenan
         fprintf(stderr, "connection events need SPECUS_DATABASE_PATH\n");
         return -1;
     }
-    if (st_storage_get_management_user(db_path, username, &user) == 0) {
+    if (st_storage_get_management_user_in_tenant(db_path, tenant, username, &user) == 0) {
         return 0;
     }
     if (st_storage_create_management_user(db_path, username, tenant, "unused-password-hash", role, 1, &user) != 0) {
@@ -2475,6 +2511,14 @@ static int endpoint_nat_push(void *ctx, long long client_id, const char *client_
     if (client_id != endpoint_push_client_id) return -1;
     ++endpoint_push_calls;
     return 0;
+}
+
+static int endpoint_nat_not_sent(void *ctx, long long client_id, const char *client_name)
+{
+    (void)ctx;
+    (void)client_id;
+    (void)client_name;
+    return ST_ADMIN_NAT_CONTROL_NOT_SENT;
 }
 
 static long long endpoint_runtime_client_id = 0;
@@ -2647,6 +2691,13 @@ static int test_admin_endpoint_contracts(void)
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh from another tenant") != 0
             || endpoint_push_calls != 2;
     }
+    /* A NAT_CONTROL that does not fit one MESSAGE was not sent: 409, never a reported push. */
+    st_admin_set_nat_control_handler(endpoint_nat_not_sent, NULL);
+    if (!failed) {
+        len = endpoint_call("POST", path, "alice", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "NAT_CONTROL",
+                                 "force refresh of a NAT_CONTROL past the limit") != 0;
+    }
     st_admin_set_nat_control_handler(NULL, NULL);
 
     /* GET /api/admin/traffic/inspection-status: TrafficInspectionService.Snapshot. */
@@ -2691,7 +2742,8 @@ static int test_admin_endpoint_contracts(void)
             "\"responseBytes\":34", "\"elapsedMs\":5", "\"requestContentType\":", "\"responseContentType\":",
             "\"responseBodyType\":\"json\"", "\"requestHeaders\":", "\"responseHeaders\":", "\"requestPreviewHex\":",
             "\"requestPreviewText\":", "\"responsePreviewHex\":", "\"responsePreviewText\":",
-            "\"requestTruncated\":false", "\"responseTruncated\":false", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
+            /* The fixture hands over 11 of its 34 response bytes, so the kept response is truncated. */
+            "\"requestTruncated\":false", "\"responseTruncated\":true", "\"capturedAt\":\"2026-07-22T00:00:00Z\""
         };
         len = endpoint_call("GET", path, "alice", "tenant-a", "USER", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 200 ", expected_id, "exchange detail for its owner") != 0;
@@ -2782,7 +2834,7 @@ static int tenant_scope_user_unchanged(const char *database_path, const char *us
                                        const char *role, const char *label)
 {
     st_storage_management_user user;
-    int ok = st_storage_get_management_user(database_path, username, &user) == 0
+    int ok = st_storage_get_management_user_in_tenant(database_path, tenant, username, &user) == 0
         && strcmp(user.tenant_id, tenant) == 0
         && strcmp(user.role, role) == 0
         && user.enabled
@@ -2920,15 +2972,30 @@ static int test_tenant_scoped_admin_mutations(void)
         len = tenant_scope_call("DELETE", "/api/admin/users/carol", "root-a", "tenant-a", "ADMIN", NULL,
                                 response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "own tenant DELETE") != 0
-            || st_storage_get_management_user(db_path, "carol", &gone) == 0;
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-a", "carol", &gone) == 0;
     }
+    /*
+     * adminManagesUsersInsideOwnTenant, updatesPasswordRoleEnabledAndDeletesInsideActingTenant:
+     * password, role and the enabled flag change together, the stored hash is the new password's.
+     */
     if (!failed) {
+        st_storage_management_user updated;
+        st_password_verification verification;
         len = tenant_scope_call("PUT", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
-                                "{\"enabled\":false}", response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0;
+                                "{\"password\":\"new-password\",\"role\":\"ADMIN\",\"enabled\":false}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"enabled\":false", "tenant-b PUT") != 0
+            || !contains(response, "\"role\":\"ADMIN\"")
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-b", "dave", &updated) != 0
+            || strcmp(updated.password_hash, "unused-password-hash") == 0
+            || st_password_verify("new-password", updated.password_hash, &verification) != 0
+            || !verification.matches
+            || strcmp(updated.role, "ADMIN") != 0 || updated.enabled;
+        if (failed) fprintf(stderr, "tenant-b PUT did not store the new password, role and enabled flag\n");
         len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/dave", "root-b", "tenant-b", "ADMIN",
                                               NULL, response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0;
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-b DELETE") != 0
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-b", "dave", &updated) == 0;
     }
 
     /* Tenant-b's credential, mapping, route and peer service, as tenant-a's administrator sees them. */
@@ -2968,16 +3035,23 @@ static int test_tenant_scoped_admin_mutations(void)
         }
         if (failed) fprintf(stderr, "tenant scope resource fixture setup failed\n");
     }
+    /* Credentials and mappings answer as Java, 400 "<kind> not found: <id>"; routes and Peer services 404. */
     struct {
         const char *prefix;
         long long id;
         const char *body;
         const char *label;
+        const char *status;
+        const char *message;
     } resources[] = {
-        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential"},
-        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping"},
-        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route"},
-        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service"},
+        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential",
+         "HTTP/1.1 400 ", "credential not found: "},
+        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping",
+         "HTTP/1.1 400 ", "mapping not found: "},
+        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route",
+         "HTTP/1.1 404 ", NULL},
+        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service",
+         "HTTP/1.1 400 ", "service not found: "},
     };
     resources[0].id = credential.id;
     resources[1].id = mapping.id;
@@ -2989,11 +3063,11 @@ static int test_tenant_scoped_admin_mutations(void)
         snprintf(label, sizeof(label), "PUT of another tenant's %s", resources[i].label);
         len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN", resources[i].body,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        failed = endpoint_expect(len, response, resources[i].status, resources[i].message, label) != 0;
         snprintf(label, sizeof(label), "DELETE of another tenant's %s", resources[i].label);
         len = failed ? -1 : tenant_scope_call("DELETE", path, "root-a", "tenant-a", "ADMIN", NULL,
                                               response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        failed = failed || endpoint_expect(len, response, resources[i].status, resources[i].message, label) != 0;
     }
     if (!failed) {
         st_storage_client_credential stored_credential;
@@ -3019,8 +3093,1214 @@ static int test_tenant_scoped_admin_mutations(void)
         snprintf(path, sizeof(path), "%s%lld", resources[i].prefix, resources[i].id);
         snprintf(label, sizeof(label), "own tenant DELETE of the %s", resources[i].label);
         len = tenant_scope_call("DELETE", path, "root-b", "tenant-b", "ADMIN", NULL, response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, label) != 0;
+        /* Java's Peer service delete is a void handler: 200 with no body; the others answer 204. */
+        failed = endpoint_expect(len, response, i == 3 ? "HTTP/1.1 200 " : "HTTP/1.1 204 ", NULL, label) != 0;
     }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * HttpTrafficExchangeStoreTests through GET /api/admin/traffic/http-exchanges: the summary list
+ * carries no headers, previews or body, the detail of one exchange shows the stored bodies the way
+ * Java's HttpBodyDataCodec does: a PNG response as data:image/png;base64,... and the request text
+ * whole although the preview is cut at 8 bytes.
+ */
+static int test_http_exchange_body_detail(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-exchange-bodies-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-exchange-bodies-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    static const uint8_t png[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    static const char request_body[] = "{\"order\":\"0123456789\"}";
+    st_storage_client client;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("bodies-owner", "tenant-bodies", "USER") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-bodies", "bodies-client", "bodies-owner", 1, 60,
+                                    &client) != 0;
+    if (!failed) {
+        st_storage_http_exchange_record record;
+        memset(&record, 0, sizeof(record));
+        record.tenant_id = "tenant-bodies";
+        record.client_id = client.id;
+        record.client_name = client.client_name;
+        record.route = "images";
+        record.method = "POST";
+        record.relative_path = "/logo.png";
+        record.status_code = 200;
+        record.success = 1;
+        record.request_bytes = (long long)strlen(request_body);
+        record.response_bytes = (long long)sizeof(png);
+        record.request_content_type = "application/json";
+        record.response_content_type = "image/png";
+        record.request_headers = "Content-Type: application/json";
+        record.response_headers = "Content-Type: image/png";
+        record.request_body = (const uint8_t *)request_body;
+        record.request_body_len = strlen(request_body);
+        record.response_body = png;
+        record.response_body_len = sizeof(png);
+        record.captured_at = "2026-10-07T00:00:00Z";
+        setenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES", "8", 1);
+        failed = st_storage_record_http_exchange(db_path, &record) != 0;
+        unsetenv("SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES");
+    }
+    long long id = failed ? -1 : endpoint_exchange_id(db_path, "bodies-client");
+    failed = failed || id <= 0;
+    if (failed) fprintf(stderr, "exchange body fixture setup failed\n");
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/traffic/http-exchanges", "bodies-owner", "tenant-bodies",
+                                    "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"requestPreviewText\":null", "exchange list") != 0
+            || !contains(response, "\"responsePreviewText\":null") || contains(response, "data:")
+            || contains(response, "0123456789");
+        if (failed && len > 0) fprintf(stderr, "the exchange list carried a body: %s\n", response);
+    }
+    if (!failed) {
+        char path[96];
+        snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%lld", id);
+        int len = tenant_scope_call("GET", path, "bodies-owner", "tenant-bodies", "USER", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ",
+                                 "\"requestPreviewText\":\"{\\\"order\\\":\\\"0123456789\\\"}\"",
+                                 "exchange detail request body") != 0
+            || !contains(response, "\"responsePreviewHex\":\"89 50 4E 47 0D 0A 1A 0A\"")
+            || !contains(response, "\"responsePreviewText\":\"data:image/png;base64,iVBORw0KGgo=\"")
+            || !contains(response, "\"responseBodyType\":\"image\"")
+            || !contains(response, "\"requestTruncated\":false,\"responseTruncated\":false");
+        if (failed && len > 0) fprintf(stderr, "exchange detail bodies: %s\n", response);
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * Java PeerMeshServiceTests.pathStatsAggregatesDirectRatioAndNatTypes through GET
+ * /api/admin/peer-mesh/stats. Sessions group by the path that carried more bytes (RELAY stored but
+ * DIRECT-heavy counts as DIRECT) and status, with the reported (RTT) count, mean RTT and bytes, and
+ * by remote address family; a session past its expiry is closed first. Devices group by NAT type,
+ * blank as UNKNOWN, and by NAT behaviour: a device that reported none is left out, values are
+ * trimmed, and the success ratio counts classified mapping and filtering. An administrator sees the
+ * tenant, an ordinary user the sessions of its clients and its own devices.
+ */
+static int test_peer_mesh_path_stats(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-peer-stats-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-peer-stats-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    static const char seed[] =
+        "INSERT INTO client_account(rowid, tenant_id, client_name, owner_username, enabled) VALUES "
+        "(801, 'tenant-stats', 'stats-c1', 'owner-a', 1), (802, 'tenant-stats', 'stats-c2', 'owner-a', 1), "
+        "(803, 'tenant-stats', 'stats-c3', 'owner-b', 1), (804, 'tenant-other', 'stats-c4', 'owner-o', 1);"
+        "INSERT INTO peer_mesh_session(tenant_id, source_client_id, source_client_name, target_client_id, "
+        "target_client_name, path_type, status, expires_at, rtt_millis, remote_endpoint, direct_bytes, relay_bytes) "
+        "VALUES "
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 10, "
+        "'203.0.113.1:4000', 600, 0),"
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 15, "
+        "'[2001:db8::1]:4000', 300, 0),"
+        "('tenant-stats', 802, 'stats-c2', 801, 'stats-c1', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', NULL, "
+        "NULL, 0, 0),"
+        "('tenant-stats', 801, 'stats-c1', 802, 'stats-c2', 'RELAY', 'ACTIVE', '2999-01-01 00:00:00', 80, "
+        "'203.0.113.2:4000', 10, 400),"
+        "('tenant-stats', 803, 'stats-c3', 803, 'stats-c3', 'RELAY', 'CLOSED', '2999-01-01 00:00:00', NULL, "
+        "'198.51.100.7:5000', 500, 100),"
+        "('tenant-stats', 801, 'stats-c1', 803, 'stats-c3', 'DIRECT', 'NEGOTIATING', '2000-01-01 00:00:00', NULL, "
+        "NULL, 0, 0),"
+        "('tenant-other', 804, 'stats-c4', 804, 'stats-c4', 'DIRECT', 'ACTIVE', '2999-01-01 00:00:00', 5, "
+        "'203.0.113.9:4000', 7, 0);"
+        "INSERT INTO peer_mesh_device(tenant_id, owner_username, client_id, client_name, enabled, nat_type, "
+        "nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery) VALUES "
+        "('tenant-stats', 'owner-a', 801, 'stats-c1', 1, '', 'ENDPOINT_INDEPENDENT', 'ADDRESS_AND_PORT_DEPENDENT', "
+        "'RFC5780'),"
+        "('tenant-stats', 'owner-a', 802, 'stats-c2', 1, 'UNKNOWN', 'ADDRESS_DEPENDENT', 'UNSUPPORTED', 'BASIC'),"
+        "('tenant-stats', 'owner-b', 803, 'stats-c3', 1, 'SYMMETRIC_NAT', NULL, NULL, NULL),"
+        "('tenant-stats', 'owner-b', 805, 'stats-c5', 0, '   ', '  ENDPOINT_INDEPENDENT ', '', NULL),"
+        "('tenant-other', 'owner-o', 804, 'stats-c4', 1, 'FULL_CONE', 'ENDPOINT_INDEPENDENT', "
+        "'ENDPOINT_INDEPENDENT', 'RFC5780');";
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("stats-root", "tenant-stats", "ADMIN") != 0
+        || connection_events_ensure_user("owner-a", "tenant-stats", "USER") != 0
+        || test_exec_sql(db_path, seed) != 0;
+    if (failed) fprintf(stderr, "peer mesh stats fixture setup failed\n");
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "stats-root", "tenant-stats", "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_body_equals(len, response,
+            "{\"totalSessions\":6,\"reportedSessions\":3,\"activeSessions\":4,\"activeDirectSessions\":3,"
+            "\"activeRelaySessions\":1,\"activeDirectRatio\":0.75,\"pathTypes\":["
+            "{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":3,\"reportedSessions\":2,"
+            "\"avgRttMillis\":12.5,\"directBytes\":900,\"relayBytes\":0},"
+            "{\"pathType\":\"DIRECT\",\"status\":\"CLOSED\",\"sessions\":2,\"reportedSessions\":0,"
+            "\"avgRttMillis\":null,\"directBytes\":500,\"relayBytes\":100},"
+            "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":1,\"reportedSessions\":1,"
+            "\"avgRttMillis\":80.0,\"directBytes\":10,\"relayBytes\":400}],\"addressFamilies\":["
+            "{\"addressFamily\":\"IPv4\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"IPv4\",\"status\":\"ACTIVE\",\"pathType\":\"RELAY\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"IPv4\",\"status\":\"CLOSED\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0},"
+            "{\"addressFamily\":\"IPv6\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":1},"
+            "{\"addressFamily\":\"UNKNOWN\",\"status\":\"ACTIVE\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0},"
+            "{\"addressFamily\":\"UNKNOWN\",\"status\":\"CLOSED\",\"pathType\":\"DIRECT\",\"sessions\":1,"
+            "\"reportedSessions\":0}],"
+            "\"natTypes\":[{\"natType\":\"UNKNOWN\",\"devices\":3},{\"natType\":\"SYMMETRIC_NAT\",\"devices\":1}],"
+            "\"natBehaviorDevices\":3,\"natBehaviorClassifiedDevices\":1,"
+            "\"natBehaviorSuccessRatio\":0.3333333333333333,"
+            "\"natMappingBehaviors\":[{\"behavior\":\"ENDPOINT_INDEPENDENT\",\"devices\":2},"
+            "{\"behavior\":\"ADDRESS_DEPENDENT\",\"devices\":1}],"
+            "\"natFilteringBehaviors\":[{\"behavior\":\"UNKNOWN\",\"devices\":1},"
+            "{\"behavior\":\"UNSUPPORTED\",\"devices\":1},{\"behavior\":\"ADDRESS_AND_PORT_DEPENDENT\",\"devices\":1}],"
+            "\"natBehaviorDiscoveries\":[{\"behavior\":\"UNKNOWN\",\"devices\":1},{\"behavior\":\"BASIC\",\"devices\":1},"
+            "{\"behavior\":\"RFC5780\",\"devices\":1}]}",
+            "tenant administrator's peer mesh stats") != 0;
+    }
+    if (!failed) {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        int closed = 0;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM peer_mesh_session WHERE status = 'CLOSED' "
+                                      "AND closed_at IS NOT NULL AND source_client_id = 801 AND target_client_id = 803",
+                                  -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            closed = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        failed = closed != 1;
+        if (failed) fprintf(stderr, "the expired negotiating session was not closed by the stats\n");
+    }
+    /* An ordinary user: the sessions of its own clients, its own devices. */
+    if (!failed) {
+        int len = tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "owner-a", "tenant-stats", "USER", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"totalSessions\":5,\"reportedSessions\":3,"
+                                 "\"activeSessions\":4,\"activeDirectSessions\":3,\"activeRelaySessions\":1,"
+                                 "\"activeDirectRatio\":0.75", "owner's peer mesh stats") != 0
+            || !contains(response, "{\"pathType\":\"DIRECT\",\"status\":\"CLOSED\",\"sessions\":1,"
+                                   "\"reportedSessions\":0,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":0}")
+            || !contains(response, "\"natTypes\":[{\"natType\":\"UNKNOWN\",\"devices\":2}],\"natBehaviorDevices\":2,"
+                                   "\"natBehaviorClassifiedDevices\":1,\"natBehaviorSuccessRatio\":0.5,")
+            || contains(response, "SYMMETRIC_NAT") || contains(response, "198.51.100.7");
+        if (failed && len > 0) fprintf(stderr, "owner's peer mesh stats: %s\n", response);
+    }
+    /* Nothing reported, nothing to divide: both ratios are null. */
+    if (!failed) {
+        failed = connection_events_ensure_user("nobody-peer", "tenant-empty", "ADMIN") != 0;
+        int len = failed ? -1 : tenant_scope_call("GET", "/api/admin/peer-mesh/stats", "nobody-peer", "tenant-empty",
+                                              "ADMIN", NULL, response, sizeof(response));
+        failed = failed || endpoint_body_equals(len, response,
+            "{\"totalSessions\":0,\"reportedSessions\":0,\"activeSessions\":0,\"activeDirectSessions\":0,"
+            "\"activeRelaySessions\":0,\"activeDirectRatio\":null,\"pathTypes\":[],\"addressFamilies\":[],"
+            "\"natTypes\":[],\"natBehaviorDevices\":0,\"natBehaviorClassifiedDevices\":0,"
+            "\"natBehaviorSuccessRatio\":null,\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],"
+            "\"natBehaviorDiscoveries\":[]}", "an empty tenant's peer mesh stats") != 0;
+    }
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* POST /auth/login with an optional tenantId; the access token on 200 (the caller frees it), else NULL. */
+static char *tenant_login(const char *username, const char *password, const char *tenant,
+                          char *response, size_t response_len)
+{
+    char body[320];
+    if (tenant == NULL) {
+        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
+    } else {
+        snprintf(body, sizeof(body), "{\"username\":\"%s\",\"password\":\"%s\",\"tenantId\":\"%s\"}",
+                 username, password, tenant);
+    }
+    int len = st_admin_build_response_with_body("POST", "/auth/login", body, response, response_len);
+    return len > 0 && strncmp(response, "HTTP/1.1 200 ", 13U) == 0 ? st_json_get_string(response, "accessToken")
+                                                                   : NULL;
+}
+
+/* The claims of a local token signed with this test's secret. */
+static int tenant_token_claims(const char *token, st_security_token_claims *claims)
+{
+    memset(claims, 0, sizeof(*claims));
+    return token == NULL ? -1
+        : st_security_validate_local_token(token, getenv("SPECUS_AUTH_JWT_SECRET"), "default", "admin", claims);
+}
+
+/* A request with "Bearer <token>". */
+static int tenant_token_call(const char *method, const char *path, const char *token, const char *body,
+                             char *out, size_t out_len)
+{
+    char authorization[2300];
+    snprintf(authorization, sizeof(authorization), "Bearer %s", token == NULL ? "" : token);
+    return st_admin_build_response_with_auth(method, path, authorization, body, out, out_len);
+}
+
+/*
+ * ManagementUserServiceTests.bareLegacyLoginFailsClosedWhenCaseInsensitiveAccountKeyIsAmbiguous.
+ * Accounts that predate tenant-scoped login names keep their username as account key, and a login
+ * without a tenant may still find them by it, ignoring case. A database may hold "Alice"
+ * (tenant-a) and "alice" (tenant-b): the migration gives each its login name in its own tenant, a
+ * bare login of that name is no one's, and naming the tenant signs in the right account. Once one
+ * spelling is gone the bare login finds the other; a default-tenant login name always comes first.
+ */
+static int test_ambiguous_login_name_fails_closed(void)
+{
+    char db_path[256];
+    char response[16384];
+    char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-ambiguous-user-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-ambiguous-user-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    char seed[1024];
+    int failed = st_storage_init(db_path, 0) != 0 || st_password_hash("secret-password", hash) != 0;
+    if (!failed) {
+        /* Rows as a release before login names stored them; the next st_storage_init backfills them. */
+        snprintf(seed, sizeof(seed),
+                 "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, "
+                 "updated_at) VALUES('Alice','tenant-a','%s','ADMIN',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
+                 "('alice','tenant-b','%s','USER',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", hash, hash);
+        failed = test_exec_sql(db_path, seed) != 0 || st_storage_init(db_path, 0) != 0;
+    }
+    if (failed) fprintf(stderr, "ambiguous user fixture setup failed\n");
+    static const char *const spellings[] = {"alice", "Alice", "ALICE"};
+    for (size_t i = 0; !failed && i < sizeof(spellings) / sizeof(spellings[0]); ++i) {
+        char *token = tenant_login(spellings[i], "secret-password", NULL, response, sizeof(response));
+        failed = token != NULL || strncmp(response, "HTTP/1.1 401 ", 13U) != 0;
+        if (failed) fprintf(stderr, "bare login with an ambiguous legacy key: %s\n", response);
+        free(token);
+    }
+    /* Naming the tenant picks the account; the token carries its login name and tenant. */
+    static const char *const tenants[][2] = {{"tenant-a", "Alice"}, {"tenant-b", "alice"}};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        st_security_token_claims claims;
+        char *token = tenant_login("ALICE", "secret-password", tenants[i][0], response, sizeof(response));
+        failed = tenant_token_claims(token, &claims) != 0 || strcmp(claims.username, tenants[i][1]) != 0
+            || strcmp(claims.tenant_id, tenants[i][0]) != 0 || !claims.has_tenant;
+        if (failed) fprintf(stderr, "tenant-qualified login of %s: %s\n", tenants[i][0], response);
+        free(token);
+    }
+    if (!failed) {
+        char count[16];
+        snprintf(seed, sizeof(seed),
+                 "SELECT COUNT(*) FROM specus_management_user WHERE lower(username) = 'alice' AND password_hash = '%s' "
+                 "AND login_name_normalized = 'alice'",
+                 hash);
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        count[0] = '\0';
+        if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, seed, -1, &stmt, NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            snprintf(count, sizeof(count), "%s", (const char *)sqlite3_column_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        failed = strcmp(count, "2") != 0;
+        if (failed) fprintf(stderr, "the legacy rows were not backfilled as seeded: %s\n", count);
+    }
+    /* With one spelling left the legacy key is unique again. */
+    if (!failed) {
+        failed = test_exec_sql(db_path, "DELETE FROM specus_management_user WHERE username = 'Alice';") != 0;
+        st_security_token_claims claims;
+        char *token = failed ? NULL : tenant_login("alice", "secret-password", NULL, response, sizeof(response));
+        failed = failed || tenant_token_claims(token, &claims) != 0 || strcmp(claims.tenant_id, "tenant-b") != 0;
+        if (failed) fprintf(stderr, "bare login once the legacy key is unique: %s\n", response);
+        free(token);
+    }
+    /* The built-in administrator creates "ALICE" in the default tenant: no conflict with tenant-b's
+     * alice, and from now on a bare login of that name means the default tenant's account. */
+    if (!failed) {
+        int len = st_admin_build_response_with_body("POST", "/api/admin/users",
+                                                    "{\"username\":\"ALICE\",\"password\":\"other-password\"}",
+                                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"tenantId\":\"default\"",
+                                 "the default tenant's own ALICE") != 0;
+    }
+    if (!failed) {
+        st_security_token_claims claims;
+        char *shadowed = tenant_login("alice", "secret-password", NULL, response, sizeof(response));
+        char *token = shadowed != NULL ? NULL : tenant_login("alice", "other-password", NULL, response, sizeof(response));
+        failed = shadowed != NULL || tenant_token_claims(token, &claims) != 0
+            || strcmp(claims.tenant_id, "default") != 0 || strcmp(claims.username, "ALICE") != 0;
+        if (failed) fprintf(stderr, "bare login after the default tenant got the name: %s\n", response);
+        free(shadowed);
+        free(token);
+    }
+    st_login_rate_limiter_reset();
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* Number of times needle occurs in haystack. */
+static int count_occurrences(const char *haystack, const char *needle)
+{
+    int count = 0;
+    for (const char *cursor = strstr(haystack, needle); cursor != NULL; cursor = strstr(cursor + 1, needle)) {
+        ++count;
+    }
+    return count;
+}
+
+/*
+ * ManagementUserServiceTests.createsSameLoginNameInDifferentTenantWithoutGlobalLookup and
+ * ManagementUserServiceIntegrationTests.tenantsCanCreateTheSameLoginNameWithoutEnumeration. Login
+ * names are unique per tenant: two tenants' administrators both create "Shared" (201, not 409),
+ * each account gets a random key rather than its name, and each list shows its own tenant's only.
+ * A second spelling inside one tenant is still a conflict whose answer names no other tenant, and
+ * an administrator changes and deletes only its own tenant's account of that name.
+ */
+static int test_tenants_share_login_names(void)
+{
+    char db_path[256];
+    char response[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-shared-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-shared-login-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "shared login name fixture setup failed\n");
+    static const char *const admins[][2] = {{"root-a", "tenant-a"}, {"root-b", "tenant-b"}};
+    const char *create = "{\"username\":\"Shared\",\"password\":\"secret-password\",\"role\":\"USER\",\"enabled\":true}";
+    char keys[2][81] = {"", ""};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        char tenant_field[64];
+        snprintf(tenant_field, sizeof(tenant_field), "\"tenantId\":\"%s\"", admins[i][1]);
+        int len = tenant_scope_call("POST", "/api/admin/users", admins[i][0], admins[i][1], "ADMIN", create,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", tenant_field, "Shared in each tenant") != 0
+            || !contains(response, "\"username\":\"Shared\"");
+        st_storage_management_user stored;
+        if (!failed) {
+            failed = st_storage_get_management_user_in_tenant(db_path, admins[i][1], "SHARED", &stored) != 0
+                || strcmp(stored.username, "Shared") != 0
+                || strlen(stored.account_key) != 36U || stored.account_key[8] != '-' || stored.account_key[14] != '4';
+            if (failed) fprintf(stderr, "%s's Shared was not stored under a random account key\n", admins[i][1]);
+            snprintf(keys[i], sizeof(keys[i]), "%s", stored.account_key);
+        }
+    }
+    if (!failed && strcmp(keys[0], keys[1]) == 0) {
+        fprintf(stderr, "both Shared accounts got one key\n");
+        failed = 1;
+    }
+    if (!failed) {
+        int len = tenant_scope_call("POST", "/api/admin/users", "root-a", "tenant-a", "ADMIN",
+                                    "{\"username\":\" SHARED \",\"password\":\"secret-password\"}",
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "a second spelling inside one tenant") != 0
+            || contains(response, "tenant-b");
+    }
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        int len = tenant_scope_call("GET", "/api/admin/users", admins[i][0], admins[i][1], "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"username\":\"Shared\"", "user list") != 0
+            || count_occurrences(response, "\"username\":\"Shared\"") != 1
+            || contains(response, admins[1U - i][0])
+            || contains(response, admins[1U - i][1]);
+        if (failed) fprintf(stderr, "%s's user list crossed its tenant: %s\n", admins[i][1], response);
+    }
+    if (!failed) {
+        int len = tenant_scope_call("PUT", "/api/admin/users/shared", "root-a", "tenant-a", "ADMIN",
+                                    "{\"role\":\"ADMIN\"}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"role\":\"ADMIN\"", "tenant-a PUT of Shared") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/Shared", "root-a", "tenant-a", "ADMIN", NULL,
+                                              response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "tenant-a DELETE of Shared") != 0;
+    }
+    if (!failed) {
+        st_storage_management_user kept;
+        st_storage_management_user gone;
+        failed = st_storage_get_management_user_in_tenant(db_path, "tenant-a", "shared", &gone) == 0
+            || st_storage_get_management_user_in_tenant(db_path, "tenant-b", "shared", &kept) != 0
+            || strcmp(kept.role, "USER") != 0 || strcmp(kept.account_key, keys[1]) != 0;
+        if (failed) fprintf(stderr, "tenant-a's changes reached tenant-b's Shared\n");
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * ManagementUserServiceIntegrationTests.tenantQualifiedLoginAndRefreshResolveOnlyTheMatchingTenant,
+ * through the real handlers: tenant-a and tenant-b each have an alice. Each signs in to its own
+ * tenant (tenantId in the login body) and gets a token of that tenant; the wrong tenant, the other
+ * alice's password and no tenant at all are refused; refresh stays in the tenant; neither sees the
+ * other's clients; deleting tenant-a's alice ends its token while tenant-b's goes on.
+ */
+static int test_tenant_qualified_login_and_refresh(void)
+{
+    char db_path[256];
+    static char response[65536];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-tenant-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-tenant-login-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "tenant login fixture setup failed\n");
+    static const char *const alices[][3] = {
+        {"root-a", "tenant-a", "{\"username\":\"alice\",\"password\":\"alice-a-password\"}"},
+        {"root-b", "tenant-b", "{\"username\":\"alice\",\"password\":\"alice-b-password\"}"},
+    };
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        int len = tenant_scope_call("POST", "/api/admin/users", alices[i][0], alices[i][1], "ADMIN", alices[i][2],
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "an alice per tenant") != 0;
+    }
+    char *token_a = NULL;
+    char *token_b = NULL;
+    st_security_token_claims claims;
+    if (!failed) {
+        token_a = tenant_login("alice", "alice-a-password", "tenant-a", response, sizeof(response));
+        failed = tenant_token_claims(token_a, &claims) != 0 || strcmp(claims.username, "alice") != 0
+            || strcmp(claims.tenant_id, "tenant-a") != 0 || !claims.has_tenant || strcmp(claims.role, "USER") != 0;
+        if (failed) fprintf(stderr, "tenant-a alice login: %s\n", response);
+    }
+    if (!failed) {
+        token_b = tenant_login("ALICE", "alice-b-password", " tenant-b ", response, sizeof(response));
+        failed = tenant_token_claims(token_b, &claims) != 0 || strcmp(claims.username, "alice") != 0
+            || strcmp(claims.tenant_id, "tenant-b") != 0;
+        if (failed) fprintf(stderr, "tenant-b alice login: %s\n", response);
+    }
+    static const char *const refused[][2] = {
+        {"alice-a-password", "tenant-b"},
+        {"alice-b-password", "tenant-a"},
+        {"alice-a-password", NULL},
+        {"alice-a-password", "default"},
+        {"alice-a-password", "tenant-c"},
+    };
+    for (size_t i = 0; !failed && i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        char *token = tenant_login("alice", refused[i][0], refused[i][1], response, sizeof(response));
+        failed = token != NULL || strncmp(response, "HTTP/1.1 401 ", 13U) != 0;
+        if (failed) fprintf(stderr, "alice signed in with %s in %s: %s\n", refused[i][0],
+                            refused[i][1] == NULL ? "no tenant" : refused[i][1], response);
+        free(token);
+    }
+    /* Refresh re-reads the account of (tenant_id, sub) and stays in the token's tenant. */
+    if (!failed) {
+        int len = tenant_token_call("POST", "/auth/refresh", token_b, NULL, response, sizeof(response));
+        char *refreshed = len > 0 && strncmp(response, "HTTP/1.1 200 ", 13U) == 0
+            ? st_json_get_string(response, "accessToken") : NULL;
+        failed = tenant_token_claims(refreshed, &claims) != 0 || strcmp(claims.tenant_id, "tenant-b") != 0
+            || strcmp(claims.username, "alice") != 0;
+        if (failed) fprintf(stderr, "tenant-b refresh: %s\n", response);
+        free(refreshed);
+    }
+    static const char *const owners[][2] = {{"tenant-a", "alice-a-client"}, {"tenant-b", "alice-b-client"}};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        const char *token = i == 0U ? token_a : token_b;
+        char tenant_field[64];
+        snprintf(tenant_field, sizeof(tenant_field), "\"tenantId\":\"%s\"", owners[i][0]);
+        int len = tenant_token_call("GET", "/api/admin/me", token, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", tenant_field, "alice's own tenant") != 0
+            || !contains(response, "\"username\":\"alice\"") || contains(response, "\"admin\":true");
+        char body[128];
+        snprintf(body, sizeof(body), "{\"clientName\":\"%s\",\"enabled\":true}", owners[i][1]);
+        len = failed ? -1 : tenant_token_call("POST", "/api/admin/clients", token, body, response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 201 ", "\"ownerUsername\":\"alice\"",
+                                           "alice's client") != 0;
+    }
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        int len = tenant_token_call("GET", "/api/admin/clients", i == 0U ? token_a : token_b, NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", owners[i][1], "alice's clients") != 0
+            || contains(response, owners[1U - i][1]);
+        if (failed) fprintf(stderr, "%s's alice saw another tenant's client\n", owners[i][0]);
+    }
+    if (!failed) {
+        /* An account that still owns a client is not deleted (management-accounts.md 7.1). */
+        int len = tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN", NULL,
+                                    response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "\"clients\":1",
+                                 "delete tenant-a's alice with a client") != 0
+            || test_exec_sql(db_path, "DELETE FROM client_account WHERE client_name = 'alice-a-client';") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN",
+                                              NULL, response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "delete tenant-a's alice") != 0;
+    }
+    if (!failed) {
+        int me_len = tenant_token_call("GET", "/api/admin/me", token_a, NULL, response, sizeof(response));
+        failed = me_len <= 0 || strncmp(response, "HTTP/1.1 200 ", 13U) == 0;
+        int refresh_len = failed ? -1 : tenant_token_call("POST", "/auth/refresh", token_a, NULL, response,
+                                                          sizeof(response));
+        failed = failed || endpoint_expect(refresh_len, response, "HTTP/1.1 401 ", NULL,
+                                           "refresh of the deleted tenant-a alice") != 0;
+        int other_len = failed ? -1 : tenant_token_call("GET", "/api/admin/me", token_b, NULL, response,
+                                                        sizeof(response));
+        failed = failed || endpoint_expect(other_len, response, "HTTP/1.1 200 ", "\"tenantId\":\"tenant-b\"",
+                                           "tenant-b alice after tenant-a's was deleted") != 0;
+    }
+    free(token_a);
+    free(token_b);
+    st_login_rate_limiter_reset();
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * A database from before tenant-scoped login names: the account table has no login name and keys
+ * accounts by their username. After the upgrade the accounts sign in as before, without a tenant
+ * (a default-tenant one directly, another tenant's through its unique legacy key) and with their
+ * tenant, and the clients recorded under their names are still theirs.
+ */
+static int test_legacy_accounts_sign_in_after_migration(void)
+{
+    char db_path[256];
+    static char response[65536];
+    char dave_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    char erin_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-legacy-login-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-legacy-login-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_login_rate_limiter_reset();
+    char seed[2048];
+    int failed = st_password_hash("dave-password", dave_hash) != 0 || st_password_hash("erin-password", erin_hash) != 0;
+    if (!failed) {
+        snprintf(seed, sizeof(seed),
+                 "CREATE TABLE specus_management_user (username TEXT PRIMARY KEY,"
+                 "tenant_id TEXT NOT NULL DEFAULT 'default', password_hash TEXT NOT NULL,"
+                 "role TEXT NOT NULL DEFAULT 'USER', enabled INTEGER NOT NULL DEFAULT 1,"
+                 "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                 "oidc_issuer TEXT, oidc_subject TEXT, oidc_identity_key TEXT);"
+                 "INSERT INTO specus_management_user(username, tenant_id, password_hash, role) VALUES"
+                 "('Dave','default','%s','USER'),('erin','tenant-e','%s','ADMIN');",
+                 dave_hash, erin_hash);
+        failed = test_exec_sql(db_path, seed) != 0 || st_storage_init(db_path, 0) != 0
+            || test_exec_sql(db_path, "INSERT INTO client_account(tenant_id, client_name, owner_username) "
+                                      "VALUES('tenant-e','erin-client','erin');") != 0;
+    }
+    if (failed) fprintf(stderr, "legacy account fixture setup failed\n");
+    st_security_token_claims claims;
+    if (!failed) {
+        char *token = tenant_login("dave", "dave-password", NULL, response, sizeof(response));
+        failed = tenant_token_claims(token, &claims) != 0 || strcmp(claims.username, "Dave") != 0
+            || strcmp(claims.tenant_id, "default") != 0;
+        if (failed) fprintf(stderr, "legacy default-tenant account login: %s\n", response);
+        free(token);
+    }
+    char *erin = NULL;
+    if (!failed) {
+        erin = tenant_login("Erin", "erin-password", NULL, response, sizeof(response));
+        failed = tenant_token_claims(erin, &claims) != 0 || strcmp(claims.username, "erin") != 0
+            || strcmp(claims.tenant_id, "tenant-e") != 0;
+        if (failed) fprintf(stderr, "legacy account of another tenant, without its tenant: %s\n", response);
+    }
+    if (!failed) {
+        char *token = tenant_login("erin", "erin-password", "tenant-e", response, sizeof(response));
+        failed = token == NULL;
+        if (failed) fprintf(stderr, "legacy account with its tenant: %s\n", response);
+        free(token);
+    }
+    if (!failed) {
+        int len = tenant_token_call("GET", "/api/admin/clients", erin, NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"erin-client\"",
+                                 "the legacy account's client") != 0;
+    }
+    if (!failed) {
+        st_storage_management_user stored;
+        failed = st_storage_get_management_user_in_tenant(db_path, "tenant-e", "ERIN", &stored) != 0
+            || strcmp(stored.account_key, "erin") != 0 || strcmp(stored.username, "erin") != 0;
+        if (failed) fprintf(stderr, "the legacy account key changed\n");
+    }
+    free(erin);
+    st_login_rate_limiter_reset();
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* POSTs one route for client_id as the given administrator; returns the response length. */
+static int route_rules_create(long long client_id, const char *admin, const char *tenant, const char *body,
+                              char *response, size_t response_len)
+{
+    char path[96];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/http-routes", client_id);
+    return tenant_scope_call("POST", path, admin, tenant, "ADMIN", body, response, response_len);
+}
+
+/*
+ * Java HttpRouteServiceTests through the real management handlers: a route name is unique per
+ * client (creating it again is refused instead of overwriting it, renaming onto it as well, keeping
+ * one's own name is no conflict), the same name on another client is fine, route and target are
+ * validated with Java's messages, an unknown client is refused, and every list stays in its tenant.
+ */
+static int test_http_route_service_rules(void)
+{
+    char db_path[256];
+    char path[160];
+    static char response[65536];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-route-rules-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-route-rules-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client client_a, client_b, client_tenant_b;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    int len = 0;
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"RouteClientA\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route rules client A") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"RouteClientB\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route rules client B") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-b", "tenant-b", "ADMIN",
+                                "{\"clientName\":\"RouteClientTenantB\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route rules tenant-b client") != 0
+            || st_storage_get_client_by_name(db_path, "RouteClientA", &client_a) != 0
+            || st_storage_get_client_by_name(db_path, "RouteClientB", &client_b) != 0
+            || st_storage_get_client_by_name(db_path, "RouteClientTenantB", &client_tenant_b) != 0;
+    }
+
+    /* createRouteDuplicateOnSameClientIsRejected: refused, and the first route keeps its target. */
+    st_storage_http_route web;
+    int found = 0;
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"enabled\":true", "route web on client A") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "route web 已存在于该客户端下",
+                                 "duplicate route on one client") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientA", "web", &web, &found) != 0
+            || !found || strcmp(web.target_base_url, "http://127.0.0.1:8080") != 0;
+        if (failed) fprintf(stderr, "the duplicate route overwrote the first one\n");
+    }
+    /* sameRouteOnDifferentClientsIsAllowed */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "same route on another client") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/http-routes", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "route list") != 0
+            || count_occurrences(response, "\"route\":\"web\"") != 2;
+        if (failed) fprintf(stderr, "both web routes expected in %s\n", response);
+    }
+    /* updateRouteCannotCollideWithExistingRouteOnSameClient and updateRouteAllowsRenamingToOwnRoute */
+    st_storage_http_route api;
+    if (!failed) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a",
+                                 "{\"route\":\"api\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "route api on client A") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientA", "api", &api, &found) != 0 || !found;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", api.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9091\",\"enabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "route web 已存在于该客户端下",
+                                 "rename onto another route of the client") != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", web.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"targetBaseUrl\":\"http://127.0.0.1:9090\"",
+                                 "update keeping the route's own name") != 0;
+    }
+    /* blank, '/', too long, non-http target, target without a host, with Java's messages */
+    char sixty[61];
+    char too_long_body[160];
+    memset(sixty, 'a', 60U);
+    sixty[60] = '\0';
+    snprintf(too_long_body, sizeof(too_long_body),
+             "{\"route\":\"%sa\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}", sixty);
+    const struct {
+        const char *body;
+        const char *message;
+    } invalid[] = {
+        {"{\"route\":\" \",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}", "route cannot be blank"},
+        {"{\"route\":\"a/b\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}", "route must not contain '/'"},
+        {too_long_body, "route is too long (max 60)"},
+        {"{\"route\":\"web2\",\"targetBaseUrl\":\"ftp://example.com\"}",
+         "targetBaseUrl must be an absolute http(s) URL"},
+        {"{\"route\":\"web2\",\"targetBaseUrl\":\"http:///path-only\"}", "targetBaseUrl must contain a host"},
+        {"{\"route\":\"web2\",\"targetBaseUrl\":\"  \"}", "targetBaseUrl cannot be blank"}
+    };
+    for (size_t i = 0; !failed && i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        len = route_rules_create(client_a.id, "root-a", "tenant-a", invalid[i].body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", invalid[i].message, invalid[i].message) != 0;
+    }
+    /* Exactly 60 characters is a valid route; a route and target are stored trimmed. */
+    if (!failed) {
+        char body[256];
+        char expected[96];
+        snprintf(body, sizeof(body),
+                 "{\"route\":\" %s \",\"targetBaseUrl\":\" https://user@[::1]:8443/base \"}", sixty);
+        snprintf(expected, sizeof(expected), "\"route\":\"%s\"", sixty);
+        len = route_rules_create(client_a.id, "root-a", "tenant-a", body, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", expected, "a 60-character route") != 0
+            || !contains(response, "\"targetBaseUrl\":\"https://user@[::1]:8443/base\"");
+    }
+    /* createRoutePersistsRowAndDefaultsEnabledTrue */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"plain\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"enabled\":true", "route defaults") != 0
+            || !contains(response, "\"clientName\":\"RouteClientB\"") || !contains(response, "\"mediaCaptureEnabled\":false")
+            || !contains(response, "\"insecureSkipVerify\":false") || !contains(response, "\"createdAt\":\"2")
+            || !contains(response, "\"updatedAt\":\"2");
+        if (failed) fprintf(stderr, "route defaults: %s\n", response);
+    }
+    /* updateRouteRewritesFieldsAndRefreshesTimestamp (timestamps have second resolution here) */
+    if (!failed) {
+        char *created_at = st_json_get_string(strstr(response, "\r\n\r\n"), "updatedAt");
+        st_storage_http_route plain;
+        failed = created_at == NULL
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "plain", &plain, &found) != 0
+            || !found;
+        if (!failed) {
+            struct timespec pause = {.tv_sec = 1, .tv_nsec = 100000000L};
+            nanosleep(&pause, NULL);
+            snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", plain.id);
+            len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                    "{\"route\":\"api2\",\"targetBaseUrl\":\"https://api.example.com\",\"enabled\":false}",
+                                    response, sizeof(response));
+            char *updated_at = len > 0 ? st_json_get_string(strstr(response, "\r\n\r\n"), "updatedAt") : NULL;
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"route\":\"api2\"", "route update") != 0
+                || !contains(response, "\"targetBaseUrl\":\"https://api.example.com\"")
+                || !contains(response, "\"enabled\":false")
+                || updated_at == NULL || strcmp(updated_at, created_at) == 0;
+            if (failed) fprintf(stderr, "route update kept updatedAt %s: %s\n", created_at, response);
+            free(updated_at);
+        }
+        free(created_at);
+    }
+    /* partialUpdatePreservesEnabledAndCaptureFlags, routeCanSkipTlsVerificationAndPartialUpdatePreservesIt */
+    st_storage_http_route media;
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"media\",\"targetBaseUrl\":\"https://127.0.0.1:8443\",\"enabled\":false,"
+                                 "\"detailCaptureEnabled\":true,\"mediaCaptureEnabled\":true,\"pathRewriteEnabled\":true,"
+                                 "\"insecureSkipVerify\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"insecureSkipVerify\":true", "flagged route") != 0
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "media", &media, &found) != 0
+            || !found;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", media.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"media\",\"targetBaseUrl\":\"https://127.0.0.1:9443\"}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"targetBaseUrl\":\"https://127.0.0.1:9443\"",
+                                 "partial route update") != 0
+            || !contains(response, "\"enabled\":false") || !contains(response, "\"detailCaptureEnabled\":true")
+            || !contains(response, "\"mediaCaptureEnabled\":true") || !contains(response, "\"pathRewriteEnabled\":true")
+            || !contains(response, "\"insecureSkipVerify\":true");
+        if (failed) fprintf(stderr, "a partial update changed the flags: %s\n", response);
+    }
+    /* firstEnableRequiresUsernameAndPassword (C's message for the colon differs, the 400 does not) */
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"viewer\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "authPassword", "authentication without a password") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"bad:user\",\"authPassword\":\"secret\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", NULL, "a username with ':'") != 0;
+    }
+    /* createProtectedRouteHashesPassword..., blankPasswordUpdatePreservesCredentialsAcrossDisableAndReenable */
+    st_storage_http_route private_route;
+    char stored_hash[ST_SHA256_HEX_LEN + 1] = "";
+    if (!failed) {
+        len = route_rules_create(client_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                 "\"authEnabled\":true,\"authUsername\":\"  viewer  \",\"authPassword\":\"secret:with-spaces \"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"authUsername\":\"viewer\"", "protected route") != 0
+            || !contains(response, "\"authPasswordConfigured\":true") || contains(response, "secret:with-spaces")
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "private", &private_route, &found) != 0
+            || !found || strcmp(private_route.auth_password_hash, "secret:with-spaces ") == 0;
+        snprintf(stored_hash, sizeof(stored_hash), "%s", found ? private_route.auth_password_hash : "");
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/http-routes/%lld", private_route.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\","
+                                "\"authEnabled\":false,\"authPassword\":\"   \"}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":false", "authentication off") != 0
+            || !contains(response, "\"authPasswordConfigured\":true");
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"route\":\"private\",\"targetBaseUrl\":\"http://127.0.0.1:8080\",\"authEnabled\":true}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"authEnabled\":true", "authentication on again") != 0
+            || !contains(response, "\"authUsername\":\"viewer\"")
+            || st_storage_find_http_route_by_client_route(db_path, "RouteClientB", "private", &private_route, &found) != 0
+            || !found || strcmp(private_route.auth_password_hash, stored_hash) != 0;
+        if (failed) fprintf(stderr, "re-enabling authentication lost the credentials: %s\n", response);
+    }
+    /* unknownClientIsRejectedOnCreate (C answers 404, Java's IllegalArgumentException maps to 400) */
+    if (!failed) {
+        len = route_rules_create(424242, "root-a", "tenant-a",
+                                 "{\"route\":\"web\",\"targetBaseUrl\":\"http://127.0.0.1:8080\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "client not found", "route of an unknown client") != 0;
+    }
+    /* deleteUnknownRouteThrows */
+    if (!failed) {
+        len = tenant_scope_call("DELETE", "/api/admin/http-routes/999999999", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "http route not found", "delete of an unknown route") != 0;
+    }
+    /* tenantScopedQueriesDoNotLeakClientsOrRoutes */
+    if (!failed) {
+        len = route_rules_create(client_tenant_b.id, "root-b", "tenant-b",
+                                 "{\"route\":\"api\",\"targetBaseUrl\":\"http://127.0.0.1:9090\",\"enabled\":true}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, "tenant-b route") != 0;
+    }
+    if (!failed) {
+        len = route_rules_create(client_tenant_b.id, "root-a", "tenant-a",
+                                 "{\"route\":\"stolen\",\"targetBaseUrl\":\"http://127.0.0.1:9090\"}",
+                                 response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "client not found",
+                                 "route on another tenant's client") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/http-routes", "root-b", "tenant-b", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"route\":\"api\"", "tenant-b route list") != 0
+            || count_occurrences(response, "\"route\":") != 1 || contains(response, "RouteClientA");
+        if (failed) fprintf(stderr, "tenant-b route list leaked: %s\n", response);
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/http-routes", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "tenant-a route list") != 0
+            || contains(response, "RouteClientTenantB") || count_occurrences(response, "\"route\":\"api\"") != 1;
+        if (failed) fprintf(stderr, "tenant-a route list leaked: %s\n", response);
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/clients", "root-a", "tenant-a", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"RouteClientA\"",
+                                 "tenant-a client list") != 0
+            || !contains(response, "\"clientName\":\"RouteClientB\"") || contains(response, "RouteClientTenantB");
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/clients", "root-b", "tenant-b", "ADMIN", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"RouteClientTenantB\"",
+                                 "tenant-b client list") != 0
+            || contains(response, "RouteClientA") || contains(response, "RouteClientB");
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* The client_name column of the one row a query selects, compared with expected. */
+static int client_reference_is(const char *db_path, const char *sql, const char *expected)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int matches = 0;
+    if (sqlite3_open(db_path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *value = (const char *)sqlite3_column_text(stmt, 0);
+        matches = value != NULL && strcmp(value, expected) == 0;
+        if (!matches) fprintf(stderr, "%s: %s, expected %s\n", sql, value == NULL ? "NULL" : value, expected);
+    } else {
+        fprintf(stderr, "%s: no row\n", sql);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return matches ? 0 : -1;
+}
+
+/*
+ * Java ClientAccountServiceTests through the real management handlers: the name availability check
+ * is global across tenants, trims the name and allows the client's own name; renaming onto a name
+ * of another tenant is refused; a rename reaches every operational record that carries the name.
+ */
+static int test_client_account_service_rules(void)
+{
+    char db_path[256];
+    char path[256];
+    char sql[512];
+    static char response[65536];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-client-rules-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-client-rules-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client first, source, target;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    int len = 0;
+    static const struct {
+        const char *admin;
+        const char *tenant;
+        const char *name;
+    } clients[] = {
+        {"root-a", "tenant-a", "office-pc"},
+        {"root-b", "tenant-b", "warehouse-pc"},
+        {"root-a", "tenant-a", "source-old"},
+        {"root-a", "tenant-a", "target"}
+    };
+    for (size_t i = 0; !failed && i < sizeof(clients) / sizeof(clients[0]); ++i) {
+        char body[160];
+        snprintf(body, sizeof(body), "{\"clientName\":\" %s \",\"enabled\":true,\"connectionRateLimitPerMinute\":30}",
+                 clients[i].name);
+        len = tenant_scope_call("POST", "/api/admin/clients", clients[i].admin, clients[i].tenant, "ADMIN", body,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", NULL, clients[i].name) != 0;
+    }
+    failed = failed || st_storage_get_client_by_name(db_path, "office-pc", &first) != 0
+        || st_storage_get_client_by_name(db_path, "source-old", &source) != 0
+        || st_storage_get_client_by_name(db_path, "target", &target) != 0;
+    if (failed) fprintf(stderr, "client rules: the names were not stored trimmed\n");
+
+    /* nameAvailabilityIsGlobalAndAllowsCurrentClient */
+    static const struct {
+        const char *query;
+        const char *answer;
+    } availability[] = {
+        {"%20office-pc%20", "{\"clientName\":\"office-pc\",\"available\":true}"},
+        {"new-name", "{\"clientName\":\"new-name\",\"available\":true}"},
+        {"warehouse-pc", "{\"clientName\":\"warehouse-pc\",\"available\":false}"},
+        {"%20warehouse-pc", "{\"clientName\":\"warehouse-pc\",\"available\":false}"}
+    };
+    for (size_t i = 0; !failed && i < sizeof(availability) / sizeof(availability[0]); ++i) {
+        snprintf(path, sizeof(path), "/api/admin/clients/name-availability?clientName=%s&excludeClientId=%lld",
+                 availability[i].query, first.id);
+        len = tenant_scope_call("GET", path, "root-a", "tenant-a", "ADMIN", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", availability[i].answer, availability[i].query) != 0;
+    }
+    /* Without excludeClientId a client's own name is taken. */
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/clients/name-availability?clientName=office-pc", "root-a",
+                                "tenant-a", "ADMIN", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"available\":false", "own name, not excluded") != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/clients/%lld", first.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"warehouse-pc\",\"enabled\":true,\"connectionRateLimitPerMinute\":30}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "clientName warehouse-pc 已存在",
+                                 "rename onto another tenant's client name") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("POST", "/api/admin/clients", "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"warehouse-pc\",\"enabled\":true}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 400 ", "clientName warehouse-pc 已存在",
+                                 "create with another tenant's client name") != 0;
+    }
+
+    /* renamePropagatesToOperationalClientNameReferences */
+    if (!failed) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO specus_client_identity(tenant_id, credential_id, client_id, client_name, "
+                 "machine_fingerprint, os_user) VALUES('tenant-a', 1, %lld, 'source-old', 'machine-source', 'tester');"
+                 "INSERT INTO specus_mapping(client_name, listen_port, target_address, target_port) "
+                 "VALUES('source-old', 31101, '127.0.0.1', 8080);"
+                 "INSERT INTO http_route_mapping(client_name, route, target_base_url) "
+                 "VALUES('source-old', 'app', 'http://127.0.0.1:8080');",
+                 source.id);
+        failed = test_exec_sql(db_path, sql) != 0;
+    }
+    if (!failed) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO peer_mesh_device(tenant_id, client_id, client_name, virtual_ip) "
+                 "VALUES('tenant-a', %lld, 'source-old', '100.96.0.10');"
+                 "INSERT INTO peer_mesh_acl(tenant_id, source_client_id, source_client_name, target_client_id, "
+                 "target_client_name) VALUES('tenant-a', %lld, 'source-old', %lld, 'target');",
+                 source.id, source.id, target.id);
+        failed = test_exec_sql(db_path, sql) != 0;
+    }
+    if (!failed) {
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO traffic_usage(client_id, client_name, usage_date) VALUES(%lld, 'source-old', '2026-07-14');"
+                 "INSERT INTO resource_traffic_usage(client_id, client_name, resource_type, resource_key, "
+                 "resource_name, usage_date) VALUES(%lld, 'source-old', 'TCP_SPECUS', '31101', 'SSH', '2026-07-14');",
+                 source.id, source.id);
+        failed = test_exec_sql(db_path, sql) != 0;
+    }
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/clients/%lld", source.id);
+        len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN",
+                                "{\"clientName\":\"source-new\",\"enabled\":true,\"connectionRateLimitPerMinute\":30}",
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"clientName\":\"source-new\"", "client rename") != 0;
+    }
+    failed = failed
+        || client_reference_is(db_path, "SELECT client_name FROM specus_client_identity", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM specus_mapping", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM http_route_mapping", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM peer_mesh_device", "source-new") != 0
+        || client_reference_is(db_path, "SELECT source_client_name FROM peer_mesh_acl", "source-new") != 0
+        || client_reference_is(db_path, "SELECT target_client_name FROM peer_mesh_acl", "target") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM traffic_usage", "source-new") != 0
+        || client_reference_is(db_path, "SELECT client_name FROM resource_traffic_usage", "source-new") != 0;
+    if (failed) fprintf(stderr, "client rename did not reach every operational record\n");
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
+/* "name|reason" of each client the management API asked to close in the last call. */
+static char client_close_calls[4][160];
+static size_t client_close_call_count = 0U;
+
+static int record_client_close(void *ctx, const char *client_name, const char *reason)
+{
+    (void)ctx;
+    if (client_close_call_count < sizeof(client_close_calls) / sizeof(client_close_calls[0])) {
+        snprintf(client_close_calls[client_close_call_count], sizeof(client_close_calls[0]), "%s|%s",
+                 client_name, reason);
+    }
+    ++client_close_call_count;
+    return 0;
+}
+
+/* One client mutation by tenant-a's administrator: its status and the one close it asks for, or none. */
+static int client_mutation_closes(const char *method, const char *path, const char *body, const char *status,
+                                  const char *expected_close, const char *label)
+{
+    char response[16384];
+    client_close_call_count = 0U;
+    int len = tenant_scope_call(method, path, "root-a", "tenant-a", "ADMIN", body, response, sizeof(response));
+    if (endpoint_expect(len, response, status, NULL, label) != 0) {
+        return -1;
+    }
+    int ok = expected_close == NULL
+        ? client_close_call_count == 0U
+        : client_close_call_count == 1U && strcmp(client_close_calls[0], expected_close) == 0;
+    if (!ok) {
+        fprintf(stderr, "%s: %zu close(s), the first %s; expected %s\n", label, client_close_call_count,
+                client_close_call_count > 0U ? client_close_calls[0] : "(none)",
+                expected_close == NULL ? "none" : expected_close);
+    }
+    return ok ? 0 : -1;
+}
+
+/*
+ * Disabling, renaming or deleting a client closes its online connections on the transitions Go's
+ * management API kicks on, with Go's reasons: disabled from enabled, or renamed while disabled
+ * (ADMIN_DISABLED), renamed (ADMIN_RENAMED), deleted (ADMIN_DELETED). The connections are named
+ * by the client's name before the change. Other updates and refused mutations close nothing.
+ */
+static int test_client_mutations_close_connections(void)
+{
+    char db_path[256];
+    char path[160];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-client-close-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-client-close-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
+    st_storage_client alpha;
+    st_storage_client foreign;
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-a", "close-alpha", "root-a", 1, 30, &alpha) != 0
+        || st_storage_upsert_client(db_path, 0, "tenant-b", "close-foreign", "root-b", 1, 30, &foreign) != 0;
+    if (failed) fprintf(stderr, "client close fixture setup failed\n");
+    st_admin_set_client_disconnect_handler(record_client_close, NULL);
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"connectionRateLimitPerMinute\":40}", "HTTP/1.1 200 ", NULL,
+                                  "rate limit change") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_DISABLED", "disable") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 200 ", NULL,
+                                  "disable an already disabled client") != 0
+        || client_mutation_closes("PUT", path, "{\"enabled\":true}", "HTTP/1.1 200 ", NULL, "enable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-2\"}", "HTTP/1.1 200 ",
+                                  "close-alpha|ADMIN_RENAMED", "rename") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-3\",\"enabled\":false}",
+                                  "HTTP/1.1 200 ", "close-alpha-2|ADMIN_DISABLED", "rename and disable") != 0
+        || client_mutation_closes("PUT", path, "{\"clientName\":\"close-alpha-4\"}", "HTTP/1.1 200 ",
+                                  "close-alpha-3|ADMIN_DISABLED", "rename while disabled") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", foreign.id);
+    failed = failed
+        || client_mutation_closes("PUT", path, "{\"enabled\":false}", "HTTP/1.1 404 ", NULL,
+                                  "disable another tenant's client") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete another tenant's client") != 0;
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", alpha.id);
+    failed = failed
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 204 ", "close-alpha-4|ADMIN_DELETED", "delete") != 0
+        || client_mutation_closes("DELETE", path, NULL, "HTTP/1.1 404 ", NULL, "delete a deleted client") != 0;
+    st_admin_set_client_disconnect_handler(NULL, NULL);
     unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
     unsetenv("SPECUS_DATABASE_PATH");
     unlink(db_path);
@@ -3074,6 +4354,115 @@ static int connectivity_call(const char *path, const char *username, const char 
  * answer the same 404, the body is checked first, every answer is private and uncacheable, and a
  * result never names the target.
  */
+/*
+ * Java UserDiagramDocumentServiceTests: a cloud diagram is stored under the creating account's
+ * tenant and username, the list is scoped to the caller, and another account (another user of
+ * the same tenant, that tenant's administrator, another tenant's administrator) cannot read,
+ * overwrite or delete it: each attempt answers exactly like a document that does not exist, in
+ * whatever shape the request body comes.
+ */
+static int test_user_diagram_owner_scope(void)
+{
+    char db_path[256];
+    char path[96];
+    char response[32768];
+    char missing[32768];
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-diagram-scope-%ld.db", (long)getpid());
+    unlink(db_path);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-diagram-scope-test-secret", 1);
+    setenv("SPECUS_DB_SEED_DEMO_CLIENT", "0", 1);
+    int failed = st_storage_init(db_path, 0) != 0
+        || connection_events_ensure_user("alice", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("bob", "tenant-a", "USER") != 0
+        || connection_events_ensure_user("root-a", "tenant-a", "ADMIN") != 0
+        || connection_events_ensure_user("root-b", "tenant-b", "ADMIN") != 0;
+    if (failed) fprintf(stderr, "diagram scope fixture setup failed\n");
+    /* "yjs-cloud-state", base64 */
+    int len = failed ? -1 : tenant_scope_call("POST", "/api/admin/diagrams", "alice", "tenant-a", "USER",
+                                              "{\"name\":\"架构图\",\"update\":\"eWpzLWNsb3VkLXN0YXRl\"}",
+                                              response, sizeof(response));
+    long long id = 0;
+    if (!failed) {
+        failed = endpoint_expect(len, response, "HTTP/1.1 201 ", "\"name\":\"架构图\"", "diagram create") != 0
+            || st_json_get_i64(strstr(response, "\r\n\r\n") + 4, "id", &id) != 0 || id <= 0;
+    }
+    if (!failed) {
+        st_storage_user_diagram stored;
+        failed = st_storage_get_user_diagram(db_path, id, "tenant-a", "alice", &stored) != 0;
+        if (!failed) {
+            failed = strcmp(stored.tenant_id, "tenant-a") != 0 || strcmp(stored.owner_username, "alice") != 0
+                || stored.snapshot_len != 15U || memcmp(stored.snapshot_data, "yjs-cloud-state", 15U) != 0;
+            st_storage_user_diagram_free(&stored);
+        }
+        if (failed) fprintf(stderr, "the diagram was not stored under the creating account\n");
+    }
+    static const struct {
+        const char *username;
+        const char *tenant;
+        const char *role;
+    } others[] = {
+        {"bob", "tenant-a", "USER"}, {"root-a", "tenant-a", "ADMIN"}, {"root-b", "tenant-b", "ADMIN"}
+    };
+    static const struct {
+        const char *method;
+        const char *body;
+    } attempts[] = {
+        {"GET", NULL},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\",\"revision\":0}"},
+        {"PUT", "{\"name\":\"taken\",\"update\":\"AQ==\"}"},
+        {"PUT", "{\"name\":\"\",\"update\":\"not base64\",\"revision\":0}"},
+        {"DELETE", NULL},
+    };
+    for (size_t who = 0; !failed && who < sizeof(others) / sizeof(others[0]); ++who) {
+        for (size_t i = 0; !failed && i < sizeof(attempts) / sizeof(attempts[0]); ++i) {
+            char label[160];
+            snprintf(label, sizeof(label), "%s %s of another account's diagram as %s/%s",
+                     attempts[i].method, attempts[i].body == NULL ? "" : attempts[i].body,
+                     others[who].tenant, others[who].username);
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+            len = tenant_scope_call(attempts[i].method, path, others[who].username, others[who].tenant,
+                                    others[who].role, attempts[i].body, response, sizeof(response));
+            snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id + 1000);
+            int missing_len = tenant_scope_call(attempts[i].method, path, others[who].username,
+                                                others[who].tenant, others[who].role, attempts[i].body,
+                                                missing, sizeof(missing));
+            failed = endpoint_expect(len, response, "HTTP/1.1 404 ", "{\"error\":\"diagram not found\"}", label) != 0
+                || missing_len != len || strcmp(response, missing) != 0;
+            if (failed) fprintf(stderr, "%s: did not answer like a missing diagram: %s\n", label, missing);
+        }
+        if (!failed) {
+            len = tenant_scope_call("GET", "/api/admin/diagrams", others[who].username, others[who].tenant,
+                                    others[who].role, NULL, response, sizeof(response));
+            failed = endpoint_expect(len, response, "HTTP/1.1 200 ", NULL, "another account's diagram list") != 0
+                || strcmp(strstr(response, "\r\n\r\n") + 4, "[]") != 0;
+            if (failed) fprintf(stderr, "another account listed a diagram: %s\n", response);
+        }
+    }
+    /* The owner still has the untouched document, and a stale revision cannot overwrite it. */
+    if (!failed) {
+        snprintf(path, sizeof(path), "/api/admin/diagrams/%lld", id);
+        len = tenant_scope_call("GET", path, "alice", "tenant-a", "USER", NULL, response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"update\":\"eWpzLWNsb3VkLXN0YXRl\"",
+                                 "owner diagram detail") != 0
+            || !contains(response, "\"name\":\"架构图\"") || !contains(response, "\"revision\":0");
+    }
+    if (!failed) {
+        len = tenant_scope_call("GET", "/api/admin/diagrams", "alice", "tenant-a", "USER", NULL,
+                                response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 200 ", "\"name\":\"架构图\"", "owner diagram list") != 0;
+    }
+    if (!failed) {
+        len = tenant_scope_call("PUT", path, "alice", "tenant-a", "USER",
+                                "{\"name\":\"架构图\",\"update\":\"AQ==\",\"revision\":2}", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", NULL, "stale diagram revision") != 0;
+    }
+    unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unlink(db_path);
+    return failed ? 1 : 0;
+}
+
 static int test_connectivity_check_endpoint(void)
 {
     char db_path[256];
@@ -3172,6 +4561,22 @@ static int test_connectivity_check_endpoint(void)
     (void)bravo;
     (void)charlie;
     return failed ? 1 : 0;
+}
+
+static long long route_auth_exchange_count(const char *database_path)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    long long count = -1;
+    if (sqlite3_open(database_path, &db) == SQLITE_OK
+        && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM specus_http_traffic_exchange WHERE route = 'api'", -1,
+                              &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return count;
 }
 
 static int route_auth_detail_is_sanitized(const char *database_path)
@@ -3388,6 +4793,26 @@ static int test_direct_http_route_authentication(const char *database_path)
         return 1;
     }
 
+    /* TrafficInspectionServiceTests: the route's detailCaptureEnabled is on, but without
+     * SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED (Java's capture-detail-enabled, default false) nothing
+     * is captured. */
+    long long captured_before = route_auth_exchange_count(database_path);
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
+             protected_path);
+    route_auth_test_context_reset(&context);
+    int uncaptured = route_auth_http_roundtrip(port, request, response, sizeof(response));
+    setenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", "true", 1);
+    if (uncaptured != 0 || !contains(response, "200 OK") || captured_before < 0
+        || route_auth_exchange_count(database_path) != captured_before) {
+        fprintf(stderr, "HTTP detail captured with SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED unset\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
     snprintf(request,
              sizeof(request),
              "GET %s HTTP/1.1\r\nHost: localhost\r\n"
@@ -3400,6 +4825,7 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !contains(response, "forwarded")
         || !route_auth_test_context_matches(&context, 1, 0, 0)
         || context.normalized_accept_encoding_headers != 1
+        || route_auth_exchange_count(database_path) != captured_before + 1
         || route_auth_detail_is_sanitized(database_path) != 0) {
         fprintf(stderr, "protected route successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
@@ -3422,6 +4848,34 @@ static int test_direct_http_route_authentication(const char *database_path)
         || !route_auth_test_queries_match(&context, "template=%7B0%7D&encoded=%7B1%7D", "")
         || !route_auth_test_paths_match(&context, "/items/a+b/c%20d/%E4%BD%A0/x%2Fy", "")) {
         fprintf(stderr, "direct HTTP raw path or query brace encoding mismatch\n");
+        route_auth_stop_server(&server);
+        pthread_mutex_destroy(&context.lock);
+        return 1;
+    }
+
+    /* Java UpstreamBrowserHeaders: the device sees the browser's Origin and Referer moved onto the
+     * route target's origin (https://example.com here) and cross-site fetch metadata as
+     * same-origin, so the target's own CSRF fences accept the request. */
+    static const char browser_headers[] =
+        "Origin: https://specus.example\r\n"
+        "Referer: https://specus.example/http/C%20managed%202/api/page?x=1\r\n"
+        "Sec-Fetch-Site: cross-site\r\n";
+    static const char rewritten_browser_headers[] =
+        "Origin:https://example.com|Referer:https://example.com/http/C%20managed%202/api/page?x=1"
+        "|Sec-Fetch-Site:same-origin";
+    snprintf(request,
+             sizeof(request),
+             "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
+    route_auth_test_context_reset(&context);
+    if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
+        || !contains(response, "200 OK")
+        || !route_auth_test_context_matches(&context, 1, 0, 0)
+        || strcmp(context.http_browser_headers, rewritten_browser_headers) != 0) {
+        fprintf(stderr, "direct HTTP browser headers were not moved onto the route target: %s\n",
+                context.http_browser_headers);
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
         return 1;
@@ -3519,14 +4973,16 @@ static int test_direct_http_route_authentication(const char *database_path)
              "GET %s/a+b/%%E4%%BD%%A0?channel={0} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n\r\n",
-             protected_path);
+             "Authorization: Basic dmlzaXRvcjpzZWNyZXQ=\r\n%s\r\n",
+             protected_path,
+             browser_headers);
     route_auth_test_context_reset(&context);
     if (route_auth_http_roundtrip(port, request, response, sizeof(response)) != 0
         || !contains(response, "404 Not Found")
         || !route_auth_test_context_matches(&context, 0, 1, 0)
         || !route_auth_test_queries_match(&context, "", "channel=%7B0%7D")
-        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")) {
+        || !route_auth_test_paths_match(&context, "", "/items/a+b/%E4%BD%A0")
+        || strcmp(context.ws_browser_headers, rewritten_browser_headers) != 0) {
         fprintf(stderr, "protected websocket successful auth or authorization stripping mismatch\n");
         route_auth_stop_server(&server);
         pthread_mutex_destroy(&context.lock);
@@ -3674,20 +5130,31 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
         return 1;
     }
 
-    static const char *const refused_rules[] = {
-        "[{\"cidr\":\"203.0.113.07\"}]",
-        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"icmp\"]}]",
-        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[443,80]]}]",
-        "[{\"protocols\":[\"tcp\"]}]",
+    /* Refused whole, with Java PeerEgressService's message, or Spring's 400 when it does not bind. */
+    static const char *const refused_rules[][2] = {
+        {"[{\"cidr\":\"203.0.113.07\"}]",
+         "{\"error\":\"destinationRules[0].cidr is not an IPv4 or IPv6 address or CIDR: 203.0.113.07\"}"},
+        {"[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"icmp\"]}]",
+         "{\"error\":\"destinationRules[0].protocols may contain only tcp and udp: icmp\"}"},
+        {"[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[443,80]]}]",
+         "{\"error\":\"destinationRules[0].portRanges entries must be [low, high] integers with "
+         "0 <= low <= high <= 65535: [443, 80]\"}"},
+        {"[{\"cidr\":\"10.0.0.0/8\"},{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[\"443\",443.5]]}]",
+         "{\"error\":\"destinationRules[1].portRanges entries must be [low, high] integers with "
+         "0 <= low <= high <= 65535: [443, 443.5]\"}"},
+        {"[{\"protocols\":[\"tcp\"]}]",
+         "{\"error\":\"destinationRules[0].cidr is not an IPv4 or IPv6 address or CIDR: null\"}"},
+        {"[null]", "{\"error\":\"destinationRules[0] must be an object\"}"},
+        {"[\"10.0.0.0/8\"]", "{\"error\":\"Bad Request\"}"},
+        {"{\"cidr\":\"10.0.0.0/8\"}", "{\"error\":\"Bad Request\"}"},
     };
     for (size_t i = 0; i < sizeof(refused_rules) / sizeof(refused_rules[0]); ++i) {
         snprintf(body, sizeof(body),
                  "{\"egressClientId\":%d,\"maxConcurrentFlows\":20,\"destinationRules\":%s}",
-                 egress_client_id, refused_rules[i]);
+                 egress_client_id, refused_rules[i][0]);
         len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
-        if (len <= 0 || !contains(response, "400 Bad Request")
-            || !contains(response, "invalid destinationRules")) {
-            fprintf(stderr, "egress policy accepted %s: %s\n", refused_rules[i], response);
+        if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, refused_rules[i][1])) {
+            fprintf(stderr, "egress policy accepted %s: %s\n", refused_rules[i][0], response);
             return 1;
         }
     }
@@ -3725,21 +5192,24 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
         fprintf(stderr, "egress policy save did not store the normalised domain rules: %s\n", response);
         return 1;
     }
-    static const char *const refused_names[] = {
-        "[{\"match\":\"203.0.113.5\"}]",
-        "[{\"match\":\"*.com\"}]",
-        "[{\"match\":\"localhost\"}]",
-        "[{\"match\":\"example.com\",\"protocols\":[\"icmp\"]}]",
-        "{\"match\":\"example.com\"}",
+    static const char *const refused_names[][2] = {
+        {"[{\"match\":\"203.0.113.5\"}]",
+         "{\"error\":\"domainRules[0].match must be a name or *.name with at least two labels: 203.0.113.5\"}"},
+        {"[{\"match\":\"*.com\"}]",
+         "{\"error\":\"domainRules[0].match must be a name or *.name with at least two labels: *.com\"}"},
+        {"[{\"match\":\"localhost\"}]",
+         "{\"error\":\"domainRules[0].match must be a name or *.name with at least two labels: localhost\"}"},
+        {"[{\"match\":\"example.com\",\"protocols\":[\"icmp\"]}]",
+         "{\"error\":\"domainRules[0].protocols may contain only tcp and udp: icmp\"}"},
+        {"{\"match\":\"example.com\"}", "{\"error\":\"Bad Request\"}"},
     };
     for (size_t i = 0; i < sizeof(refused_names) / sizeof(refused_names[0]); ++i) {
         snprintf(body, sizeof(body),
                  "{\"egressClientId\":%d,\"maxConcurrentFlows\":50,\"domainRules\":%s}",
-                 egress_client_id, refused_names[i]);
+                 egress_client_id, refused_names[i][0]);
         len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
-        if (len <= 0 || !contains(response, "400 Bad Request")
-            || !contains(response, "invalid domainRules")) {
-            fprintf(stderr, "egress policy accepted domain rules %s: %s\n", refused_names[i], response);
+        if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, refused_names[i][1])) {
+            fprintf(stderr, "egress policy accepted domain rules %s: %s\n", refused_names[i][0], response);
             return 1;
         }
     }
@@ -3762,7 +5232,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"maxConcurrentFlows\":40,\"destinationRules\":[",
              egress_client_id);
     len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "invalid request body")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"Bad Request\"}")) {
         fprintf(stderr, "egress policy accepted an unparsable body: %s\n", response);
         return 1;
     }
@@ -3775,7 +5245,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     }
     len = st_admin_build_response_with_body("PUT", "/api/admin/peer-mesh/egress/switch",
                                             "{\"enabled\":false", response, sizeof(response));
-    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "invalid request body")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"Bad Request\"}")) {
         fprintf(stderr, "egress switch accepted an unparsable body: %s\n", response);
         return 1;
     }
@@ -3793,6 +5263,435 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
         return 1;
     }
     return 0;
+}
+
+/* The body of a response, after its header. */
+static const char *response_body(const char *response)
+{
+    const char *body = strstr(response, "\r\n\r\n");
+    return body == NULL ? "" : body + 4;
+}
+
+/*
+ * PeerEgressResourceTests mutationsByANonAdminAreForbidden, enablingWhilePeerMeshIsOffIsABadRequest,
+ * anUnknownEgressClientIsNotFound and deletingAnUnknownPolicyIsNotFound: a tenant USER may read
+ * but not change egress, Peer Mesh being off forbids switching egress on, and the 404s name the id.
+ * Nothing refused is stored or pushed to the peers.
+ */
+static int test_peer_mesh_egress_admin_only(int egress_client_id)
+{
+    static const char *const switch_path = "/api/admin/peer-mesh/egress/switch";
+    static const char *const policies_path = "/api/admin/peer-mesh/egress/policies";
+    char response[16384];
+    char before_switch[4096];
+    char before_policies[8192];
+    char body[256];
+    char path[128];
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    if (tenant == NULL || connection_events_ensure_user("egress-member", tenant, "USER") != 0) {
+        fprintf(stderr, "egress member fixture setup failed\n");
+        return 1;
+    }
+    snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"enabled\":false}", egress_client_id);
+    int len = st_admin_build_response_with_body("POST", policies_path, body, response, sizeof(response));
+    int policy_id = 0;
+    if (len <= 0 || !contains(response, "200 OK") || st_json_get_int(response, "id", &policy_id) != 0) {
+        fprintf(stderr, "egress policy fixture create failed: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", switch_path, response, sizeof(response));
+    snprintf(before_switch, sizeof(before_switch), "%s", response_body(response));
+    len = st_admin_build_response("GET", policies_path, response, sizeof(response));
+    snprintf(before_policies, sizeof(before_policies), "%s", response_body(response));
+    int refreshes = peer_mesh_refresh_calls;
+
+    snprintf(path, sizeof(path), "%s/%d", policies_path, policy_id);
+    snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"enabled\":true}", egress_client_id);
+    struct {
+        const char *method;
+        const char *path;
+        const char *body;
+    } mutations[] = {
+        {"PUT", switch_path, "{\"enabled\":false}"},
+        {"POST", policies_path, body},
+        {"DELETE", path, NULL},
+    };
+    for (size_t i = 0U; i < sizeof(mutations) / sizeof(mutations[0]); ++i) {
+        len = tenant_scope_call(mutations[i].method, mutations[i].path, "egress-member", tenant, "USER",
+                                mutations[i].body, response, sizeof(response));
+        char *error = len > 0 ? st_json_get_string(response, "error") : NULL;
+        int refused = len > 0 && contains(response, "403 Forbidden") && error != NULL && *error != '\0';
+        free(error);
+        if (!refused) {
+            fprintf(stderr, "a USER's %s %s was not 403: %s\n", mutations[i].method, mutations[i].path, response);
+            return 1;
+        }
+    }
+    /* Reading stays open to the member. */
+    len = tenant_scope_call("GET", policies_path, "egress-member", tenant, "USER", NULL, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "a USER could not read the egress policies: %s\n", response);
+        return 1;
+    }
+
+    /*
+     * aSwitchRequestWithoutEnabledIsRefused and aBodyThatCannotBeParsedIsABadRequest: a switch
+     * request without enabled, or with it null, used to read as off and could stop egress for the
+     * whole tenant; a port range that is not a list is not a policy either.
+     */
+    static const char *const switch_bodies[] = {"{}", "{\"enabled\":null}"};
+    for (size_t i = 0U; i < sizeof(switch_bodies) / sizeof(switch_bodies[0]); ++i) {
+        len = st_admin_build_response_with_body("PUT", switch_path, switch_bodies[i], response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")
+            || !contains(response, "{\"error\":\"enabled is required\"}")) {
+            fprintf(stderr, "egress switch %s was not refused: %s\n", switch_bodies[i], response);
+            return 1;
+        }
+    }
+    snprintf(body, sizeof(body),
+             "{\"egressClientId\":%d,\"destinationRules\":[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":\"443\"}]}",
+             egress_client_id);
+    len = st_admin_build_response_with_body("POST", policies_path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "a policy with portRanges \"443\" was accepted: %s\n", response);
+        return 1;
+    }
+
+    /* Peer Mesh is off in this deployment: switching egress on is a bad request, off is allowed. */
+    const char *peer_mesh = getenv("SPECUS_PEER_MESH_ENABLED");
+    char saved_peer_mesh[16] = "";
+    if (peer_mesh != NULL) snprintf(saved_peer_mesh, sizeof(saved_peer_mesh), "%s", peer_mesh);
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    len = st_admin_build_response_with_body("PUT", switch_path, "{\"enabled\":true}", response, sizeof(response));
+    char *error = len > 0 ? st_json_get_string(response, "error") : NULL;
+    int refused = len > 0 && contains(response, "400 Bad Request") && error != NULL && *error != '\0';
+    free(error);
+    if (!refused) {
+        fprintf(stderr, "enabling egress with Peer Mesh off was not 400: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", switch_path, response, sizeof(response));
+    if (len <= 0 || strcmp(response_body(response), before_switch) != 0) {
+        fprintf(stderr, "a refused switch request changed the switch: %s, was %s\n", response_body(response),
+                before_switch);
+        return 1;
+    }
+    len = st_admin_build_response("GET", policies_path, response, sizeof(response));
+    if (len <= 0 || strcmp(response_body(response), before_policies) != 0 || peer_mesh_refresh_calls != refreshes) {
+        fprintf(stderr, "a refused egress request changed the policies or pushed a refresh\n");
+        return 1;
+    }
+    len = st_admin_build_response_with_body("PUT", switch_path, "{\"enabled\":false}", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"configuredEnabled\":false")) {
+        fprintf(stderr, "switching egress off with Peer Mesh off was refused: %s\n", response);
+        return 1;
+    }
+    if (saved_peer_mesh[0] != '\0') setenv("SPECUS_PEER_MESH_ENABLED", saved_peer_mesh, 1);
+
+    len = st_admin_build_response_with_body("POST", policies_path,
+                                            "{\"egressClientId\":987654321,\"enabled\":true}",
+                                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found")
+        || !contains(response, "{\"error\":\"client not found: 987654321\"}")) {
+        fprintf(stderr, "an unknown egress client was not named in the 404: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "egress policy fixture delete failed: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", path, response, sizeof(response));
+    char expected[96];
+    snprintf(expected, sizeof(expected), "{\"error\":\"egress policy not found: %d\"}", policy_id);
+    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, expected)) {
+        fprintf(stderr, "a missing egress policy was not named in the 404: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * PeerServiceDiscoveryServiceTests rejectsPublicTargetAndUnsafePath and
+ * rejectsUdpApplicationWithTcpTransport over the management API: the refused definitions are 400
+ * and nothing of them is stored; a local target in another spelling is stored normalised.
+ */
+static int test_peer_service_definition_validation(int client_id)
+{
+    static const char *const services_path = "/api/admin/peer-mesh/services";
+    static const char *const refused[] = {
+        "\"name\":\"evil\",\"application\":\"http\",\"targetHost\":\"evil.example\",\"targetPort\":80,"
+        "\"publishedPort\":28080",
+        "\"name\":\"public\",\"application\":\"http\",\"targetHost\":\"198.51.100.9\",\"targetPort\":80,"
+        "\"publishedPort\":28081",
+        "\"name\":\"url\",\"application\":\"http\",\"targetHost\":\"http://127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28082",
+        "\"name\":\"wildcard\",\"application\":\"tcp\",\"targetHost\":\"0.0.0.0\",\"targetPort\":80,"
+        "\"publishedPort\":28083",
+        "\"name\":\"script\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28084,\"path\":\"javascript:alert(1)\"",
+        "\"name\":\"traversal\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28085,\"path\":\"/a/../b\"",
+        "\"name\":\"spaces\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28086,\"path\":\"/a b\"",
+        "\"name\":\"dns\",\"transport\":\"tcp\",\"application\":\"udp\",\"targetHost\":\"127.0.0.1\","
+        "\"targetPort\":53,\"publishedPort\":28087",
+        "\"name\":\"web-over-udp\",\"transport\":\"udp\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\","
+        "\"targetPort\":80,\"publishedPort\":28088",
+        "\"name\":\"open\",\"application\":\"http\",\"targetHost\":\"127.0.0.1\",\"targetPort\":80,"
+        "\"publishedPort\":28089,\"visibility\":\"public\"",
+    };
+    char body[512];
+    char response[32768];
+    for (size_t i = 0U; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        snprintf(body, sizeof(body), "{\"clientId\":%d,%s}", client_id, refused[i]);
+        int len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
+        if (len <= 0 || !contains(response, "400 Bad Request")) {
+            fprintf(stderr, "peer service definition was not refused: %s -> %s\n", refused[i], response);
+            return 1;
+        }
+    }
+    int len = st_admin_build_response("GET", services_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || contains(response, "evil.example")
+        || contains(response, "198.51.100.9") || contains(response, "javascript") || contains(response, "2808")) {
+        fprintf(stderr, "a refused peer service definition was stored: %s\n", response);
+        return 1;
+    }
+    /*
+     * Java's new entity starts with transport tcp, which applyDefinition keeps when the request
+     * names none: a udp application without a transport is refused.
+     */
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-normal00\",\"name\":\"Local DNS\",\"application\":\"udp\","
+             "\"targetHost\":\"127.0.0.1\",\"targetPort\":53,\"publishedPort\":28052}",
+             client_id);
+    len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "{\"error\":\"udp application requires udp transport\"}")) {
+        fprintf(stderr, "a udp service without a transport was not refused as Java: %s\n", response);
+        return 1;
+    }
+    /* Accepted spellings are stored normalised, and a new service starts disabled. */
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-normal01\",\"name\":\" Local DNS \",\"application\":\"UDP\","
+             "\"transport\":\" Udp \",\"targetHost\":\" LOCALHOST \",\"targetPort\":53,\"publishedPort\":28053,"
+             "\"visibility\":\"acl\"}",
+             client_id);
+    len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
+    int service_id = 0;
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"name\":\"Local DNS\"")
+        || !contains(response, "\"application\":\"udp\"") || !contains(response, "\"transport\":\"udp\"")
+        || !contains(response, "\"targetHost\":\"127.0.0.1\"") || !contains(response, "\"visibility\":\"ACL\"")
+        || !contains(response, "\"enabled\":false") || !contains(response, "\"path\":\"\"")
+        || st_json_get_int(response, "id", &service_id) != 0 || service_id <= 0) {
+        fprintf(stderr, "a valid peer service definition was not stored normalised: %s\n", response);
+        return 1;
+    }
+    /* An update is checked the same way. */
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%d", services_path, service_id);
+    len = st_admin_build_response_with_body("PUT", path, "{\"targetHost\":\"8.8.8.8\"}", response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")) {
+        fprintf(stderr, "an update to a public target was accepted: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("DELETE", path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")) {
+        fprintf(stderr, "peer service fixture delete failed: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * PeerServiceDiscoveryServiceTests sharingDefaultsToOffWhenTableEmpty,
+ * nonAdminCannotToggleSharingOrMutateServices and cannotEnableSharingWhenDeploymentDisabled:
+ * nothing stored means sharing is off; a tenant USER may neither switch it nor define services;
+ * with Peer Mesh off the deployment refuses to switch it on.
+ */
+static int test_peer_service_sharing_rules(int client_id)
+{
+    static const char *const sharing_path = "/api/admin/peer-mesh/service-sharing";
+    char response[16384];
+    int len = st_admin_build_response("GET", sharing_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"deploymentEnabled\":true,\"configuredEnabled\":false,"
+                                        "\"effectiveEnabled\":false")
+        || !contains(response, "\"enabledServiceCount\":0") || !contains(response, "\"mdnsImportEnabled\":false")) {
+        fprintf(stderr, "peer service sharing did not default to off: %s\n", response);
+        return 1;
+    }
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-member01\",\"name\":\"ssh\",\"application\":\"ssh\","
+             "\"targetHost\":\"127.0.0.1\",\"targetPort\":22,\"publishedPort\":2222}", client_id);
+    if (tenant == NULL || connection_events_ensure_user("sharing-member", tenant, "USER") != 0) {
+        fprintf(stderr, "sharing member fixture setup failed\n");
+        return 1;
+    }
+    len = tenant_scope_call("PUT", sharing_path, "sharing-member", tenant, "USER", "{\"enabled\":true}",
+                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "403 Forbidden")) {
+        fprintf(stderr, "a USER switched peer service sharing: %s\n", response);
+        return 1;
+    }
+    len = tenant_scope_call("POST", "/api/admin/peer-mesh/services", "sharing-member", tenant, "USER", body,
+                            response, sizeof(response));
+    if (len <= 0 || !contains(response, "403 Forbidden")) {
+        fprintf(stderr, "a USER defined a peer service: %s\n", response);
+        return 1;
+    }
+    const char *peer_mesh = getenv("SPECUS_PEER_MESH_ENABLED");
+    char saved[16] = "";
+    if (peer_mesh != NULL) snprintf(saved, sizeof(saved), "%s", peer_mesh);
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    len = st_admin_build_response_with_body("PUT", sharing_path, "{\"enabled\":true}", response, sizeof(response));
+    if (saved[0] != '\0') setenv("SPECUS_PEER_MESH_ENABLED", saved, 1);
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "部署端未启用")) {
+        fprintf(stderr, "enabling sharing without Peer Mesh was not 400: %s\n", response);
+        return 1;
+    }
+    len = st_admin_build_response("GET", sharing_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"configuredEnabled\":false")) {
+        fprintf(stderr, "a refused sharing request switched sharing on: %s\n", response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * serviceReportRateAndStateTablesAreBounded (its audit half): however many audit events a tenant
+ * collects, the management API lists the latest 50.
+ */
+static int test_peer_service_audit_bounded(void)
+{
+    const char *database_path = getenv("SPECUS_DATABASE_PATH");
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    for (int i = 0; i < 120; ++i) {
+        if (database_path == NULL || tenant == NULL
+            || st_storage_record_peer_mesh_service_audit(database_path, "service-report", tenant, 1, 7001 + i,
+                                                         NULL, "rate-limited") != 0) {
+            fprintf(stderr, "peer service audit fixture failed\n");
+            return 1;
+        }
+    }
+    char response[65536];
+    int len = st_admin_build_response("GET", "/api/admin/peer-mesh/service-audit", response, sizeof(response));
+    size_t events = 0U;
+    for (const char *cursor = strstr(response, "\"action\":"); cursor != NULL;
+         cursor = strstr(cursor + 1, "\"action\":")) {
+        ++events;
+    }
+    if (len <= 0 || !contains(response, "200 OK") || events != 50U || !contains(response, "\"sessionId\":7120")) {
+        fprintf(stderr, "peer service audit listed %zu events: %s\n", events, response);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * PublicPeerMeshResourceTests: stun-config prefers a standalone STUN server, publishes it while
+ * Peer Mesh is off, and falls back to the embedded endpoint when the standalone setting is
+ * incomplete; nat-probe-config offers RFC 5780 only with a full second address and port.
+ */
+static int test_public_stun_config_endpoints(void)
+{
+    static const char *const settings[] = {
+        "SPECUS_PEER_MESH_ENABLED", "SPECUS_PEER_MESH_PUBLIC_ADDRESS", "SPECUS_PEER_MESH_STUN_TURN_PORT",
+        "SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS", "SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS",
+        "SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS",
+        "SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", "SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS",
+        "SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT",
+    };
+    for (size_t i = 0U; i < sizeof(settings) / sizeof(settings[0]); ++i) unsetenv(settings[i]);
+    char response[16384];
+    int failed = 0;
+
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", "turn.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "5349", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS", "stun-backup.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", "5350", 1);
+    static const char *const preferred =
+        "{\"peerMeshEnabled\":true,\"selfHostedStunServer\":\"stun:stun.example.com:5349\","
+        "\"stunServers\":[\"stun:stun.example.com:5349\",\"stun:stun-backup.example.com:5349\"],"
+        "\"stunTurnPort\":3478}";
+    int len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (len <= 0 || strcmp(response_body(response), preferred) != 0) {
+        fprintf(stderr, "stun-config did not prefer the standalone endpoint: %s\n", response_body(response));
+        failed = 1;
+    }
+    /* The alternate is listed on the primary port whether or not a second port is set. */
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (!failed && (len <= 0 || strcmp(response_body(response), preferred) != 0)) {
+        fprintf(stderr, "stun-config dropped the alternate without a second port: %s\n", response_body(response));
+        failed = 1;
+    }
+
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT");
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"peerMeshEnabled\":false")
+                    || !contains(response, "\"selfHostedStunServer\":\"stun:stun.example.com:3478\""))) {
+        fprintf(stderr, "stun-config did not publish standalone STUN with Peer Mesh off: %s\n",
+                response_body(response));
+        failed = 1;
+    }
+
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", "relay.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STUN_TURN_PORT", "4444", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "0", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"selfHostedStunServer\":\"stun:relay.example.com:4444\"")
+                    || !contains(response, "\"stunTurnPort\":4444") || contains(response, "stun.example.com"))) {
+        fprintf(stderr, "an incomplete standalone STUN did not fall back: %s\n", response_body(response));
+        failed = 1;
+    }
+
+    for (size_t i = 0U; i < sizeof(settings) / sizeof(settings[0]); ++i) unsetenv(settings[i]);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun-a.example.com", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "34780", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS", "203.0.113.20", 1);
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", "34781", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"available\":true,\"protocol\":\"RFC8489\","
+                                                     "\"discoveryMethod\":\"RFC5780\"")
+                    || !contains(response, "{\"id\":\"A1P1\",\"url\":\"stun:stun-a.example.com:34780\"")
+                    || !contains(response, "{\"id\":\"A1P2\",\"url\":\"stun:stun-a.example.com:34781\"")
+                    || !contains(response, "{\"id\":\"A2P1\",\"url\":\"stun:203.0.113.20:34780\"")
+                    || !contains(response, "{\"id\":\"A2P2\",\"url\":\"stun:203.0.113.20:34781\"")
+                    || !contains(response, "\"changeRequest\":true")
+                    || !contains(response, "\"padding\":true,\"browserMappingObservation\":true,"
+                                           "\"browserFilteringObservation\":false"))) {
+        fprintf(stderr, "standalone RFC 5780 nat-probe-config mismatch: %s\n", response_body(response));
+        failed = 1;
+    }
+    /* Without the second port the NAT probe alternate port stands in, as in Java. */
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "{\"id\":\"A2P2\",\"url\":\"stun:203.0.113.20:3479\""))) {
+        fprintf(stderr, "nat-probe-config ignored the NAT probe alternate port: %s\n", response_body(response));
+        failed = 1;
+    }
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
+    setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/nat-probe-config", response, sizeof(response));
+    if (!failed && (len <= 0 || !contains(response, "\"discoveryMethod\":\"BASIC_STUN\","
+                                                     "\"endpoints\":[{\"id\":\"A1P1\","
+                                                     "\"url\":\"stun:stun.example.com:34780\"")
+                    || contains(response, "A1P2") || !contains(response, "\"changeRequest\":false"))) {
+        fprintf(stderr, "basic STUN nat-probe-config mismatch: %s\n", response_body(response));
+        failed = 1;
+    }
+    for (size_t i = 0U; i < sizeof(settings) / sizeof(settings[0]); ++i) unsetenv(settings[i]);
+    return failed;
 }
 
 int main(void)
@@ -3969,6 +5868,9 @@ int main(void)
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT");
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
     unsetenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT");
+    if (test_public_stun_config_endpoints() != 0) {
+        return 1;
+    }
     len = st_admin_build_response_with_auth("GET", "/api/admin/overview", NULL, NULL, response, sizeof(response));
     if (len <= 0 || !contains(response, "401 Unauthorized")) {
         fprintf(stderr, "unauthenticated admin api response mismatch\n");
@@ -4357,13 +6259,24 @@ int main(void)
         fprintf(stderr, "client message capability management response mismatch: %s\n", response);
         return 1;
     }
+    /* Java PeerMeshDeviceView has no message capabilities, and nothing reported reads as null. */
+    {
+        st_storage_client device_client;
+        st_storage_peer_mesh_device device;
+        if (st_storage_get_client(auth_db_path, runtime_client_id, &device_client) != 0
+            || st_storage_ensure_peer_mesh_device(auth_db_path, &device_client, &device) != 0) {
+            fprintf(stderr, "peer mesh device seed failed\n");
+            return 1;
+        }
+    }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"messageAttachmentsCapable\":false")
-        || !contains(response, "\"messageMaxAttachmentBytes\":0")
+        || contains(response, "\"messageAttachmentsCapable\"")
+        || contains(response, "\"messageMaxAttachmentBytes\"")
         || !contains(response, "\"cidr\":\"100.96.0.0/11\"")
-        || !contains(response, "\"virtualDeviceMode\":\"AUTO\"")) {
-        fprintf(stderr, "peer mesh capability management response mismatch\n");
+        || !contains(response, "\"natType\":null")
+        || !contains(response, "\"virtualDeviceMode\":null")) {
+        fprintf(stderr, "peer mesh capability management response mismatch: %s\n", response);
         return 1;
     }
     if (test_client_messages_websocket() != 0) {
@@ -4421,13 +6334,18 @@ int main(void)
     setenv("SPECUS_AUTH_TENANT_ID", "tenant-admin", 1);
     setenv("SPECUS_AUTH_USERNAME", "admin-user", 1);
     len = st_admin_build_response("POST", "/api/admin/database/initialize", response, sizeof(response));
+    /* Java DatabaseInitializer: the demo client is seeded into the caller's tenant. */
+    st_storage_client initialized_demo;
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"initialized\":true")
         || !contains(response, "\"tenantId\":\"tenant-admin\"")
         || !contains(response, "\"orm\":\"sqlite3\"")
         || !contains(response, "\"dialect\":\"sqlite\"")
-        || !contains(response, "\"clients\":0")) {
-        fprintf(stderr, "database initialize response mismatch\n");
+        || !contains(response, "\"clients\":1")
+        || st_storage_get_client_by_name(db_path, "Demo client", &initialized_demo) != 0
+        || strcmp(initialized_demo.tenant_id, "tenant-admin") != 0
+        || strcmp(initialized_demo.owner_username, "admin-user") != 0) {
+        fprintf(stderr, "database initialize response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/me", response, sizeof(response));
@@ -4466,7 +6384,7 @@ int main(void)
         return 1;
     }
     st_storage_management_user premature_user;
-    if (st_storage_get_management_user(db_path, "registered-user", &premature_user) == 0) {
+    if (st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "registered-user", &premature_user) == 0) {
         fprintf(stderr, "registration created user before email verification\n");
         free(registration_id);
         return 1;
@@ -4481,7 +6399,7 @@ int main(void)
     st_storage_management_user registered_user;
     st_password_verification registered_password;
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"accessToken\"")
-        || st_storage_get_management_user(db_path, "registered-user", &registered_user) != 0
+        || st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "registered-user", &registered_user) != 0
         || strcmp(registered_user.role, "USER") != 0 || !registered_user.enabled
         || st_password_verify("password-1", registered_user.password_hash, &registered_password) != 0
         || !registered_password.matches
@@ -4529,7 +6447,7 @@ int main(void)
         return 1;
     }
     st_storage_management_user stored_alice;
-    if (st_storage_get_management_user(db_path, "alice", &stored_alice) != 0
+    if (st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "alice", &stored_alice) != 0
         || strncmp(stored_alice.password_hash,
                    "$pbkdf2-sha256$v=1$i=210000$",
                    strlen("$pbkdf2-sha256$v=1$i=210000$")) != 0) {
@@ -4557,7 +6475,7 @@ int main(void)
                                             response,
                                             sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || st_storage_get_management_user(db_path, "legacy-user", &legacy_user) != 0
+        || st_storage_get_management_user_in_tenant(db_path, "tenant-admin", "legacy-user", &legacy_user) != 0
         || strcmp(legacy_user.password_hash, legacy_password_hash) == 0
         || strncmp(legacy_user.password_hash,
                    "$pbkdf2-sha256$v=1$i=210000$",
@@ -4799,7 +6717,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/public/client-packages/%d/download", hosted_package_id);
     int download_handled = st_client_package_send_download(
-        package_sockets[0], "GET", request_path, db_path, "198.51.100.40");
+        package_sockets[0], "GET", request_path, db_path, "198.51.100.40", NULL, NULL);
     shutdown(package_sockets[0], SHUT_WR);
     char package_response[4096];
     ssize_t package_response_len = recv(package_sockets[1], package_response,
@@ -4934,7 +6852,8 @@ int main(void)
                                             "{\"listenPort\":19001,\"targetAddress\":\"127.0.0.1\",\"targetPort\":9001}",
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found")) {
+    /* Java NatControlService.findClient: 400 client not found: <id>. */
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"client not found: 1\"}")) {
         fprintf(stderr, "database user foreign specus create response mismatch\n");
         free(alice_token);
         return 1;
@@ -4998,7 +6917,7 @@ int main(void)
                                             case_acl_body,
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "source client not found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "\"error\":\"client not found: ")) {
         fprintf(stderr, "peer mesh acl source-owner authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -5014,7 +6933,7 @@ int main(void)
                                             case_acl_body,
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "cross-user peer ACL")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "普通用户不能创建跨用户 peer ACL")) {
         fprintf(stderr, "peer mesh acl target-owner authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -5030,7 +6949,7 @@ int main(void)
                                             case_acl_body,
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "target client not found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "\"error\":\"client not found: ")) {
         fprintf(stderr, "peer mesh acl tenant authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -5061,7 +6980,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%lld", hidden_case_acl.id);
     len = st_admin_build_response_with_auth("DELETE", request_path, authorization, NULL, response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "peer ACL not found: ")) {
         fprintf(stderr, "peer mesh acl delete authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -5103,9 +7022,10 @@ int main(void)
         fprintf(stderr, "management user delete response mismatch\n");
         return 1;
     }
+    /* The demo client was seeded into SPECUS_AUTH_TENANT_ID, the built-in administrator's tenant. */
     len = st_admin_build_response("GET", "/api/admin/clients", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || contains(response, "\"clientName\":\"Demo client\"")) {
+        || !contains(response, "\"clientName\":\"Demo client\"")) {
         fprintf(stderr, "clients list response mismatch\n");
         return 1;
     }
@@ -5168,7 +7088,7 @@ int main(void)
     st_admin_set_peer_mesh_refresh_handler(test_peer_mesh_refresh, NULL);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
     int created_acl_id = 0;
-    if (len <= 0 || !contains(response, "201 Created")
+    if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"sourceClientName\":\"C managed\"")
         || !contains(response, "\"targetClientName\":\"C peer target\"")
         || !contains(response, "\"allowed\":true")
@@ -5186,7 +7106,8 @@ int main(void)
         fprintf(stderr, "peer mesh acl list response mismatch\n");
         return 1;
     }
-    if (test_peer_mesh_egress_policy_validation(target_client_id) != 0) {
+    if (test_peer_mesh_egress_policy_validation(target_client_id) != 0
+        || test_peer_mesh_egress_admin_only(target_client_id) != 0) {
         return 1;
     }
     snprintf(acl_body,
@@ -5195,7 +7116,7 @@ int main(void)
              created_client_id,
              target_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"BOTH\"")) {
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"direction\":\"BOTH\"")) {
         fprintf(stderr, "peer mesh acl omitted direction should preserve existing value\n");
         return 1;
     }
@@ -5206,7 +7127,7 @@ int main(void)
              created_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
     int default_direction_acl_id = 0;
-    if (len <= 0 || !contains(response, "201 Created")
+    if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"direction\":\"OUTBOUND\"")
         || st_json_get_int(response, "id", &default_direction_acl_id) != 0
         || default_direction_acl_id <= 0) {
@@ -5219,7 +7140,7 @@ int main(void)
              target_client_id,
              created_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"INBOUND\"")) {
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"direction\":\"INBOUND\"")) {
         fprintf(stderr, "peer mesh acl inbound direction response mismatch\n");
         return 1;
     }
@@ -5229,7 +7150,7 @@ int main(void)
              target_client_id,
              created_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"INBOUND\"")) {
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"direction\":\"INBOUND\"")) {
         fprintf(stderr, "peer mesh acl omitted direction should preserve inbound value\n");
         return 1;
     }
@@ -5246,23 +7167,46 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%d", default_direction_acl_id);
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "default direction peer mesh acl delete response mismatch\n");
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%d", created_acl_id);
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "peer mesh acl delete response mismatch\n");
         return 1;
+    }
+    /* Java lists the devices that exist: none until the client logs in with Peer Mesh on. */
+    len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || contains(response, "\"clientName\":\"C managed\"")) {
+        fprintf(stderr, "a client that never logged in has a peer mesh device: %s\n", response);
+        return 1;
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/devices/%d", created_client_id);
+    len = st_admin_build_response_with_body("PUT", request_path, "{\"enabled\":true}", response, sizeof(response));
+    char missing_device[96];
+    snprintf(missing_device, sizeof(missing_device), "{\"error\":\"peer device not found: %d\"}", created_client_id);
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, missing_device)) {
+        fprintf(stderr, "enabling a device that does not exist mismatch: %s\n", response);
+        return 1;
+    }
+    {
+        st_storage_client device_client;
+        st_storage_peer_mesh_device device;
+        if (st_storage_get_client(db_path, created_client_id, &device_client) != 0
+            || st_storage_ensure_peer_mesh_device(db_path, &device_client, &device) != 0) {
+            fprintf(stderr, "peer mesh device seed failed\n");
+            return 1;
+        }
     }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed\"")
         || !contains(response, "\"enabled\":false")
         || !contains(response, "\"online\":false")
-        || !contains(response, "\"virtualDeviceStatus\":\"DOWN\"")) {
-        fprintf(stderr, "peer mesh devices from clients response mismatch\n");
+        || !contains(response, "\"virtualDeviceStatus\":null")) {
+        fprintf(stderr, "peer mesh devices response mismatch: %s\n", response);
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/devices/%d", created_client_id);
@@ -5274,7 +7218,7 @@ int main(void)
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed\"")
         || !contains(response, "\"enabled\":true")
-        || !contains(response, "\"virtualDeviceStatus\":\"DOWN\"")) {
+        || !contains(response, "\"virtualDeviceStatus\":null")) {
         fprintf(stderr, "peer mesh device update response mismatch\n");
         return 1;
     }
@@ -5285,6 +7229,7 @@ int main(void)
         fprintf(stderr, "peer mesh devices updated list response mismatch\n");
         return 1;
     }
+    /* Unexpired: listing sessions closes the expired ones first, as Java's expireIfStale. */
     char peer_session_sql[2048];
     snprintf(peer_session_sql,
              sizeof(peer_session_sql),
@@ -5293,10 +7238,10 @@ int main(void)
              "path_type, status, token_hash, started_at, updated_at, expires_at, rtt_millis, "
              "local_endpoint, remote_endpoint, direct_bytes, relay_bytes, last_traffic_at) VALUES "
              "(99001, 'tenant-admin', %d, 'C managed', %d, 'C peer target', 'DIRECT', 'ACTIVE', 'hash-a', "
-             "'2026-06-25T01:00:00Z', '2026-06-25T01:01:00Z', '2026-06-25T02:00:00Z', 12, "
+             "'2026-06-25T01:00:00Z', '2026-06-25T01:01:00Z', '2999-06-25T02:00:00Z', 12, "
              "'10.0.0.1:10000', '10.0.0.2:10001', 128, 0, '2026-06-25T01:01:00Z'),"
              "(99002, 'tenant-admin', %d, 'C managed', %d, 'C peer target', 'RELAY', 'NEGOTIATING', 'hash-b', "
-             "'2026-06-25T01:02:00Z', '2026-06-25T01:03:00Z', '2026-06-25T02:03:00Z', NULL, "
+             "'2026-06-25T01:02:00Z', '2026-06-25T01:03:00Z', '2999-06-25T02:03:00Z', NULL, "
              "NULL, 'relay.example:3478', 0, 64, NULL)",
              created_client_id,
              target_client_id,
@@ -5348,6 +7293,9 @@ int main(void)
         fprintf(stderr, "peer service sharing status mismatch\n");
         return 1;
     }
+    if (test_peer_service_sharing_rules(created_client_id) != 0) {
+        return 1;
+    }
     len = st_admin_build_response_with_body("PUT", "/api/admin/peer-mesh/service-sharing",
                                             "{\"enabled\":true,\"mdnsImportEnabled\":true}",
                                             response, sizeof(response));
@@ -5367,7 +7315,7 @@ int main(void)
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/services", body,
                                             response, sizeof(response));
     int created_service_id = 0;
-    if (len <= 0 || !contains(response, "201 Created")
+    if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"serviceId\":\"service-test\"")
         || !contains(response, "\"publishedPort\":18080")
         || st_json_get_int(response, "id", &created_service_id) != 0 || created_service_id <= 0) {
@@ -5392,8 +7340,11 @@ int main(void)
         return 1;
     }
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "peer service delete mismatch\n");
+        return 1;
+    }
+    if (test_peer_service_definition_validation(created_client_id) != 0) {
         return 1;
     }
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
@@ -5450,16 +7401,32 @@ int main(void)
                                             response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"created\":1")
-        || !contains(response, "\"serviceId\":\"import-tcp-")
+        || !contains(response, "\"name\":\"tcp-19090\"")
         || !contains(response, "\"publishedPort\":19090")) {
         fprintf(stderr, "peer TCP service import mismatch: %s\n", response);
         return 1;
+    }
+    /* importCandidatesCreatesDisabledTcpMapping: the imported service is a disabled tcp one. */
+    {
+        const char *imported = strstr(response, "\"name\":\"tcp-19090\"");
+        const char *end = imported == NULL ? NULL : strstr(imported, "\"createdAt\"");
+        size_t span = end == NULL ? 0U : (size_t)(end - imported);
+        char view[2048] = "";
+        if (span > 0U && span < sizeof(view)) memcpy(view, imported, span);
+        if (!contains(view, "\"application\":\"tcp\"") || !contains(view, "\"enabled\":false")
+            || !contains(view, "\"targetHost\":\"127.0.0.1\"")) {
+            fprintf(stderr, "an imported peer service was not a disabled tcp service: %s\n", response);
+            return 1;
+        }
     }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/service-audit", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"action\":\"service-import\"")
         || !contains(response, "\"reason\":\"created=1,skipped=0\"")) {
         fprintf(stderr, "peer service audit mismatch: %s\n", response);
+        return 1;
+    }
+    if (test_peer_service_audit_bounded() != 0) {
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/specus-mappings?clientId=%d", created_client_id);
@@ -5619,7 +7586,10 @@ int main(void)
         fprintf(stderr, "HTTP media capture route update mismatch\n");
         return 1;
     }
-    if (test_log_safe_reason() != 0 || test_direct_http_route_authentication(db_path) != 0) {
+    int route_authentication_failed = test_log_safe_reason() != 0
+        || test_direct_http_route_authentication(db_path) != 0;
+    unsetenv("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED");
+    if (route_authentication_failed) {
         return 1;
     }
     st_direct_http_response rewrite_response;
@@ -5627,8 +7597,11 @@ int main(void)
     rewrite_response.status_code = 200;
     rewrite_response.headers_len = 2;
     rewrite_response.headers = (char **)calloc(rewrite_response.headers_len, sizeof(*rewrite_response.headers));
+    /* ResponseRewriterTests: protocol-relative and absolute URLs are left as they are. */
     const char *rewrite_html = "<html><head><title>x</title></head><body>"
-        "<a href=\"/login\"><img src='/img/logo.png' srcset=\"/a.png 1x, /b.png 2x\"></body></html>";
+        "<a href=\"/login\"><img src='/img/logo.png' srcset=\"/a.png 1x, /b.png 2x\">"
+        "<img src=\"//cdn.example.com/logo.png\"><img src=\"https://cdn.example.com/external.png\">"
+        "</body></html>";
     if (rewrite_response.headers == NULL
         || (rewrite_response.headers[0] = test_dup_string("Content-Type: text/html; charset=UTF-8")) == NULL
         || (rewrite_response.headers[1] = test_dup_string("ETag: \"old\"")) == NULL
@@ -5641,10 +7614,15 @@ int main(void)
         || !contains((const char *)rewrite_response.body, "href=\"/http/C managed 2/api/login\"")
         || !contains((const char *)rewrite_response.body, "src='/http/C managed 2/api/img/logo.png'")
         || !contains((const char *)rewrite_response.body, "/http/C managed 2/api/a.png 1x")
+        || !contains((const char *)rewrite_response.body, "src=\"//cdn.example.com/logo.png\"")
+        || !contains((const char *)rewrite_response.body, "src=\"https://cdn.example.com/external.png\"")
+        || contains((const char *)rewrite_response.body, "/http/C managed 2/api//cdn")
+        || contains((const char *)rewrite_response.body, "/http/C managed 2/apihttps")
         || !contains((const char *)rewrite_response.body,
                      "<script src=\"/specus-http-route-runtime.js?v=4\" "
                      "data-specus-prefix=\"/http/C managed 2/api\"></script>")
         || contains((const char *)rewrite_response.body, "<script>")
+        || contains((const char *)rewrite_response.body, "specus polyfill failed")
         || rewrite_response.headers[1] != NULL) {
         fprintf(stderr, "direct http html rewrite response mismatch\n");
         st_direct_http_response_free(&rewrite_response);
@@ -5801,7 +7779,7 @@ int main(void)
                                   sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed 2\"")
-        || !contains(response, "\"month\":\"2026-06-20\"")
+        || !contains(response, "\"month\":\"2026-06\"")
         || !contains(response, "\"total\":1")
         || !contains(response, "\"success\":1")
         || !contains(response, "\"failure\":0")
@@ -6081,15 +8059,45 @@ int main(void)
         fprintf(stderr, "traffic detail seed failed\n");
         return 1;
     }
+    /* HttpTrafficExchangeStoreTests: a page of summaries carries no headers and no previews. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"method\":\"POST\"")
         || !contains(response, "\"statusCode\":201")
         || !contains(response, "\"responseBodyType\":\"json\"")
-        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"requestHeaders\":null,\"responseHeaders\":null,\"requestPreviewHex\":null,"
+                               "\"requestPreviewText\":null,\"responsePreviewHex\":null,\"responsePreviewText\":null")
+        || contains(response, "\"requestHeaders\":\"") || contains(response, "\"responseHeaders\":\"")
+        || contains(response, "\"requestPreviewHex\":\"") || contains(response, "\"requestPreviewText\":\"")
+        || contains(response, "\"responsePreviewHex\":\"") || contains(response, "\"responsePreviewText\":\"")
         || !contains(response, "\"size\":20")
         || !contains(response, "\"totalPages\":1")) {
-        fprintf(stderr, "http exchange page response mismatch\n");
+        fprintf(stderr, "http exchange page response mismatch: %.2000s\n", response);
+        return 1;
+    }
+    /* The detail of one exchange carries them, with Java's uppercase spaced hex. */
+    long long post_exchange_id = 0;
+    {
+        sqlite3 *db = NULL;
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_open(db_path, &db) == SQLITE_OK
+            && sqlite3_prepare_v2(db, "SELECT id FROM specus_http_traffic_exchange WHERE method='POST'", -1, &stmt,
+                                  NULL) == SQLITE_OK
+            && sqlite3_step(stmt) == SQLITE_ROW) {
+            post_exchange_id = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/traffic/http-exchanges/%lld", post_exchange_id);
+    len = st_admin_build_response("GET", request_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"requestHeaders\":\"Content-Type: application/json\"")
+        || !contains(response, "\"requestPreviewHex\":\"7B 22 68 65 6C 6C 6F 22 3A 74 72 75 65 7D\"")
+        || !contains(response, "\"requestPreviewText\":\"{\\\"hello\\\":true}\"")
+        || !contains(response, "\"responsePreviewText\":\"{\\\"ok\\\":true}\"")
+        || !contains(response, "\"responseTruncated\":false")) {
+        fprintf(stderr, "http exchange detail response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=method&q=POST&page=0&size=20", response, sizeof(response));
@@ -6113,9 +8121,11 @@ int main(void)
         fprintf(stderr, "http exchange status search response mismatch\n");
         return 1;
     }
+    /* The route gate's 401 answers recorded earlier are JSON as well, the JavaScript one is not. */
     len = st_admin_build_response("GET", "/api/admin/traffic/http-exchanges?field=responseDataType&q=json&page=0&size=20", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"total\":1")
+        || !contains(response, "\"relativePath\":\"/items\"")
+        || contains(response, "/vendor.js")
         || !contains(response, "\"responseBodyType\":\"json\"")) {
         fprintf(stderr, "http exchange response data type search response mismatch\n");
         return 1;
@@ -6182,17 +8192,17 @@ int main(void)
         return 1;
     }
     len = st_admin_build_response("DELETE", "/api/admin/peer-mesh/sessions/123", response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "peer mesh session not found")) {
+    if (len <= 0 || !contains(response, "503 Service Unavailable")) {
         fprintf(stderr, "peer mesh close missing session response mismatch\n");
         return 1;
     }
     len = st_admin_build_response("PUT", "/api/admin/peer-mesh/devices/42", response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "peer mesh device not found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"Bad Request\"}")) {
         fprintf(stderr, "peer mesh update missing device response mismatch\n");
         return 1;
     }
     len = st_admin_build_response("DELETE", "/api/admin/peer-mesh/acls/42", response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "503 Service Unavailable")) {
         fprintf(stderr, "peer mesh delete missing acl response mismatch\n");
         return 1;
     }
@@ -6384,6 +8394,38 @@ int main(void)
         return 1;
     }
     if (test_tenant_scoped_admin_mutations() != 0) {
+        return 1;
+    }
+    if (test_ambiguous_login_name_fails_closed() != 0) {
+        return 1;
+    }
+    if (test_tenants_share_login_names() != 0) {
+        return 1;
+    }
+    if (test_tenant_qualified_login_and_refresh() != 0) {
+        return 1;
+    }
+    if (test_legacy_accounts_sign_in_after_migration() != 0) {
+        return 1;
+    }
+    if (test_peer_mesh_path_stats() != 0) {
+        return 1;
+    }
+    if (test_http_exchange_body_detail() != 0) {
+        return 1;
+    }
+    if (test_http_route_service_rules() != 0) {
+        fprintf(stderr, "HttpRouteServiceTests rules mismatch\n");
+        return 1;
+    }
+    if (test_client_account_service_rules() != 0) {
+        fprintf(stderr, "ClientAccountServiceTests rules mismatch\n");
+        return 1;
+    }
+    if (test_user_diagram_owner_scope() != 0) {
+        return 1;
+    }
+    if (test_client_mutations_close_connections() != 0) {
         return 1;
     }
     unsetenv("SPECUS_ENV");

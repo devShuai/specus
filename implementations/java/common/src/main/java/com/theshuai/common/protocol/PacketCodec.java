@@ -74,6 +74,18 @@ public final class PacketCodec {
             throw new ProtocolException(ProtocolException.Reason.UNKNOWN_COMMAND, "unknown command: " + command);
         }
 
+        // A packet that cannot be encoded leaves nothing behind: no header without its body.
+        int start = byteBuf.writerIndex();
+        try {
+            encodeFrame(byteBuf, packet, serializer, command);
+        } catch (ProtocolException | RuntimeException failure) {
+            byteBuf.writerIndex(start);
+            throw failure;
+        }
+    }
+
+    private void encodeFrame(ByteBuf byteBuf, Packet packet, Serializer serializer, byte command)
+            throws ProtocolException {
         byteBuf.writeInt(MAGIC_NUMBER);
         byteBuf.writeByte(PROTOCOL_VERSION);
         byteBuf.writeByte(SerializerAlgorithm.BIN);

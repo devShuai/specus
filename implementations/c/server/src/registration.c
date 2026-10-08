@@ -91,6 +91,19 @@ static void registration_error(char *error, size_t error_len, const char *messag
     if (error != NULL && error_len > 0U) snprintf(error, error_len, "%s", message);
 }
 
+/* Java's 400 for a login name the tenant already has: "用户名已存在: <name>". */
+static void registration_username_exists(const char *username, char *error, size_t error_len)
+{
+    if (error != NULL && error_len > 0U) snprintf(error, error_len, "用户名已存在: %s", username);
+}
+
+/* Self-registration opens accounts in the default tenant only (Java RegistrationService). */
+static const char *registration_tenant(void)
+{
+    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
+    return tenant == NULL || *tenant == '\0' ? "default" : tenant;
+}
+
 void st_registration_set_handlers(st_registration_turnstile_handler turnstile,
                                   st_registration_email_handler email,
                                   void *ctx)
@@ -218,8 +231,11 @@ static int registration_verify_turnstile(const char *token, const char *expected
     st_registration_handlers handlers = registration_get_handlers();
     if (handlers.turnstile != NULL) return handlers.turnstile(handlers.ctx, token, expected_action);
     if (!registration_text_present(token)) return -1;
+    /* Trimmed on a copy: the caller's token is const and may be a literal. */
+    char *trimmed = strdup(token);
     char *secret = registration_form_encode(getenv("SPECUS_AUTH_TURNSTILE_SECRET_KEY"));
-    char *response = registration_form_encode(registration_trim((char *)token));
+    char *response = trimmed == NULL ? NULL : registration_form_encode(registration_trim(trimmed));
+    free(trimmed);
     if (secret == NULL || response == NULL) {
         free(secret); free(response);
         return -2;
@@ -238,7 +254,9 @@ static int registration_verify_turnstile(const char *token, const char *expected
     int rc = st_http_post_form(getenv("SPECUS_AUTH_TURNSTILE_VERIFY_URL"), NULL, form,
                                &options, &status, &response_body);
     free(form);
-    if (rc != 0 || status / 100L != 2L || response_body == NULL) {
+    /* As Java TurnstileVerifier: a siteverify answer that is not a JSON object means the service
+     * is unavailable (503), not that the visitor failed the challenge (400). */
+    if (rc != 0 || status / 100L != 2L || response_body == NULL || !st_json_is_valid_object(response_body)) {
         free(response_body);
         return -2;
     }
@@ -399,21 +417,84 @@ static time_t registration_parse_time(const char *value)
     return end != NULL && *end == '\0' ? timegm(&utc) : (time_t)-1;
 }
 
-static int registration_normalize_username(char *username)
+/* Spring StringUtils.hasText over ASCII: a character that Character.isWhitespace does not match. */
+static int registration_has_text(const char *value)
 {
-    char *trimmed = registration_trim(username);
-    if (trimmed == NULL || *trimmed == '\0' || strlen(trimmed) > 80U) return -1;
-    if (trimmed != username) memmove(username, trimmed, strlen(trimmed) + 1U);
+    for (const unsigned char *p = (const unsigned char *)value; p != NULL && *p != '\0'; ++p) {
+        if (*p != ' ' && (*p < 0x09U || *p > 0x0dU) && (*p < 0x1cU || *p > 0x1fU)) return 1;
+    }
     return 0;
 }
 
-static int registration_normalize_email(char *email)
+/* Java String.trim in place: every character up to U+0020 at either end. */
+static void registration_java_trim(char *value)
 {
-    char *trimmed = registration_trim(email);
-    if (trimmed == NULL || !registration_email_format(trimmed)) return -1;
-    if (trimmed != email) memmove(email, trimmed, strlen(trimmed) + 1U);
+    if (value == NULL) return;
+    size_t len = strlen(value);
+    size_t start = 0U;
+    while (start < len && (unsigned char)value[start] <= ' ') ++start;
+    while (len > start && (unsigned char)value[len - 1U] <= ' ') --len;
+    memmove(value, value + start, len - start);
+    value[len - start] = '\0';
+}
+
+/* Java String.length() of UTF-8 text: UTF-16 code units. */
+static size_t registration_utf16_length(const char *text)
+{
+    size_t count = 0U;
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; ++p) {
+        if ((*p & 0xc0U) != 0x80U) count += *p >= 0xf0U ? 2U : 1U;
+    }
+    return count;
+}
+
+/*
+ * Java ManagementUserService.normalizeUsername and requirePassword: not blank, then trimmed in
+ * place, at most max_length characters. NULL when valid, else Java's message. max_bytes is C's own
+ * bound: a management login name is stored and carried in tokens in 80 bytes, as POST
+ * /api/admin/users enforces, so a longer non-ASCII name is refused here rather than at verification.
+ */
+static const char *registration_text_error(char *value, size_t max_length, size_t max_bytes,
+                                           const char *blank, const char *too_long)
+{
+    if (!registration_has_text(value)) return blank;
+    registration_java_trim(value);
+    return registration_utf16_length(value) > max_length || strlen(value) > max_bytes ? too_long : NULL;
+}
+
+/*
+ * The local part or the domain of an address as jakarta.mail InternetAddress.checkAddress (strict)
+ * takes it: not empty, no leading, trailing or doubled dot, no control character, space or special;
+ * the domain is ASCII. Quoted local parts and domain literals, which Java also takes, are refused.
+ */
+static int registration_address_part(const char *start, const char *end, int domain)
+{
+    if (start == end || *start == '.' || end[-1] == '.') return 0;
+    for (const char *p = start; p < end; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= 0x20U || c == 0x7fU || (domain && c > 0x7fU) || strchr("()<>,;:\\\"[]@", c) != NULL
+            || (c == '.' && p + 1 < end && p[1] == '.')) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Java RegistrationService.normalizeEmail, trimmed and lower-cased in place: not blank, at most 254
+ * characters, the pattern ^[^\s@]+@[^\s@]+\.[^\s@]+$ and a plain mailbox address in
+ * InternetAddress's strict parse. NULL when valid, else Java's message.
+ */
+static const char *registration_normalize_email(char *email)
+{
+    if (!registration_has_text(email)) return "邮箱不能为空";
+    registration_java_trim(email);
     for (char *p = email; *p != '\0'; ++p) *p = (char)tolower((unsigned char)*p);
-    return 0;
+    const char *at = strchr(email, '@');
+    const char *domain = at == NULL ? NULL : at + 1;
+    const char *last_dot = domain == NULL ? NULL : strrchr(domain, '.');
+    int valid = registration_utf16_length(email) <= 254U && at != NULL && strchr(domain, '@') == NULL
+        && last_dot != NULL && last_dot != domain && last_dot[1] != '\0'
+        && registration_address_part(email, at, 0) && registration_address_part(domain, domain + strlen(domain), 1);
+    return valid ? NULL : "邮箱格式无效";
 }
 
 static int registration_code_valid(const char *code)
@@ -444,27 +525,32 @@ int st_registration_request(const char *database_path,
     char *email = st_json_get_string(json_body, "email");
     char *password = st_json_get_string(json_body, "password");
     char *turnstile = st_json_get_string(json_body, "turnstileToken");
-    char *password_value = registration_trim(password);
-    int rc = -1;
-    if (registration_normalize_username(username) != 0) registration_error(error, error_len, "username cannot be blank");
-    else if (strcasecmp(username, getenv("SPECUS_AUTH_USERNAME") == NULL ? "admin" : getenv("SPECUS_AUTH_USERNAME")) == 0)
-        registration_error(error, error_len, "该用户名不可用");
-    else if (registration_normalize_email(email) != 0) registration_error(error, error_len, "邮箱格式无效");
-    else if (password_value == NULL || *password_value == '\0' || strlen(password_value) > 120U)
-        registration_error(error, error_len, "password cannot be blank");
-    else {
-        int turnstile_result = registration_verify_turnstile(turnstile, "register");
-        if (turnstile_result == -1) registration_error(error, error_len, "人机验证失败，请重试");
-        else if (turnstile_result != 0) {
-            if (http_status != NULL) *http_status = 503;
-            registration_error(error, error_len, "人机验证服务暂不可用");
-        } else rc = 0;
-    }
+    /* Java AuthController.register: the challenge first, then requestRegistration's checks in order. */
+    int turnstile_result = registration_verify_turnstile(turnstile, "register");
     free(turnstile);
-    if (rc != 0) {
+    const char *reserved = getenv("SPECUS_AUTH_USERNAME");
+    const char *refusal = turnstile_result == 0 ? NULL
+        : (turnstile_result == -1 ? "人机验证失败，请重试" : "人机验证服务暂不可用");
+    if (turnstile_result != 0 && turnstile_result != -1 && http_status != NULL) *http_status = 503;
+    if (refusal == NULL) {
+        refusal = registration_text_error(username, 80U, 80U, "username cannot be blank", "username is too long");
+    }
+    if (refusal == NULL && strcasecmp(username, reserved == NULL || *reserved == '\0' ? "admin" : reserved) == 0) {
+        refusal = "该用户名不可用";
+    }
+    if (refusal == NULL) {
+        refusal = registration_text_error(password, 120U, SIZE_MAX, "password cannot be blank",
+                                          "password is too long");
+    }
+    if (refusal == NULL) {
+        refusal = registration_normalize_email(email);
+    }
+    if (refusal != NULL) {
+        registration_error(error, error_len, refusal);
         free(username); free(email); free(password);
         return -1;
     }
+    const char *password_value = password;
     if (database_path == NULL || st_storage_init(database_path, 0) != 0) {
         if (http_status != NULL) *http_status = 500;
         registration_error(error, error_len, "注册数据库不可用");
@@ -473,8 +559,10 @@ int st_registration_request(const char *database_path,
     }
     st_storage_management_user existing_user;
     int email_exists = st_storage_management_email_exists(database_path, email);
-    if (st_storage_get_management_user(database_path, username, &existing_user) == 0) {
-        registration_error(error, error_len, "用户名已存在");
+    /* Registration opens accounts in the default tenant only, so only its login names conflict. */
+    if (st_storage_get_management_user_in_tenant(database_path, registration_tenant(), username,
+                                                 &existing_user) == 0) {
+        registration_username_exists(username, error, error_len);
         goto fail;
     }
     if (email_exists != 0) {
@@ -575,10 +663,13 @@ int st_registration_verify(const char *database_path,
     }
     char *registration_id = st_json_get_string(json_body, "registrationId");
     char *code = st_json_get_string(json_body, "code");
-    char *id_trimmed = registration_trim(registration_id);
-    char *code_trimmed = registration_trim(code);
-    if (id_trimmed == NULL || *id_trimmed == '\0' || strlen(id_trimmed) > 64U
-        || !registration_code_valid(code_trimmed)) {
+    /* Java verifyRegistration: the id has text and at most 64 characters as sent, then is trimmed. */
+    int id_valid = registration_has_text(registration_id) && registration_utf16_length(registration_id) <= 64U;
+    registration_java_trim(registration_id);
+    registration_java_trim(code);
+    const char *id_trimmed = registration_id;
+    const char *code_trimmed = code;
+    if (!id_valid || !registration_code_valid(code_trimmed)) {
         registration_error(error, error_len, "验证码无效或已过期");
         free(registration_id); free(code);
         return -1;
@@ -622,16 +713,20 @@ int st_registration_verify(const char *database_path,
         free(registration_id); free(code);
         return -1;
     }
-    if (st_storage_get_management_user(database_path, challenge.username, &existing) == 0
-        || email_exists > 0) {
-        registration_error(error, error_len, email_exists > 0 ? "该邮箱已注册" : "用户名已存在");
+    /* As Java: the login name is checked before the email. */
+    if (st_storage_get_management_user_in_tenant(database_path, registration_tenant(), challenge.username,
+                                                 &existing) == 0) {
+        registration_username_exists(challenge.username, error, error_len);
+        free(registration_id); free(code);
+        return -1;
+    }
+    if (email_exists > 0) {
+        registration_error(error, error_len, "该邮箱已注册");
         free(registration_id); free(code);
         return -1;
     }
     snprintf(challenge.updated_at, sizeof(challenge.updated_at), "%s", now_text);
-    const char *tenant = getenv("SPECUS_AUTH_TENANT_ID");
-    if (st_storage_complete_registration(database_path, &challenge,
-                                         tenant == NULL ? "default" : tenant, user) != 0) {
+    if (st_storage_complete_registration(database_path, &challenge, registration_tenant(), user) != 0) {
         registration_error(error, error_len, "用户名或邮箱已被注册");
         free(registration_id); free(code);
         return -1;

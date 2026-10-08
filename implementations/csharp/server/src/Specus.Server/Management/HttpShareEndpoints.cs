@@ -14,8 +14,40 @@ namespace Specus.Server.Management;
 /// </summary>
 public static class HttpShareEndpoints
 {
-    private const string ManagementCacheControl = "private, no-store";
+    internal const string ManagementCacheControl = "private, no-store";
     private const int MaxManagementBodyBytes = 16 * 1024;
+
+    /// <summary>
+    /// True for the paths of the share management endpoints (§4), so the 401 of the shared
+    /// authentication layer carries their cache header as well. The anonymous exchange is not one.
+    /// </summary>
+    internal static bool IsManagementPath(PathString path)
+    {
+        if (path.Equals("/api/admin/http-access-audit", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (!path.StartsWithSegments("/api/admin/http-routes", StringComparison.OrdinalIgnoreCase,
+                out var rest) || !rest.HasValue)
+        {
+            return false;
+        }
+        // rest is "/{routeId}/shares[/{shareId}[/revoke]]" or "/{routeId}/access-audit".
+        var segments = rest.Value!.TrimEnd('/').Split('/');
+        if (segments.Length < 3 || segments[1].Length == 0)
+        {
+            return false;
+        }
+        return segments.Length switch
+        {
+            3 => segments[2].Equals("shares", StringComparison.OrdinalIgnoreCase)
+                 || segments[2].Equals("access-audit", StringComparison.OrdinalIgnoreCase),
+            4 => segments[2].Equals("shares", StringComparison.OrdinalIgnoreCase) && segments[3].Length > 0,
+            5 => segments[2].Equals("shares", StringComparison.OrdinalIgnoreCase) && segments[3].Length > 0
+                 && segments[4].Equals("revoke", StringComparison.OrdinalIgnoreCase),
+            _ => false,
+        };
+    }
 
     public static void MapHttpShareApi(this WebApplication app)
     {

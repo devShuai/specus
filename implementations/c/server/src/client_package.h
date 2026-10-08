@@ -19,12 +19,18 @@ int st_client_package_upload(const char *database_path,
                              char *error,
                              size_t error_len);
 
-/* Returns 1 when the public download route was handled, 0 for another route. */
+/*
+ * Returns 1 when the public download route was handled, 0 for another route. Range and
+ * If-None-Match (either may be NULL) follow Spring's handling of a ResponseEntity<Resource>:
+ * single and multiple byte ranges (206), 416 for an unsatisfiable range, 304 for a matching ETag.
+ */
 int st_client_package_send_download(int fd,
                                     const char *method,
                                     const char *path,
                                     const char *database_path,
-                                    const char *remote_address);
+                                    const char *remote_address,
+                                    const char *range_header,
+                                    const char *if_none_match);
 
 /* Shared anonymous read budget for catalogue, version-check and package bytes. */
 int st_client_package_rate_limit(const char *remote_address,

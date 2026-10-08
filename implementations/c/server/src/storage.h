@@ -34,8 +34,16 @@ typedef struct {
     char updated_at[64];
 } st_storage_client;
 
+/*
+ * A management account (protocol/spec/management-accounts.md). username is the login name: unique
+ * inside the tenant, case-insensitively, and with tenant_id the identity that tokens, ownership
+ * columns and the management API carry. account_key is the primary key column, historically named
+ * username: accounts that predate tenant-scoped login names keep their old username there, new
+ * accounts get a random UUID. It is never shown and never used to sign in.
+ */
 typedef struct {
     char username[81];
+    char account_key[81];
     char tenant_id[64];
     char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     char role[20];
@@ -61,7 +69,8 @@ typedef struct {
     long long id;
     char tenant_id[64];
     char owner_username[128];
-    char api_key[128];
+    /* Java's 120 characters (UTF-16 code units), at most 3 UTF-8 bytes each. */
+    char api_key[361];
     char secret_hash[65];
     int enabled;
     int max_online_instances;
@@ -302,6 +311,7 @@ typedef struct {
     long long direct_bytes;
     long long relay_bytes;
     char last_traffic_at[64];
+    char last_keepalive_at[64];
 } st_storage_peer_mesh_session;
 
 typedef struct {
@@ -436,6 +446,14 @@ typedef struct {
     int request_truncated;
     int response_truncated;
     char captured_at[64];
+    /*
+     * The stored bodies (at most ST_TRAFFIC_BODY_CAPTURE_BYTES each), read only by the detail
+     * lookup; NULL in a list. Freed by st_storage_http_exchange_free_bodies.
+     */
+    uint8_t *request_body_data;
+    size_t request_body_data_len;
+    uint8_t *response_body_data;
+    size_t response_body_data_len;
 } st_storage_http_exchange;
 
 typedef struct {
@@ -464,6 +482,9 @@ typedef struct {
     size_t request_body_len;
     const uint8_t *response_body;
     size_t response_body_len;
+    /* Content-Encoding of each body (NULL: identity); the text previews show the decoded body. */
+    const char *request_content_encoding;
+    const char *response_content_encoding;
     const char *captured_at;
 } st_storage_http_exchange_record;
 
@@ -516,40 +537,76 @@ typedef struct {
 } st_storage_tcp_frame_record;
 
 int st_storage_init(const char *path, int seed_demo_client);
+/*
+ * The demo seed of Java DatabaseInitializer.initialize(tenant): a "Demo client" in tenant_id owned
+ * by owner_username unless the tenant has one. 0 when the tenant has it afterwards, 1 when another
+ * tenant holds the name (client names are unique across tenants), -1 on a storage error.
+ * st_storage_init seeds SPECUS_AUTH_TENANT_ID's, owned by SPECUS_AUTH_USERNAME, the same way.
+ */
+int st_storage_seed_demo_client(const char *path, const char *tenant_id, const char *owner_username);
+/*
+ * Java ManagementUserSchemaMigrator, which st_storage_init runs too: adds login_name and
+ * login_name_normalized, refuses (before writing anything) a login name that is blank or longer
+ * than 80 characters and two accounts of one tenant with the same normalized login name, backfills
+ * both columns, and creates the unique index uq_management_user_tenant_login_name on
+ * (tenant_id, login_name_normalized), refusing an index of that name with another definition.
+ * Idempotent. 0 on success; -1 with the reason in error otherwise.
+ */
+int st_storage_migrate_management_login_names(const char *path, char *error, size_t error_len);
 int st_storage_client_enabled(const char *path, const char *client_name);
 int st_storage_count_clients_by_tenant(const char *path, const char *tenant_id, long long *count);
 int st_storage_list_clients(const char *path,
                             st_storage_client *clients,
                             size_t max_clients,
                             size_t *client_count);
+/*
+ * Every client of every tenant, as st_storage_list_clients, without a row bound: *clients is a heap
+ * array the caller frees (NULL when there is none).
+ */
+int st_storage_list_all_clients(const char *path, st_storage_client **clients, size_t *client_count);
 int st_storage_get_client(const char *path, long long id, st_storage_client *client);
 int st_storage_get_client_by_name(const char *path, const char *client_name, st_storage_client *client);
 int st_storage_client_has_online_receive_capability(const char *path,
                                                     long long client_id,
                                                     int *capable);
 /*
- * Usernames are a global key, so a lookup by name alone (login, registration, create conflicts and
- * token resolution) finds a user of any tenant. Listing, reading on behalf of an administrator,
- * updating and deleting are scoped to one tenant instead (NULL or empty means the default tenant):
- * a user of another tenant is simply not found there, as Java's
- * ManagementUserService.requireMutableUserInTenant has it.
+ * Login names are unique per tenant, compared trimmed and lower-cased (ASCII letters only), so
+ * every lookup by name names its tenant (NULL or empty means "default"): a user of another tenant
+ * is simply not found, as Java's ManagementUserService has it. The only lookups by account key are
+ * st_storage_find_management_user_by_account_key (a token without a tenant claim) and
+ * st_storage_find_legacy_management_user (a login without a tenant).
  */
 int st_storage_list_management_users(const char *path,
                                      const char *tenant_id,
                                      st_storage_management_user *users,
                                      size_t max_users,
                                      size_t *user_count);
-int st_storage_get_management_user(const char *path,
-                                   const char *username,
-                                   st_storage_management_user *user);
 int st_storage_get_management_user_in_tenant(const char *path,
                                              const char *tenant_id,
                                              const char *username,
                                              st_storage_management_user *user);
-/* Read-only lookup: 0 when found, 1 when there is no such user, -1 when the store cannot be read. */
-int st_storage_find_management_user(const char *path,
-                                    const char *username,
-                                    st_storage_management_user *user);
+/*
+ * Read-only lookups for every authenticated request: 0 when found, 1 when there is no such user,
+ * -1 when the store cannot be read. The first finds a login name of one tenant; the second the
+ * exact account key that a token issued without a tenant claim names.
+ */
+int st_storage_find_management_user_in_tenant(const char *path,
+                                              const char *tenant_id,
+                                              const char *username,
+                                              st_storage_management_user *user);
+int st_storage_find_management_user_by_account_key(const char *path,
+                                                    const char *account_key,
+                                                    st_storage_management_user *user);
+/*
+ * The bare-login fallback of Java's ManagementUserService.authenticate: an account that predates
+ * tenant-scoped login names kept its username as account key, so a login without a tenant may find
+ * it by that key, ignoring case. 0 when exactly one account matches, 1 when none or several do (an
+ * ambiguous key is no one's), -1 when the store cannot be read.
+ */
+int st_storage_find_legacy_management_user(const char *path,
+                                           const char *name,
+                                           st_storage_management_user *user);
+/* The new account gets a random account key; -1 when tenant_id already has the login name. */
 int st_storage_create_management_user(const char *path,
                                       const char *username,
                                       const char *tenant_id,
@@ -565,14 +622,29 @@ int st_storage_update_management_user(const char *path,
                                       const char *role,
                                       int enabled,
                                       st_storage_management_user *out_user);
-int st_storage_delete_management_user(const char *path, const char *tenant_id, const char *username);
+/* What an account still owns that must go or change hands before the account is deleted. */
+typedef struct {
+    long long clients;
+    long long credentials;
+} st_storage_account_owned;
+#define ST_STORAGE_ACCOUNT_STILL_OWNS 1
+/*
+ * Deletes the account of tenant_id with this login name and what its identity owns, handing its
+ * tenant policies to actor (management-accounts.md 7.1). ST_STORAGE_ACCOUNT_STILL_OWNS, changing
+ * nothing, while it still owns clients or credentials; -1 when there is no such account.
+ */
+int st_storage_delete_management_user(const char *path,
+                                      const char *tenant_id,
+                                      const char *username,
+                                      const char *actor);
 /*
  * Java ManagementUserService.resolveOrProvisionOidcUser for a verified issuer/subject pair, in one
  * transaction: the user already bound to identity_key resolves when enabled; otherwise an enabled,
- * unbound user named username in tenant_id is bound on this first login; otherwise a USER account
- * named username is created in tenant_id with password_hash. A disabled user, one bound to another
- * identity, or a same-named user of another tenant is refused. With password_hash NULL nothing is
- * created and 2 is returned instead, so the caller derives the slow hash only when it is needed.
+ * unbound user of tenant_id with the login name username is bound on this first login; otherwise a
+ * USER account with that login name is created in tenant_id with password_hash and a random
+ * account key. A disabled user or one bound to another identity is refused; users of other tenants
+ * take no part. With password_hash NULL nothing is created and 2 is returned instead, so the
+ * caller derives the slow hash only when it is needed.
  * Returns 0 with *out_user filled, 1 when refused, 2 as above and -1 when the store fails.
  */
 int st_storage_resolve_oidc_user(const char *path,
@@ -602,6 +674,17 @@ int st_storage_update_registration_attempts(const char *path,
                                             const char *updated_at);
 int st_storage_delete_registration_challenge(const char *path, const char *registration_id);
 int st_storage_delete_expired_registration_challenges(const char *path, const char *expires_before);
+/*
+ * Java ClientAuthNonceService.consume on specus_client_auth_nonce, in one write transaction:
+ * deletes the rows that expired before now_ms, then inserts (nonce_id, api_key_hash) to expire at
+ * now_ms + ttl_ms unless the id is already there. 0 = consumed, 1 = already consumed (a replay),
+ * -1 = the database failed.
+ */
+int st_storage_consume_client_auth_nonce(const char *path,
+                                         const char *nonce_id,
+                                         const char *api_key_hash,
+                                         long long now_ms,
+                                         long long ttl_ms);
 int st_storage_complete_registration(const char *path,
                                      const st_storage_registration_challenge *challenge,
                                      const char *tenant_id,
@@ -619,6 +702,18 @@ int st_storage_list_client_credentials(const char *path,
                                        size_t *credential_count);
 int st_storage_upsert_client_credential(const char *path,
                                         long long id,
+                                        const char *tenant_id,
+                                        const char *owner_username,
+                                        const char *api_key,
+                                        const char *secret_hash,
+                                        int enabled,
+                                        int max_online_instances,
+                                        st_storage_client_credential *out_credential);
+/*
+ * A new credential, never replacing one: 0 with *out_credential, 1 when another credential holds
+ * api_key (the unique column refused it), -1 on a storage error.
+ */
+int st_storage_insert_client_credential(const char *path,
                                         const char *tenant_id,
                                         const char *owner_username,
                                         const char *api_key,
@@ -766,21 +861,27 @@ int st_storage_upsert_client(const char *path,
                              int connection_rate_limit_per_minute,
                              st_storage_client *out_client);
 int st_storage_delete_client(const char *path, long long id);
+/*
+ * The mapping and route lists below have no upper bound: on success *mappings / *routes is a heap
+ * array of every matching record that the caller frees (NULL when there is none).
+ */
+/* The enabled mappings of client_name, by listen port. */
 int st_storage_load_mappings(const char *path,
                              const char *client_name,
-                             st_storage_mapping *mappings,
-                             size_t max_mappings,
+                             st_storage_mapping **mappings,
                              size_t *mapping_count);
+/* Every mapping of the client, or of all clients when client_id <= 0, newest first. */
 int st_storage_list_mappings(const char *path,
                              long long client_id,
-                             st_storage_mapping *mappings,
-                             size_t max_mappings,
+                             st_storage_mapping **mappings,
                              size_t *mapping_count);
 int st_storage_get_mapping(const char *path, long long id, st_storage_mapping *mapping);
 int st_storage_get_mapping_by_client_port(const char *path,
                                           const char *client_name,
                                           int listen_port,
                                           st_storage_mapping *mapping);
+/* The mapping of any client on listen_port (the oldest if several): 0 found, 1 none, -1 on error. */
+int st_storage_find_mapping_by_listen_port(const char *path, int listen_port, st_storage_mapping *mapping);
 int st_storage_upsert_mapping(const char *path,
                               const char *client_name,
                               int listen_port,
@@ -804,15 +905,15 @@ int st_storage_update_mapping_by_id(const char *path,
                                     int detail_capture_enabled,
                                     st_storage_mapping *out_mapping);
 int st_storage_delete_mapping_by_id(const char *path, long long id);
+/* The enabled routes of client_name, by route name. */
 int st_storage_load_http_routes(const char *path,
                                 const char *client_name,
-                                st_storage_http_route *routes,
-                                size_t max_routes,
+                                st_storage_http_route **routes,
                                 size_t *route_count);
+/* Every route of the client, or of all clients when client_id <= 0, newest first. */
 int st_storage_list_http_routes(const char *path,
                                 long long client_id,
-                                st_storage_http_route *routes,
-                                size_t max_routes,
+                                st_storage_http_route **routes,
                                 size_t *route_count);
 int st_storage_get_http_route(const char *path, long long id, st_storage_http_route *route);
 /* -1 when the records could not be read; otherwise 0 with *found telling whether the route exists. */
@@ -929,7 +1030,15 @@ int st_storage_list_connections_visible(const char *path,
                                         size_t max_connections,
                                         size_t *connection_count,
                                         long long *total_count);
+/* Rolls detail rows connected before the timestamp into monthly connection_stat rows, then deletes them. */
 int st_storage_archive_connections(const char *path, const char *before_timestamp);
+/*
+ * The "yyyy-MM-dd" UTC date retention_days before now (Java's archive cutoff); -1 when
+ * retention_days <= 0.
+ */
+int st_storage_connection_archive_cutoff(int retention_days, long long now_epoch_seconds, char out[11]);
+/* Java ConnectionArchiveService.archive: nothing when retention_days <= 0. */
+int st_storage_archive_expired_connections(const char *path, int retention_days, long long now_epoch_seconds);
 int st_storage_load_connection_stat(const char *path,
                                     const char *client_name,
                                     const char *stat_date,
@@ -998,12 +1107,15 @@ int st_storage_list_resource_traffic_usage_visible(const char *path,
                                                    st_storage_resource_traffic_usage *items,
                                                    size_t max_items,
                                                    size_t *item_count);
+/*
+ * The Peer Mesh lists below have no row bound, as Java's: on success the array is a heap array of
+ * every matching row that the caller frees (NULL when there is none).
+ */
 int st_storage_list_peer_mesh_acls_visible(const char *path,
                                            const char *tenant_id,
                                            const char *owner_username,
                                            int include_all_clients,
-                                           st_storage_peer_mesh_acl *acls,
-                                           size_t max_acls,
+                                           st_storage_peer_mesh_acl **acls,
                                            size_t *acl_count);
 int st_storage_ensure_peer_mesh_device(const char *path,
                                        const st_storage_client *client,
@@ -1012,6 +1124,22 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                const st_storage_client *client,
                                                int enabled,
                                                st_storage_peer_mesh_device *out_device);
+int st_storage_list_peer_mesh_devices_visible(const char *path,
+                                              const char *tenant_id,
+                                              const char *owner_username,
+                                              int include_all_clients,
+                                              st_storage_peer_mesh_device **devices,
+                                              size_t *device_count);
+/* 0 updated (enabled < 0 keeps the flag), 1 when the tenant has no device for the client, -1 error. */
+int st_storage_set_peer_mesh_device_enabled(const char *path,
+                                            const char *tenant_id,
+                                            long long client_id,
+                                            int enabled,
+                                            st_storage_peer_mesh_device *out_device);
+int st_storage_list_open_peer_mesh_sessions(const char *path,
+                                            const char *tenant_id,
+                                            st_storage_peer_mesh_session **sessions,
+                                            size_t *session_count);
 int st_storage_get_peer_mesh_device_by_client(const char *path,
                                               const char *tenant_id,
                                               long long client_id,
@@ -1056,6 +1184,83 @@ int st_storage_list_peer_mesh_sessions_visible(const char *path,
                                                st_storage_peer_mesh_session *sessions,
                                                size_t max_sessions,
                                                size_t *session_count);
+/*
+ * A page of the visible sessions, latest update first (Java PeerMeshService.listSessions and
+ * listSessionsPage): the tenant's sessions past their expiry are closed first, as expireIfStale;
+ * open_only leaves the closed ones out; *total_count counts every match. size must fit sessions.
+ */
+int st_storage_page_peer_mesh_sessions_visible(const char *path,
+                                               const char *tenant_id,
+                                               const char *owner_username,
+                                               int include_all_clients,
+                                               int open_only,
+                                               int page,
+                                               int size,
+                                               st_storage_peer_mesh_session *sessions,
+                                               size_t max_sessions,
+                                               size_t *session_count,
+                                               long long *total_count);
+/* One (effective path type, status) group of Java PeerMeshSessionRepository.aggregatePathTypes. */
+typedef struct {
+    char path_type[32];
+    char status[32];
+    long long sessions;
+    long long reported_sessions;
+    int has_avg_rtt;
+    double avg_rtt_millis;
+    long long direct_bytes;
+    long long relay_bytes;
+} st_storage_peer_mesh_path_aggregate;
+
+/* One (address family, status, effective path type) group of aggregateAddressFamilies. */
+typedef struct {
+    char address_family[16];
+    char status[32];
+    char path_type[32];
+    long long sessions;
+    long long reported_sessions;
+} st_storage_peer_mesh_family_aggregate;
+
+/* One stored natType of the devices (has_value is 0 for NULL), aggregateNatTypes. */
+typedef struct {
+    char nat_type[128];
+    int has_value;
+    long long devices;
+} st_storage_peer_mesh_nat_aggregate;
+
+/* One stored (mapping, filtering, discovery) triple of aggregateNatBehaviors; NULL reads as "". */
+typedef struct {
+    char mapping[128];
+    char filtering[128];
+    char discovery[128];
+    long long devices;
+} st_storage_peer_mesh_behavior_aggregate;
+
+typedef struct {
+    st_storage_peer_mesh_path_aggregate *paths;
+    size_t path_count;
+    st_storage_peer_mesh_family_aggregate *families;
+    size_t family_count;
+    st_storage_peer_mesh_nat_aggregate *nat_types;
+    size_t nat_type_count;
+    st_storage_peer_mesh_behavior_aggregate *behaviors;
+    size_t behavior_count;
+} st_storage_peer_mesh_stats;
+
+/*
+ * The grouped rows behind /api/admin/peer-mesh/stats (Java PeerMeshService.pathStats): first the
+ * tenant's sessions past their expiry are closed, as Java's expireIfStale does, then sessions are
+ * grouped by the path that carried more bytes (the stored path type on a tie) and status, and by
+ * remote address family as well; devices by NAT type and by NAT behaviour triple. An administrator
+ * sees the whole tenant, anyone else the sessions of the clients it owns and its own devices. The
+ * arrays are allocated; st_storage_peer_mesh_stats_free releases them.
+ */
+int st_storage_peer_mesh_stats_visible(const char *path,
+                                       const char *tenant_id,
+                                       const char *owner_username,
+                                       int include_all_clients,
+                                       st_storage_peer_mesh_stats *stats);
+void st_storage_peer_mesh_stats_free(st_storage_peer_mesh_stats *stats);
 int st_storage_close_peer_mesh_session_visible(const char *path,
                                                long long id,
                                                const char *tenant_id,
@@ -1066,8 +1271,7 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
                                                      const char *tenant_id,
                                                      const char *owner_username,
                                                      int include_all_clients,
-                                                     st_storage_peer_mesh_session *sessions,
-                                                     size_t max_sessions,
+                                                     st_storage_peer_mesh_session **sessions,
                                                      size_t *session_count);
 int st_storage_create_peer_mesh_session(const char *path,
                                         const st_storage_client *source,
@@ -1080,6 +1284,14 @@ int st_storage_get_peer_mesh_session(const char *path,
                                      const char *tenant_id,
                                      long long id,
                                      st_storage_peer_mesh_session *out_session);
+/* Open, unexpired sessions between two clients in either direction, newest first; closes the expired. */
+int st_storage_open_peer_mesh_sessions_between(const char *path,
+                                               const char *tenant_id,
+                                               long long first_client_id,
+                                               long long second_client_id,
+                                               st_storage_peer_mesh_session *sessions,
+                                               size_t max_sessions,
+                                               size_t *session_count);
 int st_storage_report_peer_mesh_session(const char *path,
                                         const st_storage_client *reporter,
                                         long long id,
@@ -1116,8 +1328,7 @@ int st_storage_list_peer_mesh_services_visible(const char *path,
                                                const char *tenant_id,
                                                const char *owner_username,
                                                int include_all_clients,
-                                               st_storage_peer_mesh_service *services,
-                                               size_t max_services,
+                                               st_storage_peer_mesh_service **services,
                                                size_t *service_count);
 int st_storage_get_peer_mesh_service_visible(const char *path,
                                              long long id,
@@ -1134,8 +1345,7 @@ int st_storage_delete_peer_mesh_service(const char *path,
 int st_storage_list_peer_mesh_egress_policies(const char *path,
                                               const char *tenant_id,
                                               int enabled_only,
-                                              st_storage_peer_mesh_egress_policy *policies,
-                                              size_t max_policies,
+                                              st_storage_peer_mesh_egress_policy **policies,
                                               size_t *policy_count);
 int st_storage_get_peer_mesh_egress_policy(const char *path,
                                            long long id,
@@ -1153,8 +1363,7 @@ int st_storage_delete_peer_mesh_egress_policy(const char *path,
                                               const char *tenant_id);
 int st_storage_list_peer_mesh_egress_activity(const char *path,
                                               const char *tenant_id,
-                                              st_storage_peer_mesh_egress_activity *rows,
-                                              size_t max_rows,
+                                              st_storage_peer_mesh_egress_activity **rows,
                                               size_t *row_count);
 int st_storage_find_peer_mesh_egress_activity(const char *path,
                                               const char *tenant_id,
@@ -1181,6 +1390,11 @@ int st_storage_list_peer_mesh_service_audits(const char *path,
                                              size_t max_events,
                                              size_t *event_count);
 int st_storage_record_http_exchange(const char *path, const st_storage_http_exchange_record *record);
+/*
+ * A page of exchange summaries: as Java's summary views, the headers, the request/response
+ * previews and the stored bodies are neither read nor returned (left empty);
+ * st_storage_get_http_exchange_visible reads one exchange with them.
+ */
 int st_storage_list_http_exchanges_visible(const char *path,
                                            long long client_id,
                                            const char *route,
@@ -1196,7 +1410,21 @@ int st_storage_list_http_exchanges_visible(const char *path,
                                            size_t max_items,
                                            size_t *item_count,
                                            long long *total_count);
+int st_storage_get_http_exchange_visible(const char *path,
+                                         long long exchange_id,
+                                         const char *tenant_id,
+                                         const char *owner_username,
+                                         int include_all_clients,
+                                         st_storage_http_exchange *item,
+                                         int *found);
+/* Frees the bodies a detail lookup read into item; item itself stays the caller's. */
+void st_storage_http_exchange_free_bodies(st_storage_http_exchange *item);
 int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_record *record);
+/*
+ * listen_port for a TCP frame list without a listenPort filter. Any other value filters, 0 and
+ * negative ports included, as Java's Integer listenPort does (they match no frame).
+ */
+#define ST_STORAGE_ANY_LISTEN_PORT INT32_MIN
 int st_storage_list_tcp_frames_visible(const char *path,
                                        long long client_id,
                                        int listen_port,
@@ -1215,15 +1443,21 @@ int st_storage_get_tcp_frame_visible(const char *path,
                                      const char *owner_username,
                                      int include_all_clients,
                                      st_storage_tcp_frame *frame);
+/*
+ * One page (size up to 1000) of a channel's frames with their payloads, in capture order as Java's
+ * findStream (by id, both directions interleaved); *total_count is the channel's frame count.
+ */
 int st_storage_list_tcp_stream_visible(const char *path,
                                        const char *channel_id,
                                        const char *tenant_id,
                                        const char *owner_username,
                                        int include_all_clients,
-                                       int limit,
+                                       int page,
+                                       int size,
                                        st_storage_tcp_frame *items,
                                        size_t max_items,
-                                       size_t *item_count);
+                                       size_t *item_count,
+                                       long long *total_count);
 void st_storage_tcp_frame_free(st_storage_tcp_frame *frame);
 
 /*
@@ -1351,6 +1585,8 @@ typedef struct {
     long long client_id;
     char client_name[256];
     char route_name[128];
+    /* The route's target; the browser headers relayed through the share take its origin. */
+    char target_base_url[512];
     int path_rewrite_enabled;
     /* Only for an active share: why its route, client or creator no longer allows it, else NULL. */
     const char *lapse_reason;
@@ -1461,8 +1697,11 @@ int st_storage_http_access_audit_list(const char *path,
 
 /*
  * Route, client and user changes with their share hooks and audit in the same transaction
- * (spec 7.3 and 8). actor is the acting user; revoked collects the shares that ended.
+ * (spec 7.3 and 8). actor is the acting user; revoked collects the shares that ended. Creating a
+ * route, or renaming one, onto a route name its client already has fails with
+ * ST_STORAGE_HTTP_ROUTE_EXISTS, as Java HttpRouteService refuses it.
  */
+#define ST_STORAGE_HTTP_ROUTE_EXISTS (-2)
 int st_storage_create_http_route_audited(const char *path,
                                          long long client_id,
                                          const char *route,
@@ -1527,12 +1766,18 @@ int st_storage_update_management_user_audited(const char *path,
                                               long long now_ms,
                                               st_storage_management_user *out_user,
                                               st_storage_share_ids *revoked);
+/*
+ * Deleting an account (management-accounts.md 7.1) answers ST_STORAGE_ACCOUNT_STILL_OWNS, changing
+ * nothing, while it still owns clients or credentials; *owned then holds both counts. Otherwise the
+ * rest of what its identity owns goes or changes hands to actor in the same transaction.
+ */
 int st_storage_delete_management_user_audited(const char *path,
                                               const st_storage_share_builtin_admin *builtin,
                                               const char *tenant_id,
                                               const char *username,
                                               const char *actor,
                                               long long now_ms,
-                                              st_storage_share_ids *revoked);
+                                              st_storage_share_ids *revoked,
+                                              st_storage_account_owned *owned);
 
 #endif

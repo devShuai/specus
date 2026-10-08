@@ -248,12 +248,17 @@ stop_client() {
 
 case_server_log() { tail -n "+$CASE_START_LINE" "$TMP_DIR/server.log"; }
 
+# Whether this case's server log has a line matching the extended regex $1. grep -q would stop at
+# the first match, and on a long log tail then dies of SIGPIPE, which pipefail turns into a "no"
+# (or, negated, a "yes") with the line there; grep -c reads everything.
+case_server_log_has() { case_server_log | grep -cE -- "$1" >/dev/null; }
+
 # How each client words a failed certificate check (Go x509, Java PKIX/SAN, .NET SslPolicyErrors).
 CERTIFICATE_ERROR='x509|certificat|PKIX|subject alternative|RemoteCertificate|UntrustedRoot|NameMismatch'
 
 # A LOGIN_REQUEST, accepted or not, would mean the client sent its token over an unverified channel.
 expect_no_login() {
-  if case_server_log | grep -qE "login (ok|rejected)"; then
+  if case_server_log_has "login (ok|rejected)"; then
     fail "$1: the client sent a login over a connection it should not have trusted"
   fi
 }
@@ -267,7 +272,7 @@ expect_rejected() {
   for _ in $(seq 1 180); do
     expect_no_login "$name"
     line="$(grep -m 1 -iE "$CERTIFICATE_ERROR" "$TMP_DIR/client-$name.log" || true)"
-    if [[ -n "$line" ]] && case_server_log | grep -qE "\[tls\] handshake (complete|rejected .*alert)"; then
+    if [[ -n "$line" ]] && case_server_log_has "\[tls\] handshake (complete|rejected .*alert)"; then
       break
     fi
     line=""
@@ -300,15 +305,15 @@ write_config trusted ",
   \"controlTls\": {\"caCertificatePath\": $CA_PATH, \"serverName\": \"$TLS_HOST\"}"
 start_client trusted
 for _ in $(seq 1 180); do
-  if case_server_log | grep -q "\[control\] login ok" && case_server_log | grep -q "\[data\] login ok"; then
+  if case_server_log_has "\[control\] login ok" && case_server_log_has "\[data\] login ok"; then
     break
   fi
   sleep 0.25
 done
-case_server_log | grep -q "\[data\] login ok" || fail "trusted: control and data did not log in"
+case_server_log_has "\[data\] login ok" || fail "trusted: control and data did not log in"
 handshakes="$(case_server_log | grep -c "\[tls\] handshake complete" || true)"
 [[ "$handshakes" -ge 2 ]] || fail "trusted: $handshakes completed TLS handshake(s), expected control and data"
-! case_server_log | grep -q "\[tls\] handshake rejected" || fail "trusted: a TLS handshake was rejected"
+! case_server_log_has "\[tls\] handshake rejected" || fail "trusted: a TLS handshake was rejected"
 
 # Bytes through a TCP mapping travel over the TLS data connection.
 python3 - "$ADMIN_PORT" "$PUBLIC_PORT" "$ECHO_PORT" "$UPSTREAM_HOST" "$ADMIN_TOKEN" <<'PY' || fail "trusted: TCP round trip"

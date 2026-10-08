@@ -1,4 +1,4 @@
-import { MAX_ACTIVE_RECEIVES, RESUME_TTL_SECONDS } from "./constants";
+import { MAX_ACTIVE_RECEIVES, MAX_STORED_PARTIALS, MEMORY_LIMIT_BYTES, RESUME_TTL_SECONDS } from "./constants";
 import { ChunkBitmap } from "./bitmap";
 import { fromHex, isHex32, type Bytes, type Digest } from "./bytes";
 import { sendJson, isRecord, type BulkChannel } from "./channel";
@@ -136,6 +136,10 @@ export class ReceiverController {
   private readonly deps: ReceiverControllerDeps;
   private readonly entries = new Map<string, Entry>();
   private readonly pending = new Map<string, Pending>();
+  /** Clicked offers whose record is being written; their channel stays reserved until bound. */
+  private readonly accepting = new Set<Pending>();
+  /** Memory-mode records past the limit check but not yet in `entries`. */
+  private memoryAdmissions = 0;
   private readonly channelTransfers = new Map<BulkChannel, string>();
   private readonly resumeRequestedAt = new Map<string, number>();
   private persistentStore: Promise<ResumeStore | null> | null = null;
@@ -186,9 +190,14 @@ export class ReceiverController {
     return this.channelTransfers.has(channel);
   }
 
-  /** Busy with a pending consent or an active session on this channel. */
-  isChannelBusy(channel: BulkChannel): boolean {
-    return this.channelTransfers.has(channel) || [...this.pending.values()].some((item) => item.channel === channel);
+  /** Busy with a pending or clicked offer or an active session on this channel, other than `except`'s. */
+  isChannelBusy(channel: BulkChannel, except?: string): boolean {
+    const bound = this.channelTransfers.get(channel);
+    if (bound !== undefined && bound !== except) {
+      return true;
+    }
+    return [...this.pending.values(), ...this.accepting]
+      .some((item) => item.channel === channel && item.offer.transferId !== except);
   }
 
   /** Page load: cleanup, then surface interrupted transfers and completed files not yet saved. */
@@ -295,6 +304,7 @@ export class ReceiverController {
         sizeBytes: record.sizeBytes,
         receivedBytes: receivedBytesOf(record),
       })),
+      memoryPartials: this.memoryPartials(),
       senderAllowed: this.deps.senderAllowed(peerId),
       transferIdInUse: inUse,
     });
@@ -338,18 +348,56 @@ export class ReceiverController {
     if (!pending) return;
     this.pending.delete(transferId);
     this.deps.clearTimer(pending.timer);
-    const { offer, channel, peerId } = pending;
-    if (channel.readyState !== "open") {
-      this.deps.onError("直连通道已断开，请让对方重新发送");
+    // Until its session is bound the channel stays reserved for this offer: a resume-offer that
+    // arrives while the record is written must not take it (§8).
+    this.accepting.add(pending);
+    let entry: Entry | null;
+    try {
+      entry = await this.admit(pending);
+    } finally {
+      this.accepting.delete(pending);
+    }
+    if (!entry) {
       this.deps.onChange();
       return;
     }
+    const { record } = entry;
+    sendJson(pending.channel, {
+      kind: "file-accept",
+      transferId,
+      manifestDigest: record.manifestDigest,
+      resumeToken: record.resumeToken,
+      storage: entry.store.mode,
+      ttlSeconds: RESUME_TTL_SECONDS,
+      have: entry.engine.bitmap.encode(),
+      needHashes: !entry.engine.hashListComplete,
+    });
+    this.deps.onChange();
+    if (entry.engine.bitmap.isComplete()) {
+      await this.runFinalVerify(entry); // empty file
+    }
+  }
+
+  /** Creates the record of a clicked offer and binds its session; null once refused (and answered). */
+  private async admit(pending: Pending): Promise<Entry | null> {
+    const { offer, channel, peerId } = pending;
+    const transferId = offer.transferId;
+    if (channel.readyState !== "open") {
+      this.deps.onError("直连通道已断开，请让对方重新发送");
+      return null;
+    }
     let store = pending.storage === "persistent" ? await this.persistent() : this.deps.memoryStore;
     if (!store) store = this.deps.memoryStore;
-    if (store.mode === "memory" && offer.sizeBytes > 128 * 1024 * 1024) {
+    const memory = store.mode === "memory";
+    if (memory && offer.sizeBytes > MEMORY_LIMIT_BYTES) {
       this.sendReject(channel, transferId, "PERSISTENCE_UNAVAILABLE");
-      this.deps.onChange();
-      return;
+      return null;
+    }
+    if (memory && this.memoryPartials() >= MAX_STORED_PARTIALS) {
+      // Checked again at the click: other memory-mode receives may have started since the prompt.
+      this.sendReject(channel, transferId, "TOO_MANY_PARTIALS");
+      this.deps.onError(`未接收 ${offer.fileName}：${LOCAL_REJECT_TEXT.TOO_MANY_PARTIALS}`);
+      return null;
     }
     const now = this.deps.now();
     const have = new ChunkBitmap(offer.chunkCount);
@@ -373,31 +421,31 @@ export class ReceiverController {
       sourcePeerId: peerId,
       sourceName: this.deps.peerName(peerId),
     };
+    // Counted from the check above until it is in `entries`, so a concurrent click cannot slip past.
+    if (memory) this.memoryAdmissions += 1;
     try {
       await store.putReceive(record);
     } catch {
       this.sendReject(channel, transferId, "INSUFFICIENT_STORAGE");
       this.deps.onError(`未接收 ${offer.fileName}：本机浏览器存储空间不足`);
-      this.deps.onChange();
-      return;
+      return null;
+    } finally {
+      if (memory) this.memoryAdmissions -= 1;
     }
     const entry = this.entryFromRecord(record, store);
     this.entries.set(transferId, entry);
-    await this.bind(entry, channel, peerId);
-    sendJson(channel, {
-      kind: "file-accept",
-      transferId,
-      manifestDigest: record.manifestDigest,
-      resumeToken: record.resumeToken,
-      storage: store.mode,
-      ttlSeconds: RESUME_TTL_SECONDS,
-      have: have.encode(),
-      needHashes: !entry.engine.hashListComplete,
-    });
-    this.deps.onChange();
-    if (entry.engine.bitmap.isComplete()) {
-      await this.runFinalVerify(entry); // empty file
+    if (!(await this.bind(entry, channel, peerId))) {
+      // Nothing was announced yet: drop the record rather than keep an empty partial for a day.
+      this.entries.delete(transferId);
+      await store.deleteReceive(transferId).catch(() => undefined);
+      if (channel.readyState === "open") {
+        this.sendReject(channel, transferId, "BUSY");
+      } else {
+        this.deps.onError("直连通道已断开，请让对方重新发送");
+      }
+      return null;
     }
+    return entry;
   }
 
   reject(transferId: string): void {
@@ -432,11 +480,6 @@ export class ReceiverController {
       senderAllowed: this.deps.senderAllowed(peerId),
       otherActiveSessions: otherActive,
     });
-    const busyChannel = this.channelTransfers.get(channel);
-    if (decision.result === "RESUME" && !decision.complete && busyChannel && busyChannel !== transferId) {
-      sendJson(channel, { kind: "resume-reject", transferId, code: "BUSY" });
-      return;
-    }
     if (decision.result === "REJECT" || !entry) {
       sendJson(channel, { kind: "resume-reject", transferId, code: decision.result === "REJECT" ? decision.code : "UNKNOWN_TRANSFER" });
       return;
@@ -457,8 +500,13 @@ export class ReceiverController {
       sendJson(channel, state); // re-sends a lost completion; takes no session slot
       return;
     }
-    // A newer session supersedes the old one: the old channel may be half-open.
-    await this.bind(entry, channel, peerId);
+    // One bulk channel carries one pending or receiving file at a time: another transfer's session
+    // or unanswered offer on this channel means BUSY, never a takeover (§8). The check and the
+    // claim in bind() run without an await in between.
+    if (this.isChannelBusy(channel, transferId) || !(await this.bind(entry, channel, peerId))) {
+      sendJson(channel, { kind: "resume-reject", transferId, code: "BUSY" });
+      return;
+    }
     entry.record.sourcePeerId = peerId;
     await entry.store.patchReceive(transferId, { sourcePeerId: peerId }).catch(() => undefined);
     sendJson(channel, state);
@@ -586,6 +634,21 @@ export class ReceiverController {
     return [...this.entries.values()].filter((entry) => entry.channel !== null).length;
   }
 
+  /**
+   * Unfinished memory-mode receives (§6): their chunks stay in this tab until they complete, are
+   * abandoned or expire, so they are capped like stored partials. A completed one dropped its chunks.
+   */
+  private memoryPartials(): number {
+    let count = this.memoryAdmissions;
+    for (const entry of this.entries.values()) {
+      const { state } = entry.engine;
+      if (entry.store.mode === "memory" && (state === "RECEIVING" || state === "INTERRUPTED")) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   private sendReject(channel: BulkChannel, transferId: string, code: string) {
     sendJson(channel, { kind: "file-reject", transferId, code, reason: receiveRejectText(code) });
   }
@@ -626,16 +689,33 @@ export class ReceiverController {
     return { record: { ...record }, store, engine, channel: null, peerId: null, delivered: false };
   }
 
-  private async bind(entry: Entry, channel: BulkChannel, peerId: string) {
-    if (entry.channel && entry.channel !== channel) {
-      this.channelTransfers.delete(entry.channel);
-      entry.channel = null;
-      await entry.engine.closeSession();
+  /**
+   * Binds the transfer's session to `channel`; false when refused. A channel carrying another
+   * transfer is never taken over: that sender may still be streaming, and its frames would then
+   * reach this transfer's state machine while the other entry kept a slot it never gives back.
+   * A closed channel is refused too: its close was handled already, nothing would unbind it.
+   * A newer session of the same transfer does supersede its old one elsewhere (§8): the old
+   * channel may be half-open. The channel is claimed before the first await.
+   */
+  private async bind(entry: Entry, channel: BulkChannel, peerId: string): Promise<boolean> {
+    const transferId = entry.record.transferId;
+    const bound = this.channelTransfers.get(channel);
+    if (channel.readyState !== "open" || (bound !== undefined && bound !== transferId)) {
+      return false;
+    }
+    const previous = entry.channel;
+    if (previous && previous !== channel && this.channelTransfers.get(previous) === transferId) {
+      this.channelTransfers.delete(previous);
     }
     entry.channel = channel;
     entry.peerId = peerId;
-    this.channelTransfers.set(channel, entry.record.transferId);
-    await entry.engine.openSession();
+    this.channelTransfers.set(channel, transferId);
+    // The engine serializes both: the superseded session ends before the new one opens.
+    const superseded = previous && previous !== channel ? entry.engine.closeSession() : null;
+    const opened = entry.engine.openSession();
+    await superseded;
+    await opened;
+    return true;
   }
 
   private async unbind(entry: Entry) {

@@ -1,7 +1,9 @@
 package com.theshuai.specusserver.management.service;
 
 import com.theshuai.common.protocol.MessageType;
+import com.theshuai.common.protocol.PacketCodec;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
+import com.theshuai.common.serialize.Serializer;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.session.SessionUtil;
 import com.theshuai.specusserver.management.model.ClientAccount;
@@ -14,6 +16,7 @@ import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -33,9 +36,10 @@ import java.util.Map;
  * 自从 HTTP 路由也由后台管理后，本服务在每次下发时**额外查询** {@link HttpRouteMappingRepository}
  * 把启用项装到同一条消息的 {@code httpSpecusConfigList} 字段。
  *
- * <p>The HTTP route list is always the client's full set of enabled routes, even when it is empty.
- * A client keeps the list it has when the field is missing, so omitting it once the last route was
- * deleted left that route forwarding on the client until it reconnected.
+ * <p>The HTTP route list is always the client's full set of enabled routes, even when it is empty,
+ * on every push including the one sent on login. Older clients keep the list they have when the field
+ * is missing, so omitting it once the last route was deleted left that route forwarding on the client
+ * until it reconnected.
  *
  * <p>HTTP 路由本身的 CRUD 在 {@link HttpRouteService}；它每次写入后回调本类的
  * {@link #pushSnapshotIfOnline(ClientAccount)}，因此一次 mutation 始终下发"当前权威全集"。
@@ -43,6 +47,33 @@ import java.util.Map;
 @Service
 @Slf4j
 public class NatControlService {
+    /** The 1 MiB MESSAGE body of protocol/spec/control-protocol.md that a NAT_CONTROL travels in. */
+    static final int MESSAGE_BODY_LIMIT = PacketCodec.MAX_MESSAGE_BODY_BYTES;
+    /** The longest client name a rename allows. */
+    static final int CLIENT_NAME_RESERVE_CHARACTERS = 120;
+    static final String NAT_CONTROL_TOO_LARGE =
+            "客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端";
+    /** The 409 of a manual push whose NAT_CONTROL, as stored, does not fit one MESSAGE. */
+    static final String NAT_CONTROL_NOT_SENT =
+            "客户端的 TCP 映射和 HTTP route 超过单条 NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端";
+    /** The 409 of a manual push to a client that is offline, or whose control connection cannot be written. */
+    static final String CLIENT_OFFLINE = "客户端不在线，无法下发映射";
+    /**
+     * How long a manual push waits for its frame to be written before it answers. A write that fails
+     * within it is answered as an offline client; one still pending then stays queued, in order, on a
+     * connection that is open, and is answered as pushed.
+     */
+    static final long WRITE_CONFIRM_MILLIS = 5_000L;
+    /*
+     * The client's name when a NAT_CONTROL is sized: 120 characters of 4 UTF-8 bytes each in the
+     * clientName field, and of a 6-byte backslash-u escape each in the JSON. No name a rename allows
+     * takes more in either place, so no later rename pushes an accepted configuration over.
+     */
+    private static final String LONGEST_FIELD_NAME =
+            Character.toString(0x10000).repeat(CLIENT_NAME_RESERVE_CHARACTERS);
+    private static final String LONGEST_JSON_NAME =
+            Character.toString(0x01).repeat(CLIENT_NAME_RESERVE_CHARACTERS);
+
     private final SpecusMappingRepository specusMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final ClientAccountRepository clientAccountRepository;
@@ -133,6 +164,9 @@ public class NatControlService {
         mapping.setCreatedAt(now);
         mapping.setUpdatedAt(now);
         SpecusMapping saved = specusMappingRepository.saveAndFlush(mapping);
+        if (saved.isEnabled()) {
+            requireNatControlFits(account);
+        }
         pushSnapshotIfOnline(account);
         return toView(saved);
     }
@@ -182,6 +216,9 @@ public class NatControlService {
 
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(saved.getClientId(), tenant.tenantId()).orElse(null);
         if (account != null) {
+            if (saved.isEnabled()) {
+                requireNatControlFits(account);
+            }
             pushSnapshotIfOnline(account);
         }
         return toView(saved);
@@ -222,6 +259,12 @@ public class NatControlService {
      * 向在线客户端下发当前启用的端口映射 + HTTP 路由快照。客户端离线时抛出异常。
      * 返回 {@link PushResult} 报告本次实际包含的 TCP / HTTP 项数（HTTP 部分若为"未管理"
      * 状态则为 -1，前端可据此区分"管理且为 0"和"未接管"）。
+     *
+     * <p>A NAT_CONTROL that does not fit one MESSAGE is not sent and fails the push with the
+     * {@link IllegalStateException} the management API answers 409 to; the connection is kept. A write
+     * to the control connection that fails is answered as an offline client, with the same 409 as one
+     * that is not connected: the push waits for the write rather than reporting a frame that never
+     * left. See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
      */
     @Transactional(readOnly = true)
     public PushResult pushToClient(long clientId) {
@@ -244,15 +287,23 @@ public class NatControlService {
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(tenant.tenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
-        if (!sendNatControl(account.getClientName(), mappings, httpRoutes)) {
-            throw new IllegalStateException("客户端不在线，无法下发映射");
-        }
-        return new PushResult(mappings.size(), httpRoutes.size());
+        return switch (sendNatControl(account.getClientName(), mappings, httpRoutes, true)) {
+            case OFFLINE, WRITE_FAILED -> throw new IllegalStateException(CLIENT_OFFLINE);
+            case NOT_SENT -> throw new IllegalStateException(NAT_CONTROL_NOT_SENT);
+            case SENT -> new PushResult(mappings.size(), httpRoutes.size());
+        };
     }
 
     /**
      * 客户端登录成功后自动下发已启用的映射。不抛出异常，仅在失败时记录日志。
-     * 若两类配置都为空，跳过 push 以减少握手抖动：HTTP 登录响应已带上同样的空快照。
+     *
+     * <p>Always pushes the full snapshot, empty lists included. A client that reconnects after a
+     * network drop reuses its access token without a new HTTP login, so this push is the only way it
+     * learns that its last mapping or route was deleted while it was offline.
+     *
+     * <p>A NAT_CONTROL that does not fit one MESSAGE is only logged: the login stands and the steps
+     * after it, the Peer Mesh push among them, still run. Closing the connection would only have the
+     * client log in again into the same failure.
      */
     @Transactional(readOnly = true)
     public void pushOnLogin(String clientName) {
@@ -263,10 +314,7 @@ public class NatControlService {
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
-        if (mappings.isEmpty() && httpRoutes.isEmpty()) {
-            return;
-        }
-        if (sendNatControl(clientName, mappings, httpRoutes)) {
+        if (sendNatControl(clientName, mappings, httpRoutes, false) == Delivery.SENT) {
             log.info("[nat-control] auto pushed {} tcp + {} http route(s) to {} on login",
                     mappings.size(), httpRoutes.size(), clientName);
         }
@@ -275,12 +323,15 @@ public class NatControlService {
     /**
      * 在 TCP 或 HTTP 任意一类配置发生变化后调用，把当前权威全集推给在线客户端。
      * 客户端不在线时静默返回。
+     *
+     * <p>Never throws: a NAT_CONTROL that does not fit one MESSAGE is only logged, and the change
+     * that called this stands and answers as it would have.
      */
     public void pushSnapshotIfOnline(ClientAccount account) {
         List<SpecusMapping> mappings = specusMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = loadEnabledHttpRoutes(account);
-        if (sendNatControl(account.getClientName(), mappings, httpRoutes)) {
+        if (sendNatControl(account.getClientName(), mappings, httpRoutes, false) == Delivery.SENT) {
             log.info("[nat-control] auto-synchronized {} tcp + {} http route(s) to {}",
                     mappings.size(), httpRoutes.size(), account.getClientName());
         }
@@ -292,14 +343,112 @@ public class NatControlService {
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
     }
 
-    private boolean sendNatControl(String clientName,
-                                   List<SpecusMapping> mappings,
-                                   List<HttpRouteMapping> httpRoutes) {
+    /**
+     * Refuses, with the {@link IllegalArgumentException} the management API answers 400 to, a change
+     * after which the client's NAT_CONTROL no longer fits one MESSAGE. Call it in the change's
+     * transaction once the change is flushed and only when the change leaves the entry enabled: a
+     * change that leaves it disabled only shrinks the message. It counts the client's enabled
+     * entries, whether or not the client is enabled. See "NAT_CONTROL 的大小" in
+     * protocol/spec/control-protocol.md.
+     */
+    void requireNatControlFits(ClientAccount account) {
+        List<SpecusMapping> mappings = specusMappingRepository
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
+        if (reservedBodyBytes(mappings, loadEnabledHttpRoutes(account)) > MESSAGE_BODY_LIMIT) {
+            throw new IllegalArgumentException(NAT_CONTROL_TOO_LARGE);
+        }
+    }
+
+    /**
+     * The MESSAGE body of a NAT_CONTROL carrying these entries, encoded as it is sent, with the
+     * client's name counted at the longest a rename allows.
+     */
+    int reservedBodyBytes(List<SpecusMapping> mappings, List<HttpRouteMapping> httpRoutes) {
+        MessageResponsePacket packet = new MessageResponsePacket();
+        packet.setClientName(LONGEST_FIELD_NAME);
+        packet.setMessageType(MessageType.NAT_CONTROL);
+        packet.setMessage(messageJson(LONGEST_JSON_NAME, mappings, httpRoutes));
+        return Serializer.COMPACT_BINARY.serialize(packet).length;
+    }
+
+    /** What became of one NAT_CONTROL push. */
+    enum Delivery {
+        SENT,
+        /** The client has no logged-in control connection. */
+        OFFLINE,
+        /** The NAT_CONTROL does not fit one MESSAGE, or cannot be encoded: nothing was written. */
+        NOT_SENT,
+        /** The write to the control connection failed: it is closed, reset or otherwise gone. */
+        WRITE_FAILED
+    }
+
+    /**
+     * Writes clientName's NAT_CONTROL to its control connection. One that does not fit one MESSAGE
+     * is not written: the encoder would refuse it after the push had been reported, and the frame
+     * would vanish without a trace. It is logged once instead and the connection is kept, so the
+     * client goes on with the configuration it has. See "NAT_CONTROL 的大小" in
+     * protocol/spec/control-protocol.md.
+     *
+     * <p>The write itself completes on the channel's event loop. With confirmWrite, as the manual push
+     * asks, this waits for it (see {@link #WRITE_CONFIRM_MILLIS}) and reports a failed one as
+     * {@link Delivery#WRITE_FAILED}; otherwise a failure is only logged.
+     */
+    private Delivery sendNatControl(String clientName,
+                                    List<SpecusMapping> mappings,
+                                    List<HttpRouteMapping> httpRoutes,
+                                    boolean confirmWrite) {
         Channel channel = SessionUtil.getChannel(clientName);
         if (channel == null || !SessionUtil.hasLogin(channel)) {
-            return false;
+            return Delivery.OFFLINE;
         }
 
+        MessageResponsePacket packet = new MessageResponsePacket();
+        packet.setClientName(clientName);
+        packet.setMessageType(MessageType.NAT_CONTROL);
+        int bodyBytes;
+        try {
+            packet.setMessage(messageJson(clientName, mappings, httpRoutes));
+            bodyBytes = Serializer.COMPACT_BINARY.serialize(packet).length;
+        } catch (RuntimeException failure) {
+            log.error("[nat-control] not pushed to {}: its NAT_CONTROL of {} tcp + {} http route(s) cannot be "
+                    + "encoded; the connection is kept", clientName, mappings.size(), httpRoutes.size(), failure);
+            return Delivery.NOT_SENT;
+        }
+        if (bodyBytes > MESSAGE_BODY_LIMIT) {
+            log.error("[nat-control] not pushed to {}: its NAT_CONTROL of {} tcp + {} http route(s) takes {} bytes, "
+                            + "over the {}-byte MESSAGE body limit; the connection is kept, disable or delete "
+                            + "entries to bring it back within the limit",
+                    clientName, mappings.size(), httpRoutes.size(), bodyBytes, MESSAGE_BODY_LIMIT);
+            return Delivery.NOT_SENT;
+        }
+        ChannelFuture write = channel.writeAndFlush(packet);
+        write.addListener(future -> {
+            if (!future.isSuccess()) {
+                log.warn("[nat-control] push to {} failed: {}", clientName, future.cause().toString());
+            }
+        });
+        if (confirmWrite && writeFailed(channel, write)) {
+            return Delivery.WRITE_FAILED;
+        }
+        log.info("[nat-control] pushed {} tcp + {} http route(s) to {}",
+                mappings.size(), httpRoutes.size(), clientName);
+        return Delivery.SENT;
+    }
+
+    /**
+     * Whether write failed, waiting up to {@link #WRITE_CONFIRM_MILLIS} for it to finish. A write still
+     * pending then has not failed: it stays queued, in order, on a connection that is open, and if that
+     * connection drops the client's next login push carries the configuration. On the channel's own
+     * event loop, where the write could never finish while this waited, nothing is waited for.
+     */
+    private static boolean writeFailed(Channel channel, ChannelFuture write) {
+        boolean finished = write.isDone()
+                || (!channel.eventLoop().inEventLoop() && write.awaitUninterruptibly(WRITE_CONFIRM_MILLIS));
+        return finished && !write.isSuccess();
+    }
+
+    /** The JSON text of clientName's NAT_CONTROL. */
+    String messageJson(String clientName, List<SpecusMapping> mappings, List<HttpRouteMapping> httpRoutes) {
         List<Map<String, Object>> specusConfigList = new ArrayList<>();
         for (SpecusMapping mapping : mappings) {
             Map<String, Object> specusConfig = new LinkedHashMap<>();
@@ -324,15 +473,7 @@ public class NatControlService {
             httpSpecusConfigList.add(entry);
         }
         specusBean.put("httpSpecusConfigList", httpSpecusConfigList);
-
-        MessageResponsePacket packet = new MessageResponsePacket();
-        packet.setClientName(clientName);
-        packet.setMessageType(MessageType.NAT_CONTROL);
-        packet.setMessage(JsonUtil.objectToString(specusBean));
-        channel.writeAndFlush(packet);
-        log.info("[nat-control] pushed {} tcp + {} http route(s) to {}",
-                mappings.size(), httpRoutes.size(), clientName);
-        return true;
+        return JsonUtil.objectToString(specusBean);
     }
 
     private ClientAccount findClient(long clientId) {

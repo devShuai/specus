@@ -559,30 +559,40 @@ static turn_allocation *find_allocation_by_relay(st_stun_turn_server *server,
     return NULL;
 }
 
+static long long username_client_id(const char *username)
+{
+    return st_turn_auth_peer_mesh_client_id(username);
+}
+
+static int username_is_general(const char *username)
+{
+    return st_turn_auth_is_general_relay_subject(username);
+}
+
 static long long allocation_client_id(const turn_allocation *allocation)
 {
-    if (allocation == NULL) return 0;
-    const char *first = strchr(allocation->username, ':');
-    if (first == NULL || strncmp(first + 1, "pm-", 3U) != 0) return 0;
-    char *end = NULL;
-    long long id = strtoll(first + 4, &end, 10);
-    return id > 0 && end != first + 4 && *end == ':' ? id : 0;
+    return allocation == NULL ? 0 : username_client_id(allocation->username);
 }
 
 static int allocation_is_general(const turn_allocation *allocation)
 {
-    if (allocation == NULL) return 0;
-    const char *first = strchr(allocation->username, ':');
-    return first != NULL && strncmp(first + 1, "public-transfer", 15U) == 0;
+    return allocation != NULL && username_is_general(allocation->username);
+}
+
+/*
+ * Java Allocation.matchesClient and Go's ClientID check: Refresh, CreatePermission and ChannelBind
+ * act on an allocation only when they are signed by the identity that created it. Otherwise a
+ * general relay credential could install permissions on a Peer Mesh allocation, which the
+ * destination policy exempts, and either identity could delete the other's allocation.
+ */
+static int allocation_matches_identity(const turn_allocation *allocation, const char *username)
+{
+    return allocation != NULL
+        && allocation_is_general(allocation) == username_is_general(username)
+        && allocation_client_id(allocation) == username_client_id(username);
 }
 
 static void close_allocation(turn_allocation *allocation);
-
-static int username_is_general(const char *username)
-{
-    const char *first = username == NULL ? NULL : strchr(username, ':');
-    return first != NULL && strncmp(first + 1, "public-transfer", 15U) == 0;
-}
 
 static int general_relay_quota_allows(st_stun_turn_server *server,
                                       const struct sockaddr_storage *client,
@@ -625,16 +635,24 @@ static uint64_t read_u64(const uint8_t *data)
     return ((uint64_t)read_u32(data) << 32U) | read_u32(data + 4U);
 }
 
+/*
+ * identified is whether TURN authentication is on. With it off an allocation carries no client id
+ * (the credential has none), so, as in Java StunTurnServer.authorizeRelayPayload, both sides go to
+ * the session check as 0 and only the session itself is checked: insisting on ids there would
+ * drop every Peer Mesh datagram, probes included, and leave the relay unusable.
+ */
 static int authorize_relay_payload(const uint8_t *payload,
                                    size_t payload_len,
                                    const turn_allocation *source,
                                    const turn_allocation *target,
-                                   int account_traffic)
+                                   int account_traffic,
+                                   int identified)
 {
     if (allocation_is_general(source) || allocation_is_general(target)) return 1;
-    long long source_id = allocation_client_id(source);
-    long long target_id = allocation_client_id(target);
-    if (source_id <= 0 || target_id <= 0) return 0;
+    if (source == NULL || target == NULL) return 0;
+    long long source_id = identified ? allocation_client_id(source) : 0;
+    long long target_id = identified ? allocation_client_id(target) : 0;
+    if (identified && (source_id <= 0 || target_id <= 0)) return 0;
     /* The same database the control channel grants sessions in. Reading any other variable here
      * leaves Peer Mesh relaying with no session to check against, so every relayed datagram is
      * dropped while allocations, permissions and channel binds all still succeed. */
@@ -666,7 +684,7 @@ static int authorize_relay_payload(const uint8_t *payload,
         && st_json_get_i64(json, "sessionId", &session_id) == 0
         && st_json_get_i64(json, "fromClientId", &from_id) == 0
         && st_json_get_i64(json, "toClientId", &to_id) == 0
-        && from_id == source_id && to_id == target_id
+        && (!identified || (from_id == source_id && to_id == target_id))
         && st_storage_verify_peer_mesh_probe(database_path, session_id, from_id, to_id, token) == 1;
     free(json); free(magic); free(type); free(token);
     return valid;
@@ -709,6 +727,73 @@ static int peer_address_allowed(st_stun_turn_server *server,
     return !IN6_IS_ADDR_UNSPECIFIED(address) && !IN6_IS_ADDR_LOOPBACK(address)
         && !IN6_IS_ADDR_LINKLOCAL(address) && !IN6_IS_ADDR_SITELOCAL(address)
         && !IN6_IS_ADDR_MULTICAST(address) && (address->s6_addr[0] & 0xfeU) != 0xfcU;
+}
+
+/*
+ * Every XOR-PEER-ADDRESS of a request: RFC 5766 section 9.1 lets one CreatePermission name several
+ * peers, and Java and Go install (and policy-check) all of them. Attributes after
+ * MESSAGE-INTEGRITY are not covered by it and are ignored (RFC 5389 section 15.4). A request with
+ * no peer, an undecodable peer or more peers than one allocation can hold is malformed.
+ */
+static int collect_peer_addresses(const uint8_t *packet,
+                                  size_t len,
+                                  struct sockaddr_storage *peers,
+                                  socklen_t *peer_lens,
+                                  size_t capacity,
+                                  size_t *count)
+{
+    *count = 0U;
+    if (!stun_packet_valid(packet, len)) return -1;
+    size_t end = STUN_HEADER_SIZE + read_u16(packet + 2U);
+    for (size_t offset = STUN_HEADER_SIZE; offset + 4U <= end;) {
+        stun_attribute attribute;
+        attribute.type = read_u16(packet + offset);
+        attribute.length = read_u16(packet + offset + 2U);
+        attribute.value = packet + offset + 4U;
+        attribute.offset = offset;
+        if (offset + 4U + attribute.length > end) return -1;
+        if (attribute.type == ATTR_MESSAGE_INTEGRITY) break;
+        if (attribute.type == ATTR_XOR_PEER_ADDRESS) {
+            if (*count >= capacity
+                || decode_xor_address(&attribute, packet + 8U, &peers[*count], &peer_lens[*count]) != 0) return -1;
+            ++*count;
+        }
+        offset += 4U + ((attribute.length + 3U) & ~3U);
+    }
+    return *count > 0U ? 0 : -1;
+}
+
+static void format_endpoint(const struct sockaddr_storage *address, char *out, size_t out_len)
+{
+    char host[INET6_ADDRSTRLEN] = "?";
+    unsigned port = 0U;
+    if (address->ss_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)address;
+        (void)inet_ntop(AF_INET, &ipv4->sin_addr, host, sizeof(host));
+        port = ntohs(ipv4->sin_port);
+        snprintf(out, out_len, "%s:%u", host, port);
+        return;
+    }
+    if (address->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)address;
+        (void)inet_ntop(AF_INET6, &ipv6->sin6_addr, host, sizeof(host));
+        port = ntohs(ipv6->sin6_port);
+    }
+    snprintf(out, out_len, "[%s]:%u", host, port);
+}
+
+/* The audit line Java and Go write when the destination policy refuses a general relay peer. */
+static void log_refused_peer(uint16_t message_type,
+                             const struct sockaddr_storage *client,
+                             const struct sockaddr_storage *peer)
+{
+    char client_text[INET6_ADDRSTRLEN + 16];
+    char peer_text[INET6_ADDRSTRLEN + 16];
+    format_endpoint(client, client_text, sizeof(client_text));
+    format_endpoint(peer, peer_text, sizeof(peer_text));
+    fprintf(stderr, "[peer-mesh][audit] general TURN %s refused: client=%s, peer=%s\n",
+            message_type == TURN_CHANNEL_BIND_REQUEST ? "channel bind" : "permission",
+            client_text, peer_text);
 }
 
 static turn_allocation *create_allocation(st_stun_turn_server *server,
@@ -979,15 +1064,7 @@ static void handle_allocate(st_stun_turn_server *server,
     turn_allocation *allocation = find_allocation_by_client(server, client);
     int quota_rejected = 0;
     int general_relay = username_is_general(username);
-    long long authenticated_client_id = 0;
-    if (!general_relay) {
-        turn_allocation identity = {0};
-        snprintf(identity.username, sizeof(identity.username), "%s", username);
-        authenticated_client_id = allocation_client_id(&identity);
-    }
-    if (allocation != NULL
-        && (allocation_is_general(allocation) != general_relay
-            || (!general_relay && allocation_client_id(allocation) != authenticated_client_id))) {
+    if (allocation != NULL && !allocation_matches_identity(allocation, username)) {
         if (general_relay && !general_relay_quota_allows(server, client, allocation)) {
             quota_rejected = 1;
             allocation = NULL;
@@ -1032,7 +1109,7 @@ static void handle_refresh(st_stun_turn_server *server,
     char username[192];
     if (authenticate_request(server, fd, packet, len, client, client_len, username) != 0) return;
     turn_allocation *allocation = find_allocation_by_client(server, client);
-    if (allocation == NULL) {
+    if (!allocation_matches_identity(allocation, username)) {
         stun_builder error;
         builder_error(&error, TURN_REFRESH_REQUEST, packet + 8U, 437, "Allocation Mismatch", 0);
         send_builder(fd, &error, client, client_len);
@@ -1065,17 +1142,30 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
     char username[192];
     if (authenticate_request(server, fd, packet, len, client, client_len, username) != 0) return;
     turn_allocation *allocation = find_allocation_by_client(server, client);
-    stun_attribute peer_attr;
-    struct sockaddr_storage peer;
-    socklen_t peer_len = 0;
-    if (allocation == NULL || find_attribute(packet, len, ATTR_XOR_PEER_ADDRESS, &peer_attr) != 0
-        || decode_xor_address(&peer_attr, packet + 8U, &peer, &peer_len) != 0
-        || (allocation != NULL && allocation_is_general(allocation)
-            && !peer_address_allowed(server, &peer))) {
+    struct sockaddr_storage peers[TURN_MAX_PERMISSIONS];
+    socklen_t peer_lens[TURN_MAX_PERMISSIONS];
+    size_t peer_count = 0U;
+    int refusal = 0;
+    const char *refusal_reason = NULL;
+    if (!allocation_matches_identity(allocation, username)) {
+        refusal = 437;
+        refusal_reason = "Allocation Mismatch";
+    } else if (collect_peer_addresses(packet, len, peers, peer_lens, TURN_MAX_PERMISSIONS, &peer_count) != 0) {
+        refusal = 400;
+        refusal_reason = "Bad Request";
+    } else if (allocation_is_general(allocation)) {
+        /* Every named peer is checked before any permission is installed, as Go does: one refused
+         * peer refuses the whole request instead of letting the peers before it through. */
+        for (size_t i = 0; i < peer_count && refusal == 0; ++i) {
+            if (peer_address_allowed(server, &peers[i])) continue;
+            log_refused_peer(message_type, client, &peers[i]);
+            refusal = 403;
+            refusal_reason = "Forbidden Peer";
+        }
+    }
+    if (refusal != 0) {
         stun_builder error;
-        builder_error(&error, message_type, packet + 8U,
-                      allocation == NULL ? 437 : 403,
-                      allocation == NULL ? "Allocation Mismatch" : "Forbidden Peer", 0);
+        builder_error(&error, message_type, packet + 8U, refusal, refusal_reason, 0);
         send_builder(fd, &error, client, client_len);
         return;
     }
@@ -1086,11 +1176,15 @@ static void handle_permission_or_channel(st_stun_turn_server *server,
         uint16_t number = 0U;
         if (find_attribute(packet, len, ATTR_CHANNEL_NUMBER, &channel) != 0 || channel.length != 4U
             || (number = read_u16(channel.value)) < 0x4000U || number > 0x7fffU) rc = -1;
-        else rc = bind_channel(allocation, number, &peer, peer_len, server->channel_ttl);
+        else rc = bind_channel(allocation, number, &peers[0], peer_lens[0], server->channel_ttl);
         success_type = TURN_CHANNEL_BIND_SUCCESS;
+        /* A ChannelBind binds the first peer it names; the others were only policy-checked. */
+        peer_count = 1U;
     }
     /* A refused ChannelBind must not leave the permission it would have installed behind. */
-    if (rc == 0) rc = add_permission(allocation, &peer, peer_len, server->permission_ttl);
+    for (size_t i = 0; i < peer_count && rc == 0; ++i) {
+        rc = add_permission(allocation, &peers[i], peer_lens[i], server->permission_ttl);
+    }
     stun_builder response;
     if (rc != 0) {
         builder_error(&response, message_type, packet + 8U, 400, "Bad Request", 0);
@@ -1117,7 +1211,8 @@ static void handle_send_indication(st_stun_turn_server *server,
         || decode_xor_address(&peer_attr, packet + 8U, &peer, &peer_len) != 0
         || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(data.value, data.length, allocation, target, 1)) return;
+    if (!authorize_relay_payload(data.value, data.length, allocation, target, 1,
+                                 server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data.length)) return;
     (void)sendto(allocation->relay_fd, data.value, data.length, 0,
                  (struct sockaddr *)&peer, peer_len);
@@ -1135,7 +1230,8 @@ static void handle_channel_data(st_stun_turn_server *server,
     turn_channel *channel = allocation == NULL ? NULL : find_channel_by_number(allocation, number);
     if (channel == NULL || 4U + data_len > len || !allocation_has_permission(allocation, &channel->peer)) return;
     turn_allocation *target = find_allocation_by_relay(server, &channel->peer);
-    if (!authorize_relay_payload(packet + 4U, data_len, allocation, target, 1)) return;
+    if (!authorize_relay_payload(packet + 4U, data_len, allocation, target, 1,
+                                 server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, data_len)) return;
     (void)sendto(allocation->relay_fd, packet + 4U, data_len, 0,
                  (struct sockaddr *)&channel->peer, channel->peer_len);
@@ -1176,7 +1272,8 @@ static void handle_relay_packet(st_stun_turn_server *server, turn_allocation *al
                                 (struct sockaddr *)&peer, &peer_len);
     if (received <= 0 || !allocation_has_permission(allocation, &peer)) return;
     turn_allocation *source = find_allocation_by_relay(server, &peer);
-    if (!authorize_relay_payload(packet, (size_t)received, source, allocation, 0)) return;
+    if (!authorize_relay_payload(packet, (size_t)received, source, allocation, 0,
+                                 server->auth_required)) return;
     if (!allow_general_relay_traffic(server, allocation, (size_t)received)) return;
     turn_channel *channel = find_channel_by_peer(allocation, &peer);
     if (channel != NULL) {

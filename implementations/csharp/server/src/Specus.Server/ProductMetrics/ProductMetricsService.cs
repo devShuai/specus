@@ -97,8 +97,9 @@ public sealed class ProductMetricsService
     }
 
     /// <summary>
-    /// PUT /settings. Switching off drops the tenant's progress rows without folding them; switching
-    /// on clears the purge mark; an unchanged state keeps updatedAt/updatedBy.
+    /// PUT /settings. Switching off drops the tenant's progress rows without folding them. Any change
+    /// of state clears the purge mark, so while the switch is off the mark only stands for a purge
+    /// made after switching off; an unchanged state keeps updatedAt/updatedBy and the mark.
     /// </summary>
     public async Task<ProductMetricsResult> PutSettingsAsync(ManagementContext context, ReadOnlyMemory<byte> body,
         CancellationToken cancellationToken)
@@ -140,10 +141,7 @@ public sealed class ProductMetricsService
                     row.Enabled = update.Enabled;
                     row.UpdatedBy = context.Username;
                     row.UpdatedAt = now;
-                    if (update.Enabled)
-                    {
-                        row.PurgedAt = null;
-                    }
+                    row.PurgedAt = null;
                 }
                 await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
                 if (!update.Enabled)
@@ -450,12 +448,30 @@ public sealed class ProductMetricsService
 
     // -- retention (9) ------------------------------------------------------------------------------
 
-    /// <summary>The four retention steps of section 9; idempotent and independent of when it runs.</summary>
-    public Task SweepAsync(CancellationToken cancellationToken) => WithDbAsync(async db =>
+    /// <summary>
+    /// The four retention steps of section 9; idempotent and independent of when it runs. Step 4 only
+    /// reaches tenants purged since they switched off: switching off clears the mark a purge made
+    /// while collecting.
+    /// </summary>
+    public async Task SweepAsync(CancellationToken cancellationToken)
+    {
+        var switches = await WithDbAsync(db => db.ProductMetricsSwitches.AsNoTracking()
+            .ToListAsync(cancellationToken)).ConfigureAwait(false);
+        await SweepAsync(switches, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs the four steps on switches read beforehand. They only pick the candidates of steps 1 and
+    /// 4: each delete checks the switch again when it runs, so a tenant switched back on since the
+    /// read keeps what it collects from then on.
+    /// </summary>
+    internal Task SweepAsync(IReadOnlyList<ProductMetricsSwitch> switches, CancellationToken cancellationToken) =>
+        WithDbAsync(db => SweepAsync(db, switches, cancellationToken));
+
+    private async Task<bool> SweepAsync(SpecusDbContext db, IReadOnlyList<ProductMetricsSwitch> switches,
+        CancellationToken cancellationToken)
     {
         var now = _clock.NowMs();
-        var switches = await db.ProductMetricsSwitches.AsNoTracking().ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
         var collecting = switches.ToDictionary(row => row.TenantId, Collecting, StringComparer.Ordinal);
         var progress = await db.ProductMetricsOnboardingProgress.AsNoTracking().ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -464,9 +480,7 @@ public sealed class ProductMetricsService
         {
             if (!collecting.GetValueOrDefault(row.TenantId))
             {
-                await db.ProductMetricsOnboardingProgress
-                    .Where(item => item.TenantId == row.TenantId && item.Username == row.Username)
-                    .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+                await DropProgressAsync(db, row, cancellationToken).ConfigureAwait(false);
             }
             else if (now >= row.StartedAt + WindowMs)
             {
@@ -480,10 +494,50 @@ public sealed class ProductMetricsService
             [cutoff], cancellationToken).ConfigureAwait(false);
         foreach (var row in switches.Where(row => !row.Enabled && row.PurgedAt is not null))
         {
-            await DeleteTenantRowsAsync(db, row.TenantId, cancellationToken).ConfigureAwait(false);
+            await DeletePurgedTenantRowsAsync(db, row.TenantId, cancellationToken).ConfigureAwait(false);
         }
         return true;
-    });
+    }
+
+    /// <summary>
+    /// Step 1 for one row of a tenant that was not collecting when the sweep read the switches. The
+    /// delete checks the switch again, so a tenant switched on since keeps the row; when the deployment
+    /// does not allow metrics no tenant collects and the row goes regardless.
+    /// </summary>
+    private Task<int> DropProgressAsync(SpecusDbContext db, ProductMetricsOnboardingProgress row,
+        CancellationToken cancellationToken)
+    {
+        var rows = db.ProductMetricsOnboardingProgress
+            .Where(item => item.TenantId == row.TenantId && item.Username == row.Username);
+        if (Allowed)
+        {
+            rows = rows.Where(item => !db.ProductMetricsSwitches
+                .Any(entry => entry.TenantId == row.TenantId && entry.Enabled));
+        }
+        return rows.ExecuteDeleteAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Step 4: deletes both daily tables' rows and the progress rows of a tenant, each table only while
+    /// the tenant's switch is off with a purge mark when that statement runs. Switching on clears the
+    /// mark, so a tenant switched back on since the sweep read the switches keeps what it collected.
+    /// </summary>
+    private static async Task DeletePurgedTenantRowsAsync(SpecusDbContext db, string tenant,
+        CancellationToken cancellationToken)
+    {
+        await db.ProductMetricsOnboardingDaily
+            .Where(item => item.TenantId == tenant && db.ProductMetricsSwitches
+                .Any(entry => entry.TenantId == tenant && !entry.Enabled && entry.PurgedAt != null))
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await db.ProductMetricsTransferDaily
+            .Where(item => item.TenantId == tenant && db.ProductMetricsSwitches
+                .Any(entry => entry.TenantId == tenant && !entry.Enabled && entry.PurgedAt != null))
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await db.ProductMetricsOnboardingProgress
+            .Where(item => item.TenantId == tenant && db.ProductMetricsSwitches
+                .Any(entry => entry.TenantId == tenant && !entry.Enabled && entry.PurgedAt != null))
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     // -- summary (7.5) ------------------------------------------------------------------------------
 

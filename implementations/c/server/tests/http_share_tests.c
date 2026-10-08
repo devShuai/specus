@@ -373,9 +373,10 @@ static int seed_world(void)
         char *tenant = jget_string(members[i].value, "tenantId");
         char *role = jget_string(members[i].value, "role");
         char *sql = sqlite3_mprintf(
-            "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled) "
-            "VALUES(%Q,%Q,'x',%Q,%d)",
-            members[i].key, tenant, role, jget_bool(members[i].value, "enabled", 1));
+            "INSERT INTO specus_management_user(username, login_name, login_name_normalized, tenant_id, "
+            "password_hash, role, enabled) VALUES(%Q,%Q,lower(%Q),%Q,'x',%Q,%d)",
+            members[i].key, members[i].key, members[i].key, tenant, role,
+            jget_bool(members[i].value, "enabled", 1));
         rc = sql_exec(sql);
         sqlite3_free(sql);
         free(tenant);
@@ -703,6 +704,8 @@ typedef struct {
     int cookie_headers;
     char cookie[1024];
     char authorization[256];
+    /* The Origin, Referer and Sec-Fetch-Site lines the device received, joined with '|'. */
+    char browser_headers[512];
     int streaming;
     int cancelled;
     int stream_returned;
@@ -732,6 +735,7 @@ static void device_reset(int mode)
     device.cookie_headers = 0;
     device.cookie[0] = '\0';
     device.authorization[0] = '\0';
+    device.browser_headers[0] = '\0';
     device.streaming = 0;
     device.cancelled = 0;
     device.stream_returned = 0;
@@ -753,6 +757,11 @@ static void device_capture_headers(char *const *headers, size_t headers_len)
             snprintf(device.cookie, sizeof(device.cookie), "%s", headers[i] + 7);
         } else if (strncasecmp(headers[i], "Authorization:", 14U) == 0) {
             snprintf(device.authorization, sizeof(device.authorization), "%s", headers[i] + 14);
+        } else if (strncasecmp(headers[i], "Origin:", 7U) == 0 || strncasecmp(headers[i], "Referer:", 8U) == 0
+                   || strncasecmp(headers[i], "Sec-Fetch-Site:", 15U) == 0) {
+            size_t used = strlen(device.browser_headers);
+            snprintf(device.browser_headers + used, sizeof(device.browser_headers) - used, "%s%s",
+                     used == 0U ? "" : "|", headers[i]);
         }
     }
 }
@@ -1300,10 +1309,9 @@ static void test_create(void)
               expected_status, response);
         CHECK(code_matches(expect, response), "create %s: code mismatch: %.300s", name, response);
         char cache[64] = "";
-        if (expected_status != 401) {
-            CHECK(response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
-                      && strcmp(cache, "private, no-store") == 0, "create %s: Cache-Control %s", name, cache);
-        }
+        /* Every answer, the authentication layer's 401 included. */
+        CHECK(response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
+                  && strcmp(cache, "private, no-store") == 0, "create %s: Cache-Control %s", name, cache);
         char *expected_body = jget(expect, "body");
         if (expected_body != NULL) {
             CHECK(jequal(expected_body, response_body(response)), "create %s: body %s, expected %s", name,
@@ -2081,7 +2089,9 @@ static void test_cookie_stripped_authorization_kept(void)
     char headers[1024];
     snprintf(headers, sizeof(headers),
              "Cookie: theme=dark; " ST_HTTP_SHARE_COOKIE_NAME "=%s; sid=abc\r\n"
-             "Cookie: extra=1\r\nAuthorization: Bearer upstream-token\r\n", token);
+             "Cookie: extra=1\r\nAuthorization: Bearer upstream-token\r\n"
+             "Origin: https://share.test\r\nReferer: https://share.test/http-share/%s/docs/\r\n"
+             "Sec-Fetch-Site: cross-site\r\n", token, share_id);
     int status = share_get(share_id, "/docs/a%20b+c?q=%2F1+2", headers, response);
     CHECK(status == 200 && strstr(response, "forwarded") != NULL, "cookie strip test: status %d %.300s", status, response);
     pthread_mutex_lock(&device.lock);
@@ -2092,6 +2102,13 @@ static void test_cookie_stripped_authorization_kept(void)
     CHECK(strcmp(device.relative_path, "/docs/a%20b+c") == 0 && strcmp(device.raw_query, "q=%2F1+2") == 0
               && strcmp(device.route, "api") == 0,
           "cookie strip test: raw path %s ?%s route %s", device.relative_path, device.raw_query, device.route);
+    /* Java UpstreamBrowserHeaders on the share path too: the route target's origin, not the share's. */
+    char expected_browser_headers[256];
+    snprintf(expected_browser_headers, sizeof(expected_browser_headers),
+             "Origin:http://127.0.0.1:9|Referer:http://127.0.0.1:9/http-share/%s/docs/|Sec-Fetch-Site:same-origin",
+             share_id);
+    CHECK(strcmp(device.browser_headers, expected_browser_headers) == 0, "cookie strip test: browser headers %s",
+          device.browser_headers);
     pthread_mutex_unlock(&device.lock);
     /* No portal headers on the share path: the target's own policy stands. */
     char header[256];
@@ -2351,10 +2368,11 @@ static void test_local_cascade_cuts_websocket_and_stream(void)
     device.ws_accept = 1;
     pthread_mutex_unlock(&device.lock);
     int fd = connect_server();
-    char request[512];
+    char request[1024];
     int len = snprintf(request, sizeof(request),
                        "GET /http-share/%s/live HTTP/1.1\r\nHost: share.test\r\nConnection: Upgrade\r\n"
                        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Origin: https://share.test\r\nSec-Fetch-Site: cross-site\r\n"
                        "Cookie: " ST_HTTP_SHARE_COOKIE_NAME "=%s\r\n\r\n", share_id, token);
     char handshake[512] = "";
     ssize_t got = fd >= 0 && send_text(fd, request, (size_t)len) == 0 ? recv(fd, handshake, sizeof(handshake) - 1U, 0) : -1;
@@ -2362,6 +2380,10 @@ static void test_local_cascade_cuts_websocket_and_stream(void)
         handshake[got] = '\0';
     }
     CHECK(got > 0 && strstr(handshake, "101 Switching Protocols") != NULL, "websocket test: no 101: %s", handshake);
+    pthread_mutex_lock(&device.lock);
+    CHECK(strcmp(device.browser_headers, "Origin:http://127.0.0.1:9|Sec-Fetch-Site:same-origin") == 0,
+          "websocket test: browser headers %s", device.browser_headers);
+    pthread_mutex_unlock(&device.lock);
     char path[128];
     snprintf(path, sizeof(path), "/api/admin/http-routes/42/shares/%s/revoke", share_id);
     long long started = monotonic_ms();
@@ -2423,7 +2445,13 @@ static void test_cascades_from_endpoints(void)
               && create_share("admin", 50, "{\"expiresInSeconds\":3600}", token, share_b) == 0
               && create_share("alice", 42, "{\"expiresInSeconds\":3600}", token, share_c) == 0,
           "endpoint cascades: setup failed");
-    /* Deleting bob ends bob's share and leaves the admin's share of the same route. */
+    /*
+     * Deleting bob ends bob's share and leaves the admin's share of the same route. An account that
+     * still owns a client is not deleted (management-accounts.md 7.1): client 8 goes to admin first.
+     */
+    CHECK(manage("DELETE", "/api/admin/users/bob", "carol", NULL, response, RESPONSE_CAP) == 409
+              && sql_exec("UPDATE client_account SET owner_username = 'admin' WHERE id = 8;") == 0,
+          "endpoint cascades: refused user delete");
     CHECK(manage("DELETE", "/api/admin/users/bob", "carol", NULL, response, RESPONSE_CAP) == 204,
           "endpoint cascades: user delete");
     share_state a = read_share(share_a);
@@ -2464,8 +2492,21 @@ static void test_cascades_from_endpoints(void)
           "endpoint cascades: bad limit");
     CHECK(manage("GET", "/api/admin/http-access-audit", "eve", NULL, response, RESPONSE_CAP) == 200
               && strstr(response, "\"entries\":[]") != NULL, "endpoint cascades: other tenant sees nothing");
-    CHECK(manage("GET", "/api/admin/http-routes/42/shares", NULL, NULL, response, RESPONSE_CAP) == 401,
-          "endpoint cascades: anonymous list");
+    static const char *const anonymous[][2] = {
+        {"POST", "/api/admin/http-routes/42/shares"},
+        {"GET", "/api/admin/http-routes/42/shares"},
+        {"GET", "/api/admin/http-routes/42/shares/abcdefghijklmnop"},
+        {"POST", "/api/admin/http-routes/42/shares/abcdefghijklmnop/revoke"},
+        {"GET", "/api/admin/http-routes/42/access-audit"},
+        {"GET", "/api/admin/http-access-audit"}
+    };
+    for (size_t i = 0U; i < sizeof(anonymous) / sizeof(anonymous[0]); ++i) {
+        char cache[64] = "";
+        CHECK(manage(anonymous[i][0], anonymous[i][1], NULL, NULL, response, RESPONSE_CAP) == 401
+                  && response_header(response, "Cache-Control", 0U, cache, sizeof(cache))
+                  && strcmp(cache, "private, no-store") == 0,
+              "endpoint cascades: anonymous %s %s answered %.200s", anonymous[i][0], anonymous[i][1], response);
+    }
     CHECK(manage("GET", "/api/admin/http-routes/abc/shares", "admin", NULL, response, RESPONSE_CAP) == 404
               && body_has_code(response, "SHARE_ROUTE_NOT_FOUND"), "endpoint cascades: non-numeric route id");
     free(response);

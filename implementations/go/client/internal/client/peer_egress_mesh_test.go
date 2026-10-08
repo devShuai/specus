@@ -3,6 +3,7 @@ package client
 import (
 	"io"
 	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -188,6 +189,13 @@ func TestEgressDenyListSkipsHostnames(t *testing.T) {
 // the enumeration returns has to be something the judgment layer can actually match against.
 func TestLocalInterfaceCIDRsAreParseable(t *testing.T) {
 	for _, cidr := range localInterfaceCIDRs() {
+		if strings.Contains(cidr, ":") {
+			// IPv6: the parser refuses host bits and any spelling it would not read back.
+			if _, _, ok := parseEgressCIDR6(cidr); !ok {
+				t.Errorf("%q is not an IPv6 CIDR the judgment layer accepts", cidr)
+			}
+			continue
+		}
 		parsed, ok := parseEgressCIDR(cidr)
 		if !ok {
 			t.Errorf("%q is not a CIDR the judgment layer accepts", cidr)

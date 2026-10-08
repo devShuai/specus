@@ -186,7 +186,8 @@ public class OidcController {
             productMetrics.milestone(user.tenantId(), user.username(), ProductMetricsModel.STEP_SIGNED_IN);
             Map<String, Object> tokens = new LinkedHashMap<>();
             tokens.put("accessToken",
-                    localTokenService.issueToken(user.username(), user.tenantId(), user.role()));
+                    localTokenService.issueToken(user.username(), user.tenantId(), user.role(),
+                            user.tokenAccountKey()));
             // Kept in sessionStorage by the browser and used only as an RP-Initiated Logout hint.
             tokens.put("idToken", rawIdToken);
             tokens.put("tokenType", body.path("token_type").asText("Bearer"));

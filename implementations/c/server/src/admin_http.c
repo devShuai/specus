@@ -7,6 +7,7 @@
 #include "client_package.h"
 #include "crypto.h"
 #include "decompression_limits.h"
+#include "elasticsearch_traffic.h"
 #include "github_release.h"
 #include "http_client.h"
 #include "http_share.h"
@@ -26,7 +27,9 @@
 #include "security_baseline.h"
 #include "storage.h"
 #include "tls_transport.h"
+#include "traffic_capture.h"
 #include "turn_auth.h"
+#include "upstream_browser_headers.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -36,6 +39,7 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -50,12 +54,8 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#define ST_ADMIN_MAX_TCP_MAPPINGS 64U
-#define ST_ADMIN_MAX_CLIENTS 128U
-#define ST_ADMIN_MAX_CLIENT_DOWNLOADS 128U
 #define ST_ADMIN_MAX_CONNECTIONS_PAGE 500U
 #define ST_ADMIN_MAX_TRAFFIC_ITEMS 1000U
-#define ST_ADMIN_MAX_PEER_ACLS 256U
 #define ST_ADMIN_MAX_PEER_SESSIONS 200U
 #define ST_ADMIN_MAX_HTTP_HEADERS 96U
 #define ST_ADMIN_MAX_DIRECT_HTTP_BODY (16U * 1024U * 1024U)
@@ -66,7 +66,8 @@
 #define ST_ADMIN_WS_TICKET_TTL_SECONDS 45
 #define ST_ADMIN_MAX_WS_TICKETS 1024U
 #define ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS (64U * 1024U)
-#define ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES (3U * ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS)
+/* /ws/connections sets no limit, so Tomcat's default text buffer of 8 KiB characters applies. */
+#define ST_ADMIN_CONNECTIONS_MAX_CHARS (8U * 1024U)
 #define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES 1024U
 #define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES_PER_SOCKET 64U
 /* Bounds the close handshake on both sides, like the Go/Java/.NET close credit timeout. */
@@ -108,6 +109,19 @@ typedef struct {
     int insecure_skip_verify;
 } st_admin_http_route;
 
+/* A client's mappings or routes, as many as it has; items is the caller's to free. */
+typedef struct {
+    st_admin_tcp_mapping *items;
+    size_t count;
+    size_t capacity;
+} st_admin_tcp_mapping_list;
+
+typedef struct {
+    st_admin_http_route *items;
+    size_t count;
+    size_t capacity;
+} st_admin_http_route_list;
+
 typedef struct {
     st_admin_server *server;
     int fd;
@@ -117,6 +131,9 @@ typedef struct {
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
+    /* The key of the account row a bearer resolved to; empty for the built-in admin. A token issued
+     * for this context carries it as uid. */
+    char account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1];
     int admin;
     int authenticated;
     /* The bearer was a valid token of the identity provider, whether or not it resolved. */
@@ -220,8 +237,12 @@ typedef struct admin_share_stream {
 typedef struct {
     char share_id[ST_HTTP_SHARE_ID_LEN + 1U];
     char client_name[256];
+    /* The account owning the share's route, as st_direct_http_request.client_id. */
+    long long client_id;
     char route[128];
     char rewrite_prefix[64];
+    /* The route's target, whose origin the relayed browser headers take (UpstreamBrowserHeaders). */
+    char target_base_url[512];
     char *relative_path;
     const char *raw_query;
     int upgrade;
@@ -237,6 +258,7 @@ static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream);
 static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
+static void admin_ws_close_identity(const char *tenant_id, const char *username);
 static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_ticket *admin_ws_tickets = NULL;
 static pthread_mutex_t admin_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -252,6 +274,12 @@ static size_t admin_pending_client_message_writes = 0U;
 static pthread_mutex_t admin_peer_mesh_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_mesh_refresh_handler admin_peer_mesh_refresh_handler = NULL;
 static void *admin_peer_mesh_refresh_ctx = NULL;
+static pthread_mutex_t admin_peer_control_send_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_peer_control_send_handler admin_peer_control_send_handler = NULL;
+static void *admin_peer_control_send_ctx = NULL;
+static pthread_mutex_t admin_client_disconnect_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_client_disconnect_handler admin_client_disconnect_handler = NULL;
+static void *admin_client_disconnect_ctx = NULL;
 
 static char *admin_url_decode(const char *value, size_t len);
 static const char *admin_database_path(void);
@@ -292,6 +320,49 @@ void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler h
     admin_peer_mesh_refresh_handler = handler;
     admin_peer_mesh_refresh_ctx = ctx;
     pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+}
+
+void st_admin_set_peer_control_send_handler(st_admin_peer_control_send_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_peer_control_send_lock);
+    admin_peer_control_send_handler = handler;
+    admin_peer_control_send_ctx = ctx;
+    pthread_mutex_unlock(&admin_peer_control_send_lock);
+}
+
+void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_client_disconnect_lock);
+    admin_client_disconnect_handler = handler;
+    admin_client_disconnect_ctx = ctx;
+    pthread_mutex_unlock(&admin_client_disconnect_lock);
+}
+
+static pthread_mutex_t admin_external_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_external_connection_stats_handler admin_external_stats_handler = NULL;
+static void *admin_external_stats_ctx = NULL;
+
+void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,
+                                                    void *ctx)
+{
+    pthread_mutex_lock(&admin_external_stats_lock);
+    admin_external_stats_handler = handler;
+    admin_external_stats_ctx = ctx;
+    pthread_mutex_unlock(&admin_external_stats_lock);
+}
+
+/* Without a runtime (the management API on its own) there are no public connections. */
+static void admin_external_connection_stats(const char *tenant_id, long long *active, long long *rejected)
+{
+    *active = 0;
+    *rejected = 0;
+    pthread_mutex_lock(&admin_external_stats_lock);
+    st_admin_external_connection_stats_handler handler = admin_external_stats_handler;
+    void *ctx = admin_external_stats_ctx;
+    pthread_mutex_unlock(&admin_external_stats_lock);
+    if (handler != NULL) {
+        handler(ctx, tenant_id, active, rejected);
+    }
 }
 
 static pthread_mutex_t admin_connectivity_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -372,6 +443,26 @@ static void admin_notify_nat_control(const st_storage_client *client)
     }
 }
 
+/* Closes the online connections of a client an admin disabled, renamed or deleted. */
+static void admin_close_client_connections(const char *client_name, const char *reason)
+{
+    pthread_mutex_lock(&admin_client_disconnect_lock);
+    st_admin_client_disconnect_handler handler = admin_client_disconnect_handler;
+    void *ctx = admin_client_disconnect_ctx;
+    pthread_mutex_unlock(&admin_client_disconnect_lock);
+    if (handler != NULL) {
+        (void)handler(ctx, client_name, reason);
+    }
+}
+
+#define ST_ADMIN_JSON_RESPONSE_HEAD            \
+    "HTTP/1.1 %d %s\r\n"                       \
+    "Content-Type: application/json\r\n"       \
+    "Cache-Control: no-store\r\n"              \
+    "X-Content-Type-Options: nosniff\r\n"      \
+    "Content-Length: %zu\r\n"                  \
+    "\r\n"
+
 static int write_response(char *out, size_t out_len, int status, const char *reason, const char *body)
 {
     if (body == NULL) {
@@ -379,18 +470,57 @@ static int write_response(char *out, size_t out_len, int status, const char *rea
     }
     int written = snprintf(out,
                            out_len,
-                           "HTTP/1.1 %d %s\r\n"
-                           "Content-Type: application/json\r\n"
-                           "Cache-Control: no-store\r\n"
-                           "X-Content-Type-Options: nosniff\r\n"
-                           "Content-Length: %zu\r\n"
-                           "\r\n"
-                           "%s",
+                           ST_ADMIN_JSON_RESPONSE_HEAD "%s",
                            status,
                            reason,
                            strlen(body),
                            body);
     return written < 0 || (size_t)written >= out_len ? -1 : written;
+}
+
+/*
+ * A response too large for the buffer handle_client passed in. handle_client arms the slot of its
+ * thread for the request it serves; a caller of the st_admin_build_response* functions brings its
+ * own buffer and leaves it unarmed, so for that caller such a response still fails.
+ */
+typedef struct {
+    char *data;
+    size_t len;
+} admin_heap_response;
+
+static _Thread_local admin_heap_response *admin_armed_heap_response;
+
+/*
+ * write_response for a body that has no fixed bound, such as every mapping and route of a client.
+ * When the response does not fit out and the slot is armed, the whole response goes to the slot
+ * and 1 is returned; handle_client sends the slot instead of out whenever it holds a response.
+ */
+static int write_unbounded_response(char *out, size_t out_len, int status, const char *reason, const char *body)
+{
+    int written = write_response(out, out_len, status, reason, body);
+    admin_heap_response *slot = admin_armed_heap_response;
+    if (written >= 0 || slot == NULL) {
+        return written;
+    }
+    if (body == NULL) {
+        body = "";
+    }
+    size_t body_len = strlen(body);
+    char head[256];
+    int head_len = snprintf(head, sizeof(head), ST_ADMIN_JSON_RESPONSE_HEAD, status, reason, body_len);
+    if (head_len < 0 || (size_t)head_len >= sizeof(head) || body_len > SIZE_MAX - (size_t)head_len) {
+        return -1;
+    }
+    char *data = (char *)malloc((size_t)head_len + body_len);
+    if (data == NULL) {
+        return -1;
+    }
+    memcpy(data, head, (size_t)head_len);
+    memcpy(data + head_len, body, body_len);
+    free(slot->data);
+    slot->data = data;
+    slot->len = (size_t)head_len + body_len;
+    return 1;
 }
 
 static int write_login_rate_limited_response(char *out, size_t out_len, int64_t retry_after_seconds)
@@ -673,42 +803,453 @@ static char *admin_query_string(const char *path, const char *key)
     return NULL;
 }
 
-static int admin_query_int_any(const char *path, const char *key, int *out)
+/*
+ * A Long or Integer value as Spring binds a request parameter or a path variable
+ * (NumberUtils.parseNumber): whitespace anywhere is dropped, an empty value is absent, a decimal or,
+ * after an optional '-', a "0x", "0X" or "#" hexadecimal number in range is the value, and anything
+ * else fails the request with 400. raw is changed in place. 0 when empty, 1 with *out set, -1 when
+ * the value does not convert.
+ */
+static int admin_spring_number(char *raw, long long minimum, long long maximum, long long *out)
 {
-    char *value = admin_query_string(path, key);
-    if (value == NULL) {
+    size_t w = 0U;
+    for (size_t r = 0U; raw[r] != '\0'; ++r) {
+        if (!isspace((unsigned char)raw[r])) {
+            raw[w++] = raw[r];
+        }
+    }
+    raw[w] = '\0';
+    if (w == 0U) {
+        return 0;
+    }
+    const char *digits = raw;
+    int negative = 0;
+    int base = 10;
+    if (*digits == '-' || *digits == '+') {
+        negative = *digits == '-';
+        ++digits;
+    }
+    if (raw[0] != '+' && (strncmp(digits, "0x", 2U) == 0 || strncmp(digits, "0X", 2U) == 0)) {
+        digits += 2;
+        base = 16;
+    } else if (raw[0] != '+' && *digits == '#') {
+        digits += 1;
+        base = 16;
+    }
+    unsigned long long magnitude = 0ULL;
+    int ok = *digits != '\0';
+    for (const char *cursor = digits; ok && *cursor != '\0'; ++cursor) {
+        int digit = isdigit((unsigned char)*cursor) ? *cursor - '0'
+            : (base == 16 && isxdigit((unsigned char)*cursor) ? tolower((unsigned char)*cursor) - 'a' + 10 : -1);
+        if (digit < 0 || magnitude > (ULLONG_MAX - (unsigned long long)digit) / (unsigned long long)base) {
+            ok = 0;
+        } else {
+            magnitude = magnitude * (unsigned long long)base + (unsigned long long)digit;
+        }
+    }
+    if (!ok || magnitude > (unsigned long long)LLONG_MAX + (negative ? 1ULL : 0ULL)) {
         return -1;
     }
-    char *end = NULL;
-    long parsed = strtol(value, &end, 10);
-    int ok = end != value && *end == '\0' && parsed >= -2147483647L && parsed <= 2147483647L;
-    if (ok) {
-        *out = (int)parsed;
+    long long value = negative ? (magnitude == (unsigned long long)LLONG_MAX + 1ULL ? LLONG_MIN
+                                                                                 : -(long long)magnitude)
+                               : (long long)magnitude;
+    if (value < minimum || value > maximum) {
+        return -1;
     }
-    free(value);
-    return ok ? 0 : -1;
+    *out = value;
+    return 1;
 }
 
-static int admin_query_bool(const char *path, const char *key, int *out)
+/* A Long or Integer request parameter (admin_spring_number): 0 when absent, 1 with *out, -1 otherwise. */
+static int admin_query_number_param(const char *path, const char *key, long long minimum, long long maximum,
+                                    long long *out)
 {
-    char *value = admin_query_string(path, key);
-    if (value == NULL) {
+    char *raw = admin_query_string(path, key);
+    if (raw == NULL) {
+        return 0;
+    }
+    int rc = admin_spring_number(raw, minimum, maximum, out);
+    free(raw);
+    return rc;
+}
+
+/* An int request parameter as Spring converts it; -1 when it is absent, empty or does not convert. */
+static int admin_query_int_any(const char *path, const char *key, int *out)
+{
+    long long value = 0;
+    if (admin_query_number_param(path, key, INT_MIN, INT_MAX, &value) != 1) {
         return -1;
     }
-    if (strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 || strcmp(value, "True") == 0
-        || strcmp(value, "1") == 0) {
-        *out = 1;
-        free(value);
+    *out = (int)value;
+    return 0;
+}
+
+/*
+ * A Boolean request parameter as Spring converts it (StringToBooleanConverter): trimmed, true, on,
+ * yes or 1 and false, off, no or 0 in any case; an empty value is absent. 0 when absent, 1 with
+ * *out set, -1 when the value does not convert (Spring answers 400).
+ */
+static int admin_query_boolean_param(const char *path, const char *key, int *out)
+{
+    static const char *const truths[] = {"true", "on", "yes", "1"};
+    static const char *const falsehoods[] = {"false", "off", "no", "0"};
+    char *raw = admin_query_string(path, key);
+    if (raw == NULL) {
         return 0;
     }
-    if (strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 || strcmp(value, "False") == 0
-        || strcmp(value, "0") == 0) {
-        *out = 0;
-        free(value);
+    char *value = raw;
+    while (isspace((unsigned char)*value)) ++value;
+    size_t len = strlen(value);
+    while (len > 0U && isspace((unsigned char)value[len - 1U])) value[--len] = '\0';
+    int rc = len == 0U ? 0 : -1;
+    for (size_t i = 0U; rc == -1 && i < sizeof(truths) / sizeof(truths[0]); ++i) {
+        if (strcasecmp(value, truths[i]) == 0) {
+            *out = 1;
+            rc = 1;
+        } else if (strcasecmp(value, falsehoods[i]) == 0) {
+            *out = 0;
+            rc = 1;
+        }
+    }
+    free(raw);
+    return rc;
+}
+
+/* A boolean request parameter that converts; -1 when it is absent, empty or does not convert. */
+static int admin_query_bool(const char *path, const char *key, int *out)
+{
+    return admin_query_boolean_param(path, key, out) == 1 ? 0 : -1;
+}
+
+/*
+ * The answer to a request Spring rejects before the controller runs: a parameter it cannot convert
+ * (MethodArgumentTypeMismatchException) or a required body that is missing or not the expected JSON
+ * object (HttpMessageNotReadableException). Both are 400, whose Spring Boot error body names the
+ * status as its "error".
+ */
+static int write_spring_bad_request(char *out, size_t out_len)
+{
+    return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"Bad Request\"}");
+}
+
+/*
+ * A request member Jackson binds to an Integer: 0 when the body leaves it out or sends null, 1 with
+ * *value, -2 when it holds something Jackson does not convert (Spring answers 400).
+ */
+static int admin_json_integer_member(const char *body, const char *key, int *value)
+{
+    char *raw = st_json_get_top_level_raw(body, key);
+    int present = raw != NULL && strcmp(raw, "null") != 0;
+    free(raw);
+    if (!present) {
         return 0;
     }
-    free(value);
-    return -1;
+    return st_json_get_int(body, key, value) == 0 ? 1 : -2;
+}
+
+/*
+ * Jackson binding of one request member into a record component, as Spring's ObjectMapper does it
+ * by default: a member Jackson cannot convert fails the request with 400 (write_spring_bad_request).
+ * Each reader answers 0 when the member is absent or null, 1 with the value, -2 when it does not
+ * convert.
+ */
+
+/* Raw text of a top-level member; NULL when it is absent or JSON null. */
+static char *admin_json_member_raw(const char *body, const char *key)
+{
+    char *raw = body == NULL ? NULL : st_json_get_top_level_raw(body, key);
+    if (raw != NULL && strcmp(raw, "null") == 0) {
+        free(raw);
+        return NULL;
+    }
+    return raw;
+}
+
+/*
+ * A JSON value bound to a Long or Integer: an integer, a number with a fraction (truncated, as
+ * ACCEPT_FLOAT_AS_INT), or a string holding an optionally signed decimal integer; an empty string
+ * is null. Anything else, or a value outside [minimum, maximum], does not convert.
+ */
+static int admin_jackson_integral_raw(const char *raw, long long minimum, long long maximum, long long *out)
+{
+    if (raw == NULL || strcmp(raw, "null") == 0) {
+        return 0;
+    }
+    int rc = -2;
+    if (raw[0] == '"') {
+        size_t decoded_len = 0U;
+        char *text = st_json_decode_string(raw, &decoded_len);
+        if (text == NULL) {
+            return -2;
+        }
+        char *value = text;
+        while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+        size_t len = strlen(value);
+        while (len > 0U && (unsigned char)value[len - 1U] <= ' ') value[--len] = '\0';
+        const char *digits = value + (*value == '+' || *value == '-');
+        int ok = strlen(text) == decoded_len && *digits != '\0';
+        for (const char *cursor = digits; ok && *cursor != '\0'; ++cursor) {
+            ok = isdigit((unsigned char)*cursor) != 0;
+        }
+        if (len == 0U && strlen(text) == decoded_len) {
+            rc = 0;
+        } else if (ok) {
+            errno = 0;
+            long long parsed = strtoll(value, NULL, 10);
+            if (errno != ERANGE && parsed >= minimum && parsed <= maximum) {
+                *out = parsed;
+                rc = 1;
+            }
+        }
+        free(text);
+        return rc;
+    }
+    if (raw[0] != '-' && !isdigit((unsigned char)raw[0])) {
+        return -2;
+    }
+    char *end = NULL;
+    errno = 0;
+    if (strpbrk(raw, ".eE") == NULL) {
+        long long parsed = strtoll(raw, &end, 10);
+        if (errno != ERANGE && end != raw && *end == '\0' && parsed >= minimum && parsed <= maximum) {
+            *out = parsed;
+            rc = 1;
+        }
+    } else {
+        double parsed = strtod(raw, &end);
+        if (end != raw && *end == '\0' && parsed > (double)minimum - 1.0 && parsed < (double)maximum + 1.0) {
+            *out = (long long)parsed;
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+static int admin_jackson_long(const char *body, const char *key, long long minimum, long long maximum,
+                              long long *out)
+{
+    char *raw = admin_json_member_raw(body, key);
+    int rc = admin_jackson_integral_raw(raw, minimum, maximum, out);
+    free(raw);
+    return rc;
+}
+
+/*
+ * A JSON value bound to a Boolean: true or false, an integer (0 is false, any other true), or the
+ * string true or false written in lower, upper or title case; an empty string is null.
+ */
+static int admin_jackson_boolean_raw(const char *raw, int *out)
+{
+    if (raw == NULL || strcmp(raw, "null") == 0) {
+        return 0;
+    }
+    if (strcmp(raw, "true") == 0 || strcmp(raw, "false") == 0) {
+        *out = raw[0] == 't';
+        return 1;
+    }
+    if (raw[0] == '"') {
+        size_t decoded_len = 0U;
+        char *text = st_json_decode_string(raw, &decoded_len);
+        if (text == NULL) {
+            return -2;
+        }
+        char *value = text;
+        while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+        size_t len = strlen(value);
+        while (len > 0U && (unsigned char)value[len - 1U] <= ' ') value[--len] = '\0';
+        int rc = -2;
+        if (strlen(text) != decoded_len) {
+            rc = -2;
+        } else if (len == 0U || strcmp(value, "null") == 0) {
+            rc = 0;
+        } else if (strcmp(value, "true") == 0 || strcmp(value, "True") == 0 || strcmp(value, "TRUE") == 0) {
+            *out = 1;
+            rc = 1;
+        } else if (strcmp(value, "false") == 0 || strcmp(value, "False") == 0 || strcmp(value, "FALSE") == 0) {
+            *out = 0;
+            rc = 1;
+        }
+        free(text);
+        return rc;
+    }
+    long long number = 0;
+    if (strpbrk(raw, ".eE") == NULL && admin_jackson_integral_raw(raw, LLONG_MIN, LLONG_MAX, &number) == 1) {
+        *out = number != 0;
+        return 1;
+    }
+    return -2;
+}
+
+static int admin_jackson_boolean(const char *body, const char *key, int *out)
+{
+    char *raw = admin_json_member_raw(body, key);
+    int rc = admin_jackson_boolean_raw(raw, out);
+    free(raw);
+    return rc;
+}
+
+/* A JSON value bound to a String: a string, or the literal text of a number or boolean. */
+static int admin_jackson_string(const char *body, const char *key, char **out)
+{
+    *out = NULL;
+    char *raw = admin_json_member_raw(body, key);
+    if (raw == NULL) {
+        return 0;
+    }
+    if (raw[0] == '{' || raw[0] == '[') {
+        free(raw);
+        return -2;
+    }
+    if (raw[0] != '"') {
+        *out = raw;
+        return 1;
+    }
+    size_t decoded_len = 0U;
+    *out = st_json_decode_string(raw, &decoded_len);
+    free(raw);
+    return *out == NULL ? -2 : 1;
+}
+
+/*
+ * The elements of a JSON array member, each as raw text (the caller frees them with
+ * st_json_free_string_array). 0 when the member is absent or null, 1 with the elements, -2 when it
+ * is not an array: Jackson binds no List from a single value or an empty string.
+ */
+static int admin_jackson_array(const char *body, const char *key, char ***items, size_t *count)
+{
+    *items = NULL;
+    *count = 0U;
+    char *raw = admin_json_member_raw(body, key);
+    if (raw == NULL) {
+        return 0;
+    }
+    int rc = -2;
+    if (raw[0] == '[') {
+        size_t wrapped_len = strlen(raw) + 8U;
+        char *wrapped = (char *)malloc(wrapped_len);
+        if (wrapped != NULL) {
+            snprintf(wrapped, wrapped_len, "{\"v\":%s}", raw);
+            rc = st_json_get_raw_array(wrapped, "v", items, count) == 0 ? 1 : -2;
+            free(wrapped);
+        }
+    }
+    free(raw);
+    return rc;
+}
+
+/*
+ * A List<Long> member: every element converts as a Long or is null. ids gets the positive ones in
+ * first-seen order without repeats, as Java PeerServiceDiscovery.encodeClientIds keeps them; *count
+ * is how many that is.
+ */
+static int admin_jackson_client_ids(const char *body, const char *key, long long **ids, size_t *count)
+{
+    *ids = NULL;
+    *count = 0U;
+    char **items = NULL;
+    size_t item_count = 0U;
+    int rc = admin_jackson_array(body, key, &items, &item_count);
+    if (rc != 1) {
+        return rc;
+    }
+    long long *unique = (long long *)calloc(item_count == 0U ? 1U : item_count, sizeof(*unique));
+    if (unique == NULL) {
+        st_json_free_string_array(items, item_count);
+        return -2;
+    }
+    size_t unique_count = 0U;
+    for (size_t i = 0U; rc == 1 && i < item_count; ++i) {
+        long long id = 0;
+        int element = admin_jackson_integral_raw(items[i], LLONG_MIN, LLONG_MAX, &id);
+        if (element < 0) {
+            rc = -2;
+        } else if (element == 1 && id > 0) {
+            int seen = 0;
+            for (size_t j = 0U; !seen && j < unique_count; ++j) seen = unique[j] == id;
+            if (!seen) unique[unique_count++] = id;
+        }
+    }
+    st_json_free_string_array(items, item_count);
+    if (rc != 1) {
+        free(unique);
+        return rc;
+    }
+    *ids = unique;
+    *count = unique_count;
+    return 1;
+}
+
+/* A required request body Jackson binds into a record or Map: present and a JSON object. */
+static int admin_body_is_object(const char *body)
+{
+    return body != NULL && st_json_is_valid_object(body);
+}
+
+/*
+ * A @PathVariable long: 1 with *id when path is prefix followed by one non-empty segment that
+ * converts (any sign, 0 included, as Spring binds it before the service looks it up), -2 when that
+ * segment does not convert (Spring answers 400), 0 when path does not have that shape.
+ */
+static int admin_path_long(const char *path, const char *prefix, long long *id)
+{
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0) {
+        return 0;
+    }
+    const char *segment = path + prefix_len;
+    size_t segment_len = strcspn(segment, "?");
+    if (segment_len == 0U || memchr(segment, '/', segment_len) != NULL) {
+        return 0;
+    }
+    char text[64];
+    if (segment_len >= sizeof(text)) {
+        return -2;
+    }
+    memcpy(text, segment, segment_len);
+    text[segment_len] = '\0';
+    return admin_spring_number(text, LLONG_MIN, LLONG_MAX, id) == 1 ? 1 : -2;
+}
+
+/* admin_jackson_long for an Integer member. */
+static int admin_jackson_int(const char *body, const char *key, int *out)
+{
+    long long value = 0;
+    int rc = admin_jackson_long(body, key, INT_MIN, INT_MAX, &value);
+    if (rc == 1) {
+        *out = (int)value;
+    }
+    return rc;
+}
+
+/*
+ * Spring's binding of a required @RequestBody record as far as its Boolean, Integer and Long
+ * members go (comma-separated names): 0 when the body is a JSON object whose named members are
+ * absent, null or convert, else Spring's 400 written to out.
+ */
+static int admin_body_members_refusal(const char *body, const char *booleans, const char *ints, const char *longs,
+                                      char *out, size_t out_len)
+{
+    if (!admin_body_is_object(body)) {
+        return write_spring_bad_request(out, out_len);
+    }
+    const char *lists[3] = {booleans, ints, longs};
+    for (size_t kind = 0U; kind < 3U; ++kind) {
+        for (const char *names = lists[kind]; names != NULL && *names != '\0';) {
+            char name[48];
+            size_t len = strcspn(names, ",");
+            snprintf(name, sizeof(name), "%.*s", (int)len, names);
+            names += len + (names[len] == ',' ? 1U : 0U);
+            int flag = 0;
+            long long number = 0;
+            int bound = kind == 0U ? admin_jackson_boolean(body, name, &flag)
+                : admin_jackson_long(body, name, kind == 1U ? INT_MIN : LLONG_MIN, kind == 1U ? INT_MAX : LLONG_MAX,
+                                     &number);
+            if (bound == -2) {
+                return write_spring_bad_request(out, out_len);
+            }
+        }
+    }
+    return 0;
 }
 
 static int admin_parse_port_text(const char *text, int *out)
@@ -808,19 +1349,26 @@ static const char *normalize_management_role(const char *role);
  * A valid signature only says which account the token was issued to. Like Java's
  * ManagementContextResolver (ManagementUserService.resolveLocalTokenUser) every request re-reads
  * that account: the built-in admin must still be allowed to log in with its password, and a stored
- * user must still exist, be enabled and belong to the token's tenant. Tenant, role and admin rights
- * come from the record as it is now, so disabling, deleting or demoting a user takes effect on the
- * next request rather than when the token expires. This is one SQLite read per authenticated
- * request, the counterpart of Java's repository lookup; nothing is cached. Returns 0 when the
- * account resolves, -1 when it does not, and -2 when the user store cannot be read.
+ * user must still exist and be enabled. The subject is a login name of the token's tenant, so the
+ * lookup is (tenant_id, sub): a same-named user of another tenant is someone else. A token without
+ * a tenant claim predates tenant-scoped login names and names its account by the exact account
+ * key. Tenant, role and admin rights come from the record as it is now, so disabling, deleting or
+ * demoting a user takes effect on the next request rather than when the token expires. This is one
+ * SQLite read per authenticated request, the counterpart of Java's repository lookup; nothing is
+ * cached. Returns 0 when the account resolves, -1 when it does not, and -2 when the user store
+ * cannot be read.
  */
 static int admin_resolve_token_user(const st_security_token_claims *claims, st_admin_context *context)
 {
     memset(context, 0, sizeof(*context));
     const char *builtin_username = env_text("SPECUS_AUTH_USERNAME", "admin");
     const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
-    if (admin_ascii_casecmp(claims->username, builtin_username) == 0
-        && (claims->tenant_id[0] == '\0' || admin_ascii_casecmp(claims->tenant_id, default_tenant) == 0)) {
+    const char *token_tenant = claims->has_tenant ? claims->tenant_id : "";
+    /* A token with uid names an account row and is never the built-in admin's (section 6). */
+    int bound_to_account = claims->account_key[0] != '\0';
+    if (!bound_to_account
+        && admin_ascii_casecmp(claims->username, builtin_username) == 0
+        && (token_tenant[0] == '\0' || strcmp(token_tenant, default_tenant) == 0)) {
         if (!management_password_login_enabled()) {
             return -1;
         }
@@ -837,18 +1385,23 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
         return -1;
     }
     st_storage_management_user user;
-    int found = st_storage_find_management_user(database_path, claims->username, &user);
+    int found = token_tenant[0] != '\0'
+        ? st_storage_find_management_user_in_tenant(database_path, token_tenant, claims->username, &user)
+        : st_storage_find_management_user_by_account_key(database_path, claims->username, &user);
     if (found < 0) {
         return -2;
     }
-    if (found != 0
-        || !user.enabled
-        || (claims->tenant_id[0] != '\0' && strcmp(user.tenant_id, claims->tenant_id) != 0)) {
+    if (found != 0 || !user.enabled) {
+        return -1;
+    }
+    /* The token of a deleted account does not pass to a later account of the same login name. */
+    if (bound_to_account && strcmp(user.account_key, claims->account_key) != 0) {
         return -1;
     }
     snprintf(context->username, sizeof(context->username), "%s", user.username);
     snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
     snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+    snprintf(context->account_key, sizeof(context->account_key), "%s", user.account_key);
     context->admin = strcmp(context->role, "ADMIN") == 0;
     context->authenticated = 1;
     return 0;
@@ -1050,25 +1603,135 @@ static int admin_sb_append_nullable_json_string(st_admin_string_builder *builder
     return admin_sb_append_json_string(builder, value);
 }
 
-static int add_admin_tcp_mapping(st_admin_tcp_mapping *mappings,
-                                 size_t *mapping_count,
+/*
+ * A stored timestamp as Java shows it (Instant.toString). C's tables default created_at and
+ * updated_at to SQLite's CURRENT_TIMESTAMP, "YYYY-MM-DD HH:MM:SS" in UTC, which a browser reads as
+ * local time; Java writes ISO-8601 instants. That form becomes "YYYY-MM-DDTHH:MM:SSZ"; any other
+ * text is shown as stored.
+ */
+static int admin_sb_append_instant(st_admin_string_builder *builder, const char *value)
+{
+    static const char pattern[] = "dddd-dd-dd dd:dd:dd";
+    int sqlite_form = value != NULL && strlen(value) == sizeof(pattern) - 1U;
+    for (size_t i = 0U; sqlite_form && i < sizeof(pattern) - 1U; ++i) {
+        sqlite_form = pattern[i] == 'd' ? isdigit((unsigned char)value[i]) != 0 : value[i] == pattern[i];
+    }
+    if (!sqlite_form) {
+        return admin_sb_append_json_string(builder, value);
+    }
+    char iso[sizeof(pattern) + 1U];
+    memcpy(iso, value, sizeof(pattern) - 1U);
+    iso[10] = 'T';
+    iso[sizeof(pattern) - 1U] = 'Z';
+    iso[sizeof(pattern)] = '\0';
+    return admin_sb_append_json_string(builder, iso);
+}
+
+/* admin_sb_append_instant for a column Java leaves null until it is set: null when empty. */
+static int admin_sb_append_nullable_instant(st_admin_string_builder *builder, const char *value)
+{
+    return value == NULL || *value == '\0' ? admin_sb_append(builder, "null")
+                                           : admin_sb_append_instant(builder, value);
+}
+
+/* Spring StringUtils.hasText over ASCII: a character that Character.isWhitespace does not match. */
+static int admin_java_has_text(const char *value)
+{
+    for (const unsigned char *cursor = (const unsigned char *)value; cursor != NULL && *cursor != '\0'; ++cursor) {
+        if (*cursor != ' ' && (*cursor < 0x09U || *cursor > 0x0dU) && (*cursor < 0x1cU || *cursor > 0x1fU)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Trims value in place as Java String.trim: every character up to U+0020 at either end. */
+static char *admin_java_trim(char *value)
+{
+    if (value == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(value);
+    size_t start = 0U;
+    while (start < len && (unsigned char)value[start] <= ' ') ++start;
+    while (len > start && (unsigned char)value[len - 1U] <= ' ') --len;
+    memmove(value, value + start, len - start);
+    value[len - start] = '\0';
+    return value;
+}
+
+/* The length Java's String.length() reports for UTF-8 text: UTF-16 code units. */
+static size_t admin_utf16_length(const char *text)
+{
+    size_t count = 0U;
+    for (const unsigned char *cursor = (const unsigned char *)text; cursor != NULL && *cursor != '\0'; ++cursor) {
+        if ((*cursor & 0xc0U) != 0x80U) {
+            count += *cursor >= 0xf0U ? 2U : 1U;
+        }
+    }
+    return count;
+}
+
+/* Grows *items, of item_size bytes each, so that it holds one more than count. */
+static int admin_grow_array(void **items, size_t *capacity, size_t count, size_t item_size)
+{
+    if (count < *capacity) {
+        return 0;
+    }
+    size_t next = *capacity == 0U ? 16U : *capacity * 2U;
+    void *grown = next < *capacity || next > SIZE_MAX / item_size ? NULL : realloc(*items, next * item_size);
+    if (grown == NULL) {
+        return -1;
+    }
+    *items = grown;
+    *capacity = next;
+    return 0;
+}
+
+static int add_admin_tcp_mapping(st_admin_tcp_mapping_list *mappings,
                                  int port,
                                  const char *target_address,
                                  int target_port)
 {
-    if (*mapping_count >= ST_ADMIN_MAX_TCP_MAPPINGS || target_address == NULL || *target_address == '\0'
-        || strlen(target_address) >= sizeof(mappings[0].specus_address)) {
+    if (target_address == NULL || *target_address == '\0'
+        || strlen(target_address) >= sizeof(mappings->items[0].specus_address)) {
         return -1;
     }
-    st_admin_tcp_mapping *mapping = &mappings[*mapping_count];
+    void *items = mappings->items;
+    if (admin_grow_array(&items, &mappings->capacity, mappings->count, sizeof(st_admin_tcp_mapping)) != 0) {
+        return -1;
+    }
+    mappings->items = (st_admin_tcp_mapping *)items;
+    st_admin_tcp_mapping *mapping = &mappings->items[mappings->count++];
     mapping->port = port;
     strcpy(mapping->specus_address, target_address);
     mapping->specus_port = target_port;
-    ++(*mapping_count);
     return 0;
 }
 
-static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping_count)
+static int add_admin_http_route(st_admin_http_route_list *routes,
+                                const char *route,
+                                const char *target_base_url,
+                                int insecure_skip_verify)
+{
+    if (route == NULL || target_base_url == NULL
+        || strlen(route) >= sizeof(routes->items[0].route)
+        || strlen(target_base_url) >= sizeof(routes->items[0].target_base_url)) {
+        return -1;
+    }
+    void *items = routes->items;
+    if (admin_grow_array(&items, &routes->capacity, routes->count, sizeof(st_admin_http_route)) != 0) {
+        return -1;
+    }
+    routes->items = (st_admin_http_route *)items;
+    st_admin_http_route *item = &routes->items[routes->count++];
+    strcpy(item->route, route);
+    strcpy(item->target_base_url, target_base_url);
+    item->insecure_skip_verify = insecure_skip_verify;
+    return 0;
+}
+
+static int load_env_tcp_mappings(st_admin_tcp_mapping_list *mappings)
 {
     const char *raw = getenv("SPECUS_TCP_MAPPINGS");
     if (raw == NULL || *raw == '\0') {
@@ -1102,7 +1765,7 @@ static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping
         int target_port = 0;
         if (admin_parse_port_text(public_port_text, &public_port) != 0
             || admin_parse_port_text(target_port_text, &target_port) != 0
-            || add_admin_tcp_mapping(mappings, mapping_count, public_port, target_host, target_port) != 0) {
+            || add_admin_tcp_mapping(mappings, public_port, target_host, target_port) != 0) {
             free(copy);
             return -1;
         }
@@ -1112,9 +1775,25 @@ static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping
     return 0;
 }
 
-static int load_database_tcp_mappings(const char *client_name,
-                                      st_admin_tcp_mapping *mappings,
-                                      size_t *mapping_count)
+/* The enabled mappings the database holds for client_name, whether or not the client is enabled. */
+static int add_stored_tcp_mappings(const char *database_path,
+                                   const char *client_name,
+                                   st_admin_tcp_mapping_list *mappings)
+{
+    st_storage_mapping *stored = NULL;
+    size_t stored_count = 0;
+    if (st_storage_load_mappings(database_path, client_name, &stored, &stored_count) != 0) {
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stored_count; ++i) {
+        rc = add_admin_tcp_mapping(mappings, stored[i].listen_port, stored[i].target_address, stored[i].target_port);
+    }
+    free(stored);
+    return rc;
+}
+
+static int load_database_tcp_mappings(const char *client_name, st_admin_tcp_mapping_list *mappings)
 {
     const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') {
@@ -1124,40 +1803,20 @@ static int load_database_tcp_mappings(const char *client_name,
         || st_storage_client_enabled(database_path, client_name) != 0) {
         return -1;
     }
-    st_storage_mapping stored[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t stored_count = 0;
-    if (st_storage_load_mappings(database_path,
-                                 client_name,
-                                 stored,
-                                 ST_ADMIN_MAX_TCP_MAPPINGS,
-                                 &stored_count) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < stored_count; ++i) {
-        if (add_admin_tcp_mapping(mappings,
-                                  mapping_count,
-                                  stored[i].listen_port,
-                                  stored[i].target_address,
-                                  stored[i].target_port)
-            != 0) {
-            return -1;
-        }
-    }
-    return 0;
+    return add_stored_tcp_mappings(database_path, client_name, mappings);
 }
 
-static int load_current_tcp_mappings(const char *client_name,
-                                     st_admin_tcp_mapping *mappings,
-                                     size_t *mapping_count)
+/* The mappings client_name is sent: its enabled database ones, then SPECUS_TCP_MAPPINGS. */
+static int load_current_tcp_mappings(const char *client_name, st_admin_tcp_mapping_list *mappings)
 {
-    *mapping_count = 0;
-    return load_database_tcp_mappings(client_name, mappings, mapping_count) != 0
-            || load_env_tcp_mappings(mappings, mapping_count) != 0
+    mappings->count = 0;
+    return load_database_tcp_mappings(client_name, mappings) != 0
+            || load_env_tcp_mappings(mappings) != 0
         ? -1
         : 0;
 }
 
-static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count)
+static int load_env_http_routes(st_admin_http_route_list *routes)
 {
     const char *raw = getenv("SPECUS_HTTP_ROUTES");
     if (raw == NULL || *raw == '\0') {
@@ -1170,10 +1829,6 @@ static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count
     char *cursor = copy;
     char *token = admin_next_csv_token(&cursor);
     while (token != NULL) {
-        if (*route_count >= ST_ADMIN_MAX_TCP_MAPPINGS) {
-            free(copy);
-            return -1;
-        }
         char *entry = admin_trim(token);
         char *equals = strchr(entry, '=');
         if (equals == NULL) {
@@ -1183,24 +1838,35 @@ static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count
         *equals = '\0';
         char *route = admin_trim(entry);
         char *target = admin_trim(equals + 1);
-        if (*route == '\0' || *target == '\0'
-            || strlen(route) >= sizeof(routes[0].route)
-            || strlen(target) >= sizeof(routes[0].target_base_url)) {
+        if (*route == '\0' || *target == '\0' || add_admin_http_route(routes, route, target, 0) != 0) {
             free(copy);
             return -1;
         }
-        st_admin_http_route *item = &routes[*route_count];
-        strcpy(item->route, route);
-        strcpy(item->target_base_url, target);
-        item->insecure_skip_verify = 0;
-        ++(*route_count);
         token = admin_next_csv_token(&cursor);
     }
     free(copy);
     return 0;
 }
 
-static int load_database_http_routes(const char *client_name, st_admin_http_route *routes, size_t *route_count)
+/* The enabled routes the database holds for client_name, whether or not the client is enabled. */
+static int add_stored_http_routes(const char *database_path,
+                                  const char *client_name,
+                                  st_admin_http_route_list *routes)
+{
+    st_storage_http_route *stored = NULL;
+    size_t stored_count = 0;
+    if (st_storage_load_http_routes(database_path, client_name, &stored, &stored_count) != 0) {
+        return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stored_count; ++i) {
+        rc = add_admin_http_route(routes, stored[i].route, stored[i].target_base_url, stored[i].insecure_skip_verify);
+    }
+    free(stored);
+    return rc;
+}
+
+static int load_database_http_routes(const char *client_name, st_admin_http_route_list *routes)
 {
     const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') {
@@ -1210,37 +1876,56 @@ static int load_database_http_routes(const char *client_name, st_admin_http_rout
         || st_storage_client_enabled(database_path, client_name) != 0) {
         return -1;
     }
-    st_storage_http_route stored[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t stored_count = 0;
-    if (st_storage_load_http_routes(database_path,
-                                    client_name,
-                                    stored,
-                                    ST_ADMIN_MAX_TCP_MAPPINGS,
-                                    &stored_count) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < stored_count; ++i) {
-        if (*route_count >= ST_ADMIN_MAX_TCP_MAPPINGS
-            || strlen(stored[i].route) >= sizeof(routes[0].route)
-            || strlen(stored[i].target_base_url) >= sizeof(routes[0].target_base_url)) {
-            return -1;
-        }
-        st_admin_http_route *item = &routes[*route_count];
-        strcpy(item->route, stored[i].route);
-        strcpy(item->target_base_url, stored[i].target_base_url);
-        item->insecure_skip_verify = stored[i].insecure_skip_verify;
-        ++(*route_count);
-    }
-    return 0;
+    return add_stored_http_routes(database_path, client_name, routes);
 }
 
-static int load_current_http_routes(const char *client_name, st_admin_http_route *routes, size_t *route_count)
+/* The routes client_name is sent: its enabled database ones, then SPECUS_HTTP_ROUTES. */
+static int load_current_http_routes(const char *client_name, st_admin_http_route_list *routes)
 {
-    *route_count = 0;
-    return load_database_http_routes(client_name, routes, route_count) != 0
-            || load_env_http_routes(routes, route_count) != 0
+    routes->count = 0;
+    return load_database_http_routes(client_name, routes) != 0
+            || load_env_http_routes(routes) != 0
         ? -1
         : 0;
+}
+
+/* One specusConfigList entry, as the login answer and NAT_CONTROL (main.c) carry it. */
+static int append_specus_config_entry(st_admin_string_builder *builder,
+                                      int port,
+                                      const char *specus_address,
+                                      int specus_port)
+{
+    char *target = st_json_escape(specus_address);
+    if (target == NULL) {
+        return -1;
+    }
+    int rc = admin_sb_appendf(builder,
+                              "{\"port\":%d,\"specusAddress\":\"%s\",\"specusPort\":%d}",
+                              port,
+                              target,
+                              specus_port);
+    free(target);
+    return rc;
+}
+
+/* One httpSpecusConfigList entry, as the login answer and NAT_CONTROL (main.c) carry it. */
+static int append_http_route_config_entry(st_admin_string_builder *builder,
+                                          const char *route_name,
+                                          const char *target_base_url,
+                                          int insecure_skip_verify)
+{
+    char *route = st_json_escape(route_name);
+    char *target = st_json_escape(target_base_url);
+    int rc = route == NULL || target == NULL
+        ? -1
+        : admin_sb_appendf(builder,
+                           "{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"insecureSkipVerify\":%s}",
+                           route,
+                           target,
+                           insecure_skip_verify ? "true" : "false");
+    free(route);
+    free(target);
+    return rc;
 }
 
 static int append_specus_config_list(st_admin_string_builder *builder,
@@ -1248,18 +1933,11 @@ static int append_specus_config_list(st_admin_string_builder *builder,
                                      size_t mapping_count)
 {
     for (size_t i = 0; i < mapping_count; ++i) {
-        char *target = st_json_escape(mappings[i].specus_address);
-        if (target == NULL) {
-            return -1;
-        }
-        int rc = admin_sb_appendf(builder,
-                                  "%s{\"port\":%d,\"specusAddress\":\"%s\",\"specusPort\":%d}",
-                                  i == 0 ? "" : ",",
-                                  mappings[i].port,
-                                  target,
-                                  mappings[i].specus_port);
-        free(target);
-        if (rc != 0) {
+        if ((i > 0 && admin_sb_append(builder, ",") != 0)
+            || append_specus_config_entry(builder,
+                                          mappings[i].port,
+                                          mappings[i].specus_address,
+                                          mappings[i].specus_port) != 0) {
             return -1;
         }
     }
@@ -1271,22 +1949,11 @@ static int append_http_route_config_list(st_admin_string_builder *builder,
                                          size_t route_count)
 {
     for (size_t i = 0; i < route_count; ++i) {
-        char *route = st_json_escape(routes[i].route);
-        char *target = st_json_escape(routes[i].target_base_url);
-        if (route == NULL || target == NULL) {
-            free(route);
-            free(target);
-            return -1;
-        }
-        int rc = admin_sb_appendf(builder,
-                                  "%s{\"route\":\"%s\",\"targetBaseUrl\":\"%s\",\"insecureSkipVerify\":%s}",
-                                  i == 0 ? "" : ",",
-                                  route,
-                                  target,
-                                  routes[i].insecure_skip_verify ? "true" : "false");
-        free(route);
-        free(target);
-        if (rc != 0) {
+        if ((i > 0 && admin_sb_append(builder, ",") != 0)
+            || append_http_route_config_entry(builder,
+                                              routes[i].route,
+                                              routes[i].target_base_url,
+                                              routes[i].insecure_skip_verify) != 0) {
             return -1;
         }
     }
@@ -1319,16 +1986,21 @@ static int load_client_api_key(uint8_t key[ST_SHA256_LEN])
 /*
  * protocol/spec/client-auth.md: a login whose signature verified consumes its (apiKey, nonce)
  * pair, and the pair again within 120 s is refused. Java answers a replay with 400 and this body;
- * a full in-memory store answers 503 with Retry-After so the client retries rather than gives up.
- * Returns 0 when the pair was fresh, else the length of the response written to out.
+ * a full in-memory store or a failing database answers 503 with Retry-After so the client retries
+ * rather than gives up. The pairs live in the database when there is one (database_path), as in
+ * Java, so a restart does not forget them. Returns 0 when the pair was fresh, else the length of
+ * the response written to out.
  */
-static int consume_client_auth_nonce(const char *api_key, const char *nonce, char *out, size_t out_len)
+static int consume_client_auth_nonce(const char *database_path,
+                                     const char *api_key,
+                                     const char *nonce,
+                                     char *out,
+                                     size_t out_len)
 {
-    int64_t retry_after_seconds = 0;
-    st_client_auth_nonce_result result = st_client_auth_nonce_consume(api_key,
-                                                                      nonce,
-                                                                      current_time_millis(),
-                                                                      &retry_after_seconds);
+    int64_t retry_after_seconds = 1;
+    st_client_auth_nonce_result result = database_path != NULL
+        ? st_client_auth_nonce_consume_stored(database_path, api_key, nonce, current_time_millis())
+        : st_client_auth_nonce_consume(api_key, nonce, current_time_millis(), &retry_after_seconds);
     if (result == ST_CLIENT_AUTH_NONCE_ACCEPTED) {
         return 0;
     }
@@ -1364,7 +2036,7 @@ static int client_auth_netty_tls(void)
     return tls.mode != ST_TLS_DISABLED || tls.terminated_upstream;
 }
 
-static int validate_client_api_login(const char *body, char *out, size_t out_len)
+static int validate_client_api_login(const char *database_path, const char *body, char *out, size_t out_len)
 {
     if (body == NULL || *body == '\0') {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"client auth request body is required\"}");
@@ -1456,7 +2128,7 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
     memset(actual_signature, 0, sizeof(actual_signature));
     memset(expected_signature, 0, sizeof(expected_signature));
     /* Only a request whose signature verified may consume its nonce. */
-    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(api_key, nonce, out, out_len);
+    int nonce_rc = invalid ? 0 : consume_client_auth_nonce(database_path, api_key, nonce, out, out_len);
     free(api_key);
     free(timestamp);
     free(nonce);
@@ -1482,14 +2154,15 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
     }
 
     const char *client_name_raw = env_text("SPECUS_CLIENT_NAME", "Demo client");
-    st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t mapping_count = 0;
-    if (load_current_tcp_mappings(client_name_raw, mappings, &mapping_count) != 0) {
+    st_admin_tcp_mapping_list mappings = {0};
+    if (load_current_tcp_mappings(client_name_raw, &mappings) != 0) {
+        free(mappings.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp mapping response build failed\"}");
     }
-    st_admin_http_route http_routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t http_route_count = 0;
-    if (load_current_http_routes(client_name_raw, http_routes, &http_route_count) != 0) {
+    st_admin_http_route_list http_routes = {0};
+    if (load_current_http_routes(client_name_raw, &http_routes) != 0) {
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response build failed\"}");
     }
 
@@ -1517,6 +2190,8 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
         free(client_name);
         free(netty_host);
         free(token);
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response build failed\"}");
     }
 
@@ -1547,13 +2222,13 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     client_id,
                                     client_name);
     if (build_rc == 0) {
-        build_rc = append_specus_config_list(&builder, mappings, mapping_count);
+        build_rc = append_specus_config_list(&builder, mappings.items, mappings.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "],\"httpSpecusConfigList\":[");
     }
     if (build_rc == 0) {
-        build_rc = append_http_route_config_list(&builder, http_routes, http_route_count);
+        build_rc = append_http_route_config_list(&builder, http_routes.items, http_routes.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "]}");
@@ -1563,11 +2238,13 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
     free(client_name);
     free(netty_host);
     free(token);
+    free(mappings.items);
+    free(http_routes.items);
     if (build_rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response too large\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -1905,34 +2582,74 @@ static int normalize_public_host(const char *value, char *out, size_t out_len)
     return 0;
 }
 
+/*
+ * A port setting as Java binds it: the default when unset, otherwise the configured number, where
+ * 0 (or anything that is not a port) means the endpoint it names is not configured.
+ */
+static int env_port(const char *name, int fallback)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return fallback;
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= 65535 ? (int)parsed : 0;
+}
+
+static int has_text(const char *value)
+{
+    if (value == NULL) return 0;
+    while (*value != '\0') {
+        if (!isspace((unsigned char)*value)) return 1;
+        ++value;
+    }
+    return 0;
+}
+
+/*
+ * The self-hosted STUN endpoint (Java PublicPeerMeshResource.selfHostedStunHost and
+ * selfHostedStunPort): a standalone STUN server when both its address and port are configured,
+ * otherwise the embedded listener at the public address. A standalone address without a port
+ * falls back instead of publishing an endpoint nobody listens on.
+ */
 static int public_primary_stun(const char *host_hint,
                                char host[384],
                                int *port,
                                int *standalone)
 {
     const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS");
-    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
-    *standalone = configured != NULL && *configured != '\0' && configured_port > 0;
+    int configured_port = env_port("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", 3478);
+    *standalone = has_text(configured) && configured_port > 0;
     if (*standalone) {
         *port = configured_port;
         return normalize_public_host(configured, host, 384U);
     }
     configured = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
-    if (configured == NULL || *configured == '\0') configured = host_hint;
+    if (!has_text(configured)) configured = host_hint;
     *port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
     return *port > 0 ? normalize_public_host(configured, host, 384U) : -1;
 }
 
-static int public_alternate_stun(char host[384], int *port)
+/*
+ * The alternate STUN address (Java standaloneAlternateStunHost): the standalone alternate address,
+ * else the RFC 5780 alternate public address.
+ */
+static int public_alternate_stun_host(char host[384])
 {
     const char *configured = getenv("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS");
-    int configured_port = env_int("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
-    if (configured == NULL || *configured == '\0') {
-        configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
-        configured_port = env_int("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
-    }
-    *port = configured_port;
-    return configured_port > 0 ? normalize_public_host(configured, host, 384U) : -1;
+    if (!has_text(configured)) configured = getenv("SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS");
+    return has_text(configured) ? normalize_public_host(configured, host, 384U) : -1;
+}
+
+/*
+ * The alternate address with the second port, for RFC 5780 (Java standaloneAlternateStunPort): the
+ * standalone alternate port, else the NAT probe alternate port.
+ */
+static int public_alternate_stun(char host[384], int *port)
+{
+    int configured_port = env_port("SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", 0);
+    *port = configured_port > 0 ? configured_port
+        : env_port("SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", 3479);
+    return *port > 0 ? public_alternate_stun_host(host) : -1;
 }
 
 static int normalize_public_stun_url(const char *value, char *out, size_t out_len)
@@ -1989,11 +2706,15 @@ static size_t collect_public_stun_urls(char urls[][512], size_t max_urls,
                                 urls[count], sizeof(urls[count])) == 0) {
         ++count;
     }
+    /*
+     * The alternate address goes in on the primary STUN port (Java standaloneAlternateStunServer),
+     * whether or not a second port is configured: that one is only for RFC 5780 probing. Unlike
+     * Java it is listed only beside a published self-hosted server, never alone for a deployment
+     * whose STUN is off.
+     */
     char alternate_host[384];
-    int alternate_port = 0;
-    if (count < max_urls && standalone
-        && public_alternate_stun(alternate_host, &alternate_port) == 0) {
-        (void)alternate_port;
+    if (count < max_urls && (peer_mesh_enabled || standalone) && primary_port > 0
+        && public_alternate_stun_host(alternate_host) == 0) {
         char normalized[512];
         if (build_public_ice_url("stun", alternate_host, primary_port, "",
                                  normalized, sizeof(normalized)) == 0
@@ -2041,7 +2762,9 @@ static int build_public_stun_config_response(const char *host_hint, char *out, s
         if (i > 0) rc = admin_sb_append(&builder, ",");
         if (rc == 0) rc = admin_sb_append_json_string(&builder, urls[i]);
     }
-    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}", port);
+    /* The embedded STUN/TURN port, also when a standalone STUN server is the one published. */
+    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}",
+                                       env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478));
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"stun config response failed\"}");
@@ -2177,14 +2900,15 @@ static int append_db_client_auth_response(char *out,
                                           const st_storage_client_session *session,
                                           const char *access_token)
 {
-    st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t mapping_count = 0;
-    if (load_current_tcp_mappings(identity->client_name, mappings, &mapping_count) != 0) {
+    st_admin_tcp_mapping_list mappings = {0};
+    if (load_current_tcp_mappings(identity->client_name, &mappings) != 0) {
+        free(mappings.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp mapping response build failed\"}");
     }
-    st_admin_http_route http_routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t http_route_count = 0;
-    if (load_current_http_routes(identity->client_name, http_routes, &http_route_count) != 0) {
+    st_admin_http_route_list http_routes = {0};
+    if (load_current_http_routes(identity->client_name, &http_routes) != 0) {
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response build failed\"}");
     }
 
@@ -2197,6 +2921,8 @@ static int append_db_client_auth_response(char *out,
         free(client_name);
         free(netty_host);
         free(token);
+        free(mappings.items);
+        free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response build failed\"}");
     }
 
@@ -2218,6 +2944,7 @@ static int append_db_client_auth_response(char *out,
     }
     if (peer_mesh_config == NULL) {
         free(tenant_id); free(client_name); free(netty_host); free(token);
+        free(mappings.items); free(http_routes.items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh response build failed\"}");
     }
     st_admin_string_builder builder = {0};
@@ -2242,13 +2969,13 @@ static int append_db_client_auth_response(char *out,
     if (build_rc == 0) build_rc = admin_sb_append(&builder, peer_mesh_config);
     if (build_rc == 0) build_rc = admin_sb_append(&builder, ",\"specusConfigList\":[");
     if (build_rc == 0) {
-        build_rc = append_specus_config_list(&builder, mappings, mapping_count);
+        build_rc = append_specus_config_list(&builder, mappings.items, mappings.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "],\"httpSpecusConfigList\":[");
     }
     if (build_rc == 0) {
-        build_rc = append_http_route_config_list(&builder, http_routes, http_route_count);
+        build_rc = append_http_route_config_list(&builder, http_routes.items, http_routes.count);
     }
     if (build_rc == 0) {
         build_rc = admin_sb_append(&builder, "]}");
@@ -2258,11 +2985,13 @@ static int append_db_client_auth_response(char *out,
     free(netty_host);
     free(token);
     free(peer_mesh_config);
+    free(mappings.items);
+    free(http_routes.items);
     if (build_rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response too large\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -2469,7 +3198,7 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(java_version);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client signature invalid or expired\"}");
     }
-    int nonce_rc = consume_client_auth_nonce(api_key, nonce, out, out_len);
+    int nonce_rc = consume_client_auth_nonce(database_path, api_key, nonce, out, out_len);
     if (nonce_rc != 0) {
         free(api_key);
         free(timestamp);
@@ -2508,6 +3237,35 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(java_version);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client identity build failed\"}");
     }
+    /*
+     * The identity names its account by id; the name it recorded may since belong to another
+     * account. As Java and Go do, the account is loaded by id within the credential's tenant, and its
+     * current name is what the session, the route snapshot and the response carry.
+     */
+    st_storage_client account;
+    int account_state = st_storage_get_client(database_path, identity.client_id, &account) != 0
+        || strcmp(account.tenant_id[0] == '\0' ? "default" : account.tenant_id,
+                  credential.tenant_id[0] == '\0' ? "default" : credential.tenant_id) != 0
+        ? -1
+        : (account.enabled ? 0 : 1);
+    if (account_state != 0) {
+        free(api_key);
+        free(timestamp);
+        free(nonce);
+        free(signature);
+        free(machine_fingerprint);
+        free(os_user);
+        free(hostname);
+        free(os_name);
+        free(os_version);
+        free(os_arch);
+        free(client_version);
+        free(java_version);
+        return account_state > 0
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端已停用\"}")
+            : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client account missing\"}");
+    }
+    snprintf(identity.client_name, sizeof(identity.client_name), "%s", account.client_name);
 
     char *peer_public_key = st_json_get_string(body, "peerPublicKey");
     if (peer_public_key != NULL && *peer_public_key != '\0'
@@ -2609,19 +3367,115 @@ static int build_client_auth_login_response(const char *body, char *out, size_t 
 {
     const char *database_path = admin_database_path();
     if (database_path != NULL
-        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
+        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        database_path = NULL;
+    }
+    if (database_path != NULL) {
         int db_response = build_database_client_auth_login_response(database_path, body, out, out_len);
         if (db_response != 0) {
             return db_response;
         }
     }
     if (client_api_auth_required()) {
-        int auth_rc = validate_client_api_login(body, out, out_len);
+        int auth_rc = validate_client_api_login(database_path, body, out, out_len);
         if (auth_rc != 0) {
             return auth_rc;
         }
     }
     return build_client_auth_login_success_response(out, out_len);
+}
+
+/*
+ * Java's management lists have no row bound, but the storage lists fill a caller's array and fail
+ * once there are more rows than it holds (that used to turn 129 clients, or 65 TCP mappings in the
+ * whole database, into a 500 for every tenant), or quietly stop there (credentials and the client
+ * catalogue were cut at 128 rows). These read every row into a heap array that grows until it
+ * fits; the caller frees it. NULL on a database error.
+ */
+#define ST_ADMIN_LIST_INITIAL 64U
+#define ST_ADMIN_LIST_MAX (1024U * 1024U)
+
+typedef struct {
+    const char *path;
+    const char *text;
+    long long id;
+} admin_list_args;
+
+typedef int (*admin_list_fn)(const admin_list_args *args, void *items, size_t capacity, size_t *count);
+
+static void *admin_list_all(admin_list_fn list, const admin_list_args *args, size_t item_size, size_t *count)
+{
+    *count = 0U;
+    for (size_t capacity = ST_ADMIN_LIST_INITIAL; capacity <= ST_ADMIN_LIST_MAX; capacity *= 4U) {
+        void *items = calloc(capacity, item_size);
+        if (items == NULL) {
+            return NULL;
+        }
+        size_t listed = 0U;
+        int rc = list(args, items, capacity, &listed);
+        /* A full array may hide more rows: some lists fail then, others stop there silently. */
+        if (rc == 0 && listed < capacity) {
+            *count = listed;
+            return items;
+        }
+        free(items);
+        if (listed < capacity) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int admin_list_client_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_clients(args->path, (st_storage_client *)items, capacity, count);
+}
+
+static int admin_list_credential_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_client_credentials(args->path, args->text, (st_storage_client_credential *)items,
+                                              capacity, count);
+}
+
+static int admin_list_user_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_management_users(args->path, args->text, (st_storage_management_user *)items,
+                                            capacity, count);
+}
+
+static int admin_list_download_rows(const admin_list_args *args, void *items, size_t capacity, size_t *count)
+{
+    return st_storage_list_client_download_links(args->path, (int)args->id,
+                                                 (st_storage_client_download_link *)items, capacity, count);
+}
+
+static st_storage_client *admin_list_all_clients(const char *path, size_t *count)
+{
+    admin_list_args args = {path, NULL, 0};
+    return (st_storage_client *)admin_list_all(admin_list_client_rows, &args, sizeof(st_storage_client), count);
+}
+
+static st_storage_client_credential *admin_list_all_credentials(const char *path, const char *tenant_id,
+                                                                size_t *count)
+{
+    admin_list_args args = {path, tenant_id, 0};
+    return (st_storage_client_credential *)admin_list_all(admin_list_credential_rows, &args,
+                                                          sizeof(st_storage_client_credential), count);
+}
+
+static st_storage_management_user *admin_list_all_users(const char *path, const char *tenant_id, size_t *count)
+{
+    admin_list_args args = {path, tenant_id, 0};
+    return (st_storage_management_user *)admin_list_all(admin_list_user_rows, &args,
+                                                        sizeof(st_storage_management_user), count);
+}
+
+static st_storage_client_download_link *admin_list_all_download_links(const char *path, int enabled_only,
+                                                                      size_t *count)
+{
+    admin_list_args args = {path, NULL, enabled_only};
+    return (st_storage_client_download_link *)admin_list_all(admin_list_download_rows, &args,
+                                                             sizeof(st_storage_client_download_link), count);
 }
 
 static int load_visible_tcp_mapping_count(const st_admin_context *context, size_t *mapping_count)
@@ -2632,26 +3486,25 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
         if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             return -1;
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             return -1;
         }
         for (size_t i = 0; i < client_count; ++i) {
             if (!admin_can_access_client(context, &clients[i])) {
                 continue;
             }
-            st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+            st_storage_mapping *mappings = NULL;
             size_t client_mapping_count = 0;
-            if (st_storage_list_mappings(database_path,
-                                         clients[i].id,
-                                         mappings,
-                                         ST_ADMIN_MAX_TCP_MAPPINGS,
-                                         &client_mapping_count) != 0) {
+            if (st_storage_list_mappings(database_path, clients[i].id, &mappings, &client_mapping_count) != 0) {
+                free(clients);
                 return -1;
             }
+            free(mappings);
             *mapping_count += client_mapping_count;
         }
+        free(clients);
         return 0;
     }
 
@@ -2664,20 +3517,102 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
     if (!admin_can_access_client(context, &client)) {
         return 0;
     }
-    st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    return load_current_tcp_mappings(client.client_name, mappings, mapping_count);
+    st_admin_tcp_mapping_list mappings = {0};
+    int rc = load_current_tcp_mappings(client.client_name, &mappings);
+    *mapping_count = mappings.count;
+    free(mappings.items);
+    return rc;
 }
 
+/* How many of the caller's connection records have this outcome (Java countBy...AndSuccess). */
+static int admin_count_connections(const char *database_path,
+                                   const st_admin_context *context,
+                                   int success,
+                                   long long *count)
+{
+    st_storage_connection first;
+    size_t listed = 0U;
+    return st_storage_list_connections_visible(database_path, 0, success, NULL, NULL, context->tenant_id,
+                                               context->username, context->admin, 0, 1, &first, 1U, &listed,
+                                               count);
+}
+
+/*
+ * GET /api/admin/overview as Java OverviewService: the caller's clients (an administrator's whole
+ * tenant), how many are online, their traffic, the successful and failed logins of the tenant (of
+ * the caller's clients for anyone else) and, for an administrator only, the tenant's open and
+ * refused public connections. C adds its server name, a status and the visible TCP mapping count.
+ */
 static int build_overview_response(const st_admin_context *context, char *out, size_t out_len)
 {
     size_t mapping_count = 0;
     if (load_visible_tcp_mapping_count(context, &mapping_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
     }
-    char body[256];
+    long long clients = 0;
+    long long online_clients = 0;
+    long long upload_bytes = 0;
+    long long download_bytes = 0;
+    long long successful_connections = 0;
+    long long failed_connections = 0;
+    const char *database_path = admin_database_path();
+    if (database_path != NULL) {
+        size_t client_count = 0U;
+        st_storage_client *all = admin_list_all_clients(database_path, &client_count);
+        if (all == NULL) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
+        }
+        for (size_t i = 0; i < client_count; ++i) {
+            if (!admin_can_access_client(context, &all[i])) {
+                continue;
+            }
+            st_admin_client_runtime_status runtime_status;
+            admin_get_client_runtime_status(all[i].id, all[i].client_name, &runtime_status);
+            ++clients;
+            online_clients += runtime_status.online ? 1 : 0;
+            upload_bytes += all[i].upload_bytes;
+            download_bytes += all[i].download_bytes;
+        }
+        free(all);
+        /* Someone without clients has no logins to count (Java answers 0 without asking). */
+        if ((context->admin || clients > 0)
+            && (admin_count_connections(database_path, context, 1, &successful_connections) != 0
+                || admin_count_connections(database_path, context, 0, &failed_connections) != 0)) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response failed\"}");
+        }
+    } else {
+        st_storage_client client = {0};
+        client.id = env_i64("SPECUS_CLIENT_ID", 1);
+        snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+        snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("SPECUS_CLIENT_NAME", "Demo client"));
+        snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+        if (admin_can_access_client(context, &client)) {
+            st_admin_client_runtime_status runtime_status;
+            admin_get_client_runtime_status(client.id, client.client_name, &runtime_status);
+            clients = 1;
+            online_clients = runtime_status.online ? 1 : 0;
+        }
+    }
+    long long external_connections = 0;
+    long long rejected_external_connections = 0;
+    if (context->admin) {
+        admin_external_connection_stats(context->tenant_id, &external_connections, &rejected_external_connections);
+    }
+    char body[512];
     int written = snprintf(body,
                            sizeof(body),
-                           "{\"server\":\"c\",\"status\":\"ok\",\"onlineClients\":0,\"tcpMappings\":%zu}",
+                           "{\"clients\":%lld,\"onlineClients\":%lld,\"successfulConnections\":%lld,"
+                           "\"failedConnections\":%lld,\"uploadBytes\":%lld,\"downloadBytes\":%lld,"
+                           "\"externalConnections\":%lld,\"rejectedExternalConnections\":%lld,"
+                           "\"server\":\"c\",\"status\":\"ok\",\"tcpMappings\":%zu}",
+                           clients,
+                           online_clients,
+                           successful_connections,
+                           failed_connections,
+                           upload_bytes,
+                           download_bytes,
+                           external_connections,
+                           rejected_external_connections,
                            mapping_count);
     if (written < 0 || (size_t)written >= sizeof(body)) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"overview response too large\"}");
@@ -2795,15 +3730,22 @@ static void record_direct_http_traffic(const char *client_name,
                                              download_bytes);
 }
 
+/*
+ * response_externalized: media capture stored the response body, so the record keeps its size
+ * but not its bytes (Java TrafficInspectionService, externalizedMediaKeepsActualSizeWithout...).
+ */
 static void record_direct_http_exchange(const char *client_name,
                                         const char *route,
                                         const st_direct_http_request *request,
                                         const st_direct_http_response *response,
                                         size_t response_bytes,
+                                        int response_externalized,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
-    if (client_name == NULL || route == NULL || request == NULL || response == NULL) {
+    /* Java captures only with specus.traffic.capture-detail-enabled and the route's own switch. */
+    if (client_name == NULL || route == NULL || request == NULL || response == NULL
+        || !st_traffic_capture_enabled()) {
         return;
     }
     const char *database_path = admin_database_path();
@@ -2815,8 +3757,8 @@ static void record_direct_http_exchange(const char *client_name,
     }
     st_storage_client client;
     st_storage_http_route http_route;
+    /* As in Java, the route's switch decides, also for the refusal of a disabled client or route. */
     if (st_storage_get_client_by_name(database_path, client_name, &client) != 0
-        || !client.enabled
         || st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) != 0
         || !http_route.detail_capture_enabled) {
         return;
@@ -2835,11 +3777,17 @@ static void record_direct_http_exchange(const char *client_name,
     char *response_headers = admin_join_headers(response->headers, response->headers_len);
     char *request_content_type = admin_header_array_value(request->headers, request->headers_len, "Content-Type");
     char *response_content_type = admin_header_array_value(response->headers, response->headers_len, "Content-Type");
+    char *request_content_encoding = admin_header_array_value(request->headers, request->headers_len,
+                                                              "Content-Encoding");
+    char *response_content_encoding = admin_header_array_value(response->headers, response->headers_len,
+                                                               "Content-Encoding");
     if (request_headers == NULL || response_headers == NULL) {
         free(request_headers);
         free(response_headers);
         free(request_content_type);
         free(response_content_type);
+        free(request_content_encoding);
+        free(response_content_encoding);
         return;
     }
     st_storage_http_exchange_record record = {
@@ -2866,8 +3814,10 @@ static void record_direct_http_exchange(const char *client_name,
         .response_headers = response_headers,
         .request_body = request->body,
         .request_body_len = request->body_len,
-        .response_body = response->body,
-        .response_body_len = response->body_len,
+        .response_body = response_externalized ? NULL : response->body,
+        .response_body_len = response_externalized ? 0U : response->body_len,
+        .request_content_encoding = request_content_encoding,
+        .response_content_encoding = response_content_encoding,
         .captured_at = captured_at
     };
     (void)st_storage_record_http_exchange(database_path, &record);
@@ -2875,6 +3825,8 @@ static void record_direct_http_exchange(const char *client_name,
     free(response_headers);
     free(request_content_type);
     free(response_content_type);
+    free(request_content_encoding);
+    free(response_content_encoding);
 }
 
 static int ensure_admin_database(const char **path, char *out, size_t out_len)
@@ -2922,6 +3874,27 @@ static int handle_database_initialize(const st_admin_context *context, char *out
     if (init_response != 0) {
         return init_response;
     }
+    /*
+     * Java DatabaseInitializer.initialize(tenant): the demo client goes to the caller's tenant,
+     * owned by the built-in administrator. When another tenant holds the name, Java's insert fails
+     * on the unique client_name and GlobalExceptionHandler answers 400.
+     */
+    if (env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) {
+        char owner[81];
+        snprintf(owner, sizeof(owner), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+        if (*admin_java_trim(owner) == '\0') {
+            snprintf(owner, sizeof(owner), "admin");
+        }
+        int seeded = st_storage_seed_demo_client(database_path, context->tenant_id, owner);
+        if (seeded < 0) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"database initialize failed\"}");
+        }
+        if (seeded > 0) {
+            return write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"客户端名称已存在或数据不符合约束\"}");
+        }
+    }
     long long clients = 0;
     if (st_storage_count_clients_by_tenant(database_path, context->tenant_id, &clients) != 0) {
         return write_response(out,
@@ -2953,13 +3926,9 @@ static int append_client_view(st_admin_string_builder *builder, const st_storage
 {
     char *client_name = st_json_escape(client->client_name);
     char *owner = st_json_escape(client->owner_username);
-    char *created = st_json_escape(client->created_at);
-    char *updated = st_json_escape(client->updated_at);
-    if (client_name == NULL || owner == NULL || created == NULL || updated == NULL) {
+    if (client_name == NULL || owner == NULL) {
         free(client_name);
         free(owner);
-        free(created);
-        free(updated);
         return -1;
     }
     st_admin_client_runtime_status status;
@@ -2991,34 +3960,32 @@ static int append_client_view(st_admin_string_builder *builder, const st_storage
                               ",\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
                               "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
                               "\"messageMaxAttachmentBytes\":%lld,"
-                              "\"uploadBytes\":%lld,\"downloadBytes\":%lld,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"uploadBytes\":%lld,\"downloadBytes\":%lld,\"createdAt\":",
                               online && client->message_send_capable ? "true" : "false",
                               online && client->message_receive_capable ? "true" : "false",
                               online && client->message_attachments_capable ? "true" : "false",
                               online && client->message_media_preview_capable ? "true" : "false",
                               online ? client->message_max_attachment_bytes : 0LL,
                               client->upload_bytes,
-                              client->download_bytes,
-                              created,
-                              updated);
+                              client->download_bytes);
     }
     free(client_name);
     free(owner);
-    free(created);
-    free(updated);
+    if (rc == 0) rc = admin_sb_append_instant(builder, client->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, client->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
+/*
+ * Java PeerMeshDeviceView: the 21 fields, with what the device has not reported (NAT type and
+ * behaviour, endpoint, virtual device) as null.
+ */
 static int append_peer_mesh_device_view(st_admin_string_builder *builder, const st_storage_peer_mesh_device *device)
 {
     st_admin_client_runtime_status runtime_status;
     admin_get_client_runtime_status(device->client_id, device->client_name, &runtime_status);
-    const char *nat_type = device->nat_type[0] == '\0' ? "UNKNOWN" : device->nat_type;
-    const char *device_mode = device->virtual_device_mode[0] == '\0' ? "AUTO" : device->virtual_device_mode;
-    const char *device_status = device->virtual_device_status[0] == '\0'
-                                    ? "DOWN"
-                                    : device->virtual_device_status;
     int rc = admin_sb_appendf(builder, "{\"id\":%lld,\"clientId\":%lld,\"clientName\":", device->id, device->client_id);
     if (rc == 0) rc = admin_sb_append_json_string(builder, device->client_name);
     if (rc == 0) rc = admin_sb_append(builder, ",\"ownerUsername\":");
@@ -3032,7 +3999,7 @@ static int append_peer_mesh_device_view(st_admin_string_builder *builder, const 
     if (rc == 0) rc = admin_sb_append(builder, ",\"publicKey\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->public_key);
     if (rc == 0) rc = admin_sb_append(builder, ",\"natType\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, nat_type);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->nat_type);
     if (rc == 0) rc = admin_sb_append(builder, ",\"natMappingBehavior\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->nat_mapping_behavior);
     if (rc == 0) rc = admin_sb_append(builder, ",\"natFilteringBehavior\":");
@@ -3042,67 +4009,38 @@ static int append_peer_mesh_device_view(st_admin_string_builder *builder, const 
     if (rc == 0) rc = admin_sb_append(builder, ",\"lastEndpoint\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->last_endpoint);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceMode\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, device_mode);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_mode);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceName\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_name);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceStatus\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, device_status);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_status);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceError\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_error);
     if (rc == 0) rc = admin_sb_append(builder, ",\"virtualDeviceUpdatedAt\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_updated_at);
+    if (rc == 0) rc = admin_sb_append_nullable_instant(builder, device->virtual_device_updated_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"lastSeenAt\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->last_seen_at);
-    if (rc == 0) {
-        rc = admin_sb_appendf(builder,
-                              ",\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
-                              "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
-                              "\"messageMaxAttachmentBytes\":%lld",
-                              runtime_status.online && device->message_send_capable ? "true" : "false",
-                              runtime_status.online && device->message_receive_capable ? "true" : "false",
-                              runtime_status.online && device->message_attachments_capable ? "true" : "false",
-                              runtime_status.online && device->message_media_preview_capable ? "true" : "false",
-                              runtime_status.online ? device->message_max_attachment_bytes : 0LL);
-    }
+    if (rc == 0) rc = admin_sb_append_nullable_instant(builder, device->last_seen_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, device->updated_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, device->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
 static int append_peer_mesh_acl_view(st_admin_string_builder *builder, const st_storage_peer_mesh_acl *acl)
 {
-    char *source = st_json_escape(acl->source_client_name);
-    char *target = st_json_escape(acl->target_client_name);
-    char *created = st_json_escape(acl->created_at);
-    char *updated = st_json_escape(acl->updated_at);
-    char *direction = st_json_escape(acl->direction);
-    if (source == NULL || target == NULL || created == NULL || updated == NULL || direction == NULL) {
-        free(source);
-        free(target);
-        free(created);
-        free(updated);
-        free(direction);
-        return -1;
-    }
-    int rc = admin_sb_appendf(builder,
-                              "{\"id\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":\"%s\","
-                              "\"targetClientId\":%lld,\"targetClientName\":\"%s\","
-                              "\"allowed\":%s,\"direction\":\"%s\",\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
-                              acl->id,
-                              acl->source_client_id,
-                              source,
-                              acl->target_client_id,
-                              target,
-                              acl->allowed ? "true" : "false",
-                              direction,
-                              created,
-                              updated);
-    free(source);
-    free(target);
-    free(created);
-    free(updated);
-    free(direction);
+    int rc = admin_sb_appendf(builder, "{\"id\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":",
+                              acl->id, acl->source_client_id);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, acl->source_client_name);
+    if (rc == 0) rc = admin_sb_appendf(builder, ",\"targetClientId\":%lld,\"targetClientName\":",
+                                       acl->target_client_id);
+    if (rc == 0) rc = admin_sb_append_json_string(builder, acl->target_client_name);
+    if (rc == 0) rc = admin_sb_appendf(builder, ",\"allowed\":%s,\"direction\":", acl->allowed ? "true" : "false");
+    if (rc == 0) rc = admin_sb_append_json_string(builder, acl->direction);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"createdAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, acl->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, acl->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
@@ -3138,15 +4076,17 @@ static int append_peer_mesh_session_view(st_admin_string_builder *builder, const
                               session->direct_bytes,
                               session->relay_bytes);
     }
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, session->last_traffic_at);
+    if (rc == 0) rc = admin_sb_append_nullable_instant(builder, session->last_traffic_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"lastKeepaliveAt\":");
+    if (rc == 0) rc = admin_sb_append_nullable_instant(builder, session->last_keepalive_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"startedAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, session->started_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, session->started_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, session->updated_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, session->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"expiresAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, session->expires_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, session->expires_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"closedAt\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, session->closed_at);
+    if (rc == 0) rc = admin_sb_append_nullable_instant(builder, session->closed_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
@@ -3155,32 +4095,27 @@ static int append_credential_view(st_admin_string_builder *builder, const st_sto
 {
     char *api_key = st_json_escape(credential->api_key);
     char *owner = st_json_escape(credential->owner_username);
-    char *created = st_json_escape(credential->created_at);
-    char *updated = st_json_escape(credential->updated_at);
-    if (api_key == NULL || owner == NULL || created == NULL || updated == NULL) {
+    if (api_key == NULL || owner == NULL) {
         free(api_key);
         free(owner);
-        free(created);
-        free(updated);
         return -1;
     }
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"apiKey\":\"%s\",\"ownerUsername\":\"%s\","
-                              "\"enabled\":%s,\"maxOnlineInstances\":%d,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"enabled\":%s,\"maxOnlineInstances\":%d,\"createdAt\":",
                               credential->id,
                               api_key,
                               owner,
                               credential->enabled ? "true" : "false",
                               credential->max_online_instances <= 0
                                   ? client_auth_default_max_online_instances()
-                                  : credential->max_online_instances,
-                              created,
-                              updated);
+                                  : credential->max_online_instances);
     free(api_key);
     free(owner);
-    free(created);
-    free(updated);
+    if (rc == 0) rc = admin_sb_append_instant(builder, credential->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, credential->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
@@ -3244,13 +4179,13 @@ static int append_client_download_link_view(st_admin_string_builder *builder,
         ? admin_sb_appendf(builder, "%lld", link->id) : admin_sb_append(builder, "null");
     if (rc == 0) rc = admin_sb_append(builder, ",\"createdAt\":");
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, link->created_at);
+        rc = admin_sb_append_instant(builder, link->created_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, ",\"updatedAt\":");
     }
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, link->updated_at);
+        rc = admin_sb_append_instant(builder, link->updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -3262,20 +4197,15 @@ static int append_mapping_view(st_admin_string_builder *builder, const st_storag
 {
     char *client_name = st_json_escape(mapping->client_name);
     char *target = st_json_escape(mapping->target_address);
-    char *created = st_json_escape(mapping->created_at);
-    char *updated = st_json_escape(mapping->updated_at);
-    if (client_name == NULL || target == NULL || created == NULL || updated == NULL) {
+    if (client_name == NULL || target == NULL) {
         free(client_name);
         free(target);
-        free(created);
-        free(updated);
         return -1;
     }
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"clientId\":%lld,\"clientName\":\"%s\","
                               "\"listenPort\":%d,\"targetAddress\":\"%s\",\"targetPort\":%d,"
-                              "\"enabled\":%s,\"detailCaptureEnabled\":%s,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"enabled\":%s,\"detailCaptureEnabled\":%s,\"createdAt\":",
                               mapping->id,
                               mapping->client_id,
                               client_name,
@@ -3283,13 +4213,13 @@ static int append_mapping_view(st_admin_string_builder *builder, const st_storag
                               target,
                               mapping->target_port,
                               mapping->enabled ? "true" : "false",
-                              mapping->detail_capture_enabled ? "true" : "false",
-                              created,
-                              updated);
+                              mapping->detail_capture_enabled ? "true" : "false");
     free(client_name);
     free(target);
-    free(created);
-    free(updated);
+    if (rc == 0) rc = admin_sb_append_instant(builder, mapping->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, mapping->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
@@ -3299,16 +4229,11 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
     char *route_name = st_json_escape(route->route);
     char *target = st_json_escape(route->target_base_url);
     char *auth_username = st_json_escape(route->auth_username);
-    char *created = st_json_escape(route->created_at);
-    char *updated = st_json_escape(route->updated_at);
-    if (client_name == NULL || route_name == NULL || target == NULL || auth_username == NULL
-        || created == NULL || updated == NULL) {
+    if (client_name == NULL || route_name == NULL || target == NULL || auth_username == NULL) {
         free(client_name);
         free(route_name);
         free(target);
         free(auth_username);
-        free(created);
-        free(updated);
         return -1;
     }
     int rc = admin_sb_appendf(builder,
@@ -3317,7 +4242,7 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
                               "\"detailCaptureEnabled\":%s,\"mediaCaptureEnabled\":%s,"
                               "\"pathRewriteEnabled\":%s,\"insecureSkipVerify\":%s,"
                               "\"authEnabled\":%s,\"authUsername\":\"%s\",\"authPasswordConfigured\":%s,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"createdAt\":",
                               route->id,
                               route->client_id,
                               client_name,
@@ -3330,15 +4255,15 @@ static int append_http_route_view(st_admin_string_builder *builder, const st_sto
                               route->insecure_skip_verify ? "true" : "false",
                               route->auth_enabled ? "true" : "false",
                               auth_username,
-                              route->auth_password_hash[0] != '\0' ? "true" : "false",
-                              created,
-                              updated);
+                              route->auth_password_hash[0] != '\0' ? "true" : "false");
     free(client_name);
     free(route_name);
     free(target);
     free(auth_username);
-    free(created);
-    free(updated);
+    if (rc == 0) rc = admin_sb_append_instant(builder, route->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, route->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
@@ -3431,13 +4356,13 @@ static int append_connection_view(st_admin_string_builder *builder, const st_sto
         rc = admin_sb_append(builder, ",\"connectedAt\":");
     }
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, connection->connected_at);
+        rc = admin_sb_append_instant(builder, connection->connected_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, ",\"disconnectedAt\":");
     }
     if (rc == 0) {
-        rc = admin_sb_append_nullable_json_string(builder, connection->disconnected_at);
+        rc = admin_sb_append_nullable_instant(builder, connection->disconnected_at);
     }
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
@@ -3495,7 +4420,7 @@ static int append_connection_stat_view(st_admin_string_builder *builder, const s
                               stat->failure);
     }
     if (rc == 0) {
-        rc = admin_sb_append_nullable_json_string(builder, stat->updated_at);
+        rc = admin_sb_append_nullable_instant(builder, stat->updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -3525,7 +4450,8 @@ static int append_traffic_usage_view(st_admin_string_builder *builder, const st_
                               usage->download_bytes);
     }
     if (rc == 0) {
-        rc = admin_sb_append_nullable_json_string(builder, usage->updated_at);
+        rc = usage->updated_at[0] == '\0' ? admin_sb_append(builder, "null")
+                                          : admin_sb_append_instant(builder, usage->updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -3581,7 +4507,8 @@ static int append_resource_traffic_usage_view(st_admin_string_builder *builder,
                               usage->download_bytes);
     }
     if (rc == 0) {
-        rc = admin_sb_append_nullable_json_string(builder, usage->updated_at);
+        rc = usage->updated_at[0] == '\0' ? admin_sb_append(builder, "null")
+                                          : admin_sb_append_instant(builder, usage->updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -3867,13 +4794,14 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     }
     long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char access_token[2048];
-    if (st_security_issue_local_token(user.username,
-                                      user.tenant_id,
-                                      normalize_management_role(user.role),
-                                      getenv("SPECUS_AUTH_JWT_SECRET"),
-                                      ttl,
-                                      access_token,
-                                      sizeof(access_token)) != 0) {
+    if (st_security_issue_local_token_for_account(user.username,
+                                                  user.tenant_id,
+                                                  normalize_management_role(user.role),
+                                                  user.account_key,
+                                                  getenv("SPECUS_AUTH_JWT_SECRET"),
+                                                  ttl,
+                                                  access_token,
+                                                  sizeof(access_token)) != 0) {
         free(id_token);
         free(token_type);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
@@ -3901,7 +4829,13 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     return response_len;
 }
 
-static int append_http_exchange_view(st_admin_string_builder *builder, const st_storage_http_exchange *item)
+/*
+ * HttpTrafficExchangeView. A summary (detail 0, the list) carries null headers and previews, as
+ * Java's summary views do; the detail of one exchange carries them.
+ */
+static int append_http_exchange_view(st_admin_string_builder *builder,
+                                     const st_storage_http_exchange *item,
+                                     int detail)
 {
     /* HttpTrafficExchangeView.id is a JSON string in Java, Go and .NET. */
     int rc = admin_sb_appendf(builder,
@@ -3942,19 +4876,41 @@ static int append_http_exchange_view(st_admin_string_builder *builder, const st_
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseContentType\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_content_type);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseBodyType\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_body_type);
+    if (rc == 0) {
+        rc = admin_sb_append_json_string(builder,
+                                         st_traffic_body_type_or_classify(item->response_body_type,
+                                                                          item->response_content_type,
+                                                                          item->response_bytes));
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responseHeaders\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_headers);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_headers : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->request_preview_hex : NULL);
+    /*
+     * The detail's preview texts are the stored bodies as Java's HttpBodyDataCodec shows them: the
+     * decoded text, or data:<type>;base64,... for a binary body.
+     */
+    char *request_text = NULL;
+    char *response_text = NULL;
+    if (rc == 0 && detail) {
+        request_text = st_traffic_body_display_text(item->request_body_data, item->request_body_data_len,
+                                                    item->request_content_type, item->request_headers,
+                                                    item->request_preview_text);
+        response_text = st_traffic_body_display_text(item->response_body_data, item->response_body_data_len,
+                                                     item->response_content_type, item->response_headers,
+                                                     item->response_preview_text);
+        rc = request_text != NULL && response_text != NULL ? 0 : -1;
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"requestPreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->request_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, request_text);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewHex\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_hex);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, detail ? item->response_preview_hex : NULL);
     if (rc == 0) rc = admin_sb_append(builder, ",\"responsePreviewText\":");
-    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, item->response_preview_text);
+    if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, response_text);
+    free(request_text);
+    free(response_text);
     if (rc == 0) {
         rc = admin_sb_appendf(builder,
                               ",\"requestTruncated\":%s,\"responseTruncated\":%s,\"capturedAt\":",
@@ -4087,9 +5043,9 @@ static int build_clients_response(const st_admin_context *context, char *out, si
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
         size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
+        st_storage_client *clients = admin_list_all_clients(database_path, &client_count);
+        if (clients == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
@@ -4104,6 +5060,7 @@ static int build_clients_response(const st_admin_context *context, char *out, si
             }
             ++visible_count;
         }
+        free(clients);
     } else if (rc == 0) {
         st_storage_client client = {0};
         client.id = env_i64("SPECUS_CLIENT_ID", 1);
@@ -4128,30 +5085,47 @@ static int build_clients_response(const st_admin_context *context, char *out, si
     return response_len;
 }
 
+static size_t http_route_text_length(const char *text);
+static void http_route_trim_in_place(char *value);
+
 static int build_client_name_availability_response(const st_admin_context *context,
                                                    const char *path,
                                                    char *out,
                                                    size_t out_len)
 {
+    /* Spring binds both parameters before the service runs: clientName is required, and
+     * excludeClientId must convert to a Long. */
     char *client_name = admin_query_string(path, "clientName");
-    if (!admin_text_present(client_name)) {
-        free(client_name);
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"clientName is required\"}");
-    }
     long long exclude_id = 0;
-    (void)admin_query_i64(path, "excludeClientId", &exclude_id);
+    int exclude = admin_query_number_param(path, "excludeClientId", LLONG_MIN, LLONG_MAX, &exclude_id);
+    if (client_name == NULL || exclude < 0) {
+        free(client_name);
+        return write_spring_bad_request(out, out_len);
+    }
+    /* Java requireClientName: the name as a create or update would store it. */
+    if (!admin_java_has_text(client_name)) {
+        free(client_name);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName cannot be blank\"}");
+    }
+    http_route_trim_in_place(client_name);
+    if (http_route_text_length(client_name) > 120U) {
+        free(client_name);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is too long\"}");
+    }
+    /* Java findClientById: an excluded client the caller cannot see, 0 and negative ids included. */
     const char *database_path = admin_database_path();
     st_storage_client excluded;
-    if (exclude_id > 0 && (database_path == NULL
+    if (exclude > 0 && (database_path == NULL || exclude_id <= 0
         || !admin_load_accessible_client(database_path, context, exclude_id, &excluded))) {
         free(client_name);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"client not found: %lld\"}", exclude_id);
+        return write_response(out, out_len, 400, "Bad Request", message);
     }
     st_storage_client existing;
     int available = database_path == NULL
         || st_storage_get_client_by_name(database_path, client_name, &existing) != 0
-        || (exclude_id > 0 && existing.id == exclude_id);
+        || (exclude > 0 && existing.id == exclude_id);
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "{\"clientName\":") == 0
         && admin_sb_append_json_string(&builder, client_name) == 0
@@ -4179,14 +5153,13 @@ static int build_client_detail_response(const st_admin_context *context,
         || !admin_load_accessible_client(database_path, context, client_id, &client)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_mapping *mappings = NULL;
+    st_storage_http_route *routes = NULL;
     size_t mapping_count = 0U;
     size_t route_count = 0U;
-    if (st_storage_list_mappings(database_path, client_id, mappings,
-                                 ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0
-        || st_storage_list_http_routes(database_path, client_id, routes,
-                                       ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+    if (st_storage_list_mappings(database_path, client_id, &mappings, &mapping_count) != 0
+        || st_storage_list_http_routes(database_path, client_id, &routes, &route_count) != 0) {
+        free(mappings);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"client detail failed\"}");
     }
@@ -4204,57 +5177,154 @@ static int build_client_detail_response(const st_admin_context *context,
         if (rc == 0) rc = append_http_route_view(&builder, &routes[i]);
     }
     if (rc == 0) rc = admin_sb_append(&builder, "]}");
+    free(mappings);
+    free(routes);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"client detail failed\"}");
     }
-    int len = write_response(out, out_len, 200, "OK", builder.data);
+    int len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return len;
 }
 
-static int build_peer_mesh_devices_response(const st_admin_context *context, char *out, size_t out_len)
+/* A 400 whose message names a value: {"error":"<prefix><value>"}, the value JSON-escaped. */
+static int write_bad_request_naming(const char *prefix, const char *value, char *out, size_t out_len)
 {
     st_admin_string_builder builder = {0};
-    int rc = admin_sb_append(&builder, "[");
+    int rc = admin_sb_append(&builder, "{\"error\":");
+    char *message = NULL;
+    size_t prefix_len = strlen(prefix);
+    size_t value_len = value == NULL ? 4U : strlen(value);
+    message = (char *)malloc(prefix_len + value_len + 1U);
+    if (message != NULL) {
+        snprintf(message, prefix_len + value_len + 1U, "%s%s", prefix, value == NULL ? "null" : value);
+    }
+    if (rc == 0) rc = message == NULL ? -1 : admin_sb_append_json_string(&builder, message);
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(message);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"response failed\"}");
+    }
+    int len = write_response(out, out_len, 400, "Bad Request", builder.data);
+    free(builder.data);
+    return len;
+}
+
+/* Java's 400 "client not found: <id>" (PeerMeshService and PeerServiceDiscoveryService). */
+static int write_client_not_found(long long id, char *out, size_t out_len)
+{
+    char message[96];
+    snprintf(message, sizeof(message), "{\"error\":\"client not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", message);
+}
+
+/*
+ * Sends one PEER_CONTROL message from "server" to a client when it is online (Java PeerSignalService
+ * sendCloseIfOnline); without a handler, as in the in-process tests, nothing is sent.
+ */
+static void admin_send_peer_control(const char *target_client_name, const char *message)
+{
+    pthread_mutex_lock(&admin_peer_control_send_lock);
+    st_admin_peer_control_send_handler handler = admin_peer_control_send_handler;
+    void *ctx = admin_peer_control_send_ctx;
+    pthread_mutex_unlock(&admin_peer_control_send_lock);
+    if (handler != NULL && target_client_name != NULL && *target_client_name != '\0') {
+        (void)handler(ctx, target_client_name, message);
+    }
+}
+
+/*
+ * Java PeerSignalService.sendClose: both ends of a session the management API closed are told, with
+ * the reason admin-force-close, so neither keeps using it.
+ */
+static void admin_send_peer_session_close(const st_storage_peer_mesh_session *session)
+{
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+                              "{\"type\":\"close\",\"sessionId\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":",
+                              session->id, session->source_client_id);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, session->source_client_name);
+    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"targetClientId\":%lld,\"targetClientName\":",
+                                       session->target_client_id);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, session->target_client_name);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, session->status);
+    if (rc == 0) rc = admin_sb_appendf(&builder, ",\"reason\":\"admin-force-close\",\"createdAtMillis\":%lld}",
+                                       current_time_millis());
+    if (rc == 0 && builder.data != NULL) {
+        admin_send_peer_control(session->source_client_name, builder.data);
+        admin_send_peer_control(session->target_client_name, builder.data);
+    }
+    free(builder.data);
+}
+
+/*
+ * Closes the tenant's open sessions Java would close after a management change, and tells both ends
+ * of each: with client_id > 0 those of that client's device (PeerMeshService
+ * closeOpenSessionsForDevice, when the device is disabled), otherwise those whose two clients may no
+ * longer peer (closeUnauthorizedSessions, after an ACL change). Failures are left to expiry.
+ */
+static void admin_close_peer_sessions(const char *database_path, const char *tenant_id, long long client_id)
+{
+    st_storage_peer_mesh_session *sessions = NULL;
+    size_t count = 0U;
+    if (database_path == NULL
+        || st_storage_list_open_peer_mesh_sessions(database_path, tenant_id, &sessions, &count) != 0) {
+        return;
+    }
+    for (size_t i = 0U; i < count; ++i) {
+        int close = 0;
+        if (client_id > 0) {
+            close = sessions[i].source_client_id == client_id || sessions[i].target_client_id == client_id;
+        } else {
+            st_storage_client source;
+            st_storage_client target;
+            int allowed = 0;
+            close = st_storage_get_client(database_path, sessions[i].source_client_id, &source) != 0
+                || st_storage_get_client(database_path, sessions[i].target_client_id, &target) != 0
+                || strcmp(source.tenant_id, tenant_id) != 0 || strcmp(target.tenant_id, tenant_id) != 0
+                || st_storage_can_peer(database_path, &source, &target, &allowed) != 0
+                || !allowed;
+        }
+        st_storage_peer_mesh_session closed;
+        if (close && st_storage_close_peer_mesh_session_visible(database_path, sessions[i].id, tenant_id, "", 1,
+                                                                 &closed) == 0) {
+            admin_send_peer_session_close(&closed);
+        }
+    }
+    free(sessions);
+}
+
+/* Java PeerMeshService.listDevices: the devices that exist, the tenant's or the caller's own. */
+static int build_peer_mesh_devices_response(const st_admin_context *context, char *out, size_t out_len)
+{
     const char *database_path = admin_database_path();
-    if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-            free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
-        }
-        st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
-        size_t client_count = 0;
-        if (st_storage_list_clients(database_path, clients, ST_ADMIN_MAX_CLIENTS, &client_count) != 0) {
-            free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
-        }
-        size_t visible_count = 0;
-        for (size_t i = 0; rc == 0 && i < client_count; ++i) {
-            if (!admin_can_access_client(context, &clients[i])) {
-                continue;
-            }
-            st_storage_peer_mesh_device device;
-            if (st_storage_ensure_peer_mesh_device(database_path, &clients[i], &device) != 0) {
-                free(builder.data);
-                return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
-            }
-            rc = admin_sb_append(&builder, visible_count == 0 ? "" : ",");
-            if (rc == 0) {
-                rc = append_peer_mesh_device_view(&builder, &device);
-            }
-            ++visible_count;
-        }
+    if (database_path == NULL) {
+        return write_response(out, out_len, 200, "OK", "[]");
     }
-    if (rc == 0) {
-        rc = admin_sb_append(&builder, "]");
+    st_storage_peer_mesh_device *devices = NULL;
+    size_t count = 0U;
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_list_peer_mesh_devices_visible(database_path, context->tenant_id, context->username,
+                                                     context->admin, &devices, &count) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
     }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "[");
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        rc = admin_sb_append(&builder, i == 0U ? "" : ",");
+        if (rc == 0) rc = append_peer_mesh_device_view(&builder, &devices[i]);
+    }
+    free(devices);
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device response failed\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -4281,25 +5351,40 @@ static int handle_peer_mesh_device_update(const st_admin_context *context,
                                           char *out,
                                           size_t out_len)
 {
-    const char *database_path = admin_database_path();
-    if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh device not found\"}");
+    /* Java binds a required DeviceMutation(Boolean enabled) before PeerMeshService.updateDevice. */
+    int value = 0;
+    int bound = admin_body_is_object(body) ? admin_jackson_boolean(body, "enabled", &value) : -2;
+    if (bound == -2) {
+        return write_spring_bad_request(out, out_len);
     }
-    st_storage_client client;
-    if (!admin_load_accessible_client(database_path, context, client_id, &client)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh device not found\"}");
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) {
+        return init_response;
     }
+    /* findAccessibleDevice: a device row of the tenant, and for a USER one the user owns. */
     st_storage_peer_mesh_device existing;
-    int enabled = 0;
-    if (st_storage_ensure_peer_mesh_device(database_path, &client, &existing) == 0) {
-        enabled = existing.enabled;
-    }
-    (void)st_json_get_bool(body, "enabled", &enabled);
     st_storage_peer_mesh_device updated;
-    if (st_storage_update_peer_mesh_device_enabled(database_path, &client, enabled, &updated) != 0) {
+    int found = st_storage_get_peer_mesh_device_by_client(database_path, context->tenant_id, client_id, &existing) == 0
+        && (context->admin || strcmp(existing.owner_username, context->username) == 0);
+    int rc = found ? st_storage_set_peer_mesh_device_enabled(database_path, context->tenant_id, client_id,
+                                                             bound == 1 ? value : -1, &updated)
+                   : 1;
+    if (rc == 1) {
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"peer device not found: %lld\"}", client_id);
+        return write_response(out, out_len, 400, "Bad Request", message);
+    }
+    if (rc != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device update failed\"}");
     }
-    admin_notify_peer_mesh_refresh(client.tenant_id);
+    /* PeerSignalService.refreshDevice, when the request carried enabled. */
+    if (bound == 1) {
+        if (!value) {
+            admin_close_peer_sessions(database_path, context->tenant_id, client_id);
+        }
+        admin_notify_peer_mesh_refresh(context->tenant_id);
+    }
     return build_peer_mesh_device_result_response(&updated, 200, "OK", out, out_len);
 }
 
@@ -4313,14 +5398,13 @@ static int build_peer_mesh_acls_response(const st_admin_context *context, char *
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl list failed\"}");
         }
-        st_storage_peer_mesh_acl acls[ST_ADMIN_MAX_PEER_ACLS];
+        st_storage_peer_mesh_acl *acls = NULL;
         size_t acl_count = 0;
         if (st_storage_list_peer_mesh_acls_visible(database_path,
                                                    context->tenant_id,
                                                    context->username,
                                                    context->admin,
-                                                   acls,
-                                                   ST_ADMIN_MAX_PEER_ACLS,
+                                                   &acls,
                                                    &acl_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl list failed\"}");
@@ -4331,6 +5415,7 @@ static int build_peer_mesh_acls_response(const st_admin_context *context, char *
                 rc = append_peer_mesh_acl_view(&builder, &acls[i]);
             }
         }
+        free(acls);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -4366,7 +5451,8 @@ static int build_peer_mesh_sessions_array_response(const st_storage_peer_mesh_se
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session response failed\"}");
     }
-    int response_len = write_response(out, out_len, status, reason, builder.data);
+    /* Closing every open session answers all of them, as many as there were. */
+    int response_len = write_unbounded_response(out, out_len, status, reason, builder.data);
     free(builder.data);
     return response_len;
 }
@@ -4383,22 +5469,73 @@ static int build_peer_mesh_sessions_response(const st_admin_context *context,
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session list failed\"}");
     }
+    /*
+     * Java PeerMeshResource.sessions: with page or size, a page of at most 100 sessions
+     * (listSessionsPage, openOnly honoured); otherwise the latest limit sessions, 1..200.
+     */
     int limit = 100;
     (void)admin_query_int_any(path, "limit", &limit);
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
+    /* page or size bound to an Integer: an empty value is null, so it does not ask for a page. */
+    long long ignored = 0;
+    int paged = admin_query_number_param(path, "page", INT_MIN, INT_MAX, &ignored) == 1
+        || admin_query_number_param(path, "size", INT_MIN, INT_MAX, &ignored) == 1;
+    int page = 0;
+    int size = limit;
+    int open_only = 0;
+    if (paged) {
+        (void)admin_query_int_any(path, "page", &page);
+        (void)admin_query_int_any(path, "size", &size);
+        (void)admin_query_bool(path, "openOnly", &open_only);
+        if (page < 0) page = 0;
+        size = size < 1 ? 1 : size > 100 ? 100 : size;
+    } else {
+        size = limit < 1 ? 1 : limit > (int)ST_ADMIN_MAX_PEER_SESSIONS ? (int)ST_ADMIN_MAX_PEER_SESSIONS : limit;
+    }
+    st_storage_peer_mesh_session *sessions =
+        (st_storage_peer_mesh_session *)calloc(ST_ADMIN_MAX_PEER_SESSIONS, sizeof(*sessions));
     size_t session_count = 0;
-    if (st_storage_list_peer_mesh_sessions_visible(database_path,
-                                                   context->tenant_id,
-                                                   context->username,
-                                                   context->admin,
-                                                   1,
-                                                   limit,
-                                                   sessions,
-                                                   ST_ADMIN_MAX_PEER_SESSIONS,
-                                                   &session_count) != 0) {
+    long long total = 0;
+    if (sessions == NULL
+        || st_storage_page_peer_mesh_sessions_visible(database_path,
+                                                      context->tenant_id,
+                                                      context->username,
+                                                      context->admin,
+                                                      open_only,
+                                                      page,
+                                                      size,
+                                                      sessions,
+                                                      ST_ADMIN_MAX_PEER_SESSIONS,
+                                                      &session_count,
+                                                      &total) != 0) {
+        free(sessions);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session list failed\"}");
     }
-    return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+    if (!paged) {
+        int len = build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+        free(sessions);
+        return len;
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"items\":[");
+    for (size_t i = 0; rc == 0 && i < session_count; ++i) {
+        rc = admin_sb_append(&builder, i == 0 ? "" : ",");
+        if (rc == 0) {
+            rc = append_peer_mesh_session_view(&builder, &sessions[i]);
+        }
+    }
+    free(sessions);
+    long long total_pages = (total + size - 1) / size;
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder, "],\"total\":%lld,\"page\":%d,\"size\":%d,\"totalPages\":%lld}",
+                              total, page, size, total_pages < 1 ? 1LL : total_pages);
+    }
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session response failed\"}");
+    }
+    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return response_len;
 }
 
 static int build_peer_mesh_session_response(const st_storage_peer_mesh_session *session,
@@ -4422,10 +5559,12 @@ static int handle_peer_mesh_session_close(const st_admin_context *context,
                                           char *out,
                                           size_t out_len)
 {
-    const char *database_path = admin_database_path();
-    if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh session not found\"}");
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) {
+        return init_response;
     }
+    /* Java findAccessibleSession: the tenant's session, and for a USER one of the user's clients. */
     st_storage_peer_mesh_session session;
     if (st_storage_close_peer_mesh_session_visible(database_path,
                                                    id,
@@ -4433,8 +5572,11 @@ static int handle_peer_mesh_session_close(const st_admin_context *context,
                                                    context->username,
                                                    context->admin,
                                                    &session) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh session not found\"}");
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"peer session not found: %lld\"}", id);
+        return write_response(out, out_len, 400, "Bad Request", message);
     }
+    admin_send_peer_session_close(&session);
     return build_peer_mesh_session_response(&session, 200, "OK", out, out_len);
 }
 
@@ -4447,74 +5589,245 @@ static int handle_peer_mesh_sessions_close_open(const st_admin_context *context,
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session close failed\"}");
     }
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
+    st_storage_peer_mesh_session *sessions = NULL;
     size_t session_count = 0;
     if (st_storage_close_open_peer_mesh_sessions_visible(database_path,
                                                          context->tenant_id,
                                                          context->username,
                                                          context->admin,
-                                                         sessions,
-                                                         ST_ADMIN_MAX_PEER_SESSIONS,
+                                                         &sessions,
                                                          &session_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session close failed\"}");
     }
-    return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+    for (size_t i = 0U; i < session_count; ++i) {
+        admin_send_peer_session_close(&sessions[i]);
+    }
+    int len = build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+    free(sessions);
+    return len;
 }
 
+/* A JSON number for a double the way Java's Double.toString writes it here: 0.75, 12.5, 80.0. */
+static int admin_sb_append_json_double(st_admin_string_builder *builder, double value)
+{
+    char text[64];
+    double magnitude = value < 0.0 ? -value : value;
+    /* Java writes plain decimals from 1e-3 up to 1e7, with at least one fractional digit. */
+    int plain = value == 0.0 || (magnitude >= 1e-3 && magnitude < 1e7);
+    for (int precision = 1; precision <= 17; ++precision) {
+        snprintf(text, sizeof(text), plain ? "%.*f" : "%.*g", precision, value);
+        if (strtod(text, NULL) == value) {
+            break;
+        }
+    }
+    return admin_sb_append(builder, text);
+}
+
+/* Adds devices to label's count in a list kept in first-seen order, as Java's LinkedHashMap. */
+typedef struct {
+    char label[128];
+    long long devices;
+} admin_peer_mesh_count;
+
+static int admin_peer_mesh_count_merge(admin_peer_mesh_count **items, size_t *count, const char *label,
+                                       long long devices)
+{
+    for (size_t i = 0; i < *count; ++i) {
+        if (strcmp((*items)[i].label, label) == 0) {
+            (*items)[i].devices += devices;
+            return 0;
+        }
+    }
+    admin_peer_mesh_count *grown = (admin_peer_mesh_count *)realloc(*items, (*count + 1U) * sizeof(**items));
+    if (grown == NULL) {
+        return -1;
+    }
+    *items = grown;
+    snprintf(grown[*count].label, sizeof(grown[*count].label), "%s", label);
+    grown[*count].devices = devices;
+    ++*count;
+    return 0;
+}
+
+static int admin_peer_mesh_has_text(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Java PeerMeshService.normalizeNatBehavior: the trimmed value, or UNKNOWN when blank. */
+static void admin_peer_mesh_nat_behavior(const char *value, char *out, size_t out_len)
+{
+    if (!admin_peer_mesh_has_text(value)) {
+        snprintf(out, out_len, "UNKNOWN");
+        return;
+    }
+    const char *start = value;
+    while (isspace((unsigned char)*start)) ++start;
+    size_t len = strlen(start);
+    while (len > 0U && isspace((unsigned char)start[len - 1U])) --len;
+    snprintf(out, out_len, "%.*s", (int)len, start);
+}
+
+static int admin_peer_mesh_nat_behavior_classified(const char *value)
+{
+    return admin_peer_mesh_has_text(value) && admin_ascii_casecmp(value, "UNKNOWN") != 0
+        && admin_ascii_casecmp(value, "UNSUPPORTED") != 0;
+}
+
+static int admin_peer_mesh_append_counts(st_admin_string_builder *builder, const char *name, const char *key,
+                                         const admin_peer_mesh_count *items, size_t count)
+{
+    int rc = admin_sb_appendf(builder, ",\"%s\":[", name);
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        rc = admin_sb_appendf(builder, "%s{\"%s\":", i == 0U ? "" : ",", key);
+        if (rc == 0) rc = admin_sb_append_json_string(builder, items[i].label);
+        if (rc == 0) rc = admin_sb_appendf(builder, ",\"devices\":%lld}", items[i].devices);
+    }
+    return rc == 0 ? admin_sb_append(builder, "]") : rc;
+}
+
+/*
+ * Java PeerMeshService.pathStats (and Go/.NET): totals and the direct ratio of the active sessions
+ * from the (path type, status) groups, those groups with their reported count, mean RTT and bytes,
+ * the address-family groups, NAT types (blank as UNKNOWN), and the NAT behaviour distribution of the
+ * devices that reported any behaviour, with the share whose mapping and filtering were classified.
+ */
 static int build_peer_mesh_stats_response(const st_admin_context *context, char *out, size_t out_len)
 {
     const char *database_path = admin_database_path();
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
-    size_t count = 0U;
+    st_storage_peer_mesh_stats stats;
+    memset(&stats, 0, sizeof(stats));
     if (database_path != NULL
-        && st_storage_list_peer_mesh_sessions_visible(database_path, context->tenant_id,
-            context->username, context->admin, 1, ST_ADMIN_MAX_PEER_SESSIONS,
-            sessions, ST_ADMIN_MAX_PEER_SESSIONS, &count) != 0) {
+        && (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+            || st_storage_peer_mesh_stats_visible(database_path, context->tenant_id, context->username,
+                                                  context->admin, &stats) != 0)) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
     }
-    long long reported = 0, active = 0, direct = 0, relay = 0;
-    long long direct_bytes = 0, relay_bytes = 0;
-    for (size_t i = 0; i < count; ++i) {
-        int is_reported = sessions[i].rtt_millis >= 0 || sessions[i].local_endpoint[0] != '\0'
-            || sessions[i].remote_endpoint[0] != '\0' || sessions[i].last_traffic_at[0] != '\0';
-        if (is_reported) ++reported;
-        if (strcmp(sessions[i].status, "ACTIVE") == 0) {
-            ++active;
-            if (strcmp(sessions[i].path_type, "RELAY") == 0) ++relay;
-            else if (strcmp(sessions[i].path_type, "DIRECT") == 0) ++direct;
+    long long total = 0, reported = 0, active = 0, active_direct = 0, active_relay = 0;
+    for (size_t i = 0; i < stats.path_count; ++i) {
+        const st_storage_peer_mesh_path_aggregate *item = &stats.paths[i];
+        total += item->sessions;
+        reported += item->reported_sessions;
+        if (strcmp(item->status, "ACTIVE") == 0) {
+            active += item->sessions;
+            if (strcmp(item->path_type, "DIRECT") == 0) active_direct += item->sessions;
+            else if (strcmp(item->path_type, "RELAY") == 0) active_relay += item->sessions;
         }
-        direct_bytes += sessions[i].direct_bytes;
-        relay_bytes += sessions[i].relay_bytes;
     }
-    char body[4096];
-    int written = snprintf(body, sizeof(body),
-        "{\"totalSessions\":%zu,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
-        "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":%s,"
-        "\"pathTypes\":[{\"pathType\":\"DIRECT\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
-        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":%lld,\"relayBytes\":0},"
-        "{\"pathType\":\"RELAY\",\"status\":\"ACTIVE\",\"sessions\":%lld,"
-        "\"reportedSessions\":%lld,\"avgRttMillis\":null,\"directBytes\":0,\"relayBytes\":%lld}],"
-        "\"addressFamilies\":[],\"natTypes\":[],\"natBehaviorDevices\":0,"
-        "\"natBehaviorClassifiedDevices\":0,\"natBehaviorSuccessRatio\":null,"
-        "\"natMappingBehaviors\":[],\"natFilteringBehaviors\":[],\"natBehaviorDiscoveries\":[]}",
-        count, reported, active, direct, relay, active > 0 ? "0" : "null",
-        direct, direct, direct_bytes, relay, relay, relay_bytes);
-    if (written < 0 || (size_t)written >= sizeof(body)) {
+    admin_peer_mesh_count *nat_types = NULL, *mappings = NULL, *filterings = NULL, *discoveries = NULL;
+    size_t nat_type_count = 0U, mapping_count = 0U, filtering_count = 0U, discovery_count = 0U;
+    long long behavior_devices = 0, classified_devices = 0;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < stats.nat_type_count; ++i) {
+        const st_storage_peer_mesh_nat_aggregate *item = &stats.nat_types[i];
+        rc = admin_peer_mesh_count_merge(&nat_types, &nat_type_count,
+                                         admin_peer_mesh_has_text(item->nat_type) ? item->nat_type : "UNKNOWN",
+                                         item->devices);
+    }
+    for (size_t i = 0; rc == 0 && i < stats.behavior_count; ++i) {
+        const st_storage_peer_mesh_behavior_aggregate *item = &stats.behaviors[i];
+        if (!admin_peer_mesh_has_text(item->mapping) && !admin_peer_mesh_has_text(item->filtering)
+            && !admin_peer_mesh_has_text(item->discovery)) {
+            continue;
+        }
+        char mapping[128], filtering[128], discovery[128];
+        admin_peer_mesh_nat_behavior(item->mapping, mapping, sizeof(mapping));
+        admin_peer_mesh_nat_behavior(item->filtering, filtering, sizeof(filtering));
+        admin_peer_mesh_nat_behavior(item->discovery, discovery, sizeof(discovery));
+        behavior_devices += item->devices;
+        if (admin_peer_mesh_nat_behavior_classified(mapping) && admin_peer_mesh_nat_behavior_classified(filtering)) {
+            classified_devices += item->devices;
+        }
+        rc = admin_peer_mesh_count_merge(&mappings, &mapping_count, mapping, item->devices);
+        if (rc == 0) rc = admin_peer_mesh_count_merge(&filterings, &filtering_count, filtering, item->devices);
+        if (rc == 0) rc = admin_peer_mesh_count_merge(&discoveries, &discovery_count, discovery, item->devices);
+    }
+
+    st_admin_string_builder builder = {0};
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder,
+                              "{\"totalSessions\":%lld,\"reportedSessions\":%lld,\"activeSessions\":%lld,"
+                              "\"activeDirectSessions\":%lld,\"activeRelaySessions\":%lld,\"activeDirectRatio\":",
+                              total, reported, active, active_direct, active_relay);
+    }
+    if (rc == 0) {
+        rc = active == 0 ? admin_sb_append(&builder, "null")
+                         : admin_sb_append_json_double(&builder, (double)active_direct / (double)active);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"pathTypes\":[");
+    for (size_t i = 0; rc == 0 && i < stats.path_count; ++i) {
+        const st_storage_peer_mesh_path_aggregate *item = &stats.paths[i];
+        rc = admin_sb_append(&builder, i == 0U ? "{\"pathType\":" : ",{\"pathType\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->path_type);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->status);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"sessions\":%lld,\"reportedSessions\":%lld,\"avgRttMillis\":",
+                                  item->sessions, item->reported_sessions);
+        }
+        if (rc == 0) {
+            rc = item->has_avg_rtt ? admin_sb_append_json_double(&builder, item->avg_rtt_millis)
+                                   : admin_sb_append(&builder, "null");
+        }
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"directBytes\":%lld,\"relayBytes\":%lld}",
+                                  item->direct_bytes, item->relay_bytes);
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "],\"addressFamilies\":[");
+    for (size_t i = 0; rc == 0 && i < stats.family_count; ++i) {
+        const st_storage_peer_mesh_family_aggregate *item = &stats.families[i];
+        rc = admin_sb_append(&builder, i == 0U ? "{\"addressFamily\":" : ",{\"addressFamily\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->address_family);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"status\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->status);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"pathType\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, item->path_type);
+        if (rc == 0) {
+            rc = admin_sb_appendf(&builder, ",\"sessions\":%lld,\"reportedSessions\":%lld}",
+                                  item->sessions, item->reported_sessions);
+        }
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "]");
+    if (rc == 0) rc = admin_peer_mesh_append_counts(&builder, "natTypes", "natType", nat_types, nat_type_count);
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder, ",\"natBehaviorDevices\":%lld,\"natBehaviorClassifiedDevices\":%lld,"
+                              "\"natBehaviorSuccessRatio\":", behavior_devices, classified_devices);
+    }
+    if (rc == 0) {
+        rc = behavior_devices == 0
+            ? admin_sb_append(&builder, "null")
+            : admin_sb_append_json_double(&builder, (double)classified_devices / (double)behavior_devices);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natMappingBehaviors", "behavior", mappings, mapping_count);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natFilteringBehaviors", "behavior", filterings,
+                                           filtering_count);
+    }
+    if (rc == 0) {
+        rc = admin_peer_mesh_append_counts(&builder, "natBehaviorDiscoveries", "behavior", discoveries,
+                                           discovery_count);
+    }
+    if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(nat_types);
+    free(mappings);
+    free(filterings);
+    free(discoveries);
+    st_storage_peer_mesh_stats_free(&stats);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh stats failed\"}");
     }
-    if (active > 0) {
-        char ratio[32];
-        snprintf(ratio, sizeof(ratio), "%.6f", (double)direct / (double)active);
-        char *placeholder = strstr(body, "\"activeDirectRatio\":0,");
-        if (placeholder != NULL) {
-            size_t prefix = (size_t)(placeholder - body) + strlen("\"activeDirectRatio\":");
-            char rebuilt[4096];
-            snprintf(rebuilt, sizeof(rebuilt), "%.*s%s%s", (int)prefix, body, ratio,
-                     placeholder + strlen("\"activeDirectRatio\":0"));
-            snprintf(body, sizeof(body), "%s", rebuilt);
-        }
-    }
-    return write_response(out, out_len, 200, "OK", body);
+    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return response_len;
 }
 
 static int append_peer_mesh_service_view(st_admin_string_builder *builder,
@@ -4615,9 +5928,9 @@ static int append_peer_mesh_service_view(st_admin_string_builder *builder,
             instance->active_connections, instance->total_connections);
     }
     if (rc == 0) rc = admin_sb_append(builder, "],\"createdAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, service->created_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, service->created_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, service->updated_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, service->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
@@ -4641,16 +5954,14 @@ static int admin_egress_id_listed(const char *csv, long long client_id)
  *
  * effectiveConsumerClientIds is the configured allowlist already intersected with the base Peer
  * ACL, so an operator sees which devices the policy actually grants rather than which ones it
- * names.
+ * names. clients holds every client (st_storage_list_all_clients).
  */
 static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
                                                const char *database_path,
+                                               const st_storage_client *clients,
+                                               size_t client_count,
                                                const st_storage_peer_mesh_egress_policy *policy)
 {
-    st_storage_client clients[512];
-    size_t client_count = 0U;
-    (void)st_storage_list_clients(database_path, clients, 512U, &client_count);
-
     int rc = admin_sb_appendf(builder,
         "{\"id\":%lld,\"egressClientId\":%lld,\"egressClientName\":",
         policy->id, policy->egress_client_id);
@@ -4708,9 +6019,9 @@ static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_appendf(builder,
         ",\"maxConcurrentFlows\":%d,\"maxFlowsPerConsumer\":%d,\"idleTimeoutSeconds\":%d,\"createdAt\":",
         policy->max_concurrent_flows, policy->max_flows_per_consumer, policy->idle_timeout_seconds);
-    if (rc == 0) rc = admin_sb_append_json_string(builder, policy->created_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, policy->created_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, policy->updated_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, policy->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
@@ -4725,10 +6036,9 @@ static int build_peer_mesh_egress_activity_response(const st_admin_context *cont
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
-    st_storage_peer_mesh_egress_activity rows[128];
+    st_storage_peer_mesh_egress_activity *rows = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_activity(database_path, context->tenant_id,
-                                                  rows, 128U, &count) != 0) {
+    if (st_storage_list_peer_mesh_egress_activity(database_path, context->tenant_id, &rows, &count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"egress activity list failed\"}");
     }
@@ -4758,6 +6068,7 @@ static int build_peer_mesh_egress_activity_response(const st_admin_context *cont
         if (rc == 0) rc = admin_sb_append_json_string(&builder, rows[i].reported_at);
         if (rc == 0) rc = admin_sb_append(&builder, "}");
     }
+    free(rows);
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -4790,9 +6101,13 @@ static int build_peer_mesh_egress_switch_response(const st_admin_context *contex
     }
     size_t enabled_policies = 0U;
     if (database_path != NULL) {
-        st_storage_peer_mesh_egress_policy policies[128];
-        (void)st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 1,
-                                                        policies, 128U, &enabled_policies);
+        st_storage_peer_mesh_egress_policy *policies = NULL;
+        if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 1,
+                                                      &policies, &enabled_policies) != 0) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"egress switch status failed\"}");
+        }
+        free(policies);
     }
     int deployment_enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     int configured = found == 0 && row.enabled;
@@ -4805,9 +6120,11 @@ static int build_peer_mesh_egress_switch_response(const st_admin_context *contex
         configured ? "true" : "false",
         (deployment_enabled && configured) ? "true" : "false",
         ST_EGRESS_PROTOCOL_VERSION, enabled_policies);
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, found == 0 ? row.updated_at : "");
+    /* Java: null while the tenant never set the switch. */
+    if (rc == 0) rc = found == 0 ? admin_sb_append_instant(&builder, row.updated_at) : admin_sb_append(&builder, "null");
     if (rc == 0) rc = admin_sb_append(&builder, ",\"updatedBy\":");
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, found == 0 ? row.updated_by : "");
+    if (rc == 0) rc = found == 0 ? admin_sb_append_nullable_json_string(&builder, row.updated_by)
+                                 : admin_sb_append(&builder, "null");
     if (rc == 0) rc = admin_sb_append(&builder, "}");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -4824,6 +6141,12 @@ static int handle_peer_mesh_egress_switch_update(const st_admin_context *context
                                                  char *out,
                                                  size_t out_len)
 {
+    /* Spring binds the SwitchMutation before PeerEgressService.setSwitch checks anything. */
+    int enabled = 0;
+    int bound = admin_body_is_object(body) ? admin_jackson_boolean(body, "enabled", &enabled) : -2;
+    if (bound == -2) {
+        return write_spring_bad_request(out, out_len);
+    }
     if (!context->admin) {
         return write_response(out, out_len, 403, "Forbidden",
                               "{\"error\":\"只有租户 ADMIN 可以管理出口授权\"}");
@@ -4833,12 +6156,7 @@ static int handle_peer_mesh_egress_switch_update(const st_admin_context *context
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"database-backed egress policies are unavailable\"}");
     }
-    /* A body that is not JSON is refused even when "enabled": true can be picked out of it. */
-    if (body == NULL || !st_json_is_valid_object(body)) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid request body\"}");
-    }
-    int enabled = 0;
-    if (st_json_get_bool(body, "enabled", &enabled) != 0) {
+    if (bound == 0) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled is required\"}");
     }
     if (enabled && !env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
@@ -4865,10 +6183,13 @@ static int build_peer_mesh_egress_policies_response(const st_admin_context *cont
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
-    st_storage_peer_mesh_egress_policy policies[128];
+    st_storage_peer_mesh_egress_policy *policies = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 0,
-                                                  policies, 128U, &count) != 0) {
+    st_storage_client *clients = NULL;
+    size_t client_count = 0U;
+    if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 0, &policies, &count) != 0
+        || (count > 0U && st_storage_list_all_clients(database_path, &clients, &client_count) != 0)) {
+        free(policies);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"egress policy list failed\"}");
     }
@@ -4876,8 +6197,12 @@ static int build_peer_mesh_egress_policies_response(const st_admin_context *cont
     int rc = admin_sb_append(&builder, "[");
     for (size_t i = 0; rc == 0 && i < count; ++i) {
         if (i > 0) rc = admin_sb_append(&builder, ",");
-        if (rc == 0) rc = append_peer_mesh_egress_policy_view(&builder, database_path, &policies[i]);
+        if (rc == 0) {
+            rc = append_peer_mesh_egress_policy_view(&builder, database_path, clients, client_count, &policies[i]);
+        }
     }
+    free(policies);
+    free(clients);
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -4889,63 +6214,103 @@ static int build_peer_mesh_egress_policies_response(const st_admin_context *cont
     return len;
 }
 
-/*
- * Validates the destination allowlist and writes the form to store. Anything the egress would not
- * read refuses the request as a whole (protocol/spec/peer-egress.md): dropping only the bad part,
- * as this used to, saved a policy other than the one the operator asked for and said nothing.
- */
-static int admin_encode_egress_destination_rules(const char *raw, char *out, size_t out_len)
+/* Java's 400 for a rule list PeerEgressService refused, or Spring's when it did not bind. */
+static int write_egress_rules_refusal(int verdict, const char *message, char *out, size_t out_len)
 {
-    char *normalized = NULL;
-    if (st_egress_normalize_destination_rules(raw, &normalized) != 0) return 1;
-    int rc = strlen(normalized) < out_len ? 0 : 1;
-    if (rc == 0) snprintf(out, out_len, "%s", normalized);
-    free(normalized);
-    return rc;
+    if (verdict == 2) {
+        return write_spring_bad_request(out, out_len);
+    }
+    return write_bad_request_naming("", message, out, out_len);
 }
 
+/*
+ * Java PeerEgressService.upsertPolicy: an upsert by egressClientId in which a field left out keeps
+ * its stored value. Spring binds the PolicyMutation first (a member of the wrong type is its 400),
+ * then the service checks, in order: ADMIN (403), egressClientId, the egress client in the tenant
+ * (404), scope, allowedConsumerClientIds, destinationRules, domainRules and the three limits.
+ */
 static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *context,
                                                    const char *body,
                                                    char *out,
                                                    size_t out_len)
 {
-    if (!context->admin) {
-        return write_response(out, out_len, 403, "Forbidden",
-                              "{\"error\":\"只有租户 ADMIN 可以管理出口授权\"}");
+    long long egress_client_id = 0;
+    int enabled = 0;
+    char *scope = NULL;
+    long long *consumers = NULL;
+    size_t consumer_count = 0U;
+    long long limits[3] = {0, 0, 0};
+    int limits_bound[3] = {0, 0, 0};
+    static const char *const limit_names[3] = {"maxConcurrentFlows", "maxFlowsPerConsumer", "idleTimeoutSeconds"};
+    char **rule_items = NULL;
+    size_t rule_count = 0U;
+    int bound_ok = admin_body_is_object(body);
+    int egress_bound = bound_ok ? admin_jackson_long(body, "egressClientId", LLONG_MIN, LLONG_MAX, &egress_client_id) : -2;
+    int enabled_bound = egress_bound == -2 ? -2 : admin_jackson_boolean(body, "enabled", &enabled);
+    int scope_bound = enabled_bound == -2 ? -2 : admin_jackson_string(body, "scope", &scope);
+    int consumers_bound = scope_bound == -2 ? -2
+        : admin_jackson_client_ids(body, "allowedConsumerClientIds", &consumers, &consumer_count);
+    int failed = consumers_bound == -2;
+    for (size_t i = 0U; !failed && i < 3U; ++i) {
+        limits_bound[i] = admin_jackson_long(body, limit_names[i], INT_MIN, INT_MAX, &limits[i]);
+        failed = limits_bound[i] == -2;
+    }
+    /* The rule lists bind as arrays of rule records; their contents are checked below. */
+    static const char *const rule_fields[2] = {"destinationRules", "domainRules"};
+    char *rules_raw[2] = {NULL, NULL};
+    for (size_t i = 0U; !failed && i < 2U; ++i) {
+        rules_raw[i] = admin_json_member_raw(body, rule_fields[i]);
+        if (rules_raw[i] != NULL) {
+            failed = admin_jackson_array(body, rule_fields[i], &rule_items, &rule_count) != 1;
+            st_json_free_string_array(rule_items, rule_count);
+            rule_items = NULL;
+            rule_count = 0U;
+        }
+    }
+    char *normalized[2] = {NULL, NULL};
+    int verdicts[2] = {0, 0};
+    char rule_errors[2][512] = {"", ""};
+    for (size_t i = 0U; !failed && i < 2U; ++i) {
+        if (rules_raw[i] != NULL) {
+            verdicts[i] = i == 0U
+                ? st_egress_normalize_destination_rules_explained(rules_raw[i], &normalized[i], rule_errors[i],
+                                                                  sizeof(rule_errors[i]))
+                : st_egress_normalize_domain_rules_explained(rules_raw[i], &normalized[i], rule_errors[i],
+                                                             sizeof(rule_errors[i]));
+            failed = verdicts[i] == 2;
+        }
+    }
+    int answer = 0;
+    if (failed) {
+        answer = write_spring_bad_request(out, out_len);
+    } else if (!context->admin) {
+        answer = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有租户 ADMIN 可以管理出口授权\"}");
     }
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        return write_response(out, out_len, 409, "Conflict",
-                              "{\"error\":\"database-backed egress policies are unavailable\"}");
-    }
-    /*
-     * The field readers below also match text in a body that is not JSON at all, and the structural
-     * ones treat it as carrying no fields: a truncated body would save the other fields while
-     * silently keeping the old rules.
-     */
-    if (body == NULL || !st_json_is_valid_object(body)) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid request body\"}");
-    }
-    long long egress_client_id = 0;
-    if (st_json_get_i64(body, "egressClientId", &egress_client_id) != 0 || egress_client_id <= 0) {
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"egressClientId is required\"}");
+    if (answer == 0 && database_path == NULL) {
+        answer = write_response(out, out_len, 409, "Conflict",
+                                "{\"error\":\"database-backed egress policies are unavailable\"}");
     }
     st_storage_client egress;
-    if (st_storage_get_client(database_path, egress_client_id, &egress) != 0
-        || strcmp(egress.tenant_id, context->tenant_id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    if (answer == 0 && egress_bound != 1) {
+        answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"egressClientId is required\"}");
+    } else if (answer == 0 && (st_storage_get_client(database_path, egress_client_id, &egress) != 0
+                               || strcmp(egress.tenant_id, context->tenant_id) != 0)) {
+        /* A ResponseStatusException(NOT_FOUND) in Java, for any id the tenant does not have. */
+        char missing[96];
+        snprintf(missing, sizeof(missing), "{\"error\":\"client not found: %lld\"}", egress_client_id);
+        answer = write_response(out, out_len, 404, "Not Found", missing);
     }
 
     st_storage_peer_mesh_egress_policy policy;
     memset(&policy, 0, sizeof(policy));
-    int found = st_storage_find_peer_mesh_egress_policy_by_client(database_path, context->tenant_id,
-                                                                   egress_client_id, &policy);
-    if (found < 0) {
-        return write_response(out, out_len, 500, "Internal Server Error",
-                              "{\"error\":\"egress policy lookup failed\"}");
+    int found = answer == 0
+        ? st_storage_find_peer_mesh_egress_policy_by_client(database_path, context->tenant_id, egress_client_id, &policy)
+        : 0;
+    if (answer == 0 && found < 0) {
+        answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"egress policy lookup failed\"}");
     }
-    if (found != 0) {
+    if (answer == 0 && found != 0) {
         memset(&policy, 0, sizeof(policy));
         snprintf(policy.scope, sizeof(policy.scope), "%s", ST_EGRESS_SCOPE_PUBLIC);
         snprintf(policy.destination_rules, sizeof(policy.destination_rules), "[]");
@@ -4954,99 +6319,85 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
         policy.max_flows_per_consumer = 64;
         policy.idle_timeout_seconds = 60;
     }
-    snprintf(policy.tenant_id, sizeof(policy.tenant_id), "%s", context->tenant_id);
-    snprintf(policy.owner_username, sizeof(policy.owner_username), "%s", context->username);
-    policy.egress_client_id = egress.id;
-    snprintf(policy.egress_client_name, sizeof(policy.egress_client_name), "%s", egress.client_name);
-
-    int enabled = 0;
-    if (st_json_get_bool(body, "enabled", &enabled) == 0) policy.enabled = enabled;
-
-    char *scope = st_json_get_string(body, "scope");
-    if (scope != NULL) {
-        for (char *p = scope; *p != '\0'; ++p) *p = (char)toupper((unsigned char)*p);
-        if (strcmp(scope, ST_EGRESS_SCOPE_PUBLIC) != 0 && strcmp(scope, ST_EGRESS_SCOPE_LAN) != 0) {
-            free(scope);
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid scope\"}");
-        }
-        snprintf(policy.scope, sizeof(policy.scope), "%s", scope);
-        free(scope);
+    if (answer == 0) {
+        snprintf(policy.tenant_id, sizeof(policy.tenant_id), "%s", context->tenant_id);
+        snprintf(policy.owner_username, sizeof(policy.owner_username), "%s", context->username);
+        policy.egress_client_id = egress.id;
+        snprintf(policy.egress_client_name, sizeof(policy.egress_client_name), "%s", egress.client_name);
+        if (enabled_bound == 1) policy.enabled = enabled;
     }
-
-    char **consumers = NULL;
-    size_t consumer_count = 0U;
-    if (st_json_get_raw_array(body, "allowedConsumerClientIds", &consumers, &consumer_count) == 0) {
+    if (answer == 0 && scope_bound == 1) {
+        /* Java: scope.trim().toUpperCase(), refused with the scope as sent. */
+        char upper[16] = "";
+        char *trimmed = admin_java_trim(admin_dup_string(scope));
+        if (trimmed != NULL && strlen(trimmed) < sizeof(upper)) {
+            for (size_t i = 0U; trimmed[i] != '\0'; ++i) upper[i] = (char)toupper((unsigned char)trimmed[i]);
+            upper[strlen(trimmed)] = '\0';
+        }
+        free(trimmed);
+        if (strcmp(upper, ST_EGRESS_SCOPE_PUBLIC) == 0 || strcmp(upper, ST_EGRESS_SCOPE_LAN) == 0) {
+            snprintf(policy.scope, sizeof(policy.scope), "%s", upper);
+        } else {
+            answer = write_bad_request_naming("invalid scope: ", scope, out, out_len);
+        }
+    }
+    if (answer == 0 && consumers_bound == 1) {
+        /* PeerServiceDiscovery.encodeClientIds: positive ids without repeats, at most 32 of them. */
         if (consumer_count > ST_EGRESS_MAX_CONSUMERS) {
-            st_json_free_string_array(consumers, consumer_count);
-            return write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"at most 32 allowedConsumerClientIds\"}");
+            answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"at most 32 allowedClientIds\"}");
+        } else {
+            size_t offset = 0U;
+            policy.allowed_consumer_client_ids[0] = '\0';
+            for (size_t i = 0U; answer == 0 && i < consumer_count; ++i) {
+                int written = snprintf(policy.allowed_consumer_client_ids + offset,
+                                       sizeof(policy.allowed_consumer_client_ids) - offset,
+                                       "%s%lld", offset == 0U ? "" : ",", consumers[i]);
+                if (written < 0 || (size_t)written >= sizeof(policy.allowed_consumer_client_ids) - offset) {
+                    answer = write_response(out, out_len, 400, "Bad Request",
+                                            "{\"error\":\"at most 32 allowedClientIds\"}");
+                } else {
+                    offset += (size_t)written;
+                }
+            }
         }
-        size_t offset = 0U;
-        policy.allowed_consumer_client_ids[0] = '\0';
-        for (size_t i = 0; i < consumer_count; ++i) {
-            char *end = NULL;
-            long long value = strtoll(consumers[i], &end, 10);
-            if (end == consumers[i] || *end != '\0' || value <= 0) continue;
-            int written = snprintf(policy.allowed_consumer_client_ids + offset,
-                                   sizeof(policy.allowed_consumer_client_ids) - offset,
-                                   "%s%lld", offset == 0U ? "" : ",", value);
-            if (written < 0
-                || (size_t)written >= sizeof(policy.allowed_consumer_client_ids) - offset) break;
-            offset += (size_t)written;
+    }
+    for (size_t i = 0U; answer == 0 && i < 2U; ++i) {
+        if (rules_raw[i] == NULL) {
+            continue; /* null leaves the stored rules as they are, like an absent field. */
         }
-        st_json_free_string_array(consumers, consumer_count);
-    }
-
-    char *rules_raw = st_json_get_top_level_raw(body, "destinationRules");
-    /* null leaves the stored rules as they are, like an absent field, as the other servers read it. */
-    if (rules_raw != NULL && strcmp(rules_raw, "null") != 0) {
-        int rc = admin_encode_egress_destination_rules(rules_raw, policy.destination_rules,
-                                                       sizeof(policy.destination_rules));
-        free(rules_raw);
-        if (rc != 0) {
-            return write_response(out, out_len, 400, "Bad Request",
-                "{\"error\":\"invalid destinationRules: each rule needs an IPv4 cidr, tcp or udp protocols "
-                "and [low, high] port ranges within 0-65535; at most 64 rules, 32 ranges per rule "
-                "and 4096 bytes stored\"}");
+        char *target = i == 0U ? policy.destination_rules : policy.domain_rules;
+        size_t target_len = i == 0U ? sizeof(policy.destination_rules) : sizeof(policy.domain_rules);
+        if (verdicts[i] != 0) {
+            answer = write_egress_rules_refusal(verdicts[i], rule_errors[i], out, out_len);
+        } else if (strlen(normalized[i]) >= target_len) {
+            answer = write_bad_request_naming(i == 0U ? "destination rules exceed 4096 bytes once stored"
+                                                      : "domain rules exceed 4096 bytes once stored",
+                                              "", out, out_len);
+        } else {
+            snprintf(target, target_len, "%s", normalized[i]);
         }
-    } else {
-        free(rules_raw);
     }
-
-    char *domain_rules_raw = st_json_get_top_level_raw(body, "domainRules");
-    /* Like destinationRules, null leaves the stored rules as they are. */
-    if (domain_rules_raw != NULL && strcmp(domain_rules_raw, "null") != 0) {
-        char *normalized = NULL;
-        int rc = st_egress_normalize_domain_rules(domain_rules_raw, &normalized) != 0
-            || strlen(normalized) >= sizeof(policy.domain_rules);
-        if (rc == 0) snprintf(policy.domain_rules, sizeof(policy.domain_rules), "%s", normalized);
-        free(normalized);
-        free(domain_rules_raw);
-        if (rc != 0) {
-            return write_response(out, out_len, 400, "Bad Request",
-                "{\"error\":\"invalid domainRules: each rule needs a match written as name or *.name with "
-                "at least two labels, tcp or udp protocols and [low, high] port ranges within 0-65535; at most "
-                "64 rules, 32 ranges per rule and 4096 bytes stored\"}");
+    int *stored_limits[3] = {&policy.max_concurrent_flows, &policy.max_flows_per_consumer, &policy.idle_timeout_seconds};
+    for (size_t i = 0U; answer == 0 && i < 3U; ++i) {
+        if (limits_bound[i] != 1) {
+            continue;
         }
-    } else {
-        free(domain_rules_raw);
+        if (limits[i] <= 0) {
+            char message[96];
+            snprintf(message, sizeof(message), "{\"error\":\"%s must be positive\"}", limit_names[i]);
+            answer = write_response(out, out_len, 400, "Bad Request", message);
+        } else {
+            *stored_limits[i] = (int)limits[i];
+        }
     }
-
-    int value = 0;
-    if (st_json_get_int(body, "maxConcurrentFlows", &value) == 0) {
-        if (value <= 0) return write_response(out, out_len, 400, "Bad Request",
-                                              "{\"error\":\"maxConcurrentFlows must be positive\"}");
-        policy.max_concurrent_flows = value;
+    free(scope);
+    free(consumers);
+    for (size_t i = 0U; i < 2U; ++i) {
+        free(rules_raw[i]);
+        free(normalized[i]);
     }
-    if (st_json_get_int(body, "maxFlowsPerConsumer", &value) == 0) {
-        if (value <= 0) return write_response(out, out_len, 400, "Bad Request",
-                                              "{\"error\":\"maxFlowsPerConsumer must be positive\"}");
-        policy.max_flows_per_consumer = value;
-    }
-    if (st_json_get_int(body, "idleTimeoutSeconds", &value) == 0) {
-        if (value <= 0) return write_response(out, out_len, 400, "Bad Request",
-                                              "{\"error\":\"idleTimeoutSeconds must be positive\"}");
-        policy.idle_timeout_seconds = value;
+    if (answer != 0) {
+        return answer;
     }
 
     st_storage_peer_mesh_egress_policy saved;
@@ -5058,7 +6409,11 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
     admin_notify_peer_mesh_refresh(saved.tenant_id);
 
     st_admin_string_builder builder = {0};
-    int rc = append_peer_mesh_egress_policy_view(&builder, database_path, &saved);
+    st_storage_client *clients = NULL;
+    size_t client_count = 0U;
+    int rc = st_storage_list_all_clients(database_path, &clients, &client_count);
+    if (rc == 0) rc = append_peer_mesh_egress_policy_view(&builder, database_path, clients, client_count, &saved);
+    free(clients);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -5084,26 +6439,29 @@ static int handle_peer_mesh_egress_policy_delete(const st_admin_context *context
                               "{\"error\":\"database-backed egress policies are unavailable\"}");
     }
     st_storage_peer_mesh_egress_policy policy;
-    int found = st_storage_get_peer_mesh_egress_policy(database_path, id, context->tenant_id, &policy);
+    int found = id > 0 ? st_storage_get_peer_mesh_egress_policy(database_path, id, context->tenant_id, &policy) : 1;
     if (found != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"egress policy not found\"}");
+        char missing[96];
+        snprintf(missing, sizeof(missing), "{\"error\":\"egress policy not found: %lld\"}", id);
+        return write_response(out, out_len, 404, "Not Found", missing);
     }
     if (st_storage_delete_peer_mesh_egress_policy(database_path, id, context->tenant_id) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"egress policy delete failed\"}");
     }
     admin_notify_peer_mesh_refresh(policy.tenant_id);
-    return write_response(out, out_len, 200, "OK", "{}");
+    /* Java's void handler: 200 with no body. */
+    return write_response(out, out_len, 200, "OK", "");
 }
 
 static int build_peer_mesh_services_response(const st_admin_context *context, char *out, size_t out_len)
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
-    st_storage_peer_mesh_service services[256];
+    st_storage_peer_mesh_service *services = NULL;
     size_t count = 0U;
     if (st_storage_list_peer_mesh_services_visible(database_path, context->tenant_id,
-            context->username, context->admin, services, 256, &count) != 0) {
+            context->username, context->admin, &services, &count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service list failed\"}");
     }
     st_admin_string_builder builder = {0};
@@ -5112,6 +6470,7 @@ static int build_peer_mesh_services_response(const st_admin_context *context, ch
         if (i > 0) rc = admin_sb_append(&builder, ",");
         if (rc == 0) rc = append_peer_mesh_service_view(&builder, &services[i], context->admin);
     }
+    free(services);
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -5129,13 +6488,14 @@ static int build_peer_mesh_sharing_response(const st_admin_context *context, cha
     int found = database_path == NULL ? 1
         : st_storage_get_peer_mesh_service_sharing(database_path, context->tenant_id, &sharing);
     if (found < 0) return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer sharing status failed\"}");
-    st_storage_peer_mesh_service services[256];
+    st_storage_peer_mesh_service *services = NULL;
     size_t count = 0U;
     long long enabled_count = 0;
     if (database_path != NULL
         && st_storage_list_peer_mesh_services_visible(database_path, context->tenant_id,
-            context->username, 1, services, 256, &count) == 0) {
+            context->username, 1, &services, &count) == 0) {
         for (size_t i = 0; i < count; ++i) if (services[i].enabled) ++enabled_count;
+        free(services);
     }
     int deployment = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     st_admin_string_builder builder = {0};
@@ -5145,7 +6505,7 @@ static int build_peer_mesh_sharing_response(const st_admin_context *context, cha
         "\"enabledServiceCount\":%lld,\"updatedAt\":",
         deployment ? "true" : "false", sharing.enabled ? "true" : "false",
         deployment && sharing.enabled ? "true" : "false", enabled_count);
-    if (rc == 0) rc = found == 0 ? admin_sb_append_json_string(&builder, sharing.updated_at) : admin_sb_append(&builder, "null");
+    if (rc == 0) rc = found == 0 ? admin_sb_append_instant(&builder, sharing.updated_at) : admin_sb_append(&builder, "null");
     if (rc == 0) rc = admin_sb_append(&builder, ",\"updatedBy\":");
     if (rc == 0) rc = found == 0 && sharing.updated_by[0] != '\0'
         ? admin_sb_append_json_string(&builder, sharing.updated_by) : admin_sb_append(&builder, "null");
@@ -5157,18 +6517,32 @@ static int build_peer_mesh_sharing_response(const st_admin_context *context, cha
     return len;
 }
 
+/*
+ * Java PeerMeshResource.updateServiceSharing binds the body as a Map and takes a member only when it
+ * is a JSON boolean (raw instanceof Boolean); anything else counts as absent. Then
+ * PeerServiceDiscoveryService.setSharing: ADMIN, one of the two flags, Peer Mesh for enabling.
+ */
 static int handle_peer_mesh_sharing_update(const st_admin_context *context,
                                            const char *body,
                                            char *out,
                                            size_t out_len)
 {
+    if (!admin_body_is_object(body)) {
+        return write_spring_bad_request(out, out_len);
+    }
     if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
-    int enabled = 0, mdns = 0;
-    int has_enabled = st_json_get_bool(body, "enabled", &enabled) == 0;
-    int has_mdns = st_json_get_bool(body, "mdnsImportEnabled", &mdns) == 0;
+    char *enabled_raw = admin_json_member_raw(body, "enabled");
+    char *mdns_raw = admin_json_member_raw(body, "mdnsImportEnabled");
+    int has_enabled = enabled_raw != NULL && (strcmp(enabled_raw, "true") == 0 || strcmp(enabled_raw, "false") == 0);
+    int has_mdns = mdns_raw != NULL && (strcmp(mdns_raw, "true") == 0 || strcmp(mdns_raw, "false") == 0);
+    int enabled = has_enabled && enabled_raw[0] == 't';
+    int mdns = has_mdns && mdns_raw[0] == 't';
+    free(enabled_raw);
+    free(mdns_raw);
     if (!has_enabled && !has_mdns) return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"enabled or mdnsImportEnabled is required\"}");
+    /* A request the deployment cannot honour: 400, as Java's IllegalArgumentException maps it. */
     if (has_enabled && enabled && !env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"部署端未启用 Peer Mesh，不能开启服务共享\"}");
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
@@ -5176,164 +6550,407 @@ static int handle_peer_mesh_sharing_update(const st_admin_context *context,
     }
     st_storage_peer_mesh_service_sharing current = {0};
     (void)st_storage_get_peer_mesh_service_sharing(database_path, context->tenant_id, &current);
+    int next_mdns = has_mdns ? mdns : current.mdns_import_enabled;
     if (st_storage_upsert_peer_mesh_service_sharing(database_path, context->tenant_id,
-            has_enabled ? enabled : current.enabled, has_mdns ? mdns : current.mdns_import_enabled,
+            has_enabled ? enabled : current.enabled, next_mdns,
             context->username, NULL) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer sharing update failed\"}");
     }
+    char reason[32];
+    snprintf(reason, sizeof(reason), "%s%s", has_enabled && enabled ? "enabled" : "updated", next_mdns ? ",mdns" : "");
     (void)st_storage_record_peer_mesh_service_audit(database_path, "sharing-toggle",
-        context->tenant_id, 0, 0, NULL,
-        has_enabled && enabled ? "enabled" : "updated");
+        context->tenant_id, 0, 0, NULL, reason);
     admin_notify_peer_mesh_refresh(context->tenant_id);
     return build_peer_mesh_sharing_response(context, out, out_len);
 }
 
-static int peer_service_string_valid(const char *value, size_t min_len, size_t max_len)
+/* Java UUID.randomUUID().toString(): the serviceId of a service created without one. */
+static int admin_generate_uuid(char out[37])
 {
-    size_t len = value == NULL ? 0U : strlen(value);
-    return len >= min_len && len <= max_len;
+    uint8_t bytes[16];
+    if (RAND_bytes(bytes, (int)sizeof(bytes)) != 1) {
+        return -1;
+    }
+    bytes[6] = (uint8_t)((bytes[6] & 0x0fU) | 0x40U);
+    bytes[8] = (uint8_t)((bytes[8] & 0x3fU) | 0x80U);
+    snprintf(out, 37U, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    return 0;
 }
 
+/* Java PeerServiceDiscovery.requireServiceId on text that has some: trimmed, [A-Za-z0-9._-]{8,64}. */
 static int peer_service_id_valid(const char *value)
 {
-    if (!peer_service_string_valid(value, 8U, 64U)) return 0;
+    size_t len = value == NULL ? 0U : strlen(value);
+    if (len < 8U || len > 64U) return 0;
     for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; ++p) {
         if (!isalnum(*p) && *p != '.' && *p != '_' && *p != '-') return 0;
     }
     return 1;
 }
 
-static int peer_service_allowed_ids(const char *body, char out[512], int preserve_missing)
+/* ServiceMutation as Spring binds it; the strings are NULL when absent or null. */
+typedef struct {
+    int client_bound;
+    long long client_id;
+    char *service_id;
+    char *name;
+    char *description;
+    char *transport;
+    char *application;
+    char *target_host;
+    char *path;
+    char *visibility;
+    int target_port_bound;
+    long long target_port;
+    int published_port_bound;
+    long long published_port;
+    int enabled_bound;
+    int enabled;
+    int allowed_bound;
+    long long *allowed;
+    size_t allowed_count;
+} admin_peer_service_mutation;
+
+static void admin_peer_service_mutation_free(admin_peer_service_mutation *mutation)
 {
-    char **items = NULL;
-    size_t count = 0U;
-    if (st_json_get_raw_array(body, "allowedClientIds", &items, &count) != 0) {
-        return preserve_missing ? 1 : 0;
+    free(mutation->service_id);
+    free(mutation->name);
+    free(mutation->description);
+    free(mutation->transport);
+    free(mutation->application);
+    free(mutation->target_host);
+    free(mutation->path);
+    free(mutation->visibility);
+    free(mutation->allowed);
+    memset(mutation, 0, sizeof(*mutation));
+}
+
+/* 0 when the body binds into ServiceMutation, -2 when it does not (Spring's 400). */
+static int admin_peer_service_mutation_bind(const char *body, admin_peer_service_mutation *mutation)
+{
+    memset(mutation, 0, sizeof(*mutation));
+    if (!admin_body_is_object(body)) return -2;
+    static const char *const names[8] = {
+        "serviceId", "name", "description", "transport", "application", "targetHost", "path", "visibility"
+    };
+    char **fields[8] = {
+        &mutation->service_id, &mutation->name, &mutation->description, &mutation->transport,
+        &mutation->application, &mutation->target_host, &mutation->path, &mutation->visibility
+    };
+    mutation->client_bound = admin_jackson_long(body, "clientId", LLONG_MIN, LLONG_MAX, &mutation->client_id);
+    int failed = mutation->client_bound == -2;
+    for (size_t i = 0U; !failed && i < 8U; ++i) {
+        failed = admin_jackson_string(body, names[i], fields[i]) == -2;
     }
-    if (count > 32U) { st_json_free_string_array(items, count); return -1; }
-    out[0] = '\0';
-    size_t offset = 0U;
-    long long unique_ids[32];
-    size_t unique_count = 0U;
-    for (size_t i = 0; i < count; ++i) {
-        char *end = NULL;
-        long long id = strtoll(items[i], &end, 10);
-        if (end == items[i] || *end != '\0' || id <= 0) continue;
-        int duplicate = 0;
-        for (size_t j = 0; j < unique_count; ++j) if (unique_ids[j] == id) duplicate = 1;
-        if (duplicate) continue;
-        unique_ids[unique_count++] = id;
-        int written = snprintf(out + offset, 512U - offset, "%s%lld", offset == 0U ? "" : ",", id);
-        if (written < 0 || (size_t)written >= 512U - offset) { st_json_free_string_array(items, count); return -1; }
-        offset += (size_t)written;
+    if (!failed) {
+        mutation->target_port_bound = admin_jackson_long(body, "targetPort", INT_MIN, INT_MAX, &mutation->target_port);
+        mutation->published_port_bound = admin_jackson_long(body, "publishedPort", INT_MIN, INT_MAX,
+                                                            &mutation->published_port);
+        mutation->enabled_bound = admin_jackson_boolean(body, "enabled", &mutation->enabled);
+        mutation->allowed_bound = admin_jackson_client_ids(body, "allowedClientIds", &mutation->allowed,
+                                                           &mutation->allowed_count);
+        failed = mutation->target_port_bound == -2 || mutation->published_port_bound == -2
+            || mutation->enabled_bound == -2 || mutation->allowed_bound == -2;
     }
-    st_json_free_string_array(items, count);
+    if (failed) {
+        admin_peer_service_mutation_free(mutation);
+        return -2;
+    }
     return 0;
 }
 
+/*
+ * Java requireName / normalizeDescription: trimmed, no character below U+0020, at most max UTF-16
+ * code units. A value C's stored field cannot hold is refused with the same message.
+ */
+static const char *peer_service_text(const char *raw, const char *field, int required, size_t max_chars,
+                                     char *out, size_t out_len, char message[96])
+{
+    if (!admin_java_has_text(raw)) {
+        if (required) {
+            snprintf(message, 96U, "%s is required", field);
+            return message;
+        }
+        out[0] = '\0';
+        return NULL;
+    }
+    char *value = admin_java_trim(admin_dup_string(raw));
+    if (value == NULL) return "out of memory";
+    const char *refusal = NULL;
+    for (const unsigned char *p = (const unsigned char *)value; refusal == NULL && *p != '\0'; ++p) {
+        if (*p < 32U) {
+            snprintf(message, 96U, "%s contains control characters", field);
+            refusal = message;
+        }
+    }
+    if (refusal == NULL && (admin_utf16_length(value) > max_chars || strlen(value) >= out_len)) {
+        snprintf(message, 96U, "%s exceeds %zu characters", field, max_chars);
+        refusal = message;
+    }
+    if (refusal == NULL) snprintf(out, out_len, "%s", value);
+    free(value);
+    return refusal;
+}
+
+/* Lower-cased and trimmed copy of value into out, empty when it does not fit. */
+static void peer_service_trim_lower(const char *value, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    char *copy = admin_java_trim(admin_dup_string(value == NULL ? "" : value));
+    if (copy == NULL) return;
+    if (strlen(copy) < out_len) {
+        for (size_t i = 0U; copy[i] != '\0'; ++i) out[i] = (char)tolower((unsigned char)copy[i]);
+        out[strlen(copy)] = '\0';
+    } else {
+        snprintf(out, out_len, "?");
+    }
+    free(copy);
+}
+
+/*
+ * Java PeerServiceDiscovery.normalizePath: "/" for http and https and "" otherwise when blank; else
+ * trimmed, without "://", a backslash, ".." or a space, starting with "/", at most 128 characters
+ * of [A-Za-z0-9._~/-].
+ */
+static const char *peer_service_path(const char *raw, const char *application, char *out, size_t out_len)
+{
+    if (!admin_java_has_text(raw)) {
+        snprintf(out, out_len, "%s", strcmp(application, "http") == 0 || strcmp(application, "https") == 0 ? "/" : "");
+        return NULL;
+    }
+    char *value = admin_java_trim(admin_dup_string(raw));
+    if (value == NULL) return "out of memory";
+    const char *refusal = NULL;
+    size_t len = strlen(value);
+    if (strstr(value, "://") != NULL || strchr(value, '\\') != NULL || strstr(value, "..") != NULL
+        || strchr(value, ' ') != NULL) {
+        refusal = "path must be a safe relative HTTP path";
+    } else if (value[0] != '/') {
+        refusal = "path must start with /";
+    } else if (admin_utf16_length(value) > 128U || len >= out_len) {
+        refusal = "path exceeds 128 characters";
+    } else {
+        for (size_t i = 0U; refusal == NULL && i < len; ++i) {
+            unsigned char c = (unsigned char)value[i];
+            if (!isalnum(c) && strchr("._~/-", c) == NULL) refusal = "path contains unsupported characters";
+        }
+    }
+    if (refusal == NULL) snprintf(out, out_len, "%s", value);
+    free(value);
+    return refusal;
+}
+
+/*
+ * Java PeerServiceDiscoveryService.applyDefinition on row: the fields the request carries (all of
+ * them on create), in Java's order, then the published-port conflict among the client's enabled
+ * services. NULL when the row was updated, else the refusal.
+ */
+static const char *admin_peer_service_apply(const char *database_path,
+                                            st_storage_peer_mesh_service *row,
+                                            const admin_peer_service_mutation *mutation,
+                                            int creating,
+                                            char message[96])
+{
+    const char *refusal = NULL;
+    if (creating || mutation->name != NULL) {
+        refusal = peer_service_text(mutation->name, "name", 1, 80U, row->name, sizeof(row->name), message);
+    }
+    if (refusal == NULL && (creating || mutation->description != NULL)) {
+        refusal = peer_service_text(mutation->description, "description", 0, 200U, row->description,
+                                    sizeof(row->description), message);
+    }
+    if (refusal == NULL && (creating || mutation->application != NULL)) {
+        char application[16];
+        peer_service_trim_lower(mutation->application, application, sizeof(application));
+        if (strcmp(application, "http") != 0 && strcmp(application, "https") != 0 && strcmp(application, "ssh") != 0
+            && strcmp(application, "tcp") != 0 && strcmp(application, "udp") != 0) {
+            refusal = "unsupported application";
+        } else {
+            snprintf(row->application, sizeof(row->application), "%s", application);
+        }
+    }
+    if (refusal == NULL) {
+        /* requireTransportForApplication: the stored transport when the request names none. */
+        char transport[16];
+        peer_service_trim_lower(mutation->transport != NULL ? mutation->transport : row->transport, transport,
+                                sizeof(transport));
+        int udp_application = strcmp(row->application, "udp") == 0;
+        if (transport[0] == '\0') snprintf(transport, sizeof(transport), "%s", udp_application ? "udp" : "tcp");
+        if (strcmp(transport, "tcp") != 0 && strcmp(transport, "udp") != 0) {
+            refusal = "transport must be tcp or udp";
+        } else if (udp_application && strcmp(transport, "udp") != 0) {
+            refusal = "udp application requires udp transport";
+        } else if (!udp_application && strcmp(transport, "udp") == 0) {
+            refusal = "http/https/ssh/tcp applications require tcp transport";
+        } else {
+            snprintf(row->transport, sizeof(row->transport), "%.7s", transport);
+        }
+    }
+    if (refusal == NULL && (creating || mutation->target_host != NULL)) {
+        char normalized[256];
+        refusal = st_peer_mesh_local_host_refusal(mutation->target_host, normalized);
+        if (refusal == NULL) {
+            if (strlen(normalized) >= sizeof(row->target_host)) refusal = "targetHost must be a unicast IP or localhost";
+            else snprintf(row->target_host, sizeof(row->target_host), "%s", normalized);
+        }
+    }
+    static const char *const port_names[2] = {"targetPort", "publishedPort"};
+    int bound[2] = {mutation->target_port_bound, mutation->published_port_bound};
+    long long values[2] = {mutation->target_port, mutation->published_port};
+    int *stored[2] = {&row->target_port, &row->published_port};
+    for (size_t i = 0U; refusal == NULL && i < 2U; ++i) {
+        if (!creating && bound[i] != 1) continue;
+        if (bound[i] != 1 || values[i] < 1 || values[i] > 65535) {
+            snprintf(message, 96U, "%s must be 1..65535", port_names[i]);
+            refusal = message;
+        } else {
+            *stored[i] = (int)values[i];
+        }
+    }
+    if (refusal == NULL && (creating || mutation->path != NULL)) {
+        refusal = peer_service_path(mutation->path, row->application, row->path, sizeof(row->path));
+    }
+    if (refusal == NULL && (creating || mutation->visibility != NULL)) {
+        char visibility[16];
+        peer_service_trim_lower(mutation->visibility, visibility, sizeof(visibility));
+        if (visibility[0] == '\0' || strcmp(visibility, "owner") == 0) {
+            snprintf(row->visibility, sizeof(row->visibility), "OWNER");
+        } else if (strcmp(visibility, "acl") == 0) {
+            snprintf(row->visibility, sizeof(row->visibility), "ACL");
+        } else {
+            refusal = "visibility must be OWNER or ACL";
+        }
+    }
+    if (refusal == NULL) {
+        if (mutation->enabled_bound == 1) row->enabled = mutation->enabled;
+        else if (creating) row->enabled = 0;
+    }
+    if (refusal == NULL && (creating || mutation->allowed_bound == 1)) {
+        /* PeerServiceDiscovery.encodeClientIds: positive ids without repeats, at most 32. */
+        size_t offset = 0U;
+        row->allowed_client_ids[0] = '\0';
+        if (mutation->allowed_count > 32U) refusal = "at most 32 allowedClientIds";
+        for (size_t i = 0U; refusal == NULL && i < mutation->allowed_count; ++i) {
+            int written = snprintf(row->allowed_client_ids + offset, sizeof(row->allowed_client_ids) - offset,
+                                   "%s%lld", offset == 0U ? "" : ",", mutation->allowed[i]);
+            if (written < 0 || (size_t)written >= sizeof(row->allowed_client_ids) - offset) {
+                refusal = "at most 32 allowedClientIds";
+            } else {
+                offset += (size_t)written;
+            }
+        }
+    }
+    if (refusal == NULL && row->enabled) {
+        /* rejectPublishedPortConflict, among the client's own services. */
+        st_storage_peer_mesh_service *services = NULL;
+        size_t count = 0U;
+        if (st_storage_list_peer_mesh_services_visible(database_path, row->tenant_id, "", 1, &services, &count) != 0) {
+            return "peer service conflict check failed";
+        }
+        for (size_t i = 0U; refusal == NULL && i < count; ++i) {
+            if (services[i].id != row->id && services[i].client_id == row->client_id && services[i].enabled
+                && services[i].published_port == row->published_port) {
+                refusal = "publishedPort already used by another enabled service";
+            }
+        }
+        free(services);
+    }
+    return refusal;
+}
+
+/*
+ * Java PeerServiceDiscoveryService.createService (id 0) and updateService: Spring binds the
+ * ServiceMutation, then ADMIN, the client (create) or the service (update) of the tenant, the
+ * serviceId (create: as given, or a random UUID), applyDefinition. Both answer 200.
+ */
 static int handle_peer_mesh_service_mutation(const st_admin_context *context,
+                                             int creating,
                                              long long id,
                                              const char *body,
                                              char *out,
                                              size_t out_len)
 {
-    if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    admin_peer_service_mutation mutation;
+    if (admin_peer_service_mutation_bind(body, &mutation) != 0) {
+        return write_spring_bad_request(out, out_len);
+    }
+    if (!context->admin) {
+        admin_peer_service_mutation_free(&mutation);
+        return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
+        admin_peer_service_mutation_free(&mutation);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"database-backed peer services are unavailable\"}");
     }
-    int creating = id <= 0;
     st_storage_peer_mesh_service service;
     memset(&service, 0, sizeof(service));
+    int answer = 0;
     if (!creating) {
-        int found = st_storage_get_peer_mesh_service_visible(database_path, id, context->tenant_id,
-                                                              context->username, 1, &service);
-        if (found != 0) return write_response(out, out_len, 404, "Not Found", "{\"error\":\"service not found\"}");
+        if (st_storage_get_peer_mesh_service_visible(database_path, id, context->tenant_id, context->username, 1,
+                                                     &service) != 0) {
+            char message[96];
+            snprintf(message, sizeof(message), "{\"error\":\"service not found: %lld\"}", id);
+            answer = write_response(out, out_len, 400, "Bad Request", message);
+        }
     } else {
-        long long client_id = 0;
-        if (st_json_get_i64(body, "clientId", &client_id) != 0 || client_id <= 0) {
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientId is required\"}");
-        }
         st_storage_client client;
-        if (st_storage_get_client(database_path, client_id, &client) != 0
-            || strcmp(client.tenant_id, context->tenant_id) != 0) {
-            return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
-        }
-        service.client_id = client.id;
-        snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", client.tenant_id);
-        snprintf(service.client_name, sizeof(service.client_name), "%s", client.client_name);
-        snprintf(service.visibility, sizeof(service.visibility), "OWNER");
-    }
-    char *service_id = st_json_get_string(body, "serviceId");
-    char *name = st_json_get_string(body, "name");
-    char *description = st_json_get_string(body, "description");
-    char *transport = st_json_get_string(body, "transport");
-    char *application = st_json_get_string(body, "application");
-    char *target_host = st_json_get_string(body, "targetHost");
-    char *path = st_json_get_string(body, "path");
-    char *visibility = st_json_get_string(body, "visibility");
-    if (creating) {
-        if (service_id == NULL) snprintf(service.service_id, sizeof(service.service_id),
-                                         "svc-%lld-%lld", service.client_id, current_time_millis());
-        else snprintf(service.service_id, sizeof(service.service_id), "%s", service_id);
-    }
-    if (name != NULL) snprintf(service.name, sizeof(service.name), "%s", name);
-    if (description != NULL) snprintf(service.description, sizeof(service.description), "%s", description);
-    if (application != NULL) snprintf(service.application, sizeof(service.application), "%s", application);
-    if (transport != NULL) snprintf(service.transport, sizeof(service.transport), "%s", transport);
-    if (target_host != NULL) snprintf(service.target_host, sizeof(service.target_host), "%s",
-                                      strcmp(target_host, "localhost") == 0 ? "127.0.0.1" : target_host);
-    if (path != NULL) snprintf(service.path, sizeof(service.path), "%s", path);
-    if (visibility != NULL) snprintf(service.visibility, sizeof(service.visibility), "%s",
-                                     strcmp(visibility, "ACL") == 0 ? "ACL" : "OWNER");
-    if (creating && service.path[0] == '\0'
-        && (strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0)) snprintf(service.path, sizeof(service.path), "/");
-    if (creating && service.transport[0] == '\0') snprintf(service.transport, sizeof(service.transport),
-                                                            "%s", strcmp(service.application, "udp") == 0 ? "udp" : "tcp");
-    int target_port = 0, published_port = 0, enabled = 0;
-    if (st_json_get_int(body, "targetPort", &target_port) == 0) service.target_port = target_port;
-    if (st_json_get_int(body, "publishedPort", &published_port) == 0) service.published_port = published_port;
-    if (st_json_get_bool(body, "enabled", &enabled) == 0) service.enabled = enabled;
-    int ids_rc = peer_service_allowed_ids(body, service.allowed_client_ids, !creating);
-    int app_ok = strcmp(service.application, "http") == 0 || strcmp(service.application, "https") == 0
-        || strcmp(service.application, "ssh") == 0 || strcmp(service.application, "tcp") == 0
-        || strcmp(service.application, "udp") == 0;
-    int transport_ok = strcmp(service.transport, "tcp") == 0 || strcmp(service.transport, "udp") == 0;
-    if (!peer_service_id_valid(service.service_id) || !peer_service_string_valid(service.name, 1U, 80U)
-        || strlen(service.description) > 200U || !app_ok || !transport_ok
-        || (strcmp(service.application, "udp") == 0) != (strcmp(service.transport, "udp") == 0)
-        || !peer_service_string_valid(service.target_host, 1U, 127U)
-        || service.target_port < 1 || service.target_port > 65535
-        || service.published_port < 1 || service.published_port > 65535
-        || strstr(service.path, "..") != NULL || ids_rc < 0) {
-        free(service_id); free(name); free(description); free(transport); free(application);
-        free(target_host); free(path); free(visibility);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid peer service definition\"}");
-    }
-    service.id = id;
-    if (service.enabled) {
-        st_storage_peer_mesh_service services[256];
-        size_t count = 0U;
-        if (st_storage_list_peer_mesh_services_visible(database_path, service.tenant_id, "", 1,
-                                                        services, 256U, &count) != 0) {
-            free(service_id); free(name); free(description); free(transport); free(application);
-            free(target_host); free(path); free(visibility);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service conflict check failed\"}");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (services[i].id != service.id && services[i].client_id == service.client_id
-                && services[i].enabled && services[i].published_port == service.published_port) {
-                free(service_id); free(name); free(description); free(transport); free(application);
-                free(target_host); free(path); free(visibility);
-                return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"publishedPort already used by another enabled service\"}");
+        if (mutation.client_bound != 1 || mutation.client_id <= 0) {
+            answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientId is required\"}");
+        } else if (!admin_load_tenant_client(database_path, context, mutation.client_id, &client)) {
+            answer = write_client_not_found(mutation.client_id, out, out_len);
+        } else {
+            service.client_id = client.id;
+            snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", client.tenant_id);
+            snprintf(service.client_name, sizeof(service.client_name), "%s", client.client_name);
+            /* The entity's defaults, which applyDefinition starts from. */
+            snprintf(service.transport, sizeof(service.transport), "tcp");
+            snprintf(service.visibility, sizeof(service.visibility), "OWNER");
+            if (admin_java_has_text(mutation.service_id)) {
+                char *trimmed = admin_java_trim(admin_dup_string(mutation.service_id));
+                if (trimmed == NULL || !peer_service_id_valid(trimmed)) {
+                    answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"invalid serviceId\"}");
+                } else {
+                    snprintf(service.service_id, sizeof(service.service_id), "%s", trimmed);
+                }
+                free(trimmed);
+            } else if (admin_generate_uuid(service.service_id) != 0) {
+                answer = write_response(out, out_len, 500, "Internal Server Error",
+                                        "{\"error\":\"peer service id generation failed\"}");
             }
+            st_storage_peer_mesh_service *services = NULL;
+            size_t count = 0U;
+            if (answer == 0 && st_storage_list_peer_mesh_services_visible(database_path, service.tenant_id, "", 1,
+                                                                          &services, &count) != 0) {
+                answer = write_response(out, out_len, 500, "Internal Server Error",
+                                        "{\"error\":\"peer service lookup failed\"}");
+            }
+            for (size_t i = 0U; answer == 0 && i < count; ++i) {
+                if (services[i].client_id == service.client_id && strcmp(services[i].service_id, service.service_id) == 0) {
+                    answer = write_response(out, out_len, 400, "Bad Request",
+                                            "{\"error\":\"serviceId already exists on this client\"}");
+                }
+            }
+            free(services);
         }
     }
+    if (answer == 0) {
+        char message[96];
+        const char *refusal = admin_peer_service_apply(database_path, &service, &mutation, creating, message);
+        if (refusal != NULL) answer = write_bad_request_naming("", refusal, out, out_len);
+    }
+    admin_peer_service_mutation_free(&mutation);
+    if (answer != 0) {
+        return answer;
+    }
+    service.id = creating ? 0 : id;
     st_storage_peer_mesh_service saved;
-    int save_rc = st_storage_upsert_peer_mesh_service(database_path, &service, &saved);
-    free(service_id); free(name); free(description); free(transport); free(application);
-    free(target_host); free(path); free(visibility);
-    if (save_rc != 0) return write_response(out, out_len, 409, "Conflict", "{\"error\":\"peer service conflict\"}");
+    if (st_storage_upsert_peer_mesh_service(database_path, &service, &saved) != 0) {
+        /* Java's unique constraint on (tenant, client, serviceId), as GlobalExceptionHandler words it. */
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}");
+    }
     (void)st_storage_record_peer_mesh_service_audit(database_path,
         creating ? "service-create" : "service-update", context->tenant_id,
         saved.client_id, 0, saved.service_id,
@@ -5344,7 +6961,7 @@ static int handle_peer_mesh_service_mutation(const st_admin_context *context,
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service response failed\"}");
     }
-    int len = write_response(out, out_len, creating ? 201 : 200, creating ? "Created" : "OK", builder.data);
+    int len = write_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return len;
 }
@@ -5359,15 +6976,17 @@ static int handle_peer_mesh_service_delete(const st_admin_context *context,
     st_storage_peer_mesh_service service;
     if (database_path == NULL
         || st_storage_get_peer_mesh_service_visible(database_path, id, context->tenant_id,
-                                                     context->username, 1, &service) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"service not found\"}");
+                                                     context->username, 1, &service) != 0
+        || st_storage_delete_peer_mesh_service(database_path, id, context->tenant_id) != 0) {
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"service not found: %lld\"}", id);
+        return write_response(out, out_len, 400, "Bad Request", message);
     }
-    int rc = st_storage_delete_peer_mesh_service(database_path, id, context->tenant_id);
-    if (rc != 0) return write_response(out, out_len, 404, "Not Found", "{\"error\":\"service not found\"}");
     (void)st_storage_record_peer_mesh_service_audit(database_path, "service-delete",
         context->tenant_id, service.client_id, 0, service.service_id, "deleted");
     admin_notify_peer_mesh_refresh(service.tenant_id);
-    return write_response(out, out_len, 204, "No Content", "");
+    /* Java's void handler: 200 with no body. */
+    return write_response(out, out_len, 200, "OK", "");
 }
 
 static int peer_service_target_used(const st_storage_peer_mesh_service *services,
@@ -5437,10 +7056,15 @@ static int parse_peer_http_target(const char *url,
     return strstr(path, "..") == NULL ? 0 : -1;
 }
 
+/*
+ * Java PeerServiceDiscoveryService.importService: the target must pass requireTargetHost (or the
+ * candidate is skipped), a host:port this client already publishes is skipped, and the candidate
+ * becomes a disabled OWNER service through createService (a random serviceId, the name, the path
+ * for its application), skipped when createService refuses it. 0 created, 1 skipped, -1 on error.
+ */
 static int append_imported_peer_service(st_admin_string_builder *builder,
                                         const char *database_path,
                                         const st_storage_client *client,
-                                        const char *service_id,
                                         const char *name,
                                         const char *transport,
                                         const char *application,
@@ -5448,30 +7072,41 @@ static int append_imported_peer_service(st_admin_string_builder *builder,
                                         int target_port,
                                         int published_port,
                                         const char *path,
-                                        st_storage_peer_mesh_service *existing,
+                                        st_storage_peer_mesh_service **existing,
                                         size_t *existing_count,
                                         int *first)
 {
-    if (peer_service_target_used(existing, *existing_count, target_host, target_port)) return 1;
+    char host[256];
+    if (st_peer_mesh_local_host_refusal(target_host, host) != NULL) return 1;
+    if (peer_service_target_used(*existing, *existing_count, host, target_port)) return 1;
     st_storage_peer_mesh_service service;
     memset(&service, 0, sizeof(service));
     snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", client->tenant_id);
     service.client_id = client->id;
     snprintf(service.client_name, sizeof(service.client_name), "%s", client->client_name);
-    snprintf(service.service_id, sizeof(service.service_id), "%s", service_id);
-    snprintf(service.name, sizeof(service.name), "%.80s", name);
     snprintf(service.description, sizeof(service.description), "imported candidate");
     snprintf(service.transport, sizeof(service.transport), "%s", transport);
     snprintf(service.application, sizeof(service.application), "%s", application);
-    snprintf(service.target_host, sizeof(service.target_host), "%s", target_host);
+    snprintf(service.target_host, sizeof(service.target_host), "%.127s", host);
     service.target_port = target_port;
     service.published_port = published_port;
-    snprintf(service.path, sizeof(service.path), "%s", path == NULL ? "" : path);
     service.enabled = 0;
     snprintf(service.visibility, sizeof(service.visibility), "OWNER");
+    /* The target counts as taken from here on, as Java's usedTargets does, whatever createService says. */
+    st_storage_peer_mesh_service *grown = (st_storage_peer_mesh_service *)realloc(
+        *existing, (*existing_count + 1U) * sizeof(**existing));
+    if (grown == NULL) return -1;
+    *existing = grown;
+    grown[(*existing_count)++] = service;
+    char message[96];
+    if (peer_service_text(name, "name", 1, 80U, service.name, sizeof(service.name), message) != NULL
+        || peer_service_path(path, application, service.path, sizeof(service.path)) != NULL
+        || target_port < 1 || target_port > 65535 || published_port < 1 || published_port > 65535
+        || admin_generate_uuid(service.service_id) != 0) {
+        return 1;
+    }
     st_storage_peer_mesh_service saved;
     if (st_storage_upsert_peer_mesh_service(database_path, &service, &saved) != 0) return 1;
-    if (*existing_count < 256U) existing[(*existing_count)++] = saved;
     if ((!*first && admin_sb_append(builder, ",") != 0)
         || append_peer_mesh_service_view(builder, &saved, 1) != 0) return -1;
     *first = 0;
@@ -5480,125 +7115,123 @@ static int append_imported_peer_service(st_admin_string_builder *builder,
     return 0;
 }
 
+/*
+ * Java PeerMeshResource.importServices binds the body as a Map: clientId counts only as a JSON
+ * number (its long value) and source only as a string, "tcp-http" otherwise. Then
+ * PeerServiceDiscoveryService.importCandidates: ADMIN, the client of the tenant, and the mapping and
+ * route targets (or, for "mdns", the mDNS candidates) as disabled services.
+ */
 static int handle_peer_mesh_service_import(const st_admin_context *context,
                                            const char *body,
                                            char *out,
                                            size_t out_len)
 {
+    if (!admin_body_is_object(body)) {
+        return write_spring_bad_request(out, out_len);
+    }
     if (!context->admin) return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"只有管理员可以修改 Peer 服务共享\"}");
+    char *client_raw = admin_json_member_raw(body, "clientId");
     long long client_id = 0;
-    if (st_json_get_i64(body, "clientId", &client_id) != 0 || client_id <= 0) {
+    int has_client = client_raw != NULL && (client_raw[0] == '-' || isdigit((unsigned char)client_raw[0]));
+    if (has_client) {
+        client_id = strpbrk(client_raw, ".eE") != NULL ? (long long)strtod(client_raw, NULL)
+                                                        : strtoll(client_raw, NULL, 10);
+    }
+    free(client_raw);
+    char *source_raw = admin_json_member_raw(body, "source");
+    char *source = source_raw != NULL && source_raw[0] == '"' ? st_json_decode_string(source_raw, NULL) : NULL;
+    int import_mdns = source != NULL && strcasecmp(source, "mdns") == 0;
+    free(source_raw);
+    free(source);
+    if (!has_client || client_id <= 0) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientId is required\"}");
     }
-    char *source = st_json_get_top_level_string(body, "source");
-    int import_mdns = source != NULL && strcasecmp(source, "mdns") == 0;
-    free(source);
-    const char *database_path = admin_database_path();
-    st_storage_client client;
-    if (database_path == NULL || st_storage_get_client(database_path, client_id, &client) != 0
-        || strcmp(client.tenant_id, context->tenant_id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) {
+        return init_response;
     }
-    st_storage_peer_mesh_service existing[256];
+    st_storage_client client;
+    if (!admin_load_tenant_client(database_path, context, client_id, &client)) {
+        return write_client_not_found(client_id, out, out_len);
+    }
+    st_storage_peer_mesh_service *existing = NULL;
     size_t existing_count = 0U;
     if (st_storage_list_peer_mesh_services_visible(database_path, client.tenant_id, "", 1,
-                                                    existing, 256U, &existing_count) != 0) {
+                                                    &existing, &existing_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service import failed\"}");
     }
-    if (import_mdns) {
-        st_storage_peer_mesh_service_sharing sharing = {0};
-        if (st_storage_get_peer_mesh_service_sharing(database_path, client.tenant_id, &sharing) != 0
-            || !sharing.mdns_import_enabled) {
-            return write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"mDNS candidate import is disabled\"}");
+    /* Java importCandidates skips the host:port targets this client already publishes, not those
+     * of the tenant's other clients: another client may share the same target. */
+    size_t own_count = 0U;
+    for (size_t i = 0U; i < existing_count; ++i) {
+        if (existing[i].client_id == client.id) {
+            existing[own_count++] = existing[i];
         }
-        st_peer_mesh_mdns_candidate candidates[256];
-        size_t candidate_count = 0U;
-        if (st_peer_mesh_list_mdns_candidates(client.tenant_id, client.id, candidates,
-                                              256U, &candidate_count) != 0) {
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"peer service import failed\"}");
-        }
-        st_admin_string_builder imported_services = {0};
-        int import_rc = admin_sb_append(&imported_services, "[");
-        int import_first = 1;
-        int imported_created = 0;
-        int imported_skipped = 0;
-        for (size_t i = 0; import_rc == 0 && i < candidate_count; ++i) {
-            char service_id[65];
-            const char *path = strcmp(candidates[i].application, "http") == 0
-                || strcmp(candidates[i].application, "https") == 0 ? "/" : "";
-            snprintf(service_id, sizeof(service_id), "import-mdns-%lld-%zu", client.id, i + 1U);
-            int imported = append_imported_peer_service(&imported_services, database_path, &client,
-                service_id, candidates[i].name, candidates[i].transport, candidates[i].application,
-                candidates[i].target_host, candidates[i].target_port, candidates[i].target_port,
-                path, existing, &existing_count, &import_first);
-            if (imported == 0) ++imported_created;
-            else if (imported == 1) ++imported_skipped;
-            else import_rc = -1;
-        }
-        if (import_rc == 0) import_rc = admin_sb_append(&imported_services, "]");
-        st_admin_string_builder imported_response = {0};
-        if (import_rc == 0) import_rc = admin_sb_appendf(&imported_response,
-            "{\"created\":%d,\"skipped\":%d,\"services\":",
-            imported_created, imported_skipped);
-        if (import_rc == 0) import_rc = admin_sb_append(&imported_response, imported_services.data);
-        if (import_rc == 0) import_rc = admin_sb_append(&imported_response, "}");
-        free(imported_services.data);
-        if (import_rc != 0 || imported_response.data == NULL) {
-            free(imported_response.data);
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"peer service import failed\"}");
-        }
-        char imported_reason[64];
-        snprintf(imported_reason, sizeof(imported_reason), "created=%d,skipped=%d",
-                 imported_created, imported_skipped);
-        (void)st_storage_record_peer_mesh_service_audit(database_path, "service-import-mdns",
-            client.tenant_id, client.id, 0, NULL, imported_reason);
-        if (imported_created > 0) admin_notify_peer_mesh_refresh(client.tenant_id);
-        int imported_len = write_response(out, out_len, 200, "OK", imported_response.data);
-        free(imported_response.data);
-        return imported_len;
     }
+    existing_count = own_count;
     st_admin_string_builder services = {0};
     int rc = admin_sb_append(&services, "[");
     int first = 1;
     int created = 0;
     int skipped = 0;
-    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t mapping_count = 0U;
-    if (rc == 0 && st_storage_list_mappings(database_path, client.id, mappings,
-                                             ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) rc = -1;
-    for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
-        char service_id[65];
-        char name[81];
-        const char *host = strcmp(mappings[i].target_address, "localhost") == 0
-            ? "127.0.0.1" : mappings[i].target_address;
-        snprintf(service_id, sizeof(service_id), "import-tcp-%lld", mappings[i].id);
-        snprintf(name, sizeof(name), "tcp-%d", mappings[i].listen_port);
-        int imported = append_imported_peer_service(&services, database_path, &client,
-            service_id, name, "tcp", "tcp", host, mappings[i].target_port,
-            mappings[i].listen_port, "", existing, &existing_count, &first);
-        if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
-    }
-    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-    size_t route_count = 0U;
-    if (rc == 0 && st_storage_list_http_routes(database_path, client.id, routes,
-                                                ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) rc = -1;
-    for (size_t i = 0; rc == 0 && i < route_count; ++i) {
-        char host[128], application[16], target_path[256], service_id[65];
-        int target_port = 0;
-        if (parse_peer_http_target(routes[i].target_base_url, host, &target_port,
-                                   application, target_path) != 0) {
-            ++skipped;
-            continue;
+    const char *action = "service-import";
+    if (import_mdns) {
+        st_storage_peer_mesh_service_sharing sharing = {0};
+        if (st_storage_get_peer_mesh_service_sharing(database_path, client.tenant_id, &sharing) != 0
+            || !sharing.mdns_import_enabled) {
+            free(existing);
+            free(services.data);
+            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"mDNS 候选导入未开启\"}");
         }
-        snprintf(service_id, sizeof(service_id), "import-http-%lld", routes[i].id);
-        int imported = append_imported_peer_service(&services, database_path, &client,
-            service_id, routes[i].route, "tcp", application, host, target_port,
-            target_port, target_path, existing, &existing_count, &first);
-        if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
+        st_peer_mesh_mdns_candidate candidates[256];
+        size_t candidate_count = 0U;
+        if (st_peer_mesh_list_mdns_candidates(client.tenant_id, client.id, candidates,
+                                              256U, &candidate_count) != 0) {
+            rc = -1;
+        }
+        for (size_t i = 0U; rc == 0 && i < candidate_count; ++i) {
+            int imported = append_imported_peer_service(&services, database_path, &client,
+                candidates[i].name, candidates[i].transport, candidates[i].application,
+                candidates[i].target_host, candidates[i].target_port, candidates[i].target_port,
+                "", &existing, &existing_count, &first);
+            if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
+        }
+        action = "service-import-mdns";
+    } else {
+        st_storage_mapping *mappings = NULL;
+        size_t mapping_count = 0U;
+        if (rc == 0 && st_storage_list_mappings(database_path, client.id, &mappings, &mapping_count) != 0) rc = -1;
+        for (size_t i = 0U; rc == 0 && i < mapping_count; ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "tcp-%d", mappings[i].listen_port);
+            int imported = append_imported_peer_service(&services, database_path, &client,
+                name, "tcp", "tcp", mappings[i].target_address, mappings[i].target_port,
+                mappings[i].listen_port, "", &existing, &existing_count, &first);
+            if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
+        }
+        free(mappings);
+        st_storage_http_route *routes = NULL;
+        size_t route_count = 0U;
+        if (rc == 0 && st_storage_list_http_routes(database_path, client.id, &routes, &route_count) != 0) rc = -1;
+        for (size_t i = 0U; rc == 0 && i < route_count; ++i) {
+            char host[128], application[16], target_path[256];
+            int target_port = 0;
+            if (parse_peer_http_target(routes[i].target_base_url, host, &target_port,
+                                       application, target_path) != 0) {
+                ++skipped;
+                continue;
+            }
+            /* URI.getPath: the query and fragment are not part of the path. */
+            target_path[strcspn(target_path, "?#")] = '\0';
+            int imported = append_imported_peer_service(&services, database_path, &client,
+                routes[i].route, "tcp", application, host, target_port,
+                target_port, target_path, &existing, &existing_count, &first);
+            if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
+        }
+        free(routes);
     }
+    free(existing);
     if (rc == 0) rc = admin_sb_append(&services, "]");
     st_admin_string_builder response = {0};
     if (rc == 0) rc = admin_sb_appendf(&response, "{\"created\":%d,\"skipped\":%d,\"services\":", created, skipped);
@@ -5611,10 +7244,10 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
     }
     char reason[64];
     snprintf(reason, sizeof(reason), "created=%d,skipped=%d", created, skipped);
-    (void)st_storage_record_peer_mesh_service_audit(database_path, "service-import",
+    (void)st_storage_record_peer_mesh_service_audit(database_path, action,
         client.tenant_id, client.id, 0, NULL, reason);
     if (created > 0) admin_notify_peer_mesh_refresh(client.tenant_id);
-    int len = write_response(out, out_len, 200, "OK", response.data);
+    int len = write_unbounded_response(out, out_len, 200, "OK", response.data);
     free(response.data);
     return len;
 }
@@ -5637,7 +7270,7 @@ static int build_peer_mesh_service_audit_response(const st_admin_context *contex
         st_storage_peer_mesh_service_audit *event = &events[i];
         if (i > 0) rc = admin_sb_append(&builder, ",");
         if (rc == 0) rc = admin_sb_append(&builder, "{\"at\":");
-        if (rc == 0) rc = admin_sb_append_json_string(&builder, event->at);
+        if (rc == 0) rc = admin_sb_append_instant(&builder, event->at);
         if (rc == 0) rc = admin_sb_append(&builder, ",\"action\":");
         if (rc == 0) rc = admin_sb_append_json_string(&builder, event->action);
         if (rc == 0) rc = admin_sb_append(&builder, ",\"tenantId\":");
@@ -5684,10 +7317,18 @@ static int build_client_result_response(const st_storage_client *client, int sta
 
 static int build_specusMappings_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
+    /* Java binds clientId as a Long and filters by whatever it names: 0 or a negative id, or a
+     * client the caller cannot see, gives an empty list; a value that is no number is 400. */
+    long long filter_client_id = 0;
+    int client_filter = admin_query_number_param(path, "clientId", LLONG_MIN, LLONG_MAX, &filter_client_id);
+    if (client_filter < 0) {
+        return write_spring_bad_request(out, out_len);
+    }
+    if (client_filter > 0 && filter_client_id <= 0) {
+        return write_response(out, out_len, 200, "OK", "[]");
+    }
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "[");
-    long long filter_client_id = 0;
-    (void)admin_query_i64(path, "clientId", &filter_client_id);
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
         if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
@@ -5707,9 +7348,9 @@ static int build_specusMappings_response(const st_admin_context *context, const 
                 return response_len;
             }
         }
-        st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
+        st_storage_mapping *mappings = NULL;
         size_t mapping_count = 0;
-        if (st_storage_list_mappings(database_path, filter_client_id, mappings, ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) {
+        if (st_storage_list_mappings(database_path, filter_client_id, &mappings, &mapping_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
@@ -5725,29 +7366,31 @@ static int build_specusMappings_response(const st_admin_context *context, const 
             }
             ++visible_count;
         }
+        free(mappings);
     } else if (rc == 0) {
-        st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-        size_t mapping_count = 0;
+        st_admin_tcp_mapping_list mappings = {0};
         const char *client_name = env_text("SPECUS_CLIENT_NAME", "Demo client");
-        if (load_current_tcp_mappings(client_name, mappings, &mapping_count) != 0) {
+        if (load_current_tcp_mappings(client_name, &mappings) != 0) {
+            free(mappings.items);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
         long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
-        for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
+        for (size_t i = 0; rc == 0 && i < mappings.count; ++i) {
             st_storage_mapping mapping = {0};
             mapping.id = (long long)i + 1;
             mapping.client_id = client_id;
             snprintf(mapping.client_name, sizeof(mapping.client_name), "%s", client_name);
-            mapping.listen_port = mappings[i].port;
-            snprintf(mapping.target_address, sizeof(mapping.target_address), "%s", mappings[i].specus_address);
-            mapping.target_port = mappings[i].specus_port;
+            mapping.listen_port = mappings.items[i].port;
+            snprintf(mapping.target_address, sizeof(mapping.target_address), "%s", mappings.items[i].specus_address);
+            mapping.target_port = mappings.items[i].specus_port;
             mapping.enabled = 1;
             rc = admin_sb_append(&builder, i == 0 ? "" : ",");
             if (rc == 0) {
                 rc = append_mapping_view(&builder, &mapping);
             }
         }
+        free(mappings.items);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -5756,7 +7399,7 @@ static int build_specusMappings_response(const st_admin_context *context, const 
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus response failed\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -5798,9 +7441,9 @@ static int build_http_routes_response(const st_admin_context *context, const cha
                 return response_len;
             }
         }
-        st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+        st_storage_http_route *routes = NULL;
         size_t route_count = 0;
-        if (st_storage_list_http_routes(database_path, filter_client_id, routes, ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+        if (st_storage_list_http_routes(database_path, filter_client_id, &routes, &route_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
@@ -5816,28 +7459,30 @@ static int build_http_routes_response(const st_admin_context *context, const cha
             }
             ++visible_count;
         }
+        free(routes);
     } else if (rc == 0) {
-        st_admin_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
-        size_t route_count = 0;
+        st_admin_http_route_list routes = {0};
         const char *client_name = env_text("SPECUS_CLIENT_NAME", "Demo client");
-        if (load_current_http_routes(client_name, routes, &route_count) != 0) {
+        if (load_current_http_routes(client_name, &routes) != 0) {
+            free(routes.items);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
         long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
-        for (size_t i = 0; rc == 0 && i < route_count; ++i) {
+        for (size_t i = 0; rc == 0 && i < routes.count; ++i) {
             st_storage_http_route route = {0};
             route.id = (long long)i + 1;
             route.client_id = client_id;
             snprintf(route.client_name, sizeof(route.client_name), "%s", client_name);
-            snprintf(route.route, sizeof(route.route), "%.127s", routes[i].route);
-            snprintf(route.target_base_url, sizeof(route.target_base_url), "%s", routes[i].target_base_url);
+            snprintf(route.route, sizeof(route.route), "%.127s", routes.items[i].route);
+            snprintf(route.target_base_url, sizeof(route.target_base_url), "%s", routes.items[i].target_base_url);
             route.enabled = 1;
             rc = admin_sb_append(&builder, i == 0 ? "" : ",");
             if (rc == 0) {
                 rc = append_http_route_view(&builder, &route);
             }
         }
+        free(routes.items);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -5846,7 +7491,7 @@ static int build_http_routes_response(const st_admin_context *context, const cha
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response failed\"}");
     }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    int response_len = write_unbounded_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
     return response_len;
 }
@@ -6011,6 +7656,23 @@ static int build_connection_stats_response(const st_admin_context *context, cons
     return response_len;
 }
 
+/*
+ * Java binds a traffic list's clientId as a Long and filters by it whatever its value: 0 or a
+ * negative id names no client, so the page is empty rather than unfiltered.
+ */
+static int admin_query_names_no_client(const char *path)
+{
+    char *raw = admin_query_string(path, "clientId");
+    if (raw == NULL) {
+        return 0;
+    }
+    char *end = NULL;
+    long long parsed = strtoll(raw, &end, 10);
+    int none = end != raw && *end == '\0' && parsed <= 0;
+    free(raw);
+    return none;
+}
+
 static int build_empty_page_response(const char *path, char *out, size_t out_len)
 {
     int page = 0;
@@ -6040,23 +7702,56 @@ static int build_empty_page_response(const char *path, char *out, size_t out_len
     return write_response(out, out_len, 200, "OK", body);
 }
 
+/*
+ * The parameters of Java TrafficResource's two usage lists: clientId binds as a Long and limit as an
+ * int (default_limit when absent), Math.clamp(limit, 1, 500); either one that does not convert is
+ * 400. A clientId the caller cannot see (TrafficViewService.canAccessClient), 0 and negative ids
+ * included, gives an empty list. 0 when the list is to be read; else *answer holds what was
+ * written to out (an empty list or a refusal).
+ */
+static int admin_traffic_usage_params(const st_admin_context *context,
+                                      const char *path,
+                                      int default_limit,
+                                      const char **database_path,
+                                      long long *client_id,
+                                      int *limit,
+                                      int *answer,
+                                      char *out,
+                                      size_t out_len)
+{
+    *client_id = 0;
+    long long requested_limit = default_limit;
+    int client_filter = admin_query_number_param(path, "clientId", LLONG_MIN, LLONG_MAX, client_id);
+    int limit_param = admin_query_number_param(path, "limit", INT_MIN, INT_MAX, &requested_limit);
+    if (client_filter < 0 || limit_param < 0) {
+        *answer = write_spring_bad_request(out, out_len);
+        return -1;
+    }
+    *limit = requested_limit < 1 ? 1 : (requested_limit > 500 ? 500 : (int)requested_limit);
+    *database_path = admin_database_path();
+    if (*database_path != NULL && st_storage_init(*database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        *answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"traffic list failed\"}");
+        return -1;
+    }
+    st_storage_client client;
+    if (*database_path == NULL
+        || (client_filter > 0 && (*client_id <= 0
+                                  || !admin_load_accessible_client(*database_path, context, *client_id, &client)))) {
+        *answer = write_response(out, out_len, 200, "OK", "[]");
+        return -1;
+    }
+    return 0;
+}
+
 static int build_traffic_usage_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     long long filter_client_id = 0;
     int limit = 100;
-    (void)admin_query_i64(path, "clientId", &filter_client_id);
-    (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > (int)ST_ADMIN_MAX_TRAFFIC_ITEMS) {
-        limit = 100;
-    }
-    const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        return write_response(out, out_len, 200, "OK", "[]");
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"traffic list failed\"}");
+    const char *database_path = NULL;
+    int answer = 0;
+    if (admin_traffic_usage_params(context, path, 100, &database_path, &filter_client_id, &limit, &answer,
+                                   out, out_len) != 0) {
+        return answer;
     }
     st_storage_traffic_usage items[ST_ADMIN_MAX_TRAFFIC_ITEMS];
     size_t item_count = 0;
@@ -6096,22 +7791,18 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
 {
     long long filter_client_id = 0;
     int limit = 200;
-    (void)admin_query_i64(path, "clientId", &filter_client_id);
-    (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > (int)ST_ADMIN_MAX_TRAFFIC_ITEMS) {
-        limit = 200;
+    const char *database_path = NULL;
+    int answer = 0;
+    if (admin_traffic_usage_params(context, path, 200, &database_path, &filter_client_id, &limit, &answer,
+                                   out, out_len) != 0) {
+        return answer;
     }
+    /* Java normalizeResourceType: trimmed and upper-cased; blank is no filter. */
     char *type = admin_query_string(path, "type");
-    const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        free(type);
-        return write_response(out, out_len, 200, "OK", "[]");
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        free(type);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"resource traffic list failed\"}");
+    if (type != NULL) {
+        for (char *cursor = admin_java_trim(type); *cursor != '\0'; ++cursor) {
+            *cursor = (char)toupper((unsigned char)*cursor);
+        }
     }
     st_storage_resource_traffic_usage items[ST_ADMIN_MAX_TRAFFIC_ITEMS];
     size_t item_count = 0;
@@ -6149,6 +7840,29 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
     return response_len;
 }
 
+static int admin_text_is_blank(const char *value)
+{
+    for (; value != NULL && *value != '\0'; ++value) {
+        if (!isspace((unsigned char)*value)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * flush=true on the traffic detail endpoints (Java TrafficInspectionService.flush): what the
+ * Elasticsearch writer still holds is sent before the query. The SQLite store writes as it
+ * captures, so there is nothing to send there.
+ */
+static void admin_traffic_flush_if_asked(const char *path)
+{
+    int flush = 0;
+    if (admin_query_bool(path, "flush", &flush) == 0 && flush && st_elasticsearch_traffic_enabled_current()) {
+        st_elasticsearch_traffic_flush();
+    }
+}
+
 static int build_http_exchanges_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     int page = 0;
@@ -6160,16 +7874,18 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     if (page < 0) page = 0;
     if (size < 1) size = 1;
     if (size > 500) size = 500;
+    admin_traffic_flush_if_asked(path);
     char *route = admin_query_string(path, "route");
     char *response_body_type = admin_query_string(path, "responseBodyType");
-    if (response_body_type == NULL || *response_body_type == '\0') {
+    /* Java firstText(responseBodyType, responseDataType): the first one that is not blank. */
+    if (response_body_type == NULL || admin_text_is_blank(response_body_type)) {
         free(response_body_type);
         response_body_type = admin_query_string(path, "responseDataType");
     }
     char *field = admin_query_string(path, "field");
     char *query = admin_query_string(path, "q");
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
+    if (database_path == NULL || admin_query_names_no_client(path)) {
         free(route);
         free(response_body_type);
         free(field);
@@ -6223,7 +7939,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
         rc = admin_sb_append(&builder, i == 0 ? "" : ",");
         if (rc == 0) {
-            rc = append_http_exchange_view(&builder, &items[i]);
+            rc = append_http_exchange_view(&builder, &items[i], 0);
         }
     }
     if (rc == 0) {
@@ -6255,41 +7971,26 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
-    const int page_size = 100;
-    st_storage_http_exchange *items = (st_storage_http_exchange *)calloc(
-        (size_t)page_size, sizeof(*items));
-    if (items == NULL) {
+    /* One row by id with its headers and previews, under the same visibility as the list. */
+    st_storage_http_exchange *match = (st_storage_http_exchange *)calloc(1U, sizeof(*match));
+    int found = 0;
+    if (match == NULL
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_get_http_exchange_visible(database_path, exchange_id, context->tenant_id, context->username,
+                                                context->admin, match, &found) != 0) {
+        free(match);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"http exchange lookup failed\"}");
     }
-    long long total = 0;
-    int found = 0;
-    st_storage_http_exchange match;
-    for (int page = 0; !found; ++page) {
-        size_t count = 0U;
-        if (st_storage_list_http_exchanges_visible(database_path, 0, NULL, NULL, NULL, NULL,
-                context->tenant_id, context->username, context->admin, page, page_size,
-                items, (size_t)page_size, &count, &total) != 0) {
-            free(items);
-            return write_response(out, out_len, 500, "Internal Server Error",
-                                  "{\"error\":\"http exchange lookup failed\"}");
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (items[i].id == exchange_id) {
-                match = items[i];
-                found = 1;
-                break;
-            }
-        }
-        if (found || count == 0U || (long long)(page + 1) * page_size >= total) break;
-    }
-    free(items);
     if (!found) {
+        free(match);
         return write_response(out, out_len, 404, "Not Found",
                               "{\"error\":\"HTTP exchange not found\"}");
     }
     st_admin_string_builder builder = {0};
-    int rc = append_http_exchange_view(&builder, &match);
+    int rc = append_http_exchange_view(&builder, match, 1);
+    st_storage_http_exchange_free_bodies(match);
+    free(match);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -6300,21 +8001,43 @@ static int build_http_exchange_detail_response(const st_admin_context *context,
     return len;
 }
 
+/*
+ * Java TrafficInspectionService.Snapshot. With Elasticsearch the counters are those of its write
+ * queue; the SQLite store writes as it captures, so nothing is ever pending or dropped there.
+ */
 static int build_traffic_inspection_status_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED", 0);
-    return write_response(out, out_len, 200, "OK",
-        enabled
-            ? "{\"enabled\":true,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}"
-            : "{\"enabled\":false,\"pendingHttp\":0,\"pendingTcp\":0,\"droppedHttp\":0,\"droppedTcp\":0,\"lastFlushedAt\":null}");
+    int enabled = st_traffic_capture_enabled();
+    st_elasticsearch_traffic_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (st_elasticsearch_traffic_enabled_current()) {
+        st_elasticsearch_traffic_snapshot_current(&snapshot);
+    }
+    char last_flushed_at[48] = "null";
+    if (snapshot.last_flushed_at[0] != '\0') {
+        snprintf(last_flushed_at, sizeof(last_flushed_at), "\"%s\"", snapshot.last_flushed_at);
+    }
+    char body[256];
+    int written = snprintf(body, sizeof(body),
+                           "{\"enabled\":%s,\"pendingHttp\":%d,\"pendingTcp\":%d,\"droppedHttp\":%lld,"
+                           "\"droppedTcp\":%lld,\"lastFlushedAt\":%s}",
+                           enabled ? "true" : "false", snapshot.pending_http, snapshot.pending_tcp,
+                           snapshot.dropped_http, snapshot.dropped_tcp, last_flushed_at);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"inspection status failed\"}");
+    }
+    return write_response(out, out_len, 200, "OK", body);
 }
 
 static int build_tcp_frames_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
+    admin_traffic_flush_if_asked(path);
     int page = 0;
     int size = 50;
     int limit = 0;
-    int listen_port = 0;
+    /* Java's Integer listenPort filters whenever it is given, 0 included. */
+    int listen_port = ST_STORAGE_ANY_LISTEN_PORT;
     long long client_id = 0;
     (void)admin_query_int_any(path, "page", &page);
     if (admin_query_int_any(path, "size", &size) != 0 && admin_query_int_any(path, "limit", &limit) == 0) {
@@ -6326,29 +8049,30 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
     if (size < 1) size = 1;
     if (size > 500) size = 500;
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
+    if (database_path == NULL || admin_query_names_no_client(path)) {
         return build_empty_page_response(path, out, out_len);
     }
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
-    st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
-    memset(items, 0, sizeof(items));
+    /* Each frame carries its previews (about 8 KiB); a full page stays off the thread's stack. */
+    st_storage_tcp_frame *items = (st_storage_tcp_frame *)calloc(ST_ADMIN_MAX_CONNECTIONS_PAGE, sizeof(*items));
     size_t item_count = 0;
     long long total_count = 0;
-    int rc = st_storage_list_tcp_frames_visible(database_path,
-                                                client_id,
-                                                listen_port,
-                                                context->tenant_id,
-                                                context->username,
-                                                context->admin,
-                                                page,
-                                                size,
-                                                items,
-                                                ST_ADMIN_MAX_CONNECTIONS_PAGE,
-                                                &item_count,
-                                                &total_count);
+    int rc = items == NULL ? -1 : st_storage_list_tcp_frames_visible(database_path,
+                                                                     client_id,
+                                                                     listen_port,
+                                                                     context->tenant_id,
+                                                                     context->username,
+                                                                     context->admin,
+                                                                     page,
+                                                                     size,
+                                                                     items,
+                                                                     ST_ADMIN_MAX_CONNECTIONS_PAGE,
+                                                                     &item_count,
+                                                                     &total_count);
     if (rc != 0) {
+        free(items);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
     long long total_pages = total_count <= 0 ? 0 : (total_count + size - 1) / size;
@@ -6360,6 +8084,7 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
             rc = append_tcp_frame_view(&builder, &items[i], 0);
         }
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_appendf(&builder,
                               "],\"total\":%lld,\"page\":%d,\"size\":%d,\"totalPages\":%lld}",
@@ -6408,79 +8133,61 @@ static int build_tcp_frame_detail_response(const st_admin_context *context, long
     return response_len;
 }
 
-static int build_empty_tcp_stream_response(const char *path, char *out, size_t out_len)
-{
-    char *channel_id = admin_query_string(path, "channelId");
-    if (channel_id == NULL || *channel_id == '\0') {
-        free(channel_id);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"channelId is required\"}");
-    }
-    int limit = 500;
-    (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > 1000) {
-        limit = 1000;
-    }
-    st_admin_string_builder builder = {0};
-    int rc = admin_sb_append(&builder, "{\"channelId\":");
-    if (rc == 0) {
-        rc = admin_sb_append_json_string(&builder, channel_id);
-    }
-    if (rc == 0) {
-        rc = admin_sb_appendf(&builder,
-                              ",\"items\":[],\"total\":0,\"limit\":%d,\"truncated\":false}",
-                              limit);
-    }
-    free(channel_id);
-    if (rc != 0 || builder.data == NULL) {
-        free(builder.data);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream response failed\"}");
-    }
-    int response_len = write_response(out, out_len, 200, "OK", builder.data);
-    free(builder.data);
-    return response_len;
-}
+/* The most frames one tcp-streams page holds (Java clamps size and limit to 1..1000). */
+#define ST_ADMIN_MAX_TCP_STREAM_PAGE 1000
 
+/*
+ * GET /api/admin/traffic/tcp-streams as Java TrafficResource.getTcpStream: page (default 0) and
+ * size (default limit, default 500, both clamped to 1..1000) select one page of the channel's
+ * frames in capture order, each with its payload; limit repeats the size, totalPages is at least
+ * 1 and truncated says a later page exists.
+ */
 static int build_tcp_stream_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     char *channel_id = admin_query_string(path, "channelId");
-    if (channel_id == NULL || *channel_id == '\0') {
-        free(channel_id);
+    if (channel_id == NULL) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"channelId is required\"}");
     }
+    admin_traffic_flush_if_asked(path);
+    int page = 0;
     int limit = 500;
+    int size = 0;
+    (void)admin_query_int_any(path, "page", &page);
     (void)admin_query_int_any(path, "limit", &limit);
-    if (limit < 1) limit = 1;
-    if (limit > 1000) limit = 1000;
+    if (admin_query_int_any(path, "size", &size) != 0) {
+        size = limit;
+    }
+    if (page < 0) page = 0;
+    if (size < 1) size = 1;
+    if (size > ST_ADMIN_MAX_TCP_STREAM_PAGE) size = ST_ADMIN_MAX_TCP_STREAM_PAGE;
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        int response_len = build_empty_tcp_stream_response(path, out, out_len);
-        free(channel_id);
-        return response_len;
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        free(channel_id);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
-    }
-    st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
-    memset(items, 0, sizeof(items));
+    st_storage_tcp_frame *items = NULL;
     size_t item_count = 0;
-    int rc = st_storage_list_tcp_stream_visible(database_path,
-                                                channel_id,
-                                                context->tenant_id,
-                                                context->username,
-                                                context->admin,
-                                                limit,
-                                                items,
-                                                ST_ADMIN_MAX_CONNECTIONS_PAGE,
-                                                &item_count);
-    if (rc != 0) {
-        free(channel_id);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
+    long long total = 0;
+    if (database_path != NULL) {
+        items = (st_storage_tcp_frame *)calloc((size_t)size, sizeof(*items));
+        if (items == NULL
+            || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
+            || st_storage_list_tcp_stream_visible(database_path,
+                                                  channel_id,
+                                                  context->tenant_id,
+                                                  context->username,
+                                                  context->admin,
+                                                  page,
+                                                  size,
+                                                  items,
+                                                  (size_t)size,
+                                                  &item_count,
+                                                  &total) != 0) {
+            free(items);
+            free(channel_id);
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
+        }
     }
+    long long total_pages = total <= 0 ? 0 : (total + size - 1) / size;
+    if (total_pages < 1) total_pages = 1;
     st_admin_string_builder builder = {0};
-    rc = admin_sb_append(&builder, "{\"channelId\":");
+    int rc = admin_sb_append(&builder, "{\"channelId\":");
     if (rc == 0) rc = admin_sb_append_json_string(&builder, channel_id);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"items\":[");
     for (size_t i = 0; rc == 0 && i < item_count; ++i) {
@@ -6488,14 +8195,21 @@ static int build_tcp_stream_response(const st_admin_context *context, const char
         if (rc == 0) {
             rc = append_tcp_frame_view(&builder, &items[i], 1);
         }
+    }
+    for (size_t i = 0; i < item_count; ++i) {
         st_storage_tcp_frame_free(&items[i]);
     }
+    free(items);
     if (rc == 0) {
         rc = admin_sb_appendf(&builder,
-                              "],\"total\":%zu,\"limit\":%d,\"truncated\":%s}",
-                              item_count,
-                              limit,
-                              item_count >= (size_t)limit ? "true" : "false");
+                              "],\"total\":%lld,\"page\":%d,\"size\":%d,\"limit\":%d,\"totalPages\":%lld,"
+                              "\"truncated\":%s}",
+                              total,
+                              page,
+                              size,
+                              size,
+                              total_pages,
+                              (long long)page + 1 < total_pages ? "true" : "false");
     }
     free(channel_id);
     if (rc != 0 || builder.data == NULL) {
@@ -6757,10 +8471,141 @@ int st_admin_http_share_sweep(void)
     return rc;
 }
 
+/* Characters of UTF-8 text, as Java counts a String's length for these limits. */
+static size_t http_route_text_length(const char *text)
+{
+    return admin_utf16_length(text);
+}
+
+/* Trims value in place (spaces and control characters, as Java String.trim). */
+static void http_route_trim_in_place(char *value)
+{
+    if (value == NULL) {
+        return;
+    }
+    size_t len = strlen(value);
+    size_t start = 0U;
+    while (start < len && (unsigned char)value[start] <= ' ') ++start;
+    while (len > start && (unsigned char)value[len - 1U] <= ' ') --len;
+    memmove(value, value + start, len - start);
+    value[len - start] = '\0';
+}
+
+/*
+ * Java HttpRouteService.requireRoute and requireTargetBaseUrl on the trimmed values (trimmed in
+ * place): the route is not blank, at most 60 characters and without '/'; the target is not blank,
+ * at most 512 characters, an absolute http(s) URL and has a host. NULL when both are valid, else
+ * the message Java answers 400 with.
+ */
+static const char *http_route_mutation_error(char *route, char *target_base_url)
+{
+    http_route_trim_in_place(route);
+    http_route_trim_in_place(target_base_url);
+    if (route == NULL || *route == '\0') {
+        return "route cannot be blank";
+    }
+    if (http_route_text_length(route) > 60U) {
+        return "route is too long (max 60)";
+    }
+    if (strchr(route, '/') != NULL) {
+        return "route must not contain '/'";
+    }
+    if (target_base_url == NULL || *target_base_url == '\0') {
+        return "targetBaseUrl cannot be blank";
+    }
+    if (http_route_text_length(target_base_url) > 512U) {
+        return "targetBaseUrl is too long (max 512)";
+    }
+    for (const unsigned char *cursor = (const unsigned char *)target_base_url; *cursor != '\0'; ++cursor) {
+        if (*cursor <= ' ' || *cursor == 0x7fU) {
+            return "targetBaseUrl is not a valid URI";
+        }
+    }
+    const char *authority = NULL;
+    if (admin_ascii_ncasecmp(target_base_url, "http://", 7U) == 0) {
+        authority = target_base_url + 7;
+    } else if (admin_ascii_ncasecmp(target_base_url, "https://", 8U) == 0) {
+        authority = target_base_url + 8;
+    } else {
+        return "targetBaseUrl must be an absolute http(s) URL";
+    }
+    size_t authority_len = strcspn(authority, "/?#");
+    const char *at = NULL;
+    for (size_t i = 0; i < authority_len; ++i) {
+        if (authority[i] == '@') {
+            at = authority + i;
+        }
+    }
+    const char *host = at == NULL ? authority : at + 1;
+    size_t host_len = authority_len - (size_t)(host - authority);
+    if (host_len > 0U && host[0] == '[') {
+        const char *close = memchr(host, ']', host_len);
+        host_len = close == NULL ? 0U : (size_t)(close - host) - 1U;
+    } else {
+        const char *port = memchr(host, ':', host_len);
+        if (port != NULL) {
+            host_len = (size_t)(port - host);
+        }
+    }
+    return host_len == 0U ? "targetBaseUrl must contain a host" : NULL;
+}
+
+/* Java HttpRouteService's answer for a route name the client already has. */
+static int write_http_route_exists(const char *route, char *out, size_t out_len)
+{
+    char *escaped = st_json_escape(route == NULL ? "" : route);
+    char body[512];
+    int written = escaped == NULL ? -1
+        : snprintf(body, sizeof(body), "{\"error\":\"route %.300s 已存在于该客户端下\"}", escaped);
+    free(escaped);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"route 已存在于该客户端下\"}");
+    }
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/* write_response with {"error":message}, message being one of the validation texts above. */
+static int write_http_route_invalid(const char *message, char *out, size_t out_len)
+{
+    char body[256];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/*
+ * Java ClientAccountService.requireClientName on a value trimmed in place: not blank and at most
+ * 120 characters. NULL when valid, else the message Java answers 400 with.
+ */
+static const char *client_name_error(char *client_name)
+{
+    http_route_trim_in_place(client_name);
+    if (client_name == NULL || *client_name == '\0') {
+        return "clientName cannot be blank";
+    }
+    return http_route_text_length(client_name) > 120U ? "clientName is too long" : NULL;
+}
+
+/* Java's 400 for a client name that is taken: names are unique across all tenants. */
+static int write_client_name_exists(const char *client_name, char *out, size_t out_len)
+{
+    char *escaped = st_json_escape(client_name == NULL ? "" : client_name);
+    char body[768];
+    int written = escaped == NULL ? -1
+        : snprintf(body, sizeof(body), "{\"error\":\"clientName %.600s 已存在\"}", escaped);
+    free(escaped);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName 已存在\"}");
+    }
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
 static int handle_client_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body, "enabled", "connectionRateLimitPerMinute", NULL,
+                                                  out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -6768,15 +8613,21 @@ static int handle_client_create(const st_admin_context *context, const char *bod
         return init_response;
     }
     char *client_name = st_json_get_string(body, "clientName");
-    if (client_name == NULL || *client_name == '\0') {
+    const char *invalid = client_name_error(client_name);
+    if (invalid != NULL) {
         free(client_name);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is required\"}");
+        return write_http_route_invalid(invalid, out, out_len);
     }
     int enabled = 1;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
     int rate_limit = 30;
-    (void)st_json_get_int(body, "connectionRateLimitPerMinute", &rate_limit);
+    (void)admin_jackson_int(body, "connectionRateLimitPerMinute", &rate_limit);
     st_storage_client client;
+    if (st_storage_get_client_by_name(database_path, client_name, &client) == 0) {
+        int len = write_client_name_exists(client_name, out, out_len);
+        free(client_name);
+        return len;
+    }
     int rc = st_storage_upsert_client(database_path,
                                       0,
                                       context->tenant_id,
@@ -6795,8 +8646,11 @@ static int handle_client_create(const st_admin_context *context, const char *bod
 
 static int handle_client_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body, "enabled", "connectionRateLimitPerMinute", NULL,
+                                                  out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -6807,12 +8661,27 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     if (st_storage_get_client(database_path, id, &existing) != 0 || !admin_can_access_client(context, &existing)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    /* A blank or missing name keeps the current one (Java StringUtils.hasText). */
     char *client_name = st_json_get_string(body, "clientName");
-    const char *next_client_name = client_name != NULL && *client_name != '\0' ? client_name : existing.client_name;
+    http_route_trim_in_place(client_name);
+    int name_given = client_name != NULL && *client_name != '\0';
+    const char *invalid = name_given ? client_name_error(client_name) : NULL;
+    if (invalid != NULL) {
+        free(client_name);
+        return write_http_route_invalid(invalid, out, out_len);
+    }
+    const char *next_client_name = name_given ? client_name : existing.client_name;
+    st_storage_client taken;
+    if (strcmp(next_client_name, existing.client_name) != 0
+        && st_storage_get_client_by_name(database_path, next_client_name, &taken) == 0) {
+        int len = write_client_name_exists(next_client_name, out, out_len);
+        free(client_name);
+        return len;
+    }
     int enabled = existing.enabled;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
     int rate_limit = existing.connection_rate_limit_per_minute;
-    (void)st_json_get_int(body, "connectionRateLimitPerMinute", &rate_limit);
+    (void)admin_jackson_int(body, "connectionRateLimitPerMinute", &rate_limit);
     st_storage_client updated;
     st_storage_share_ids revoked = {0};
     /* Disabling the client ends the shares of all its routes in the same transaction. */
@@ -6830,6 +8699,16 @@ static int handle_client_update(const st_admin_context *context, long long id, c
     st_storage_share_ids_free(&revoked);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
+    }
+    /*
+     * As Go's management API: the online connections of a disabled or renamed client are closed,
+     * so none keeps serving under a name or route set the server no longer has.
+     */
+    int renamed = strcmp(existing.client_name, updated.client_name) != 0;
+    if (!updated.enabled && (existing.enabled || renamed)) {
+        admin_close_client_connections(existing.client_name, "ADMIN_DISABLED");
+    } else if (renamed) {
+        admin_close_client_connections(existing.client_name, "ADMIN_RENAMED");
     }
     admin_notify_peer_mesh_refresh(updated.tenant_id);
     return build_client_result_response(&updated, 200, "OK", out, out_len);
@@ -6855,6 +8734,7 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    admin_close_client_connections(existing.client_name, "ADMIN_DELETED");
     admin_notify_peer_mesh_refresh(existing.tenant_id);
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -6871,144 +8751,269 @@ static int build_peer_mesh_acl_result_response(const st_storage_peer_mesh_acl *a
     return response_len;
 }
 
+/*
+ * Java PeerMeshService.createAcl, an upsert of the (source, target) pair answered 200, with its
+ * checks in order: sourceClientId, the source among the caller's clients, targetClientId, the target
+ * in the tenant, distinct clients, a USER's target among the user's own, then direction.
+ */
 static int handle_peer_mesh_acl_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    long long source_client_id = 0;
+    long long target_client_id = 0;
+    int allowed = 1;
+    char *direction_value = NULL;
+    int source_bound = admin_body_is_object(body)
+        ? admin_jackson_long(body, "sourceClientId", LLONG_MIN, LLONG_MAX, &source_client_id) : -2;
+    int target_bound = source_bound == -2 ? -2
+        : admin_jackson_long(body, "targetClientId", LLONG_MIN, LLONG_MAX, &target_client_id);
+    int allowed_bound = target_bound == -2 ? -2 : admin_jackson_boolean(body, "allowed", &allowed);
+    int direction_bound = allowed_bound == -2 ? -2 : admin_jackson_string(body, "direction", &direction_value);
+    if (direction_bound == -2) {
+        free(direction_value);
+        return write_spring_bad_request(out, out_len);
+    }
+    if (allowed_bound != 1) {
+        allowed = 1;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
     if (init_response != 0) {
+        free(direction_value);
         return init_response;
-    }
-    long long source_client_id = 0;
-    long long target_client_id = 0;
-    if (st_json_get_i64(body, "sourceClientId", &source_client_id) != 0
-        || st_json_get_i64(body, "targetClientId", &target_client_id) != 0
-        || source_client_id <= 0
-        || target_client_id <= 0) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"sourceClientId and targetClientId are required\"}");
-    }
-    if (source_client_id == target_client_id) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"source and target cannot be the same client\"}");
     }
     st_storage_client source;
     st_storage_client target;
-    if (!admin_load_accessible_client(database_path, context, source_client_id, &source)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"source client not found\"}");
+    int answer = 0;
+    if (source_bound != 1 || source_client_id <= 0) {
+        answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"sourceClientId is required\"}");
+    } else if (!admin_load_accessible_client(database_path, context, source_client_id, &source)) {
+        answer = write_client_not_found(source_client_id, out, out_len);
+    } else if (target_bound != 1 || target_client_id <= 0) {
+        answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"targetClientId is required\"}");
+    } else if (!admin_load_tenant_client(database_path, context, target_client_id, &target)) {
+        answer = write_client_not_found(target_client_id, out, out_len);
+    } else if (source.id == target.id) {
+        answer = write_response(out, out_len, 400, "Bad Request",
+                                "{\"error\":\"source and target cannot be the same client\"}");
+    } else if (!context->admin
+               && strcmp(target.owner_username[0] == '\0' ? "admin" : target.owner_username, context->username) != 0) {
+        answer = write_response(out, out_len, 400, "Bad Request", "{\"error\":\"普通用户不能创建跨用户 peer ACL\"}");
     }
-    if (!admin_load_tenant_client(database_path, context, target_client_id, &target)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"target client not found\"}");
-    }
-    if (!context->admin && strcmp(target.owner_username, context->username) != 0) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"ordinary users cannot create cross-user peer ACL\"}");
-    }
-    int allowed = 1;
-    (void)st_json_get_bool(body, "allowed", &allowed);
-    char *direction_value = st_json_get_string(body, "direction");
     const char *direction = NULL;
-    if (direction_value != NULL && admin_ascii_casecmp(direction_value, "OUTBOUND") == 0) {
-        direction = "OUTBOUND";
-    } else if (direction_value != NULL && admin_ascii_casecmp(direction_value, "INBOUND") == 0) {
-        direction = "INBOUND";
-    } else if (direction_value != NULL && admin_ascii_casecmp(direction_value, "BOTH") == 0) {
-        direction = "BOTH";
-    } else if (direction_value != NULL) {
-        char *escaped_direction = st_json_escape(direction_value);
-        st_admin_string_builder error = {0};
-        int error_rc = escaped_direction == NULL
-            ? -1
-            : admin_sb_appendf(&error, "{\"error\":\"invalid direction: %s\"}", escaped_direction);
-        free(escaped_direction);
-        free(direction_value);
-        if (error_rc != 0 || error.data == NULL) {
-            free(error.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl validation failed\"}");
+    if (answer == 0 && direction_value != NULL) {
+        char upper[16];
+        size_t len = strlen(direction_value);
+        if (len < sizeof(upper)) {
+            for (size_t i = 0U; i <= len; ++i) upper[i] = (char)toupper((unsigned char)direction_value[i]);
+            direction = strcmp(upper, "OUTBOUND") == 0 ? "OUTBOUND"
+                : strcmp(upper, "INBOUND") == 0 ? "INBOUND"
+                : strcmp(upper, "BOTH") == 0 ? "BOTH" : NULL;
         }
-        int response_len = write_response(out, out_len, 400, "Bad Request", error.data);
-        free(error.data);
-        return response_len;
+        if (direction == NULL) {
+            answer = write_bad_request_naming("invalid direction: ", direction_value, out, out_len);
+        }
     }
     st_storage_peer_mesh_acl acl;
-    if (st_storage_upsert_peer_mesh_acl(database_path,
-                                        context->tenant_id,
-                                        context->username,
-                                        &source,
-                                        &target,
-                                        allowed,
-                                        direction,
-                                        &acl) != 0) {
-        free(direction_value);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"peer mesh acl create failed\"}");
+    if (answer == 0 && st_storage_upsert_peer_mesh_acl(database_path,
+                                                       context->tenant_id,
+                                                       context->username,
+                                                       &source,
+                                                       &target,
+                                                       allowed,
+                                                       direction,
+                                                       &acl) != 0) {
+        answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl create failed\"}");
     }
     free(direction_value);
+    if (answer != 0) {
+        return answer;
+    }
+    /* PeerSignalService.refreshAuthorization. */
+    admin_close_peer_sessions(database_path, context->tenant_id, 0);
     admin_notify_peer_mesh_refresh(context->tenant_id);
-    return build_peer_mesh_acl_result_response(&acl, 201, "Created", out, out_len);
+    return build_peer_mesh_acl_result_response(&acl, 200, "OK", out, out_len);
 }
 
 static int handle_peer_mesh_acl_delete(const st_admin_context *context, long long id, char *out, size_t out_len)
 {
-    const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        return write_response(out, out_len, 204, "No Content", "");
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl delete failed\"}");
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) {
+        return init_response;
     }
     if (st_storage_delete_peer_mesh_acl_visible(database_path,
                                                 id,
                                                 context->tenant_id,
                                                 context->username,
                                                 context->admin) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh acl not found\"}");
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"peer ACL not found: %lld\"}", id);
+        return write_response(out, out_len, 400, "Bad Request", message);
     }
+    /* PeerSignalService.refreshAuthorization; Java's void handler answers 200 with no body. */
+    admin_close_peer_sessions(database_path, context->tenant_id, 0);
     admin_notify_peer_mesh_refresh(context->tenant_id);
-    return write_response(out, out_len, 204, "No Content", "");
+    return write_response(out, out_len, 200, "OK", "");
 }
 
-static int handle_specus_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
+/*
+ * NAT_CONTROL reaches the client as one MESSAGE_RESPONSE, whose body protocol/spec/control-protocol.md
+ * caps at 1 MiB (ST_MAX_MESSAGE_BODY_SIZE). main.c builds it (build_nat_control_json) from the
+ * client's enabled mappings and routes plus SPECUS_TCP_MAPPINGS and SPECUS_HTTP_ROUTES. A change
+ * that takes it past the cap could be stored but never sent, so the management API refuses that
+ * change instead. The client's name is counted at the longest a rename can make it, 120 characters
+ * of up to 4 UTF-8 bytes in the message and up to 6 bytes (a backslash-u escape) in the JSON, so no
+ * later rename pushes an accepted configuration over. A configuration stored past the cap before
+ * this check, or straight to the database, is not sent: the login and the runtime push only log it,
+ * and the manual push answers 409 with ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY.
+ */
+#define ST_ADMIN_NAT_CONTROL_NAME_BYTES (120U * 4U)
+#define ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES (120U * 6U)
+#define ST_ADMIN_NAT_CONTROL_TOO_LARGE_BODY \
+    "{\"error\":\"客户端的 TCP 映射和 HTTP route 将超过单条 NAT_CONTROL 消息 1 MiB 的上限，无法下发给客户端\"}"
+#define ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY \
+    "{\"error\":\"客户端的 TCP 映射和 HTTP route 超过单条 NAT_CONTROL 消息 1 MiB 的上限，未下发给客户端\"}"
+
+static size_t admin_varint_size(size_t value)
 {
-    if (body == NULL) {
-        body = "";
+    size_t size = 1U;
+    while (value >= 0x80U) {
+        value >>= 7;
+        ++size;
     }
-    const char *database_path = NULL;
-    int init_response = ensure_admin_database(&database_path, out, out_len);
-    if (init_response != 0) {
-        return init_response;
+    return size;
+}
+
+/*
+ * Whether client_name's NAT_CONTROL stays within the cap once added_entry, a list entry as
+ * append_specus_config_entry or append_http_route_config_entry writes it, takes the place of
+ * removed_entry (NULL when it joins the list). -1 when the configuration could not be read, else 0
+ * with *fits set.
+ */
+static int admin_nat_control_fits(const char *database_path,
+                                  const char *client_name,
+                                  const char *removed_entry,
+                                  const char *added_entry,
+                                  int *fits)
+{
+    st_admin_tcp_mapping_list mappings = {0};
+    st_admin_http_route_list routes = {0};
+    st_admin_string_builder json = {0};
+    char *public_address = st_json_escape(env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
+    int rc = public_address == NULL
+            || add_stored_tcp_mappings(database_path, client_name, &mappings) != 0
+            || load_env_tcp_mappings(&mappings) != 0
+            || add_stored_http_routes(database_path, client_name, &routes) != 0
+            || load_env_http_routes(&routes) != 0
+        ? -1
+        : 0;
+    /* build_nat_control_json's document, its clientName left empty to be counted at its longest. */
+    if (rc == 0) {
+        rc = admin_sb_appendf(&json,
+                              "{\"clientName\":\"\",\"remoteAddress\":\"%s\",\"remotePort\":%d,\"specusConfigList\":[",
+                              public_address,
+                              env_int("SPECUS_NETTY_PORT", 7010));
     }
-    st_storage_client owner;
-    if (!admin_load_accessible_client(database_path, context, client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    if (rc == 0) rc = append_specus_config_list(&json, mappings.items, mappings.count);
+    if (rc == 0) rc = admin_sb_append(&json, "],\"httpSpecusConfigList\":[");
+    if (rc == 0) rc = append_http_route_config_list(&json, routes.items, routes.count);
+    if (rc == 0) rc = admin_sb_append(&json, "]}");
+    if (rc == 0) {
+        size_t json_len = json.len + ST_ADMIN_NAT_CONTROL_ESCAPED_NAME_BYTES;
+        size_t removed_len = removed_entry == NULL ? 0U : strlen(removed_entry);
+        if (removed_len <= json_len) {
+            json_len -= removed_len;
+        }
+        /* An entry that joins the list brings the comma that separates it. */
+        json_len += strlen(added_entry) + (removed_entry == NULL ? 1U : 0U);
+        /* As st_protocol_encode_nat_control writes it: clientName, a null toClientName, the type, the JSON. */
+        size_t body_len = admin_varint_size(ST_ADMIN_NAT_CONTROL_NAME_BYTES + 1U) + ST_ADMIN_NAT_CONTROL_NAME_BYTES
+            + 1U + admin_varint_size((size_t)ST_MESSAGE_TYPE_NAT_CONTROL)
+            + admin_varint_size(json_len + 1U) + json_len;
+        *fits = body_len <= ST_MAX_MESSAGE_BODY_SIZE;
     }
-    int listen_port = 0;
-    int target_port = 0;
-    char *target_address = st_json_get_string(body, "targetAddress");
-    if (st_json_get_int(body, "listenPort", &listen_port) != 0
-        || st_json_get_int(body, "targetPort", &target_port) != 0
-        || target_address == NULL || *target_address == '\0') {
-        free(target_address);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"listenPort, targetAddress and targetPort are required\"}");
+    free(public_address);
+    free(mappings.items);
+    free(routes.items);
+    free(json.data);
+    return rc;
+}
+
+/* 0 when added_entry fits client_name's NAT_CONTROL (see above), else the answer written to out. */
+static int admin_nat_control_answer(const char *database_path,
+                                    const char *client_name,
+                                    int entries_built,
+                                    const char *removed_entry,
+                                    const char *added_entry,
+                                    char *out,
+                                    size_t out_len)
+{
+    int fits = 0;
+    if (!entries_built || admin_nat_control_fits(database_path, client_name, removed_entry, added_entry, &fits) != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"NAT_CONTROL size check failed\"}");
     }
-    int enabled = 1;
-    (void)st_json_get_bool(body, "enabled", &enabled);
-    int detail_capture_enabled = 0;
-    (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
-    st_storage_mapping mapping;
-    int rc = st_storage_create_mapping_for_client(database_path,
-                                                  client_id,
-                                                  listen_port,
-                                                  target_address,
-                                                  target_port,
-                                                  enabled,
-                                                  detail_capture_enabled,
-                                                  &mapping);
-    free(target_address);
-    if (rc != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or specus create failed\"}");
+    return fits ? 0 : write_response(out, out_len, 400, "Bad Request", ST_ADMIN_NAT_CONTROL_TOO_LARGE_BODY);
+}
+
+/*
+ * The NAT_CONTROL check of a mapping change: replaced is the enabled mapping the change replaces or
+ * disables (NULL when none), and the new fields are what it leaves enabled, if anything. Removing
+ * an entry only shrinks the message, so a change that enables nothing always passes.
+ */
+static int admin_check_mapping_change(const char *database_path,
+                                      const char *client_name,
+                                      const st_storage_mapping *replaced,
+                                      int enabled,
+                                      int listen_port,
+                                      const char *target_address,
+                                      int target_port,
+                                      char *out,
+                                      size_t out_len)
+{
+    if (!enabled) {
+        return 0;
     }
-    admin_notify_nat_control(&owner);
-    admin_product_metrics_milestone(owner.tenant_id, owner.owner_username, ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED);
-    return build_mapping_response(&mapping, 201, "Created", out, out_len);
+    st_admin_string_builder removed = {0};
+    st_admin_string_builder added = {0};
+    int built = (replaced == NULL
+                 || append_specus_config_entry(&removed, replaced->listen_port, replaced->target_address,
+                                               replaced->target_port) == 0)
+        && append_specus_config_entry(&added, listen_port, target_address, target_port) == 0
+        && added.data != NULL;
+    int answer = admin_nat_control_answer(database_path, client_name, built,
+                                          replaced == NULL ? NULL : removed.data, added.data, out, out_len);
+    free(removed.data);
+    free(added.data);
+    return answer;
+}
+
+/* The NAT_CONTROL check of an HTTP route change, as admin_check_mapping_change. */
+static int admin_check_http_route_change(const char *database_path,
+                                         const char *client_name,
+                                         const st_storage_http_route *replaced,
+                                         int enabled,
+                                         const char *route,
+                                         const char *target_base_url,
+                                         int insecure_skip_verify,
+                                         char *out,
+                                         size_t out_len)
+{
+    if (!enabled) {
+        return 0;
+    }
+    st_admin_string_builder removed = {0};
+    st_admin_string_builder added = {0};
+    int built = (replaced == NULL
+                 || append_http_route_config_entry(&removed, replaced->route, replaced->target_base_url,
+                                                   replaced->insecure_skip_verify) == 0)
+        && append_http_route_config_entry(&added, route, target_base_url, insecure_skip_verify) == 0
+        && added.data != NULL;
+    int answer = admin_nat_control_answer(database_path, client_name, built,
+                                          replaced == NULL ? NULL : removed.data, added.data, out, out_len);
+    free(removed.data);
+    free(added.data);
+    return answer;
 }
 
 static int handle_nat_control_push(const st_admin_context *context, long long client_id, char *out, size_t out_len)
@@ -7022,14 +9027,13 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
     if (!admin_load_accessible_client(database_path, context, client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    st_storage_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
-    st_storage_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
+    st_storage_mapping *mappings = NULL;
+    st_storage_http_route *routes = NULL;
     size_t mapping_count = 0U;
     size_t route_count = 0U;
-    if (st_storage_list_mappings(database_path, client_id, mappings,
-                                 ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0
-        || st_storage_list_http_routes(database_path, client_id, routes,
-                                       ST_ADMIN_MAX_TCP_MAPPINGS, &route_count) != 0) {
+    if (st_storage_list_mappings(database_path, client_id, &mappings, &mapping_count) != 0
+        || st_storage_list_http_routes(database_path, client_id, &routes, &route_count) != 0) {
+        free(mappings);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"映射下发失败\"}");
     }
@@ -7037,6 +9041,8 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
     int enabled_routes = 0;
     for (size_t i = 0; i < mapping_count; ++i) if (mappings[i].enabled) ++enabled_mappings;
     for (size_t i = 0; i < route_count; ++i) if (routes[i].enabled) ++enabled_routes;
+    free(mappings);
+    free(routes);
     int push_result = admin_push_nat_control(owner.id, owner.client_name);
     if (push_result == 0) {
         char response[160];
@@ -7044,6 +9050,10 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
                  "{\"pushed\":%d,\"specusMappings\":%d,\"httpRoutes\":%d}",
                  enabled_mappings, enabled_mappings, route_count == 0U ? -1 : enabled_routes);
         return write_response(out, out_len, 200, "OK", response);
+    }
+    if (push_result == ST_ADMIN_NAT_CONTROL_NOT_SENT) {
+        /* Nothing was sent and the connection is kept; the caller must not take it as pushed. */
+        return write_response(out, out_len, 409, "Conflict", ST_ADMIN_NAT_CONTROL_NOT_SENT_BODY);
     }
     return push_result == -1
         ? write_response(out,
@@ -7058,10 +9068,145 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
                          "{\"error\":\"映射下发失败\"}");
 }
 
+/* Java's 400 for a mapping the caller cannot see: "mapping not found: <id>". */
+static int write_mapping_not_found(long long id, char *out, size_t out_len)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"error\":\"mapping not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/*
+ * Java NatControlService.requirePort and requireTargetAddress on a mapping request, in Java's
+ * order: listenPort, targetPort, then targetAddress, trimmed and at most 255 characters. 0 with
+ * *target_address (the caller frees it) when all three are valid, else the answer written to out.
+ */
+static int admin_mapping_fields(const char *body,
+                                int *listen_port,
+                                int *target_port,
+                                char **target_address,
+                                char *out,
+                                size_t out_len)
+{
+    *target_address = NULL;
+    static const char *const ports[] = {"listenPort", "targetPort"};
+    int *values[] = {listen_port, target_port};
+    for (size_t i = 0U; i < 2U; ++i) {
+        int member = admin_json_integer_member(body, ports[i], values[i]);
+        if (member == -2) {
+            return write_spring_bad_request(out, out_len);
+        }
+        if (member == 0 || *values[i] < 1 || *values[i] > 65535) {
+            char message[96];
+            snprintf(message, sizeof(message), "{\"error\":\"%s must be between 1 and 65535\"}", ports[i]);
+            return write_response(out, out_len, 400, "Bad Request", message);
+        }
+    }
+    char *address = st_json_get_string(body, "targetAddress");
+    if (!admin_java_has_text(address)) {
+        free(address);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"targetAddress cannot be blank\"}");
+    }
+    if (admin_utf16_length(admin_java_trim(address)) > 255U) {
+        free(address);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"targetAddress is too long\"}");
+    }
+    *target_address = address;
+    return 0;
+}
+
+/*
+ * Java findByListenPort: a public port belongs to one mapping of any client, so a port another
+ * mapping holds is refused. 0 when listen_port is free for mapping_id, else the answer written.
+ */
+static int admin_mapping_port_answer(const char *database_path,
+                                     int listen_port,
+                                     long long mapping_id,
+                                     char *out,
+                                     size_t out_len)
+{
+    st_storage_mapping holder;
+    int found = st_storage_find_mapping_by_listen_port(database_path, listen_port, &holder);
+    if (found < 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus port check failed\"}");
+    }
+    if (found == 0 && holder.id != mapping_id) {
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"公网端口 %d 已被占用\"}", listen_port);
+        return write_response(out, out_len, 400, "Bad Request", message);
+    }
+    return 0;
+}
+
+/*
+ * Java NatControlService.createMapping, after Spring bound the required MappingMutation: the client
+ * among the caller's (400 client not found: <id>), the three fields as on update, and a public port
+ * no mapping of any client holds (400 公网端口 N 已被占用). A new mapping, never a replacement of the
+ * client's mapping on that port.
+ */
+static int handle_specus_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
+{
+    int enabled = 1;
+    int detail_capture_enabled = 0;
+    int enabled_bound = admin_body_is_object(body) ? admin_jackson_boolean(body, "enabled", &enabled) : -2;
+    int capture_bound = enabled_bound == -2 ? -2
+        : admin_jackson_boolean(body, "detailCaptureEnabled", &detail_capture_enabled);
+    if (capture_bound == -2) {
+        return write_spring_bad_request(out, out_len);
+    }
+    if (enabled_bound != 1) {
+        enabled = 1;
+    }
+    if (capture_bound != 1) {
+        detail_capture_enabled = 0;
+    }
+    const char *database_path = NULL;
+    int init_response = ensure_admin_database(&database_path, out, out_len);
+    if (init_response != 0) {
+        return init_response;
+    }
+    st_storage_client owner;
+    if (!admin_load_accessible_client(database_path, context, client_id, &owner)) {
+        return write_client_not_found(client_id, out, out_len);
+    }
+    int listen_port = 0;
+    int target_port = 0;
+    char *target_address = NULL;
+    int invalid = admin_mapping_fields(body, &listen_port, &target_port, &target_address, out, out_len);
+    if (invalid == 0) {
+        invalid = admin_mapping_port_answer(database_path, listen_port, 0, out, out_len);
+    }
+    if (invalid == 0) {
+        invalid = admin_check_mapping_change(database_path, owner.client_name, NULL, enabled, listen_port,
+                                             target_address, target_port, out, out_len);
+    }
+    if (invalid != 0) {
+        free(target_address);
+        return invalid;
+    }
+    st_storage_mapping mapping;
+    int rc = st_storage_create_mapping_for_client(database_path,
+                                                  client_id,
+                                                  listen_port,
+                                                  target_address,
+                                                  target_port,
+                                                  enabled,
+                                                  detail_capture_enabled,
+                                                  &mapping);
+    free(target_address);
+    if (rc != 0) {
+        /* Another request took the port in between: Java's unique constraint, as GlobalExceptionHandler words it. */
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}");
+    }
+    admin_notify_nat_control(&owner);
+    admin_product_metrics_milestone(owner.tenant_id, owner.owner_username, ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED);
+    return build_mapping_response(&mapping, 201, "Created", out, out_len);
+}
+
 static int handle_specus_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    if (body == NULL || !st_json_is_valid_object(body)) {
+        return write_spring_bad_request(out, out_len);
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -7072,20 +9217,39 @@ static int handle_specus_update(const st_admin_context *context, long long id, c
     st_storage_client owner;
     if (st_storage_get_mapping(database_path, id, &existing) != 0
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
+        return write_mapping_not_found(id, out, out_len);
     }
-    int listen_port = existing.listen_port;
-    (void)st_json_get_int(body, "listenPort", &listen_port);
-    int target_port = existing.target_port;
-    (void)st_json_get_int(body, "targetPort", &target_port);
-    char *target_address = st_json_get_string(body, "targetAddress");
-    const char *next_target_address = target_address != NULL && *target_address != '\0'
-        ? target_address
-        : existing.target_address;
-    int enabled = existing.enabled;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    /* Java updateMapping: all three fields are required, as on create. */
+    int listen_port = 0;
+    int target_port = 0;
+    char *target_address = NULL;
+    int invalid = admin_mapping_fields(body, &listen_port, &target_port, &target_address, out, out_len);
+    if (invalid == 0 && listen_port != existing.listen_port) {
+        invalid = admin_mapping_port_answer(database_path, listen_port, existing.id, out, out_len);
+    }
+    if (invalid != 0) {
+        free(target_address);
+        return invalid;
+    }
+    const char *next_target_address = target_address;
+    /* As Java: enabled left out (or null) enables the mapping; detailCaptureEnabled keeps its value. */
+    int enabled = 1;
     int detail_capture_enabled = existing.detail_capture_enabled;
-    (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    int value = 0;
+    int bound = admin_jackson_boolean(body, "enabled", &value);
+    if (bound == 1) enabled = value;
+    int capture_bound = bound == -2 ? -2 : admin_jackson_boolean(body, "detailCaptureEnabled", &value);
+    if (capture_bound == 1) detail_capture_enabled = value;
+    if (capture_bound == -2) {
+        free(target_address);
+        return write_spring_bad_request(out, out_len);
+    }
+    int refused = admin_check_mapping_change(database_path, owner.client_name, existing.enabled ? &existing : NULL,
+                                             enabled, listen_port, next_target_address, target_port, out, out_len);
+    if (refused != 0) {
+        free(target_address);
+        return refused;
+    }
     st_storage_mapping mapping;
     int rc = st_storage_update_mapping_by_id(database_path,
                                              id,
@@ -7113,11 +9277,9 @@ static int handle_specus_delete(const st_admin_context *context, long long id, c
     st_storage_mapping existing;
     st_storage_client owner;
     if (st_storage_get_mapping(database_path, id, &existing) != 0
-        || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
-    }
-    if (st_storage_delete_mapping_by_id(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
+        || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)
+        || st_storage_delete_mapping_by_id(database_path, id) != 0) {
+        return write_mapping_not_found(id, out, out_len);
     }
     admin_notify_nat_control(&owner);
     return write_response(out, out_len, 204, "No Content", "");
@@ -7169,8 +9331,12 @@ static int http_route_auth_password_hash(const char *password,
 
 static int handle_http_route_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body,
+        "enabled,detailCaptureEnabled,mediaCaptureEnabled,pathRewriteEnabled,insecureSkipVerify,authEnabled",
+        NULL, NULL, out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -7183,23 +9349,24 @@ static int handle_http_route_create(const st_admin_context *context, long long c
     }
     char *route_name = st_json_get_string(body, "route");
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
-    if (route_name == NULL || *route_name == '\0' || target_base_url == NULL || *target_base_url == '\0') {
+    const char *invalid = http_route_mutation_error(route_name, target_base_url);
+    if (invalid != NULL) {
         free(route_name);
         free(target_base_url);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"route and targetBaseUrl are required\"}");
+        return write_http_route_invalid(invalid, out, out_len);
     }
     int enabled = 1;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
     int detail_capture_enabled = 0;
-    (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    (void)admin_jackson_boolean(body, "detailCaptureEnabled", &detail_capture_enabled);
     int media_capture_enabled = 0;
-    (void)st_json_get_bool(body, "mediaCaptureEnabled", &media_capture_enabled);
+    (void)admin_jackson_boolean(body, "mediaCaptureEnabled", &media_capture_enabled);
     int path_rewrite_enabled = 0;
-    (void)st_json_get_bool(body, "pathRewriteEnabled", &path_rewrite_enabled);
+    (void)admin_jackson_boolean(body, "pathRewriteEnabled", &path_rewrite_enabled);
     int insecure_skip_verify = 0;
-    (void)st_json_get_bool(body, "insecureSkipVerify", &insecure_skip_verify);
+    (void)admin_jackson_boolean(body, "insecureSkipVerify", &insecure_skip_verify);
     int auth_enabled = 0;
-    (void)st_json_get_bool(body, "authEnabled", &auth_enabled);
+    (void)admin_jackson_boolean(body, "authEnabled", &auth_enabled);
     char *auth_username = st_json_get_string(body, "authUsername");
     char *auth_password = st_json_get_string(body, "authPassword");
     char auth_password_hash[ST_SHA256_HEX_LEN + 1] = {0};
@@ -7218,9 +9385,19 @@ static int handle_http_route_create(const st_admin_context *context, long long c
         free(auth_password);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and authPassword are required when authentication is enabled\"}");
     }
+    /* A route name the client already has is refused below, so a new route never replaces one. */
+    int refused = admin_check_http_route_change(database_path, owner.client_name, NULL, enabled, route_name,
+                                                target_base_url, insecure_skip_verify, out, out_len);
+    if (refused != 0) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return refused;
+    }
     st_storage_http_route route;
     st_storage_share_ids revoked = {0};
-    /* route.created (or, for a name that exists, the update's audit and share hooks) in one go. */
+    /* route.created in the same transaction; a name the client already has is refused. */
     int rc = st_storage_create_http_route_audited(database_path,
                                                   client_id,
                                                   route_name,
@@ -7238,12 +9415,16 @@ static int handle_http_route_create(const st_admin_context *context, long long c
                                                   st_http_share_now_ms(),
                                                   &route,
                                                   &revoked);
+    int exists_len = rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? write_http_route_exists(route_name, out, out_len) : 0;
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_HTTP_ROUTE_EXISTS) {
+        return exists_len;
+    }
     if (rc != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or http route create failed\"}");
     }
@@ -7254,8 +9435,12 @@ static int handle_http_route_create(const st_admin_context *context, long long c
 
 static int handle_http_route_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body,
+        "enabled,detailCaptureEnabled,mediaCaptureEnabled,pathRewriteEnabled,insecureSkipVerify,authEnabled",
+        NULL, NULL, out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -7268,24 +9453,36 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"http route not found\"}");
     }
+    /* A field left out keeps its value; one that is given is validated as on creation. */
     char *route_name = st_json_get_string(body, "route");
-    const char *next_route = route_name != NULL && *route_name != '\0' ? route_name : existing.route;
+    if (route_name == NULL) {
+        route_name = admin_dup_string(existing.route);
+    }
     char *target_base_url = st_json_get_string(body, "targetBaseUrl");
-    const char *next_target = target_base_url != NULL && *target_base_url != '\0'
-        ? target_base_url
-        : existing.target_base_url;
+    if (target_base_url == NULL) {
+        target_base_url = admin_dup_string(existing.target_base_url);
+    }
+    const char *invalid = route_name == NULL || target_base_url == NULL ? "route update failed"
+        : http_route_mutation_error(route_name, target_base_url);
+    if (invalid != NULL) {
+        free(route_name);
+        free(target_base_url);
+        return write_http_route_invalid(invalid, out, out_len);
+    }
+    const char *next_route = route_name;
+    const char *next_target = target_base_url;
     int enabled = existing.enabled;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
     int detail_capture_enabled = existing.detail_capture_enabled;
-    (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
+    (void)admin_jackson_boolean(body, "detailCaptureEnabled", &detail_capture_enabled);
     int media_capture_enabled = existing.media_capture_enabled;
-    (void)st_json_get_bool(body, "mediaCaptureEnabled", &media_capture_enabled);
+    (void)admin_jackson_boolean(body, "mediaCaptureEnabled", &media_capture_enabled);
     int path_rewrite_enabled = existing.path_rewrite_enabled;
-    (void)st_json_get_bool(body, "pathRewriteEnabled", &path_rewrite_enabled);
+    (void)admin_jackson_boolean(body, "pathRewriteEnabled", &path_rewrite_enabled);
     int insecure_skip_verify = existing.insecure_skip_verify;
-    (void)st_json_get_bool(body, "insecureSkipVerify", &insecure_skip_verify);
+    (void)admin_jackson_boolean(body, "insecureSkipVerify", &insecure_skip_verify);
     int auth_enabled = existing.auth_enabled;
-    (void)st_json_get_bool(body, "authEnabled", &auth_enabled);
+    (void)admin_jackson_boolean(body, "authEnabled", &auth_enabled);
     char *auth_username = st_json_get_string(body, "authUsername");
     const char *next_auth_username = auth_username == NULL ? existing.auth_username : auth_username;
     char *auth_password = st_json_get_string(body, "authPassword");
@@ -7304,6 +9501,15 @@ static int handle_http_route_update(const st_admin_context *context, long long i
         free(auth_username);
         free(auth_password);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"authUsername and a configured authPassword are required when authentication is enabled\"}");
+    }
+    int refused = admin_check_http_route_change(database_path, owner.client_name, existing.enabled ? &existing : NULL,
+                                                enabled, next_route, next_target, insecure_skip_verify, out, out_len);
+    if (refused != 0) {
+        free(route_name);
+        free(target_base_url);
+        free(auth_username);
+        free(auth_password);
+        return refused;
     }
     st_storage_http_route route;
     st_storage_share_ids revoked = {0};
@@ -7328,12 +9534,16 @@ static int handle_http_route_update(const st_admin_context *context, long long i
                                                   st_http_share_now_ms(),
                                                   &route,
                                                   &revoked);
+    int exists_len = rc == ST_STORAGE_HTTP_ROUTE_EXISTS ? write_http_route_exists(next_route, out, out_len) : 0;
     free(route_name);
     free(target_base_url);
     free(auth_username);
     free(auth_password);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_HTTP_ROUTE_EXISTS) {
+        return exists_len;
+    }
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"http route update failed\"}");
     }
@@ -8217,20 +10427,72 @@ static int password_hash_matches(const char *password, const char *expected_hash
     return st_constant_time_eq(actual, expected, sizeof(actual));
 }
 
+/* Java ClientCredentialService.normalizeApiKey: trimmed in place, 3 to 120 characters. */
 static int normalize_api_key_in_place(char *api_key)
 {
     if (api_key == NULL) {
         return -1;
     }
-    char *trimmed = admin_trim(api_key);
-    size_t len = strlen(trimmed);
-    if (len < 3U || len > 120U) {
+    size_t len = admin_utf16_length(admin_java_trim(api_key));
+    return len < 3U || len > 120U ? -1 : 0;
+}
+
+/* Java "ck_" + UUID.randomUUID() without its dashes: 32 lowercase hex digits of a version 4 UUID. */
+static int admin_generate_api_key(char out[36])
+{
+    uint8_t bytes[16];
+    if (RAND_bytes(bytes, (int)sizeof(bytes)) != 1) {
         return -1;
     }
-    if (trimmed != api_key) {
-        memmove(api_key, trimmed, len + 1U);
-    }
+    bytes[6] = (uint8_t)((bytes[6] & 0x0fU) | 0x40U);
+    bytes[8] = (uint8_t)((bytes[8] & 0x3fU) | 0x80U);
+    memcpy(out, "ck_", 3U);
+    st_hex_encode(bytes, sizeof(bytes), out + 3);
     return 0;
+}
+
+/* Java PasswordService.generatePassword: 18 characters of its alphabet without look-alikes. */
+static int admin_generate_secret(char out[19])
+{
+    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    const unsigned int size = (unsigned int)(sizeof(alphabet) - 1U);
+    const unsigned int limit = 256U - 256U % size;
+    size_t written = 0U;
+    while (written < 18U) {
+        uint8_t random[32];
+        if (RAND_bytes(random, (int)sizeof(random)) != 1) {
+            return -1;
+        }
+        for (size_t i = 0U; i < sizeof(random) && written < 18U; ++i) {
+            if (random[i] < limit) {
+                out[written++] = alphabet[random[i] % size];
+            }
+        }
+    }
+    out[18] = '\0';
+    return 0;
+}
+
+/*
+ * Java ClientCredentialService.normalizeMaxOnline for a member the request carries: 1 to 10000.
+ * As admin_json_integer_member, and -1 when the number is out of range.
+ */
+static int admin_credential_max_online(const char *body, int *value)
+{
+    int member = admin_json_integer_member(body, "maxOnlineInstances", value);
+    return member == 1 && (*value < 1 || *value > 10000) ? -1 : member;
+}
+
+#define ST_ADMIN_MAX_ONLINE_RANGE_BODY "{\"error\":\"maxOnlineInstances must be between 1 and 10000\"}"
+#define ST_ADMIN_API_KEY_LENGTH_BODY "{\"error\":\"apiKey length must be between 3 and 120\"}"
+#define ST_ADMIN_API_KEY_EXISTS_BODY "{\"error\":\"apiKey already exists\"}"
+
+/* Java's 400 for a credential the caller cannot see: "credential not found: <id>". */
+static int write_credential_not_found(long long id, char *out, size_t out_len)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"error\":\"credential not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
 }
 
 static int build_credential_result_response(const st_storage_client_credential *credential,
@@ -8245,11 +10507,12 @@ static int build_credential_result_response(const st_storage_client_credential *
     if (rc == 0) {
         rc = append_credential_view(&builder, credential);
     }
-    if (rc == 0 && secret != NULL && *secret != '\0') {
+    /* Java CredentialResult: an update that leaves the secret as it was answers "secret":null. */
+    if (rc == 0) {
         rc = admin_sb_append(&builder, ",\"secret\":");
-        if (rc == 0) {
-            rc = admin_sb_append_json_string(&builder, secret);
-        }
+    }
+    if (rc == 0) {
+        rc = admin_sb_append_nullable_json_string(&builder, secret);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "}");
@@ -8273,13 +10536,10 @@ static int build_credentials_response(const st_admin_context *context, char *out
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
-        st_storage_client_credential credentials[ST_ADMIN_MAX_CLIENTS];
         size_t credential_count = 0;
-        if (st_storage_list_client_credentials(database_path,
-                                               context->tenant_id,
-                                               credentials,
-                                               ST_ADMIN_MAX_CLIENTS,
-                                               &credential_count) != 0) {
+        st_storage_client_credential *credentials =
+            admin_list_all_credentials(database_path, context->tenant_id, &credential_count);
+        if (credentials == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
@@ -8294,6 +10554,7 @@ static int build_credentials_response(const st_admin_context *context, char *out
             }
             ++visible_count;
         }
+        free(credentials);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -8309,56 +10570,62 @@ static int build_credentials_response(const st_admin_context *context, char *out
 
 static int handle_credential_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Java binds a required CredentialMutation: no body, or one that is not an object, is 400. */
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body, "enabled", NULL, NULL, out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
     if (init_response != 0) {
         return init_response;
     }
-    char generated_api_key[140];
-    char generated_secret[140];
+    /* In Java's order (ClientCredentialService.create): apiKey, its uniqueness, secret, enabled, max online. */
+    char generated_api_key[36];
+    char generated_secret[19];
     char *api_key = st_json_get_string(body, "apiKey");
     char *secret = st_json_get_string(body, "secret");
-    if (api_key == NULL || *admin_trim(api_key) == '\0') {
-        build_prefixed_token("ck_", generated_api_key, sizeof(generated_api_key));
-        generated_api_key[120] = '\0';
+    int answer = 0;
+    if (admin_java_has_text(api_key)) {
+        if (normalize_api_key_in_place(api_key) != 0) {
+            answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_LENGTH_BODY);
+        }
+    } else {
         free(api_key);
-        api_key = admin_dup_string(generated_api_key);
-    }
-    if (secret == NULL || *admin_trim(secret) == '\0') {
-        build_prefixed_token("sk_", generated_secret, sizeof(generated_secret));
-        free(secret);
-        secret = admin_dup_string(generated_secret);
-    }
-    if (normalize_api_key_in_place(api_key) != 0 || secret == NULL || *admin_trim(secret) == '\0') {
-        free(api_key);
-        free(secret);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"apiKey length must be between 3 and 120\"}");
+        api_key = admin_generate_api_key(generated_api_key) == 0 ? admin_dup_string(generated_api_key) : NULL;
     }
     st_storage_client_credential existing;
-    if (st_storage_get_client_credential_by_api_key(database_path, api_key, &existing) == 0) {
-        free(api_key);
+    if (answer == 0 && api_key != NULL
+        && st_storage_get_client_credential_by_api_key(database_path, api_key, &existing) == 0) {
+        answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_EXISTS_BODY);
+    }
+    if (answer == 0 && !admin_java_has_text(secret)) {
         free(secret);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"apiKey already exists\"}");
+        secret = admin_generate_secret(generated_secret) == 0 ? admin_dup_string(generated_secret) : NULL;
     }
     int enabled = 1;
     int max_online_instances = client_auth_default_max_online_instances();
-    (void)st_json_get_bool(body, "enabled", &enabled);
-    (void)st_json_get_int(body, "maxOnlineInstances", &max_online_instances);
-    if (max_online_instances <= 0) {
-        max_online_instances = client_auth_default_max_online_instances();
-    }
+    int max_online = answer == 0 ? admin_credential_max_online(body, &max_online_instances) : 0;
     char secret_hash[ST_SHA256_HEX_LEN + 1];
-    if (password_hash_hex(admin_trim(secret), secret_hash) != 0) {
+    if (answer == 0 && max_online == -2) {
+        answer = write_spring_bad_request(out, out_len);
+    } else if (answer == 0 && max_online == -1) {
+        answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_MAX_ONLINE_RANGE_BODY);
+    } else if (answer == 0 && (api_key == NULL || secret == NULL
+                               || password_hash_hex(admin_java_trim(secret), secret_hash) != 0)) {
+        answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential create failed\"}");
+    }
+    if (answer != 0) {
         free(api_key);
         free(secret);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"secret cannot be blank\"}");
+        return answer;
     }
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
+    /* A plain insert: a create that races another one for the api key never replaces it; Java's
+     * unique column refuses it and GlobalExceptionHandler answers 400. */
     st_storage_client_credential credential;
-    int rc = st_storage_upsert_client_credential(database_path,
-                                                 0,
+    int rc = st_storage_insert_client_credential(database_path,
                                                  context->tenant_id,
                                                  context->username,
                                                  api_key,
@@ -8369,11 +10636,13 @@ static int handle_credential_create(const st_admin_context *context, const char 
     free(api_key);
     if (rc != 0) {
         free(secret);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"credential create failed\"}");
+        return rc > 0
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
+            : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential create failed\"}");
     }
     admin_product_metrics_milestone(credential.tenant_id, credential.owner_username,
                                     ST_PRODUCT_METRICS_STEP_CREDENTIAL_CREATED);
-    int response_len = build_credential_result_response(&credential, admin_trim(secret), 201, "Created", out, out_len);
+    int response_len = build_credential_result_response(&credential, secret, 201, "Created", out, out_len);
     free(secret);
     return response_len;
 }
@@ -8384,8 +10653,10 @@ static int handle_credential_update(const st_admin_context *context,
                                     char *out,
                                     size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body, "enabled", NULL, NULL, out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -8395,47 +10666,49 @@ static int handle_credential_update(const st_admin_context *context,
     st_storage_client_credential existing;
     if (st_storage_get_client_credential(database_path, id, &existing) != 0
         || !admin_can_access_credential(context, &existing)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"credential not found\"}");
+        return write_credential_not_found(id, out, out_len);
     }
+    /* Java updateCredential: only what the request carries changes, in this order. */
     char *api_key = st_json_get_string(body, "apiKey");
     char *secret = st_json_get_string(body, "secret");
     const char *next_api_key = existing.api_key;
-    if (api_key != NULL && *admin_trim(api_key) != '\0') {
+    int answer = 0;
+    if (admin_java_has_text(api_key)) {
+        st_storage_client_credential duplicate;
         if (normalize_api_key_in_place(api_key) != 0) {
-            free(api_key);
-            free(secret);
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"apiKey length must be between 3 and 120\"}");
-        }
-        if (strcmp(api_key, existing.api_key) != 0) {
-            st_storage_client_credential duplicate;
-            if (st_storage_get_client_credential_by_api_key(database_path, api_key, &duplicate) == 0) {
-                free(api_key);
-                free(secret);
-                return write_response(out, out_len, 409, "Conflict", "{\"error\":\"apiKey already exists\"}");
-            }
+            answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_LENGTH_BODY);
+        } else if (strcmp(api_key, existing.api_key) != 0
+                   && st_storage_get_client_credential_by_api_key(database_path, api_key, &duplicate) == 0) {
+            answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_EXISTS_BODY);
         }
         next_api_key = api_key;
     }
     char secret_hash[ST_SHA256_HEX_LEN + 1];
     const char *secret_hash_ptr = existing.secret_hash;
     const char *revealed_secret = NULL;
-    if (secret != NULL && *admin_trim(secret) != '\0') {
-        if (password_hash_hex(admin_trim(secret), secret_hash) != 0) {
-            free(api_key);
-            free(secret);
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"secret cannot be blank\"}");
+    if (answer == 0 && admin_java_has_text(secret)) {
+        if (password_hash_hex(admin_java_trim(secret), secret_hash) != 0) {
+            answer = write_response(out, out_len, 500, "Internal Server Error",
+                                    "{\"error\":\"credential update failed\"}");
         }
         secret_hash_ptr = secret_hash;
-        revealed_secret = admin_trim(secret);
+        revealed_secret = secret;
     }
     int enabled = existing.enabled;
     int max_online_instances = existing.max_online_instances <= 0
         ? client_auth_default_max_online_instances()
         : existing.max_online_instances;
-    (void)st_json_get_bool(body, "enabled", &enabled);
-    (void)st_json_get_int(body, "maxOnlineInstances", &max_online_instances);
-    if (max_online_instances <= 0) {
-        max_online_instances = client_auth_default_max_online_instances();
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
+    int max_online = answer == 0 ? admin_credential_max_online(body, &max_online_instances) : 0;
+    if (answer == 0 && max_online == -2) {
+        answer = write_spring_bad_request(out, out_len);
+    } else if (answer == 0 && max_online == -1) {
+        answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_MAX_ONLINE_RANGE_BODY);
+    }
+    if (answer != 0) {
+        free(api_key);
+        free(secret);
+        return answer;
     }
     st_storage_client_credential credential;
     int rc = st_storage_upsert_client_credential(database_path,
@@ -8467,11 +10740,9 @@ static int handle_credential_delete(const st_admin_context *context, long long i
     }
     st_storage_client_credential existing;
     if (st_storage_get_client_credential(database_path, id, &existing) != 0
-        || !admin_can_access_credential(context, &existing)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"credential not found\"}");
-    }
-    if (st_storage_delete_client_credential(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"credential not found\"}");
+        || !admin_can_access_credential(context, &existing)
+        || st_storage_delete_client_credential(database_path, id) != 0) {
+        return write_credential_not_found(id, out, out_len);
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -8588,6 +10859,121 @@ static int valid_sha256_text(const char *value)
     return 1;
 }
 
+/* Java's "[0-9a-f]{64}": the digest form a publishable row must carry. */
+static int canonical_sha256_text(const char *value)
+{
+    if (value == NULL || strlen(value) != 64U) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor != '\0'; ++cursor) {
+        if (!isdigit(*cursor) && (*cursor < 'a' || *cursor > 'f')) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Java ClientDownloadLinkService.isSafeExternalPackageUrl over java.net.URI: an absolute https URL
+ * with a server-based host, no user information, no query and no fragment. Characters URI refuses
+ * (whitespace, controls, "<>\^`{|} and the double quote) make it unsafe, and so does a host of
+ * anything but letters, digits, '-' and '.' or a port that is not a number: URI reads such an
+ * authority as registry-based, and getHost() is then null.
+ */
+static int client_download_safe_external_url(const char *value)
+{
+    if (value == NULL) return 0;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+    const char *end = value + strlen(value);
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
+    if ((size_t)(end - value) < 9U || admin_ascii_ncasecmp(value, "https://", 8U) != 0) return 0;
+    for (const char *p = value; p < end; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= ' ' || c == 0x7fU || strchr("\"<>\\^`{|}?#", (int)c) != NULL) return 0;
+    }
+    const char *authority = value + 8U;
+    const char *authority_end = authority;
+    while (authority_end < end && *authority_end != '/') ++authority_end;
+    if (authority_end == authority || memchr(authority, '@', (size_t)(authority_end - authority)) != NULL) {
+        return 0;
+    }
+    const char *host_end = authority_end;
+    if (*authority == '[') {
+        const char *close = memchr(authority, ']', (size_t)(authority_end - authority));
+        if (close == NULL || close == authority + 1) return 0;
+        host_end = close + 1;
+    } else {
+        const char *colon = memchr(authority, ':', (size_t)(authority_end - authority));
+        if (colon != NULL) host_end = colon;
+        if (host_end == authority || *authority == '.' || *authority == '-'
+            || host_end[-1] == '-') return 0;
+        for (const char *p = authority; p < host_end; ++p) {
+            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return 0;
+        }
+    }
+    if (host_end < authority_end) {
+        if (*host_end != ':') return 0;
+        for (const char *p = host_end + 1; p < authority_end; ++p) {
+            if (!isdigit((unsigned char)*p)) return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Java hasAuthoritativeDistributionMetadata: a positive size and a lowercase SHA-256, and either
+ * this server's own download path for a hosted package or a safe external HTTPS URL.
+ */
+static int client_download_has_authoritative_metadata(long long id,
+                                                      int hosted,
+                                                      const char *download_url,
+                                                      const char *sha256,
+                                                      long long file_size)
+{
+    if (file_size <= 0 || !canonical_sha256_text(sha256)) return 0;
+    if (hosted) {
+        char expected[96];
+        snprintf(expected, sizeof(expected), "/api/public/client-packages/%lld/download", id);
+        return id > 0 && download_url != NULL && strcmp(download_url, expected) == 0;
+    }
+    return client_download_safe_external_url(download_url);
+}
+
+/* Java SemanticVersion.normalize: trimmed, at most one leading lowercase "v" removed. */
+static void admin_normalize_semver_text(const char *value, char *out, size_t out_len)
+{
+    if (out_len == 0U) return;
+    out[0] = '\0';
+    if (value == NULL) return;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+    if (*value == 'v') ++value;
+    size_t len = strlen(value);
+    while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+    if (len >= out_len) len = out_len - 1U;
+    memcpy(out, value, len);
+    out[len] = '\0';
+}
+
+/* Java answers an unknown catalogue id with IllegalArgumentException, i.e. 400. */
+static int write_client_download_not_found(long long id, char *out, size_t out_len)
+{
+    char body[128];
+    snprintf(body, sizeof(body), "{\"error\":\"client download link not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/* Java validateTargetCoordinates; NULL when the target may exist. */
+static const char *client_download_target_error(const char *implementation,
+                                                const char *platform,
+                                                const char *arch)
+{
+    if (strcmp(implementation, "android") == 0
+        && (strcmp(platform, "android") != 0 || strcmp(arch, "any") != 0)) {
+        return "{\"error\":\"android packages must use platform=android and arch=any\"}";
+    }
+    if (strcmp(platform, "android") == 0
+        && (strcmp(implementation, "android") != 0 || strcmp(arch, "any") != 0)) {
+        return "{\"error\":\"platform=android is reserved for android/any packages\"}";
+    }
+    return NULL;
+}
+
 typedef struct {
     char major[33];
     char minor[33];
@@ -8604,13 +10990,40 @@ static int semver_numeric_part(const char *value)
     return 1;
 }
 
+/*
+ * Dot-separated SemVer identifiers: none may be empty ("a..b", a leading or trailing dot), each is
+ * [0-9A-Za-z-]+, and a numeric pre-release identifier has no leading zero (build metadata may).
+ */
+static int semver_identifiers_valid(const char *text, int prerelease)
+{
+    const char *part = text;
+    for (;;) {
+        const char *end = strchr(part, '.');
+        size_t len = end == NULL ? strlen(part) : (size_t)(end - part);
+        if (len == 0U) return 0;
+        int all_numeric = 1;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = (unsigned char)part[i];
+            if (!isalnum(c) && c != '-') return 0;
+            if (!isdigit(c)) all_numeric = 0;
+        }
+        if (prerelease && all_numeric && len > 1U && part[0] == '0') return 0;
+        if (end == NULL) return 1;
+        part = end + 1;
+    }
+}
+
+/*
+ * Java SemanticVersion.parse: trimmed (every character up to and including space, as String.trim
+ * does), one optional lowercase "v" removed, at most 32 characters, then strict SemVer 2.0.
+ */
 static int parse_admin_semver(const char *value, st_admin_semver *out)
 {
     if (value == NULL || out == NULL) return -1;
-    while (isspace((unsigned char)*value)) ++value;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
     if (*value == 'v') ++value;
     const char *end = value + strlen(value);
-    while (end > value && isspace((unsigned char)end[-1])) --end;
+    while (end > value && (unsigned char)end[-1] <= ' ') --end;
     size_t len = (size_t)(end - value);
     if (len == 0U || len > 32U) return -1;
     char copy[33];
@@ -8618,37 +11031,24 @@ static int parse_admin_semver(const char *value, st_admin_semver *out)
     copy[len] = '\0';
     char *build = strchr(copy, '+');
     if (build != NULL) {
-        if (build[1] == '\0') return -1;
-        for (char *p = build + 1; *p != '\0'; ++p) {
-            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '.') return -1;
-        }
+        if (!semver_identifiers_valid(build + 1, 0)) return -1;
         *build = '\0';
     }
     char *prerelease = strchr(copy, '-');
     memset(out, 0, sizeof(*out));
     if (prerelease != NULL) {
         *prerelease++ = '\0';
-        if (*prerelease == '\0' || strlen(prerelease) >= sizeof(out->prerelease)) return -1;
-        char validation[33];
-        snprintf(validation, sizeof(validation), "%s", prerelease);
-        char *save = NULL;
-        for (char *part = strtok_r(validation, ".", &save); part != NULL;
-             part = strtok_r(NULL, ".", &save)) {
-            int all_numeric = *part != '\0';
-            for (char *p = part; *p != '\0'; ++p) if (!isdigit((unsigned char)*p)) all_numeric = 0;
-            if (*part == '\0' || (all_numeric && semver_numeric_part(part) == 0)) return -1;
-            for (char *p = part; *p != '\0'; ++p) {
-                if (!isalnum((unsigned char)*p) && *p != '-') return -1;
-            }
-        }
+        if (strlen(prerelease) >= sizeof(out->prerelease) || !semver_identifiers_valid(prerelease, 1)) return -1;
         snprintf(out->prerelease, sizeof(out->prerelease), "%s", prerelease);
     }
-    char *save = NULL;
-    char *major = strtok_r(copy, ".", &save);
-    char *minor = strtok_r(NULL, ".", &save);
-    char *patch = strtok_r(NULL, ".", &save);
-    if (!semver_numeric_part(major) || !semver_numeric_part(minor)
-        || !semver_numeric_part(patch) || strtok_r(NULL, ".", &save) != NULL) return -1;
+    /* Exactly three parts: strtok_r would skip the empty one in "1..0.0" or ".1.0.0". */
+    char *major = copy;
+    char *minor = strchr(major, '.');
+    char *patch = minor == NULL ? NULL : strchr(minor + 1, '.');
+    if (minor == NULL || patch == NULL || strchr(patch + 1, '.') != NULL) return -1;
+    *minor++ = '\0';
+    *patch++ = '\0';
+    if (!semver_numeric_part(major) || !semver_numeric_part(minor) || !semver_numeric_part(patch)) return -1;
     snprintf(out->major, sizeof(out->major), "%s", major);
     snprintf(out->minor, sizeof(out->minor), "%s", minor);
     snprintf(out->patch, sizeof(out->patch), "%s", patch);
@@ -8696,12 +11096,27 @@ static int compare_admin_semver(const st_admin_semver *left, const st_admin_semv
     return left_part == right_part ? 0 : (left_part == NULL ? -1 : 1);
 }
 
+int st_admin_semver_compare_for_testing(const char *left, const char *right, int *result)
+{
+    st_admin_semver parsed_left;
+    st_admin_semver parsed_right;
+    if (result == NULL || parse_admin_semver(left, &parsed_left) != 0
+        || parse_admin_semver(right, &parsed_right) != 0) return -1;
+    *result = compare_admin_semver(&parsed_left, &parsed_right);
+    return 0;
+}
+
 static int read_client_download_mutation(const char *body,
                                          const st_storage_client_download_link *existing,
                                          st_admin_client_download_mutation *mutation,
                                          char *out,
                                          size_t out_len)
 {
+    /* Spring binds the required request body before the service runs. */
+    int bind_refusal = admin_body_members_refusal(body, "enabled,isLatest", "displayOrder", "fileSize", out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
+    }
     static const char *const implementations[] = {"java", "go", "csharp", "android"};
     static const char *const platforms[] = {"windows", "linux", "macos", "android", "any"};
     static const char *const archs[] = {"x64", "arm64", "any"};
@@ -8807,17 +11222,14 @@ static int read_client_download_mutation(const char *body,
         memmove(mutation->min_supported_version, mutation->min_supported_version + 1,
                 strlen(mutation->min_supported_version));
     }
-    (void)st_json_get_int(body, "displayOrder", &mutation->display_order);
-    (void)st_json_get_bool(body, "enabled", &mutation->enabled);
-    (void)st_json_get_i64(body, "fileSize", &mutation->file_size);
-    (void)st_json_get_bool(body, "isLatest", &mutation->is_latest);
-    if ((strcmp(mutation->implementation, "android") == 0
-         && (strcmp(mutation->platform, "android") != 0 || strcmp(mutation->arch, "any") != 0))
-        || (strcmp(mutation->platform, "android") == 0
-            && (strcmp(mutation->implementation, "android") != 0
-                || strcmp(mutation->arch, "any") != 0))) {
-        response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"android packages require android/any\"}");
+    (void)admin_jackson_int(body, "displayOrder", &mutation->display_order);
+    (void)admin_jackson_boolean(body, "enabled", &mutation->enabled);
+    (void)admin_jackson_long(body, "fileSize", LLONG_MIN, LLONG_MAX, &mutation->file_size);
+    (void)admin_jackson_boolean(body, "isLatest", &mutation->is_latest);
+    const char *target_error = client_download_target_error(mutation->implementation,
+                                                            mutation->platform, mutation->arch);
+    if (target_error != NULL) {
+        response = write_response(out, out_len, 400, "Bad Request", target_error);
         goto done;
     }
     st_admin_semver release_version;
@@ -8837,14 +11249,19 @@ static int read_client_download_mutation(const char *body,
                                   "{\"error\":\"invalid fileSize or sha256\"}");
         goto done;
     }
-    if (mutation->is_latest && (!mutation->enabled || mutation->version[0] == '\0')) {
+    if (mutation->is_latest && mutation->version[0] == '\0') {
         response = write_response(out, out_len, 400, "Bad Request",
-                                  "{\"error\":\"an enabled version is required for latest\"}");
+                                  "{\"error\":\"isLatest requires a versioned catalogue entry\"}");
+        goto done;
+    }
+    if (mutation->is_latest && !mutation->enabled) {
+        response = write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"a disabled client download cannot be latest\"}");
         goto done;
     }
     if (mutation->is_latest && (existing == NULL || !existing->hosted)
-        && (admin_ascii_ncasecmp(mutation->download_url, "https://", 8U) != 0
-            || !valid_sha256_text(mutation->sha256) || mutation->file_size <= 0)) {
+        && !client_download_has_authoritative_metadata(0, 0, mutation->download_url,
+                                                       mutation->sha256, mutation->file_size)) {
         response = write_response(out, out_len, 400, "Bad Request",
             "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
         goto done;
@@ -8881,6 +11298,16 @@ static int compare_client_download_order(const void *left_raw, const void *right
     return left->id < right->id ? -1 : (left->id > right->id ? 1 : 0);
 }
 
+/* Java findAllByOrderByImplementationAscDisplayOrderAscIdAsc. */
+static int compare_client_download_public_order(const void *left_raw, const void *right_raw)
+{
+    const st_storage_client_download_link *left = left_raw;
+    const st_storage_client_download_link *right = right_raw;
+    int compared = strcmp(left->implementation, right->implementation);
+    if (compared != 0) return compared < 0 ? -1 : 1;
+    return compare_client_download_order(left_raw, right_raw);
+}
+
 static int build_client_downloads_response(const st_admin_context *context,
                                            int enabled_only,
                                            char *out,
@@ -8896,16 +11323,19 @@ static int build_client_downloads_response(const st_admin_context *context,
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link catalogue[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
+        /* Every version of every target stays in the catalogue, so it grows with each release. */
         size_t catalogue_count = 0U;
-        if (st_storage_list_client_download_links(database_path, 0, catalogue,
-                ST_ADMIN_MAX_CLIENT_DOWNLOADS, &catalogue_count) != 0) {
+        st_storage_client_download_link *catalogue =
+            admin_list_all_download_links(database_path, 0, &catalogue_count);
+        size_t link_capacity = catalogue_count + ST_GITHUB_RELEASE_MAX_PACKAGES;
+        st_storage_client_download_link *links = catalogue == NULL
+            ? NULL : (st_storage_client_download_link *)calloc(link_capacity, sizeof(*links));
+        if (links == NULL) {
+            free(catalogue);
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"client download list failed\"}");
         }
-        st_storage_client_download_link links[
-            ST_ADMIN_MAX_CLIENT_DOWNLOADS + ST_GITHUB_RELEASE_MAX_PACKAGES];
         size_t link_count = 0U;
         if (!enabled_only) {
             memcpy(links, catalogue, catalogue_count * sizeof(*links));
@@ -8926,29 +11356,41 @@ static int build_client_downloads_response(const st_admin_context *context,
                     links[link_count++] = catalogue[i];
                 }
             }
-            st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
-            size_t fallback_count = 0U;
-            if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
-                                         &fallback_count) == 0) {
-                for (size_t i = 0U; i < fallback_count; ++i) {
-                    int configured = 0;
-                    for (size_t j = 0U; j < catalogue_count; ++j) {
-                        if (client_download_same_target(&fallback[i], &catalogue[j])) {
-                            configured = 1;
-                            break;
+            /*
+             * Java listEnabled: when no release target is left unconfigured (or the fallback is
+             * off) the catalogue is returned in its implementation, displayOrder, id order and
+             * GitHub is not asked; otherwise release assets fill the unconfigured targets and the
+             * merged list is ordered by displayOrder, id.
+             */
+            if (!st_github_release_may_supply_missing_target(catalogue, catalogue_count)) {
+                qsort(links, link_count, sizeof(*links), compare_client_download_public_order);
+            } else {
+                st_storage_client_download_link fallback[ST_GITHUB_RELEASE_MAX_PACKAGES];
+                size_t fallback_count = 0U;
+                if (st_github_release_latest(fallback, ST_GITHUB_RELEASE_MAX_PACKAGES,
+                                             &fallback_count) == 0) {
+                    for (size_t i = 0U; i < fallback_count; ++i) {
+                        int configured = 0;
+                        for (size_t j = 0U; j < catalogue_count; ++j) {
+                            if (client_download_same_target(&fallback[i], &catalogue[j])) {
+                                configured = 1;
+                                break;
+                            }
+                        }
+                        if (!configured && link_count < link_capacity) {
+                            links[link_count++] = fallback[i];
                         }
                     }
-                    if (!configured && link_count < sizeof(links) / sizeof(links[0])) {
-                        links[link_count++] = fallback[i];
-                    }
                 }
+                qsort(links, link_count, sizeof(*links), compare_client_download_order);
             }
-            qsort(links, link_count, sizeof(*links), compare_client_download_order);
         }
         for (size_t i = 0U; rc == 0 && i < link_count; ++i) {
             rc = admin_sb_append(&builder, i == 0U ? "" : ",");
             if (rc == 0) rc = append_client_download_link_view(&builder, &links[i]);
         }
+        free(links);
+        free(catalogue);
     }
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
@@ -9061,7 +11503,7 @@ static int handle_client_download_update(const st_admin_context *context,
     }
     st_storage_client_download_link existing;
     if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+        return write_client_download_not_found(id, out, out_len);
     }
     st_admin_client_download_mutation mutation;
     int validation_response = read_client_download_mutation(body, &existing, &mutation, out, out_len);
@@ -9091,19 +11533,56 @@ static int handle_client_download_mark_latest(const st_admin_context *context,
     if (init_response != 0) return init_response;
     st_storage_client_download_link existing;
     if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
-        return write_response(out, out_len, 404, "Not Found",
-                              "{\"error\":\"client download not found\"}");
+        return write_client_download_not_found(id, out, out_len);
     }
-    st_admin_semver parsed;
-    if (!existing.enabled || parse_admin_semver(existing.version, &parsed) != 0
-        || (existing.hosted && !st_client_package_is_readable(&existing))
-        || (!existing.hosted && (admin_ascii_ncasecmp(existing.download_url, "https://", 8U) != 0
-            || !valid_sha256_text(existing.sha256) || existing.file_size <= 0))) {
+    /*
+     * Java markLatest: a version is required and must be SemVer, a minimum must not be newer, the
+     * row must be enabled and an external one must carry verified HTTPS metadata. The stored
+     * version and minimum are rewritten in canonical form (one leading "v" removed).
+     */
+    char version[sizeof(existing.version)];
+    char minimum[sizeof(existing.min_supported_version)];
+    admin_normalize_semver_text(existing.version, version, sizeof(version));
+    admin_normalize_semver_text(existing.min_supported_version, minimum, sizeof(minimum));
+    st_admin_semver parsed_version;
+    st_admin_semver parsed_minimum;
+    if (version[0] == '\0') {
         return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"download is not publishable as latest\"}");
+                              "{\"error\":\"client download link has no version\"}");
+    }
+    if (parse_admin_semver(version, &parsed_version) != 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"version must be a valid SemVer 2.0 version\"}");
+    }
+    if (minimum[0] != '\0' && parse_admin_semver(minimum, &parsed_minimum) != 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"minSupportedVersion must be a valid SemVer 2.0 version\"}");
+    }
+    if (minimum[0] != '\0' && compare_admin_semver(&parsed_minimum, &parsed_version) > 0) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"minSupportedVersion cannot be newer than version\"}");
+    }
+    if (!existing.enabled) {
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"a disabled client download cannot be latest\"}");
+    }
+    if (!existing.hosted
+        && !client_download_has_authoritative_metadata(existing.id, 0, existing.download_url,
+                                                       existing.sha256, existing.file_size)) {
+        return write_response(out, out_len, 400, "Bad Request",
+            "{\"error\":\"an external latest download requires HTTPS, sha256 and a positive fileSize\"}");
+    }
+    if (existing.hosted && !st_client_package_is_readable(&existing)) {
+        /* C only: never publish a hosted row whose bytes are missing or no longer match. */
+        return write_response(out, out_len, 400, "Bad Request",
+                              "{\"error\":\"client package is not readable\"}");
     }
     st_storage_client_download_link updated;
-    if (st_storage_mark_client_download_latest(database_path, id, &updated) != 0) {
+    if (st_storage_upsert_client_download_link_extended(database_path, id, existing.implementation,
+            existing.platform, existing.arch, existing.display_name, existing.download_url,
+            existing.description, existing.display_order, existing.enabled, version, existing.sha256,
+            existing.file_size, 1, existing.changelog_url, minimum, existing.hosted,
+            existing.package_path, existing.package_file_name, &updated) != 0) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"client download latest update failed\"}");
     }
@@ -9135,11 +11614,16 @@ static int build_client_version_check_response(const char *path, char *out, size
         return write_response(out, out_len, 400, "Bad Request",
                               "{\"error\":\"invalid client version target\"}");
     }
+    const char *target_error = client_download_target_error(normalized_implementation,
+                                                            normalized_platform, normalized_arch);
+    if (target_error != NULL) {
+        return write_response(out, out_len, 400, "Bad Request", target_error);
+    }
     const char *database_path = admin_database_path();
-    st_storage_client_download_link links[ST_ADMIN_MAX_CLIENT_DOWNLOADS];
     size_t count = 0U;
-    if (database_path == NULL || st_storage_list_client_download_links(database_path, 0, links,
-            ST_ADMIN_MAX_CLIENT_DOWNLOADS, &count) != 0) {
+    st_storage_client_download_link *links = database_path == NULL
+        ? NULL : admin_list_all_download_links(database_path, 0, &count);
+    if (links == NULL) {
         return write_response(out, out_len, 200, "OK",
             "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
             "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
@@ -9156,10 +11640,10 @@ static int build_client_version_check_response(const char *path, char *out, size
             || (strcmp(candidate->platform, normalized_platform) != 0
                 && strcmp(candidate->platform, "any") != 0)
             || (strcmp(candidate->arch, normalized_arch) != 0 && strcmp(candidate->arch, "any") != 0)
-            || candidate->file_size <= 0 || !valid_sha256_text(candidate->sha256)
-            || parse_admin_semver(candidate->version, &candidate_version) != 0
-            || (!candidate->hosted
-                && admin_ascii_ncasecmp(candidate->download_url, "https://", 8U) != 0)) continue;
+            || !client_download_has_authoritative_metadata(candidate->id, candidate->hosted,
+                                                           candidate->download_url, candidate->sha256,
+                                                           candidate->file_size)
+            || parse_admin_semver(candidate->version, &candidate_version) != 0) continue;
         int specificity = (strcmp(candidate->platform, normalized_platform) == 0 ? 2 : 0)
             + (strcmp(candidate->arch, normalized_arch) == 0 ? 1 : 0);
         if (best == NULL || specificity > best_specificity
@@ -9209,6 +11693,7 @@ static int build_client_version_check_response(const char *path, char *out, size
             }
         }
         if (best == NULL) {
+            free(links);
             return write_response(out, out_len, 200, "OK",
                 "{\"updateAvailable\":false,\"mandatory\":false,\"latestVersion\":null,"
                 "\"downloadUrl\":null,\"sha256\":null,\"fileSize\":0,"
@@ -9221,10 +11706,12 @@ static int build_client_version_check_response(const char *path, char *out, size
     if (update_available && parse_admin_semver(best->min_supported_version, &minimum) == 0) {
         mandatory = compare_admin_semver(&current, &minimum) < 0;
     }
+    char latest_version[sizeof(best->version)];
+    admin_normalize_semver_text(best->version, latest_version, sizeof(latest_version));
     st_admin_string_builder builder = {0};
     int rc = admin_sb_appendf(&builder, "{\"updateAvailable\":%s,\"mandatory\":%s,\"latestVersion\":",
                               update_available ? "true" : "false", mandatory ? "true" : "false");
-    if (rc == 0) rc = admin_sb_append_json_string(&builder, best->version);
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, latest_version);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"downloadUrl\":");
     if (rc == 0) rc = admin_sb_append_json_string(&builder, best->download_url);
     if (rc == 0) rc = admin_sb_append(&builder, ",\"sha256\":");
@@ -9235,6 +11722,7 @@ static int build_client_version_check_response(const char *path, char *out, size
     if (rc == 0) rc = best->hosted
         ? admin_sb_appendf(&builder, "%lld", best->id) : admin_sb_append(&builder, "null");
     if (rc == 0) rc = admin_sb_append(&builder, "}");
+    free(links);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -9258,8 +11746,19 @@ static int handle_client_download_delete(const st_admin_context *context,
     if (init_response != 0) {
         return init_response;
     }
-    if (st_client_package_delete(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client download not found\"}");
+    st_storage_client_download_link existing;
+    if (st_storage_get_client_download_link(database_path, id, &existing) != 0) {
+        return write_client_download_not_found(id, out, out_len);
+    }
+    int deleted = st_client_package_delete(database_path, id);
+    if (deleted == -2) {
+        /* Java storage.quarantine throws IllegalStateException: 409, the row stays. */
+        return write_response(out, out_len, 409, "Conflict",
+                              "{\"error\":\"cannot quarantine client package\"}");
+    }
+    if (deleted != 0) {
+        return write_response(out, out_len, 500, "Internal Server Error",
+                              "{\"error\":\"client download delete failed\"}");
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -9272,9 +11771,9 @@ static int append_user_diagram_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_appendf(builder,
         ",\"sizeBytes\":%lld,\"revision\":%lld,\"createdAt\":",
         diagram->size_bytes, diagram->revision);
-    if (rc == 0) rc = admin_sb_append_json_string(builder, diagram->created_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, diagram->created_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
-    if (rc == 0) rc = admin_sb_append_json_string(builder, diagram->updated_at);
+    if (rc == 0) rc = admin_sb_append_instant(builder, diagram->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
@@ -9399,8 +11898,21 @@ static int handle_user_diagram_update(const st_admin_context *context,
                                       char *out,
                                       size_t out_len)
 {
+    /*
+     * Java UserDiagramDocumentService.update: the document must belong to the caller (404) before
+     * its revision is compared (409) and the new content is read (400), so another account learns
+     * nothing from the body it sends.
+     */
+    const char *database_path = admin_database_path();
+    st_storage_user_diagram existing;
+    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
+            context->tenant_id, context->username, &existing) != 0) {
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
+    }
+    long long current_revision = existing.revision;
+    st_storage_user_diagram_free(&existing);
     long long revision = -1;
-    if (st_json_get_i64(body, "revision", &revision) != 0 || revision < 0) {
+    if (st_json_get_i64(body, "revision", &revision) != 0 || revision != current_revision) {
         return write_response(out, out_len, 409, "Conflict",
                               "{\"error\":\"diagram revision conflict\"}");
     }
@@ -9409,14 +11921,6 @@ static int handle_user_diagram_update(const st_admin_context *context,
     size_t snapshot_len = 0U;
     int validation = read_user_diagram_mutation(body, name, &snapshot, &snapshot_len, out, out_len);
     if (validation != 0) return validation;
-    const char *database_path = admin_database_path();
-    st_storage_user_diagram existing;
-    if (database_path == NULL || st_storage_get_user_diagram(database_path, id,
-            context->tenant_id, context->username, &existing) != 0) {
-        free(snapshot);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"diagram not found\"}");
-    }
-    st_storage_user_diagram_free(&existing);
     st_storage_user_diagram updated;
     int rc = st_storage_update_user_diagram(database_path, id, context->tenant_id, context->username,
                                             revision, name, snapshot, snapshot_len, &updated);
@@ -9477,14 +11981,15 @@ static int append_management_user_view(st_admin_string_builder *builder,
                               built_in ? "true" : "false",
                               enabled ? "true" : "false");
     }
+    /* NULL is Java's null; "" stays an empty string. */
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, created_at == NULL ? "" : created_at);
+        rc = created_at == NULL ? admin_sb_append(builder, "null") : admin_sb_append_instant(builder, created_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, ",\"updatedAt\":");
     }
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, updated_at == NULL ? "" : updated_at);
+        rc = updated_at == NULL ? admin_sb_append(builder, "null") : admin_sb_append_instant(builder, updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -9505,17 +12010,30 @@ static int append_stored_management_user_view(st_admin_string_builder *builder,
                                        user->updated_at);
 }
 
+/*
+ * Java ManagementUserService.currentUser: the built-in administrator under its configured name, an
+ * ADMIN of the caller's tenant created and updated now; else the caller's account row in its
+ * tenant; else what the token carries, with null timestamps.
+ */
 static int build_management_me_response(const st_admin_context *context, char *out, size_t out_len)
 {
     st_admin_string_builder builder = {0};
-    int rc = append_management_user_view(&builder,
-                                         context->username,
-                                         context->tenant_id,
-                                         context->role,
-                                         admin_ascii_casecmp(context->username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0,
-                                         1,
-                                         "",
-                                         "");
+    const char *built_in = env_text("SPECUS_AUTH_USERNAME", "admin");
+    const char *database_path = admin_database_path();
+    st_storage_management_user user;
+    int rc;
+    if (admin_ascii_casecmp(context->username, built_in) == 0) {
+        char now[64];
+        admin_iso_time((long long)time(NULL), now);
+        rc = append_management_user_view(&builder, built_in, context->tenant_id, "ADMIN", 1, 1, now, now);
+    } else if (database_path != NULL
+               && st_storage_get_management_user_in_tenant(database_path, context->tenant_id, context->username,
+                                                            &user) == 0) {
+        rc = append_stored_management_user_view(&builder, &user);
+    } else {
+        rc = append_management_user_view(&builder, context->username, context->tenant_id,
+                                         context->admin ? "ADMIN" : "USER", 0, 1, NULL, NULL);
+    }
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user response failed\"}");
@@ -9532,16 +12050,21 @@ static int build_management_users_response(const st_admin_context *context, char
     }
     st_admin_string_builder builder = {0};
     const char *tenant_id = context->tenant_id;
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
+    /* The built-in admin belongs to the default tenant only: it signs in there and its tokens resolve
+     * there, so another tenant's list does not show it as one of its accounts. */
+    int listed = 0;
     int rc = admin_sb_append(&builder, "[");
-    if (rc == 0) {
+    if (rc == 0 && strcmp(tenant_id, default_tenant) == 0) {
         rc = append_management_user_view(&builder,
                                          env_text("SPECUS_AUTH_USERNAME", "admin"),
-                                         tenant_id,
+                                         default_tenant,
                                          "ADMIN",
                                          1,
                                          1,
                                          "",
                                          "");
+        listed = 1;
     }
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
@@ -9549,18 +12072,21 @@ static int build_management_users_response(const st_admin_context *context, char
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
-        st_storage_management_user users[ST_ADMIN_MAX_CLIENTS];
         size_t user_count = 0;
-        if (st_storage_list_management_users(database_path, tenant_id, users, ST_ADMIN_MAX_CLIENTS, &user_count) != 0) {
+        st_storage_management_user *users = admin_list_all_users(database_path, tenant_id, &user_count);
+        if (users == NULL) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
         for (size_t i = 0; rc == 0 && i < user_count; ++i) {
-            rc = admin_sb_append(&builder, ",");
+            if (listed++ > 0) {
+                rc = admin_sb_append(&builder, ",");
+            }
             if (rc == 0) {
                 rc = append_stored_management_user_view(&builder, &users[i]);
             }
         }
+        free(users);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -9613,9 +12139,12 @@ static int handle_management_user_create(const st_admin_context *context, const 
         free(role);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username and password are required\"}");
     }
+    /* Login names are unique per tenant: a same-named user of another tenant is no conflict, and the
+     * answer never tells whether one exists (Java ManagementUserService.createUser). */
     st_storage_management_user existing_user;
     if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0
-        || st_storage_get_management_user(database_path, username, &existing_user) == 0) {
+        || st_storage_get_management_user_in_tenant(database_path, context->tenant_id, username,
+                                                    &existing_user) == 0) {
         free(username);
         free(password);
         free(role);
@@ -9803,12 +12332,28 @@ static int handle_management_user_delete(const st_admin_context *context, const 
                                                                username, &target) == 0;
     st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
     st_storage_share_ids revoked = {0};
-    /* Deleting the user ends its shares in the same transaction, so a later namesake never inherits them. */
+    st_storage_account_owned owned = {0};
+    /*
+     * Deleting the user ends its shares in the same transaction, so a later namesake never inherits
+     * them; an account still owning clients or credentials is refused (management-accounts.md 7.1).
+     */
     int rc = st_storage_delete_management_user_audited(database_path, &builtin, context->tenant_id, username,
-                                                       context->username, st_http_share_now_ms(), &revoked);
+                                                       context->username, st_http_share_now_ms(), &revoked,
+                                                       &owned);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
+    if (rc == ST_STORAGE_ACCOUNT_STILL_OWNS) {
+        free(username);
+        char refusal[256];
+        snprintf(refusal, sizeof(refusal),
+                 "{\"error\":\"the account still owns %lld clients and %lld credentials: delete or transfer them "
+                 "first\",\"clients\":%lld,\"credentials\":%lld}",
+                 owned.clients, owned.credentials, owned.clients, owned.credentials);
+        return write_response(out, out_len, 409, "Conflict", refusal);
+    }
     if (rc == 0 && have_target) {
+        /* Committed: the identity's open management WebSockets end. */
+        admin_ws_close_identity(target.tenant_id, target.username);
         (void)st_product_metrics_user_deleted(database_path, target.tenant_id, target.username);
     }
     int response_len = rc != 0
@@ -9880,15 +12425,15 @@ static int write_workbench_error(char *out,
     return write_workbench_response(out, out_len, status, body, retry_after_seconds);
 }
 
-/* A refusal of the shared authentication layer, with the workbench's header on a workbench path. */
+/* A refusal of the shared authentication layer, private on a path whose every answer is private. */
 static int write_auth_refusal(char *out,
                               size_t out_len,
-                              int workbench_path,
+                              int private_path,
                               int status,
                               const char *reason,
                               const char *body)
 {
-    return workbench_path
+    return private_path
         ? write_workbench_response(out, out_len, status, body, 0)
         : write_response(out, out_len, status, reason, body);
 }
@@ -9977,21 +12522,24 @@ static int handle_workbench_request(const st_admin_context *context,
     return response_len;
 }
 
+/* account_key is the uid claim of the token: the account row's key, NULL for the built-in admin. */
 static int write_management_token_response(const char *username,
                                            const char *tenant_id,
                                            const char *role,
+                                           const char *account_key,
                                            char *out,
                                            size_t out_len)
 {
     long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char token[2048];
-    if (st_security_issue_local_token(username,
-                                      tenant_id,
-                                      role,
-                                      getenv("SPECUS_AUTH_JWT_SECRET"),
-                                      ttl,
-                                      token,
-                                      sizeof(token)) != 0) {
+    if (st_security_issue_local_token_for_account(username,
+                                                  tenant_id,
+                                                  role,
+                                                  account_key,
+                                                  getenv("SPECUS_AUTH_JWT_SECRET"),
+                                                  ttl,
+                                                  token,
+                                                  sizeof(token)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
     }
     char *escaped_token = st_json_escape(token);
@@ -10011,6 +12559,31 @@ static int write_management_token_response(const char *username,
     return write_response(out, out_len, 200, "OK", body);
 }
 
+/*
+ * The account dimension of the login rate limit, Java's AuthController.loginIdentity: the tenant
+ * and the login name as sent, so same-named accounts of different tenants are counted apart. The
+ * limiter trims and lower-cases the key; the separator is no white space, so it survives that.
+ */
+static char *management_login_identity(const char *tenant_id, const char *username)
+{
+    const char *tenant = tenant_id == NULL ? "" : tenant_id;
+    const char *name = username == NULL ? "" : username;
+    size_t len = strlen(tenant) + 1U + strlen(name) + 1U;
+    char *identity = malloc(len);
+    if (identity != NULL) {
+        snprintf(identity, len, "%s\x1f%s", tenant, name);
+    }
+    return identity;
+}
+
+/*
+ * POST /auth/login, Java's ManagementUserService.authenticate. The tenant comes from the request
+ * body only (tenantId). With a tenant only that tenant's login names are searched. Without one the
+ * default tenant is searched first and then, only when it has no such name, an account that
+ * predates tenant-scoped login names, found by its account key and only when that key is unique;
+ * new accounts of other tenants must name their tenant. The built-in admin matches without a tenant
+ * or with the default one. Every refusal answers alike.
+ */
 static int handle_management_auth_login(const char *body,
                                         const char *remote_address,
                                         char *out,
@@ -10022,18 +12595,27 @@ static int handle_management_auth_login(const char *body,
     char *username = st_json_get_string(body, "username");
     char *password = st_json_get_string(body, "password");
     char *turnstile_token = st_json_get_string(body, "turnstileToken");
+    char *tenant_text = st_json_get_string(body, "tenantId");
+    const char *requested_tenant = tenant_text == NULL ? "" : admin_trim(tenant_text);
+    char *identity = management_login_identity(requested_tenant, username == NULL ? "" : username);
     st_login_rate_limit_config rate_limit = management_login_rate_limit_config();
     int64_t retry_after_seconds = 0;
     time_t now = time(NULL);
-    if (st_login_rate_limiter_check(remote_address,
-                                    username,
-                                    &rate_limit,
-                                    now < 0 ? 0 : (int64_t)now,
-                                    &retry_after_seconds) != 0) {
+    if (identity == NULL
+        || st_login_rate_limiter_check(remote_address,
+                                       identity,
+                                       &rate_limit,
+                                       now < 0 ? 0 : (int64_t)now,
+                                       &retry_after_seconds) != 0) {
+        int failed = identity == NULL;
         free(username);
         free(password);
         free(turnstile_token);
-        return write_login_rate_limited_response(out, out_len, retry_after_seconds);
+        free(tenant_text);
+        free(identity);
+        return failed
+            ? write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"login failed\"}")
+            : write_login_rate_limited_response(out, out_len, retry_after_seconds);
     }
     int turnstile_status = 400;
     char turnstile_error[256];
@@ -10042,23 +12624,33 @@ static int handle_management_auth_login(const char *body,
         free(username);
         free(password);
         free(turnstile_token);
+        free(tenant_text);
+        free(identity);
         return write_registration_error_response(turnstile_status, turnstile_error, out, out_len);
     }
     free(turnstile_token);
-    if (normalize_username_in_place(username) != 0 || password == NULL) {
+    /* A tenant id longer than any tenant can have (Java's TenantContext allows 80 characters, C
+     * stores 63 bytes) names no tenant: the login fails like any other. */
+    if (normalize_username_in_place(username) != 0 || password == NULL
+        || strlen(requested_tenant) > ST_SECURITY_TOKEN_TENANT_LEN) {
         free(username);
         free(password);
+        free(tenant_text);
+        free(identity);
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
     int ok = 0;
     int database_user = 0;
     char token_username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
+    char token_account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1] = "";
     snprintf(token_username, sizeof(token_username), "%s", username);
-    snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+    snprintf(token_tenant, sizeof(token_tenant), "%s", default_tenant);
     snprintf(token_role, sizeof(token_role), "%s", "USER");
-    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
+    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0
+        && (*requested_tenant == '\0' || strcmp(requested_tenant, default_tenant) == 0)) {
         const char *admin_password = getenv("SPECUS_AUTH_PASSWORD");
         if (admin_password == NULL) {
             admin_password = "";
@@ -10071,7 +12663,7 @@ static int handle_management_auth_login(const char *body,
             && st_constant_time_eq(expected, actual, sizeof(expected));
         if (ok) {
             snprintf(token_username, sizeof(token_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
-            snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+            snprintf(token_tenant, sizeof(token_tenant), "%s", default_tenant);
             snprintf(token_role, sizeof(token_role), "%s", "ADMIN");
         }
     } else {
@@ -10080,7 +12672,13 @@ static int handle_management_auth_login(const char *body,
             && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
             st_storage_management_user user;
             st_password_verification verification;
-            ok = st_storage_get_management_user(database_path, username, &user) == 0
+            int found = *requested_tenant != '\0'
+                ? st_storage_find_management_user_in_tenant(database_path, requested_tenant, username, &user)
+                : st_storage_find_management_user_in_tenant(database_path, default_tenant, username, &user);
+            if (found == 1 && *requested_tenant == '\0') {
+                found = st_storage_find_legacy_management_user(database_path, username, &user);
+            }
+            ok = found == 0
                 && user.enabled
                 && st_password_verify(password, user.password_hash, &verification) == 0
                 && verification.matches;
@@ -10097,19 +12695,23 @@ static int handle_management_auth_login(const char *body,
                 snprintf(token_username, sizeof(token_username), "%s", user.username);
                 snprintf(token_tenant, sizeof(token_tenant), "%s", user.tenant_id);
                 snprintf(token_role, sizeof(token_role), "%s", normalize_management_role(user.role));
+                snprintf(token_account_key, sizeof(token_account_key), "%s", user.account_key);
                 database_user = 1;
             }
         }
     }
     if (ok) {
-        st_login_rate_limiter_record_success(username);
+        st_login_rate_limiter_record_success(identity);
     }
     free(username);
     free(password);
+    free(tenant_text);
+    free(identity);
     if (!ok) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
-    int response_len = write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    int response_len = write_management_token_response(token_username, token_tenant, token_role,
+                                                       database_user ? token_account_key : NULL, out, out_len);
     /* The built-in admin is no user row and never enters the onboarding cohort. */
     if (database_user && admin_token_response_issued(out, response_len)) {
         admin_product_metrics_milestone(token_tenant, token_username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
@@ -10117,13 +12719,16 @@ static int handle_management_auth_login(const char *body,
     return response_len;
 }
 
-/* The context was re-read from the user record, so the new token carries today's tenant and role. */
+/* The context was re-read from the user record, so the new token carries today's tenant and role,
+ * and names the account row it resolved to whether or not the old token did. */
 static int handle_management_auth_refresh(const st_admin_context *context, char *out, size_t out_len)
 {
     if (context == NULL || !context->authenticated) {
         return write_admin_unauthorized(out, out_len);
     }
-    return write_management_token_response(context->username, context->tenant_id, context->role, out, out_len);
+    return write_management_token_response(context->username, context->tenant_id, context->role,
+                                           context->account_key[0] == '\0' ? NULL : context->account_key,
+                                           out, out_len);
 }
 
 static int write_registration_error_response(int status,
@@ -10136,7 +12741,7 @@ static int write_registration_error_response(int status,
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"registration response failed\"}");
     }
-    char body[512];
+    char body[1024];
     int written = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", escaped);
     free(escaped);
     if (written <= 0 || (size_t)written >= sizeof(body)) {
@@ -10151,7 +12756,7 @@ static int handle_management_registration_request(const char *body, char *out, s
     const char *database_path = admin_database_path();
     st_registration_challenge_response challenge;
     int status = 400;
-    char error[256];
+    char error[512];
     if (st_registration_request(database_path, body, &challenge,
                                 &status, error, sizeof(error)) != 0) {
         return write_registration_error_response(status, error, out, out_len);
@@ -10180,13 +12785,14 @@ static int handle_management_registration_verify(const char *body, char *out, si
     const char *database_path = admin_database_path();
     st_storage_management_user user;
     int status = 400;
-    char error[256];
+    char error[512];
     if (st_registration_verify(database_path, body, &user, &status, error, sizeof(error)) != 0) {
         return write_registration_error_response(status, error, out, out_len);
     }
     /* Verification created the account and signs it in at once: two milestones, in step order. */
     admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
-    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, user.account_key,
+                                                       out, out_len);
     if (admin_token_response_issued(out, response_len)) {
         admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
     }
@@ -10272,6 +12878,93 @@ static int handle_product_metrics_request(const st_admin_context *context,
     return response_len;
 }
 
+/*
+ * The typed request parameters of Java's management endpoints, which Spring converts before the
+ * controller runs: a value that does not convert to its Long, Integer or Boolean, or a required
+ * parameter that is missing, is Spring's 400 whatever the handler would make of it. Names are
+ * comma-separated; a NULL list has none.
+ */
+typedef struct {
+    const char *method;
+    const char *path;
+    const char *longs;
+    const char *ints;
+    const char *booleans;
+    const char *required;
+} admin_spring_parameters;
+
+static const admin_spring_parameters admin_spring_parameter_table[] = {
+    {"GET", "/api/admin/clients/name-availability", "excludeClientId", NULL, NULL, "clientName"},
+    {"GET", "/api/admin/specus-mappings", "clientId", NULL, NULL, NULL},
+    {"GET", "/api/admin/http-routes", "clientId", NULL, NULL, NULL},
+    {"GET", "/api/admin/connections", "clientId", "page,size", "success", NULL},
+    {"GET", "/api/admin/connection-stats", NULL, "limit", NULL, NULL},
+    {"GET", "/api/admin/traffic", "clientId", "limit", "flush", NULL},
+    {"GET", "/api/admin/traffic/resources", "clientId", "limit", "flush", NULL},
+    {"GET", "/api/admin/traffic/http-exchanges", "clientId", "page,size", "flush", NULL},
+    {"GET", "/api/admin/traffic/tcp-frames", "clientId", "listenPort,page,size,limit", "flush", NULL},
+    {"GET", "/api/admin/traffic/tcp-streams", NULL, "limit,page,size", "flush", "channelId"},
+    {"GET", "/api/admin/traffic/media-captures", "clientId", "page,size", NULL, NULL},
+    {"GET", "/api/admin/peer-mesh/sessions", NULL, "limit,page,size", "openOnly", NULL},
+    {"GET", "/api/public/client-version-check", NULL, NULL, NULL, "implementation,platform,arch,current"},
+};
+
+/* 1 when one of the named parameters does not convert (or, for required ones, is missing). */
+static int admin_spring_names_fail(const char *path, const char *names, char kind)
+{
+    while (names != NULL && *names != '\0') {
+        char name[32];
+        size_t len = strcspn(names, ",");
+        snprintf(name, sizeof(name), "%.*s", (int)len, names);
+        names += len + (names[len] == ',' ? 1U : 0U);
+        long long number = 0;
+        int flag = 0;
+        char *value = NULL;
+        int failed = 0;
+        switch (kind) {
+        case 'l':
+            failed = admin_query_number_param(path, name, LLONG_MIN, LLONG_MAX, &number) < 0;
+            break;
+        case 'i':
+            failed = admin_query_number_param(path, name, INT_MIN, INT_MAX, &number) < 0;
+            break;
+        case 'b':
+            failed = admin_query_boolean_param(path, name, &flag) < 0;
+            break;
+        default:
+            value = admin_query_string(path, name);
+            failed = value == NULL;
+            free(value);
+            break;
+        }
+        if (failed) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int admin_spring_parameters_fail(const char *method, const char *path)
+{
+    size_t count = sizeof(admin_spring_parameter_table) / sizeof(admin_spring_parameter_table[0]);
+    for (size_t i = 0U; i < count; ++i) {
+        const admin_spring_parameters *entry = &admin_spring_parameter_table[i];
+        if (strcmp(method, entry->method) == 0 && admin_path_equals(path, entry->path)) {
+            return admin_spring_names_fail(path, entry->required, 'r')
+                || admin_spring_names_fail(path, entry->longs, 'l')
+                || admin_spring_names_fail(path, entry->ints, 'i')
+                || admin_spring_names_fail(path, entry->booleans, 'b');
+        }
+    }
+    /* POST /api/admin/traffic/media-captures/{id}/playback-ticket?backfillMissing= */
+    if (strcmp(method, "POST") == 0
+        && strncmp(path, "/api/admin/traffic/media-captures/", strlen("/api/admin/traffic/media-captures/")) == 0
+        && strstr(path, "/playback-ticket") != NULL) {
+        return admin_spring_names_fail(path, "backfillMissing", 'b');
+    }
+    return 0;
+}
+
 static int st_admin_build_response_internal(const char *method,
                                             const char *path,
                                             const char *authorization,
@@ -10294,8 +12987,15 @@ static int st_admin_build_response_internal(const char *method,
     /* Product metrics answers are private, the shared layer's refusals included. */
     int product_metrics_path = st_product_metrics_path(path);
     if (admin_path_requires_auth(method, path)) {
-        /* Workbench answers are private, the shared layer's refusals included. */
-        int workbench_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0;
+        /*
+         * Workbench and temporary-share management answers are private, the shared layer's refusals
+         * included (service-workbench.md, temporary-http-share.md section 4).
+         */
+        admin_share_path share_path;
+        admin_parse_share_path(path, &share_path);
+        int private_path = strncmp(path, ST_WORKBENCH_PATH, strlen(ST_WORKBENCH_PATH)) == 0
+            || share_path.kind != ADMIN_SHARE_PATH_NONE
+            || admin_path_equals(path, "/api/admin/http-access-audit");
         int unauthorized = 0;
         if (authorization != NULL) {
             int auth_rc = admin_context_from_authorization(authorization, &context);
@@ -10315,7 +13015,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 403,
                                                      "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 403, "Forbidden",
+                    : write_auth_refusal(out, out_len, private_path, 403, "Forbidden",
                                          "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
             }
             /* Fail closed, as Java's repository error would surface as a 500. */
@@ -10323,7 +13023,7 @@ static int st_admin_build_response_internal(const char *method,
                 return product_metrics_path
                     ? write_product_metrics_response(out, out_len, 500,
                                                      "{\"error\":\"management user store unavailable\"}")
-                    : write_auth_refusal(out, out_len, workbench_path, 500, "Internal Server Error",
+                    : write_auth_refusal(out, out_len, private_path, 500, "Internal Server Error",
                                          "{\"error\":\"management user store unavailable\"}");
             }
             unauthorized = auth_rc != 0;
@@ -10339,9 +13039,12 @@ static int st_admin_build_response_internal(const char *method,
             if (admin_connectivity_check_path(path, NULL, 0U)) {
                 return write_connectivity_response(out, out_len, 401, 0, ST_ADMIN_UNAUTHORIZED_BODY);
             }
-            return write_auth_refusal(out, out_len, workbench_path, 401, "Unauthorized",
+            return write_auth_refusal(out, out_len, private_path, 401, "Unauthorized",
                                       ST_ADMIN_UNAUTHORIZED_BODY);
         }
+    }
+    if (admin_spring_parameters_fail(method, path)) {
+        return write_spring_bad_request(out, out_len);
     }
     if (product_metrics_path) {
         return handle_product_metrics_request(&context, method, path, body, body_len, out, out_len);
@@ -10629,7 +13332,7 @@ static int st_admin_build_response_internal(const char *method,
         return build_peer_mesh_services_response(&context, out, out_len);
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/services")) {
-        return handle_peer_mesh_service_mutation(&context, 0, body, out, out_len);
+        return handle_peer_mesh_service_mutation(&context, 1, 0, body, out, out_len);
     }
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/services/import")) {
         return handle_peer_mesh_service_import(&context, body, out, out_len);
@@ -10649,9 +13352,15 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/policies")) {
         return handle_peer_mesh_egress_policy_mutation(&context, body, out, out_len);
     }
-    if (strcmp(method, "DELETE")== 0
-        && admin_parse_path_id(path, "/api/admin/peer-mesh/egress/policies/", &path_id) == 0) {
-        return handle_peer_mesh_egress_policy_delete(&context, path_id, out, out_len);
+    /*
+     * The Peer Mesh path variables bind as a long whatever its sign, as Spring does, and a segment
+     * that is not one is Spring's 400; the services then answer for ids they do not have.
+     */
+    int peer_path = 0;
+    if (strcmp(method, "DELETE") == 0
+        && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/egress/policies/", &path_id)) != 0) {
+        return peer_path == 1 ? handle_peer_mesh_egress_policy_delete(&context, path_id, out, out_len)
+                              : write_spring_bad_request(out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/service-audit")) {
         return build_peer_mesh_service_audit_response(&context, out, out_len);
@@ -10659,20 +13368,20 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "DELETE") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/sessions")) {
         return handle_peer_mesh_sessions_close_open(&context, out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/peer-mesh/sessions/", &path_id) == 0) {
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_peer_mesh_session_close(&context, path_id, out, out_len);
-        }
+    if (strcmp(method, "DELETE") == 0
+        && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/sessions/", &path_id)) != 0) {
+        return peer_path == 1 ? handle_peer_mesh_session_close(&context, path_id, out, out_len)
+                              : write_spring_bad_request(out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/peer-mesh/devices/", &path_id) == 0) {
-        if (strcmp(method, "PUT") == 0) {
-            return handle_peer_mesh_device_update(&context, path_id, body, out, out_len);
-        }
+    if (strcmp(method, "PUT") == 0
+        && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/devices/", &path_id)) != 0) {
+        return peer_path == 1 ? handle_peer_mesh_device_update(&context, path_id, body, out, out_len)
+                              : write_spring_bad_request(out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/peer-mesh/acls/", &path_id) == 0) {
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_peer_mesh_acl_delete(&context, path_id, out, out_len);
-        }
+    if (strcmp(method, "DELETE") == 0
+        && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/acls/", &path_id)) != 0) {
+        return peer_path == 1 ? handle_peer_mesh_acl_delete(&context, path_id, out, out_len)
+                              : write_spring_bad_request(out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/diagrams")) {
         return build_user_diagrams_response(&context, out, out_len);
@@ -10691,13 +13400,14 @@ static int st_admin_build_response_internal(const char *method,
             return handle_user_diagram_delete(&context, path_id, out, out_len);
         }
     }
-    if (admin_parse_path_id(path, "/api/admin/peer-mesh/services/", &path_id) == 0) {
-        if (strcmp(method, "PUT") == 0) {
-            return handle_peer_mesh_service_mutation(&context, path_id, body, out, out_len);
+    if ((strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/services/", &path_id)) != 0) {
+        if (peer_path != 1) {
+            return write_spring_bad_request(out, out_len);
         }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_peer_mesh_service_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0
+            ? handle_peer_mesh_service_mutation(&context, 0, path_id, body, out, out_len)
+            : handle_peer_mesh_service_delete(&context, path_id, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/me")) {
         return build_management_me_response(&context, out, out_len);
@@ -11140,18 +13850,25 @@ static int admin_wire_read(admin_wire_reader *reader, char *out, size_t len)
 
 /*
  * Reads a chunked request body (RFC 9112 section 7.1) into one malloc'd, NUL-terminated buffer,
- * the way a Content-Length body is read. Chunk extensions and trailer fields are read and
- * dropped. Returns 0, -1 for a malformed or truncated body, or -2 once it outgrows max_len.
+ * the way a Content-Length body is read. Chunk extensions are dropped; the trailer fields come back
+ * in *trailers as they arrived (the caller keeps only declared ones). Returns 0, -1 for a malformed
+ * or truncated body, or -2 once it outgrows max_len; then *out keeps the first refused_capture
+ * bytes of the body for the record of the refused request.
  */
 static int admin_read_chunked_body(int fd,
                                    const char *received,
                                    size_t received_len,
                                    size_t max_len,
+                                   size_t refused_capture,
                                    char **out,
-                                   size_t *out_len)
+                                   size_t *out_len,
+                                   char ***trailers,
+                                   size_t *trailers_len)
 {
     *out = NULL;
     *out_len = 0;
+    *trailers = NULL;
+    *trailers_len = 0U;
     admin_wire_reader *reader = (admin_wire_reader *)malloc(sizeof(*reader));
     if (reader == NULL || received_len > sizeof(reader->buffer)) {
         free(reader);
@@ -11191,6 +13908,16 @@ static int admin_read_chunked_body(int fd,
             break;
         }
         if (size > max_len - len) {
+            /* What arrives of this chunk still belongs to the capture of the refused body. */
+            size_t wanted = len < refused_capture ? refused_capture - len : 0U;
+            size_t take = size < wanted ? size : wanted;
+            char *grown = take == 0U ? body : (char *)realloc(body, len + take + 1U);
+            if (grown != NULL) {
+                body = grown;
+                if (take > 0U && admin_wire_read(reader, body + len, take) == 0) {
+                    len += take;
+                }
+            }
             rc = -2;
             break;
         }
@@ -11210,21 +13937,52 @@ static int admin_read_chunked_body(int fd,
         len += size;
     }
     /* The trailer section ends at an empty line. */
-    for (int fields = 0; rc == 0; ++fields) {
-        if (fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
+    char **fields = NULL;
+    size_t field_count = 0U;
+    for (int read_fields = 0; rc == 0; ++read_fields) {
+        if (read_fields > 64 || admin_wire_read_line(reader, line, sizeof(line)) != 0) {
             rc = -1;
         } else if (line[0] == '\0') {
             break;
+        } else if (strchr(line, ':') != NULL) {
+            char **grown = (char **)realloc(fields, (field_count + 1U) * sizeof(*grown));
+            char *copy = grown == NULL ? NULL : admin_dup_string(line);
+            if (grown != NULL) {
+                fields = grown;
+            }
+            if (copy == NULL) {
+                rc = -1;
+            } else {
+                fields[field_count++] = copy;
+            }
         }
     }
     free(reader);
     if (rc != 0) {
+        for (size_t i = 0; i < field_count; ++i) {
+            free(fields[i]);
+        }
+        free(fields);
+        if (rc == -2 && refused_capture > 0U && body != NULL) {
+            /* Only the first bytes stay, for the record of the refusal. */
+            size_t kept = len < refused_capture ? len : refused_capture;
+            char *shrunk = (char *)realloc(body, kept + 1U);
+            if (shrunk != NULL) {
+                body = shrunk;
+            }
+            body[kept] = '\0';
+            *out = body;
+            *out_len = kept;
+            return rc;
+        }
         free(body);
         return rc;
     }
     body[len] = '\0';
     *out = body;
     *out_len = len;
+    *trailers = fields;
+    *trailers_len = field_count;
     return 0;
 }
 
@@ -12157,9 +14915,18 @@ static int send_text_http_error(int fd, int status, const char *message)
         && send_all(fd, body, (size_t)body_len) == 0;
 }
 
+/*
+ * The texts of Java HttpSpecusController for the route gate and an offline client, carried in this
+ * server's {"error":"..."} envelope (http-route.md section 1).
+ */
+#define ADMIN_ROUTE_NOT_FOUND_TEXT "HTTP 路由不存在或未启用"
+#define ADMIN_ROUTE_AUTH_REQUIRED_TEXT "需要 HTTP Basic 认证"
+#define ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT "HTTP 路由认证暂不可用"
+#define ADMIN_ROUTE_CLIENT_OFFLINE_TEXT "客户端不在线"
+
 static int send_http_route_auth_challenge(int fd)
 {
-    static const char body[] = "{\"error\":\"HTTP route authentication required\"}";
+    static const char body[] = "{\"error\":\"" ADMIN_ROUTE_AUTH_REQUIRED_TEXT "\"}";
     char header[384];
     int header_len = snprintf(header,
                               sizeof(header),
@@ -12181,7 +14948,7 @@ static int send_http_route_auth_challenge(int fd)
 
 static int send_http_route_policy_unavailable(int fd)
 {
-    static const char body[] = "{\"error\":\"HTTP route authentication is temporarily unavailable\"}";
+    static const char body[] = "{\"error\":\"" ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT "\"}";
     char header[384];
     int header_len = snprintf(header,
                               sizeof(header),
@@ -12292,23 +15059,159 @@ static int admin_constant_time_text_equals(const char *left, const char *right)
 }
 
 /* Whether route_name is one of the SPECUS_HTTP_ROUTES routes every client is given. */
-static int admin_env_http_route_configured(const char *route_name)
+/* Whether SPECUS_HTTP_ROUTES defines route_name; its target is copied into target when it does. */
+static int admin_env_http_route_configured(const char *route_name, char *target, size_t target_len)
 {
-    st_admin_http_route *routes = calloc(ST_ADMIN_MAX_TCP_MAPPINGS, sizeof(*routes));
-    size_t route_count = 0;
+    st_admin_http_route_list routes = {0};
     int configured = 0;
-    if (routes != NULL && load_env_http_routes(routes, &route_count) == 0) {
-        for (size_t i = 0; i < route_count && !configured; ++i) {
-            configured = strcmp(routes[i].route, route_name) == 0;
+    if (load_env_http_routes(&routes) == 0) {
+        for (size_t i = 0; i < routes.count && !configured; ++i) {
+            configured = strcmp(routes.items[i].route, route_name) == 0;
+            if (configured && target != NULL) {
+                snprintf(target, target_len, "%s", routes.items[i].target_base_url);
+            }
         }
     }
-    free(routes);
+    free(routes.items);
     return configured;
+}
+
+static void admin_fd_remote_text(int fd, char out[128]);
+
+/*
+ * Records a /http/ exchange that ended in an answer of this server instead of a relayed response
+ * (http-route.md section 9: every request is recorded with its failure reason), as Java
+ * HttpSpecusController and HttpSpecusBodyLimitFilter record theirs: the response is the
+ * {"error":"message"} answer that went out, and the record only happens with the server switch
+ * and the route's detailCaptureEnabled, like a relayed exchange.
+ */
+static void record_direct_http_failure(const char *client_name,
+                                       const char *route,
+                                       const st_direct_http_request *request,
+                                       int status,
+                                       const char *public_message,
+                                       const char *failure,
+                                       const char *remote_address,
+                                       long long started_ms)
+{
+    if (!st_traffic_capture_enabled()) {
+        return;
+    }
+    char *escaped = st_json_escape(public_message == NULL ? "" : public_message);
+    if (escaped == NULL) {
+        return;
+    }
+    size_t body_len = strlen("{\"error\":\"\"}") + strlen(escaped);
+    char *body = (char *)malloc(body_len + 1U);
+    char content_type[] = "Content-Type:application/json";
+    char *headers[] = {content_type};
+    if (body != NULL) {
+        snprintf(body, body_len + 1U, "{\"error\":\"%s\"}", escaped);
+        st_direct_http_response response = {
+            .status_code = status,
+            .headers = headers,
+            .headers_len = 1U,
+            .body = (uint8_t *)body,
+            .body_len = body_len,
+            .error = (char *)(failure == NULL ? public_message : failure)
+        };
+        long long elapsed_ms = admin_now_ms() - started_ms;
+        record_direct_http_exchange(client_name, route, request, &response, body_len, 0, remote_address,
+                                    elapsed_ms < 0 ? 0 : elapsed_ms);
+    }
+    free(body);
+    free(escaped);
+}
+
+/*
+ * record_direct_http_failure for a request refused before it was forwarded: its client, route,
+ * relative path and query come from the request path; headers and body are what the refusal may
+ * show of the request (none for a refusal of the route gate, as in Java).
+ */
+static void record_direct_http_refusal(int fd,
+                                       const char *method,
+                                       const char *path,
+                                       char **headers,
+                                       size_t headers_len,
+                                       const uint8_t *body,
+                                       size_t body_len,
+                                       int status,
+                                       const char *message,
+                                       long long started_ms)
+{
+    char *client_name = NULL;
+    char *route = NULL;
+    if (!st_traffic_capture_enabled() || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+        return;
+    }
+    const char *query = strchr(path, '?');
+    size_t path_len = query == NULL ? strlen(path) : (size_t)(query - path);
+    const char *client_end = memchr(path + 6, '/', path_len - 6U);
+    const char *route_end = client_end == NULL ? NULL
+        : memchr(client_end + 1, '/', (size_t)(path + path_len - client_end - 1));
+    char *relative_path = route_end == NULL ? admin_dup_string("/")
+        : admin_dup_range(route_end, (size_t)(path + path_len - route_end));
+    char *raw_query = admin_encode_raw_query_for_forwarding(query == NULL ? "" : query + 1);
+    if (relative_path != NULL && raw_query != NULL) {
+        st_direct_http_request request = {
+            .request_method = (char *)method,
+            .route = route,
+            .relative_path = relative_path,
+            .raw_query = raw_query,
+            .headers = headers,
+            .headers_len = headers_len,
+            .body = body,
+            .body_len = body_len
+        };
+        char remote_address[128];
+        admin_fd_remote_text(fd, remote_address);
+        record_direct_http_failure(client_name, route, &request, status, message, NULL, remote_address,
+                                   started_ms);
+    }
+    free(relative_path);
+    free(raw_query);
+    free(client_name);
+    free(route);
+}
+
+/* Whether a refused request on this /http/ path would be recorded, so its body is worth capturing. */
+static int admin_direct_route_captured(const char *path)
+{
+    char *client_name = NULL;
+    char *route = NULL;
+    const char *database_path = admin_database_path();
+    if (!st_traffic_capture_enabled() || database_path == NULL
+        || admin_parse_direct_route_identity(path, &client_name, &route) != 0) {
+        return 0;
+    }
+    st_storage_http_route http_route;
+    int captured = st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0
+        && st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) == 0
+        && http_route.detail_capture_enabled;
+    free(client_name);
+    free(route);
+    return captured;
 }
 
 static int send_http_route_not_found(int fd)
 {
-    send_text_http_error(fd, 404, "HTTP route is not configured or disabled");
+    send_text_http_error(fd, 404, ADMIN_ROUTE_NOT_FOUND_TEXT);
+    return -1;
+}
+
+/* A refusal of the route gate: the answer, then its record (no request headers or body, as Java). */
+static int refuse_direct_http_route(int fd, const char *method, const char *path, int status, long long started_ms)
+{
+    const char *message = status == 401 ? ADMIN_ROUTE_AUTH_REQUIRED_TEXT
+        : status == 503 ? ADMIN_ROUTE_AUTH_UNAVAILABLE_TEXT : ADMIN_ROUTE_NOT_FOUND_TEXT;
+    if (status == 401) {
+        send_http_route_auth_challenge(fd);
+    } else if (status == 503) {
+        send_http_route_policy_unavailable(fd);
+    } else {
+        send_http_route_not_found(fd);
+    }
+    record_direct_http_refusal(fd, method, path, NULL, 0U, NULL, 0U, status, message, started_ms);
     return -1;
 }
 
@@ -12317,18 +15220,30 @@ static int send_http_route_not_found(int fd)
  * response. It fails closed: a request enters the tunnel only for a route the server itself
  * defines, a SQLite row of an enabled client or a SPECUS_HTTP_ROUTES entry (public by
  * definition). A client may still forward a route it was told about earlier, such as one deleted
- * since, so what the client holds never makes a route reachable.
+ * since, so what the client holds never makes a route reachable. The route's target is copied into
+ * target_base_url for the browser header rewrite. *client_id is the account the request was let in
+ * for (0 without a database), so that only a data connection of that account, not one of a former
+ * account of the same name, can serve it. Every refusal is recorded like Java's.
  */
-static int authorize_direct_http_route(int fd, const char *path, const char *raw_request)
+static int authorize_direct_http_route(int fd,
+                                       const char *method,
+                                       const char *path,
+                                       const char *raw_request,
+                                       long long started_ms,
+                                       char *target_base_url,
+                                       size_t target_base_url_len,
+                                       long long *client_id)
 {
+    *client_id = 0;
     char *client_name = NULL;
     char *route_name = NULL;
+    target_base_url[0] = '\0';
     if (admin_parse_direct_route_identity(path, &client_name, &route_name) != 0) {
         return send_http_route_not_found(fd);
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL) {
-        int configured = admin_env_http_route_configured(route_name);
+        int configured = admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
         free(client_name);
         free(route_name);
         return configured ? 0 : send_http_route_not_found(fd);
@@ -12349,30 +15264,40 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     if (lookup_rc != 0) {
         free(client_name);
         free(route_name);
-        send_http_route_policy_unavailable(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
     /* Unknown and disabled clients have no reachable routes, environment ones included: with a
      * database a client cannot log in without an enabled account either. */
     int client_enabled = st_storage_client_enabled(database_path, client_name) == 0;
-    int env_configured = !found && client_enabled && admin_env_http_route_configured(route_name);
+    int env_configured = !found && client_enabled
+        && admin_env_http_route_configured(route_name, target_base_url, target_base_url_len);
+    long long env_client_id = 0;
+    if (env_configured) {
+        /* A SPECUS_HTTP_ROUTES route has no row of its own: it belongs to the account named. */
+        st_storage_client account;
+        env_configured = st_storage_get_client_by_name(database_path, client_name, &account) == 0
+            && account.enabled;
+        env_client_id = env_configured ? account.id : 0;
+    }
     free(client_name);
     free(route_name);
     if (!client_enabled) {
-        return send_http_route_not_found(fd);
+        return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
     if (!found) {
+        *client_id = env_client_id;
         return env_configured ? 0 : send_http_route_not_found(fd);
     }
     if (!route.enabled) {
-        return send_http_route_not_found(fd);
+        return refuse_direct_http_route(fd, method, path, 404, started_ms);
     }
+    *client_id = route.client_id;
+    snprintf(target_base_url, target_base_url_len, "%s", route.target_base_url);
     if (!route.auth_enabled) {
         return 0;
     }
     if (route.auth_username[0] == '\0' || route.auth_password_hash[0] == '\0') {
-        send_http_route_policy_unavailable(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 503, started_ms);
     }
 
     char *authorization = admin_extract_header_value(raw_request, "Authorization");
@@ -12405,8 +15330,7 @@ static int authorize_direct_http_route(int fd, const char *path, const char *raw
     memset(decoded, 0, sizeof(decoded));
     free(authorization);
     if (!valid) {
-        send_http_route_auth_challenge(fd);
-        return -1;
+        return refuse_direct_http_route(fd, method, path, 401, started_ms);
     }
     return 1;
 }
@@ -12424,6 +15348,8 @@ typedef struct {
     const char *method;
     const char *source_url;
     st_media_capture_session *media_capture;
+    /* Media capture took the response body (Java responseBodyExternalized): the detail keeps none. */
+    int response_externalized;
     st_direct_http_response response;
     char **trailer_names;
     size_t trailer_names_len;
@@ -12431,6 +15357,8 @@ typedef struct {
     const char *share_id;
     const char *rewrite_prefix;
     admin_share_stream *share_stream;
+    /* The client's RST reason, made log-safe, as the failure of the HTTP detail (never public). */
+    char reset_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
 } admin_direct_http_sink_state;
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
@@ -12529,15 +15457,15 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
 
 static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
 {
-    const admin_direct_http_sink_state *state = (const admin_direct_http_sink_state *)ctx;
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
     char safe_client[512];
     char safe_route[512];
     char safe_method[64];
-    char safe_reason[ST_ADMIN_LOG_REASON_MAX_CODE_POINTS * 6U + 32U];
+    char *safe_reason = state->reset_reason;
     (void)st_admin_log_safe_reason(state->client_name, safe_client, sizeof(safe_client));
     (void)st_admin_log_safe_reason(state->route, safe_route, sizeof(safe_route));
     (void)st_admin_log_safe_reason(state->method, safe_method, sizeof(safe_method));
-    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(safe_reason));
+    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(state->reset_reason));
     fprintf(stderr,
             "[http-stream-v2] stream reset client=%s route=%s method=%s status=502 errorCode=%u reason=%s\n",
             safe_client,
@@ -12594,17 +15522,162 @@ void st_direct_http_response_free(st_direct_http_response *response)
     memset(response, 0, sizeof(*response));
 }
 
-static int direct_valid_trailer_name(const char *name)
+/* An RFC 9110 field-name token of len bytes. */
+static int direct_trailer_token(const char *name, size_t len)
 {
-    if (name == NULL || *name == '\0') {
+    if (len == 0U) {
         return 0;
     }
-    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; ++p) {
-        if (!isalnum(*p) && strchr("!#$%&'*+-.^_`|~", *p) == NULL) {
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '\0' || (!isalnum(c) && strchr("!#$%&'*+-.^_`|~", c) == NULL)) {
             return 0;
         }
     }
     return 1;
+}
+
+/* Java HttpSpecusController.SKIPPED_HEADERS: hop-by-hop or recomputed, so never a trailer either. */
+static int direct_trailer_name_forbidden(const char *name, size_t len)
+{
+    static const char *const forbidden[] = {
+        "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
+    };
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); ++i) {
+        if (strlen(forbidden[i]) == len && admin_ascii_ncasecmp(name, forbidden[i], len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Narrows [*start, *start + *len) to the bytes between leading and trailing spaces and tabs. */
+static void direct_trim_span(const char **start, size_t *len)
+{
+    while (*len > 0U && (**start == ' ' || **start == '\t')) {
+        ++*start;
+        --*len;
+    }
+    while (*len > 0U && ((*start)[*len - 1U] == ' ' || (*start)[*len - 1U] == '\t')) {
+        --*len;
+    }
+}
+
+static int direct_trailer_name_listed(char *const *names, size_t names_len, const char *name, size_t len)
+{
+    for (size_t i = 0; i < names_len; ++i) {
+        if (strlen(names[i]) == len && admin_ascii_ncasecmp(names[i], name, len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The trailer names that may cross (Java HttpSpecusController.validTrailerNames, http-route.md
+ * sections 3 and 4): each candidate trimmed, a token, no hop-by-hop field, not Authorization when
+ * the route gate consumed it, and every name once in its first spelling. *out is the caller's.
+ */
+static int direct_valid_trailer_names(char *const *candidates,
+                                      size_t candidates_len,
+                                      int strip_authorization,
+                                      char ***out,
+                                      size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    if (candidates_len == 0U) {
+        return 0;
+    }
+    char **names = (char **)calloc(candidates_len, sizeof(*names));
+    if (names == NULL) {
+        return -1;
+    }
+    size_t count = 0U;
+    for (size_t i = 0; i < candidates_len; ++i) {
+        const char *name = candidates[i] == NULL ? "" : candidates[i];
+        size_t len = strlen(name);
+        direct_trim_span(&name, &len);
+        if (!direct_trailer_token(name, len) || direct_trailer_name_forbidden(name, len)
+            || (strip_authorization && len == strlen("Authorization")
+                && admin_ascii_ncasecmp(name, "Authorization", len) == 0)
+            || direct_trailer_name_listed(names, count, name, len)) {
+            continue;
+        }
+        names[count] = admin_dup_range(name, len);
+        if (names[count] == NULL) {
+            direct_free_strings(names, count);
+            return -1;
+        }
+        ++count;
+    }
+    if (count == 0U) {
+        free(names);
+        return 0;
+    }
+    *out = names;
+    *out_len = count;
+    return 0;
+}
+
+/*
+ * The trailer fields that may cross (Java HttpSpecusController.validTrailerLines and
+ * flattenTrailers): name:value fields whose trimmed name was declared, is a token and no hop-by-hop
+ * field, and whose value carries no CR or LF. Each comes out as name:value, both sides trimmed.
+ * declared holds names direct_valid_trailer_names already accepted. *out is the caller's.
+ */
+static int direct_declared_trailer_fields(char *const *fields,
+                                          size_t fields_len,
+                                          char *const *declared,
+                                          size_t declared_len,
+                                          char ***out,
+                                          size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0U;
+    if (fields_len == 0U || declared_len == 0U) {
+        return 0;
+    }
+    char **kept = (char **)calloc(fields_len, sizeof(*kept));
+    if (kept == NULL) {
+        return -1;
+    }
+    size_t count = 0U;
+    for (size_t i = 0; i < fields_len; ++i) {
+        const char *field = fields[i];
+        const char *colon = field == NULL ? NULL : strchr(field, ':');
+        if (colon == NULL || colon == field || strchr(field, '\r') != NULL || strchr(field, '\n') != NULL) {
+            continue;
+        }
+        const char *name = field;
+        size_t name_len = (size_t)(colon - field);
+        const char *value = colon + 1;
+        size_t value_len = strlen(value);
+        direct_trim_span(&name, &name_len);
+        direct_trim_span(&value, &value_len);
+        if (!direct_trailer_token(name, name_len) || direct_trailer_name_forbidden(name, name_len)
+            || !direct_trailer_name_listed(declared, declared_len, name, name_len)) {
+            continue;
+        }
+        kept[count] = (char *)malloc(name_len + value_len + 2U);
+        if (kept[count] == NULL) {
+            direct_free_strings(kept, count);
+            return -1;
+        }
+        memcpy(kept[count], name, name_len);
+        kept[count][name_len] = ':';
+        memcpy(kept[count] + name_len + 1U, value, value_len);
+        kept[count][name_len + 1U + value_len] = '\0';
+        ++count;
+    }
+    if (count == 0U) {
+        free(kept);
+        return 0;
+    }
+    *out = kept;
+    *out_len = count;
+    return 0;
 }
 
 static int direct_should_buffer_rewrite(const char *client_name,
@@ -12649,13 +15722,8 @@ static int direct_sink_start_chunked(admin_direct_http_sink_state *state)
     }
     if (rc == 0 && state->trailer_names_len > 0U) {
         rc = admin_sb_append(&builder, "Trailer: ");
-        int written = 0;
         for (size_t i = 0; rc == 0 && i < state->trailer_names_len; ++i) {
-            if (direct_valid_trailer_name(state->trailer_names[i])) {
-                rc = admin_sb_appendf(&builder, "%s%s", written ? ", " : "",
-                                      state->trailer_names[i]);
-                written = 1;
-            }
+            rc = admin_sb_appendf(&builder, "%s%s", i == 0U ? "" : ", ", state->trailer_names[i]);
         }
         if (rc == 0) {
             rc = admin_sb_append(&builder, "\r\n");
@@ -12717,11 +15785,12 @@ static int direct_sink_on_headers(void *ctx,
                                   size_t trailer_names_len)
 {
     admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    /* Only valid, non-hop-by-hop names are declared, and only their fields cross at the end. */
     if (state->started || state->response.status_code != 0 || status_code < 100 || status_code > 599
         || direct_copy_strings(headers, headers_len,
                                &state->response.headers, &state->response.headers_len) != 0
-        || direct_copy_strings(trailer_names, trailer_names_len,
-                               &state->trailer_names, &state->trailer_names_len) != 0) {
+        || direct_valid_trailer_names(trailer_names, trailer_names_len, 0,
+                                      &state->trailer_names, &state->trailer_names_len) != 0) {
         return -1;
     }
     if (state->share_id != NULL) {
@@ -12746,7 +15815,8 @@ static int direct_sink_on_headers(void *ctx,
                                                 status_code,
                                                 state->response.headers,
                                                 state->response.headers_len);
-    state->buffer_for_rewrite = trailer_names_len == 0U
+    state->response_externalized = st_media_capture_externalized(state->media_capture);
+    state->buffer_for_rewrite = state->trailer_names_len == 0U
         && direct_should_buffer_rewrite(
             state->client_name, state->route, state->response.headers,
             state->response.headers_len, &state->rewrite_limit);
@@ -12806,19 +15876,20 @@ static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_
     if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
         return -1;
     }
-    for (size_t i = 0; i < trailers_len; ++i) {
-        const char *trailer = trailers[i];
-        const char *colon = trailer == NULL ? NULL : strchr(trailer, ':');
-        if (colon != NULL && colon != trailer && strchr(trailer, '\r') == NULL
-            && strchr(trailer, '\n') == NULL
-            && send_all(state->fd, trailer, strlen(trailer)) != 0) {
-            return -1;
-        }
-        if (colon != NULL && colon != trailer && send_all(state->fd, "\r\n", 2U) != 0) {
-            return -1;
-        }
+    /* Undeclared, hop-by-hop and CR/LF-carrying trailers are dropped (http-route.md section 4). */
+    char **declared = NULL;
+    size_t declared_len = 0U;
+    if (direct_declared_trailer_fields(trailers, trailers_len, state->trailer_names, state->trailer_names_len,
+                                       &declared, &declared_len) != 0) {
+        return -1;
     }
-    if (send_all(state->fd, "\r\n", 2U) != 0) {
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < declared_len; ++i) {
+        rc = send_all(state->fd, declared[i], strlen(declared[i])) == 0
+            && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+    }
+    direct_free_strings(declared, declared_len);
+    if (rc != 0 || send_all(state->fd, "\r\n", 2U) != 0) {
         return -1;
     }
     state->ended = 1;
@@ -13696,6 +16767,31 @@ static int admin_ws_send_frame(st_admin_ws_client *client,
     return rc;
 }
 
+/*
+ * The account of this identity was deleted (management-accounts.md 7.1): its client-messages and
+ * connections sockets end. A socket keeps the identity it was opened with, so it would otherwise go
+ * on as the deleted account and receive what is meant for a later account of the same name. The
+ * reading thread of each socket sees the shutdown and removes it.
+ */
+static void admin_ws_close_identity(const char *tenant_id, const char *username)
+{
+    if (tenant_id == NULL || username == NULL) {
+        return;
+    }
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(1008U, "account deleted", payload);
+    pthread_mutex_lock(&admin_ws_lock);
+    for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
+        if (!client->closing && strcmp(client->tenant_id, tenant_id) == 0
+            && strcmp(client->username, username) == 0) {
+            client->closing = 1;
+            (void)admin_ws_send_frame(client, 0x8U, payload, payload_len);
+            shutdown(client->fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&admin_ws_lock);
+}
+
 static int admin_ws_reserve_client_message_write(st_admin_ws_client *client)
 {
     pthread_mutex_lock(&admin_ws_lock);
@@ -13729,69 +16825,6 @@ static void admin_ws_release_client_message_write(st_admin_ws_client *client)
     }
     pthread_cond_broadcast(&client->pending_cond);
     pthread_mutex_unlock(&admin_ws_lock);
-}
-
-static void admin_drain_websocket(st_admin_ws_client *client)
-{
-    for (;;) {
-        uint8_t header[2];
-        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) {
-            return;
-        }
-        uint8_t opcode = header[0] & 0x0fU;
-        int masked = (header[1] & 0x80U) != 0;
-        uint64_t payload_len = header[1] & 0x7fU;
-        if (payload_len == 126U) {
-            uint8_t extended[2];
-            if (admin_recv_all(client->fd, extended, sizeof(extended)) != 0) {
-                return;
-            }
-            payload_len = ((uint64_t)extended[0] << 8U) | (uint64_t)extended[1];
-        } else if (payload_len == 127U) {
-            uint8_t extended[8];
-            if (admin_recv_all(client->fd, extended, sizeof(extended)) != 0) {
-                return;
-            }
-            payload_len = 0;
-            for (size_t i = 0; i < sizeof(extended); ++i) {
-                payload_len = (payload_len << 8U) | (uint64_t)extended[i];
-            }
-        }
-        uint8_t mask[4] = {0};
-        if (masked && admin_recv_all(client->fd, mask, sizeof(mask)) != 0) {
-            return;
-        }
-        if (payload_len > (1024U * 1024U)) {
-            uint8_t close_payload[2] = {0x03U, 0xf1U};
-            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
-            return;
-        }
-        uint8_t *payload = NULL;
-        if (payload_len > 0) {
-            payload = (uint8_t *)malloc((size_t)payload_len);
-            if (payload == NULL) {
-                return;
-            }
-            if (admin_recv_all(client->fd, payload, (size_t)payload_len) != 0) {
-                free(payload);
-                return;
-            }
-            if (masked) {
-                for (size_t i = 0; i < (size_t)payload_len; ++i) {
-                    payload[i] ^= mask[i % 4U];
-                }
-            }
-        }
-        if (opcode == 0x8U) {
-            admin_ws_send_frame(client, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
-            free(payload);
-            return;
-        }
-        if (opcode == 0x9U) {
-            admin_ws_send_frame(client, 0xAU, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
-        }
-        free(payload);
-    }
 }
 
 static int admin_ws_send_message_status(st_admin_ws_client *client,
@@ -13865,14 +16898,14 @@ static void *admin_client_message_write_thread(void *arg)
                                                write->message,
                                                NULL);
         } else {
+            /* Java reports any failed write to the target channel as target-write-failed, also
+             * when the control connection went away after the online check. */
             (void)admin_ws_send_message_status(write->client,
-                                               send_rc == -1 ? "error" : "failed",
+                                               "failed",
                                                write->message_id,
                                                NULL,
                                                NULL,
-                                               send_rc == -1
-                                                   ? "target-offline"
-                                                   : "target-write-failed");
+                                               "target-write-failed");
         }
     }
     admin_ws_release_client_message_write(write->client);
@@ -13880,16 +16913,39 @@ static void *admin_client_message_write_thread(void *arg)
     return NULL;
 }
 
+/*
+ * A command member as Java's ObjectMapper binds it into a String field: the text of a string, the
+ * literal text of a number or of true and false (a scalar is coerced, so "messageId":42 reads as
+ * "42" and is echoed so), and NULL for null or a missing member.
+ */
+static char *admin_json_scalar_text(const char *json, const char *key)
+{
+    char *raw = st_json_get_top_level_raw(json, key);
+    if (raw == NULL || raw[0] == '"' || strcmp(raw, "null") == 0) {
+        int is_string = raw != NULL && raw[0] == '"';
+        free(raw);
+        return is_string ? st_json_get_top_level_string(json, key) : NULL;
+    }
+    return raw;
+}
+
 static void admin_handle_client_message_command(st_admin_ws_client *client, const char *json)
 {
-    if (!st_json_is_valid_object(json)) {
+    /*
+     * Java binds the text into ClientMessageCommand(type, messageId, toClientName, message) with a
+     * default ObjectMapper: an unknown member, or an object or array where a string belongs, fails
+     * the mapping just as malformed JSON does.
+     */
+    static const char *const command_fields[] = {"type", "messageId", "toClientName", "message"};
+    if (!st_json_object_has_only_scalar_fields(json, command_fields,
+                                               sizeof(command_fields) / sizeof(command_fields[0]))) {
         (void)admin_ws_send_message_status(client, "error", NULL, NULL, NULL, "invalid-json");
         return;
     }
-    char *type = st_json_get_top_level_string(json, "type");
-    char *message_id = st_json_get_top_level_string(json, "messageId");
-    char *to_client_name = st_json_get_top_level_string(json, "toClientName");
-    char *message = st_json_get_top_level_string(json, "message");
+    char *type = admin_json_scalar_text(json, "type");
+    char *message_id = admin_json_scalar_text(json, "messageId");
+    char *to_client_name = admin_json_scalar_text(json, "toClientName");
+    char *message = admin_json_scalar_text(json, "message");
     if (type == NULL || strcmp(type, "message") != 0) {
         (void)admin_ws_send_message_status(client,
                                            "error",
@@ -13997,7 +17053,8 @@ done:
     free(message);
 }
 
-static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units)
+/* 0 with *units set for valid UTF-8 of at most max_units UTF-16 code units; -1 invalid; -2 longer. */
+static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t max_units, size_t *units)
 {
     size_t offset = 0U;
     size_t count = 0U;
@@ -14037,7 +17094,7 @@ static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units
             return -1;
         }
         size_t increment = codepoint > 0xffffU ? 2U : 1U;
-        if (count > ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS - increment) {
+        if (count > max_units - increment) {
             return -2;
         }
         count += increment;
@@ -14048,15 +17105,25 @@ static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units
     return 0;
 }
 
-static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
+/* Handles one complete text message; -1 when the socket was closed for it. */
+typedef int (*admin_ws_text_handler)(st_admin_ws_client *client, const char *text, size_t len);
+
+/*
+ * Reads a management WebSocket as Java's container serves a TextWebSocketHandler: a text message,
+ * reassembled from its fragments, may hold at most max_chars UTF-16 code units (1009 otherwise) of
+ * valid UTF-8 (1007 otherwise); binary closes 1003; unmasked frames, set RSV bits, broken
+ * fragmentation and fragmented or oversized control frames close 1002; pings are answered and a
+ * close is echoed. Each text message goes to on_text, or is dropped when it is NULL.
+ */
+static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_chars, admin_ws_text_handler on_text)
 {
+    /* No more UTF-8 bytes than three per UTF-16 code unit can fit max_chars. */
+    const uint64_t max_bytes = (uint64_t)max_chars * 3U;
     st_admin_string_builder fragmented = {0};
     int fragment_active = 0;
     for (;;) {
         uint8_t header[2];
-        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) {
-            break;
-        }
+        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) break;
         int fin = (header[0] & 0x80U) != 0U;
         uint8_t rsv = (uint8_t)((header[0] >> 4U) & 7U);
         uint8_t opcode = header[0] & 0x0fU;
@@ -14076,21 +17143,26 @@ static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
         }
         int control_frame = opcode >= 0x8U;
         int too_large = !control_frame
-            && (payload_len > ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES
-                || (fragment_active
-                    && payload_len > ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES - fragmented.len));
-        int protocol_error = !masked || rsv != 0U
-            || (control_frame && (!fin || payload_len > 125U));
+            && (payload_len > max_bytes || (fragment_active && payload_len > max_bytes - fragmented.len));
+        int protocol_error = rsv != 0U || (control_frame && (!fin || payload_len > 125U));
         if (protocol_error || too_large) {
             uint8_t close_payload[2] = {0x03U, too_large ? 0xf1U : 0xeaU};
             (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
             break;
         }
-        uint8_t mask[4];
-        if (admin_recv_all(client->fd, mask, sizeof(mask)) != 0) break;
+        uint8_t mask[4] = {0U, 0U, 0U, 0U};
+        if (masked && admin_recv_all(client->fd, mask, sizeof(mask)) != 0) break;
         uint8_t *payload = (uint8_t *)malloc(payload_len == 0U ? 1U : (size_t)payload_len);
         if (payload == NULL) break;
         if (payload_len > 0U && admin_recv_all(client->fd, payload, (size_t)payload_len) != 0) {
+            free(payload);
+            break;
+        }
+        /* A browser masks every frame (RFC 6455 5.1); the container closes 1002 otherwise. The frame
+         * is read first, so that the close is not cut off by unread input. */
+        if (!masked) {
+            uint8_t close_payload[2] = {0x03U, 0xeaU};
+            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
             free(payload);
             break;
         }
@@ -14117,6 +17189,7 @@ static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
             free(payload);
             continue;
         }
+        /* TextWebSocketHandler refuses binary messages with 1003. */
         if (opcode == 0x2U) {
             uint8_t close_payload[2] = {0x03U, 0xebU};
             (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
@@ -14138,18 +17211,32 @@ static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
         fragment_active = !fin;
         if (fin) {
             const uint8_t *text = (const uint8_t *)(fragmented.data == NULL ? "" : fragmented.data);
-            int utf8_rc = admin_utf8_utf16_units(text, fragmented.len, NULL);
-            if (utf8_rc != 0 || memchr(text, '\0', fragmented.len) != NULL) {
+            int utf8_rc = admin_utf8_utf16_units(text, fragmented.len, max_chars, NULL);
+            if (utf8_rc != 0) {
                 uint8_t close_payload[2] = {0x03U, utf8_rc == -2 ? 0xf1U : 0xefU};
                 (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
                 break;
             }
-            admin_handle_client_message_command(client, (const char *)text);
+            if (on_text != NULL && on_text(client, (const char *)text, fragmented.len) != 0) {
+                break;
+            }
             free(fragmented.data);
             memset(&fragmented, 0, sizeof(fragmented));
         }
     }
     free(fragmented.data);
+}
+
+static int admin_client_messages_text(st_admin_ws_client *client, const char *text, size_t len)
+{
+    /* The command is read as a C string; a NUL inside it cannot belong to JSON text. */
+    if (memchr(text, '\0', len) != NULL) {
+        uint8_t close_payload[2] = {0x03U, 0xefU};
+        (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+        return -1;
+    }
+    admin_handle_client_message_command(client, text);
+    return 0;
 }
 
 static int handle_connection_websocket_request(int fd, const char *method, const char *path, const char *request)
@@ -14232,7 +17319,7 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
         return 1;
     }
-    admin_drain_websocket(client);
+    admin_drain_text_websocket(client, ST_ADMIN_CONNECTIONS_MAX_CHARS, NULL);
     admin_ws_remove(client);
     return 1;
 }
@@ -14344,7 +17431,7 @@ static int handle_client_messages_websocket_request(int fd,
         return 1;
     }
     if (admin_ws_send_client_messages_hello(client) == 0) {
-        admin_drain_client_messages_websocket(client);
+        admin_drain_text_websocket(client, ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS, admin_client_messages_text);
     }
     admin_ws_remove(client);
     return 1;
@@ -14949,6 +18036,7 @@ static void admin_direct_ws_run(st_admin_server *server,
                                 int fd,
                                 char *accept_key,
                                 const char *client_name,
+                                long long client_id,
                                 const char *route,
                                 const char *relative_path,
                                 const char *raw_query,
@@ -14990,7 +18078,8 @@ static void admin_direct_ws_run(st_admin_server *server,
         .headers_len = headers_len,
         .body = empty_body,
         .body_len = 0,
-        .stream = stream
+        .stream = stream,
+        .client_id = client_id
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
     if (open_rc != 0) {
@@ -15061,7 +18150,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
                                                  const char *method,
                                                  const char *path,
                                                  const char *raw_request,
-                                                 int strip_authorization)
+                                                 int strip_authorization,
+                                                 const char *target_base_url,
+                                                 long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0
         || !admin_header_value_contains_token_ci(raw_request, "Connection", "Upgrade")
@@ -15129,7 +18220,9 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(client_name);
         free(route);
@@ -15138,7 +18231,7 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct websocket header capture failed");
         return 1;
     }
-    admin_direct_ws_run(server, fd, accept_key, client_name, route, relative_path, raw_query,
+    admin_direct_ws_run(server, fd, accept_key, client_name, client_id, route, relative_path, raw_query,
                         headers, headers_len, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
@@ -15153,10 +18246,26 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
  * for a request through a temporary HTTP share: its response headers are rewritten, the path
  * rewrite uses the share prefix, and an ended share can cancel the stream.
  */
+/* A request's declared trailer names and the declared trailer fields of its chunked body. */
+typedef struct {
+    char **names;
+    size_t names_len;
+    char **fields;
+    size_t fields_len;
+} admin_request_trailers;
+
+static void admin_request_trailers_free(admin_request_trailers *trailers)
+{
+    direct_free_strings(trailers->names, trailers->names_len);
+    direct_free_strings(trailers->fields, trailers->fields_len);
+    memset(trailers, 0, sizeof(*trailers));
+}
+
 static void admin_forward_direct_http(st_admin_server *server,
                                       int fd,
                                       const char *method,
                                       const char *client_name,
+                                      long long client_id,
                                       const char *route,
                                       const char *relative_path,
                                       const char *raw_query,
@@ -15164,6 +18273,7 @@ static void admin_forward_direct_http(st_admin_server *server,
                                       size_t headers_len,
                                       const uint8_t *body,
                                       size_t body_len,
+                                      const admin_request_trailers *trailers,
                                       admin_share_admission *share)
 {
     st_direct_http_request direct = {
@@ -15174,7 +18284,12 @@ static void admin_forward_direct_http(st_admin_server *server,
         .headers = headers,
         .headers_len = headers_len,
         .body = body,
-        .body_len = body_len
+        .body_len = body_len,
+        .trailer_names = trailers->names,
+        .trailer_names_len = trailers->names_len,
+        .trailers = trailers->fields,
+        .trailers_len = trailers->fields_len,
+        .client_id = client_id
     };
     size_t source_len = strlen(relative_path) + strlen(raw_query) + 2U;
     char *source_url = (char *)malloc(source_len);
@@ -15215,21 +18330,33 @@ static void admin_forward_direct_http(st_admin_server *server,
         record_direct_http_traffic(client_name, route, (long long)body_len,
                                    (long long)sink_state.response_bytes);
         record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
-                                    sink_state.response_bytes, remote_address, elapsed_ms);
+                                    sink_state.response_bytes, sink_state.response_externalized,
+                                    remote_address, elapsed_ms);
     } else if (rc == ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED) {
         /* The share ended mid-exchange: the public connection was already shut down. */
-    } else if (!sink_state.started && rc == -2) {
-        send_text_http_error(fd, 504, "direct http response timeout");
-    } else if (!sink_state.started && rc == -3) {
-        send_text_http_error(fd, 404, "direct http route is not configured");
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET) {
-        /* direct_sink_on_reset logged the client's RST reason; it is never echoed here. */
-        send_text_http_error(fd, 502, ST_ADMIN_DIRECT_HTTP_RESET_BODY);
-    } else if (!sink_state.started && rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT) {
-        /* The stream could not be created, answered as Java HttpSpecusController does. */
-        send_text_http_error(fd, 502, "HTTP 流创建失败");
-    } else if (!sink_state.started) {
-        send_text_http_error(fd, 502, "direct http target client is offline");
+    } else {
+        int status = rc == -2 ? 504 : rc == -3 ? 404 : 502;
+        const char *message = rc == -2 ? "direct http response timeout"
+            : rc == -3 ? "direct http route is not configured"
+            : rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET ? ST_ADMIN_DIRECT_HTTP_RESET_BODY
+            /* The stream could not be created, answered as Java HttpSpecusController does. */
+            : rc == ST_ADMIN_DIRECT_HTTP_STREAM_LIMIT ? "HTTP 流创建失败"
+            : ADMIN_ROUTE_CLIENT_OFFLINE_TEXT;
+        /* direct_sink_on_reset logged the client's RST reason; it is never echoed to the caller. */
+        const char *failure = rc == ST_ADMIN_DIRECT_HTTP_STREAM_RESET && sink_state.reset_reason[0] != '\0'
+            ? sink_state.reset_reason : message;
+        if (!sink_state.started) {
+            send_text_http_error(fd, status, message);
+            record_direct_http_failure(client_name, route, &direct, status, message, failure, remote_address,
+                                       started_ms);
+        } else {
+            /* Cut short after its head went out: recorded with what was relayed, and why it ended. */
+            free(sink_state.response.error);
+            sink_state.response.error = admin_dup_string(failure);
+            record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                        sink_state.response_bytes, sink_state.response_externalized,
+                                        remote_address, elapsed_ms);
+        }
     }
 
     if (rc != 0) {
@@ -15249,7 +18376,10 @@ static int handle_direct_http_request(st_admin_server *server,
                                       const char *raw_request,
                                       const uint8_t *body,
                                       size_t body_len,
-                                      int strip_authorization)
+                                      const admin_request_trailers *trailers,
+                                      int strip_authorization,
+                                      const char *target_base_url,
+                                      long long client_id)
 {
     if (strncmp(path, "/http/", 6) != 0) {
         return 0;
@@ -15299,7 +18429,9 @@ static int handle_direct_http_request(st_admin_server *server,
 
     char **headers = NULL;
     size_t headers_len = 0;
-    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0) {
+    if (admin_collect_headers(raw_request, strip_authorization, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(client_name);
         free(route);
         free(relative_path);
@@ -15307,8 +18439,8 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct http header capture failed");
         return 1;
     }
-    admin_forward_direct_http(server, fd, method, client_name, route, relative_path, raw_query,
-                              headers, headers_len, body, body_len, NULL);
+    admin_forward_direct_http(server, fd, method, client_name, client_id, route, relative_path, raw_query,
+                              headers, headers_len, body, body_len, trailers, NULL);
     free_header_array(headers, headers_len);
     free(client_name);
     free(route);
@@ -15417,6 +18549,65 @@ static int admin_collect_header_values(const char *request, const char *name, ch
         line = next + 2;
     }
     return 0;
+}
+
+/*
+ * The request trailers that cross to the client (http-route.md section 3; Java
+ * HttpSpecusController.declaredTrailerNames and flattenTrailers): the names every Trailer header
+ * declares, without Authorization when the route gate consumed it, and of the chunked body's
+ * trailer fields only the declared ones. Takes over nothing; *out is the caller's to free.
+ */
+static int admin_request_trailers_collect(const char *raw_request,
+                                          int strip_authorization,
+                                          char *const *received,
+                                          size_t received_len,
+                                          admin_request_trailers *out)
+{
+    memset(out, 0, sizeof(*out));
+    char **declarations = NULL;
+    size_t declaration_count = 0U;
+    if (admin_collect_header_values(raw_request, "Trailer", &declarations, &declaration_count) != 0) {
+        return -1;
+    }
+    char **candidates = NULL;
+    size_t candidate_count = 0U;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < declaration_count; ++i) {
+        const char *cursor = declarations[i];
+        for (;;) {
+            size_t len = strcspn(cursor, ",");
+            char **grown = (char **)realloc(candidates, (candidate_count + 1U) * sizeof(*grown));
+            if (grown == NULL) {
+                rc = -1;
+                break;
+            }
+            candidates = grown;
+            candidates[candidate_count] = admin_dup_range(cursor, len);
+            if (candidates[candidate_count] == NULL) {
+                rc = -1;
+                break;
+            }
+            ++candidate_count;
+            if (cursor[len] == '\0') {
+                break;
+            }
+            cursor += len + 1U;
+        }
+    }
+    free_header_array(declarations, declaration_count);
+    if (rc == 0) {
+        rc = direct_valid_trailer_names(candidates, candidate_count, strip_authorization,
+                                        &out->names, &out->names_len);
+    }
+    free_header_array(candidates, candidate_count);
+    if (rc == 0) {
+        rc = direct_declared_trailer_fields(received, received_len, out->names, out->names_len,
+                                            &out->fields, &out->fields_len);
+    }
+    if (rc != 0) {
+        admin_request_trailers_free(out);
+    }
+    return rc;
 }
 
 /*
@@ -15600,7 +18791,9 @@ static int admit_http_share_request(int fd,
         return 0;
     }
     snprintf(admission->client_name, sizeof(admission->client_name), "%s", resolution.client_name);
+    admission->client_id = resolution.client_id;
     snprintf(admission->route, sizeof(admission->route), "%s", resolution.route_name);
+    snprintf(admission->target_base_url, sizeof(admission->target_base_url), "%s", resolution.target_base_url);
     return 1;
 }
 
@@ -15630,14 +18823,17 @@ static void forward_http_share_websocket(st_admin_server *server,
     char **headers = NULL;
     size_t headers_len = 0U;
     if (accept_key == NULL || raw_query == NULL
-        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+        || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(accept_key);
         free(raw_query);
         send_text_http_error(fd, 500, "direct websocket request build failed");
         return;
     }
-    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->route,
-                        admission->relative_path, raw_query, headers, headers_len, &admission->stream);
+    admin_direct_ws_run(server, fd, accept_key, admission->client_name, admission->client_id,
+                        admission->route, admission->relative_path, raw_query, headers, headers_len,
+                        &admission->stream);
     free_header_array(headers, headers_len);
     free(raw_query);
 }
@@ -15648,6 +18844,7 @@ static void forward_http_share_request(st_admin_server *server,
                                        const char *raw_request,
                                        const uint8_t *body,
                                        size_t body_len,
+                                       const admin_request_trailers *trailers,
                                        admin_share_admission *admission)
 {
     if (server->direct_http_forward == NULL) {
@@ -15657,17 +18854,97 @@ static void forward_http_share_request(st_admin_server *server,
     char *raw_query = admin_encode_raw_query_for_forwarding(admission->raw_query);
     char **headers = NULL;
     size_t headers_len = 0U;
-    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0) {
+    if (raw_query == NULL || admin_share_forward_headers(raw_request, &headers, &headers_len) != 0
+        || st_upstream_browser_headers_rewrite(headers, headers_len, admission->target_base_url) != 0) {
+        free_header_array(headers, headers_len);
         free(raw_query);
         send_text_http_error(fd, 500, "direct http request build failed");
         return;
     }
     /* No Basic gate: Authorization belongs to the target and is relayed as it came. */
-    admin_forward_direct_http(server, fd, method, admission->client_name, admission->route,
-                              admission->relative_path, raw_query, headers, headers_len, body, body_len,
-                              admission);
+    admin_forward_direct_http(server, fd, method, admission->client_name, admission->client_id,
+                              admission->route, admission->relative_path, raw_query, headers, headers_len,
+                              body, body_len, trailers, admission);
     free_header_array(headers, headers_len);
     free(raw_query);
+}
+
+/*
+ * The object-storage bucket origin Java SecurityConfig adds to the portal policy when aliyun-oss is
+ * configured, so the browser may PUT to and preview from the bucket directly; empty otherwise.
+ */
+static void admin_portal_oss_origin(char *out, size_t out_len)
+{
+    out[0] = '\0';
+    const char *provider = getenv("SPECUS_OBJECT_STORAGE_PROVIDER");
+    const char *endpoint = getenv("SPECUS_OBJECT_STORAGE_ENDPOINT");
+    const char *bucket = getenv("SPECUS_OBJECT_STORAGE_BUCKET");
+    if (provider == NULL || endpoint == NULL || bucket == NULL) {
+        return;
+    }
+    while (isspace((unsigned char)*provider)) ++provider;
+    size_t provider_len = strlen(provider);
+    while (provider_len > 0U && isspace((unsigned char)provider[provider_len - 1U])) --provider_len;
+    if (provider_len != strlen("aliyun-oss") || admin_ascii_ncasecmp(provider, "aliyun-oss", provider_len) != 0) {
+        return;
+    }
+    while (isspace((unsigned char)*endpoint)) ++endpoint;
+    if (admin_ascii_ncasecmp(endpoint, "https://", 8U) == 0) {
+        endpoint += 8;
+    } else if (admin_ascii_ncasecmp(endpoint, "http://", 7U) == 0) {
+        endpoint += 7;
+    }
+    size_t host_len = strcspn(endpoint, "/");
+    while (host_len > 0U && isspace((unsigned char)endpoint[host_len - 1U])) --host_len;
+    while (isspace((unsigned char)*bucket)) ++bucket;
+    size_t bucket_len = strlen(bucket);
+    while (bucket_len > 0U && isspace((unsigned char)bucket[bucket_len - 1U])) --bucket_len;
+    if (host_len == 0U || bucket_len == 0U) {
+        return;
+    }
+    int written = snprintf(out, out_len, "https://%.*s.%.*s", (int)bucket_len, bucket, (int)host_len, endpoint);
+    if (written < 0 || (size_t)written >= out_len) {
+        out[0] = '\0';
+    }
+}
+
+/*
+ * The security headers of Java SecurityConfig's portal header writer (and Go securityHeaders) for
+ * the management pages; /http/ and /http-share/ are never served from here, their responses belong
+ * to the target application. Returns the header lines, each ending in CRLF, or NULL.
+ */
+static char *admin_portal_security_headers(void)
+{
+    char oss_origin[384];
+    admin_portal_oss_origin(oss_origin, sizeof(oss_origin));
+    const char *oss_space = oss_origin[0] == '\0' ? "" : " ";
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+                              "Content-Security-Policy: default-src 'self'; "
+                              "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com "
+                              "'sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=' "
+                              "'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
+                              "style-src 'self' 'unsafe-inline'; "
+                              "img-src 'self' blob: data: https://www.google-analytics.com "
+                              "https://*.googletagmanager.com%s%s; "
+                              "media-src 'self' blob: data:%s%s; "
+                              "object-src 'self' blob:; "
+                              "frame-src 'self' blob: https://challenges.cloudflare.com; "
+                              "font-src 'self' data:; "
+                              "connect-src 'self' ws: wss: https://api.github.com https://www.google-analytics.com "
+                              "https://*.analytics.google.com https://*.googletagmanager.com%s%s; "
+                              "form-action 'self'; "
+                              "frame-ancestors 'none'; "
+                              "base-uri 'self'\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "X-Frame-Options: DENY\r\n"
+                              "Referrer-Policy: strict-origin-when-cross-origin\r\n",
+                              oss_space, oss_origin, oss_space, oss_origin, oss_space, oss_origin);
+    if (rc != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
 }
 
 static int send_static_file(int fd, const char *method, const char *path, const char *static_root)
@@ -15688,17 +18965,21 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     if (file == NULL) {
         return 0;
     }
-    char header[512];
-    int header_len = snprintf(header,
-                              sizeof(header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: %s\r\n"
-                              "Cache-Control: no-cache\r\n"
-                              "X-Content-Type-Options: nosniff\r\n"
-                              "Content-Length: %lld\r\n"
-                              "\r\n",
-                              content_type,
-                              (long long)st.st_size);
+    char *security_headers = admin_portal_security_headers();
+    char header[4096];
+    int header_len = security_headers == NULL ? -1
+        : snprintf(header,
+                   sizeof(header),
+                   "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: %s\r\n"
+                   "Cache-Control: no-cache\r\n"
+                   "%s"
+                   "Content-Length: %lld\r\n"
+                   "\r\n",
+                   content_type,
+                   security_headers,
+                   (long long)st.st_size);
+    free(security_headers);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header)
         || send_all(fd, header, (size_t)header_len) != 0) {
         fclose(file);
@@ -15717,10 +18998,59 @@ static int send_static_file(int fd, const char *method, const char *path, const 
     return 1;
 }
 
+/* Java HttpSpecusBodyLimitFilter keeps this much of a refused body for the HTTP detail. */
+#define ADMIN_REFUSED_BODY_CAPTURE (64U * 1024U)
+
+/* What a 413 of admin_read_request_body leaves for the record of the refused request. */
+typedef struct {
+    int capture;       /* in: keep the refused body's first ADMIN_REFUSED_BODY_CAPTURE bytes */
+    int too_large;     /* out: the body was refused for its size */
+    char *prefix;      /* out: the kept bytes, the caller's to free */
+    size_t prefix_len;
+} admin_body_refusal;
+
+/*
+ * The first bytes of a body whose Content-Length is over the limit, as Java
+ * HttpSpecusBodyLimitFilter reads them before it answers: what came with the header block, then
+ * what the socket brings within two seconds, up to ADMIN_REFUSED_BODY_CAPTURE bytes in all.
+ */
+static void admin_capture_refused_body(int fd, const char *received, size_t received_len,
+                                       size_t declared_len, admin_body_refusal *refusal)
+{
+    size_t wanted = declared_len < ADMIN_REFUSED_BODY_CAPTURE ? declared_len : ADMIN_REFUSED_BODY_CAPTURE;
+    char *prefix = (char *)malloc(wanted + 1U);
+    if (prefix == NULL) {
+        return;
+    }
+    size_t used = received_len < wanted ? received_len : wanted;
+    memcpy(prefix, received, used);
+    long long deadline = admin_now_ms() + 2000LL;
+    while (used < wanted) {
+        long long remaining = deadline - admin_now_ms();
+        struct pollfd ready = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (remaining <= 0 || poll(&ready, 1, (int)remaining) <= 0) {
+            break;
+        }
+        ssize_t got = recv(fd, prefix + used, wanted - used, 0);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            break;
+        }
+        used += (size_t)got;
+    }
+    prefix[used] = '\0';
+    refusal->prefix = prefix;
+    refusal->prefix_len = used;
+}
+
 /*
  * Reads the body that follows the header block in request (len bytes received so far), by
  * Content-Length or chunked and within the limit of the path. 0 with the body (in request or in
- * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out.
+ * a malloc'd *body_buffer_out) and its length, or -1 once an error answer went out. A chunked
+ * body's trailer fields come back in *trailers_out, the caller's to free. When refusal is given, a
+ * 413 is reported there with the refused body's first bytes if refusal->capture asks for them.
  */
 static int admin_read_request_body(int fd,
                                    const char *request,
@@ -15728,12 +19058,17 @@ static int admin_read_request_body(int fd,
                                    const char *path,
                                    const char **body_out,
                                    size_t *body_len_out,
-                                   char **body_buffer_out)
+                                   char **body_buffer_out,
+                                   char ***trailers_out,
+                                   size_t *trailers_len_out,
+                                   admin_body_refusal *refusal)
 {
     const char *body = strstr(request, "\r\n\r\n");
     size_t available_body_len = 0;
     size_t content_length = 0;
     char *body_buffer = NULL;
+    *trailers_out = NULL;
+    *trailers_len_out = 0U;
     if (body != NULL) {
         body += 4;
         available_body_len = (size_t)(request + len - body);
@@ -15758,9 +19093,18 @@ static int admin_read_request_body(int fd,
                                                : "仅支持 chunked Transfer-Encoding");
                 return -1;
             }
+            size_t refused_capture = refusal != NULL && refusal->capture ? ADMIN_REFUSED_BODY_CAPTURE : 0U;
             int chunked_rc = admin_read_chunked_body(fd, body, available_body_len, max_content_length,
-                                                     &body_buffer, &content_length);
+                                                     refused_capture, &body_buffer, &content_length,
+                                                     trailers_out, trailers_len_out);
             if (chunked_rc != 0) {
+                if (chunked_rc == -2 && refusal != NULL) {
+                    refusal->too_large = 1;
+                    refusal->prefix = body_buffer;
+                    refusal->prefix_len = content_length;
+                } else {
+                    free(body_buffer);
+                }
                 send_text_http_error(fd, chunked_rc == -2 ? 413 : 400,
                                      chunked_rc == -2 ? "HTTP 请求体超过限制" : "HTTP 请求体不完整");
                 return -1;
@@ -15770,6 +19114,17 @@ static int admin_read_request_body(int fd,
         } else {
             int length_rc = admin_parse_content_length(request, max_content_length, &content_length);
             if (length_rc == -2) {
+                if (refusal != NULL) {
+                    refusal->too_large = 1;
+                    if (refusal->capture) {
+                        char *declared = admin_extract_header_value(request, "Content-Length");
+                        unsigned long long declared_len = declared == NULL ? 0ULL : strtoull(declared, NULL, 10);
+                        free(declared);
+                        admin_capture_refused_body(fd, body, available_body_len,
+                                                   declared_len > SIZE_MAX ? SIZE_MAX : (size_t)declared_len,
+                                                   refusal);
+                    }
+                }
                 send_text_http_error(fd, 413, "HTTP 请求体超过限制");
                 return -1;
             }
@@ -15830,10 +19185,23 @@ static void handle_http_share_client(st_admin_server *server,
         const char *body = NULL;
         size_t body_len = 0U;
         char *body_buffer = NULL;
-        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer) == 0) {
-            forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
-                                       &admission);
+        char **received_trailers = NULL;
+        size_t received_trailers_len = 0U;
+        admin_request_trailers trailers;
+        memset(&trailers, 0, sizeof(trailers));
+        if (admin_read_request_body(fd, request, len, path, &body, &body_len, &body_buffer,
+                                    &received_trailers, &received_trailers_len, NULL) == 0) {
+            /* No Basic gate on a share: an Authorization trailer belongs to the target as well. */
+            if (admin_request_trailers_collect(request, 0, received_trailers, received_trailers_len,
+                                               &trailers) != 0) {
+                send_text_http_error(fd, 500, "direct http request build failed");
+            } else {
+                forward_http_share_request(server, fd, method, request, (const uint8_t *)body, body_len,
+                                           &trailers, &admission);
+            }
         }
+        admin_request_trailers_free(&trailers);
+        free_header_array(received_trailers, received_trailers_len);
         free(body_buffer);
     }
     admin_share_stream_unregister(&admission.stream);
@@ -15842,6 +19210,7 @@ static void handle_http_share_client(st_admin_server *server,
 
 static void handle_client(st_admin_server *server, int fd)
 {
+    long long started_ms = admin_now_ms();
     char request[8192];
     ssize_t len = recv(fd, request, sizeof(request) - 1U, 0);
     if (len <= 0) {
@@ -15879,8 +19248,12 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     int strip_direct_authorization = 0;
-    if (strncmp(path, "/http/", 6) == 0) {
-        int auth_result = authorize_direct_http_route(fd, path, request);
+    char direct_target_base_url[512] = "";
+    long long direct_client_id = 0;
+    int direct_path = strncmp(path, "/http/", 6) == 0;
+    if (direct_path) {
+        int auth_result = authorize_direct_http_route(fd, method, path, request, started_ms, direct_target_base_url,
+                                                      sizeof(direct_target_base_url), &direct_client_id);
         if (auth_result < 0) {
             close(fd);
             return;
@@ -15890,11 +19263,39 @@ static void handle_client(st_admin_server *server, int fd)
     const char *body = NULL;
     size_t available_body_len = 0;
     char *body_buffer = NULL;
+    char **received_trailers = NULL;
+    size_t received_trailers_len = 0U;
+    admin_body_refusal refusal;
+    memset(&refusal, 0, sizeof(refusal));
+    refusal.capture = direct_path && admin_direct_route_captured(path);
     if (admin_read_request_body(fd, request, (size_t)len, path, &body, &available_body_len,
-                                &body_buffer) != 0) {
+                                &body_buffer, &received_trailers, &received_trailers_len, &refusal) != 0) {
+        if (direct_path && refusal.too_large) {
+            /* Java HttpSpecusBodyLimitFilter records the refusal with the headers and the body's start. */
+            char **headers = NULL;
+            size_t headers_len = 0U;
+            if (admin_collect_headers(request, strip_direct_authorization, &headers, &headers_len) == 0) {
+                record_direct_http_refusal(fd, method, path, headers, headers_len, (const uint8_t *)refusal.prefix,
+                                           refusal.prefix_len, 413, "HTTP 请求体超过限制", started_ms);
+            }
+            free_header_array(headers, headers_len);
+        }
+        free(refusal.prefix);
         close(fd);
         return;
     }
+    admin_request_trailers direct_trailers;
+    memset(&direct_trailers, 0, sizeof(direct_trailers));
+    if (strncmp(path, "/http/", 6) == 0
+        && admin_request_trailers_collect(request, strip_direct_authorization, received_trailers,
+                                          received_trailers_len, &direct_trailers) != 0) {
+        free_header_array(received_trailers, received_trailers_len);
+        free(body_buffer);
+        send_text_http_error(fd, 500, "direct http request build failed");
+        close(fd);
+        return;
+    }
+    free_header_array(received_trailers, received_trailers_len);
 
     char request_remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, request_remote_address);
@@ -15904,17 +19305,20 @@ static void handle_client(st_admin_server *server, int fd)
                                              path,
                                              request,
                                              request_remote_address)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
 
     if (handle_connection_websocket_request(fd, method, path, request)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
     if (handle_client_messages_websocket_request(fd, method, path, request)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
@@ -15924,26 +19328,38 @@ static void handle_client(st_admin_server *server, int fd)
                                              method,
                                              path,
                                              request,
-                                             strip_direct_authorization)) {
+                                             strip_direct_authorization,
+                                             direct_target_base_url,
+                                             direct_client_id)) {
+        admin_request_trailers_free(&direct_trailers);
         free(body_buffer);
         close(fd);
         return;
     }
-    if (handle_direct_http_request(server,
-                                   fd,
-                                   method,
-                                   path,
-                                   request,
-                                   (const uint8_t *)body,
-                                   available_body_len,
-                                   strip_direct_authorization)) {
+    int direct_handled = handle_direct_http_request(server,
+                                                    fd,
+                                                    method,
+                                                    path,
+                                                    request,
+                                                    (const uint8_t *)body,
+                                                    available_body_len,
+                                                    &direct_trailers,
+                                                    strip_direct_authorization,
+                                                    direct_target_base_url,
+                                                    direct_client_id);
+    admin_request_trailers_free(&direct_trailers);
+    if (direct_handled) {
         free(body_buffer);
         close(fd);
         return;
     }
     const char *database_path = admin_database_path();
+    char *package_range = admin_extract_header_value(request, "Range");
+    char *package_if_none_match = admin_extract_header_value(request, "If-None-Match");
     int package_download_response = st_client_package_send_download(
-        fd, method, path, database_path, request_remote_address);
+        fd, method, path, database_path, request_remote_address, package_range, package_if_none_match);
+    free(package_range);
+    free(package_if_none_match);
     if (package_download_response != 0) {
         free(body_buffer);
         close(fd);
@@ -15962,6 +19378,11 @@ static void handle_client(st_admin_server *server, int fd)
     if (host_header == NULL || *host_header == '\0') {
         free(host_header);
         host_header = admin_extract_header_value(request, "Host");
+    }
+    /* Java PublicPeerMeshResource.forwardedHost: the first of a comma-separated list, trimmed. */
+    if (host_header != NULL) {
+        host_header[strcspn(host_header, ",")] = '\0';
+        (void)admin_java_trim(host_header);
     }
     char response_stack[32768];
     size_t response_capacity = sizeof(response_stack);
@@ -16002,8 +19423,12 @@ static void handle_client(st_admin_server *server, int fd)
         }
     }
     if (strncmp(path, "/api/admin/http-routes/", strlen("/api/admin/http-routes/")) == 0
-        || admin_path_equals(path, "/api/admin/http-access-audit")) {
-        /* A route keeps its ended shares for 30 days and an audit page holds up to 200 entries. */
+        || admin_path_equals(path, "/api/admin/http-access-audit")
+        || strncmp(path, "/api/admin/traffic/http-exchanges/", strlen("/api/admin/traffic/http-exchanges/")) == 0) {
+        /*
+         * A route keeps its ended shares for 30 days and an audit page holds up to 200 entries; an
+         * exchange's detail carries both stored bodies, up to 64 KiB each, as text or data: URLs.
+         */
         response_capacity = 2U * 1024U * 1024U;
         response = (char *)malloc(response_capacity);
         if (response == NULL) {
@@ -16038,6 +19463,9 @@ static void handle_client(st_admin_server *server, int fd)
             return;
         }
     }
+    /* An answer without a fixed bound that outgrows response comes back in heap_response. */
+    admin_heap_response heap_response = {NULL, 0U};
+    admin_armed_heap_response = &heap_response;
     int response_len = st_admin_build_response_internal(method,
                                                         path,
                                                         authorization,
@@ -16051,8 +19479,51 @@ static void handle_client(st_admin_server *server, int fd)
                                                         0,
                                                         response,
                                                         response_capacity);
-    if (response_len > 0) {
+    admin_armed_heap_response = NULL;
+    /*
+     * A management read can answer more than the buffer chosen above: a page of traffic detail, a
+     * TCP stream with its payloads, a long list. Java has no such bound, so a GET under /api/admin/
+     * that did not fit is built again in a larger buffer; a read is safe to repeat.
+     */
+    static const size_t larger_capacities[] = {1024U * 1024U, 16U * 1024U * 1024U, 128U * 1024U * 1024U};
+    for (size_t attempt = 0;
+         response_len < 0 && strcmp(method, "GET") == 0 && strncmp(path, "/api/admin/", 11U) == 0
+             && attempt < sizeof(larger_capacities) / sizeof(larger_capacities[0]);
+         ++attempt) {
+        if (larger_capacities[attempt] <= response_capacity) {
+            continue;
+        }
+        char *grown = (char *)malloc(larger_capacities[attempt]);
+        if (grown == NULL) {
+            break;
+        }
+        if (response != response_stack) {
+            free(response);
+        }
+        response = grown;
+        response_capacity = larger_capacities[attempt];
+        response_len = st_admin_build_response_internal(method,
+                                                        path,
+                                                        authorization,
+                                                        oss_public_key_url,
+                                                        range_header,
+                                                        host_header,
+                                                        content_type,
+                                                        body,
+                                                        available_body_len,
+                                                        request_remote_address,
+                                                        0,
+                                                        response,
+                                                        response_capacity);
+    }
+    if (heap_response.data != NULL) {
+        send_all(fd, heap_response.data, heap_response.len);
+        free(heap_response.data);
+    } else if (response_len > 0) {
         send_all(fd, response, (size_t)response_len);
+    } else if (response_len < 0) {
+        /* Better a status than a connection closed without any answer. */
+        send_text_http_error(fd, 500, "response too large");
     }
     if (response != response_stack) {
         free(response);

@@ -227,9 +227,10 @@ class Engine:
         tenant = actor["tenantId"]
         row = self.switches.setdefault(tenant, {"enabled": False, "updatedBy": None, "updatedAt": None, "purgedAt": None})
         if row["enabled"] != body["enabled"]:
-            row.update(enabled=body["enabled"], updatedBy=actor["username"], updatedAt=stamp(at))
-            if body["enabled"]:
-                row["purgedAt"] = None
+            # Every change of state clears the purge mark, so while the switch is off the mark can
+            # only come from a purge made after switching off (section 9, step 4). A purge made
+            # while collecting must not make the sweep delete what was collected after it.
+            row.update(enabled=body["enabled"], updatedBy=actor["username"], updatedAt=stamp(at), purgedAt=None)
         if not body["enabled"]:
             self.drop_progress(tenant)
         return {"status": 200, "body": self.settings_view(tenant, True)}
@@ -326,6 +327,7 @@ class Engine:
         for table in (self.onboarding, self.transfers):
             for key in [key for key in table if key[1] < cutoff]:
                 del table[key]
+        # Off and purged since switching off: remove whatever was written within the switch cache period.
         for tenant, row in self.switches.items():
             if not row["enabled"] and row["purgedAt"] is not None:
                 self.delete_tenant_rows(tenant)
@@ -579,7 +581,8 @@ def progress_row(tenant, user, started, signed=None, credential=None, online=Non
 
 
 RETENTION_STATE = {
-    "switches": [switch("t1", True), switch("t2", False), switch("t3", False, purged="2026-09-20T23:00:00Z")],
+    "switches": [switch("t1", True), switch("t2", False), switch("t3", False, purged="2026-09-20T23:00:00Z"),
+                 switch("t4", True)],
     "progress": [
         progress_row("t1", "olga", "2026-09-07T00:30:00Z", "2026-09-07T00:31:00Z", "2026-09-07T00:40:00Z"),
         progress_row("t1", "pavel", "2026-09-07T00:30:01Z", "2026-09-07T00:31:00Z"),
@@ -593,8 +596,37 @@ RETENTION_STATE = {
     ],
     "transferDaily": [transfer_row("t1", "2026-03-25", 7), transfer_row("t1", "2026-03-26", 5),
                       transfer_row("t1", "2026-09-21", 1), transfer_row("t2", "2026-09-20", 6),
-                      transfer_row("t3", "2026-09-20", 9)],  # t3: a straggler written after the purge
+                      transfer_row("t3", "2026-09-20", 9),  # t3: a straggler written after the purge
+                      transfer_row("t4", "2026-09-20", 4)],
 }
+
+ROOT4 = actor("t4", "root4", "ADMIN")
+
+RETENTION_OPS = [
+    {"op": "sweep", "at": "2026-09-21T00:30:00Z"},
+    {"op": "checkpoint", "at": "2026-09-21T00:30:00Z"},
+    # t4 purges while collecting, keeps collecting, then switches off without purging: what was
+    # collected after the purge stays until it ages out, the sweep does not take it.
+    {"op": "purge", "at": "2026-09-21T01:00:00Z", "actor": ROOT4},
+    {"op": "ingest", "at": "2026-09-21T02:00:00Z", "actor": actor("t4", "uma"),
+     "bodyText": body([SAMPLE, ev("link", "cloud", "gt512m", "first", "failure")])},
+    m("2026-09-21T02:10:00Z", "t4", "vera", "account_created"),
+    m("2026-09-21T02:25:00Z", "t4", "vera", "service_published"),
+    m("2026-09-21T02:30:00Z", "t4", "walt", "account_created"),
+    {"op": "putSettings", "at": "2026-09-21T03:00:00Z", "actor": ROOT4, "body": DISABLE},  # clears purgedAt
+    {"op": "sweep", "at": "2026-09-21T03:30:00Z"},  # also expires pavel's window (00:30:01)
+    {"op": "summary", "at": "2026-09-21T03:30:00Z", "actor": ROOT4, "query": {"from": "2026-09-21", "to": "2026-09-21"}},
+    {"op": "checkpoint", "at": "2026-09-21T03:30:00Z"},
+    # Switch off and purge, in that order as the admin page does: the mark survives the switch-off,
+    # and a repeated switch-off changes nothing, so later sweeps keep removing stragglers.
+    {"op": "putSettings", "at": "2026-09-21T04:00:00Z", "actor": ROOT4, "body": ENABLE},
+    {"op": "ingest", "at": "2026-09-21T04:00:00Z", "actor": actor("t4", "uma"), "bodyText": body([SAMPLE])},
+    {"op": "putSettings", "at": "2026-09-21T04:10:00Z", "actor": ROOT4, "body": DISABLE},
+    {"op": "purge", "at": "2026-09-21T04:10:00Z", "actor": ROOT4},
+    {"op": "putSettings", "at": "2026-09-21T04:15:00Z", "actor": ROOT4, "body": DISABLE},
+    {"op": "sweep", "at": "2026-09-21T04:30:00Z"},
+    {"op": "checkpoint", "at": "2026-09-21T04:30:00Z"},
+]
 
 SCENARIOS = [
     {"name": "onboarding-funnel", "limits": DEFAULT_LIMITS, "initialState": {}, "ops": ONBOARDING_OPS},
@@ -602,8 +634,7 @@ SCENARIOS = [
     {"name": "per-user-rate-limit", "limits": DEFAULT_LIMITS, "initialState": {}, "ops": RATE_OPS},
     {"name": "per-tenant-rate-limit", "limits": {"perUserEventsPerMinute": 30, "perTenantEventsPerMinute": 50},
      "initialState": {}, "ops": TENANT_RATE_OPS},
-    {"name": "retention-sweep", "limits": DEFAULT_LIMITS, "initialState": RETENTION_STATE,
-     "ops": [{"op": "sweep", "at": "2026-09-21T00:30:00Z"}, {"op": "checkpoint", "at": "2026-09-21T00:30:00Z"}]},
+    {"name": "retention-sweep", "limits": DEFAULT_LIMITS, "initialState": RETENTION_STATE, "ops": RETENTION_OPS},
 ]
 
 
@@ -730,13 +761,42 @@ def check_tenant_rates(results):
 
 
 def check_retention(results):
-    state = results[-1]["state"]
+    def switch_of(state, tenant):
+        return next(row for row in state["switches"] if row["tenantId"] == tenant)
+
+    def rows_of(state, table, tenant):
+        return [row for row in state[table] if row["tenantId"] == tenant]
+
+    state = results[1]["state"]
     assert state["progress"] == [progress_row("t1", "pavel", "2026-09-07T00:30:01Z", "2026-09-07T00:31:00Z")]
     assert [(r["tenantId"], r["cohortDay"], r["reachedStep"], r["users"]) for r in state["onboardingDaily"]] == [
         ("t1", "2026-03-26", "signed_in", 1), ("t1", "2026-09-07", "credential_created", 1),
         ("t2", "2026-09-01", "signed_in", 4)]
     assert [(r["tenantId"], r["day"], r["count"]) for r in state["transferDaily"]] == [
-        ("t1", "2026-03-26", 5), ("t1", "2026-09-21", 1), ("t2", "2026-09-20", 6)]
+        ("t1", "2026-03-26", 5), ("t1", "2026-09-21", 1), ("t2", "2026-09-20", 6), ("t4", "2026-09-20", 4)]
+
+    assert results[2] == {"status": 200, "body": {"purged": True, "enabled": True}}
+    assert [r.get("effect") for r in results[4:7]] == ["started", "completed", "started"]
+    assert results[7]["body"]["enabled"] is False and results[7]["body"]["updatedAt"] == "2026-09-21T03:00:00Z"
+    kept = results[10]["state"]
+    assert switch_of(kept, "t4")["purgedAt"] is None, kept
+    assert rows_of(kept, "progress", "t4") == []  # walt's progress went with the switch-off
+    assert [(r["day"], r["mode"], r["outcome"], r["count"]) for r in rows_of(kept, "transferDaily", "t4")] == [
+        ("2026-09-21", "device", "success", 1), ("2026-09-21", "link", "failure", 1)]
+    assert [(r["cohortDay"], r["reachedStep"], r["durationBucket"], r["users"])
+            for r in rows_of(kept, "onboardingDaily", "t4")] == [("2026-09-21", "service_published", "10m-30m", 1)]
+    assert ("t1", "2026-09-07", "signed_in", "none") in [
+        (r["tenantId"], r["cohortDay"], r["reachedStep"], r["durationBucket"]) for r in kept["onboardingDaily"]]
+    summary = results[9]["body"]
+    assert summary["enabled"] is False and summary["onboarding"]["completed"] == 1
+    assert (summary["transfers"]["total"]["success"], summary["transfers"]["total"]["failure"]) == (1, 1)
+
+    assert results[14] == {"status": 200, "body": {"purged": True, "enabled": False}}
+    assert results[15]["body"]["updatedAt"] == "2026-09-21T04:10:00Z"  # unchanged by the repeated switch-off
+    final = results[-1]["state"]
+    assert {k: v for k, v in switch_of(final, "t4").items() if k != "updatedBy"} == {
+        "tenantId": "t4", "enabled": False, "updatedAt": "2026-09-21T04:10:00Z", "purgedAt": "2026-09-21T04:10:00Z"}
+    assert rows_of(final, "transferDaily", "t4") == [] and rows_of(final, "onboardingDaily", "t4") == []
 
 
 CHECKS = {"onboarding-funnel": check_onboarding, "transfer-outcomes": check_transfers,

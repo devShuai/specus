@@ -11,8 +11,11 @@
  * it. The digest is the one Java keys its specus_client_auth_nonce rows by:
  * SHA-256(hex(SHA-256(apiKey)) + "\n" + nonce).
  *
- * The store lives in process memory with a fixed capacity. When every slot holds a digest that
- * has not expired, a new pair is refused rather than evicting one that may still be replayed.
+ * With a database the pairs are kept in Java's specus_client_auth_nonce table, so a restart does
+ * not forget them and instances sharing the database file share them. Without one (only the
+ * environment-configured client) the store lives in process memory with a fixed capacity: when
+ * every slot holds a digest that has not expired, a new pair is refused rather than evicting one
+ * that may still be replayed.
  */
 #define ST_CLIENT_AUTH_NONCE_TTL_MS 120000LL
 #define ST_CLIENT_AUTH_NONCE_CAPACITY 65536U
@@ -32,6 +35,15 @@ st_client_auth_nonce_result st_client_auth_nonce_consume(const char *api_key,
                                                          const char *nonce,
                                                          int64_t now_ms,
                                                          int64_t *retry_after_seconds);
+
+/*
+ * The same check against the database at database_path (st_storage_consume_client_auth_nonce);
+ * UNAVAILABLE when the database fails, so a login fails closed.
+ */
+st_client_auth_nonce_result st_client_auth_nonce_consume_stored(const char *database_path,
+                                                                const char *api_key,
+                                                                const char *nonce,
+                                                                int64_t now_ms);
 
 /* Digests currently held, expired ones not yet reclaimed included. For tests and diagnostics. */
 size_t st_client_auth_nonce_tracked(void);

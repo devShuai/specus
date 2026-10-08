@@ -1120,6 +1120,143 @@ static int run_domain_policy_edges(void)
     return failures;
 }
 
+/*
+ * The IPv6 spelling against the ipv6Prefixes section of peer-egress-rules-v1.json, which the clients,
+ * the other servers and the admin page read too: each accepted text reads as the stated address and
+ * length and is stored as the canonical address (with the length only when written); each refused
+ * text is refused by the parser and by the management normalisation alike.
+ */
+static int run_ipv6_prefixes(const char *vector)
+{
+    char *section = st_json_get_top_level_raw(vector, "ipv6Prefixes");
+    char **accept = NULL;
+    char **reject = NULL;
+    size_t accept_len = 0U;
+    size_t reject_len = 0U;
+    int failures = 0;
+    if (section == NULL || st_json_get_raw_array(section, "accept", &accept, &accept_len) != 0 || accept_len == 0U
+        || st_json_get_raw_array(section, "reject", &reject, &reject_len) != 0 || reject_len == 0U) {
+        fprintf(stderr, "rules vector carried no ipv6Prefixes\n");
+        failures++;
+    }
+    for (size_t i = 0U; i < accept_len; i++) {
+        char *text = st_json_get_string(accept[i], "text");
+        char *address = st_json_get_string(accept[i], "address");
+        int length = -1;
+        st_json_get_int(accept[i], "prefixLength", &length);
+        st_egress_cidr6 cidr;
+        int had_length = 0;
+        char formatted[64] = {0};
+        if (text == NULL || address == NULL || st_egress_parse_cidr6(text, &cidr, &had_length) != 0) {
+            fprintf(stderr, "ipv6Prefixes accept %zu: %s refused\n", i, text == NULL ? "(missing)" : text);
+            failures++;
+        } else {
+            st_egress_format_address6(cidr.network, formatted, sizeof(formatted));
+            if (strcmp(formatted, address) != 0 || cidr.prefix_length != length) {
+                fprintf(stderr, "ipv6Prefixes %s: read as %s/%d, want %s/%d\n", text, formatted,
+                        cidr.prefix_length, address, length);
+                failures++;
+            }
+            char want[96];
+            if (had_length) {
+                snprintf(want, sizeof(want), "[{\"cidr\":\"%s/%d\",\"protocols\":[],\"portRanges\":[]}]", address, length);
+            } else {
+                snprintf(want, sizeof(want), "[{\"cidr\":\"%s\",\"protocols\":[],\"portRanges\":[]}]", address);
+            }
+            char request[128];
+            snprintf(request, sizeof(request), "[{\"cidr\":\"%s\"}]", text);
+            char *stored = NULL;
+            if (st_egress_normalize_destination_rules(request, &stored) != 0 || stored == NULL
+                || strcmp(stored, want) != 0) {
+                fprintf(stderr, "ipv6Prefixes %s: stored %s, want %s\n", text,
+                        stored == NULL ? "(refused)" : stored, want);
+                failures++;
+            }
+            free(stored);
+        }
+        free(text);
+        free(address);
+    }
+    for (size_t i = 0U; i < reject_len; i++) {
+        char *text = st_json_get_string(reject[i], "text");
+        st_egress_cidr6 cidr;
+        if (text == NULL || st_egress_parse_cidr6(text, &cidr, NULL) == 0) {
+            fprintf(stderr, "ipv6Prefixes reject %zu: %s read\n", i, text == NULL ? "(missing)" : text);
+            failures++;
+        }
+        free(text);
+    }
+    st_json_free_string_array(accept, accept_len);
+    st_json_free_string_array(reject, reject_len);
+    free(section);
+    return failures;
+}
+
+/*
+ * The IPv6 lists this build enforces are the ones the ipv6 section of the authorization vector
+ * states, entry for entry, and each entry holds against the broad ::/0 rule in its policy.
+ */
+static int run_ipv6_forced_deny(const char *section)
+{
+    char *policy_raw = st_json_get_top_level_raw(section, "policy");
+    st_egress_policy policy;
+    if (policy_raw == NULL || load_policy(policy_raw, &policy) != 0) {
+        fprintf(stderr, "ipv6 authorization policy did not load\n");
+        free(policy_raw);
+        return 1;
+    }
+    free(policy_raw);
+    st_egress_context context;
+    st_egress_context_init(&context);
+
+    struct {
+        const char *key;
+        const char *const *cidrs;
+        size_t cidrs_len;
+        int forced;
+    } lists[] = {
+        { "forcedDenyCidrs", ST_EGRESS_FORCED_DENY_CIDRS6, 0U, 1 },
+        { "cloudMetadataCidrs", ST_EGRESS_CLOUD_METADATA_CIDRS6, 0U, 1 },
+        { "lanCidrs", ST_EGRESS_LAN_CIDRS6, 0U, 0 },
+    };
+    lists[0].cidrs_len = ST_EGRESS_FORCED_DENY_CIDRS6_LEN;
+    lists[1].cidrs_len = ST_EGRESS_CLOUD_METADATA_CIDRS6_LEN;
+    lists[2].cidrs_len = ST_EGRESS_LAN_CIDRS6_LEN;
+    int failures = 0;
+    for (size_t k = 0U; k < sizeof(lists) / sizeof(lists[0]); k++) {
+        char **entries = NULL;
+        size_t entries_len = 0U;
+        if (st_json_get_string_array(section, lists[k].key, &entries, &entries_len) != 0
+            || entries_len != lists[k].cidrs_len) {
+            fprintf(stderr, "ipv6 %s: %zu entries, this build has %zu\n", lists[k].key, entries_len, lists[k].cidrs_len);
+            st_json_free_string_array(entries, entries_len);
+            failures++;
+            continue;
+        }
+        for (size_t i = 0U; i < entries_len; i++) {
+            if (strcmp(entries[i], lists[k].cidrs[i]) != 0) {
+                fprintf(stderr, "ipv6 %s[%zu]: %s, vector says %s\n", lists[k].key, i, lists[k].cidrs[i], entries[i]);
+                failures++;
+            }
+            st_egress_cidr6 cidr;
+            if (!lists[k].forced || st_egress_parse_cidr6(entries[i], &cidr, NULL) != 0) {
+                continue;
+            }
+            st_egress_request request;
+            memset(&request, 0, sizeof(request));
+            request.consumer_client_id = 1;
+            st_egress_format_address6(cidr.network, request.destination_ip, sizeof(request.destination_ip));
+            request.destination_port = 443;
+            snprintf(request.protocol, sizeof(request.protocol), "tcp");
+            st_egress_decision decision;
+            st_egress_authorize(&request, &policy, 1, &context, &decision);
+            failures += expect_code(entries[i], decision.code, ST_EGRESS_CODE_FORBIDDEN_DESTINATION);
+        }
+        st_json_free_string_array(entries, entries_len);
+    }
+    return failures;
+}
+
 int main(void)
 {
     char *authz = read_vector("peer-egress-authz-v1.json");
@@ -1138,8 +1275,20 @@ int main(void)
     failures += run_policy_variants(authz);
     failures += run_cross_language_sweep(authz);
     failures += run_forced_deny_cases(authz);
+    char *authz_ipv6 = st_json_get_top_level_raw(authz, "ipv6");
+    if (authz_ipv6 == NULL) {
+        fprintf(stderr, "authorization vector carried no ipv6 section\n");
+        failures++;
+    } else {
+        /* The same replays as for IPv4, over the section's own policy and cases. */
+        failures += run_authorization_cases(authz_ipv6);
+        failures += run_policy_variants(authz_ipv6);
+        failures += run_ipv6_forced_deny(authz_ipv6);
+        free(authz_ipv6);
+    }
     failures += run_rule_matching(rules);
     failures += run_rule_validation(rules);
+    failures += run_ipv6_prefixes(rules);
     failures += run_parser_boundaries();
     failures += run_storage_round_trip();
     failures += run_domain_target_declaration();

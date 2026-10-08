@@ -46,12 +46,31 @@ add_library(specus_c_core
     src/stream_tombstones.c
     src/stun_turn.c
     src/tls_transport.c
+    src/traffic_capture.c
     src/turn_auth.c
+    src/upstream_browser_headers.c
     src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
 target_compile_options(specus_c_core PRIVATE -Wall -Wextra -Wpedantic)
+
+# libbrotlidec is optional: with it, Content-Encoding br is decoded as Java's org.brotli:dec does
+# (traffic detail previews and display, media manifests); without it a br body stays as stored.
+# libbrotlienc, when present too, lets the tests compress their own br fixtures.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(BROTLIDEC QUIET libbrotlidec)
+    pkg_check_modules(BROTLIENC QUIET libbrotlienc)
+endif()
+if(BROTLIDEC_FOUND)
+    message(STATUS "libbrotlidec found: Content-Encoding br is decoded")
+    target_compile_definitions(specus_c_core PUBLIC ST_HAVE_BROTLI)
+    target_include_directories(specus_c_core PUBLIC ${BROTLIDEC_INCLUDE_DIRS})
+    target_link_libraries(specus_c_core PUBLIC ${BROTLIDEC_LINK_LIBRARIES})
+else()
+    message(STATUS "libbrotlidec not found: Content-Encoding br is not decoded")
+endif()
 
 add_executable(specus-server-c src/main.c)
 target_link_libraries(specus-server-c PRIVATE specus_c_core)
@@ -76,10 +95,36 @@ target_link_libraries(specus_c_github_release_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_github_release_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME github_release_tests COMMAND specus_c_github_release_tests)
 
+# The client catalogue and hosted packages against the Java ClientDownloadLink*/ClientPackage* tests.
+add_executable(specus_c_client_package_tests tests/client_package_tests.c)
+target_link_libraries(specus_c_client_package_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_package_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_package_tests COMMAND specus_c_client_package_tests)
+
 add_executable(specus_c_client_address_tests tests/client_address_tests.c)
 target_link_libraries(specus_c_client_address_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_address_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_address_tests COMMAND specus_c_client_address_tests)
+
+add_executable(specus_c_semantic_version_tests tests/semantic_version_tests.c)
+target_link_libraries(specus_c_semantic_version_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_semantic_version_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME semantic_version_tests COMMAND specus_c_semantic_version_tests)
+
+add_executable(specus_c_traffic_capture_tests tests/traffic_capture_tests.c)
+target_link_libraries(specus_c_traffic_capture_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_capture_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_capture_tests COMMAND specus_c_traffic_capture_tests)
+
+add_executable(specus_c_turnstile_verifier_tests tests/turnstile_verifier_tests.c)
+target_link_libraries(specus_c_turnstile_verifier_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_turnstile_verifier_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME turnstile_verifier_tests COMMAND specus_c_turnstile_verifier_tests)
+
+add_executable(specus_c_upstream_browser_headers_tests tests/upstream_browser_headers_tests.c)
+target_link_libraries(specus_c_upstream_browser_headers_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_upstream_browser_headers_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME upstream_browser_headers_tests COMMAND specus_c_upstream_browser_headers_tests)
 
 add_executable(specus_c_client_auth_nonce_tests tests/client_auth_nonce_tests.c)
 target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)
@@ -100,6 +145,11 @@ add_test(NAME crypto_tests COMMAND specus_c_crypto_tests)
 
 add_executable(specus_c_decompression_limits_tests tests/decompression_limits_tests.c)
 target_link_libraries(specus_c_decompression_limits_tests PRIVATE specus_c_core)
+if(BROTLIDEC_FOUND AND BROTLIENC_FOUND)
+    target_compile_definitions(specus_c_decompression_limits_tests PRIVATE ST_HAVE_BROTLI_ENCODER)
+    target_include_directories(specus_c_decompression_limits_tests PRIVATE ${BROTLIENC_INCLUDE_DIRS})
+    target_link_libraries(specus_c_decompression_limits_tests PRIVATE ${BROTLIENC_LINK_LIBRARIES})
+endif()
 target_compile_options(specus_c_decompression_limits_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME decompression_limits_tests COMMAND specus_c_decompression_limits_tests)
 
@@ -110,6 +160,55 @@ add_test(NAME elasticsearch_traffic_tests
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/elasticsearch_traffic_test.sh
                  $<TARGET_FILE:specus_c_elasticsearch_traffic_tests>)
 set_tests_properties(elasticsearch_traffic_tests PROPERTIES TIMEOUT 45)
+
+# The traffic detail API against Java's semantics: search over Elasticsearch through an in-process
+# admin listener, TCP capture from a real server process through the write queue, and the stream
+# contract and large pages on SQLite. Runs against the same fake Elasticsearch.
+add_executable(specus_c_traffic_detail_api_tests tests/traffic_detail_api_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_traffic_detail_api_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_traffic_detail_api_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME traffic_detail_api_tests
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/elasticsearch_traffic_test.sh
+                 $<TARGET_FILE:specus_c_traffic_detail_api_tests> $<TARGET_FILE:specus-server-c>)
+set_tests_properties(traffic_detail_api_tests PROPERTIES TIMEOUT 180)
+
+# protocol/spec/client-messages.md on a real server process (admin to client, client to every
+# session of an administrator, a disabled sender) and a failed write on an in-process listener.
+add_executable(specus_c_client_messages_tests tests/client_messages_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_client_messages_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_messages_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_messages_tests
+    COMMAND specus_c_client_messages_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(client_messages_tests PROPERTIES TIMEOUT 120)
+
+# Management lists with more rows than the arrays C used to read them into, over real HTTP.
+add_executable(specus_c_management_lists_tests tests/management_lists_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_lists_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_lists_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_lists_tests COMMAND specus_c_management_lists_tests)
+set_tests_properties(management_lists_tests PROPERTIES TIMEOUT 180)
+
+# Registration, /me, credentials, mappings, name availability, initialize and traffic usage against Java.
+add_executable(specus_c_management_crud_tests tests/management_crud_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_crud_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_crud_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_crud_tests COMMAND specus_c_management_crud_tests)
+
+# The Peer Mesh / Egress management endpoints, Spring-converted parameters, mapping create, times.
+add_executable(specus_c_peer_mesh_api_tests tests/peer_mesh_api_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_peer_mesh_api_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_peer_mesh_api_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME peer_mesh_api_tests COMMAND specus_c_peer_mesh_api_tests)
+set_tests_properties(peer_mesh_api_tests PROPERTIES TIMEOUT 120)
+set_tests_properties(management_crud_tests PROPERTIES TIMEOUT 120)
+
+# Java OverviewService on a real server process: clients, logins and public connection counters.
+add_executable(specus_c_management_overview_tests tests/management_overview_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_management_overview_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_overview_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME management_overview_tests
+    COMMAND specus_c_management_overview_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(management_overview_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_http_share_tests tests/http_share_tests.c)
 target_link_libraries(specus_c_http_share_tests PRIVATE specus_c_core)
@@ -174,7 +273,17 @@ add_test(NAME peer_egress_tests COMMAND specus_c_peer_egress_tests)
 add_executable(specus_c_peer_mesh_tests tests/peer_mesh_tests.c)
 target_link_libraries(specus_c_peer_mesh_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_peer_mesh_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_peer_mesh_tests PRIVATE
+    ST_EGRESS_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME peer_mesh_tests COMMAND specus_c_peer_mesh_tests)
+
+# Peer Mesh control messages (egress-report) over a real control connection of a real server process.
+add_executable(specus_c_peer_mesh_e2e_tests tests/peer_mesh_e2e_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_peer_mesh_e2e_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_peer_mesh_e2e_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME peer_mesh_e2e_tests
+    COMMAND specus_c_peer_mesh_e2e_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(peer_mesh_e2e_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_public_coordination_tests tests/public_coordination_tests.c)
 target_link_libraries(specus_c_public_coordination_tests PRIVATE specus_c_core)
@@ -186,6 +295,22 @@ add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 45)
+# The STCE envelope and the cluster identifiers against protocol/test-vectors/public-transfer-cluster-v2.json
+# (Java PublicTransferClusterFrameTests and PublicTransferCoordinationServiceTests).
+add_executable(specus_c_public_cluster_codec_tests tests/public_cluster_codec_tests.c)
+target_link_libraries(specus_c_public_cluster_codec_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_public_cluster_codec_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_public_cluster_codec_tests PRIVATE
+    ST_CLUSTER_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/public-transfer-cluster-v2.json")
+add_test(NAME public_cluster_codec_tests COMMAND specus_c_public_cluster_codec_tests)
+# Discovery, the STWR2 relay, WebSocket tickets and public rooms over loopback HTTP and WebSocket
+# (Java PublicTransferDiscoveryWebSocketHandlerTests, PublicTransferRelayFrameTests,
+# WebSocketTicketServiceTests, PublicTransferRoomResourceTests, PublicTransferRoomServiceTests).
+add_executable(specus_c_public_transfer_tests tests/public_transfer_tests.c)
+target_link_libraries(specus_c_public_transfer_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_public_transfer_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME public_transfer_tests COMMAND specus_c_public_transfer_tests)
+set_tests_properties(public_transfer_tests PROPERTIES TIMEOUT 120)
 
 # The shared product metrics vector through the real request handling, the write-path hooks, and a
 # real server process (client_online on a control login, the HTTP layer's body hand-over).
@@ -218,9 +343,60 @@ add_test(NAME security_baseline_tests COMMAND specus_c_security_baseline_tests)
 add_executable(specus_c_session_lifecycle_tests tests/session_lifecycle_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_session_lifecycle_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_session_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_session_lifecycle_tests PRIVATE
+    ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
 add_test(NAME session_lifecycle_tests
     COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
+
+# Java SecurityRulesTests on a real server process: public transfer grants and callbacks, the public
+# HTTP entry against foreign tokens and portal headers, the portal policy and the cloud diagram API.
+add_executable(specus_c_security_rules_tests tests/security_rules_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_security_rules_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_security_rules_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME security_rules_tests
+    COMMAND specus_c_security_rules_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(security_rules_tests PROPERTIES TIMEOUT 120)
+
+# Java HttpWebSocketRoutingTests on a real server process: how /http/** splits WebSocket upgrades
+# from plain requests, raw query characters, and the public route runtime asset.
+add_executable(specus_c_http_websocket_routing_tests tests/http_websocket_routing_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_websocket_routing_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_websocket_routing_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_websocket_routing_tests PRIVATE
+    ST_ADMIN_WEB_PUBLIC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../apps/admin-web/public")
+add_test(NAME http_websocket_routing_tests
+    COMMAND specus_c_http_websocket_routing_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_websocket_routing_tests PROPERTIES TIMEOUT 120)
+
+# Java ConnectionArchiveServiceTests on a real server process: the scheduled monthly archive.
+add_executable(specus_c_connection_archive_tests tests/connection_archive_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connection_archive_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connection_archive_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connection_archive_tests
+    COMMAND specus_c_connection_archive_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connection_archive_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_http_route_lifecycle_tests tests/http_route_lifecycle_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_route_lifecycle_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_route_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_route_lifecycle_tests PRIVATE
+    ST_ROUTE_LIFECYCLE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/http-route-lifecycle-v1.json")
+add_test(NAME http_route_lifecycle_tests
+    COMMAND specus_c_http_route_lifecycle_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_route_lifecycle_tests PROPERTIES TIMEOUT 180)
+
+# More than 64 TCP mappings and HTTP routes on one client, and the NAT_CONTROL message limit, on a
+# real server process: login answer, NAT_CONTROL, runtime push, client detail and lists; and a
+# configuration already past the limit (nat-control-size-v1.json existingOversize).
+add_executable(specus_c_client_route_scale_tests tests/client_route_scale_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_client_route_scale_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_route_scale_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_client_route_scale_tests PRIVATE
+    ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
+add_test(NAME client_route_scale_tests
+    COMMAND specus_c_client_route_scale_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(client_route_scale_tests PROPERTIES TIMEOUT 180)
 
 add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)
@@ -245,6 +421,13 @@ target_compile_options(specus_c_workbench_tests PRIVATE -Wall -Wextra -Wpedantic
 target_compile_definitions(specus_c_workbench_tests PRIVATE
     ST_WORKBENCH_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/service-workbench-v1.json")
 add_test(NAME workbench_tests COMMAND specus_c_workbench_tests)
+
+add_executable(specus_c_management_accounts_tests tests/management_accounts_tests.c)
+target_link_libraries(specus_c_management_accounts_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_management_accounts_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_management_accounts_tests PRIVATE
+    ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/management-accounts-v1.json")
+add_test(NAME management_accounts_tests COMMAND specus_c_management_accounts_tests)
 
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)

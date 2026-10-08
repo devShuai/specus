@@ -127,21 +127,24 @@ public class DirectHttpForwarderTests
     }
 
     [Fact]
-    public async Task ApplyRoutes_PreservesMissingSnapshotAndClearsEmptySnapshotLikeJava()
+    public async Task ApplyRoutes_ClearsTheTableOnMissingAndEmptySnapshots()
     {
         await using var stream = new MemoryStream();
         await using var writer = new FrameWriter(stream);
         using var http = new HttpClient();
+        var web = new[] { new HttpSpecusConfigEntry { Route = "web", TargetBaseUrl = "http://127.0.0.1:8080" } };
         var handler = new DirectHttpHandler(
-            new[] { new HttpSpecusConfigEntry { Route = "web", TargetBaseUrl = "http://127.0.0.1:8080" } },
+            web,
             writer,
             new DirectHttpForwarder(http),
             NullLogger<DirectHttpHandler>.Instance);
 
+        // No client defines routes locally, so a missing snapshot has nothing to keep.
         handler.ApplyRoutes(null);
 
-        Assert.True(handler.SnapshotRoutes().ContainsKey("web"));
+        Assert.Empty(handler.SnapshotRoutes());
 
+        handler.ApplyRoutes(web);
         handler.ApplyRoutes(Array.Empty<HttpSpecusConfigEntry>());
 
         Assert.Empty(handler.SnapshotRoutes());

@@ -707,7 +707,7 @@ public sealed class SpecusControlClient : IAsyncDisposable
         }
     }
 
-    private async Task ApplyNatControlAsync(
+    internal async Task ApplyNatControlAsync(
         string payload, NatClientHandler nat, DirectHttpHandler directHttp)
     {
         if (string.IsNullOrWhiteSpace(payload))
@@ -728,6 +728,8 @@ public sealed class SpecusControlClient : IAsyncDisposable
         {
             return;
         }
+        // Every NAT_CONTROL is the full snapshot: the route table and the displayed routes are both
+        // replaced, and a missing or null HTTP list (read as empty) clears them.
         await nat.ApplyConfigAsync(snapshot.SpecusConfigList).ConfigureAwait(false);
         directHttp.ApplyRoutes(snapshot.HttpSpecusConfigList);
         PublishRoutes(snapshot.SpecusConfigList, snapshot.HttpSpecusConfigList);
