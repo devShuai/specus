@@ -1173,8 +1173,9 @@ static int test_workbench_cascades(void)
         || response.status != 204 || count_rows("http-route", 11) != 0;
     failures += call("DELETE", "/api/admin/specus-mappings/12", alice, NULL, buffer, sizeof(buffer), &response) != 0
         || response.status != 204 || count_rows("tcp-mapping", 12) != 0;
+    /* Java's Peer service delete is a void handler: 200 with no body. */
     failures += call("DELETE", "/api/admin/peer-mesh/services/13", root, NULL, buffer, sizeof(buffer), &response) != 0
-        || response.status != 204 || count_rows("peer-service", 13) != 0;
+        || response.status != 200 || count_rows("peer-service", 13) != 0;
     failures += count_rows("http-route", 21) != 2 || count_rows("http-route", 31) != 4;
     if (failures != 0) {
         fprintf(stderr, "object deletions did not cascade: %s\n", buffer);

@@ -234,9 +234,17 @@ static int test_me(void)
         || expect("GET", "/api/admin/me", NULL, user_token, 200, "\"username\":\"crud-user\"") != 0
         || strstr(last_body, "\"builtIn\":false") == NULL || strstr(last_body, "\"admin\":false") == NULL;
     if (!failed) {
+        /* The account row's time, shown as Java's Instant.toString shows it. */
+        char instant[64];
+        snprintf(instant, sizeof(instant), "%s", user.created_at);
+        if (strlen(instant) == 19U && instant[10] == ' ') {
+            instant[10] = 'T';
+            instant[19] = 'Z';
+            instant[20] = '\0';
+        }
         char expected[160];
-        snprintf(expected, sizeof(expected), "\"createdAt\":\"%s\"", user.created_at);
-        failed = user.created_at[0] == '\0' || strstr(last_body, expected) == NULL;
+        snprintf(expected, sizeof(expected), "\"createdAt\":\"%s\"", instant);
+        failed = user.created_at[0] == '\0' || !is_instant(instant) || strstr(last_body, expected) == NULL;
     }
     if (failed) fprintf(stderr, "me: %s\n", last_body == NULL ? "" : last_body);
     printf("%s /api/admin/me as Java currentUser\n", failed ? "FAIL" : "ok  ");
