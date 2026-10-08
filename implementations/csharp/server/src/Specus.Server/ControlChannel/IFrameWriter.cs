@@ -10,7 +10,9 @@ namespace Specus.Server.ControlChannel;
 public interface IFrameWriter
 {
     /// <summary>Encode + flush one packet. Awaiting completes once the bytes are in the
-    /// socket layer (network may still buffer). Throws if the connection is already closed.</summary>
+    /// socket layer (network may still buffer). Throws if the connection is already closed.
+    /// <paramref name="cancellationToken"/> can only drop the packet before it starts going out; a
+    /// frame is never cut short by it, and one whose write fails closes the connection.</summary>
     ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default);
 
     /// <summary>Queues a small flow-control frame so a blocked DATA write cannot stop reads.</summary>

@@ -218,6 +218,12 @@ struct specus_session {
      */
     server_config config;
     pthread_mutex_t send_lock;
+    /*
+     * Set under send_lock once a write on the connection failed. The write may have stopped partway
+     * through a frame, the socket having a write timeout, and anything written after it would be read
+     * out of step, so nothing is written again (see session_send_packet_locked).
+     */
+    int write_failed;
     pthread_mutex_t map_lock;
     pthread_mutex_t direct_lock;
     pthread_cond_t reference_cond;
@@ -1312,17 +1318,44 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
     return 0;
 }
 
-/* Writes a packet on a connection whose send_lock the caller already holds. */
+/*
+ * Writes a packet on a connection whose send_lock the caller already holds.
+ *
+ * A write that fails, because the peer is gone or because the write timeout ran out, may have put
+ * part of the frame on the wire; any frame after it would be read out of step. The connection is
+ * then never written again: write_failed turns every later write away, and the socket is shut down
+ * so the connection's own thread wakes from its read, records IO_ERROR and closes it ("帧写入失败"
+ * in protocol/spec/control-protocol.md). This may run on any thread that sends; only shutting the
+ * socket down here, under send_lock, is safe, since session_shutdown closes the descriptor under
+ * the same lock and its number cannot have been reused yet.
+ */
 static int session_send_packet_locked(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
-    if (packet->data != NULL && session->control_fd >= 0) {
+    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed) {
         rc = session->tls_connection == NULL
             ? send_all(session->control_fd, packet->data, packet->len)
             : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
+        if (rc != 0) {
+            int write_errno = errno;
+            session->write_failed = 1;
+            shutdown(session->control_fd, SHUT_RDWR);
+            fprintf(stderr, "[%s] write failed remote=%s client=%s errno=%d: closing the connection\n",
+                    session->is_data_connection ? "data" : "control", session->remote,
+                    session->config.client_name, write_errno);
+        }
     }
     st_buffer_free(packet);
     return rc;
+}
+
+/* Whether a write on the connection has failed, which shut it down (session_send_packet_locked). */
+static int session_write_failed(specus_session *session)
+{
+    pthread_mutex_lock(&session->send_lock);
+    int failed = session->write_failed;
+    pthread_mutex_unlock(&session->send_lock);
+    return failed;
 }
 
 static int session_send_packet(specus_session *session, st_buffer *packet)
@@ -2786,9 +2819,9 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
             result = ST_ADMIN_NAT_CONTROL_NOT_SENT;
         } else if (session_send_packet(control, &packet) != 0) {
             /*
-             * The connection is closed, reset or no longer writable: the client is as good as offline,
-             * and the manual push answers it as one. See "NAT_CONTROL 写失败与数据库错误" in
-             * protocol/spec/control-protocol.md.
+             * The connection is closed, reset or no longer writable, and a write that failed here has
+             * shut it down: the client is as good as offline, and the manual push answers it as one.
+             * See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
              */
             fprintf(stderr, "[nat-control] runtime push to %s failed: its control connection cannot be written\n",
                     client_name);
@@ -5002,6 +5035,13 @@ static void *client_thread(void *arg)
         uint8_t *body = NULL;
         size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
         int rc = read_frame(session, frame_limit, &header, &body);
+        if (rc != 1 && session_write_failed(session)) {
+            /* A failed write, on whichever thread sent it, shut the socket down and so ended the read. */
+            disconnect_reason = "IO_ERROR";
+            fprintf(stderr, "[%s] closed %s after a failed write\n",
+                    session->is_data_connection ? "data" : "control", session->remote);
+            break;
+        }
         if (rc == 0) {
             disconnect_reason = "CLIENT_CLOSED";
             printf("[control] closed %s\n", session->remote);
@@ -5129,8 +5169,10 @@ static void *client_thread(void *arg)
                     /*
                      * The control socket has a write timeout, so a failed write may have left half a
                      * frame on the wire: anything written after it, the Peer Mesh push included, would
-                     * be read out of step. The connection is closed instead; the client logs in again
-                     * and gets its configuration then.
+                     * be read out of step. The failed write has already shut the connection down and
+                     * nothing more is written to it; it is closed here rather than after a Peer Mesh
+                     * push that could not go out. The client logs in again and gets its configuration
+                     * then.
                      */
                     fprintf(stderr, "[nat-control] push to %s on login failed: its control connection cannot "
                             "be written; closing it\n", session->config.client_name);
