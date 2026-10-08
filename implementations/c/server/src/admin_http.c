@@ -39,6 +39,7 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -828,6 +829,95 @@ static int admin_query_bool(const char *path, const char *key, int *out)
     return -1;
 }
 
+/*
+ * A Long or Integer request parameter as Spring binds it (NumberUtils.parseNumber): whitespace
+ * anywhere is dropped, an empty value is absent, a decimal or, after an optional '-', a "0x", "0X"
+ * or "#" hexadecimal number in range is the value, and anything else fails the request with 400.
+ * 0 when absent, 1 with *out set, -1 when the value does not convert.
+ */
+static int admin_query_number_param(const char *path, const char *key, long long minimum, long long maximum,
+                                    long long *out)
+{
+    char *raw = admin_query_string(path, key);
+    if (raw == NULL) {
+        return 0;
+    }
+    size_t w = 0U;
+    for (size_t r = 0U; raw[r] != '\0'; ++r) {
+        if (!isspace((unsigned char)raw[r])) {
+            raw[w++] = raw[r];
+        }
+    }
+    raw[w] = '\0';
+    if (w == 0U) {
+        free(raw);
+        return 0;
+    }
+    const char *digits = raw;
+    int negative = 0;
+    int base = 10;
+    if (*digits == '-' || *digits == '+') {
+        negative = *digits == '-';
+        ++digits;
+    }
+    if (raw[0] != '+' && (strncmp(digits, "0x", 2U) == 0 || strncmp(digits, "0X", 2U) == 0)) {
+        digits += 2;
+        base = 16;
+    } else if (raw[0] != '+' && *digits == '#') {
+        digits += 1;
+        base = 16;
+    }
+    unsigned long long magnitude = 0ULL;
+    int ok = *digits != '\0';
+    for (const char *cursor = digits; ok && *cursor != '\0'; ++cursor) {
+        int digit = isdigit((unsigned char)*cursor) ? *cursor - '0'
+            : (base == 16 && isxdigit((unsigned char)*cursor) ? tolower((unsigned char)*cursor) - 'a' + 10 : -1);
+        if (digit < 0 || magnitude > (ULLONG_MAX - (unsigned long long)digit) / (unsigned long long)base) {
+            ok = 0;
+        } else {
+            magnitude = magnitude * (unsigned long long)base + (unsigned long long)digit;
+        }
+    }
+    free(raw);
+    if (!ok || magnitude > (unsigned long long)LLONG_MAX + (negative ? 1ULL : 0ULL)) {
+        return -1;
+    }
+    long long value = negative ? (magnitude == (unsigned long long)LLONG_MAX + 1ULL ? LLONG_MIN
+                                                                                 : -(long long)magnitude)
+                               : (long long)magnitude;
+    if (value < minimum || value > maximum) {
+        return -1;
+    }
+    *out = value;
+    return 1;
+}
+
+/*
+ * The answer to a request Spring rejects before the controller runs: a parameter it cannot convert
+ * (MethodArgumentTypeMismatchException) or a required body that is missing or not the expected JSON
+ * object (HttpMessageNotReadableException). Both are 400, whose Spring Boot error body names the
+ * status as its "error".
+ */
+static int write_spring_bad_request(char *out, size_t out_len)
+{
+    return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"Bad Request\"}");
+}
+
+/*
+ * A request member Jackson binds to an Integer: 0 when the body leaves it out or sends null, 1 with
+ * *value, -2 when it holds something Jackson does not convert (Spring answers 400).
+ */
+static int admin_json_integer_member(const char *body, const char *key, int *value)
+{
+    char *raw = st_json_get_top_level_raw(body, key);
+    int present = raw != NULL && strcmp(raw, "null") != 0;
+    free(raw);
+    if (!present) {
+        return 0;
+    }
+    return st_json_get_int(body, key, value) == 0 ? 1 : -2;
+}
+
 static int admin_parse_port_text(const char *text, int *out)
 {
     if (text == NULL || *text == '\0') {
@@ -1177,6 +1267,68 @@ static int admin_sb_append_nullable_json_string(st_admin_string_builder *builder
         return admin_sb_append(builder, "null");
     }
     return admin_sb_append_json_string(builder, value);
+}
+
+/*
+ * A stored timestamp as Java shows it (Instant.toString). C's tables default created_at and
+ * updated_at to SQLite's CURRENT_TIMESTAMP, "YYYY-MM-DD HH:MM:SS" in UTC, which a browser reads as
+ * local time; Java writes ISO-8601 instants. That form becomes "YYYY-MM-DDTHH:MM:SSZ"; any other
+ * text is shown as stored.
+ */
+static int admin_sb_append_instant(st_admin_string_builder *builder, const char *value)
+{
+    static const char pattern[] = "dddd-dd-dd dd:dd:dd";
+    int sqlite_form = value != NULL && strlen(value) == sizeof(pattern) - 1U;
+    for (size_t i = 0U; sqlite_form && i < sizeof(pattern) - 1U; ++i) {
+        sqlite_form = pattern[i] == 'd' ? isdigit((unsigned char)value[i]) != 0 : value[i] == pattern[i];
+    }
+    if (!sqlite_form) {
+        return admin_sb_append_json_string(builder, value);
+    }
+    char iso[sizeof(pattern) + 1U];
+    memcpy(iso, value, sizeof(pattern) - 1U);
+    iso[10] = 'T';
+    iso[sizeof(pattern) - 1U] = 'Z';
+    iso[sizeof(pattern)] = '\0';
+    return admin_sb_append_json_string(builder, iso);
+}
+
+/* Spring StringUtils.hasText over ASCII: a character that Character.isWhitespace does not match. */
+static int admin_java_has_text(const char *value)
+{
+    for (const unsigned char *cursor = (const unsigned char *)value; cursor != NULL && *cursor != '\0'; ++cursor) {
+        if (*cursor != ' ' && (*cursor < 0x09U || *cursor > 0x0dU) && (*cursor < 0x1cU || *cursor > 0x1fU)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Trims value in place as Java String.trim: every character up to U+0020 at either end. */
+static char *admin_java_trim(char *value)
+{
+    if (value == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(value);
+    size_t start = 0U;
+    while (start < len && (unsigned char)value[start] <= ' ') ++start;
+    while (len > start && (unsigned char)value[len - 1U] <= ' ') --len;
+    memmove(value, value + start, len - start);
+    value[len - start] = '\0';
+    return value;
+}
+
+/* The length Java's String.length() reports for UTF-8 text: UTF-16 code units. */
+static size_t admin_utf16_length(const char *text)
+{
+    size_t count = 0U;
+    for (const unsigned char *cursor = (const unsigned char *)text; cursor != NULL && *cursor != '\0'; ++cursor) {
+        if ((*cursor & 0xc0U) != 0x80U) {
+            count += *cursor >= 0xf0U ? 2U : 1U;
+        }
+    }
+    return count;
 }
 
 /* Grows *items, of item_size bytes each, so that it holds one more than count. */
@@ -3381,6 +3533,27 @@ static int handle_database_initialize(const st_admin_context *context, char *out
     if (init_response != 0) {
         return init_response;
     }
+    /*
+     * Java DatabaseInitializer.initialize(tenant): the demo client goes to the caller's tenant,
+     * owned by the built-in administrator. When another tenant holds the name, Java's insert fails
+     * on the unique client_name and GlobalExceptionHandler answers 400.
+     */
+    if (env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) {
+        char owner[81];
+        snprintf(owner, sizeof(owner), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+        if (*admin_java_trim(owner) == '\0') {
+            snprintf(owner, sizeof(owner), "admin");
+        }
+        int seeded = st_storage_seed_demo_client(database_path, context->tenant_id, owner);
+        if (seeded < 0) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"database initialize failed\"}");
+        }
+        if (seeded > 0) {
+            return write_response(out, out_len, 400, "Bad Request",
+                                  "{\"error\":\"客户端名称已存在或数据不符合约束\"}");
+        }
+    }
     long long clients = 0;
     if (st_storage_count_clients_by_tenant(database_path, context->tenant_id, &clients) != 0) {
         return write_response(out,
@@ -3614,32 +3787,27 @@ static int append_credential_view(st_admin_string_builder *builder, const st_sto
 {
     char *api_key = st_json_escape(credential->api_key);
     char *owner = st_json_escape(credential->owner_username);
-    char *created = st_json_escape(credential->created_at);
-    char *updated = st_json_escape(credential->updated_at);
-    if (api_key == NULL || owner == NULL || created == NULL || updated == NULL) {
+    if (api_key == NULL || owner == NULL) {
         free(api_key);
         free(owner);
-        free(created);
-        free(updated);
         return -1;
     }
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"apiKey\":\"%s\",\"ownerUsername\":\"%s\","
-                              "\"enabled\":%s,\"maxOnlineInstances\":%d,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"enabled\":%s,\"maxOnlineInstances\":%d,\"createdAt\":",
                               credential->id,
                               api_key,
                               owner,
                               credential->enabled ? "true" : "false",
                               credential->max_online_instances <= 0
                                   ? client_auth_default_max_online_instances()
-                                  : credential->max_online_instances,
-                              created,
-                              updated);
+                                  : credential->max_online_instances);
     free(api_key);
     free(owner);
-    free(created);
-    free(updated);
+    if (rc == 0) rc = admin_sb_append_instant(builder, credential->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, credential->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
@@ -3721,20 +3889,15 @@ static int append_mapping_view(st_admin_string_builder *builder, const st_storag
 {
     char *client_name = st_json_escape(mapping->client_name);
     char *target = st_json_escape(mapping->target_address);
-    char *created = st_json_escape(mapping->created_at);
-    char *updated = st_json_escape(mapping->updated_at);
-    if (client_name == NULL || target == NULL || created == NULL || updated == NULL) {
+    if (client_name == NULL || target == NULL) {
         free(client_name);
         free(target);
-        free(created);
-        free(updated);
         return -1;
     }
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"clientId\":%lld,\"clientName\":\"%s\","
                               "\"listenPort\":%d,\"targetAddress\":\"%s\",\"targetPort\":%d,"
-                              "\"enabled\":%s,\"detailCaptureEnabled\":%s,"
-                              "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"enabled\":%s,\"detailCaptureEnabled\":%s,\"createdAt\":",
                               mapping->id,
                               mapping->client_id,
                               client_name,
@@ -3742,13 +3905,13 @@ static int append_mapping_view(st_admin_string_builder *builder, const st_storag
                               target,
                               mapping->target_port,
                               mapping->enabled ? "true" : "false",
-                              mapping->detail_capture_enabled ? "true" : "false",
-                              created,
-                              updated);
+                              mapping->detail_capture_enabled ? "true" : "false");
     free(client_name);
     free(target);
-    free(created);
-    free(updated);
+    if (rc == 0) rc = admin_sb_append_instant(builder, mapping->created_at);
+    if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
+    if (rc == 0) rc = admin_sb_append_instant(builder, mapping->updated_at);
+    if (rc == 0) rc = admin_sb_append(builder, "}");
     return rc;
 }
 
@@ -3984,7 +4147,8 @@ static int append_traffic_usage_view(st_admin_string_builder *builder, const st_
                               usage->download_bytes);
     }
     if (rc == 0) {
-        rc = admin_sb_append_nullable_json_string(builder, usage->updated_at);
+        rc = usage->updated_at[0] == '\0' ? admin_sb_append(builder, "null")
+                                          : admin_sb_append_instant(builder, usage->updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -4040,7 +4204,8 @@ static int append_resource_traffic_usage_view(st_admin_string_builder *builder,
                               usage->download_bytes);
     }
     if (rc == 0) {
-        rc = admin_sb_append_nullable_json_string(builder, usage->updated_at);
+        rc = usage->updated_at[0] == '\0' ? admin_sb_append(builder, "null")
+                                          : admin_sb_append_instant(builder, usage->updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -4625,31 +4790,39 @@ static int build_client_name_availability_response(const st_admin_context *conte
                                                    char *out,
                                                    size_t out_len)
 {
+    /* Spring binds both parameters before the service runs: clientName is required, and
+     * excludeClientId must convert to a Long. */
     char *client_name = admin_query_string(path, "clientName");
-    if (!admin_text_present(client_name)) {
+    long long exclude_id = 0;
+    int exclude = admin_query_number_param(path, "excludeClientId", LLONG_MIN, LLONG_MAX, &exclude_id);
+    if (client_name == NULL || exclude < 0) {
         free(client_name);
-        return write_response(out, out_len, 400, "Bad Request",
-                              "{\"error\":\"clientName is required\"}");
+        return write_spring_bad_request(out, out_len);
     }
-    /* The name as a create or update would store it (Java requireClientName). */
+    /* Java requireClientName: the name as a create or update would store it. */
+    if (!admin_java_has_text(client_name)) {
+        free(client_name);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName cannot be blank\"}");
+    }
     http_route_trim_in_place(client_name);
     if (http_route_text_length(client_name) > 120U) {
         free(client_name);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"clientName is too long\"}");
     }
-    long long exclude_id = 0;
-    (void)admin_query_i64(path, "excludeClientId", &exclude_id);
+    /* Java findClientById: an excluded client the caller cannot see, 0 and negative ids included. */
     const char *database_path = admin_database_path();
     st_storage_client excluded;
-    if (exclude_id > 0 && (database_path == NULL
+    if (exclude > 0 && (database_path == NULL || exclude_id <= 0
         || !admin_load_accessible_client(database_path, context, exclude_id, &excluded))) {
         free(client_name);
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"client not found: %lld\"}", exclude_id);
+        return write_response(out, out_len, 400, "Bad Request", message);
     }
     st_storage_client existing;
     int available = database_path == NULL
         || st_storage_get_client_by_name(database_path, client_name, &existing) != 0
-        || (exclude_id > 0 && existing.id == exclude_id);
+        || (exclude > 0 && existing.id == exclude_id);
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "{\"clientName\":") == 0
         && admin_sb_append_json_string(&builder, client_name) == 0
@@ -6371,6 +6544,15 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
                                                     &existing, &existing_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service import failed\"}");
     }
+    /* Java importCandidates skips the host:port targets this client already publishes, not those
+     * of the tenant's other clients: another client may share the same target. */
+    size_t own_count = 0U;
+    for (size_t i = 0U; i < existing_count; ++i) {
+        if (existing[i].client_id == client.id) {
+            existing[own_count++] = existing[i];
+        }
+    }
+    existing_count = own_count;
     if (import_mdns) {
         st_storage_peer_mesh_service_sharing sharing = {0};
         if (st_storage_get_peer_mesh_service_sharing(database_path, client.tenant_id, &sharing) != 0
@@ -6554,10 +6736,18 @@ static int build_client_result_response(const st_storage_client *client, int sta
 
 static int build_specusMappings_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
+    /* Java binds clientId as a Long and filters by whatever it names: 0 or a negative id, or a
+     * client the caller cannot see, gives an empty list; a value that is no number is 400. */
+    long long filter_client_id = 0;
+    int client_filter = admin_query_number_param(path, "clientId", LLONG_MIN, LLONG_MAX, &filter_client_id);
+    if (client_filter < 0) {
+        return write_spring_bad_request(out, out_len);
+    }
+    if (client_filter > 0 && filter_client_id <= 0) {
+        return write_response(out, out_len, 200, "OK", "[]");
+    }
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "[");
-    long long filter_client_id = 0;
-    (void)admin_query_i64(path, "clientId", &filter_client_id);
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
         if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
@@ -6931,24 +7121,56 @@ static int build_empty_page_response(const char *path, char *out, size_t out_len
     return write_response(out, out_len, 200, "OK", body);
 }
 
+/*
+ * The parameters of Java TrafficResource's two usage lists: clientId binds as a Long and limit as an
+ * int (default_limit when absent), Math.clamp(limit, 1, 500); either one that does not convert is
+ * 400. A clientId the caller cannot see (TrafficViewService.canAccessClient), 0 and negative ids
+ * included, gives an empty list. 0 when the list is to be read; else *answer holds what was
+ * written to out (an empty list or a refusal).
+ */
+static int admin_traffic_usage_params(const st_admin_context *context,
+                                      const char *path,
+                                      int default_limit,
+                                      const char **database_path,
+                                      long long *client_id,
+                                      int *limit,
+                                      int *answer,
+                                      char *out,
+                                      size_t out_len)
+{
+    *client_id = 0;
+    long long requested_limit = default_limit;
+    int client_filter = admin_query_number_param(path, "clientId", LLONG_MIN, LLONG_MAX, client_id);
+    int limit_param = admin_query_number_param(path, "limit", INT_MIN, INT_MAX, &requested_limit);
+    if (client_filter < 0 || limit_param < 0) {
+        *answer = write_spring_bad_request(out, out_len);
+        return -1;
+    }
+    *limit = requested_limit < 1 ? 1 : (requested_limit > 500 ? 500 : (int)requested_limit);
+    *database_path = admin_database_path();
+    if (*database_path != NULL && st_storage_init(*database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        *answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"traffic list failed\"}");
+        return -1;
+    }
+    st_storage_client client;
+    if (*database_path == NULL
+        || (client_filter > 0 && (*client_id <= 0
+                                  || !admin_load_accessible_client(*database_path, context, *client_id, &client)))) {
+        *answer = write_response(out, out_len, 200, "OK", "[]");
+        return -1;
+    }
+    return 0;
+}
+
 static int build_traffic_usage_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     long long filter_client_id = 0;
     int limit = 100;
-    (void)admin_query_i64(path, "clientId", &filter_client_id);
-    (void)admin_query_int_any(path, "limit", &limit);
-    /* Java TrafficViewService: Math.clamp(limit, 1, 500). */
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > 500) {
-        limit = 500;
-    }
-    const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        return write_response(out, out_len, 200, "OK", "[]");
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"traffic list failed\"}");
+    const char *database_path = NULL;
+    int answer = 0;
+    if (admin_traffic_usage_params(context, path, 100, &database_path, &filter_client_id, &limit, &answer,
+                                   out, out_len) != 0) {
+        return answer;
     }
     st_storage_traffic_usage items[ST_ADMIN_MAX_TRAFFIC_ITEMS];
     size_t item_count = 0;
@@ -6988,23 +7210,18 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
 {
     long long filter_client_id = 0;
     int limit = 200;
-    (void)admin_query_i64(path, "clientId", &filter_client_id);
-    (void)admin_query_int_any(path, "limit", &limit);
-    /* Java TrafficViewService: Math.clamp(limit, 1, 500). */
-    if (limit < 1) {
-        limit = 1;
-    } else if (limit > 500) {
-        limit = 500;
+    const char *database_path = NULL;
+    int answer = 0;
+    if (admin_traffic_usage_params(context, path, 200, &database_path, &filter_client_id, &limit, &answer,
+                                   out, out_len) != 0) {
+        return answer;
     }
+    /* Java normalizeResourceType: trimmed and upper-cased; blank is no filter. */
     char *type = admin_query_string(path, "type");
-    const char *database_path = admin_database_path();
-    if (database_path == NULL) {
-        free(type);
-        return write_response(out, out_len, 200, "OK", "[]");
-    }
-    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
-        free(type);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"resource traffic list failed\"}");
+    if (type != NULL) {
+        for (char *cursor = admin_java_trim(type); *cursor != '\0'; ++cursor) {
+            *cursor = (char)toupper((unsigned char)*cursor);
+        }
     }
     st_storage_resource_traffic_usage items[ST_ADMIN_MAX_TRAFFIC_ITEMS];
     size_t item_count = 0;
@@ -7676,11 +7893,7 @@ int st_admin_http_share_sweep(void)
 /* Characters of UTF-8 text, as Java counts a String's length for these limits. */
 static size_t http_route_text_length(const char *text)
 {
-    size_t count = 0U;
-    for (const unsigned char *cursor = (const unsigned char *)text; *cursor != '\0'; ++cursor) {
-        count += (*cursor & 0xc0U) != 0x80U;
-    }
-    return count;
+    return admin_utf16_length(text);
 }
 
 /* Trims value in place (spaces and control characters, as Java String.trim). */
@@ -8313,10 +8526,80 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
                          "{\"error\":\"映射下发失败\"}");
 }
 
+/* Java's 400 for a mapping the caller cannot see: "mapping not found: <id>". */
+static int write_mapping_not_found(long long id, char *out, size_t out_len)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"error\":\"mapping not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
+}
+
+/*
+ * Java NatControlService.requirePort and requireTargetAddress on a mapping request, in Java's
+ * order: listenPort, targetPort, then targetAddress, trimmed and at most 255 characters. 0 with
+ * *target_address (the caller frees it) when all three are valid, else the answer written to out.
+ */
+static int admin_mapping_fields(const char *body,
+                                int *listen_port,
+                                int *target_port,
+                                char **target_address,
+                                char *out,
+                                size_t out_len)
+{
+    *target_address = NULL;
+    static const char *const ports[] = {"listenPort", "targetPort"};
+    int *values[] = {listen_port, target_port};
+    for (size_t i = 0U; i < 2U; ++i) {
+        int member = admin_json_integer_member(body, ports[i], values[i]);
+        if (member == -2) {
+            return write_spring_bad_request(out, out_len);
+        }
+        if (member == 0 || *values[i] < 1 || *values[i] > 65535) {
+            char message[96];
+            snprintf(message, sizeof(message), "{\"error\":\"%s must be between 1 and 65535\"}", ports[i]);
+            return write_response(out, out_len, 400, "Bad Request", message);
+        }
+    }
+    char *address = st_json_get_string(body, "targetAddress");
+    if (!admin_java_has_text(address)) {
+        free(address);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"targetAddress cannot be blank\"}");
+    }
+    if (admin_utf16_length(admin_java_trim(address)) > 255U) {
+        free(address);
+        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"targetAddress is too long\"}");
+    }
+    *target_address = address;
+    return 0;
+}
+
+/*
+ * Java findByListenPort: a public port belongs to one mapping of any client, so a port another
+ * mapping holds is refused. 0 when listen_port is free for mapping_id, else the answer written.
+ */
+static int admin_mapping_port_answer(const char *database_path,
+                                     int listen_port,
+                                     long long mapping_id,
+                                     char *out,
+                                     size_t out_len)
+{
+    st_storage_mapping holder;
+    int found = st_storage_find_mapping_by_listen_port(database_path, listen_port, &holder);
+    if (found < 0) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus port check failed\"}");
+    }
+    if (found == 0 && holder.id != mapping_id) {
+        char message[96];
+        snprintf(message, sizeof(message), "{\"error\":\"公网端口 %d 已被占用\"}", listen_port);
+        return write_response(out, out_len, 400, "Bad Request", message);
+    }
+    return 0;
+}
+
 static int handle_specus_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    if (body == NULL || !st_json_is_valid_object(body)) {
+        return write_spring_bad_request(out, out_len);
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -8327,17 +8610,23 @@ static int handle_specus_update(const st_admin_context *context, long long id, c
     st_storage_client owner;
     if (st_storage_get_mapping(database_path, id, &existing) != 0
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
+        return write_mapping_not_found(id, out, out_len);
     }
-    int listen_port = existing.listen_port;
-    (void)st_json_get_int(body, "listenPort", &listen_port);
-    int target_port = existing.target_port;
-    (void)st_json_get_int(body, "targetPort", &target_port);
-    char *target_address = st_json_get_string(body, "targetAddress");
-    const char *next_target_address = target_address != NULL && *target_address != '\0'
-        ? target_address
-        : existing.target_address;
-    int enabled = existing.enabled;
+    /* Java updateMapping: all three fields are required, as on create. */
+    int listen_port = 0;
+    int target_port = 0;
+    char *target_address = NULL;
+    int invalid = admin_mapping_fields(body, &listen_port, &target_port, &target_address, out, out_len);
+    if (invalid == 0 && listen_port != existing.listen_port) {
+        invalid = admin_mapping_port_answer(database_path, listen_port, existing.id, out, out_len);
+    }
+    if (invalid != 0) {
+        free(target_address);
+        return invalid;
+    }
+    const char *next_target_address = target_address;
+    /* As Java: enabled left out (or null) enables the mapping; detailCaptureEnabled keeps its value. */
+    int enabled = 1;
     (void)st_json_get_bool(body, "enabled", &enabled);
     int detail_capture_enabled = existing.detail_capture_enabled;
     (void)st_json_get_bool(body, "detailCaptureEnabled", &detail_capture_enabled);
@@ -8374,11 +8663,9 @@ static int handle_specus_delete(const st_admin_context *context, long long id, c
     st_storage_mapping existing;
     st_storage_client owner;
     if (st_storage_get_mapping(database_path, id, &existing) != 0
-        || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
-    }
-    if (st_storage_delete_mapping_by_id(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
+        || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)
+        || st_storage_delete_mapping_by_id(database_path, id) != 0) {
+        return write_mapping_not_found(id, out, out_len);
     }
     admin_notify_nat_control(&owner);
     return write_response(out, out_len, 204, "No Content", "");
@@ -9518,20 +9805,72 @@ static int password_hash_matches(const char *password, const char *expected_hash
     return st_constant_time_eq(actual, expected, sizeof(actual));
 }
 
+/* Java ClientCredentialService.normalizeApiKey: trimmed in place, 3 to 120 characters. */
 static int normalize_api_key_in_place(char *api_key)
 {
     if (api_key == NULL) {
         return -1;
     }
-    char *trimmed = admin_trim(api_key);
-    size_t len = strlen(trimmed);
-    if (len < 3U || len > 120U) {
+    size_t len = admin_utf16_length(admin_java_trim(api_key));
+    return len < 3U || len > 120U ? -1 : 0;
+}
+
+/* Java "ck_" + UUID.randomUUID() without its dashes: 32 lowercase hex digits of a version 4 UUID. */
+static int admin_generate_api_key(char out[36])
+{
+    uint8_t bytes[16];
+    if (RAND_bytes(bytes, (int)sizeof(bytes)) != 1) {
         return -1;
     }
-    if (trimmed != api_key) {
-        memmove(api_key, trimmed, len + 1U);
-    }
+    bytes[6] = (uint8_t)((bytes[6] & 0x0fU) | 0x40U);
+    bytes[8] = (uint8_t)((bytes[8] & 0x3fU) | 0x80U);
+    memcpy(out, "ck_", 3U);
+    st_hex_encode(bytes, sizeof(bytes), out + 3);
     return 0;
+}
+
+/* Java PasswordService.generatePassword: 18 characters of its alphabet without look-alikes. */
+static int admin_generate_secret(char out[19])
+{
+    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    const unsigned int size = (unsigned int)(sizeof(alphabet) - 1U);
+    const unsigned int limit = 256U - 256U % size;
+    size_t written = 0U;
+    while (written < 18U) {
+        uint8_t random[32];
+        if (RAND_bytes(random, (int)sizeof(random)) != 1) {
+            return -1;
+        }
+        for (size_t i = 0U; i < sizeof(random) && written < 18U; ++i) {
+            if (random[i] < limit) {
+                out[written++] = alphabet[random[i] % size];
+            }
+        }
+    }
+    out[18] = '\0';
+    return 0;
+}
+
+/*
+ * Java ClientCredentialService.normalizeMaxOnline for a member the request carries: 1 to 10000.
+ * As admin_json_integer_member, and -1 when the number is out of range.
+ */
+static int admin_credential_max_online(const char *body, int *value)
+{
+    int member = admin_json_integer_member(body, "maxOnlineInstances", value);
+    return member == 1 && (*value < 1 || *value > 10000) ? -1 : member;
+}
+
+#define ST_ADMIN_MAX_ONLINE_RANGE_BODY "{\"error\":\"maxOnlineInstances must be between 1 and 10000\"}"
+#define ST_ADMIN_API_KEY_LENGTH_BODY "{\"error\":\"apiKey length must be between 3 and 120\"}"
+#define ST_ADMIN_API_KEY_EXISTS_BODY "{\"error\":\"apiKey already exists\"}"
+
+/* Java's 400 for a credential the caller cannot see: "credential not found: <id>". */
+static int write_credential_not_found(long long id, char *out, size_t out_len)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"error\":\"credential not found: %lld\"}", id);
+    return write_response(out, out_len, 400, "Bad Request", body);
 }
 
 static int build_credential_result_response(const st_storage_client_credential *credential,
@@ -9546,11 +9885,12 @@ static int build_credential_result_response(const st_storage_client_credential *
     if (rc == 0) {
         rc = append_credential_view(&builder, credential);
     }
-    if (rc == 0 && secret != NULL && *secret != '\0') {
+    /* Java CredentialResult: an update that leaves the secret as it was answers "secret":null. */
+    if (rc == 0) {
         rc = admin_sb_append(&builder, ",\"secret\":");
-        if (rc == 0) {
-            rc = admin_sb_append_json_string(&builder, secret);
-        }
+    }
+    if (rc == 0) {
+        rc = admin_sb_append_nullable_json_string(&builder, secret);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "}");
@@ -9608,56 +9948,60 @@ static int build_credentials_response(const st_admin_context *context, char *out
 
 static int handle_credential_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    /* Java binds a required CredentialMutation: no body, or one that is not an object, is 400. */
+    if (body == NULL || !st_json_is_valid_object(body)) {
+        return write_spring_bad_request(out, out_len);
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
     if (init_response != 0) {
         return init_response;
     }
-    char generated_api_key[140];
-    char generated_secret[140];
+    /* In Java's order (ClientCredentialService.create): apiKey, its uniqueness, secret, enabled, max online. */
+    char generated_api_key[36];
+    char generated_secret[19];
     char *api_key = st_json_get_string(body, "apiKey");
     char *secret = st_json_get_string(body, "secret");
-    if (api_key == NULL || *admin_trim(api_key) == '\0') {
-        build_prefixed_token("ck_", generated_api_key, sizeof(generated_api_key));
-        generated_api_key[120] = '\0';
+    int answer = 0;
+    if (admin_java_has_text(api_key)) {
+        if (normalize_api_key_in_place(api_key) != 0) {
+            answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_LENGTH_BODY);
+        }
+    } else {
         free(api_key);
-        api_key = admin_dup_string(generated_api_key);
-    }
-    if (secret == NULL || *admin_trim(secret) == '\0') {
-        build_prefixed_token("sk_", generated_secret, sizeof(generated_secret));
-        free(secret);
-        secret = admin_dup_string(generated_secret);
-    }
-    if (normalize_api_key_in_place(api_key) != 0 || secret == NULL || *admin_trim(secret) == '\0') {
-        free(api_key);
-        free(secret);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"apiKey length must be between 3 and 120\"}");
+        api_key = admin_generate_api_key(generated_api_key) == 0 ? admin_dup_string(generated_api_key) : NULL;
     }
     st_storage_client_credential existing;
-    if (st_storage_get_client_credential_by_api_key(database_path, api_key, &existing) == 0) {
-        free(api_key);
+    if (answer == 0 && api_key != NULL
+        && st_storage_get_client_credential_by_api_key(database_path, api_key, &existing) == 0) {
+        answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_EXISTS_BODY);
+    }
+    if (answer == 0 && !admin_java_has_text(secret)) {
         free(secret);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"apiKey already exists\"}");
+        secret = admin_generate_secret(generated_secret) == 0 ? admin_dup_string(generated_secret) : NULL;
     }
     int enabled = 1;
     int max_online_instances = client_auth_default_max_online_instances();
-    (void)st_json_get_bool(body, "enabled", &enabled);
-    (void)st_json_get_int(body, "maxOnlineInstances", &max_online_instances);
-    if (max_online_instances <= 0) {
-        max_online_instances = client_auth_default_max_online_instances();
-    }
+    int max_online = answer == 0 ? admin_credential_max_online(body, &max_online_instances) : 0;
     char secret_hash[ST_SHA256_HEX_LEN + 1];
-    if (password_hash_hex(admin_trim(secret), secret_hash) != 0) {
+    if (answer == 0 && max_online == -2) {
+        answer = write_spring_bad_request(out, out_len);
+    } else if (answer == 0 && max_online == -1) {
+        answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_MAX_ONLINE_RANGE_BODY);
+    } else if (answer == 0 && (api_key == NULL || secret == NULL
+                               || password_hash_hex(admin_java_trim(secret), secret_hash) != 0)) {
+        answer = write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential create failed\"}");
+    }
+    if (answer != 0) {
         free(api_key);
         free(secret);
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"secret cannot be blank\"}");
+        return answer;
     }
+    (void)st_json_get_bool(body, "enabled", &enabled);
+    /* A plain insert: a create that races another one for the api key never replaces it; Java's
+     * unique column refuses it and GlobalExceptionHandler answers 400. */
     st_storage_client_credential credential;
-    int rc = st_storage_upsert_client_credential(database_path,
-                                                 0,
+    int rc = st_storage_insert_client_credential(database_path,
                                                  context->tenant_id,
                                                  context->username,
                                                  api_key,
@@ -9668,11 +10012,13 @@ static int handle_credential_create(const st_admin_context *context, const char 
     free(api_key);
     if (rc != 0) {
         free(secret);
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"credential create failed\"}");
+        return rc > 0
+            ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
+            : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential create failed\"}");
     }
     admin_product_metrics_milestone(credential.tenant_id, credential.owner_username,
                                     ST_PRODUCT_METRICS_STEP_CREDENTIAL_CREATED);
-    int response_len = build_credential_result_response(&credential, admin_trim(secret), 201, "Created", out, out_len);
+    int response_len = build_credential_result_response(&credential, secret, 201, "Created", out, out_len);
     free(secret);
     return response_len;
 }
@@ -9683,8 +10029,8 @@ static int handle_credential_update(const st_admin_context *context,
                                     char *out,
                                     size_t out_len)
 {
-    if (body == NULL) {
-        body = "";
+    if (body == NULL || !st_json_is_valid_object(body)) {
+        return write_spring_bad_request(out, out_len);
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -9694,47 +10040,49 @@ static int handle_credential_update(const st_admin_context *context,
     st_storage_client_credential existing;
     if (st_storage_get_client_credential(database_path, id, &existing) != 0
         || !admin_can_access_credential(context, &existing)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"credential not found\"}");
+        return write_credential_not_found(id, out, out_len);
     }
+    /* Java updateCredential: only what the request carries changes, in this order. */
     char *api_key = st_json_get_string(body, "apiKey");
     char *secret = st_json_get_string(body, "secret");
     const char *next_api_key = existing.api_key;
-    if (api_key != NULL && *admin_trim(api_key) != '\0') {
+    int answer = 0;
+    if (admin_java_has_text(api_key)) {
+        st_storage_client_credential duplicate;
         if (normalize_api_key_in_place(api_key) != 0) {
-            free(api_key);
-            free(secret);
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"apiKey length must be between 3 and 120\"}");
-        }
-        if (strcmp(api_key, existing.api_key) != 0) {
-            st_storage_client_credential duplicate;
-            if (st_storage_get_client_credential_by_api_key(database_path, api_key, &duplicate) == 0) {
-                free(api_key);
-                free(secret);
-                return write_response(out, out_len, 409, "Conflict", "{\"error\":\"apiKey already exists\"}");
-            }
+            answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_LENGTH_BODY);
+        } else if (strcmp(api_key, existing.api_key) != 0
+                   && st_storage_get_client_credential_by_api_key(database_path, api_key, &duplicate) == 0) {
+            answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_EXISTS_BODY);
         }
         next_api_key = api_key;
     }
     char secret_hash[ST_SHA256_HEX_LEN + 1];
     const char *secret_hash_ptr = existing.secret_hash;
     const char *revealed_secret = NULL;
-    if (secret != NULL && *admin_trim(secret) != '\0') {
-        if (password_hash_hex(admin_trim(secret), secret_hash) != 0) {
-            free(api_key);
-            free(secret);
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"secret cannot be blank\"}");
+    if (answer == 0 && admin_java_has_text(secret)) {
+        if (password_hash_hex(admin_java_trim(secret), secret_hash) != 0) {
+            answer = write_response(out, out_len, 500, "Internal Server Error",
+                                    "{\"error\":\"credential update failed\"}");
         }
         secret_hash_ptr = secret_hash;
-        revealed_secret = admin_trim(secret);
+        revealed_secret = secret;
     }
     int enabled = existing.enabled;
     int max_online_instances = existing.max_online_instances <= 0
         ? client_auth_default_max_online_instances()
         : existing.max_online_instances;
     (void)st_json_get_bool(body, "enabled", &enabled);
-    (void)st_json_get_int(body, "maxOnlineInstances", &max_online_instances);
-    if (max_online_instances <= 0) {
-        max_online_instances = client_auth_default_max_online_instances();
+    int max_online = answer == 0 ? admin_credential_max_online(body, &max_online_instances) : 0;
+    if (answer == 0 && max_online == -2) {
+        answer = write_spring_bad_request(out, out_len);
+    } else if (answer == 0 && max_online == -1) {
+        answer = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_MAX_ONLINE_RANGE_BODY);
+    }
+    if (answer != 0) {
+        free(api_key);
+        free(secret);
+        return answer;
     }
     st_storage_client_credential credential;
     int rc = st_storage_upsert_client_credential(database_path,
@@ -9766,11 +10114,9 @@ static int handle_credential_delete(const st_admin_context *context, long long i
     }
     st_storage_client_credential existing;
     if (st_storage_get_client_credential(database_path, id, &existing) != 0
-        || !admin_can_access_credential(context, &existing)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"credential not found\"}");
-    }
-    if (st_storage_delete_client_credential(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"credential not found\"}");
+        || !admin_can_access_credential(context, &existing)
+        || st_storage_delete_client_credential(database_path, id) != 0) {
+        return write_credential_not_found(id, out, out_len);
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -11004,14 +11350,15 @@ static int append_management_user_view(st_admin_string_builder *builder,
                               built_in ? "true" : "false",
                               enabled ? "true" : "false");
     }
+    /* NULL is Java's null; "" stays an empty string. */
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, created_at == NULL ? "" : created_at);
+        rc = created_at == NULL ? admin_sb_append(builder, "null") : admin_sb_append_json_string(builder, created_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, ",\"updatedAt\":");
     }
     if (rc == 0) {
-        rc = admin_sb_append_json_string(builder, updated_at == NULL ? "" : updated_at);
+        rc = updated_at == NULL ? admin_sb_append(builder, "null") : admin_sb_append_json_string(builder, updated_at);
     }
     if (rc == 0) {
         rc = admin_sb_append(builder, "}");
@@ -11032,17 +11379,30 @@ static int append_stored_management_user_view(st_admin_string_builder *builder,
                                        user->updated_at);
 }
 
+/*
+ * Java ManagementUserService.currentUser: the built-in administrator under its configured name, an
+ * ADMIN of the caller's tenant created and updated now; else the caller's account row in its
+ * tenant; else what the token carries, with null timestamps.
+ */
 static int build_management_me_response(const st_admin_context *context, char *out, size_t out_len)
 {
     st_admin_string_builder builder = {0};
-    int rc = append_management_user_view(&builder,
-                                         context->username,
-                                         context->tenant_id,
-                                         context->role,
-                                         admin_ascii_casecmp(context->username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0,
-                                         1,
-                                         "",
-                                         "");
+    const char *built_in = env_text("SPECUS_AUTH_USERNAME", "admin");
+    const char *database_path = admin_database_path();
+    st_storage_management_user user;
+    int rc;
+    if (admin_ascii_casecmp(context->username, built_in) == 0) {
+        char now[64];
+        admin_iso_time((long long)time(NULL), now);
+        rc = append_management_user_view(&builder, built_in, context->tenant_id, "ADMIN", 1, 1, now, now);
+    } else if (database_path != NULL
+               && st_storage_get_management_user_in_tenant(database_path, context->tenant_id, context->username,
+                                                            &user) == 0) {
+        rc = append_stored_management_user_view(&builder, &user);
+    } else {
+        rc = append_management_user_view(&builder, context->username, context->tenant_id,
+                                         context->admin ? "ADMIN" : "USER", 0, 1, NULL, NULL);
+    }
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user response failed\"}");
@@ -11734,7 +12094,7 @@ static int write_registration_error_response(int status,
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"registration response failed\"}");
     }
-    char body[512];
+    char body[1024];
     int written = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", escaped);
     free(escaped);
     if (written <= 0 || (size_t)written >= sizeof(body)) {
@@ -11749,7 +12109,7 @@ static int handle_management_registration_request(const char *body, char *out, s
     const char *database_path = admin_database_path();
     st_registration_challenge_response challenge;
     int status = 400;
-    char error[256];
+    char error[512];
     if (st_registration_request(database_path, body, &challenge,
                                 &status, error, sizeof(error)) != 0) {
         return write_registration_error_response(status, error, out, out_len);
@@ -11778,7 +12138,7 @@ static int handle_management_registration_verify(const char *body, char *out, si
     const char *database_path = admin_database_path();
     st_storage_management_user user;
     int status = 400;
-    char error[256];
+    char error[512];
     if (st_registration_verify(database_path, body, &user, &status, error, sizeof(error)) != 0) {
         return write_registration_error_response(status, error, out, out_len);
     }
