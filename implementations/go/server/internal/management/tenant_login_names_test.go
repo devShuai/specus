@@ -382,8 +382,9 @@ func TestLegacyAccountsStillSignInAfterTheLoginNameMigration(t *testing.T) {
 		clients[0].ClientName != "erin-client" {
 		t.Fatalf("erin's clients: status %d body %s", status, payload)
 	}
+	// The built-in admin belongs to the default tenant and is not listed in tenant-e.
 	users := h.users(erin)
-	if len(users) != 2 || users[1].Username != "erin" || users[1].TenantID != "tenant-e" {
+	if len(users) != 1 || users[0].Username != "erin" || users[0].TenantID != "tenant-e" || users[0].BuiltIn {
 		t.Fatalf("tenant-e users: %+v", users)
 	}
 	stored, err := h.db.FindManagementUserByLogin(context.Background(), "tenant-e", "ERIN")

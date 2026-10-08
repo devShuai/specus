@@ -206,8 +206,11 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             size = sum(len(json.dumps(value, separators=(",", ":")))
                        for value in indices.get(name, {}).get("docs", {}).values())
-        self.send_json(200, {"indices": {name: {"total": {"store": {
-            "size_in_bytes": size, "total_data_set_size_in_bytes": size}}}}})
+        # A cluster may report a zero data set size, or none at all (older versions).
+        store = {"size_in_bytes": size}
+        if not name.endswith("-no-dataset"):
+            store["total_data_set_size_in_bytes"] = 0 if name.endswith("-zero-dataset") else size
+        self.send_json(200, {"indices": {name: {"total": {"store": store}}}})
 
     def do_POST(self):
         if not self.auth(): return self.send_json(401, {"error": "unauthorized"})

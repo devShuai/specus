@@ -16,6 +16,7 @@ import java.util.Set;
 public class ManagementUserSchemaMigrator {
     static final String TABLE = "specus_management_user";
     static final String UNIQUE_INDEX = "uq_management_user_tenant_login_name";
+    static final String EMAIL_TABLE = "specus_management_user_email";
     private static final List<String> UNIQUE_INDEX_COLUMNS = List.of("tenant_id", "login_name_normalized");
 
     private final JdbcTemplate jdbcTemplate;
@@ -68,7 +69,24 @@ public class ManagementUserSchemaMigrator {
                     row.accountKey());
         }
         ensureUniqueIndex(table);
+        removeOrphanedEmails();
         log.info("[schema] management login-name migration verified for {} row(s)", rows.size());
+    }
+
+    /**
+     * Accounts deleted before the delete took their email record along left that record behind,
+     * keyed by an account key no account has any more, and the address could never register
+     * again. Those records are released here; every other record is left alone.
+     */
+    private void removeOrphanedEmails() {
+        if (SchemaMetadata.table(jdbcTemplate, EMAIL_TABLE) == null) {
+            return;
+        }
+        int removed = jdbcTemplate.update("delete from " + EMAIL_TABLE
+                + " where username not in (select username from " + TABLE + ")");
+        if (removed > 0) {
+            log.info("[schema] removed {} email record(s) of deleted management accounts", removed);
+        }
     }
 
     private void ensureColumn(SchemaMetadata.Table table, String name, String type) {

@@ -288,19 +288,22 @@ static int test_peer_mesh_egress_policy_round_trip(void)
         fprintf(stderr, "egress policy update failed\n");
         failures++;
     }
-    st_storage_peer_mesh_egress_policy listed[8];
+    st_storage_peer_mesh_egress_policy *listed = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_policies(path, "default", 1, listed, 8U, &count) != 0
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 1, &listed, &count) != 0
         || count != 0U) {
         fprintf(stderr, "a disabled policy is still listed as enabled\n");
         failures++;
     }
-    if (st_storage_list_peer_mesh_egress_policies(path, "default", 0, listed, 8U, &count) != 0
+    free(listed);
+    listed = NULL;
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 0, &listed, &count) != 0
         || count != 1U
         || strcmp(listed[0].allowed_consumer_client_ids, "1001,1002") != 0) {
         fprintf(stderr, "the update did not persist\n");
         failures++;
     }
+    free(listed);
 
     if (st_storage_delete_peer_mesh_egress_policy(path, saved.id, "default") != 0
         || st_storage_get_peer_mesh_egress_policy(path, saved.id, "default", &found) != 1) {
@@ -430,13 +433,14 @@ static int test_peer_mesh_egress_activity_round_trip(void)
         fprintf(stderr, "egress activity update failed\n");
         failures++;
     }
-    st_storage_peer_mesh_egress_activity rows[8];
+    st_storage_peer_mesh_egress_activity *rows = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_activity(path, "default", rows, 8U, &count) != 0
+    if (st_storage_list_peer_mesh_egress_activity(path, "default", &rows, &count) != 0
         || count != 1U || rows[0].active_flows != 21 || rows[0].revision != 13) {
         fprintf(stderr, "egress activity list mismatch: count=%zu\n", count);
         failures++;
     }
+    free(rows);
     unlink(path);
     return failures;
 }
@@ -1818,33 +1822,36 @@ int main(void)
         unlink(path);
         return 1;
     }
-    st_storage_peer_mesh_acl visible_acls[4];
+    st_storage_peer_mesh_acl *visible_acls = NULL;
     size_t visible_acl_count = 0;
-    if (st_storage_list_peer_mesh_acls_visible(path,
-                                               "tenant-c",
-                                               "OwnerCase",
-                                               0,
-                                               visible_acls,
-                                               4,
-                                               &visible_acl_count) != 0
-        || visible_acl_count != 1U
-        || visible_acls[0].id != acl_id
-        || st_storage_list_peer_mesh_acls_visible(path,
-                                                  "tenant-c",
-                                                  "ownercase",
-                                                  0,
-                                                  visible_acls,
-                                                  4,
-                                                  &visible_acl_count) != 0
-        || visible_acl_count != 0U
-        || st_storage_list_peer_mesh_acls_visible(path,
-                                                  "TENANT-C",
-                                                  "OwnerCase",
-                                                  1,
-                                                  visible_acls,
-                                                  4,
-                                                  &visible_acl_count) != 0
-        || visible_acl_count != 0U) {
+    int owner_ok = st_storage_list_peer_mesh_acls_visible(path,
+                                                          "tenant-c",
+                                                          "OwnerCase",
+                                                          0,
+                                                          &visible_acls,
+                                                          &visible_acl_count) == 0
+        && visible_acl_count == 1U
+        && visible_acls[0].id == acl_id;
+    free(visible_acls);
+    visible_acls = NULL;
+    int other_case_owner_ok = st_storage_list_peer_mesh_acls_visible(path,
+                                                                     "tenant-c",
+                                                                     "ownercase",
+                                                                     0,
+                                                                     &visible_acls,
+                                                                     &visible_acl_count) == 0
+        && visible_acl_count == 0U;
+    free(visible_acls);
+    visible_acls = NULL;
+    int other_case_tenant_ok = st_storage_list_peer_mesh_acls_visible(path,
+                                                                      "TENANT-C",
+                                                                      "OwnerCase",
+                                                                      1,
+                                                                      &visible_acls,
+                                                                      &visible_acl_count) == 0
+        && visible_acl_count == 0U;
+    free(visible_acls);
+    if (!owner_ok || !other_case_owner_ok || !other_case_tenant_ok) {
         fprintf(stderr, "peer mesh acl tenant/owner visibility must be case-sensitive\n");
         unlink(path);
         return 1;

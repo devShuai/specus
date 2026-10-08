@@ -345,8 +345,8 @@ static void test_store(void)
     st_storage_tcp_frame frames[1];
     memset(frames, 0, sizeof(frames));
     count = 0U;
-    EXPECT(recorded && st_storage_list_tcp_frames_visible(path, 0, 0, "tenant-a", "alice", 0, 0, 10, frames, 1U,
-                                                          &count, &total) == 0 && count == 1U,
+    EXPECT(recorded && st_storage_list_tcp_frames_visible(path, 0, ST_STORAGE_ANY_LISTEN_PORT, "tenant-a", "alice", 0,
+                                                          0, 10, frames, 1U, &count, &total) == 0 && count == 1U,
            "TCP frame record or list failed");
     if (count == 1U) {
         st_storage_tcp_frame frame;

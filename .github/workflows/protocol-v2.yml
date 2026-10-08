@@ -318,6 +318,23 @@ jobs:
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/peer_mesh_e2e.sh
+      # The Android client core (SpecusCore.Runtime) on this JVM: :app:jvmClientLauncher writes a
+      # launcher for JvmClientMain from its unit-test sources, which takes the same arguments as the
+      # other clients. The runner image ships the Android SDK the Gradle build needs.
+      - name: Set up Gradle for the Android client
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build the Android client for the JVM
+        id: android-client
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
+        working-directory: implementations/android/client
+        run: ./gradlew :app:jvmClientLauncher --no-daemon
+      - name: Android client Direct HTTP and WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh
