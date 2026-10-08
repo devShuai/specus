@@ -1901,8 +1901,8 @@ public final class SpecusCore {
                         + Integer.toUnsignedString(packet.streamId));
             }
             if (packet.type == NatMessageType.WINDOW_UPDATE) {
-                if (streamFlow.contains(packet.streamId)
-                        && !streamFlow.addCredit(packet.streamId, packet.value)) {
+                if (streamFlow.creditIfOpen(packet.streamId, packet.value)
+                        == StreamFlowScheduler.Credit.INVALID) {
                     throw new IOException("invalid WINDOW_UPDATE credit");
                 }
                 return;
