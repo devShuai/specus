@@ -47,10 +47,10 @@ class AuthControllerRefreshTests {
     @Test
     void refreshUsesCurrentDatabaseTenantAndRole() {
         Jwt jwt = jwt(LocalTokenService.ISSUER, "alice");
-        when(users.resolveLocalTokenUser("alice", "current-tenant"))
+        when(users.resolveLocalTokenUser("alice", "current-tenant", "alice-key"))
                 .thenReturn(Optional.of(new LoginUser(
-                        "alice", "current-tenant", ManagementRole.USER, false)));
-        when(tokens.issueToken("alice", "current-tenant", ManagementRole.USER))
+                        "alice", "current-tenant", ManagementRole.USER, false, "alice-key")));
+        when(tokens.issueToken("alice", "current-tenant", ManagementRole.USER, "alice-key"))
                 .thenReturn("fresh-token");
 
         var response = controller.refresh(jwt);
@@ -58,18 +58,19 @@ class AuthControllerRefreshTests {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isInstanceOf(Map.class);
         assertThat(((Map<?, ?>) response.getBody()).get("accessToken")).isEqualTo("fresh-token");
-        verify(tokens).issueToken("alice", "current-tenant", ManagementRole.USER);
+        verify(tokens).issueToken("alice", "current-tenant", ManagementRole.USER, "alice-key");
     }
 
     @Test
     void refreshRejectsDisabledOrDeletedLocalUser() {
         Jwt jwt = jwt(LocalTokenService.ISSUER, "alice");
-        when(users.resolveLocalTokenUser("alice", "current-tenant")).thenReturn(Optional.empty());
+        when(users.resolveLocalTokenUser("alice", "current-tenant", "alice-key")).thenReturn(Optional.empty());
 
         assertThat(controller.refresh(jwt).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         verify(tokens, never()).issueToken(
                 org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any());
     }
 
@@ -78,7 +79,7 @@ class AuthControllerRefreshTests {
         Jwt jwt = jwt("https://issuer.example", "alice");
 
         assertThat(controller.refresh(jwt).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        verify(users, never()).resolveLocalTokenUser("alice", "current-tenant");
+        verify(users, never()).resolveLocalTokenUser("alice", "current-tenant", "alice-key");
     }
 
     private Jwt jwt(String issuer, String subject) {
@@ -88,7 +89,8 @@ class AuthControllerRefreshTests {
                 "iss", issuer,
                 "sub", subject,
                 "tenant_id", "current-tenant",
-                "role", "ADMIN"));
+                "role", "ADMIN",
+                LocalTokenService.ACCOUNT_KEY_CLAIM, "alice-key"));
         return jwt;
     }
 }

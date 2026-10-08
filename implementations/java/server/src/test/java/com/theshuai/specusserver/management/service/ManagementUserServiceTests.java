@@ -3,6 +3,8 @@ package com.theshuai.specusserver.management.service;
 import com.theshuai.specusserver.config.AuthProperties;
 import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.model.ManagementUser;
+import com.theshuai.specusserver.management.model.ManagementUserView;
+import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.tenant.TenantContext;
@@ -27,15 +29,19 @@ import static org.mockito.Mockito.when;
 class ManagementUserServiceTests {
     private static final String ISSUER = "https://certus.devshuai.com";
     private ManagementUserRepository repository;
+    private ManagementUserEmailRepository emailRepository;
     private ManagementUserService service;
 
     @BeforeEach
     void setUp() {
         repository = mock(ManagementUserRepository.class);
+        emailRepository = mock(ManagementUserEmailRepository.class);
         AuthProperties properties = new AuthProperties();
         properties.setUsername("dungouji");
+        properties.setPassword("built-in-password");
         properties.setTenantId("default");
-        service = new ManagementUserService(repository, properties, null, mock(WorkbenchReferences.class));
+        service = new ManagementUserService(repository, properties, null, mock(WorkbenchReferences.class),
+                emailRepository);
         when(repository.save(any(ManagementUser.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
         when(repository.saveAndFlush(any(ManagementUser.class)))
@@ -263,6 +269,81 @@ class ManagementUserServiceTests {
 
         service.deleteUser(tenantAAdmin, "bob");
         verify(repository).delete(bob);
+        verify(emailRepository).deleteByAccountKey("bob");
+    }
+
+    @Test
+    void deletingAnAccountReleasesItsEmailByAccountKey() {
+        ManagementUser carol = user("4c1f5e0a-3b2d-4e6f-8a9b-0c1d2e3f4a5b", ManagementRole.USER, true);
+        carol.setLoginName("Carol");
+        carol.setLoginNameNormalized("carol");
+        carol.setTenantId("tenant-a");
+        ManagementContext tenantAAdmin = new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+        when(repository.findByTenantIdAndLoginNameNormalized("tenant-a", "carol"))
+                .thenReturn(Optional.of(carol));
+
+        assertThat(service.deleteUser(tenantAAdmin, "CAROL")).isEqualTo("Carol");
+
+        // The email row is keyed by the account key, never by the login name.
+        verify(emailRepository).deleteByAccountKey("4c1f5e0a-3b2d-4e6f-8a9b-0c1d2e3f4a5b");
+        verify(emailRepository, never()).deleteByAccountKey("Carol");
+        verify(repository).delete(carol);
+    }
+
+    @Test
+    void localTokenWithAccountKeyResolvesOnlyThatAccountRow() {
+        ManagementUser recreated = user("6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a", ManagementRole.USER, true);
+        recreated.setLoginName("alice");
+        recreated.setLoginNameNormalized("alice");
+        recreated.setTenantId("tenant-a");
+        when(repository.findByTenantIdAndLoginNameNormalized("tenant-a", "alice"))
+                .thenReturn(Optional.of(recreated));
+
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-a", "6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a"))
+                .get()
+                .extracting(ManagementUserService.LoginUser::accountKey)
+                .isEqualTo("6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a");
+        // The key of the deleted alice, or the right key spelled differently, resolves to no one.
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-a", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"))
+                .isEmpty();
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-a", "6D5C4B3A-2F1E-4D0C-9B8A-7F6E5D4C3B2A"))
+                .isEmpty();
+        // Tokens issued before the claim existed resolve as before, until they expire.
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-a", null)).isPresent();
+        assertThat(service.resolveLocalTokenUser("alice", "tenant-a", "")).isPresent();
+    }
+
+    @Test
+    void localTokenWithAccountKeyIsNeverTheBuiltInAdministrator() {
+        when(repository.findByTenantIdAndLoginNameNormalized("default", "dungouji"))
+                .thenReturn(Optional.empty());
+
+        assertThat(service.resolveLocalTokenUser("dungouji", "default", null))
+                .get()
+                .matches(ManagementUserService.LoginUser::builtInAdmin)
+                .extracting(ManagementUserService.LoginUser::tokenAccountKey)
+                .isNull();
+        assertThat(service.resolveLocalTokenUser("dungouji", "default", "dungouji")).isEmpty();
+    }
+
+    @Test
+    void listsTheBuiltInAdministratorOnlyInTheDefaultTenant() {
+        ManagementUser dora = user("dora", ManagementRole.ADMIN, true);
+        ManagementUser erin = user("erin", ManagementRole.ADMIN, true);
+        erin.setTenantId("tenant-a");
+        when(repository.findByTenantIdOrderByLoginNameAsc("default")).thenReturn(List.of(dora));
+        when(repository.findByTenantIdOrderByLoginNameAsc("tenant-a")).thenReturn(List.of(erin));
+
+        List<ManagementUserView> defaultTenant = service.listUsers(
+                new ManagementContext(new TenantContext("default"), "dora", true));
+        List<ManagementUserView> tenantA = service.listUsers(
+                new ManagementContext(new TenantContext("tenant-a"), "erin", true));
+
+        assertThat(defaultTenant).extracting(ManagementUserView::username).containsExactly("dungouji", "dora");
+        assertThat(defaultTenant.getFirst().builtIn()).isTrue();
+        assertThat(defaultTenant.getFirst().tenantId()).isEqualTo("default");
+        assertThat(tenantA).extracting(ManagementUserView::username).containsExactly("erin");
+        assertThat(tenantA).noneMatch(ManagementUserView::builtIn);
     }
 
     @Test

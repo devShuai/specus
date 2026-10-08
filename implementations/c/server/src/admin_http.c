@@ -55,7 +55,6 @@
 
 #define ST_ADMIN_MAX_CONNECTIONS_PAGE 500U
 #define ST_ADMIN_MAX_TRAFFIC_ITEMS 1000U
-#define ST_ADMIN_MAX_PEER_ACLS 256U
 #define ST_ADMIN_MAX_PEER_SESSIONS 200U
 #define ST_ADMIN_MAX_HTTP_HEADERS 96U
 #define ST_ADMIN_MAX_DIRECT_HTTP_BODY (16U * 1024U * 1024U)
@@ -66,7 +65,8 @@
 #define ST_ADMIN_WS_TICKET_TTL_SECONDS 45
 #define ST_ADMIN_MAX_WS_TICKETS 1024U
 #define ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS (64U * 1024U)
-#define ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES (3U * ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS)
+/* /ws/connections sets no limit, so Tomcat's default text buffer of 8 KiB characters applies. */
+#define ST_ADMIN_CONNECTIONS_MAX_CHARS (8U * 1024U)
 #define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES 1024U
 #define ST_ADMIN_MAX_PENDING_CLIENT_MESSAGE_WRITES_PER_SOCKET 64U
 /* Bounds the close handshake on both sides, like the Go/Java/.NET close credit timeout. */
@@ -130,6 +130,9 @@ typedef struct {
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
+    /* The key of the account row a bearer resolved to; empty for the built-in admin. A token issued
+     * for this context carries it as uid. */
+    char account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1];
     int admin;
     int authenticated;
     /* The bearer was a valid token of the identity provider, whether or not it resolved. */
@@ -937,7 +940,10 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
     const char *builtin_username = env_text("SPECUS_AUTH_USERNAME", "admin");
     const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
     const char *token_tenant = claims->has_tenant ? claims->tenant_id : "";
-    if (admin_ascii_casecmp(claims->username, builtin_username) == 0
+    /* A token with uid names an account row and is never the built-in admin's (section 6). */
+    int bound_to_account = claims->account_key[0] != '\0';
+    if (!bound_to_account
+        && admin_ascii_casecmp(claims->username, builtin_username) == 0
         && (token_tenant[0] == '\0' || strcmp(token_tenant, default_tenant) == 0)) {
         if (!management_password_login_enabled()) {
             return -1;
@@ -964,9 +970,14 @@ static int admin_resolve_token_user(const st_security_token_claims *claims, st_a
     if (found != 0 || !user.enabled) {
         return -1;
     }
+    /* The token of a deleted account does not pass to a later account of the same login name. */
+    if (bound_to_account && strcmp(user.account_key, claims->account_key) != 0) {
+        return -1;
+    }
     snprintf(context->username, sizeof(context->username), "%s", user.username);
     snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
     snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+    snprintf(context->account_key, sizeof(context->account_key), "%s", user.account_key);
     context->admin = strcmp(context->role, "ADMIN") == 0;
     context->authenticated = 1;
     return 0;
@@ -4315,13 +4326,14 @@ static int build_oidc_token_exchange_response(const char *body, char *out, size_
     }
     long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char access_token[2048];
-    if (st_security_issue_local_token(user.username,
-                                      user.tenant_id,
-                                      normalize_management_role(user.role),
-                                      getenv("SPECUS_AUTH_JWT_SECRET"),
-                                      ttl,
-                                      access_token,
-                                      sizeof(access_token)) != 0) {
+    if (st_security_issue_local_token_for_account(user.username,
+                                                  user.tenant_id,
+                                                  normalize_management_role(user.role),
+                                                  user.account_key,
+                                                  getenv("SPECUS_AUTH_JWT_SECRET"),
+                                                  ttl,
+                                                  access_token,
+                                                  sizeof(access_token)) != 0) {
         free(id_token);
         free(token_type);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
@@ -4802,14 +4814,13 @@ static int build_peer_mesh_acls_response(const st_admin_context *context, char *
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl list failed\"}");
         }
-        st_storage_peer_mesh_acl acls[ST_ADMIN_MAX_PEER_ACLS];
+        st_storage_peer_mesh_acl *acls = NULL;
         size_t acl_count = 0;
         if (st_storage_list_peer_mesh_acls_visible(database_path,
                                                    context->tenant_id,
                                                    context->username,
                                                    context->admin,
-                                                   acls,
-                                                   ST_ADMIN_MAX_PEER_ACLS,
+                                                   &acls,
                                                    &acl_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl list failed\"}");
@@ -4820,6 +4831,7 @@ static int build_peer_mesh_acls_response(const st_admin_context *context, char *
                 rc = append_peer_mesh_acl_view(&builder, &acls[i]);
             }
         }
+        free(acls);
     }
     if (rc == 0) {
         rc = admin_sb_append(&builder, "]");
@@ -4855,7 +4867,8 @@ static int build_peer_mesh_sessions_array_response(const st_storage_peer_mesh_se
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session response failed\"}");
     }
-    int response_len = write_response(out, out_len, status, reason, builder.data);
+    /* Closing every open session answers all of them, as many as there were. */
+    int response_len = write_unbounded_response(out, out_len, status, reason, builder.data);
     free(builder.data);
     return response_len;
 }
@@ -4872,22 +4885,74 @@ static int build_peer_mesh_sessions_response(const st_admin_context *context,
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session list failed\"}");
     }
+    /*
+     * Java PeerMeshResource.sessions: with page or size, a page of at most 100 sessions
+     * (listSessionsPage, openOnly honoured); otherwise the latest limit sessions, 1..200.
+     */
     int limit = 100;
     (void)admin_query_int_any(path, "limit", &limit);
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
+    char *page_text = admin_query_string(path, "page");
+    char *size_text = admin_query_string(path, "size");
+    int paged = page_text != NULL || size_text != NULL;
+    free(page_text);
+    free(size_text);
+    int page = 0;
+    int size = limit;
+    int open_only = 0;
+    if (paged) {
+        (void)admin_query_int_any(path, "page", &page);
+        (void)admin_query_int_any(path, "size", &size);
+        (void)admin_query_bool(path, "openOnly", &open_only);
+        if (page < 0) page = 0;
+        size = size < 1 ? 1 : size > 100 ? 100 : size;
+    } else {
+        size = limit < 1 ? 1 : limit > (int)ST_ADMIN_MAX_PEER_SESSIONS ? (int)ST_ADMIN_MAX_PEER_SESSIONS : limit;
+    }
+    st_storage_peer_mesh_session *sessions =
+        (st_storage_peer_mesh_session *)calloc(ST_ADMIN_MAX_PEER_SESSIONS, sizeof(*sessions));
     size_t session_count = 0;
-    if (st_storage_list_peer_mesh_sessions_visible(database_path,
-                                                   context->tenant_id,
-                                                   context->username,
-                                                   context->admin,
-                                                   1,
-                                                   limit,
-                                                   sessions,
-                                                   ST_ADMIN_MAX_PEER_SESSIONS,
-                                                   &session_count) != 0) {
+    long long total = 0;
+    if (sessions == NULL
+        || st_storage_page_peer_mesh_sessions_visible(database_path,
+                                                      context->tenant_id,
+                                                      context->username,
+                                                      context->admin,
+                                                      open_only,
+                                                      page,
+                                                      size,
+                                                      sessions,
+                                                      ST_ADMIN_MAX_PEER_SESSIONS,
+                                                      &session_count,
+                                                      &total) != 0) {
+        free(sessions);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session list failed\"}");
     }
-    return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+    if (!paged) {
+        int len = build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+        free(sessions);
+        return len;
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"items\":[");
+    for (size_t i = 0; rc == 0 && i < session_count; ++i) {
+        rc = admin_sb_append(&builder, i == 0 ? "" : ",");
+        if (rc == 0) {
+            rc = append_peer_mesh_session_view(&builder, &sessions[i]);
+        }
+    }
+    free(sessions);
+    long long total_pages = (total + size - 1) / size;
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder, "],\"total\":%lld,\"page\":%d,\"size\":%d,\"totalPages\":%lld}",
+                              total, page, size, total_pages < 1 ? 1LL : total_pages);
+    }
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session response failed\"}");
+    }
+    int response_len = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return response_len;
 }
 
 static int build_peer_mesh_session_response(const st_storage_peer_mesh_session *session,
@@ -4936,18 +5001,19 @@ static int handle_peer_mesh_sessions_close_open(const st_admin_context *context,
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session close failed\"}");
     }
-    st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
+    st_storage_peer_mesh_session *sessions = NULL;
     size_t session_count = 0;
     if (st_storage_close_open_peer_mesh_sessions_visible(database_path,
                                                          context->tenant_id,
                                                          context->username,
                                                          context->admin,
-                                                         sessions,
-                                                         ST_ADMIN_MAX_PEER_SESSIONS,
+                                                         &sessions,
                                                          &session_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session close failed\"}");
     }
-    return build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+    int len = build_peer_mesh_sessions_array_response(sessions, session_count, 200, "OK", out, out_len);
+    free(sessions);
+    return len;
 }
 
 /* A JSON number for a double the way Java's Double.toString writes it here: 0.75, 12.5, 80.0. */
@@ -5297,16 +5363,14 @@ static int admin_egress_id_listed(const char *csv, long long client_id)
  *
  * effectiveConsumerClientIds is the configured allowlist already intersected with the base Peer
  * ACL, so an operator sees which devices the policy actually grants rather than which ones it
- * names.
+ * names. clients holds every client (st_storage_list_all_clients).
  */
 static int append_peer_mesh_egress_policy_view(st_admin_string_builder *builder,
                                                const char *database_path,
+                                               const st_storage_client *clients,
+                                               size_t client_count,
                                                const st_storage_peer_mesh_egress_policy *policy)
 {
-    st_storage_client clients[512];
-    size_t client_count = 0U;
-    (void)st_storage_list_clients(database_path, clients, 512U, &client_count);
-
     int rc = admin_sb_appendf(builder,
         "{\"id\":%lld,\"egressClientId\":%lld,\"egressClientName\":",
         policy->id, policy->egress_client_id);
@@ -5381,10 +5445,9 @@ static int build_peer_mesh_egress_activity_response(const st_admin_context *cont
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
-    st_storage_peer_mesh_egress_activity rows[128];
+    st_storage_peer_mesh_egress_activity *rows = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_activity(database_path, context->tenant_id,
-                                                  rows, 128U, &count) != 0) {
+    if (st_storage_list_peer_mesh_egress_activity(database_path, context->tenant_id, &rows, &count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"egress activity list failed\"}");
     }
@@ -5414,6 +5477,7 @@ static int build_peer_mesh_egress_activity_response(const st_admin_context *cont
         if (rc == 0) rc = admin_sb_append_json_string(&builder, rows[i].reported_at);
         if (rc == 0) rc = admin_sb_append(&builder, "}");
     }
+    free(rows);
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -5446,9 +5510,13 @@ static int build_peer_mesh_egress_switch_response(const st_admin_context *contex
     }
     size_t enabled_policies = 0U;
     if (database_path != NULL) {
-        st_storage_peer_mesh_egress_policy policies[128];
-        (void)st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 1,
-                                                        policies, 128U, &enabled_policies);
+        st_storage_peer_mesh_egress_policy *policies = NULL;
+        if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 1,
+                                                      &policies, &enabled_policies) != 0) {
+            return write_response(out, out_len, 500, "Internal Server Error",
+                                  "{\"error\":\"egress switch status failed\"}");
+        }
+        free(policies);
     }
     int deployment_enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     int configured = found == 0 && row.enabled;
@@ -5521,10 +5589,13 @@ static int build_peer_mesh_egress_policies_response(const st_admin_context *cont
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
-    st_storage_peer_mesh_egress_policy policies[128];
+    st_storage_peer_mesh_egress_policy *policies = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 0,
-                                                  policies, 128U, &count) != 0) {
+    st_storage_client *clients = NULL;
+    size_t client_count = 0U;
+    if (st_storage_list_peer_mesh_egress_policies(database_path, context->tenant_id, 0, &policies, &count) != 0
+        || (count > 0U && st_storage_list_all_clients(database_path, &clients, &client_count) != 0)) {
+        free(policies);
         return write_response(out, out_len, 500, "Internal Server Error",
                               "{\"error\":\"egress policy list failed\"}");
     }
@@ -5532,8 +5603,12 @@ static int build_peer_mesh_egress_policies_response(const st_admin_context *cont
     int rc = admin_sb_append(&builder, "[");
     for (size_t i = 0; rc == 0 && i < count; ++i) {
         if (i > 0) rc = admin_sb_append(&builder, ",");
-        if (rc == 0) rc = append_peer_mesh_egress_policy_view(&builder, database_path, &policies[i]);
+        if (rc == 0) {
+            rc = append_peer_mesh_egress_policy_view(&builder, database_path, clients, client_count, &policies[i]);
+        }
     }
+    free(policies);
+    free(clients);
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -5717,7 +5792,11 @@ static int handle_peer_mesh_egress_policy_mutation(const st_admin_context *conte
     admin_notify_peer_mesh_refresh(saved.tenant_id);
 
     st_admin_string_builder builder = {0};
-    int rc = append_peer_mesh_egress_policy_view(&builder, database_path, &saved);
+    st_storage_client *clients = NULL;
+    size_t client_count = 0U;
+    int rc = st_storage_list_all_clients(database_path, &clients, &client_count);
+    if (rc == 0) rc = append_peer_mesh_egress_policy_view(&builder, database_path, clients, client_count, &saved);
+    free(clients);
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
         return write_response(out, out_len, 500, "Internal Server Error",
@@ -5761,10 +5840,10 @@ static int build_peer_mesh_services_response(const st_admin_context *context, ch
 {
     const char *database_path = admin_database_path();
     if (database_path == NULL) return write_response(out, out_len, 200, "OK", "[]");
-    st_storage_peer_mesh_service services[256];
+    st_storage_peer_mesh_service *services = NULL;
     size_t count = 0U;
     if (st_storage_list_peer_mesh_services_visible(database_path, context->tenant_id,
-            context->username, context->admin, services, 256, &count) != 0) {
+            context->username, context->admin, &services, &count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service list failed\"}");
     }
     st_admin_string_builder builder = {0};
@@ -5773,6 +5852,7 @@ static int build_peer_mesh_services_response(const st_admin_context *context, ch
         if (i > 0) rc = admin_sb_append(&builder, ",");
         if (rc == 0) rc = append_peer_mesh_service_view(&builder, &services[i], context->admin);
     }
+    free(services);
     if (rc == 0) rc = admin_sb_append(&builder, "]");
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
@@ -5790,13 +5870,14 @@ static int build_peer_mesh_sharing_response(const st_admin_context *context, cha
     int found = database_path == NULL ? 1
         : st_storage_get_peer_mesh_service_sharing(database_path, context->tenant_id, &sharing);
     if (found < 0) return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer sharing status failed\"}");
-    st_storage_peer_mesh_service services[256];
+    st_storage_peer_mesh_service *services = NULL;
     size_t count = 0U;
     long long enabled_count = 0;
     if (database_path != NULL
         && st_storage_list_peer_mesh_services_visible(database_path, context->tenant_id,
-            context->username, 1, services, 256, &count) == 0) {
+            context->username, 1, &services, &count) == 0) {
         for (size_t i = 0; i < count; ++i) if (services[i].enabled) ++enabled_count;
+        free(services);
     }
     int deployment = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     st_admin_string_builder builder = {0};
@@ -6089,21 +6170,24 @@ static int handle_peer_mesh_service_mutation(const st_admin_context *context,
     }
     service.id = id;
     if (service.enabled) {
-        st_storage_peer_mesh_service services[256];
+        st_storage_peer_mesh_service *services = NULL;
         size_t count = 0U;
         if (st_storage_list_peer_mesh_services_visible(database_path, service.tenant_id, "", 1,
-                                                        services, 256U, &count) != 0) {
+                                                        &services, &count) != 0) {
             free(service_id); free(name); free(description); free(transport); free(application);
             free(target_host); free(path); free(visibility);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service conflict check failed\"}");
         }
-        for (size_t i = 0; i < count; ++i) {
-            if (services[i].id != service.id && services[i].client_id == service.client_id
-                && services[i].enabled && services[i].published_port == service.published_port) {
-                free(service_id); free(name); free(description); free(transport); free(application);
-                free(target_host); free(path); free(visibility);
-                return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"publishedPort already used by another enabled service\"}");
-            }
+        int port_used = 0;
+        for (size_t i = 0; !port_used && i < count; ++i) {
+            port_used = services[i].id != service.id && services[i].client_id == service.client_id
+                && services[i].enabled && services[i].published_port == service.published_port;
+        }
+        free(services);
+        if (port_used) {
+            free(service_id); free(name); free(description); free(transport); free(application);
+            free(target_host); free(path); free(visibility);
+            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"publishedPort already used by another enabled service\"}");
         }
     }
     st_storage_peer_mesh_service saved;
@@ -6225,11 +6309,11 @@ static int append_imported_peer_service(st_admin_string_builder *builder,
                                         int target_port,
                                         int published_port,
                                         const char *path,
-                                        st_storage_peer_mesh_service *existing,
+                                        st_storage_peer_mesh_service **existing,
                                         size_t *existing_count,
                                         int *first)
 {
-    if (peer_service_target_used(existing, *existing_count, target_host, target_port)) return 1;
+    if (peer_service_target_used(*existing, *existing_count, target_host, target_port)) return 1;
     st_storage_peer_mesh_service service;
     memset(&service, 0, sizeof(service));
     snprintf(service.tenant_id, sizeof(service.tenant_id), "%s", client->tenant_id);
@@ -6248,7 +6332,12 @@ static int append_imported_peer_service(st_admin_string_builder *builder,
     snprintf(service.visibility, sizeof(service.visibility), "OWNER");
     st_storage_peer_mesh_service saved;
     if (st_storage_upsert_peer_mesh_service(database_path, &service, &saved) != 0) return 1;
-    if (*existing_count < 256U) existing[(*existing_count)++] = saved;
+    /* Later candidates with this target are skipped too. */
+    st_storage_peer_mesh_service *grown = (st_storage_peer_mesh_service *)realloc(
+        *existing, (*existing_count + 1U) * sizeof(**existing));
+    if (grown == NULL) return -1;
+    *existing = grown;
+    grown[(*existing_count)++] = saved;
     if ((!*first && admin_sb_append(builder, ",") != 0)
         || append_peer_mesh_service_view(builder, &saved, 1) != 0) return -1;
     *first = 0;
@@ -6276,16 +6365,17 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         || strcmp(client.tenant_id, context->tenant_id) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
-    st_storage_peer_mesh_service existing[256];
+    st_storage_peer_mesh_service *existing = NULL;
     size_t existing_count = 0U;
     if (st_storage_list_peer_mesh_services_visible(database_path, client.tenant_id, "", 1,
-                                                    existing, 256U, &existing_count) != 0) {
+                                                    &existing, &existing_count) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service import failed\"}");
     }
     if (import_mdns) {
         st_storage_peer_mesh_service_sharing sharing = {0};
         if (st_storage_get_peer_mesh_service_sharing(database_path, client.tenant_id, &sharing) != 0
             || !sharing.mdns_import_enabled) {
+            free(existing);
             return write_response(out, out_len, 400, "Bad Request",
                                   "{\"error\":\"mDNS candidate import is disabled\"}");
         }
@@ -6293,6 +6383,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         size_t candidate_count = 0U;
         if (st_peer_mesh_list_mdns_candidates(client.tenant_id, client.id, candidates,
                                               256U, &candidate_count) != 0) {
+            free(existing);
             return write_response(out, out_len, 500, "Internal Server Error",
                                   "{\"error\":\"peer service import failed\"}");
         }
@@ -6309,11 +6400,12 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
             int imported = append_imported_peer_service(&imported_services, database_path, &client,
                 service_id, candidates[i].name, candidates[i].transport, candidates[i].application,
                 candidates[i].target_host, candidates[i].target_port, candidates[i].target_port,
-                path, existing, &existing_count, &import_first);
+                path, &existing, &existing_count, &import_first);
             if (imported == 0) ++imported_created;
             else if (imported == 1) ++imported_skipped;
             else import_rc = -1;
         }
+        free(existing);
         if (import_rc == 0) import_rc = admin_sb_append(&imported_services, "]");
         st_admin_string_builder imported_response = {0};
         if (import_rc == 0) import_rc = admin_sb_appendf(&imported_response,
@@ -6333,7 +6425,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         (void)st_storage_record_peer_mesh_service_audit(database_path, "service-import-mdns",
             client.tenant_id, client.id, 0, NULL, imported_reason);
         if (imported_created > 0) admin_notify_peer_mesh_refresh(client.tenant_id);
-        int imported_len = write_response(out, out_len, 200, "OK", imported_response.data);
+        int imported_len = write_unbounded_response(out, out_len, 200, "OK", imported_response.data);
         free(imported_response.data);
         return imported_len;
     }
@@ -6354,7 +6446,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         snprintf(name, sizeof(name), "tcp-%d", mappings[i].listen_port);
         int imported = append_imported_peer_service(&services, database_path, &client,
             service_id, name, "tcp", "tcp", host, mappings[i].target_port,
-            mappings[i].listen_port, "", existing, &existing_count, &first);
+            mappings[i].listen_port, "", &existing, &existing_count, &first);
         if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
     }
     free(mappings);
@@ -6372,7 +6464,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         snprintf(service_id, sizeof(service_id), "import-http-%lld", routes[i].id);
         int imported = append_imported_peer_service(&services, database_path, &client,
             service_id, routes[i].route, "tcp", application, host, target_port,
-            target_port, target_path, existing, &existing_count, &first);
+            target_port, target_path, &existing, &existing_count, &first);
         if (imported == 0) ++created; else if (imported == 1) ++skipped; else rc = -1;
     }
     free(routes);
@@ -6382,6 +6474,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
     if (rc == 0) rc = admin_sb_append(&response, services.data);
     if (rc == 0) rc = admin_sb_append(&response, "}");
     free(services.data);
+    free(existing);
     if (rc != 0 || response.data == NULL) {
         free(response.data);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer service import failed\"}");
@@ -6792,6 +6885,23 @@ static int build_connection_stats_response(const st_admin_context *context, cons
     return response_len;
 }
 
+/*
+ * Java binds a traffic list's clientId as a Long and filters by it whatever its value: 0 or a
+ * negative id names no client, so the page is empty rather than unfiltered.
+ */
+static int admin_query_names_no_client(const char *path)
+{
+    char *raw = admin_query_string(path, "clientId");
+    if (raw == NULL) {
+        return 0;
+    }
+    char *end = NULL;
+    long long parsed = strtoll(raw, &end, 10);
+    int none = end != raw && *end == '\0' && parsed <= 0;
+    free(raw);
+    return none;
+}
+
 static int build_empty_page_response(const char *path, char *out, size_t out_len)
 {
     int page = 0;
@@ -6977,7 +7087,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
     char *field = admin_query_string(path, "field");
     char *query = admin_query_string(path, "q");
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
+    if (database_path == NULL || admin_query_names_no_client(path)) {
         free(route);
         free(response_body_type);
         free(field);
@@ -7128,7 +7238,8 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
     int page = 0;
     int size = 50;
     int limit = 0;
-    int listen_port = 0;
+    /* Java's Integer listenPort filters whenever it is given, 0 included. */
+    int listen_port = ST_STORAGE_ANY_LISTEN_PORT;
     long long client_id = 0;
     (void)admin_query_int_any(path, "page", &page);
     if (admin_query_int_any(path, "size", &size) != 0 && admin_query_int_any(path, "limit", &limit) == 0) {
@@ -7140,7 +7251,7 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
     if (size < 1) size = 1;
     if (size > 500) size = 500;
     const char *database_path = admin_database_path();
-    if (database_path == NULL) {
+    if (database_path == NULL || admin_query_names_no_client(path)) {
         return build_empty_page_response(path, out, out_len);
     }
     if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
@@ -10948,16 +11059,21 @@ static int build_management_users_response(const st_admin_context *context, char
     }
     st_admin_string_builder builder = {0};
     const char *tenant_id = context->tenant_id;
+    const char *default_tenant = env_text("SPECUS_AUTH_TENANT_ID", "default");
+    /* The built-in admin belongs to the default tenant only: it signs in there and its tokens resolve
+     * there, so another tenant's list does not show it as one of its accounts. */
+    int listed = 0;
     int rc = admin_sb_append(&builder, "[");
-    if (rc == 0) {
+    if (rc == 0 && strcmp(tenant_id, default_tenant) == 0) {
         rc = append_management_user_view(&builder,
                                          env_text("SPECUS_AUTH_USERNAME", "admin"),
-                                         tenant_id,
+                                         default_tenant,
                                          "ADMIN",
                                          1,
                                          1,
                                          "",
                                          "");
+        listed = 1;
     }
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
@@ -10972,7 +11088,9 @@ static int build_management_users_response(const st_admin_context *context, char
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
         for (size_t i = 0; rc == 0 && i < user_count; ++i) {
-            rc = admin_sb_append(&builder, ",");
+            if (listed++ > 0) {
+                rc = admin_sb_append(&builder, ",");
+            }
             if (rc == 0) {
                 rc = append_stored_management_user_view(&builder, &users[i]);
             }
@@ -11397,21 +11515,24 @@ static int handle_workbench_request(const st_admin_context *context,
     return response_len;
 }
 
+/* account_key is the uid claim of the token: the account row's key, NULL for the built-in admin. */
 static int write_management_token_response(const char *username,
                                            const char *tenant_id,
                                            const char *role,
+                                           const char *account_key,
                                            char *out,
                                            size_t out_len)
 {
     long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char token[2048];
-    if (st_security_issue_local_token(username,
-                                      tenant_id,
-                                      role,
-                                      getenv("SPECUS_AUTH_JWT_SECRET"),
-                                      ttl,
-                                      token,
-                                      sizeof(token)) != 0) {
+    if (st_security_issue_local_token_for_account(username,
+                                                  tenant_id,
+                                                  role,
+                                                  account_key,
+                                                  getenv("SPECUS_AUTH_JWT_SECRET"),
+                                                  ttl,
+                                                  token,
+                                                  sizeof(token)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"token issue failed\"}");
     }
     char *escaped_token = st_json_escape(token);
@@ -11517,6 +11638,7 @@ static int handle_management_auth_login(const char *body,
     char token_username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
+    char token_account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1] = "";
     snprintf(token_username, sizeof(token_username), "%s", username);
     snprintf(token_tenant, sizeof(token_tenant), "%s", default_tenant);
     snprintf(token_role, sizeof(token_role), "%s", "USER");
@@ -11566,6 +11688,7 @@ static int handle_management_auth_login(const char *body,
                 snprintf(token_username, sizeof(token_username), "%s", user.username);
                 snprintf(token_tenant, sizeof(token_tenant), "%s", user.tenant_id);
                 snprintf(token_role, sizeof(token_role), "%s", normalize_management_role(user.role));
+                snprintf(token_account_key, sizeof(token_account_key), "%s", user.account_key);
                 database_user = 1;
             }
         }
@@ -11580,7 +11703,8 @@ static int handle_management_auth_login(const char *body,
     if (!ok) {
         return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"用户名或密码错误\"}");
     }
-    int response_len = write_management_token_response(token_username, token_tenant, token_role, out, out_len);
+    int response_len = write_management_token_response(token_username, token_tenant, token_role,
+                                                       database_user ? token_account_key : NULL, out, out_len);
     /* The built-in admin is no user row and never enters the onboarding cohort. */
     if (database_user && admin_token_response_issued(out, response_len)) {
         admin_product_metrics_milestone(token_tenant, token_username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
@@ -11588,13 +11712,16 @@ static int handle_management_auth_login(const char *body,
     return response_len;
 }
 
-/* The context was re-read from the user record, so the new token carries today's tenant and role. */
+/* The context was re-read from the user record, so the new token carries today's tenant and role,
+ * and names the account row it resolved to whether or not the old token did. */
 static int handle_management_auth_refresh(const st_admin_context *context, char *out, size_t out_len)
 {
     if (context == NULL || !context->authenticated) {
         return write_admin_unauthorized(out, out_len);
     }
-    return write_management_token_response(context->username, context->tenant_id, context->role, out, out_len);
+    return write_management_token_response(context->username, context->tenant_id, context->role,
+                                           context->account_key[0] == '\0' ? NULL : context->account_key,
+                                           out, out_len);
 }
 
 static int write_registration_error_response(int status,
@@ -11657,7 +11784,8 @@ static int handle_management_registration_verify(const char *body, char *out, si
     }
     /* Verification created the account and signs it in at once: two milestones, in step order. */
     admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED);
-    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, out, out_len);
+    int response_len = write_management_token_response(user.username, user.tenant_id, user.role, user.account_key,
+                                                       out, out_len);
     if (admin_token_response_issued(out, response_len)) {
         admin_product_metrics_milestone(user.tenant_id, user.username, ST_PRODUCT_METRICS_STEP_SIGNED_IN);
     }
@@ -15570,83 +15698,6 @@ static void admin_ws_release_client_message_write(st_admin_ws_client *client)
     pthread_mutex_unlock(&admin_ws_lock);
 }
 
-static void admin_drain_websocket(st_admin_ws_client *client)
-{
-    for (;;) {
-        uint8_t header[2];
-        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) {
-            return;
-        }
-        uint8_t opcode = header[0] & 0x0fU;
-        int masked = (header[1] & 0x80U) != 0;
-        uint64_t payload_len = header[1] & 0x7fU;
-        if (payload_len == 126U) {
-            uint8_t extended[2];
-            if (admin_recv_all(client->fd, extended, sizeof(extended)) != 0) {
-                return;
-            }
-            payload_len = ((uint64_t)extended[0] << 8U) | (uint64_t)extended[1];
-        } else if (payload_len == 127U) {
-            uint8_t extended[8];
-            if (admin_recv_all(client->fd, extended, sizeof(extended)) != 0) {
-                return;
-            }
-            payload_len = 0;
-            for (size_t i = 0; i < sizeof(extended); ++i) {
-                payload_len = (payload_len << 8U) | (uint64_t)extended[i];
-            }
-        }
-        uint8_t mask[4] = {0};
-        if (masked && admin_recv_all(client->fd, mask, sizeof(mask)) != 0) {
-            return;
-        }
-        if (payload_len > (1024U * 1024U)) {
-            uint8_t close_payload[2] = {0x03U, 0xf1U};
-            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
-            return;
-        }
-        uint8_t *payload = NULL;
-        if (payload_len > 0) {
-            payload = (uint8_t *)malloc((size_t)payload_len);
-            if (payload == NULL) {
-                return;
-            }
-            if (admin_recv_all(client->fd, payload, (size_t)payload_len) != 0) {
-                free(payload);
-                return;
-            }
-            if (masked) {
-                for (size_t i = 0; i < (size_t)payload_len; ++i) {
-                    payload[i] ^= mask[i % 4U];
-                }
-            }
-        }
-        /* A browser masks every frame (RFC 6455 5.1); Java's container closes 1002 otherwise. The
-         * frame is read first so that the close is not cut off by unread input. */
-        if (!masked) {
-            uint8_t close_payload[2] = {0x03U, 0xeaU};
-            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
-            free(payload);
-            return;
-        }
-        if (opcode == 0x8U) {
-            admin_ws_send_frame(client, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
-            free(payload);
-            return;
-        }
-        if (opcode == 0x9U) {
-            admin_ws_send_frame(client, 0xAU, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
-        }
-        free(payload);
-        /* Java's TextWebSocketHandler refuses binary messages with 1003; text is ignored. */
-        if (opcode == 0x2U) {
-            uint8_t close_payload[2] = {0x03U, 0xebU};
-            admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
-            return;
-        }
-    }
-}
-
 static int admin_ws_send_message_status(st_admin_ws_client *client,
                                         const char *type,
                                         const char *message_id,
@@ -15733,6 +15784,22 @@ static void *admin_client_message_write_thread(void *arg)
     return NULL;
 }
 
+/*
+ * A command member as Java's ObjectMapper binds it into a String field: the text of a string, the
+ * literal text of a number or of true and false (a scalar is coerced, so "messageId":42 reads as
+ * "42" and is echoed so), and NULL for null or a missing member.
+ */
+static char *admin_json_scalar_text(const char *json, const char *key)
+{
+    char *raw = st_json_get_top_level_raw(json, key);
+    if (raw == NULL || raw[0] == '"' || strcmp(raw, "null") == 0) {
+        int is_string = raw != NULL && raw[0] == '"';
+        free(raw);
+        return is_string ? st_json_get_top_level_string(json, key) : NULL;
+    }
+    return raw;
+}
+
 static void admin_handle_client_message_command(st_admin_ws_client *client, const char *json)
 {
     /*
@@ -15746,10 +15813,10 @@ static void admin_handle_client_message_command(st_admin_ws_client *client, cons
         (void)admin_ws_send_message_status(client, "error", NULL, NULL, NULL, "invalid-json");
         return;
     }
-    char *type = st_json_get_top_level_string(json, "type");
-    char *message_id = st_json_get_top_level_string(json, "messageId");
-    char *to_client_name = st_json_get_top_level_string(json, "toClientName");
-    char *message = st_json_get_top_level_string(json, "message");
+    char *type = admin_json_scalar_text(json, "type");
+    char *message_id = admin_json_scalar_text(json, "messageId");
+    char *to_client_name = admin_json_scalar_text(json, "toClientName");
+    char *message = admin_json_scalar_text(json, "message");
     if (type == NULL || strcmp(type, "message") != 0) {
         (void)admin_ws_send_message_status(client,
                                            "error",
@@ -15857,7 +15924,8 @@ done:
     free(message);
 }
 
-static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units)
+/* 0 with *units set for valid UTF-8 of at most max_units UTF-16 code units; -1 invalid; -2 longer. */
+static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t max_units, size_t *units)
 {
     size_t offset = 0U;
     size_t count = 0U;
@@ -15897,7 +15965,7 @@ static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units
             return -1;
         }
         size_t increment = codepoint > 0xffffU ? 2U : 1U;
-        if (count > ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS - increment) {
+        if (count > max_units - increment) {
             return -2;
         }
         count += increment;
@@ -15908,15 +15976,25 @@ static int admin_utf8_utf16_units(const uint8_t *data, size_t len, size_t *units
     return 0;
 }
 
-static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
+/* Handles one complete text message; -1 when the socket was closed for it. */
+typedef int (*admin_ws_text_handler)(st_admin_ws_client *client, const char *text, size_t len);
+
+/*
+ * Reads a management WebSocket as Java's container serves a TextWebSocketHandler: a text message,
+ * reassembled from its fragments, may hold at most max_chars UTF-16 code units (1009 otherwise) of
+ * valid UTF-8 (1007 otherwise); binary closes 1003; unmasked frames, set RSV bits, broken
+ * fragmentation and fragmented or oversized control frames close 1002; pings are answered and a
+ * close is echoed. Each text message goes to on_text, or is dropped when it is NULL.
+ */
+static void admin_drain_text_websocket(st_admin_ws_client *client, size_t max_chars, admin_ws_text_handler on_text)
 {
+    /* No more UTF-8 bytes than three per UTF-16 code unit can fit max_chars. */
+    const uint64_t max_bytes = (uint64_t)max_chars * 3U;
     st_admin_string_builder fragmented = {0};
     int fragment_active = 0;
     for (;;) {
         uint8_t header[2];
-        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) {
-            break;
-        }
+        if (admin_recv_all(client->fd, header, sizeof(header)) != 0) break;
         int fin = (header[0] & 0x80U) != 0U;
         uint8_t rsv = (uint8_t)((header[0] >> 4U) & 7U);
         uint8_t opcode = header[0] & 0x0fU;
@@ -15936,21 +16014,26 @@ static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
         }
         int control_frame = opcode >= 0x8U;
         int too_large = !control_frame
-            && (payload_len > ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES
-                || (fragment_active
-                    && payload_len > ST_ADMIN_CLIENT_MESSAGE_MAX_UTF8_BYTES - fragmented.len));
-        int protocol_error = !masked || rsv != 0U
-            || (control_frame && (!fin || payload_len > 125U));
+            && (payload_len > max_bytes || (fragment_active && payload_len > max_bytes - fragmented.len));
+        int protocol_error = rsv != 0U || (control_frame && (!fin || payload_len > 125U));
         if (protocol_error || too_large) {
             uint8_t close_payload[2] = {0x03U, too_large ? 0xf1U : 0xeaU};
             (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
             break;
         }
-        uint8_t mask[4];
-        if (admin_recv_all(client->fd, mask, sizeof(mask)) != 0) break;
+        uint8_t mask[4] = {0U, 0U, 0U, 0U};
+        if (masked && admin_recv_all(client->fd, mask, sizeof(mask)) != 0) break;
         uint8_t *payload = (uint8_t *)malloc(payload_len == 0U ? 1U : (size_t)payload_len);
         if (payload == NULL) break;
         if (payload_len > 0U && admin_recv_all(client->fd, payload, (size_t)payload_len) != 0) {
+            free(payload);
+            break;
+        }
+        /* A browser masks every frame (RFC 6455 5.1); the container closes 1002 otherwise. The frame
+         * is read first, so that the close is not cut off by unread input. */
+        if (!masked) {
+            uint8_t close_payload[2] = {0x03U, 0xeaU};
+            (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
             free(payload);
             break;
         }
@@ -15977,6 +16060,7 @@ static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
             free(payload);
             continue;
         }
+        /* TextWebSocketHandler refuses binary messages with 1003. */
         if (opcode == 0x2U) {
             uint8_t close_payload[2] = {0x03U, 0xebU};
             (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
@@ -15998,18 +16082,32 @@ static void admin_drain_client_messages_websocket(st_admin_ws_client *client)
         fragment_active = !fin;
         if (fin) {
             const uint8_t *text = (const uint8_t *)(fragmented.data == NULL ? "" : fragmented.data);
-            int utf8_rc = admin_utf8_utf16_units(text, fragmented.len, NULL);
-            if (utf8_rc != 0 || memchr(text, '\0', fragmented.len) != NULL) {
+            int utf8_rc = admin_utf8_utf16_units(text, fragmented.len, max_chars, NULL);
+            if (utf8_rc != 0) {
                 uint8_t close_payload[2] = {0x03U, utf8_rc == -2 ? 0xf1U : 0xefU};
                 (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
                 break;
             }
-            admin_handle_client_message_command(client, (const char *)text);
+            if (on_text != NULL && on_text(client, (const char *)text, fragmented.len) != 0) {
+                break;
+            }
             free(fragmented.data);
             memset(&fragmented, 0, sizeof(fragmented));
         }
     }
     free(fragmented.data);
+}
+
+static int admin_client_messages_text(st_admin_ws_client *client, const char *text, size_t len)
+{
+    /* The command is read as a C string; a NUL inside it cannot belong to JSON text. */
+    if (memchr(text, '\0', len) != NULL) {
+        uint8_t close_payload[2] = {0x03U, 0xefU};
+        (void)admin_ws_send_frame(client, 0x8U, close_payload, sizeof(close_payload));
+        return -1;
+    }
+    admin_handle_client_message_command(client, text);
+    return 0;
 }
 
 static int handle_connection_websocket_request(int fd, const char *method, const char *path, const char *request)
@@ -16092,7 +16190,7 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
         return 1;
     }
-    admin_drain_websocket(client);
+    admin_drain_text_websocket(client, ST_ADMIN_CONNECTIONS_MAX_CHARS, NULL);
     admin_ws_remove(client);
     return 1;
 }
@@ -16204,7 +16302,7 @@ static int handle_client_messages_websocket_request(int fd,
         return 1;
     }
     if (admin_ws_send_client_messages_hello(client) == 0) {
-        admin_drain_client_messages_websocket(client);
+        admin_drain_text_websocket(client, ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS, admin_client_messages_text);
     }
     admin_ws_remove(client);
     return 1;
