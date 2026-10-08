@@ -78,6 +78,8 @@ char *st_peer_mesh_build_login_config(const char *database_path,
  * unique-local unicast IP. 0 with the address in out, -1 when the host is anything else.
  */
 int st_peer_mesh_normalize_local_host(const char *value, char out[256]);
+/* The same check with Java's refusal message: NULL with the address in out, else the message. */
+const char *st_peer_mesh_local_host_refusal(const char *value, char out[256]);
 
 /*
  * Test hooks for the two bounded tables of client-driven session ids: placeholder entries that fill

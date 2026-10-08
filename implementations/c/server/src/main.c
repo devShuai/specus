@@ -3048,6 +3048,13 @@ static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *sessio
     return runtime;
 }
 
+/* The management API's PEER_CONTROL messages (a session it closed) go out like the runtime's own. */
+static int push_runtime_peer_control(void *ctx, const char *target_client_name, const char *message)
+{
+    (void)ctx;
+    return peer_mesh_runtime_send(NULL, target_client_name, "server", message);
+}
+
 static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
 {
     const server_config *config = (const server_config *)ctx;
@@ -5559,6 +5566,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    st_admin_set_peer_control_send_handler(push_runtime_peer_control, NULL);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
     st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);
     const st_connectivity_device connectivity_device = {
@@ -5584,6 +5592,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
@@ -5600,6 +5609,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
@@ -5622,6 +5632,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
@@ -5730,6 +5741,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+    st_admin_set_peer_control_send_handler(NULL, NULL);
     st_admin_set_client_disconnect_handler(NULL, NULL);
     st_admin_set_external_connection_stats_handler(NULL, NULL);
     st_stun_turn_server_stop(stun_turn_server);

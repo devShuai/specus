@@ -382,6 +382,18 @@ char *st_egress_encode_destination_rules(const st_egress_destination_rule *rules
  */
 int st_egress_normalize_domain_rules(const char *json, char **out_json);
 
+/*
+ * The two normalisers with Java PeerEgressService's verdict on a management request: 0 with
+ * *out_json; 1 when the list is refused, with Java's IllegalArgumentException message in error
+ * (destinationRules[0].cidr is not an IPv4 or IPv6 address or CIDR: ..., too many domain rules: ..., and so
+ * on; Spring answers 400 with it); 2 when the JSON does not bind into Java's rule records at all --
+ * a list that is not an array, an element that is neither an object nor null, a field of the wrong
+ * shape -- which Spring answers with its own 400 before the service runs. error may be NULL.
+ */
+int st_egress_normalize_destination_rules_explained(const char *json, char **out_json, char *error,
+                                                    size_t error_len);
+int st_egress_normalize_domain_rules_explained(const char *json, char **out_json, char *error, size_t error_len);
+
 /* Collects the distinct protocols an allowlist mentions, in first-seen order. */
 size_t st_egress_collect_protocols(const st_egress_destination_rule *rules,
                                    size_t rules_len,

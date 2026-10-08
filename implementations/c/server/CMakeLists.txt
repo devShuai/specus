@@ -55,6 +55,23 @@ target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DI
 target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
 target_compile_options(specus_c_core PRIVATE -Wall -Wextra -Wpedantic)
 
+# libbrotlidec is optional: with it, Content-Encoding br is decoded as Java's org.brotli:dec does
+# (traffic detail previews and display, media manifests); without it a br body stays as stored.
+# libbrotlienc, when present too, lets the tests compress their own br fixtures.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(BROTLIDEC QUIET libbrotlidec)
+    pkg_check_modules(BROTLIENC QUIET libbrotlienc)
+endif()
+if(BROTLIDEC_FOUND)
+    message(STATUS "libbrotlidec found: Content-Encoding br is decoded")
+    target_compile_definitions(specus_c_core PUBLIC ST_HAVE_BROTLI)
+    target_include_directories(specus_c_core PUBLIC ${BROTLIDEC_INCLUDE_DIRS})
+    target_link_libraries(specus_c_core PUBLIC ${BROTLIDEC_LINK_LIBRARIES})
+else()
+    message(STATUS "libbrotlidec not found: Content-Encoding br is not decoded")
+endif()
+
 add_executable(specus-server-c src/main.c)
 target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
@@ -128,6 +145,11 @@ add_test(NAME crypto_tests COMMAND specus_c_crypto_tests)
 
 add_executable(specus_c_decompression_limits_tests tests/decompression_limits_tests.c)
 target_link_libraries(specus_c_decompression_limits_tests PRIVATE specus_c_core)
+if(BROTLIDEC_FOUND AND BROTLIENC_FOUND)
+    target_compile_definitions(specus_c_decompression_limits_tests PRIVATE ST_HAVE_BROTLI_ENCODER)
+    target_include_directories(specus_c_decompression_limits_tests PRIVATE ${BROTLIENC_INCLUDE_DIRS})
+    target_link_libraries(specus_c_decompression_limits_tests PRIVATE ${BROTLIENC_LINK_LIBRARIES})
+endif()
 target_compile_options(specus_c_decompression_limits_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME decompression_limits_tests COMMAND specus_c_decompression_limits_tests)
 
@@ -171,6 +193,13 @@ add_executable(specus_c_management_crud_tests tests/management_crud_tests.c test
 target_link_libraries(specus_c_management_crud_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_management_crud_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME management_crud_tests COMMAND specus_c_management_crud_tests)
+
+# The Peer Mesh / Egress management endpoints, Spring-converted parameters, mapping create, times.
+add_executable(specus_c_peer_mesh_api_tests tests/peer_mesh_api_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_peer_mesh_api_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_peer_mesh_api_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME peer_mesh_api_tests COMMAND specus_c_peer_mesh_api_tests)
+set_tests_properties(peer_mesh_api_tests PROPERTIES TIMEOUT 120)
 set_tests_properties(management_crud_tests PROPERTIES TIMEOUT 120)
 
 # Java OverviewService on a real server process: clients, logins and public connection counters.

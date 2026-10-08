@@ -311,6 +311,7 @@ typedef struct {
     long long direct_bytes;
     long long relay_bytes;
     char last_traffic_at[64];
+    char last_keepalive_at[64];
 } st_storage_peer_mesh_session;
 
 typedef struct {
@@ -1123,6 +1124,22 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                const st_storage_client *client,
                                                int enabled,
                                                st_storage_peer_mesh_device *out_device);
+int st_storage_list_peer_mesh_devices_visible(const char *path,
+                                              const char *tenant_id,
+                                              const char *owner_username,
+                                              int include_all_clients,
+                                              st_storage_peer_mesh_device **devices,
+                                              size_t *device_count);
+/* 0 updated (enabled < 0 keeps the flag), 1 when the tenant has no device for the client, -1 error. */
+int st_storage_set_peer_mesh_device_enabled(const char *path,
+                                            const char *tenant_id,
+                                            long long client_id,
+                                            int enabled,
+                                            st_storage_peer_mesh_device *out_device);
+int st_storage_list_open_peer_mesh_sessions(const char *path,
+                                            const char *tenant_id,
+                                            st_storage_peer_mesh_session **sessions,
+                                            size_t *session_count);
 int st_storage_get_peer_mesh_device_by_client(const char *path,
                                               const char *tenant_id,
                                               long long client_id,
