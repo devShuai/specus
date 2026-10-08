@@ -602,7 +602,7 @@ SPECUS_DB_DIALECT=com.theshuai.specusserver.database.SpecusSqliteDialect \
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
-`SpecusSqliteDialect` 是 Hibernate 社区 `SQLiteDialect` 的子类，额外把 SQLite 的约束冲突（`SQLITE_CONSTRAINT`）翻译为 `DataIntegrityViolationException`，与 MySQL/PostgreSQL 一致。仍配置为 `org.hibernate.community.dialect.SQLiteDialect` 的部署会在启动时自动换成它。
+`SpecusSqliteDialect` 是 Hibernate 社区 `SQLiteDialect` 的子类，额外把 SQLite 的约束冲突（`SQLITE_CONSTRAINT`）翻译为 `DataIntegrityViolationException`，与 MySQL/PostgreSQL 一致；并用 `getBytes` 读取 `@Lob byte[]` 的 BLOB 列（sqlite-jdbc 未实现 `getBlob`，社区方言读这些列会失败）。仍配置为 `org.hibernate.community.dialect.SQLiteDialect` 的部署会在启动时自动换成它。
 
 切换至 MySQL：
 

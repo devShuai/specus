@@ -20,7 +20,6 @@ public enum HttpTrafficSearchField {
                     "responseContentType",
                     "responseBodyType",
                     "capturedAt"),
-            List.of(),
             List.of("resourceName", "relativePath", "rawQuery", "error"),
             List.of("clientName", "route", "method", "remoteAddress",
                     "requestContentType", "responseContentType", "responseBodyType", "capturedAt"),
@@ -44,8 +43,9 @@ public enum HttpTrafficSearchField {
                     "responseBodyType",
                     "requestHeaders",
                     "responseHeaders",
+                    "requestPreviewText",
+                    "responsePreviewText",
                     "capturedAt"),
-            List.of("requestPreviewText", "responsePreviewText"),
             List.of("resourceName", "relativePath", "rawQuery", "error", "requestHeaders", "responseHeaders", "requestPreviewText", "responsePreviewText"),
             List.of("clientName", "route", "method", "remoteAddress",
                     "requestContentType", "responseContentType", "responseBodyType", "capturedAt"),
@@ -53,33 +53,31 @@ public enum HttpTrafficSearchField {
             true,
             true,
             true),
-    ID("id", List.of(), List.of(), List.of(), List.of(), true, false, false, false),
-    METHOD("method", List.of("method"), List.of(), List.of(), List.of("method"), false, false, false, false),
-    STATUS("status", List.of(), List.of(), List.of(), List.of(), false, false, true, false),
-    PATH("path", List.of("relativePath", "rawQuery"), List.of(), List.of("relativePath", "rawQuery"), List.of(), false, false, false, false),
-    ROUTE("route", List.of("route"), List.of(), List.of(), List.of("route"), false, false, false, false),
-    CLIENT("client", List.of("clientName"), List.of(), List.of(), List.of("clientName"), false, true, false, false),
-    RESOURCE("resource", List.of("resourceName"), List.of(), List.of("resourceName"), List.of(), false, false, false, true),
-    REMOTE("remote", List.of("remoteAddress"), List.of(), List.of(), List.of("remoteAddress"), false, false, false, false),
+    ID("id", List.of(), List.of(), List.of(), true, false, false, false),
+    METHOD("method", List.of("method"), List.of(), List.of("method"), false, false, false, false),
+    STATUS("status", List.of(), List.of(), List.of(), false, false, true, false),
+    PATH("path", List.of("relativePath", "rawQuery"), List.of("relativePath", "rawQuery"), List.of(), false, false, false, false),
+    ROUTE("route", List.of("route"), List.of(), List.of("route"), false, false, false, false),
+    CLIENT("client", List.of("clientName"), List.of(), List.of("clientName"), false, true, false, false),
+    RESOURCE("resource", List.of("resourceName"), List.of("resourceName"), List.of(), false, false, false, true),
+    REMOTE("remote", List.of("remoteAddress"), List.of(), List.of("remoteAddress"), false, false, false, false),
     CONTENT_TYPE(
             "contentType",
             List.of("requestContentType", "responseContentType", "responseBodyType"),
-            List.of(),
             List.of(),
             List.of("requestContentType", "responseContentType", "responseBodyType"),
             false,
             false,
             false,
             false),
-    ERROR("error", List.of("error"), List.of(), List.of("error"), List.of(), false, false, false, false),
-    REQUEST_HEADERS("requestHeaders", List.of("requestHeaders"), List.of(), List.of("requestHeaders"), List.of(), false, false, false, false),
-    RESPONSE_HEADERS("responseHeaders", List.of("responseHeaders"), List.of(), List.of("responseHeaders"), List.of(), false, false, false, false),
-    REQUEST_BODY("requestBody", List.of(), List.of("requestPreviewText"), List.of("requestPreviewText"), List.of(), false, false, false, false),
-    RESPONSE_BODY("responseBody", List.of(), List.of("responsePreviewText"), List.of("responsePreviewText"), List.of(), false, false, false, false);
+    ERROR("error", List.of("error"), List.of("error"), List.of(), false, false, false, false),
+    REQUEST_HEADERS("requestHeaders", List.of("requestHeaders"), List.of("requestHeaders"), List.of(), false, false, false, false),
+    RESPONSE_HEADERS("responseHeaders", List.of("responseHeaders"), List.of("responseHeaders"), List.of(), false, false, false, false),
+    REQUEST_BODY("requestBody", List.of("requestPreviewText"), List.of("requestPreviewText"), List.of(), false, false, false, false),
+    RESPONSE_BODY("responseBody", List.of("responsePreviewText"), List.of("responsePreviewText"), List.of(), false, false, false, false);
 
     private final String code;
     private final List<String> jpaStringFields;
-    private final List<String> jpaClobFields;
     private final List<String> elasticTextFields;
     private final List<String> elasticKeywordFields;
     private final boolean searchId;
@@ -89,7 +87,6 @@ public enum HttpTrafficSearchField {
 
     HttpTrafficSearchField(String code,
                            List<String> jpaStringFields,
-                           List<String> jpaClobFields,
                            List<String> elasticTextFields,
                            List<String> elasticKeywordFields,
                            boolean searchId,
@@ -98,7 +95,6 @@ public enum HttpTrafficSearchField {
                            boolean searchResourceId) {
         this.code = code;
         this.jpaStringFields = jpaStringFields;
-        this.jpaClobFields = jpaClobFields;
         this.elasticTextFields = elasticTextFields;
         this.elasticKeywordFields = elasticKeywordFields;
         this.searchId = searchId;
@@ -126,10 +122,6 @@ public enum HttpTrafficSearchField {
 
     public List<String> jpaStringFields() {
         return jpaStringFields;
-    }
-
-    public List<String> jpaClobFields() {
-        return jpaClobFields;
     }
 
     public List<String> elasticTextFields() {
