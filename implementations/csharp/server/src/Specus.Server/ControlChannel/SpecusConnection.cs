@@ -243,13 +243,21 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         return WriteDirectAsync(bytes, cancellationToken);
     }
 
+    /// <summary>
+    /// Holds the write lock across <paramref name="commit"/> and the packet, so any frame the
+    /// committed state lets another producer send (direct, priority, or stream) waits behind it.
+    /// </summary>
+    public ValueTask CommitAndWriteAsync(Action? commit, Packet packet,
+        CancellationToken cancellationToken = default) =>
+        WriteDirectAsync(PacketCodec.Encode(packet), cancellationToken, commit: commit);
+
     private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken,
-        DisconnectReason failureReason = DisconnectReason.IoError)
+        DisconnectReason failureReason = DisconnectReason.IoError, Action? commit = null)
     {
         var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
         try
         {
-            await WriteEncodedAsync(bytes, cancellationToken, failureReason).ConfigureAwait(false);
+            await WriteEncodedAsync(bytes, cancellationToken, failureReason, commit).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -310,10 +318,12 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
     /// alone: a caller giving up (an HTTP request aborted mid-push) must not cut it short. A write
     /// that fails or is cancelled partway leaves part of a frame behind, after which any frame would
     /// be read out of step, so the connection is closed and never written again ("帧写入失败" in
-    /// protocol/spec/control-protocol.md).
+    /// protocol/spec/control-protocol.md). <paramref name="commit"/>, when given, runs once the lock
+    /// is held and before the frame is written, and not at all when the lock wait is cancelled or
+    /// the connection already failed a write.
     /// </summary>
     private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken,
-        DisconnectReason failureReason = DisconnectReason.IoError)
+        DisconnectReason failureReason = DisconnectReason.IoError, Action? commit = null)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         var failed = false;
@@ -323,6 +333,7 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
             {
                 throw new IOException("the connection was closed after a failed write");
             }
+            commit?.Invoke();
             try
             {
                 await _stream.WriteAsync(bytes, _lifetimeCts.Token).ConfigureAwait(false);
