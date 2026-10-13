@@ -5,6 +5,7 @@ import com.theshuai.specusserver.management.model.PublicTransferDiagramVersion;
 import com.theshuai.specusserver.management.model.PublicTransferRoom;
 import com.theshuai.specusserver.management.model.PublicTransferRoomAccess;
 import com.theshuai.specusserver.management.model.PublicTransferRoomPairingCode;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.PublicTransferDiagramVersionRepository;
 import com.theshuai.specusserver.management.repository.PublicTransferRoomAccessRepository;
 import com.theshuai.specusserver.management.repository.PublicTransferRoomPairingCodeRepository;
@@ -151,6 +152,7 @@ public class PublicTransferRoomService {
         Instant createdAt = Instant.now();
         long configuredTtl = properties.getPairingCodeTtlSeconds();
         long ttlSeconds = Math.max(60L, Math.min(900L, configuredTtl));
+        Instant expiresAt = createdAt.plusSeconds(ttlSeconds);
         String plainCode = newUniquePairingCode();
         PublicTransferRoomPairingCode pairingCode = new PublicTransferRoomPairingCode();
         pairingCode.setId(newUniquePairingCodeId());
@@ -159,13 +161,13 @@ public class PublicTransferRoomService {
         pairingCode.setRole(role.name());
         pairingCode.setLabel(normalizeText(request.label(), role == Role.EDITOR ? "编辑者配对" : "访客配对", 80));
         pairingCode.setCreatedAt(createdAt.toString());
-        pairingCode.setExpiresAt(createdAt.plusSeconds(ttlSeconds).toString());
+        pairingCode.setExpiresAt(SortableInstant.format(expiresAt));
         pairingCode.setMaxUses(maxUses);
         pairingCode.setUsedCount(0);
         PublicTransferRoomPairingCode saved = pairingCodeRepository.saveAndFlush(pairingCode);
         return new CreatePairingCodeResponse(
                 saved.getId(), plainCode, role, saved.getLabel(), saved.getCreatedAt(),
-                saved.getExpiresAt(), saved.getMaxUses(), saved.getUsedCount());
+                expiresAt.toString(), saved.getMaxUses(), saved.getUsedCount());
     }
 
     @Transactional
@@ -174,7 +176,7 @@ public class PublicTransferRoomService {
         String plainCode = normalizePairingCode(request.code());
         String codeHash = pairingCodeHash(plainCode);
         Instant now = Instant.now();
-        if (pairingCodeRepository.consumeUsable(codeHash, now.toString()) != 1) {
+        if (pairingCodeRepository.consumeUsable(codeHash, SortableInstant.format(now)) != 1) {
             throw invalidPairingCode();
         }
         PublicTransferRoomPairingCode pairingCode = pairingCodeRepository.findByCodeHash(codeHash)

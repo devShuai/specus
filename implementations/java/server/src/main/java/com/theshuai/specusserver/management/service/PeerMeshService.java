@@ -19,6 +19,7 @@ import com.theshuai.specusserver.management.model.PeerMeshPathStatsView;
 import com.theshuai.specusserver.management.model.PeerMeshServiceSharing;
 import com.theshuai.specusserver.management.model.PeerMeshSession;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
@@ -407,7 +408,7 @@ public class PeerMeshService {
         session.setTokenHash(HexFormat.of().formatHex(HmacSigner.sha256(token)));
         session.setStartedAt(now.toString());
         session.setUpdatedAt(now.toString());
-        session.setExpiresAt(now.plusSeconds(properties.getSessionTtlSeconds()).toString());
+        session.setExpiresAt(SortableInstant.format(now.plusSeconds(properties.getSessionTtlSeconds())));
         PeerMeshSession saved = sessionRepository.save(session);
         sessionTokenCache.put(saved.getId(), token);
         return new PeerSessionGrant(toSessionView(saved), token);
@@ -1264,7 +1265,7 @@ public class PeerMeshService {
                 session.getLastKeepaliveAt(),
                 session.getStartedAt(),
                 session.getUpdatedAt(),
-                session.getExpiresAt(),
+                SortableInstant.toInstantString(session.getExpiresAt()),
                 session.getClosedAt()
         );
     }
@@ -1400,7 +1401,7 @@ public class PeerMeshService {
         List<PeerMeshSession> expired = sessionRepository
                 .findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(
                         STATUS_CLOSED,
-                        now.toString(),
+                        SortableInstant.format(now),
                         PageRequest.of(0, Math.clamp(limit, 1, 1000)));
         for (PeerMeshSession session : expired) {
             markClosed(session, now);

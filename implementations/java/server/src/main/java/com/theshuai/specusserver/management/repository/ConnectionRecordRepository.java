@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.management.repository;
 
 import com.theshuai.specusserver.management.model.ConnectionRecord;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
@@ -22,8 +23,10 @@ public interface ConnectionRecordRepository extends JpaRepository<ConnectionReco
 
     long countByTenantIdAndClientIdInAndSuccess(String tenantId, List<Long> clientIds, boolean success);
 
+    /** {@code connectedAt} and the column are {@link SortableInstant} text, so the string order is the time order. */
     long countByClientIdAndConnectedAtGreaterThanEqual(Long clientId, String connectedAt);
 
+    /** {@code connectedAt} and the column are {@link SortableInstant} text, so the string order is the time order. */
     long countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(String tenantId, Long clientId, String connectedAt);
 
     // Roll detail rows older than the cutoff into per-natural-month totals (month = yyyy-MM from
@@ -45,10 +48,14 @@ public interface ConnectionRecordRepository extends JpaRepository<ConnectionReco
     // 服务端进程被 kill / 重启时 channelInactive 不会触发，旧记录的 disconnectedAt 会留 null，
     // 让 UI 一直把它们算成"在线"。启动时统一把启动前还没收尾的记录关上。
     // cutoff 取启动时刻，避免误伤启动过程中刚进来的新连接。
+    // cutoff is SortableInstant text, compared with connectedAt; closedAt is the same instant in
+    // the Instant.toString() form that disconnectedAt keeps for the views.
     @Modifying
-    @Query("update ConnectionRecord r set r.disconnectedAt = :cutoff, r.disconnectReason = :reason " +
+    @Query("update ConnectionRecord r set r.disconnectedAt = :closedAt, r.disconnectReason = :reason " +
             "where r.disconnectedAt is null and r.connectedAt < :cutoff")
-    int closeOpenRecordsBefore(@Param("cutoff") String cutoff, @Param("reason") String reason);
+    int closeOpenRecordsBefore(@Param("cutoff") String cutoff,
+                               @Param("closedAt") String closedAt,
+                               @Param("reason") String reason);
 
     // 服务端优雅停机时（ContextClosedEvent）直接把所有还在线的记录收尾，
     // 避免 channelInactive → loginExecutor 异步派发链路在 shutdown 过程中被 RejectedExecution。

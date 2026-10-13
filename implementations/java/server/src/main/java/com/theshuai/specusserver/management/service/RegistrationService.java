@@ -4,6 +4,7 @@ import com.theshuai.specusserver.config.AuthProperties;
 import com.theshuai.specusserver.config.EmailVerificationProperties;
 import com.theshuai.specusserver.management.model.ManagementRegistrationChallenge;
 import com.theshuai.specusserver.management.model.ManagementUserEmail;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ManagementRegistrationChallengeRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
@@ -118,6 +119,7 @@ public class RegistrationService {
 
         long ttlSeconds = Math.max(60, properties.getCodeTtlSeconds());
         long cooldownSeconds = Math.max(1, properties.getResendCooldownSeconds());
+        Instant expiresAt = now.plusSeconds(ttlSeconds);
         String registrationId = randomRegistrationId();
         String code = String.format(Locale.ROOT, "%06d", secureRandom.nextInt(1_000_000));
         ManagementRegistrationChallenge challenge = new ManagementRegistrationChallenge();
@@ -127,7 +129,7 @@ public class RegistrationService {
         challenge.setPasswordHash(PasswordService.hash(password));
         challenge.setCodeHash(codeHash(registrationId, code));
         challenge.setAttemptsRemaining(Math.max(1, properties.getMaxAttempts()));
-        challenge.setExpiresAt(now.plusSeconds(ttlSeconds).toString());
+        challenge.setExpiresAt(SortableInstant.format(expiresAt));
         challenge.setResendAvailableAt(now.plusSeconds(cooldownSeconds).toString());
         challenge.setCreatedAt(now.toString());
         challenge.setUpdatedAt(now.toString());
@@ -136,7 +138,7 @@ public class RegistrationService {
         return new RegistrationChallengeResponse(
                 registrationId,
                 maskEmail(email),
-                challenge.getExpiresAt(),
+                expiresAt.toString(),
                 cooldownSeconds);
     }
 
@@ -194,7 +196,7 @@ public class RegistrationService {
     @Scheduled(fixedDelayString = "${specus.auth.email-verification.cleanup-interval-ms:3600000}")
     @Transactional
     public void deleteExpiredChallenges() {
-        challengeRepository.deleteByExpiresAtBefore(Instant.now().toString());
+        challengeRepository.deleteByExpiresAtBefore(SortableInstant.format(Instant.now()));
     }
 
     private void requireAvailable() {

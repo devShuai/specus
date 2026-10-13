@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.management.service;
 
 import com.theshuai.common.security.HmacSigner;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAuthNonceRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -22,10 +23,11 @@ public class ClientAuthNonceService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean consume(String apiKey, String nonce) {
         Instant now = Instant.now();
-        repository.deleteExpired(now.toString());
+        repository.deleteExpired(SortableInstant.format(now));
         String apiKeyHash = sha256(apiKey);
         String nonceId = sha256(apiKeyHash + "\n" + nonce);
-        return repository.insertIfAbsent(nonceId, apiKeyHash, now.plusSeconds(NONCE_TTL_SECONDS).toString()) == 1;
+        return repository.insertIfAbsent(
+                nonceId, apiKeyHash, SortableInstant.format(now.plusSeconds(NONCE_TTL_SECONDS))) == 1;
     }
 
     private static String sha256(String value) {

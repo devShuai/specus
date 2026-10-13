@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.management.repository;
 
 import com.theshuai.specusserver.management.model.PublicTransferRoomPairingCode;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -16,6 +17,8 @@ public interface PublicTransferRoomPairingCodeRepository extends JpaRepository<P
     /**
      * Atomically reserves one redemption. This avoids the check-then-update race that could let a
      * one-time code mint more than one access token on MySQL/PostgreSQL or concurrent SQLite use.
+     * {@code now} and {@code expiresAt} are {@link SortableInstant} text, so the string order is the
+     * time order.
      */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""

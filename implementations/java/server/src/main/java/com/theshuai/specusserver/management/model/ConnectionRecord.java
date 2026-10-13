@@ -45,6 +45,10 @@ public class ConnectionRecord {
     @Column(name = "remote_address", length = 255)
     private String remoteAddress;
 
+    /**
+     * {@link SortableInstant} text: the rate limit, the list filter and the startup close compare it
+     * as a string. Views carry {@link SortableInstant#toInstantString}.
+     */
     @Column(name = "connected_at", nullable = false, length = 40)
     private String connectedAt;
 

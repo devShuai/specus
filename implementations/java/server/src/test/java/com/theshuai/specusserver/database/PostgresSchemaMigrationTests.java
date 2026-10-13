@@ -4,6 +4,7 @@ import com.theshuai.specusserver.SpecusServerApplication;
 import com.theshuai.specusserver.management.model.HttpBodyDataCodec;
 import com.theshuai.specusserver.management.model.HttpTrafficExchange;
 import com.theshuai.specusserver.management.model.HttpTrafficExchangeView;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.HttpTrafficExchangeRepository;
 import com.theshuai.specusserver.management.service.TrafficViewService;
 import com.theshuai.specusserver.management.storage.HttpTrafficExchangeStore;
@@ -26,6 +27,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -291,14 +294,51 @@ class PostgresSchemaMigrationTests {
     }
 
     @Test
-    void transferTimestampMigrationSkipsMissingTablesWithoutAbortingTheTransaction() {
+    void sortableTimestampMigrationSkipsMissingTablesWithoutAbortingTheTransaction() {
         DataSource dataSource = newDatabase();
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);
 
         inTransaction(dataSource, () -> {
-            new TransferTimestampMigrator(jdbc).migrate();
+            new SortableTimestampMigrator(jdbc).migrate();
             assertThat(jdbc.queryForObject("select 1", Integer.class)).isEqualTo(1);
         });
+    }
+
+    /** Legacy values under a numeric and a text key, more than one batch of them, rewritten in place. */
+    @Test
+    void sortableTimestampMigrationRewritesLegacyRowsOnPostgres() {
+        DataSource dataSource = newDatabase();
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("create table specus_connection_record (id bigint primary key, connected_at varchar(40) not null)");
+        jdbc.execute("""
+                create table specus_websocket_ticket (
+                    token_hash varchar(64) primary key, expires_at varchar(40) not null)
+                """);
+        // Whole seconds and 3, 6 or 9 fraction digits, as Instant.toString() writes them.
+        long[] fractionNanos = {0L, 7_000_000L, 7_000L, 7L};
+        List<Object[]> records = new ArrayList<>();
+        List<Object[]> tickets = new ArrayList<>();
+        for (int i = 1; i <= SortableTimestampMigrator.BATCH_SIZE + 3; i++) {
+            String legacy = Instant.parse("2026-09-15T12:00:00Z")
+                    .plusSeconds(i).plusNanos(fractionNanos[i % 4]).toString();
+            records.add(new Object[]{(long) i, legacy});
+            tickets.add(new Object[]{"t%04d".formatted(i), legacy});
+        }
+        jdbc.batchUpdate("insert into specus_connection_record(id, connected_at) values (?, ?)", records);
+        jdbc.batchUpdate("insert into specus_websocket_ticket(token_hash, expires_at) values (?, ?)", tickets);
+
+        migrateTwice(dataSource, () -> new SortableTimestampMigrator(jdbc).migrate());
+
+        assertThat(jdbc.queryForObject("select count(*) from specus_connection_record where length(connected_at) <> ?",
+                Integer.class, SortableInstant.LENGTH)).isZero();
+        assertThat(jdbc.queryForObject("select count(*) from specus_websocket_ticket where length(expires_at) <> ?",
+                Integer.class, SortableInstant.LENGTH)).isZero();
+        assertThat(jdbc.queryForObject("select connected_at from specus_connection_record where id = 2", String.class))
+                .isEqualTo("2026-09-15T12:00:02.0000070Z");
+        // In the second batch.
+        assertThat(jdbc.queryForObject(
+                "select expires_at from specus_websocket_ticket where token_hash = 't0501'", String.class))
+                .isEqualTo("2026-09-15T12:08:21.0070000Z");
     }
 
     private String createDatabase() {

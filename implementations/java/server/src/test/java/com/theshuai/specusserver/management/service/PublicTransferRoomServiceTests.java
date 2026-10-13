@@ -5,6 +5,7 @@ import com.theshuai.specusserver.management.model.PublicTransferDiagramVersion;
 import com.theshuai.specusserver.management.model.PublicTransferRoom;
 import com.theshuai.specusserver.management.model.PublicTransferRoomAccess;
 import com.theshuai.specusserver.management.model.PublicTransferRoomPairingCode;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.PublicTransferDiagramVersionRepository;
 import com.theshuai.specusserver.management.repository.PublicTransferRoomAccessRepository;
 import com.theshuai.specusserver.management.repository.PublicTransferRoomPairingCodeRepository;
@@ -36,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -182,6 +184,9 @@ class PublicTransferRoomServiceTests {
         assertEquals(64, captor.getValue().getCodeHash().length());
         assertNotEquals(created.code(), captor.getValue().getCodeHash());
         assertTrue(Instant.parse(created.expiresAt()).isAfter(Instant.parse(created.createdAt())));
+        // Stored for the redeem query's text comparison, answered in the Instant.toString() form.
+        assertEquals(SortableInstant.normalize(created.expiresAt()), captor.getValue().getExpiresAt());
+        assertEquals(Instant.parse(created.expiresAt()).toString(), created.expiresAt());
     }
 
     @Test
@@ -207,6 +212,8 @@ class PublicTransferRoomServiceTests {
         ArgumentCaptor<PublicTransferRoomAccess> captor = ArgumentCaptor.forClass(PublicTransferRoomAccess.class);
         verify(accessRepository).saveAndFlush(captor.capture());
         assertEquals(redeemed.expiresAt(), captor.getValue().getExpiresAt());
+        verify(pairingCodeRepository).consumeUsable(anyString(),
+                argThat(now -> now.length() == SortableInstant.LENGTH));
     }
 
     @Test
