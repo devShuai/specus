@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -226,6 +228,22 @@ class GateFidelityTests(unittest.TestCase):
             self.assert_original_failure_retained(instance)
             self.assertFalse(instance.results[-1]["ok"])
             self.assertTrue(list(instance.report_dir.glob("new-flow-trace-*/samples.jsonl")))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX artifact directory permissions")
+    def test_archived_evidence_uses_report_permissions_without_changing_private_source(self):
+        # mkdtemp is 0700. copytree copies that mode too; the sudo lab's archive
+        # then cannot be scanned by the ordinary CI runner that uploads reports.
+        for report_mode in (0o755, 0o750):
+            with self.subTest(report_mode=oct(report_mode)), tempfile.TemporaryDirectory() as directory:
+                instance = self.lab(directory, trace=True)
+                instance.report_dir.chmod(report_mode)
+                with patch("lab.NewFlowTrace.start", side_effect=RuntimeError("no namespace in fixture")):
+                    with instance.new_flow_evidence() as trace:
+                        instance.first_byte_gate(trace)
+                archived = instance.report_dir / trace.directory.name
+                self.assertEqual(report_mode, stat.S_IMODE(archived.stat().st_mode))
+                self.assertEqual(0o700, stat.S_IMODE(trace.directory.stat().st_mode))
+                self.assertTrue((archived / "samples.jsonl").is_file())
 
     def test_diagnostic_write_failure_does_not_discard_the_slow_sample(self):
         with tempfile.TemporaryDirectory() as directory:

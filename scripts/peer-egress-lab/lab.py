@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -1183,7 +1184,12 @@ class Lab:
                 except (OSError, ValueError) as error:
                     self.note(f"new-flow metadata finalization failed ({type(error).__name__})")
                 try:
-                    shutil.copytree(trace.directory, self.report_dir / trace.directory.name)
+                    archived = self.report_dir / trace.directory.name
+                    shutil.copytree(trace.directory, archived)
+                    # copytree preserves mkdtemp's private 0700 source mode. The
+                    # sudo lab's archive must be as readable as the existing
+                    # report for the non-root artifact uploader, but no more.
+                    archived.chmod(stat.S_IMODE(self.report_dir.stat().st_mode))
                     copied = True
                 except OSError as error:
                     self.note(f"new-flow metadata archive failed ({type(error).__name__})")
