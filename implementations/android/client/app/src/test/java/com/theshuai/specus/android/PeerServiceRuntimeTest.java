@@ -5,6 +5,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -12,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +25,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -252,28 +255,199 @@ public class PeerServiceRuntimeTest {
             long started = System.nanoTime();
             runtime.applyConfig(first);
             try (Socket firstCaller = new Socket("127.0.0.1", firstPublishedPort);
-                 Socket firstForwarded = firstTarget.accept()) {
+                 Socket firstForwarded = acceptForwarded(firstTarget, firstCaller, "first-generation", started)) {
                 assertTrue(java.time.Duration.ofNanos(System.nanoTime() - started).compareTo(
                         java.time.Duration.ofSeconds(5)) < 0);
 
                 SpecusCore.PeerMeshConfig replacement = config(true, secondTarget.getLocalPort(), true);
                 replacement.localServices.get(0).publishedPort = secondPublishedPort;
                 replacement.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+                long replaced = System.nanoTime();
                 runtime.applyConfig(replacement);
                 firstCaller.setSoTimeout(1_000);
                 assertTrue(readClosed(firstCaller));
-                assertConnectRejected(firstPublishedPort);
+                assertConnectRejected("after replacement", "127.0.0.1", firstPublishedPort);
 
                 try (Socket secondCaller = new Socket("127.0.0.1", secondPublishedPort);
-                     Socket secondForwarded = secondTarget.accept()) {
-                    assertTrue(secondForwarded.isConnected());
+                     Socket secondForwarded = acceptForwarded(secondTarget, secondCaller,
+                             "replacement-generation", replaced)) {
                     replacement.localServices.get(0).enabled = false;
                     runtime.applyConfig(replacement);
                     secondCaller.setSoTimeout(1_000);
                     assertTrue(readClosed(secondCaller));
                 }
-                assertConnectRejected(secondPublishedPort);
+                assertConnectRejected("after disable", "127.0.0.1", secondPublishedPort);
             }
+        }
+    }
+
+    @Test
+    public void inPlaceTcpConfigEditClosesOldListenerAndReenableRestoresForwarding() throws Exception {
+        int[] ports = freePorts(3);
+        try (ServerSocket target = listen(ports[2])) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            SpecusCore.PeerMeshConfig current = config(true, target.getLocalPort(), true);
+            current.localServices.get(0).publishedPort = ports[0];
+            current.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+            long started = System.nanoTime();
+            runtime.applyConfig(current);
+            try (Socket caller = new Socket("127.0.0.1", ports[0]);
+                 Socket forwarded = acceptForwarded(target, caller, "before-mutation", started)) {
+                current.localServices.get(0).publishedPort = ports[1];
+                long replaced = System.nanoTime();
+                runtime.applyConfig(current);
+                assertConnectRejected("in-place published port edit", "127.0.0.1", ports[0]);
+                caller.setSoTimeout(1_000);
+                assertTrue("old active flow survives in-place edit", readClosed(caller));
+                assertRoundTrip(target, "127.0.0.1", ports[1], "after-mutation", replaced);
+            }
+            current.localServices.get(0).enabled = false;
+            runtime.applyConfig(current);
+            assertConnectRejected("in-place disable", "127.0.0.1", ports[1]);
+            current.localServices.get(0).enabled = true;
+            long reenabled = System.nanoTime();
+            runtime.applyConfig(current);
+            assertRoundTrip(target, "127.0.0.1", ports[1], "reenabled", reenabled);
+            runtime.setHasAuthorizedOnlinePeer(false);
+            assertConnectRejected("authorization withdrawn", "127.0.0.1", ports[1]);
+        }
+    }
+
+    @Test
+    public void virtualIpEditRebindsListenerInsteadOfKeepingOldAddress() throws Exception {
+        int[] ports = freePorts(2);
+        try (ServerSocket target = listen(ports[1])) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            SpecusCore.PeerMeshConfig current = config(true, target.getLocalPort(), true);
+            current.localServices.get(0).publishedPort = ports[0];
+            current.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+            runtime.applyConfig(current);
+            current.virtualIp = "127.0.0.2";
+            long replaced = System.nanoTime();
+            runtime.applyConfig(current);
+            assertConnectRejected("virtual IP edit", "127.0.0.1", ports[0]);
+            assertRoundTrip(target, "127.0.0.2", ports[0], "new-virtual-ip", replaced);
+        }
+    }
+
+    @Test
+    public void inPlaceAclEditClosesOldFlowAndAuthorizesOnlyReplacementSource() throws Exception {
+        int[] ports = freePorts(2);
+        try (ServerSocket target = listen(ports[1])) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            SpecusCore.PeerMeshConfig current = config(true, target.getLocalPort(), true);
+            SpecusCore.LocalPeerService local = current.localServices.get(0);
+            local.publishedPort = ports[0];
+            local.allowedPeerVirtualIps = new ArrayList<>(List.of("127.0.0.2"));
+            long started = System.nanoTime();
+            runtime.applyConfig(current);
+            try (Socket caller = connectFrom("127.0.0.2", ports[0]);
+                 Socket forwarded = acceptForwarded(target, caller, "old-acl", started)) {
+                local.allowedPeerVirtualIps.set(0, "127.0.0.3");
+                long replaced = System.nanoTime();
+                runtime.applyConfig(current);
+                caller.setSoTimeout(1_000);
+                assertTrue("previously authorized flow survives ACL replacement", readClosed(caller));
+                try (Socket denied = connectFrom("127.0.0.2", ports[0])) {
+                    denied.setSoTimeout(1_000);
+                    assertTrue("revoked source still authorized", readClosed(denied));
+                }
+                try (Socket allowed = connectFrom("127.0.0.3", ports[0]);
+                     Socket replacement = acceptForwarded(target, allowed, "new-acl", replaced)) {
+                    runtime.setHasAuthorizedOnlinePeer(false);
+                    allowed.setSoTimeout(1_000);
+                    assertTrue("replacement flow survives authorization withdrawal", readClosed(allowed));
+                }
+            }
+            assertConnectRejected("ACL service authorization withdrawn", "127.0.0.1", ports[0]);
+        }
+    }
+
+    @Test
+    public void boundTcpGenerationDoesNotRetargetWhenCallerMutatesConfig() throws Exception {
+        int[] ports = freePorts(3);
+        SpecusCore.LocalPeerService local = config(true, ports[1], true).localServices.get(0);
+        local.publishedPort = ports[0];
+        local.allowedPeerVirtualIps = new ArrayList<>(List.of("127.0.0.1"));
+        try (ServerSocket originalTarget = listen(ports[1]);
+             ServerSocket replacementTarget = listen(ports[2]);
+             PeerServiceBridge bridge = PeerServiceBridge.bind("127.0.0.1", local)) {
+            assertTrue(bridge.matches("127.0.0.1", local));
+            local.targetPort = replacementTarget.getLocalPort();
+            local.allowedPeerVirtualIps.set(0, "127.0.0.2");
+            assertFalse("bridge aliases mutable target/ACL config", bridge.matches("127.0.0.1", local));
+            assertRoundTrip(originalTarget, "127.0.0.1", ports[0], "bound-generation", System.nanoTime());
+            replacementTarget.setSoTimeout(250);
+            try (Socket unexpected = replacementTarget.accept()) {
+                throw new AssertionError("unapplied config retargeted existing bridge");
+            } catch (SocketTimeoutException expected) {
+                // This binding remains on its captured target until runtime reconciliation.
+            }
+        }
+    }
+
+    @Test
+    public void inPlaceTransportEditWithdrawsTcpAndCreatesUdpBridge() throws Exception {
+        int[] ports = freePorts(2);
+        try (ServerSocket tcpTarget = listen(ports[1]); UdpEchoTarget udpTarget = new UdpEchoTarget()) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            SpecusCore.PeerMeshConfig current = config(true, tcpTarget.getLocalPort(), true);
+            current.localServices.get(0).publishedPort = ports[0];
+            current.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+            runtime.applyConfig(current);
+            current.localServices.get(0).transport = "udp";
+            current.localServices.get(0).application = "udp";
+            current.localServices.get(0).targetPort = udpTarget.port();
+            runtime.applyConfig(current);
+            assertConnectRejected("in-place TCP to UDP", "127.0.0.1", ports[0]);
+            assertUdpRoundTrip(ports[0], "new-udp-generation");
+        }
+    }
+
+    @Test
+    public void udpInPlaceReplacementDisableReenableAndRevokeReleaseListener() throws Exception {
+        int[] ports = freeUdpPorts(2);
+        try (UdpEchoTarget target = new UdpEchoTarget()) {
+            runtime = newRuntime();
+            runtime.setHasAuthorizedOnlinePeer(true);
+            SpecusCore.PeerMeshConfig current = config(true, target.port(), true);
+            SpecusCore.LocalPeerService local = current.localServices.get(0);
+            local.transport = "udp";
+            local.application = "udp";
+            local.publishedPort = ports[0];
+            local.allowedPeerVirtualIps = List.of("127.0.0.1");
+            runtime.applyConfig(current);
+            assertUdpRoundTrip(ports[0], "first-udp-generation");
+            local.publishedPort = ports[1];
+            runtime.applyConfig(current);
+            assertUdpPortReleased("UDP replacement", ports[0]);
+            assertUdpRoundTrip(ports[1], "replacement-udp-generation");
+            local.enabled = false;
+            runtime.applyConfig(current);
+            assertUdpPortReleased("UDP disable", ports[1]);
+            local.enabled = true;
+            runtime.applyConfig(current);
+            assertUdpRoundTrip(ports[1], "reenabled-udp-generation");
+            runtime.setHasAuthorizedOnlinePeer(false);
+            assertUdpPortReleased("UDP authorization withdrawn", ports[1]);
+        }
+    }
+
+    @Test
+    public void rejectionAssertionStillFailsForARealLiveListener() throws Exception {
+        try (ServerSocket target = listen(0)) {
+            try {
+                assertConnectRejected("live-listener negative control", "127.0.0.1", target.getLocalPort());
+            } catch (AssertionError expected) {
+                assertTrue(expected.getMessage().contains("live-listener negative control"));
+                assertTrue(expected.getMessage().contains("source="));
+                return;
+            }
+            throw new AssertionError("rejection assertion accepted a live listener");
         }
     }
 
@@ -298,6 +472,30 @@ public class PeerServiceRuntimeTest {
         try (ServerSocket ignored = listen(port)) {
             assertTrue(PeerServiceRuntime.probeTcp("127.0.0.1", port, 400));
         }
+    }
+
+    @Test
+    public void reachabilityRequiresDistinctLiveEndpointsForIpv4AndIpv6() throws Exception {
+        assertFalse(PeerServiceRuntime.connectedToOtherEndpoint(new Socket()));
+        for (String host : List.of("127.0.0.1", "::1")) {
+            InetSocketAddress source = new InetSocketAddress(host, 41000);
+            assertFalse(PeerServiceRuntime.connectedToOtherEndpoint(endpointSocket(source, source)));
+            try (Socket distinct = endpointSocket(source, new InetSocketAddress(host, 41001))) {
+                assertTrue(PeerServiceRuntime.connectedToOtherEndpoint(distinct));
+                distinct.close();
+                assertFalse(PeerServiceRuntime.connectedToOtherEndpoint(distinct));
+            }
+        }
+        assertTrue(PeerServiceRuntime.connectedToOtherEndpoint(endpointSocket(
+                new InetSocketAddress("127.0.0.1", 41000), new InetSocketAddress("127.0.0.2", 41000))));
+    }
+
+    private static Socket endpointSocket(InetSocketAddress source, InetSocketAddress destination) {
+        return new Socket() {
+            @Override public boolean isConnected() { return true; }
+            @Override public java.net.SocketAddress getLocalSocketAddress() { return source; }
+            @Override public java.net.SocketAddress getRemoteSocketAddress() { return destination; }
+        };
     }
 
     @Test
@@ -566,11 +764,131 @@ public class PeerServiceRuntimeTest {
         }
     }
 
-    private static void assertConnectRejected(int port) throws Exception {
-        try (Socket ignored = new Socket("127.0.0.1", port)) {
-            throw new AssertionError("closed peer service accepted a new connection");
-        } catch (IOException expected) {
-            // expected
+    private static void assertConnectRejected(String phase, String host, int port) throws Exception {
+        try (Socket socket = new Socket()) {
+            // Different loopback addresses make the TCP 4-tuple non-reflexive even if the
+            // kernel chooses the destination port as the ephemeral source port. This is
+            // one connect, not a retry or permission to accept a connection after close.
+            String source = "127.0.0.2".equals(host) ? "127.0.0.3" : "127.0.0.2";
+            socket.bind(new InetSocketAddress(source, 0));
+            try {
+                socket.connect(new InetSocketAddress(host, port), 1_000);
+            } catch (ConnectException refused) {
+                return;
+            }
+            throw new AssertionError(phase + ": closed peer service accepted a new connection"
+                    + " source=" + socket.getLocalSocketAddress()
+                    + " destination=" + socket.getRemoteSocketAddress()
+                    + " runtime=" + PeerServiceRuntime.lastSnapshotJson());
+        }
+    }
+
+    private static Socket acceptForwarded(ServerSocket target, Socket caller, String phase, long started)
+            throws Exception {
+        long deadline = started + TimeUnit.SECONDS.toNanos(5);
+        byte[] marker = phase.getBytes(StandardCharsets.UTF_8);
+        caller.getOutputStream().write(marker);
+        while (true) {
+            target.setSoTimeout(remainingMillis(deadline, phase));
+            Socket forwarded = target.accept();
+            try {
+                forwarded.setSoTimeout(remainingMillis(deadline, phase));
+                byte[] received = forwarded.getInputStream().readNBytes(marker.length);
+                if (received.length == 0) {
+                    // The runtime's health probe connects and closes without sending bytes.
+                    // Only EOF without a payload may be discarded; unknown payloads fail.
+                    forwarded.close();
+                    continue;
+                }
+                assertArrayEquals(phase + ": wrong generation or non-forwarded connection", marker, received);
+                forwarded.getOutputStream().write(received);
+                caller.setSoTimeout(remainingMillis(deadline, phase));
+                assertArrayEquals(phase + ": response not forwarded", marker,
+                        caller.getInputStream().readNBytes(marker.length));
+                assertTrue(phase + ": exceeded original five-second budget", System.nanoTime() < deadline);
+                return forwarded;
+            } catch (Exception | AssertionError failure) {
+                forwarded.close();
+                throw failure;
+            }
+        }
+    }
+
+    private static int remainingMillis(long deadline, String phase) {
+        long remaining = deadline - System.nanoTime();
+        assertTrue(phase + ": exhausted original five-second budget", remaining > 0);
+        return (int) Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining));
+    }
+
+    private static void assertRoundTrip(ServerSocket target, String host, int port, String phase, long started)
+            throws Exception {
+        try (Socket caller = new Socket(host, port);
+             Socket forwarded = acceptForwarded(target, caller, phase, started)) {
+            assertTrue(phase, forwarded.isConnected());
+        }
+    }
+
+    private static void assertUdpRoundTrip(int port, String phase) throws Exception {
+        byte[] marker = phase.getBytes(StandardCharsets.UTF_8);
+        try (DatagramSocket caller = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0))) {
+            caller.setSoTimeout(1_000);
+            caller.send(new DatagramPacket(marker, marker.length, new InetSocketAddress("127.0.0.1", port)));
+            DatagramPacket reply = new DatagramPacket(new byte[marker.length + 1], marker.length + 1);
+            caller.receive(reply);
+            assertArrayEquals(phase, marker, java.util.Arrays.copyOf(reply.getData(), reply.getLength()));
+        }
+    }
+
+    private static void assertUdpPortReleased(String phase, int port) throws Exception {
+        try (DatagramSocket reservation = new DatagramSocket(new InetSocketAddress("127.0.0.1", port))) {
+            assertEquals(phase, port, reservation.getLocalPort());
+        }
+    }
+
+    private static int[] freeUdpPorts(int count) throws Exception {
+        List<DatagramSocket> reservations = new ArrayList<>();
+        try {
+            int[] ports = new int[count];
+            for (int i = 0; i < count; i++) {
+                DatagramSocket socket = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0));
+                reservations.add(socket);
+                ports[i] = socket.getLocalPort();
+            }
+            return ports;
+        } finally {
+            reservations.forEach(DatagramSocket::close);
+        }
+    }
+
+    private static final class UdpEchoTarget implements AutoCloseable {
+        private final DatagramSocket socket = new DatagramSocket(new InetSocketAddress("127.0.0.1", 0));
+        private final Thread responder;
+
+        UdpEchoTarget() throws Exception {
+            responder = new Thread(() -> {
+                try {
+                    while (!socket.isClosed()) {
+                        DatagramPacket packet = new DatagramPacket(new byte[1024], 1024);
+                        socket.receive(packet);
+                        socket.send(new DatagramPacket(packet.getData(), packet.getLength(), packet.getSocketAddress()));
+                    }
+                } catch (IOException closed) {
+                    if (!socket.isClosed()) {
+                        throw new AssertionError(closed);
+                    }
+                }
+            }, "peer-service-test-udp-echo");
+            responder.setDaemon(true);
+            responder.start();
+        }
+
+        int port() { return socket.getLocalPort(); }
+
+        @Override
+        public void close() throws Exception {
+            socket.close();
+            responder.join(1_000);
+            assertFalse("UDP fixture thread did not stop", responder.isAlive());
         }
     }
 

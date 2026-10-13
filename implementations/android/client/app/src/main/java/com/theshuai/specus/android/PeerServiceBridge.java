@@ -46,14 +46,40 @@ final class PeerServiceBridge implements AutoCloseable {
     }
 
     static PeerServiceBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws IOException {
+        service = snapshotService(service);
         InetAddress target = PeerServiceRuntime.resolveLocalServiceTarget(service.targetHost);
         if (target == null) {
             throw new IOException("targetHost is not assigned to this device");
         }
         ServerSocket server = new ServerSocket();
-        server.setReuseAddress(true);
-        server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.publishedPort));
-        return new PeerServiceBridge(virtualIp, service, target, server);
+        try {
+            server.setReuseAddress(true);
+            server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.publishedPort));
+            return new PeerServiceBridge(virtualIp, service, target, server);
+        } catch (IOException | RuntimeException failure) {
+            server.close();
+            throw failure;
+        }
+    }
+
+    // A bridge owns one binding generation. Reusing a mutable config object must not
+    // rewrite the identity used for reconciliation or retarget an existing connection.
+    static SpecusCore.LocalPeerService snapshotService(SpecusCore.LocalPeerService source) {
+        SpecusCore.LocalPeerService copy = new SpecusCore.LocalPeerService();
+        copy.serviceId = source.serviceId;
+        copy.name = source.name;
+        copy.description = source.description;
+        copy.transport = source.transport;
+        copy.application = source.application;
+        copy.targetHost = source.targetHost;
+        copy.targetPort = source.targetPort;
+        copy.publishedPort = source.publishedPort;
+        copy.path = source.path;
+        copy.enabled = source.enabled;
+        copy.visibility = source.visibility;
+        copy.allowedPeerVirtualIps = source.allowedPeerVirtualIps == null ? java.util.List.of()
+                : java.util.Collections.unmodifiableList(new java.util.ArrayList<>(source.allowedPeerVirtualIps));
+        return copy;
     }
 
     boolean matches(String virtualIp, SpecusCore.LocalPeerService service) {

@@ -41,6 +41,7 @@ final class PeerServiceUdpBridge implements AutoCloseable {
     }
 
     static PeerServiceUdpBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws Exception {
+        service = PeerServiceBridge.snapshotService(service);
         InetAddress target = PeerServiceRuntime.resolveLocalServiceTarget(service.targetHost);
         if (target == null) {
             throw new IllegalArgumentException("targetHost is not assigned to this device");
