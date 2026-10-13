@@ -52,6 +52,10 @@ public class PeerMeshSession {
     @Column(name = "updated_at", nullable = false, length = 40)
     private String updatedAt;
 
+    /**
+     * {@link SortableInstant} text for the expiry sweep. Views, and the signalling built from them,
+     * carry {@link SortableInstant#toInstantString}.
+     */
     @Column(name = "expires_at", nullable = false, length = 40)
     private String expiresAt;
 

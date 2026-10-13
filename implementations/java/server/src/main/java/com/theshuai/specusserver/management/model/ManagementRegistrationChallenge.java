@@ -37,6 +37,7 @@ public class ManagementRegistrationChallenge {
     @Column(name = "attempts_remaining", nullable = false)
     private int attemptsRemaining;
 
+    /** {@link SortableInstant} text: the expired-challenge purge compares it as a string. */
     @Column(name = "expires_at", nullable = false, length = 40)
     private String expiresAt;
 

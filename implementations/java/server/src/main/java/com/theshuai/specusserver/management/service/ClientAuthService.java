@@ -15,6 +15,7 @@ import com.theshuai.specusserver.management.model.ClientCredential;
 import com.theshuai.specusserver.management.model.ClientIdentity;
 import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.HttpRouteMapping;
+import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.model.SpecusMapping;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientCredentialRepository;
@@ -432,7 +433,7 @@ public class ClientAuthService {
                 && connectionRecordRepository.countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(
                 account.getTenantId(),
                 account.getId(),
-                Instant.now().minus(1, ChronoUnit.MINUTES).toString()
+                SortableInstant.format(Instant.now().minus(1, ChronoUnit.MINUTES))
         ) >= account.getConnectionRateLimitPerMinute();
     }
 
