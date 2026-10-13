@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -216,6 +217,86 @@ public class SpecusCoreProtocolTest {
         assertTrue(lifecycle.isRecentlyClosed(4));
         assertTrue(lifecycle.beginPending(3));
         assertFalse(lifecycle.isRecentlyClosed(3));
+    }
+
+    @Test
+    public void streamRetirementPublishesTombstoneBeforeRemovingLiveIdentity() throws Exception {
+        SpecusCore.StreamLifecycleRegistry lifecycle = new SpecusCore.StreamLifecycleRegistry(4, 4);
+        AtomicBoolean checkedAtRemoval = new AtomicBoolean();
+        Map<Integer, Object> streams = new ConcurrentHashMap<>() {
+            @Override
+            public boolean remove(Object key, Object expected) {
+                boolean removed = super.remove(key, expected);
+                if (removed) {
+                    // Exactly the gap in #251: a late RST sees no live map entry, before any
+                    // scheduler/transport cleanup or another finish callback has run.
+                    try {
+                        lifecycle.requireRecentlyClosedReset((Integer) key);
+                    } catch (IOException error) {
+                        throw new AssertionError("retired stream was transiently unknown", error);
+                    }
+                    checkedAtRemoval.set(true);
+                }
+                return removed;
+            }
+        };
+        Object stream = new Object();
+        streams.put(10, stream);
+        assertTrue(lifecycle.beginPending(10));
+        assertTrue(lifecycle.removeClosedStream(streams, 10, stream));
+        assertTrue(checkedAtRemoval.get());
+        assertEquals(0, lifecycle.pendingCount());
+        lifecycle.requireRecentlyClosedReset(10);
+        assertThrows(IOException.class, () -> lifecycle.requireRecentlyClosedReset(99));
+    }
+
+    @Test
+    public void remoteRetirementSurvivesAConcurrentAlreadyFinishedCallback() throws Exception {
+        SpecusCore.StreamLifecycleRegistry lifecycle = new SpecusCore.StreamLifecycleRegistry(4, 4);
+        Map<Integer, Object> streams = new ConcurrentHashMap<>();
+        Object stream = new Object(), nextStream = new Object();
+        streams.put(10, stream);
+        streams.put(11, nextStream);
+        CountDownLatch cleanupEntered = new CountDownLatch(1), releaseCleanup = new CountDownLatch(1);
+        FutureTask<Void> finishing = new FutureTask<>(() -> {
+            assertEquals(stream, lifecycle.removeClosedStream(streams, 10));
+            cleanupEntered.countDown();
+            assertTrue(releaseCleanup.await(5, TimeUnit.SECONDS));
+            // The competing finish callback has already set its finished flag and does no more
+            // work. Removal itself must suffice; it must not depend on that callback's cleanup.
+            return null;
+        });
+        Thread worker = new Thread(finishing, "stream-retirement-regression");
+        worker.start();
+        try {
+            assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
+            assertNull(streams.get(10));
+            lifecycle.requireRecentlyClosedReset(10);
+            assertEquals(nextStream, streams.get(11));
+            assertThrows(IOException.class, () -> lifecycle.requireRecentlyClosedReset(99));
+        } finally {
+            releaseCleanup.countDown();
+            worker.join(5000);
+        }
+        finishing.get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
+    public void staleCompletionCannotRetireAReopenedStreamIdentity() throws Exception {
+        SpecusCore.StreamLifecycleRegistry lifecycle = new SpecusCore.StreamLifecycleRegistry(4, 4);
+        Map<Integer, Object> streams = new ConcurrentHashMap<>();
+        Object previous = new Object(), replacement = new Object();
+        streams.put(10, previous);
+        assertTrue(lifecycle.removeClosedStream(streams, 10, previous));
+        assertTrue(lifecycle.beginPending(10));
+        streams.put(10, replacement);
+        assertFalse(lifecycle.removeClosedStream(streams, 10, previous));
+        assertFalse(lifecycle.isRecentlyClosed(10));
+        assertEquals(replacement, streams.get(10));
+        assertEquals(1, lifecycle.pendingCount());
+        assertThrows(IOException.class, () -> lifecycle.requireRecentlyClosedReset(10));
+        assertTrue(lifecycle.removeClosedStream(streams, 10, replacement));
+        lifecycle.requireRecentlyClosedReset(10);
     }
 
     @Test
