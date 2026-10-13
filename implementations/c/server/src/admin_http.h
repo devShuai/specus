@@ -5,6 +5,7 @@
 
 #include "connectivity_check.h"
 #include "protocol.h"
+#include "public_coordination.h"
 #include "storage.h"
 
 typedef struct {
@@ -274,6 +275,8 @@ int st_admin_deliver_client_message_to_admin(const char *tenant_id,
 void st_admin_broadcast_connection_event(const char *tenant_id,
                                          const char *type,
                                          const st_storage_connection *connection);
+/* Receives existing STCE management kinds; validates tenant binding before local authorization. */
+void st_admin_handle_cluster_event(const st_public_cluster_event *event);
 
 /*
  * Temporary HTTP shares (protocol/spec/temporary-http-share.md section 6.6 and 7.5). The

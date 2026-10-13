@@ -312,7 +312,13 @@ The public-transfer discovery WebSocket works in process-local mode by default a
 multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message,
 pairing-code redemption and presign-upload limits, and STCE2 Pub/Sub text/binary routing. Redis outages fail
 closed by terminating local discovery sockets and refusing the source-address limits rather than falling back
-to divergent local state. In SQLite mode it resolves
+to divergent local state. The same Redis channel carries management connection events (STCE kind 4) and
+committed account revocations (kind 5). Receivers verify the tenant/group binding before tenant and current
+client-owner filtering; revocation removes local tickets and closes both management WebSocket endpoints.
+Connection-event publication failure falls back locally, and revocation publication failure cannot roll back
+the account mutation. Pub/Sub does not guarantee delivery; this coordination is not database HA or replication.
+`management_cluster_e2e.py` covers real Redis with two C instances and a third tenant; `--java-jar` verifies
+native event/revocation interoperability in both directions with Java. In SQLite mode it resolves
 owner, editor, and viewer credentials to one persistent room; access-token creation/list/revocation and
 domain-separated HMAC pairing-code creation/atomic redemption follow the Java API. Plaintext credentials
 are returned only at creation/redemption and are never persisted. The roster merges same-room peers across

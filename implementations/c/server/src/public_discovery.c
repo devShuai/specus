@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "public_discovery.h"
+#include "admin_http.h"
 
 #include "crypto.h"
 #include "json.h"
@@ -1104,6 +1105,11 @@ static void public_cluster_event_handler(const st_public_cluster_event *event, v
 {
     (void)context;
     if (event == NULL) return;
+    if (event->kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+        || event->kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION) {
+        st_admin_handle_cluster_event(event);
+        return;
+    }
     if (event->kind == ST_PUBLIC_CLUSTER_EVENT_UNAVAILABLE) {
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next)
