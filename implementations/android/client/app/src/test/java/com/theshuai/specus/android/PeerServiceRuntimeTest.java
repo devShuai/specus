@@ -458,11 +458,24 @@ public class PeerServiceRuntimeTest {
         SpecusCore.LocalPeerService local = config(true, port, true).localServices.get(0);
         local.publishedPort = port;
         local.transport = "udp";
+        assertOwnedIoClosed(PeerServiceUdpBridge.bind("127.0.0.1", local));
+        assertUdpPortReleased("owned UDP I/O drained", port);
+    }
+
+    @Test
+    public void tcpCloseWaitsForOwnedIoBeforeItsListenerCanBeReused() throws Exception {
+        int[] ports = freePorts(2);
+        SpecusCore.LocalPeerService local = config(true, ports[1], true).localServices.get(0);
+        local.publishedPort = ports[0];
+        assertOwnedIoClosed(PeerServiceBridge.bind("127.0.0.1", local));
+        assertConnectRejected("owned TCP I/O drained", "127.0.0.1", ports[0]);
+    }
+
+    private static void assertOwnedIoClosed(AutoCloseable bridge) throws Exception {
         java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
         java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
         java.util.concurrent.ExecutorService closer = Executors.newSingleThreadExecutor();
-        PeerServiceUdpBridge bridge = PeerServiceUdpBridge.bind("127.0.0.1", local);
-        java.lang.reflect.Field field = PeerServiceUdpBridge.class.getDeclaredField("executor");
+        java.lang.reflect.Field field = bridge.getClass().getDeclaredField("executor");
         field.setAccessible(true);
         java.util.concurrent.ExecutorService io = (java.util.concurrent.ExecutorService) field.get(bridge);
         java.util.concurrent.Future<?> closed = null;
@@ -479,22 +492,26 @@ public class PeerServiceRuntimeTest {
                 if (interrupted) Thread.currentThread().interrupt();
             });
             assertTrue("owned I/O task never entered", entered.await(1, TimeUnit.SECONDS));
-            closed = closer.submit(bridge::close);
+            closed = closer.submit(() -> { bridge.close(); return null; });
             try {
                 closed.get(200, TimeUnit.MILLISECONDS);
-                throw new AssertionError("UDP close returned before owned I/O finished");
+                throw new AssertionError(bridge.getClass().getSimpleName() + " close returned before owned I/O finished");
             } catch (java.util.concurrent.TimeoutException expected) {
                 // close must wait for completion, not just mark DatagramSocket closed.
             }
         } finally {
             release.countDown();
-            if (closed != null) closed.get(2, TimeUnit.SECONDS);
-            bridge.close();
-            closer.shutdownNow();
-            assertTrue("close executor leaked", closer.awaitTermination(1, TimeUnit.SECONDS));
-            assertTrue("owned UDP I/O did not terminate", io.awaitTermination(1, TimeUnit.SECONDS));
+            try {
+                if (closed != null) closed.get(2, TimeUnit.SECONDS);
+            } finally {
+                try { bridge.close(); }
+                finally {
+                    closer.shutdownNow();
+                    assertTrue("close executor leaked", closer.awaitTermination(1, TimeUnit.SECONDS));
+                    assertTrue("owned bridge I/O did not terminate", io.awaitTermination(1, TimeUnit.SECONDS));
+                }
+            }
         }
-        assertUdpPortReleased("owned UDP I/O drained", port);
     }
 
     @Test

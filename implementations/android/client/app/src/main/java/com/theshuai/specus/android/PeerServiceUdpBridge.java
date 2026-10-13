@@ -10,7 +10,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -169,14 +168,7 @@ final class PeerServiceUdpBridge implements AutoCloseable {
         // DatagramSocket.close may pre-close a descriptor and defer its final release
         // until blocking receive/send returns. Await owned I/O before reusing the port;
         // a timeout/interruption is a failed close, not permission to continue silently.
-        try {
-            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("UDP bridge I/O did not terminate for " + service.serviceId);
-            }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted closing UDP bridge " + service.serviceId, interrupted);
-        }
+        PeerServiceBridge.awaitClosedIo(executor, "UDP", service.serviceId);
     }
 
     private static final class UdpPeer implements AutoCloseable {

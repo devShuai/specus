@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -209,21 +210,34 @@ final class PeerServiceBridge implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!open.compareAndSet(true, false)) {
-            return;
+        if (open.compareAndSet(true, false)) {
+            LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
+                    + " activeConnections=" + splices.size()
+                    + " reason=config-withdrawn-or-shutdown");
+            try {
+                serverSocket.close();
+            } catch (IOException ignored) {
+            }
+            splices.forEach((inbound, outbound) -> {
+                closeQuietly(inbound);
+                closeQuietly(outbound);
+            });
+            splices.clear();
+            executor.shutdownNow();
         }
-        LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
-                + " activeConnections=" + splices.size()
-                + " reason=config-withdrawn-or-shutdown");
+        awaitClosedIo(executor, "TCP", service.serviceId);
+    }
+
+    static void awaitClosedIo(ExecutorService executor, String transport, String serviceId) {
+        // JDK socket close can defer final descriptor release until native I/O unwinds.
+        // All callers share the same executor completion boundary, including repeat close.
         try {
-            serverSocket.close();
-        } catch (IOException ignored) {
+            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                throw new IllegalStateException(transport + " bridge I/O did not terminate for " + serviceId);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted closing " + transport + " bridge " + serviceId, interrupted);
         }
-        splices.forEach((inbound, outbound) -> {
-            closeQuietly(inbound);
-            closeQuietly(outbound);
-        });
-        splices.clear();
-        executor.shutdownNow();
     }
 }
