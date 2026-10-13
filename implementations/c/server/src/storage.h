@@ -314,6 +314,16 @@ typedef struct {
     char last_keepalive_at[64];
 } st_storage_peer_mesh_session;
 
+/* Identities of sessions closed by a committed client deletion; no token or target address. */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    long long source_client_id;
+    char source_client_name[256];
+    long long target_client_id;
+    char target_client_name[256];
+} st_storage_peer_close;
+
 typedef struct {
     int enabled;
     int mdns_import_enabled;
@@ -1755,6 +1765,10 @@ int st_storage_delete_client_audited(const char *path,
                                      const char *actor,
                                      long long now_ms,
                                      st_storage_share_ids *revoked);
+int st_storage_delete_client_audited_with_peers(const char *path, long long id,
+                                               const char *actor, long long now_ms,
+                                               st_storage_share_ids *revoked,
+                                               st_storage_peer_close **closed, size_t *closed_count);
 int st_storage_update_management_user_audited(const char *path,
                                               const st_storage_share_builtin_admin *builtin,
                                               const char *tenant_id,

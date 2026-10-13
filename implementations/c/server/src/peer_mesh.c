@@ -91,6 +91,21 @@ typedef struct {
 static pm_catalog peer_catalogs[ST_PEER_MESH_MAX_CATALOGS];
 static pthread_mutex_t peer_catalog_lock = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct pm_client_deletion {
+    st_storage_client client;
+    st_storage_peer_close *closed;
+    size_t closed_count;
+    pm_catalog *withdrawals;
+    size_t withdrawal_count;
+    int prepared;
+    struct pm_client_deletion *next;
+} pm_client_deletion;
+
+static pm_client_deletion *peer_deletion_head = NULL;
+static pm_client_deletion *peer_deletion_tail = NULL;
+static pthread_mutex_t peer_deletion_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t peer_deletion_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     char *data;
     size_t len;
@@ -1503,6 +1518,149 @@ int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
         "publisher-offline", publisher.tenant_id, publisher.id,
         runtime->publisher_session_id, NULL, "disconnected");
     return pm_fanout_catalog(runtime, &snapshot, &publisher);
+}
+
+static void pm_enqueue_deletion(pm_client_deletion *item)
+{
+    item->next = NULL;
+    pthread_mutex_lock(&peer_deletion_queue_lock);
+    if (peer_deletion_tail == NULL) peer_deletion_head = item;
+    else peer_deletion_tail->next = item;
+    peer_deletion_tail = item;
+    pthread_mutex_unlock(&peer_deletion_queue_lock);
+}
+
+int st_peer_mesh_queue_client_deleted(const st_storage_client *client,
+                                      const st_storage_peer_close *closed, size_t closed_count)
+{
+    if (client == NULL || client->id <= 0 || !pm_has_text(client->tenant_id)
+        || (closed_count != 0U && closed == NULL)
+        || closed_count > SIZE_MAX / sizeof(*closed)) return -1;
+    if (!pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)) return 0;
+    pm_client_deletion *item = calloc(1U, sizeof(*item));
+    if (item == NULL) return -1;
+    item->client = *client;
+    if (closed_count != 0U) {
+        item->closed = malloc(closed_count * sizeof(*closed));
+        if (item->closed == NULL) { free(item); return -1; }
+        memcpy(item->closed, closed, closed_count * sizeof(*closed));
+    }
+    item->closed_count = closed_count;
+    pm_enqueue_deletion(item);
+    return 0;
+}
+
+static int pm_prepare_deleted_catalogs(pm_client_deletion *item)
+{
+    if (item->prepared) return 0;
+    pthread_mutex_lock(&peer_catalog_lock);
+    size_t count = 0U;
+    for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
+        const pm_catalog *catalog = &peer_catalogs[i];
+        if (catalog->in_use && catalog->publisher_client_id == item->client.id
+            && strcmp(catalog->tenant_id, item->client.tenant_id) == 0) ++count;
+    }
+    pm_catalog *withdrawals = count == 0U ? NULL : calloc(count, sizeof(*withdrawals));
+    if (count != 0U && withdrawals == NULL) {
+        pthread_mutex_unlock(&peer_catalog_lock);
+        return -1;
+    }
+    size_t index = 0U;
+    for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
+        pm_catalog *catalog = &peer_catalogs[i];
+        if (!catalog->in_use || catalog->publisher_client_id != item->client.id
+            || strcmp(catalog->tenant_id, item->client.tenant_id) != 0) continue;
+        pm_catalog *snapshot = &withdrawals[index++];
+        *snapshot = *catalog;
+        snapshot->active = 0;
+        snapshot->expires_at = time(NULL);
+        if (snapshot->catalog_revision < LLONG_MAX) ++snapshot->catalog_revision;
+        snapshot->service_count = 0U;
+        snapshot->stats_count = 0U;
+        snapshot->mdns_candidates = NULL;
+        snapshot->mdns_count = 0U;
+        free(catalog->mdns_candidates);
+        memset(catalog, 0, sizeof(*catalog));
+    }
+    /* The queue owns the withdrawal identities/revisions before cached state disappears. */
+    item->withdrawals = withdrawals;
+    item->withdrawal_count = count;
+    item->prepared = 1;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    return 0;
+}
+
+static char *pm_deleted_close_message(const st_storage_peer_close *closed)
+{
+    pm_builder builder = {0};
+    if (pm_appendf(&builder, "{\"type\":\"close\",\"sessionId\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":",
+                   closed->id, closed->source_client_id) != 0
+        || pm_append_json_string(&builder, closed->source_client_name) != 0
+        || pm_appendf(&builder, ",\"targetClientId\":%lld,\"targetClientName\":", closed->target_client_id) != 0
+        || pm_append_json_string(&builder, closed->target_client_name) != 0
+        || pm_appendf(&builder, ",\"status\":\"CLOSED\",\"reason\":\"client-deleted\",\"createdAtMillis\":%lld}",
+                      (long long)time(NULL) * 1000LL) != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return builder.data;
+}
+
+static int pm_dispatch_deleted_client(const st_peer_mesh_runtime *runtime, pm_client_deletion *item)
+{
+    if (pm_prepare_deleted_catalogs(item) != 0) return -1;
+    st_storage_client *clients = NULL;
+    size_t count = 0U;
+    if (st_storage_list_all_clients(runtime->database_path, &clients, &count) != 0) return -1;
+    int rc = 0;
+    for (size_t i = 0U; i < count; ++i) {
+        const st_storage_client *recipient = &clients[i];
+        if (recipient->id == item->client.id || strcmp(recipient->tenant_id, item->client.tenant_id) != 0
+            || !runtime->online(runtime->ctx, recipient->id, recipient->client_name)) continue;
+        for (size_t j = 0U; j < item->closed_count; ++j) {
+            const st_storage_peer_close *closed = &item->closed[j];
+            if (strcmp(closed->tenant_id, recipient->tenant_id) != 0
+                || (closed->source_client_id != recipient->id && closed->target_client_id != recipient->id)) continue;
+            char *message = pm_deleted_close_message(closed);
+            if (message == NULL || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
+            free(message);
+        }
+        for (size_t j = 0U; j < item->withdrawal_count; ++j) {
+            char *message = pm_build_catalog_message(runtime, &item->withdrawals[j], &item->client, recipient, 0);
+            if (message == NULL || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
+            free(message);
+        }
+    }
+    free(clients);
+    if (st_peer_mesh_refresh_tenant(runtime, item->client.tenant_id) != 0) rc = -1;
+    return rc;
+}
+
+int st_peer_mesh_drain_client_deletions(const st_peer_mesh_runtime *runtime)
+{
+    if (runtime == NULL || runtime->database_path == NULL || runtime->send == NULL || runtime->online == NULL) return -1;
+    if (pthread_mutex_trylock(&peer_deletion_dispatch_lock) != 0) return 0;
+    int rc = 0;
+    for (size_t n = 0U; n < 64U; ++n) {
+        pthread_mutex_lock(&peer_deletion_queue_lock);
+        pm_client_deletion *item = peer_deletion_head;
+        if (item != NULL) {
+            peer_deletion_head = item->next;
+            if (peer_deletion_head == NULL) peer_deletion_tail = NULL;
+        }
+        pthread_mutex_unlock(&peer_deletion_queue_lock);
+        if (item == NULL) break;
+        if (pm_dispatch_deleted_client(runtime, item) != 0) {
+            pm_enqueue_deletion(item);
+            rc = -1;
+            break;
+        }
+        free(item->closed);
+        free(item->withdrawals);
+        free(item);
+    }
+    pthread_mutex_unlock(&peer_deletion_dispatch_lock);
+    return rc;
 }
 
 int st_peer_mesh_list_mdns_candidates(const char *tenant_id,

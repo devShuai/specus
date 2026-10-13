@@ -2,6 +2,7 @@
 #define SPECUS_PEER_MESH_H
 
 #include <stddef.h>
+#include "storage.h"
 
 typedef int (*st_peer_mesh_send_fn)(void *ctx,
                                     const char *target_client_name,
@@ -54,6 +55,10 @@ int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
 /* Rebuild config/roster and re-publish active catalogues after an admin mutation. */
 int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
                                 const char *tenant_id);
+/* Queue only after successful deletion commit; arguments are copied. Maintenance retries writes. */
+int st_peer_mesh_queue_client_deleted(const st_storage_client *client,
+                                      const st_storage_peer_close *closed, size_t closed_count);
+int st_peer_mesh_drain_client_deletions(const st_peer_mesh_runtime *runtime);
 int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
                                    const char *client_name);
 int st_peer_mesh_expire_catalogs(const st_peer_mesh_runtime *runtime);

@@ -3098,6 +3098,13 @@ static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
     return st_peer_mesh_refresh_tenant(&runtime, tenant_id);
 }
 
+static int queue_runtime_peer_client_deleted(void *ctx, const st_storage_client *client,
+                                             const st_storage_peer_close *closed, size_t closed_count)
+{
+    (void)ctx;
+    return st_peer_mesh_queue_client_deleted(client, closed, closed_count);
+}
+
 typedef struct {
     pthread_t thread;
     pthread_mutex_t lock;
@@ -3181,6 +3188,8 @@ static void *peer_mesh_maintenance_thread(void *unused)
             2
         };
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+        if (st_peer_mesh_drain_client_deletions(&runtime) != 0)
+            fprintf(stderr, "[peer-mesh] deleted client notification failed; retrying\n");
         st_admin_http_share_tick();
         time_t now = time(NULL);
         if (now >= peer_mesh_maintenance.next_catalog_expiry) {
@@ -5403,8 +5412,9 @@ static void *client_thread(void *arg)
         pthread_mutex_unlock(&control_admission_lock);
         if (session->config.database_path[0] != '\0') {
             st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+            int client_deleted = disconnect_reason != NULL && strcmp(disconnect_reason, "ADMIN_DELETED") == 0;
             /* The catalog is keyed by runtime session; a newer control of the same session owns it now. */
-            if (!session_still_live
+            if (!session_still_live && !client_deleted
                 && st_peer_mesh_handle_disconnect(&peer_runtime,
                                                   session->config.client_name) != 0) {
                 fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
@@ -5412,7 +5422,7 @@ static void *client_thread(void *arg)
             }
             /* After active_session_remove_locked above, so the rosters count it as offline; a
              * client already back on a newer control is still online and is left alone. */
-            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
+            if (!client_deleted && st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
                 fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n",
                         session->config.client_name);
             }
@@ -5602,6 +5612,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    st_admin_set_peer_client_deleted_handler(queue_runtime_peer_client_deleted, NULL);
     st_admin_set_peer_control_send_handler(push_runtime_peer_control, NULL);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
     st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);

@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <openssl/rand.h>
 #include <sqlite3.h>
@@ -4821,13 +4822,163 @@ int st_storage_upsert_client(const char *path,
     return out_client == NULL ? 0 : st_storage_get_client(path, id, out_client);
 }
 
-/* Deletes the client with its mappings and HTTP routes. */
-static int delete_client_on_db(sqlite3 *db, long long id, const char *client_name)
+/* Return a filtered CSV without granting any recipient that was not already listed. */
+static int delete_peer_id_from_csv(const char *raw, long long id, char **filtered)
+{
+    size_t length = strlen(raw);
+    char *copy = malloc(length + 1U);
+    char *out = malloc(length + 1U);
+    if (copy == NULL || out == NULL) {
+        free(copy);
+        free(out);
+        return -1;
+    }
+    memcpy(copy, raw, length + 1U);
+    out[0] = '\0';
+    size_t used = 0U;
+    int changed = 0;
+    char *part = copy;
+    while (part != NULL) {
+        char *next = strchr(part, ',');
+        if (next != NULL) *next++ = '\0';
+        char *end = NULL;
+        errno = 0;
+        long long value = strtoll(part, &end, 10);
+        int valid = errno != ERANGE && end != part && *end == '\0' && value > 0;
+        if (valid && value == id) {
+            changed = 1;
+        } else if (valid) {
+            size_t size = strlen(part);
+            if (used != 0U) out[used++] = ',';
+            memcpy(out + used, part, size);
+            used += size;
+            out[used] = '\0';
+        }
+        part = next;
+    }
+    free(copy);
+    *filtered = out;
+    return changed;
+}
+
+static int delete_peer_allowlist_references(sqlite3 *db, const char *tenant, long long id, int services)
+{
+    const char *table = services ? "peer_mesh_shared_service" : "peer_mesh_egress_policy";
+    const char *column = services ? "allowed_client_ids" : "allowed_consumer_client_ids";
+    char sql[320];
+    snprintf(sql, sizeof(sql), "SELECT id, COALESCE(%s, ''), %s FROM %s WHERE tenant_id = ?",
+             column, services ? "visibility" : "'OWNER'", table);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+    typedef struct { long long id; char *csv; int disable; } peer_list_update;
+    peer_list_update *updates = NULL;
+    size_t count = 0U;
+    int step = SQLITE_DONE;
+    int rc = 0;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        char *csv = NULL;
+        int changed = delete_peer_id_from_csv((const char *)sqlite3_column_text(stmt, 1), id, &csv);
+        if (changed < 0) { rc = -1; break; }
+        if (!changed) { free(csv); continue; }
+        if (count >= SIZE_MAX / sizeof(*updates) - 1U) { free(csv); rc = -1; break; }
+        peer_list_update *grown = realloc(updates, (count + 1U) * sizeof(*updates));
+        if (grown == NULL) { free(csv); rc = -1; break; }
+        updates = grown;
+        updates[count].id = sqlite3_column_int64(stmt, 0);
+        updates[count].csv = csv;
+        const char *visibility = (const char *)sqlite3_column_text(stmt, 2);
+        updates[count].disable = services && *csv == '\0' && (visibility == NULL || strcmp(visibility, "OWNER") != 0);
+        ++count;
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    snprintf(sql, sizeof(sql), "UPDATE %s SET %s = ?, updated_at = strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', 'now')%s"
+             " WHERE tenant_id = ? AND id = ?", table, column,
+             services ? ", enabled = CASE WHEN ? THEN 0 ELSE enabled END" : "");
+    stmt = NULL;
+    if (rc == 0 && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) rc = -1;
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, updates[i].csv, -1, SQLITE_TRANSIENT);
+        int index = 2;
+        if (services) sqlite3_bind_int(stmt, index++, updates[i].disable);
+        sqlite3_bind_text(stmt, index++, tenant, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, index, updates[i].id);
+        if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    for (size_t i = 0U; i < count; ++i) free(updates[i].csv);
+    free(updates);
+    return rc;
+}
+
+static int delete_client_peer_references(sqlite3 *db, const char *tenant, long long id)
+{
+    static const struct { const char *sql; int both; } statements[] = {
+        {"UPDATE peer_mesh_session SET status = 'CLOSED', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),"
+         " closed_at = COALESCE(NULLIF(closed_at, ''), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+         " WHERE tenant_id = ? AND status <> 'CLOSED' AND (source_client_id = ? OR target_client_id = ?)", 1},
+        {"DELETE FROM peer_mesh_acl WHERE tenant_id = ? AND (source_client_id = ? OR target_client_id = ?)", 1},
+        {"DELETE FROM peer_mesh_device WHERE tenant_id = ? AND client_id = ?", 0},
+        {"DELETE FROM peer_mesh_egress_policy WHERE tenant_id = ? AND egress_client_id = ?", 0},
+        {"DELETE FROM peer_mesh_shared_service WHERE tenant_id = ? AND client_id = ?", 0}
+    };
+    for (size_t i = 0U; i < sizeof(statements) / sizeof(statements[0]); ++i) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, statements[i].sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+        sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, id);
+        if (statements[i].both) sqlite3_bind_int64(stmt, 3, id);
+        int ok = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        if (!ok) return -1;
+    }
+    return delete_peer_allowlist_references(db, tenant, id, 0) == 0
+        && delete_peer_allowlist_references(db, tenant, id, 1) == 0 ? 0 : -1;
+}
+
+static int collect_deleted_peer_sessions(sqlite3 *db, const char *tenant, long long id,
+                                         st_storage_peer_close **closed, size_t *count)
+{
+    if (closed == NULL) return 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id, tenant_id, source_client_id, source_client_name,"
+        " target_client_id, target_client_name FROM peer_mesh_session WHERE tenant_id = ?"
+        " AND status <> 'CLOSED' AND (source_client_id = ? OR target_client_id = ?)", -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, id);
+    sqlite3_bind_int64(stmt, 3, id);
+    int step;
+    int rc = 0;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (*count >= SIZE_MAX / sizeof(**closed) - 1U) { rc = -1; break; }
+        st_storage_peer_close *grown = realloc(*closed, (*count + 1U) * sizeof(**closed));
+        if (grown == NULL) { rc = -1; break; }
+        *closed = grown;
+        st_storage_peer_close *item = &grown[*count];
+        memset(item, 0, sizeof(*item));
+        item->id = sqlite3_column_int64(stmt, 0);
+        item->source_client_id = sqlite3_column_int64(stmt, 2);
+        item->target_client_id = sqlite3_column_int64(stmt, 4);
+        if (copy_text_column(stmt, 1, item->tenant_id, sizeof(item->tenant_id)) != 0
+            || copy_text_column(stmt, 3, item->source_client_name, sizeof(item->source_client_name)) != 0
+            || copy_text_column(stmt, 5, item->target_client_name, sizeof(item->target_client_name)) != 0) { rc = -1; break; }
+        ++*count;
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* Deletes operational rows in the caller's transaction; historical sessions and usage remain. */
+static int delete_client_on_db(sqlite3 *db, long long id, const char *client_name, const char *tenant,
+                               st_storage_peer_close **closed, size_t *closed_count)
 {
     /*
      * Workbench references to everything the client carries go first, in the caller's transaction:
-     * its routes and mappings below, and its Peer services, whose rows this deletion leaves in
-     * place but which no longer resolve to a client.
+     * its routes and mappings below, and its Peer services, before their rows are removed.
      */
     static const char *const workbench_refs_sql[] = {
         "DELETE FROM management_workbench_item WHERE kind = 'http-route' AND object_id IN ("
@@ -4853,6 +5004,8 @@ static int delete_client_on_db(sqlite3 *db, long long id, const char *client_nam
         sqlite3_finalize(stmt);
         stmt = NULL;
     }
+    if (rc == 0) rc = collect_deleted_peer_sessions(db, tenant, id, closed, closed_count);
+    if (rc == 0) rc = delete_client_peer_references(db, tenant, id);
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE client_name = ?", -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
@@ -4920,7 +5073,7 @@ int st_storage_delete_client(const char *path, long long id)
         sqlite3_close(db);
         return -1;
     }
-    int rc = delete_client_on_db(db, id, client.client_name);
+    int rc = delete_client_on_db(db, id, client.client_name, client.tenant_id, NULL, NULL);
     if (rc == 0) {
         rc = exec_sql(db, "COMMIT");
     } else {
@@ -11971,6 +12124,18 @@ int st_storage_delete_client_audited(const char *path,
                                      long long now_ms,
                                      st_storage_share_ids *revoked)
 {
+    return st_storage_delete_client_audited_with_peers(path, id, actor, now_ms, revoked, NULL, NULL);
+}
+
+int st_storage_delete_client_audited_with_peers(const char *path, long long id,
+                                               const char *actor, long long now_ms,
+                                               st_storage_share_ids *revoked,
+                                               st_storage_peer_close **closed, size_t *closed_count)
+{
+    if ((closed == NULL) != (closed_count == NULL)) return -1;
+    if (closed != NULL) { *closed = NULL; *closed_count = 0U; }
+    st_storage_peer_close *pending_closed = NULL;
+    size_t pending_count = 0U;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -12025,7 +12190,8 @@ int st_storage_delete_client_audited(const char *path,
         rc = share_active_of_client(db, client.client_name, now_ms, &shares, &share_count);
     }
     if (rc == 0) {
-        rc = delete_client_on_db(db, id, client.client_name);
+        rc = delete_client_on_db(db, id, client.client_name, client.tenant_id,
+                                  closed == NULL ? NULL : &pending_closed, &pending_count);
     }
     for (size_t i = 0U; rc == 0 && i < route_count; ++i) {
         char detail[64];
@@ -12040,6 +12206,13 @@ int st_storage_delete_client_audited(const char *path,
     free(shares);
     rc = share_end(db, rc);
     sqlite3_close(db);
+    if (rc == 0 && closed != NULL) {
+        *closed = pending_closed;
+        *closed_count = pending_count;
+    } else {
+        free(pending_closed);
+        if (rc != 0) st_storage_share_ids_free(revoked);
+    }
     return rc == 0 ? 0 : -1;
 }
 

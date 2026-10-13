@@ -274,6 +274,8 @@ static void *admin_client_message_ctx = NULL;
 static size_t admin_pending_client_message_writes = 0U;
 static pthread_mutex_t admin_peer_mesh_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_mesh_refresh_handler admin_peer_mesh_refresh_handler = NULL;
+static st_admin_peer_client_deleted_handler admin_peer_client_deleted_handler = NULL;
+static void *admin_peer_client_deleted_ctx = NULL;
 static void *admin_peer_mesh_refresh_ctx = NULL;
 static pthread_mutex_t admin_peer_control_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_control_send_handler admin_peer_control_send_handler = NULL;
@@ -320,6 +322,14 @@ void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler h
     pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
     admin_peer_mesh_refresh_handler = handler;
     admin_peer_mesh_refresh_ctx = ctx;
+    pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+}
+
+void st_admin_set_peer_client_deleted_handler(st_admin_peer_client_deleted_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
+    admin_peer_client_deleted_handler = handler;
+    admin_peer_client_deleted_ctx = ctx;
     pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
 }
 
@@ -8743,13 +8753,24 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     }
     /* Its routes go with it, audited as route.deleted, and their shares end. */
     st_storage_share_ids revoked = {0};
-    int rc = st_storage_delete_client_audited(database_path, id, context->username, st_http_share_now_ms(),
-                                              &revoked);
-    admin_share_cut_revoked(&revoked);
-    st_storage_share_ids_free(&revoked);
+    st_storage_peer_close *closed = NULL;
+    size_t closed_count = 0U;
+    int rc = st_storage_delete_client_audited_with_peers(database_path, id, context->username, st_http_share_now_ms(),
+                                                        &revoked, &closed, &closed_count);
     if (rc != 0) {
+        st_storage_share_ids_free(&revoked);
+        free(closed);
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
+    pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
+    st_admin_peer_client_deleted_handler deleted_handler = admin_peer_client_deleted_handler;
+    void *deleted_ctx = admin_peer_client_deleted_ctx;
+    pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+    if (deleted_handler != NULL && deleted_handler(deleted_ctx, &existing, closed, closed_count) != 0)
+        fprintf(stderr, "[peer-mesh] failed to queue deleted client notification id=%lld\n", existing.id);
+    free(closed);
     admin_close_client_connections(existing.client_name, "ADMIN_DELETED");
     admin_notify_peer_mesh_refresh(existing.tenant_id);
     return write_response(out, out_len, 204, "No Content", "");

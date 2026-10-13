@@ -164,6 +164,8 @@ typedef int (*st_admin_client_message_handler)(void *ctx,
                                                const char *message);
 typedef int (*st_admin_peer_mesh_refresh_handler)(void *ctx,
                                                   const char *tenant_id);
+typedef int (*st_admin_peer_client_deleted_handler)(void *ctx, const st_storage_client *client,
+                                                    const st_storage_peer_close *closed, size_t closed_count);
 /*
  * Sends one PEER_CONTROL message from "server" to a client's control connection; -1 when the client
  * is not online. The management API uses it to tell both ends of a session it closed.
@@ -257,6 +259,7 @@ void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_h
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
 void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx);
+void st_admin_set_peer_client_deleted_handler(st_admin_peer_client_deleted_handler handler, void *ctx);
 void st_admin_set_peer_control_send_handler(st_admin_peer_control_send_handler handler, void *ctx);
 void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx);
 void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,

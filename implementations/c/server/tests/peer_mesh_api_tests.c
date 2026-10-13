@@ -646,6 +646,57 @@ static int seed(void)
                                          sizeof(user_token)) != 0 ? -1 : 0;
 }
 
+static int deleted_callback_count = 0;
+static int deleted_callback_committed = 0;
+static st_storage_peer_close deleted_callback_peer;
+
+static int capture_deleted_client(void *ctx, const st_storage_client *client,
+                                   const st_storage_peer_close *closed, size_t closed_count)
+{
+    (void)ctx;
+    st_storage_client lookup;
+    int absent = st_storage_get_client(db_path, client->id, &lookup) != 0;
+    pthread_mutex_lock(&sent_lock);
+    ++deleted_callback_count;
+    deleted_callback_committed = absent && closed_count == 1U;
+    if (closed_count == 1U) deleted_callback_peer = closed[0];
+    pthread_mutex_unlock(&sent_lock);
+    return 0;
+}
+
+static int test_client_delete_commit_notification(void)
+{
+    st_storage_client client = {0}, lookup;
+    st_storage_peer_mesh_device device;
+    if (st_storage_upsert_client(db_path, 0, TENANT, "pm-delete", "pm-admin", 1, 30, &client) != 0
+        || st_storage_update_peer_mesh_device_enabled(db_path, &client, 1, &device) != 0
+        || insert_open_session(9800, client.id, client.client_name, client_a, "pm-a") != 0) return 1;
+    char path[128], sql[512];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld", client.id);
+    st_admin_set_peer_client_deleted_handler(capture_deleted_client, NULL);
+    int failed = expect("DELETE", path, NULL, user_token, 404, "client not found") != 0;
+    snprintf(sql, sizeof(sql), "CREATE TRIGGER fail_http_client_delete BEFORE DELETE ON client_account"
+             " WHEN OLD.id=%lld BEGIN SELECT RAISE(ABORT,'injected delete failure'); END", client.id);
+    if (!failed) failed = exec_sql(sql) != 0 || expect("DELETE", path, NULL, admin_token, 404, "client not found") != 0;
+    pthread_mutex_lock(&sent_lock);
+    if (deleted_callback_count != 0) failed = 1;
+    pthread_mutex_unlock(&sent_lock);
+    if (!session_status_is(9800, "ACTIVE") || st_storage_get_client(db_path, client.id, &lookup) != 0
+        || st_storage_get_peer_mesh_device_by_client(db_path, TENANT, client.id, &device) != 0) failed = 1;
+    if (exec_sql("DROP TRIGGER fail_http_client_delete") != 0) failed = 1;
+    if (!failed) failed = expect("DELETE", path, NULL, admin_token, 204, "") != 0;
+    pthread_mutex_lock(&sent_lock);
+    if (deleted_callback_count != 1 || !deleted_callback_committed || deleted_callback_peer.id != 9800
+        || deleted_callback_peer.source_client_id != client.id || deleted_callback_peer.target_client_id != client_a
+        || strcmp(deleted_callback_peer.tenant_id, TENANT) != 0) failed = 1;
+    pthread_mutex_unlock(&sent_lock);
+    if (!session_status_is(9800, "CLOSED") || st_storage_get_client(db_path, client.id, &lookup) == 0
+        || st_storage_get_peer_mesh_device_by_client(db_path, TENANT, client.id, &device) == 0) failed = 1;
+    st_admin_set_peer_client_deleted_handler(NULL, NULL);
+    if (failed) fprintf(stderr, "client delete HTTP authorization/rollback/commit notification failed\n");
+    return failed;
+}
+
 int main(void)
 {
     const char *tmp = getenv("TMPDIR");
@@ -692,6 +743,7 @@ int main(void)
         failed = test_parameters() != 0 || failed;
         failed = test_timestamps() != 0 || failed;
         failed = test_forwarded_host() != 0 || failed;
+        failed = test_client_delete_commit_notification() != 0 || failed;
     }
     st_admin_set_peer_control_send_handler(NULL, NULL);
     free(last_body);
