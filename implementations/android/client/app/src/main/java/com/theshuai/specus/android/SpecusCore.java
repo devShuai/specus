@@ -528,6 +528,27 @@ public final class SpecusCore {
             recentlyClosedStreams.add(streamId);
         }
 
+        /** Publish the tombstone before removing the live identity. Scheduler cleanup can run
+         * completion callbacks or wait for a writer; neither may expose an unknown-stream gap. */
+        synchronized <T> boolean removeClosedStream(Map<Integer, T> streams, int streamId, T expected) {
+            if (expected == null || streams.get(streamId) != expected) {
+                return false;
+            }
+            markClosed(streamId);
+            return streams.remove(streamId, expected);
+        }
+
+        synchronized <T> T removeClosedStream(Map<Integer, T> streams, int streamId) {
+            T current = streams.get(streamId);
+            return removeClosedStream(streams, streamId, current) ? current : null;
+        }
+
+        synchronized void requireRecentlyClosedReset(int streamId) throws IOException {
+            if (!isRecentlyClosed(streamId)) {
+                throw new IOException("RST for unknown stream " + Integer.toUnsignedString(streamId));
+            }
+        }
+
         synchronized boolean isRecentlyClosed(int streamId) {
             return recentlyClosedStreams.contains(streamId);
         }
@@ -1857,7 +1878,7 @@ public final class SpecusCore {
                     http.onRequestEnd(packet.meta);
                     return;
                 }
-                LocalWebSocketSpecus webSocket = localWebSockets.remove(packet.streamId);
+                LocalWebSocketSpecus webSocket = streamLifecycle.removeClosedStream(localWebSockets, packet.streamId);
                 if (webSocket != null) {
                     closeSendWindow(packet.streamId);
                     webSocket.closeFromRemote();
@@ -1876,14 +1897,13 @@ public final class SpecusCore {
                 return;
             }
             if (packet.type == NatMessageType.RST) {
-                HttpStreamForwarder http = httpStreams.remove(packet.streamId);
+                HttpStreamForwarder http = streamLifecycle.removeClosedStream(httpStreams, packet.streamId);
                 if (http != null) {
                     closeSendWindow(packet.streamId);
-                    streamLifecycle.markClosed(packet.streamId);
                     http.closeFromControl();
                     return;
                 }
-                LocalWebSocketSpecus webSocket = localWebSockets.remove(packet.streamId);
+                LocalWebSocketSpecus webSocket = streamLifecycle.removeClosedStream(localWebSockets, packet.streamId);
                 if (webSocket != null) {
                     closeSendWindow(packet.streamId);
                     webSocket.closeFromRemote();
@@ -1894,11 +1914,8 @@ public final class SpecusCore {
                     specus.receiveRemoteReset();
                     return;
                 }
-                if (streamLifecycle.isRecentlyClosed(packet.streamId)) {
-                    return;
-                }
-                throw new IOException("RST for unknown stream "
-                        + Integer.toUnsignedString(packet.streamId));
+                streamLifecycle.requireRecentlyClosedReset(packet.streamId);
+                return;
             }
             if (packet.type == NatMessageType.WINDOW_UPDATE) {
                 if (streamFlow.creditIfOpen(packet.streamId, packet.value)
@@ -2088,28 +2105,28 @@ public final class SpecusCore {
         }
 
         void completeHttpStream(int streamId, HttpStreamForwarder expected) {
-            httpStreams.remove(streamId, expected);
-            closeSendWindow(streamId);
-            streamLifecycle.markClosed(streamId);
+            if (streamLifecycle.removeClosedStream(httpStreams, streamId, expected)) {
+                closeSendWindow(streamId);
+            }
         }
 
         @Override
         public void completeTcpStream(int streamId, LocalSpecus expected) {
-            localSpecusMappings.remove(streamId, expected);
-            closeSendWindow(streamId);
-            streamLifecycle.markClosed(streamId);
+            if (streamLifecycle.removeClosedStream(localSpecusMappings, streamId, expected)) {
+                closeSendWindow(streamId);
+            }
         }
 
         void completeWebSocketStream(int streamId, LocalWebSocketSpecus expected) {
-            localWebSockets.remove(streamId, expected);
-            closeSendWindow(streamId);
-            streamLifecycle.markClosed(streamId);
+            if (streamLifecycle.removeClosedStream(localWebSockets, streamId, expected)) {
+                closeSendWindow(streamId);
+            }
         }
 
         @Override
         public void resetTcpStream(int streamId, LocalSpecus expected,
                             long errorCode, String reason) {
-            if (!localSpecusMappings.remove(streamId, expected)) {
+            if (!streamLifecycle.removeClosedStream(localSpecusMappings, streamId, expected)) {
                 return;
             }
             try {
@@ -2120,7 +2137,7 @@ public final class SpecusCore {
 
         void resetHttpStream(int streamId, HttpStreamForwarder expected,
                              long errorCode, String reason, String failure) {
-            if (!httpStreams.remove(streamId, expected)) {
+            if (!streamLifecycle.removeClosedStream(httpStreams, streamId, expected)) {
                 return;
             }
             try {
@@ -2131,7 +2148,7 @@ public final class SpecusCore {
 
         void resetWebSocketStream(int streamId, LocalWebSocketSpecus expected,
                                   long errorCode, String reason) {
-            if (!localWebSockets.remove(streamId, expected)) {
+            if (!streamLifecycle.removeClosedStream(localWebSockets, streamId, expected)) {
                 return;
             }
             try {
@@ -2194,11 +2211,8 @@ public final class SpecusCore {
                 throws Exception {
             NatMessage reset = Packet.stream(NatMessageType.RST, streamId, errorCode, null);
             reset.meta = metadata;
-            try {
-                streamFlow.reset(streamId, () -> sendData(reset));
-            } finally {
-                streamLifecycle.markClosed(streamId);
-            }
+            streamLifecycle.markClosed(streamId);
+            streamFlow.reset(streamId, () -> sendData(reset));
         }
 
         @Override
@@ -2236,7 +2250,7 @@ public final class SpecusCore {
                 }
                 specus.start();
             } catch (Throwable error) {
-                localWebSockets.remove(streamId);
+                streamLifecycle.removeClosedStream(localWebSockets, streamId);
                 status.publish("WebSocket route failed", message(error), true);
                 sendReset(streamId, 4, "websocket connect failed");
             }
