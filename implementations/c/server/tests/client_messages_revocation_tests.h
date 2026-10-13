@@ -1,4 +1,8 @@
 /* Included by client_messages_tests.c: real sockets, shared vector, real SQLite rollback. */
+#ifndef ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE
+#define ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE "../../../protocol/test-vectors/management-accounts-v1.json"
+#endif
+
 static int revocation_sql(test_server *server, const char *sql)
 {
     sqlite3 *db = NULL;
