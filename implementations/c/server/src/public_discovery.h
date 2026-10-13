@@ -14,6 +14,17 @@ int st_public_discovery_name_availability_response(const char *path,
                                                    char *out,
                                                    size_t out_len);
 
+/*
+ * Java PublicTransferRateLimiter with the public transfer cluster enabled: the fixed window of an
+ * anonymous entry point (pairing-code redemption, presign upload) lives in Redis and is shared by
+ * every instance. Returns 1 when the call is allowed, 0 when it is rate limited and -1 when the
+ * cluster is disabled or Redis is unavailable, in which case the caller fails closed.
+ */
+int st_public_discovery_shared_rate_allow(const char *bucket,
+                                          const char *identity,
+                                          long limit,
+                                          long window_seconds);
+
 /* Returns 1 when the request path belongs to discovery (handled or rejected), 0 otherwise. */
 int st_public_discovery_handle_websocket(int fd,
                                          const char *method,

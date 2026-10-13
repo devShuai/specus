@@ -1,5 +1,7 @@
 #include "storage.h"
 
+#include "client_auth_nonce.h"
+#include "crypto.h"
 #include "peer_egress.h"
 
 #include <sqlite3.h>
@@ -286,19 +288,22 @@ static int test_peer_mesh_egress_policy_round_trip(void)
         fprintf(stderr, "egress policy update failed\n");
         failures++;
     }
-    st_storage_peer_mesh_egress_policy listed[8];
+    st_storage_peer_mesh_egress_policy *listed = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_policies(path, "default", 1, listed, 8U, &count) != 0
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 1, &listed, &count) != 0
         || count != 0U) {
         fprintf(stderr, "a disabled policy is still listed as enabled\n");
         failures++;
     }
-    if (st_storage_list_peer_mesh_egress_policies(path, "default", 0, listed, 8U, &count) != 0
+    free(listed);
+    listed = NULL;
+    if (st_storage_list_peer_mesh_egress_policies(path, "default", 0, &listed, &count) != 0
         || count != 1U
         || strcmp(listed[0].allowed_consumer_client_ids, "1001,1002") != 0) {
         fprintf(stderr, "the update did not persist\n");
         failures++;
     }
+    free(listed);
 
     if (st_storage_delete_peer_mesh_egress_policy(path, saved.id, "default") != 0
         || st_storage_get_peer_mesh_egress_policy(path, saved.id, "default", &found) != 1) {
@@ -428,13 +433,14 @@ static int test_peer_mesh_egress_activity_round_trip(void)
         fprintf(stderr, "egress activity update failed\n");
         failures++;
     }
-    st_storage_peer_mesh_egress_activity rows[8];
+    st_storage_peer_mesh_egress_activity *rows = NULL;
     size_t count = 0U;
-    if (st_storage_list_peer_mesh_egress_activity(path, "default", rows, 8U, &count) != 0
+    if (st_storage_list_peer_mesh_egress_activity(path, "default", &rows, &count) != 0
         || count != 1U || rows[0].active_flows != 21 || rows[0].revision != 13) {
         fprintf(stderr, "egress activity list mismatch: count=%zu\n", count);
         failures++;
     }
+    free(rows);
     unlink(path);
     return failures;
 }
@@ -662,6 +668,73 @@ static int exec_script(const char *path, const char *sql)
 }
 
 /*
+ * Java ClientAuthNonceServiceIntegrationTests on the stored form: each (api key, nonce) pair is
+ * consumed once, under Java's id and with Java's text expiry; a row still answers at its exact
+ * expiry instant (Java deletes rows with expiresAt < now) and is gone a millisecond later, and
+ * every consume sweeps what has expired.
+ */
+static int test_client_auth_nonce_store(void)
+{
+    char path[256];
+    scratch_db_path(path, sizeof(path), "client-auth-nonce");
+    if (st_storage_init(path, 0) != 0) {
+        unlink(path);
+        return 1;
+    }
+    const long long now = 1791374400000LL; /* 2026-10-07T12:00:00.000Z */
+    int failures = 0;
+    if (st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now) != ST_CLIENT_AUTH_NONCE_ACCEPTED
+        || st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now) != ST_CLIENT_AUTH_NONCE_REPLAYED
+        || st_client_auth_nonce_consume_stored(path, "api-key-b", "nonce", now) != ST_CLIENT_AUTH_NONCE_ACCEPTED) {
+        fprintf(stderr, "stored nonce: each api key and nonce pair must be consumed exactly once\n");
+        failures = 1;
+    }
+    uint8_t digest[ST_SHA256_LEN];
+    char api_key_hash[ST_SHA256_HEX_LEN + 1];
+    char material[ST_SHA256_HEX_LEN + 16];
+    char nonce_id[ST_SHA256_HEX_LEN + 1];
+    st_sha256((const uint8_t *)"api-key-a", strlen("api-key-a"), digest);
+    st_hex_encode(digest, sizeof(digest), api_key_hash);
+    snprintf(material, sizeof(material), "%s\nnonce", api_key_hash);
+    st_sha256((const uint8_t *)material, strlen(material), digest);
+    st_hex_encode(digest, sizeof(digest), nonce_id);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM specus_client_auth_nonce WHERE id = '%s' AND api_key_hash = '%s' "
+             "AND expires_at = '2026-10-07T12:02:00.000Z'", nonce_id, api_key_hash);
+    if (!failures && query_int(path, sql) != 1) {
+        fprintf(stderr, "stored nonce row is not Java's id, api key hash and expiry\n");
+        failures = 1;
+    }
+    if (!failures
+        && (st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now + 120000LL)
+                != ST_CLIENT_AUTH_NONCE_REPLAYED
+            || st_client_auth_nonce_consume_stored(path, "api-key-a", "nonce", now + 120001LL)
+                != ST_CLIENT_AUTH_NONCE_ACCEPTED
+            || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce") != 1)) {
+        fprintf(stderr, "stored nonce expiry boundary or sweep mismatch\n");
+        failures = 1;
+    }
+    if (!failures
+        && (st_client_auth_nonce_consume_stored(path, "api-key-c", "other", now + 300000LL)
+                != ST_CLIENT_AUTH_NONCE_ACCEPTED
+            || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce WHERE expires_at = "
+                               "'2026-10-07T12:07:00.000Z'") != 1
+            || query_int(path, "SELECT COUNT(*) FROM specus_client_auth_nonce") != 1)) {
+        fprintf(stderr, "stored nonce sweep of expired rows mismatch\n");
+        failures = 1;
+    }
+    unlink(path);
+    /* A database that cannot be opened fails closed. */
+    if (!failures && st_client_auth_nonce_consume_stored("/nonexistent-dir/specus.db", "api-key-a", "nonce", now)
+                         != ST_CLIENT_AUTH_NONCE_UNAVAILABLE) {
+        fprintf(stderr, "stored nonce on a broken database did not fail closed\n");
+        failures = 1;
+    }
+    return failures;
+}
+
+/*
  * Java PeerServiceDiscoverySchemaMigratorTests, createsTablesDisabledByDefaultAndAddsSessionCapabilityColumns.
  * A session table from before peer service discovery and peer egress gains the four capability
  * columns, and a row already there as well as a new row that does not set them announce nothing.
@@ -860,9 +933,345 @@ static int test_connection_archive_window(void)
     return failures;
 }
 
+/* The first column of the first row of sql as text ("" when there is none). */
+static void query_text(const char *path, const char *sql, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL) {
+        snprintf(out, out_len, "%s", (const char *)sqlite3_column_text(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+/*
+ * client_account used to be keyed by client_name with the rowid as account id, and SQLite gives a
+ * freed newest rowid to the next account. The migration keeps every id, retires the ids other
+ * tables still refer to, and from then on no id is handed out twice. A rename carries the account's
+ * identity and session names along; a delete ends its runtime tokens.
+ */
+static int test_client_account_id_migration(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-client-account-ids-%ld.db", (long)getpid());
+    unlink(path);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "client account id: init failed\n");
+        unlink(path);
+        return 1;
+    }
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    const char *legacy =
+        "DROP TABLE client_account;"
+        "DELETE FROM sqlite_sequence WHERE name = 'client_account';"
+        "CREATE TABLE client_account ("
+        "tenant_id TEXT NOT NULL DEFAULT 'default',"
+        "client_name TEXT PRIMARY KEY,"
+        "owner_username TEXT NOT NULL DEFAULT 'admin',"
+        "enabled INTEGER NOT NULL DEFAULT 1,"
+        "connection_limit_per_minute INTEGER NOT NULL DEFAULT 30,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+        "INSERT INTO client_account(client_name) VALUES('alpha'),('beta'),('gamma'),('delta'),('epsilon');"
+        /* epsilon (5) is gone, but an identity still names it; gamma (3) is gone without a trace. */
+        "DELETE FROM client_account WHERE client_name IN ('gamma', 'epsilon');"
+        "INSERT INTO specus_client_identity(credential_id, client_id, client_name, machine_fingerprint, os_user) "
+        "VALUES(1, 5, 'epsilon', 'machine-epsilon', 'user');"
+        "INSERT INTO specus_client_identity(credential_id, client_id, client_name, machine_fingerprint, os_user) "
+        "VALUES(1, 2, 'beta', 'machine-beta', 'user');"
+        "INSERT INTO specus_client_session(credential_id, identity_id, client_id, client_name, token_hash, status, "
+        "machine_fingerprint, os_user, expires_at) "
+        "VALUES(1, 2, 2, 'beta', 'hash', 'NETTY_ONLINE', 'machine-beta', 'user', '2999-01-01T00:00:00Z');";
+    if (sqlite3_open(path, &db) != SQLITE_OK || sqlite3_exec(db, legacy, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "client account id: legacy schema setup failed: %s\n", error == NULL ? "sqlite error" : error);
+        sqlite3_free(error);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_close(db);
+
+    int failures = 0;
+    char text[256];
+    for (int pass = 0; pass < 2; ++pass) {
+        /* The second init finds the migrated table and leaves it alone. */
+        if (st_storage_init(path, 0) != 0) {
+            fprintf(stderr, "client account id: migration %d failed\n", pass);
+            unlink(path);
+            return 1;
+        }
+    }
+    query_text(path, "SELECT group_concat(id || ':' || client_name, ',') FROM "
+                     "(SELECT id, client_name FROM client_account ORDER BY id)", text, sizeof(text));
+    if (strcmp(text, "1:alpha,2:beta,4:delta") != 0) {
+        fprintf(stderr, "client account id: migrated accounts %s, expected their old rowids\n", text);
+        ++failures;
+    }
+    st_storage_client created;
+    if (st_storage_upsert_client(path, 0, "default", "zeta", "admin", 1, 30, &created) != 0 || created.id != 6) {
+        fprintf(stderr, "client account id: first new account got id %lld, expected 6 (5 is still referenced)\n",
+                created.id);
+        ++failures;
+    }
+    st_storage_client again;
+    if (st_storage_delete_client(path, created.id) != 0
+        || st_storage_upsert_client(path, 0, "default", "zeta", "admin", 1, 30, &again) != 0
+        || again.id != 7) {
+        fprintf(stderr, "client account id: re-created newest account got id %lld, expected 7, not the deleted 6\n",
+                again.id);
+        ++failures;
+    }
+    if (st_storage_upsert_client(path, 0, "default", "alpha", "admin", 1, 30, &created) == 0) {
+        fprintf(stderr, "client account id: a second account named alpha was created\n");
+        ++failures;
+    }
+
+    st_storage_client renamed;
+    if (st_storage_upsert_client(path, 2, "default", "beta-renamed", "admin", 1, 30, &renamed) != 0) {
+        fprintf(stderr, "client account id: rename failed\n");
+        ++failures;
+    }
+    query_text(path, "SELECT (SELECT client_name FROM specus_client_identity WHERE client_id = 2) || '|' || "
+                     "(SELECT client_name FROM specus_client_session WHERE client_id = 2) || '|' || "
+                     "(SELECT client_name FROM specus_client_identity WHERE client_id = 5)", text, sizeof(text));
+    if (strcmp(text, "beta-renamed|beta-renamed|epsilon") != 0) {
+        fprintf(stderr, "client account id: identity|session|other names after the rename: %s\n", text);
+        ++failures;
+    }
+    if (st_storage_delete_client(path, 2) != 0) {
+        fprintf(stderr, "client account id: delete failed\n");
+        ++failures;
+    }
+    query_text(path, "SELECT status || '|' || (expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) "
+                     "FROM specus_client_session WHERE client_id = 2", text, sizeof(text));
+    if (strcmp(text, "DISCONNECTED|1") != 0) {
+        fprintf(stderr, "client account id: session of the deleted account is %s, expected DISCONNECTED|1 "
+                        "(status|expired)\n", text);
+        ++failures;
+    }
+    unlink(path);
+    return failures == 0 ? 0 : 1;
+}
+
+/* specus_management_user as releases before tenant-scoped login names created it. */
+static const char legacy_management_user_table[] =
+    "CREATE TABLE specus_management_user ("
+    "username TEXT PRIMARY KEY,"
+    "tenant_id TEXT NOT NULL DEFAULT 'default',"
+    "password_hash TEXT NOT NULL DEFAULT 'hash',"
+    "role TEXT NOT NULL DEFAULT 'USER',"
+    "enabled INTEGER NOT NULL DEFAULT 1,"
+    "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+    "oidc_issuer TEXT,"
+    "oidc_subject TEXT,"
+    "oidc_identity_key TEXT);";
+
+static int login_name_exec(const char *path, const char *sql)
+{
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    int rc = sqlite3_open(path, &db) == SQLITE_OK ? sqlite3_exec(db, sql, NULL, NULL, &error) : SQLITE_ERROR;
+    sqlite3_free(error);
+    sqlite3_close(db);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
+/* A fresh file holding only the legacy account table and the given rows. */
+static int legacy_login_name_database(const char *path, const char *rows)
+{
+    unlink(path);
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "%s%s", legacy_management_user_table, rows);
+    if (login_name_exec(path, sql) != 0) {
+        fprintf(stderr, "legacy account table setup failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int login_name_query_text(const char *path, const char *sql, char *out, size_t out_len)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    out[0] = '\0';
+    if (sqlite3_open(path, &db) == SQLITE_OK && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        snprintf(out, out_len, "%s", text == NULL ? "(null)" : (const char *)text);
+        rc = 0;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
+/* Java ManagementUserSchemaMigratorTests.backfillsLegacyRowsAndEnforcesTenantScopedUniqueness. */
+static int test_login_name_migration_backfills_legacy_rows(void)
+{
+    char path[256];
+    char text[128];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-backfill-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "INSERT INTO specus_management_user(username, tenant_id) "
+                                         "VALUES('Alice','tenant-a'),('alice','tenant-b');") != 0) {
+        return 1;
+    }
+    int failed = st_storage_init(path, 0) != 0 || st_storage_init(path, 0) != 0;
+    char error[160];
+    failed = failed || st_storage_migrate_management_login_names(path, error, sizeof(error)) != 0;
+    if (failed) fprintf(stderr, "login-name migration of legacy rows failed\n");
+    if (!failed) {
+        failed = login_name_query_text(path, "SELECT login_name || '/' || login_name_normalized "
+                                             "FROM specus_management_user WHERE username = 'Alice'",
+                                       text, sizeof(text)) != 0
+            || strcmp(text, "Alice/alice") != 0;
+        if (failed) fprintf(stderr, "legacy row backfill mismatch: %s\n", text);
+    }
+    if (!failed && login_name_exec(path, "INSERT INTO specus_management_user(username, tenant_id, login_name, "
+                                         "login_name_normalized, password_hash) "
+                                         "VALUES('new-key','tenant-a','ALICE','alice','hash');") == 0) {
+        fprintf(stderr, "a second alice of tenant-a was stored\n");
+        failed = 1;
+    }
+    static const char *const tenants[][2] = {{"tenant-a", "Alice"}, {"tenant-b", "alice"}};
+    for (size_t i = 0; !failed && i < 2U; ++i) {
+        st_storage_management_user user;
+        failed = st_storage_get_management_user_in_tenant(path, tenants[i][0], "ALICE", &user) != 0
+            || strcmp(user.account_key, tenants[i][1]) != 0 || strcmp(user.username, tenants[i][1]) != 0
+            || strcmp(user.tenant_id, tenants[i][0]) != 0;
+        if (failed) fprintf(stderr, "%s's alice is not found in its own tenant\n", tenants[i][0]);
+    }
+    st_storage_management_user nobody;
+    if (!failed && st_storage_get_management_user_in_tenant(path, "default", "alice", &nobody) == 0) {
+        fprintf(stderr, "the default tenant found another tenant's alice\n");
+        failed = 1;
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/* Java ManagementUserSchemaMigratorTests.failsBeforeBackfillWhenLegacyRowsCollideInsideTenant. */
+static int test_login_name_migration_refuses_duplicates_inside_a_tenant(void)
+{
+    char path[256];
+    char text[128];
+    char error[160];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-duplicate-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "INSERT INTO specus_management_user(username, tenant_id) "
+                                         "VALUES('Alice','tenant-a'),('alice','tenant-a');") != 0) {
+        return 1;
+    }
+    int failed = st_storage_init(path, 0) == 0;
+    if (failed) fprintf(stderr, "storage opened with two alices in one tenant\n");
+    if (!failed) {
+        failed = st_storage_migrate_management_login_names(path, error, sizeof(error)) == 0
+            || strstr(error, "duplicate management login name") == NULL || strstr(error, "tenant-a") == NULL;
+        if (failed) fprintf(stderr, "duplicate login name error mismatch: %s\n", error);
+    }
+    if (!failed) {
+        failed = login_name_query_text(path, "SELECT COUNT(*) FROM specus_management_user "
+                                             "WHERE login_name IS NOT NULL", text, sizeof(text)) != 0
+            || strcmp(text, "0") != 0;
+        if (failed) fprintf(stderr, "%s rows were backfilled before the failure\n", text);
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/* Java ManagementUserSchemaMigratorTests.rejectsAnExistingIndexWithTheExpectedNameButWrongDefinition. */
+static int test_login_name_migration_rejects_a_wrong_index(void)
+{
+    char path[256];
+    char error[160];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-index-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "CREATE UNIQUE INDEX uq_management_user_tenant_login_name "
+                                         "ON specus_management_user(username);") != 0) {
+        return 1;
+    }
+    int failed = st_storage_init(path, 0) == 0
+        || st_storage_migrate_management_login_names(path, error, sizeof(error)) == 0
+        || strstr(error, "must be unique on (tenant_id, login_name_normalized)") == NULL;
+    if (failed) fprintf(stderr, "a wrong login-name index was accepted: %s\n", error);
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
+/*
+ * ManagementUserServiceTests.createsSameLoginNameInDifferentTenantWithoutGlobalLookup at the store:
+ * a new account gets a random key rather than its name, so tenants share login names, and the
+ * legacy key lookup finds only accounts that predate login names, and only an unambiguous one.
+ */
+static int test_login_names_are_unique_per_tenant(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/specus-c-login-name-tenants-%ld.db", (long)getpid());
+    if (legacy_login_name_database(path, "INSERT INTO specus_management_user(username, tenant_id) "
+                                         "VALUES('Carol','tenant-c'),('carol','tenant-d'),('erin','tenant-e');") != 0) {
+        return 1;
+    }
+    st_storage_management_user a;
+    st_storage_management_user b;
+    st_storage_management_user other;
+    int failed = st_storage_init(path, 0) != 0
+        || st_storage_create_management_user(path, "Bob", "tenant-a", "hash", "USER", 1, &a) != 0
+        || st_storage_create_management_user(path, "bob", "tenant-b", "hash", "USER", 1, &b) != 0;
+    if (failed) fprintf(stderr, "same login name in two tenants was refused\n");
+    if (!failed) {
+        failed = strlen(a.account_key) != 36U || a.account_key[8] != '-' || a.account_key[14] != '4'
+            || strcmp(a.account_key, b.account_key) == 0 || strcmp(a.username, "Bob") != 0
+            || strcmp(b.username, "bob") != 0;
+        if (failed) fprintf(stderr, "new accounts did not get random keys: %s %s\n", a.account_key, b.account_key);
+    }
+    if (!failed && st_storage_create_management_user(path, " BOB ", "tenant-a", "hash", "USER", 1, &other) == 0) {
+        fprintf(stderr, "a second bob of tenant-a was created\n");
+        failed = 1;
+    }
+    if (!failed && st_storage_find_legacy_management_user(path, "bob", &other) != 1) {
+        fprintf(stderr, "a new account was found by its login name as a legacy key\n");
+        failed = 1;
+    }
+    if (!failed && st_storage_find_legacy_management_user(path, "CAROL", &other) != 1) {
+        fprintf(stderr, "an ambiguous legacy key resolved\n");
+        failed = 1;
+    }
+    if (!failed) {
+        failed = st_storage_find_legacy_management_user(path, "Erin", &other) != 0
+            || strcmp(other.account_key, "erin") != 0 || strcmp(other.tenant_id, "tenant-e") != 0;
+        if (failed) fprintf(stderr, "a unique legacy key did not resolve\n");
+    }
+    if (!failed) {
+        failed = st_storage_find_management_user_by_account_key(path, a.account_key, &other) != 0
+            || strcmp(other.tenant_id, "tenant-a") != 0
+            || st_storage_find_management_user_by_account_key(path, "ERIN", &other) != 1
+            || st_storage_find_management_user_in_tenant(path, "tenant-b", "BOB", &other) != 0
+            || strcmp(other.account_key, b.account_key) != 0
+            || st_storage_find_management_user_in_tenant(path, "tenant-c", "bob", &other) != 1;
+        if (failed) fprintf(stderr, "account key or tenant lookups mismatch\n");
+    }
+    unlink(path);
+    return failed ? 1 : 0;
+}
+
 int main(void)
 {
+    if (test_client_account_id_migration() != 0) {
+        return 1;
+    }
+    if (test_login_name_migration_backfills_legacy_rows() != 0
+        || test_login_name_migration_refuses_duplicates_inside_a_tenant() != 0
+        || test_login_name_migration_rejects_a_wrong_index() != 0
+        || test_login_names_are_unique_per_tenant() != 0) {
+        return 1;
+    }
     if (test_peer_mesh_acl_direction_migration() != 0) {
+        return 1;
+    }
+    if (test_client_auth_nonce_store() != 0) {
         return 1;
     }
     if (test_peer_service_discovery_migration() != 0) {
@@ -962,8 +1371,8 @@ int main(void)
         || st_storage_get_management_user_in_tenant(path, "tenant-other", "alice", &foreign_view) == 0
         || st_storage_update_management_user(path, "tenant-other", "ALICE", "taken-over", "ADMIN", 0,
                                              &foreign_view) == 0
-        || st_storage_delete_management_user(path, "tenant-other", "alice") == 0
-        || st_storage_get_management_user(path, "alice", &created_user) != 0
+        || st_storage_delete_management_user(path, "tenant-other", "alice", "admin") == 0
+        || st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) != 0
         || strcmp(created_user.tenant_id, "default") != 0
         || strcmp(created_user.password_hash, "hash-value") != 0
         || strcmp(created_user.role, "USER") != 0
@@ -989,15 +1398,15 @@ int main(void)
         unlink(path);
         return 1;
     }
-    if (st_storage_get_management_user(path, "alice", &created_user) != 0
+    if (st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) != 0
         || strcmp(created_user.username, "alice") != 0
         || created_user.enabled != 0) {
         fprintf(stderr, "management user lookup mismatch\n");
         unlink(path);
         return 1;
     }
-    if (st_storage_delete_management_user(path, "default", "alice") != 0
-        || st_storage_get_management_user(path, "alice", &created_user) == 0) {
+    if (st_storage_delete_management_user(path, "default", "alice", "admin") != 0
+        || st_storage_get_management_user_in_tenant(path, "default", "alice", &created_user) == 0) {
         fprintf(stderr, "management user delete mismatch\n");
         unlink(path);
         return 1;
@@ -1413,33 +1822,36 @@ int main(void)
         unlink(path);
         return 1;
     }
-    st_storage_peer_mesh_acl visible_acls[4];
+    st_storage_peer_mesh_acl *visible_acls = NULL;
     size_t visible_acl_count = 0;
-    if (st_storage_list_peer_mesh_acls_visible(path,
-                                               "tenant-c",
-                                               "OwnerCase",
-                                               0,
-                                               visible_acls,
-                                               4,
-                                               &visible_acl_count) != 0
-        || visible_acl_count != 1U
-        || visible_acls[0].id != acl_id
-        || st_storage_list_peer_mesh_acls_visible(path,
-                                                  "tenant-c",
-                                                  "ownercase",
-                                                  0,
-                                                  visible_acls,
-                                                  4,
-                                                  &visible_acl_count) != 0
-        || visible_acl_count != 0U
-        || st_storage_list_peer_mesh_acls_visible(path,
-                                                  "TENANT-C",
-                                                  "OwnerCase",
-                                                  1,
-                                                  visible_acls,
-                                                  4,
-                                                  &visible_acl_count) != 0
-        || visible_acl_count != 0U) {
+    int owner_ok = st_storage_list_peer_mesh_acls_visible(path,
+                                                          "tenant-c",
+                                                          "OwnerCase",
+                                                          0,
+                                                          &visible_acls,
+                                                          &visible_acl_count) == 0
+        && visible_acl_count == 1U
+        && visible_acls[0].id == acl_id;
+    free(visible_acls);
+    visible_acls = NULL;
+    int other_case_owner_ok = st_storage_list_peer_mesh_acls_visible(path,
+                                                                     "tenant-c",
+                                                                     "ownercase",
+                                                                     0,
+                                                                     &visible_acls,
+                                                                     &visible_acl_count) == 0
+        && visible_acl_count == 0U;
+    free(visible_acls);
+    visible_acls = NULL;
+    int other_case_tenant_ok = st_storage_list_peer_mesh_acls_visible(path,
+                                                                      "TENANT-C",
+                                                                      "OwnerCase",
+                                                                      1,
+                                                                      &visible_acls,
+                                                                      &visible_acl_count) == 0
+        && visible_acl_count == 0U;
+    free(visible_acls);
+    if (!owner_ok || !other_case_owner_ok || !other_case_tenant_ok) {
         fprintf(stderr, "peer mesh acl tenant/owner visibility must be case-sensitive\n");
         unlink(path);
         return 1;
@@ -1471,9 +1883,9 @@ int main(void)
         unlink(path);
         return 1;
     }
-    st_storage_mapping mappings[4];
+    st_storage_mapping *mappings = NULL;
     size_t count = 0;
-    if (st_storage_load_mappings(path, "Demo client", mappings, 4, &count) != 0
+    if (st_storage_load_mappings(path, "Demo client", &mappings, &count) != 0
         || count != 1U
         || mappings[0].listen_port != 18080
         || strcmp(mappings[0].target_address, "127.0.0.1") != 0
@@ -1481,9 +1893,11 @@ int main(void)
         || mappings[0].enabled != 1
         || mappings[0].detail_capture_enabled != 0) {
         fprintf(stderr, "mapping load mismatch\n");
+        free(mappings);
         unlink(path);
         return 1;
     }
+    free(mappings);
     st_storage_mapping mapping_by_port;
     if (st_storage_get_mapping_by_client_port(path, "Demo client", 18080, &mapping_by_port) != 0
         || mapping_by_port.listen_port != 18080
@@ -1515,11 +1929,13 @@ int main(void)
         return 1;
     }
     count = 0;
-    if (st_storage_list_mappings(path, clients[0].id, mappings, 4, &count) != 0 || count != 2U) {
+    if (st_storage_list_mappings(path, clients[0].id, &mappings, &count) != 0 || count != 2U) {
         fprintf(stderr, "mapping list mismatch\n");
+        free(mappings);
         unlink(path);
         return 1;
     }
+    free(mappings);
     if (st_storage_delete_mapping_by_id(path, created_mapping.id) != 0) {
         fprintf(stderr, "mapping delete failed\n");
         unlink(path);
@@ -1612,16 +2028,18 @@ int main(void)
         unlink(path);
         return 1;
     }
-    st_storage_http_route routes[4];
+    st_storage_http_route *routes = NULL;
     size_t route_count = 0;
-    if (st_storage_list_http_routes(path, clients[0].id, routes, 4, &route_count) != 0
+    if (st_storage_list_http_routes(path, clients[0].id, &routes, &route_count) != 0
         || route_count != 1U
         || strcmp(routes[0].auth_username, "viewer") != 0
         || strcmp(routes[0].auth_password_hash, updated_route_password_hash) != 0) {
         fprintf(stderr, "http route list mismatch\n");
+        free(routes);
         unlink(path);
         return 1;
     }
+    free(routes);
     if (st_storage_delete_http_route_by_id(path, created_route.id) != 0) {
         fprintf(stderr, "http route delete failed\n");
         unlink(path);

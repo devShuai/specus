@@ -23,9 +23,14 @@
 #include <time.h>
 
 #define ST_ES_MAX_RESPONSE (32U * 1024U * 1024U)
+/* Java ElasticsearchProperties.uris is a comma separated node list; C keeps up to this many. */
+#define ST_ES_MAX_ENDPOINTS 8U
 
 typedef struct {
+    /* The first node, which also keys the index readiness cache. */
     char endpoint[1024];
+    char endpoints[ST_ES_MAX_ENDPOINTS][1024];
+    size_t endpoint_count;
     char username[256];
     char password[512];
     char api_key[1024];
@@ -160,23 +165,76 @@ static long long es_parse_size(const char *value, long long fallback)
     return number > LLONG_MAX / multiplier ? fallback : number * multiplier;
 }
 
+/*
+ * One node of SPECUS_ELASTICSEARCH_URIS as Java's ElasticsearchConnectionDetails builds it: only the
+ * scheme, host and port count (a path or user info is dropped), and a node without a port is
+ * 9200 for http and 443 for https.
+ */
+static int es_normalize_endpoint(const char *value, char *out, size_t out_len)
+{
+    char trimmed[1024];
+    if (es_copy_trimmed(trimmed, sizeof(trimmed), value) != 0 || trimmed[0] == '\0') return -1;
+    int https = strncasecmp(trimmed, "https://", 8U) == 0;
+    if (!https && strncasecmp(trimmed, "http://", 7U) != 0) return -1;
+    const char *authority = trimmed + (https ? 8U : 7U);
+    size_t authority_len = strcspn(authority, "/?#");
+    const char *at = memchr(authority, '@', authority_len);
+    if (at != NULL) {
+        authority_len -= (size_t)(at + 1 - authority);
+        authority = at + 1;
+    }
+    if (authority_len == 0U) return -1;
+    const char *port = NULL;
+    if (authority[0] == '[') {
+        const char *close = memchr(authority, ']', authority_len);
+        if (close == NULL) return -1;
+        if ((size_t)(close + 1 - authority) < authority_len) {
+            if (close[1] != ':') return -1;
+            port = close + 2;
+        }
+    } else {
+        const char *colon = memchr(authority, ':', authority_len);
+        if (colon != NULL) port = colon + 1;
+    }
+    size_t host_len = port == NULL ? authority_len : (size_t)(port - 1 - authority);
+    size_t port_len = port == NULL ? 0U : authority_len - (size_t)(port - authority);
+    if (host_len == 0U) return -1;
+    for (size_t i = 0; i < port_len; ++i) if (!isdigit((unsigned char)port[i])) return -1;
+    int written = port_len == 0U
+        ? snprintf(out, out_len, "%s://%.*s:%s", https ? "https" : "http", (int)host_len, authority,
+                   https ? "443" : "9200")
+        : snprintf(out, out_len, "%s://%.*s:%.*s", https ? "https" : "http", (int)host_len, authority,
+                   (int)port_len, port);
+    return written < 0 || (size_t)written >= out_len ? -1 : 0;
+}
+
 static int es_load_config(st_es_config *config)
 {
     memset(config, 0, sizeof(*config));
     const char *uris = getenv("SPECUS_ELASTICSEARCH_URIS");
-    if (uris == NULL || *uris == '\0') return 1;
-    const char *comma = strchr(uris, ',');
-    size_t first_len = comma == NULL ? strlen(uris) : (size_t)(comma - uris);
-    if (first_len >= sizeof(config->endpoint)) return -1;
-    char first[1024];
-    memcpy(first, uris, first_len);
-    first[first_len] = '\0';
-    if (es_copy_trimmed(config->endpoint, sizeof(config->endpoint), first) != 0) return -1;
-    size_t endpoint_len = strlen(config->endpoint);
-    while (endpoint_len > 0U && config->endpoint[endpoint_len - 1U] == '/')
-        config->endpoint[--endpoint_len] = '\0';
-    if (!(strncasecmp(config->endpoint, "http://", 7U) == 0
-          || strncasecmp(config->endpoint, "https://", 8U) == 0)) return -1;
+    if (uris == NULL) return 1;
+    /* Java configures the store only when the URI list has text. */
+    const char *scan = uris;
+    while (isspace((unsigned char)*scan)) ++scan;
+    if (*scan == '\0') return 1;
+    for (const char *cursor = uris; *cursor != '\0';) {
+        size_t len = strcspn(cursor, ",");
+        char node[1024];
+        if (len >= sizeof(node)) return -1;
+        memcpy(node, cursor, len);
+        node[len] = '\0';
+        cursor += len;
+        if (*cursor == ',') ++cursor;
+        char *start = node;
+        while (isspace((unsigned char)*start)) ++start;
+        if (*start == '\0') continue;
+        if (config->endpoint_count == ST_ES_MAX_ENDPOINTS
+            || es_normalize_endpoint(start, config->endpoints[config->endpoint_count],
+                                     sizeof(config->endpoints[0])) != 0) return -1;
+        ++config->endpoint_count;
+    }
+    if (config->endpoint_count == 0U) return -1;
+    snprintf(config->endpoint, sizeof(config->endpoint), "%s", config->endpoints[0]);
     if (es_copy_trimmed(config->username, sizeof(config->username), getenv("SPECUS_ELASTICSEARCH_USERNAME")) != 0
         || es_copy_trimmed(config->password, sizeof(config->password), getenv("SPECUS_ELASTICSEARCH_PASSWORD")) != 0
         || es_copy_trimmed(config->api_key, sizeof(config->api_key), getenv("SPECUS_ELASTICSEARCH_API_KEY")) != 0
@@ -209,6 +267,20 @@ static size_t es_collect(char *data, size_t size, size_t nmemb, void *context)
     return es_buffer_append_n(buffer, data, count) == 0 ? count : 0U;
 }
 
+static int es_request_node(const st_es_config *config,
+                           const char *endpoint,
+                           const char *method,
+                           const char *path,
+                           const char *body,
+                           const char *content_type,
+                           long *status,
+                           char **response);
+
+/*
+ * One request to the cluster. As the Java client does with its node list, a node that cannot be
+ * reached (no HTTP answer at all) is skipped for the next one; an HTTP answer of any status ends
+ * the attempt.
+ */
 static int es_request(const st_es_config *config,
                       const char *method,
                       const char *path,
@@ -217,12 +289,29 @@ static int es_request(const st_es_config *config,
                       long *status,
                       char **response)
 {
+    int rc = -1;
+    for (size_t i = 0; i < config->endpoint_count; ++i) {
+        rc = es_request_node(config, config->endpoints[i], method, path, body, content_type, status, response);
+        if (rc == 0) break;
+    }
+    return rc;
+}
+
+static int es_request_node(const st_es_config *config,
+                           const char *endpoint,
+                           const char *method,
+                           const char *path,
+                           const char *body,
+                           const char *content_type,
+                           long *status,
+                           char **response)
+{
     *status = 0;
     *response = NULL;
-    size_t url_len = strlen(config->endpoint) + strlen(path) + 1U;
+    size_t url_len = strlen(endpoint) + strlen(path) + 1U;
     char *url = (char *)malloc(url_len);
     if (url == NULL) return -1;
-    snprintf(url, url_len, "%s%s", config->endpoint, path);
+    snprintf(url, url_len, "%s%s", endpoint, path);
     (void)pthread_once(&es_curl_once, es_curl_init);
     CURL *curl = es_curl_init_result == CURLE_OK ? curl_easy_init() : NULL;
     if (curl == NULL) { free(url); return -1; }
@@ -282,7 +371,8 @@ static const char es_http_mapping[] =
     "\"requestPreviewHex\":{\"type\":\"text\"},\"requestPreviewText\":{\"type\":\"text\"},"
     "\"responsePreviewHex\":{\"type\":\"text\"},\"responsePreviewText\":{\"type\":\"text\"},"
     "\"requestTruncated\":{\"type\":\"boolean\"},\"responseTruncated\":{\"type\":\"boolean\"},"
-    "\"capturedAt\":{\"type\":\"keyword\"}}}}";
+    "\"capturedAt\":{\"type\":\"keyword\"},"
+    "\"requestBodyData\":{\"type\":\"binary\"},\"responseBodyData\":{\"type\":\"binary\"}}}}";
 
 static const char es_tcp_mapping[] =
     "{\"mappings\":{\"properties\":{"
@@ -299,7 +389,19 @@ static const char es_tcp_mapping[] =
     "\"payloadPreviewText\":{\"type\":\"text\"},\"truncated\":{\"type\":\"boolean\"},"
     "\"frameTime\":{\"type\":\"keyword\"}}}}";
 
-static int es_ensure_index(const st_es_config *config, const char *index, const char *mapping, int *ready)
+/*
+ * Java's putBinaryBodyMapping: an HTTP index made before bodies were stored gets the two body
+ * fields as binary, so new documents do not map them dynamically as text.
+ */
+static const char es_http_body_mapping[] =
+    "{\"properties\":{\"requestBodyData\":{\"type\":\"binary\"},\"responseBodyData\":{\"type\":\"binary\"}}}";
+
+/* existing_update, when not NULL, is put on the index's mapping if the index exists already. */
+static int es_ensure_index(const st_es_config *config,
+                           const char *index,
+                           const char *mapping,
+                           const char *existing_update,
+                           int *ready)
 {
     pthread_mutex_lock(&es_index_lock);
     if (strcmp(es_ready_endpoint, config->endpoint) != 0) {
@@ -317,6 +419,19 @@ static int es_ensure_index(const st_es_config *config, const char *index, const 
     if (rc == 0 && status == 404) {
         rc = es_request(config, "PUT", path, mapping, "application/json", &status, &response);
         free(response);
+    } else if (rc == 0 && status >= 200 && status < 300 && existing_update != NULL) {
+        char mapping_path[320];
+        snprintf(mapping_path, sizeof(mapping_path), "/%s/_mapping", index);
+        long update_status = 0;
+        char *update_response = NULL;
+        /* As in Java, a refused update (a field mapped otherwise already) leaves the index as it is. */
+        if (es_request(config, "PUT", mapping_path, existing_update, "application/json",
+                       &update_status, &update_response) != 0
+            || update_status < 200 || update_status >= 300) {
+            fprintf(stderr, "failed to update the mapping of Elasticsearch index %s (HTTP %ld)\n",
+                    index, update_status);
+        }
+        free(update_response);
     }
     if (rc == 0 && status >= 200 && status < 300) *ready = 1;
     else rc = -1;
@@ -333,8 +448,8 @@ int st_elasticsearch_traffic_initialize_current(void)
         fprintf(stderr, "Elasticsearch configuration is invalid\n");
         return -1;
     }
-    if (es_ensure_index(&config, config.http_index, es_http_mapping, &es_http_ready) != 0
-        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, &es_tcp_ready) != 0) {
+    if (es_ensure_index(&config, config.http_index, es_http_mapping, es_http_body_mapping, &es_http_ready) != 0
+        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, NULL, &es_tcp_ready) != 0) {
         fprintf(stderr, "failed to initialize Elasticsearch traffic detail indices\n");
         return -1;
     }
@@ -374,11 +489,16 @@ static int es_store_bytes(const st_es_config *config, const char *index, long lo
     char *entry = indices == NULL ? NULL : st_json_get_top_level_raw(indices, index);
     char *total = entry == NULL ? NULL : st_json_get_top_level_raw(entry, "total");
     char *store = total == NULL ? NULL : st_json_get_top_level_raw(total, "store");
+    /*
+     * Java currentStoreBytes: total_data_set_size_in_bytes whenever the cluster reports it, also when
+     * it is 0 (nothing is trimmed then); size_in_bytes only when the field is absent.
+     */
     long long value = 0;
-    int rc = store != NULL && st_json_get_i64(store, "total_data_set_size_in_bytes", &value) == 0
-        && value > 0 ? 0 : store != NULL ? st_json_get_i64(store, "size_in_bytes", &value) : -1;
+    int rc = store == NULL ? -1
+        : st_json_get_i64(store, "total_data_set_size_in_bytes", &value) == 0 ? 0
+        : st_json_get_i64(store, "size_in_bytes", &value);
     free(store); free(total); free(entry); free(indices); free(response);
-    if (rc == 0) *bytes = value;
+    if (rc == 0) *bytes = value < 0 ? 0 : value;
     return rc;
 }
 
@@ -479,27 +599,282 @@ static int es_json_bool_field(st_es_buffer *json, const char *key, int value, in
     return es_json_key(json, key, first) == 0 && es_buffer_append(json, value ? "true" : "false") == 0 ? 0 : -1;
 }
 
-static int es_index_document(const st_es_config *config,
-                             const char *index,
-                             long long id,
-                             const char *document)
+/*
+ * The write queue of Java TrafficInspectionService: a captured exchange or frame is turned into its
+ * document on the capturing thread and queued; a background writer sends what is queued every
+ * SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS (2000) in _bulk batches of at most
+ * SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE (1000) per kind, then enforces the index size limit. A
+ * kind holding SPECUS_TRAFFIC_CAPTURE_MAX_PENDING (20000) documents drops the next one and counts
+ * it. The forwarding path therefore never waits for Elasticsearch.
+ */
+#define ST_ES_DEFAULT_MAX_PENDING 20000LL
+#define ST_ES_DEFAULT_FLUSH_BATCH 1000LL
+#define ST_ES_DEFAULT_FLUSH_INTERVAL_MS 2000LL
+/* Beyond Java's per-kind count: the queued documents of both kinds together stay under this. */
+#define ST_ES_MAX_PENDING_BYTES (256U * 1024U * 1024U)
+
+typedef struct es_pending_doc {
+    struct es_pending_doc *next;
+    long long id;
+    char *json;
+    size_t len;
+} es_pending_doc;
+
+typedef struct {
+    es_pending_doc *head;
+    es_pending_doc *tail;
+    int count;
+    long long dropped;
+} es_queue;
+
+static pthread_mutex_t es_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t es_queue_cond = PTHREAD_COND_INITIALIZER;
+static es_queue es_http_queue;
+static es_queue es_tcp_queue;
+static size_t es_pending_bytes = 0U;
+static int es_worker_running = 0;
+static int es_worker_stopping = 0;
+static pthread_t es_worker_thread;
+static char es_last_flushed_at[40];
+/* One flush at a time, so batches reach Elasticsearch in the order they were queued. */
+static pthread_mutex_t es_flush_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static long long es_env_number(const char *name, long long fallback, long long minimum)
 {
-    char path[384];
-    int written = snprintf(path, sizeof(path), "/%s/_doc/%lld", index, id);
-    if (written < 0 || (size_t)written >= sizeof(path)) return -1;
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') return fallback;
+    char *end = NULL;
+    errno = 0;
+    long long number = strtoll(value, &end, 10);
+    if (errno != 0 || end == value) return fallback;
+    while (isspace((unsigned char)*end)) ++end;
+    if (*end != '\0') return fallback;
+    return number < minimum ? minimum : number;
+}
+
+static void es_free_docs(es_pending_doc *doc)
+{
+    while (doc != NULL) {
+        es_pending_doc *next = doc->next;
+        free(doc->json);
+        free(doc);
+        doc = next;
+    }
+}
+
+static void *es_worker_main(void *arg);
+
+/* Takes json (heap, NUL-terminated) whatever the outcome. 0 = queued, -1 = dropped. */
+static int es_enqueue(es_queue *queue, long long id, char *json, size_t len)
+{
+    es_pending_doc *doc = (es_pending_doc *)calloc(1U, sizeof(*doc));
+    if (doc == NULL) {
+        free(json);
+        pthread_mutex_lock(&es_queue_lock);
+        ++queue->dropped;
+        pthread_mutex_unlock(&es_queue_lock);
+        return -1;
+    }
+    doc->id = id;
+    doc->json = json;
+    doc->len = len;
+    long long max_pending = es_env_number("SPECUS_TRAFFIC_CAPTURE_MAX_PENDING", ST_ES_DEFAULT_MAX_PENDING, 0);
+    pthread_mutex_lock(&es_queue_lock);
+    if (max_pending <= 0 || queue->count >= max_pending || es_worker_stopping
+        || len > ST_ES_MAX_PENDING_BYTES - es_pending_bytes) {
+        ++queue->dropped;
+        pthread_mutex_unlock(&es_queue_lock);
+        es_free_docs(doc);
+        return -1;
+    }
+    if (queue->tail == NULL) queue->head = doc;
+    else queue->tail->next = doc;
+    queue->tail = doc;
+    ++queue->count;
+    es_pending_bytes += len;
+    if (!es_worker_running) {
+        if (pthread_create(&es_worker_thread, NULL, es_worker_main, NULL) == 0) {
+            es_worker_running = 1;
+        } else {
+            fprintf(stderr, "Elasticsearch traffic writer failed to start\n");
+        }
+    }
+    pthread_mutex_unlock(&es_queue_lock);
+    return 0;
+}
+
+/* Up to batch documents from the head of the queue, in order (Java's drain). */
+static es_pending_doc *es_drain(es_queue *queue, long long batch, size_t *count)
+{
+    *count = 0U;
+    pthread_mutex_lock(&es_queue_lock);
+    es_pending_doc *first = queue->head;
+    es_pending_doc *last = NULL;
+    for (es_pending_doc *doc = first; doc != NULL && (long long)*count < batch; doc = doc->next) {
+        last = doc;
+        ++*count;
+        es_pending_bytes -= doc->len;
+    }
+    if (last != NULL) {
+        queue->head = last->next;
+        if (queue->head == NULL) queue->tail = NULL;
+        last->next = NULL;
+        queue->count -= (int)*count;
+    } else {
+        first = NULL;
+    }
+    pthread_mutex_unlock(&es_queue_lock);
+    return first;
+}
+
+/* One _bulk request for the drained documents, then the index size limit. */
+static void es_write_batch(int tcp, es_pending_doc *docs, size_t count)
+{
+    if (docs == NULL || count == 0U) return;
+    st_es_config config;
+    if (es_load_config(&config) != 0) {
+        es_free_docs(docs);
+        return;
+    }
+    const char *index = tcp ? config.tcp_index : config.http_index;
+    if (es_ensure_index(&config, index, tcp ? es_tcp_mapping : es_http_mapping,
+                        tcp ? NULL : es_http_body_mapping, tcp ? &es_tcp_ready : &es_http_ready) != 0) {
+        fprintf(stderr, "Elasticsearch %s traffic index %s unavailable; %zu document(s) not stored\n",
+                tcp ? "TCP" : "HTTP", index, count);
+        es_free_docs(docs);
+        return;
+    }
+    st_es_buffer body = {0};
+    int rc = 0;
+    for (es_pending_doc *doc = docs; rc == 0 && doc != NULL; doc = doc->next) {
+        rc = es_buffer_append(&body, "{\"index\":{\"_index\":")
+            || es_append_json_string(&body, index)
+            || es_buffer_appendf(&body, ",\"_id\":\"%lld\"}}\n", doc->id)
+            || es_buffer_append_n(&body, doc->json, doc->len)
+            || es_buffer_append(&body, "\n");
+    }
+    es_free_docs(docs);
     long status = 0;
     char *response = NULL;
-    int rc = es_request(config, "PUT", path, document, "application/json", &status, &response);
+    if (rc == 0) rc = es_request(&config, "POST", "/_bulk", body.data, "application/x-ndjson", &status, &response);
+    free(body.data);
+    int errors = 0;
+    if (rc == 0 && status >= 200 && status < 300 && response != NULL
+        && st_json_get_bool(response, "errors", &errors) == 0 && !errors) {
+        free(response);
+        es_trim_if_needed(&config, index, tcp ? config.tcp_max_bytes : config.http_max_bytes,
+                          tcp ? &es_tcp_last_trim_ms : &es_http_last_trim_ms);
+        return;
+    }
     free(response);
-    return rc == 0 && status >= 200 && status < 300 ? 0 : -1;
+    fprintf(stderr, "Elasticsearch %s traffic bulk write to %s failed (status %ld); %zu document(s) not stored\n",
+            tcp ? "TCP" : "HTTP", index, status, count);
 }
+
+static void es_mark_flushed(void)
+{
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0) return;
+    time_t seconds = now.tv_sec;
+    struct tm utc;
+    if (gmtime_r(&seconds, &utc) == NULL) return;
+    char stamp[40];
+    size_t len = strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", &utc);
+    if (len == 0U) return;
+    snprintf(stamp + len, sizeof(stamp) - len, ".%03ldZ", (long)(now.tv_usec / 1000));
+    pthread_mutex_lock(&es_queue_lock);
+    snprintf(es_last_flushed_at, sizeof(es_last_flushed_at), "%s", stamp);
+    pthread_mutex_unlock(&es_queue_lock);
+}
+
+/* Java flush(): one batch of each kind, then lastFlushedAt. */
+static void es_flush_once(void)
+{
+    long long batch = es_env_number("SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE", ST_ES_DEFAULT_FLUSH_BATCH, 1);
+    pthread_mutex_lock(&es_flush_lock);
+    size_t count = 0U;
+    es_pending_doc *docs = es_drain(&es_http_queue, batch, &count);
+    es_write_batch(0, docs, count);
+    docs = es_drain(&es_tcp_queue, batch, &count);
+    es_write_batch(1, docs, count);
+    es_mark_flushed();
+    pthread_mutex_unlock(&es_flush_lock);
+}
+
+static void *es_worker_main(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&es_queue_lock);
+    while (!es_worker_stopping) {
+        long long interval = es_env_number("SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS",
+                                           ST_ES_DEFAULT_FLUSH_INTERVAL_MS, 1);
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += (time_t)(interval / 1000LL);
+        deadline.tv_nsec += (long)(interval % 1000LL) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        int waited = 0;
+        while (!es_worker_stopping && waited == 0) {
+            waited = pthread_cond_timedwait(&es_queue_cond, &es_queue_lock, &deadline);
+        }
+        if (es_worker_stopping) break;
+        pthread_mutex_unlock(&es_queue_lock);
+        es_flush_once();
+        pthread_mutex_lock(&es_queue_lock);
+    }
+    pthread_mutex_unlock(&es_queue_lock);
+    return NULL;
+}
+
+void st_elasticsearch_traffic_flush(void)
+{
+    es_flush_once();
+}
+
+void st_elasticsearch_traffic_shutdown(void)
+{
+    pthread_mutex_lock(&es_queue_lock);
+    int running = es_worker_running;
+    es_worker_stopping = 1;
+    pthread_cond_broadcast(&es_queue_cond);
+    pthread_mutex_unlock(&es_queue_lock);
+    if (running) pthread_join(es_worker_thread, NULL);
+    /* Java flushes once before shutdown; C writes out everything still queued. */
+    for (;;) {
+        pthread_mutex_lock(&es_queue_lock);
+        int pending = es_http_queue.count + es_tcp_queue.count;
+        pthread_mutex_unlock(&es_queue_lock);
+        if (pending == 0) break;
+        es_flush_once();
+    }
+    pthread_mutex_lock(&es_queue_lock);
+    es_worker_running = 0;
+    es_worker_stopping = 0;
+    pthread_mutex_unlock(&es_queue_lock);
+}
+
+void st_elasticsearch_traffic_snapshot_current(st_elasticsearch_traffic_snapshot *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    pthread_mutex_lock(&es_queue_lock);
+    snapshot->pending_http = es_http_queue.count;
+    snapshot->pending_tcp = es_tcp_queue.count;
+    snapshot->dropped_http = es_http_queue.dropped;
+    snapshot->dropped_tcp = es_tcp_queue.dropped;
+    snprintf(snapshot->last_flushed_at, sizeof(snapshot->last_flushed_at), "%s", es_last_flushed_at);
+    pthread_mutex_unlock(&es_queue_lock);
+}
+
+static char *es_base64(const uint8_t *data, size_t len);
 
 int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
 {
     if (record == NULL || record->client_id <= 0 || record->client_name == NULL || record->route == NULL) return -1;
     st_es_config config;
-    if (es_load_config(&config) != 0
-        || es_ensure_index(&config, config.http_index, es_http_mapping, &es_http_ready) != 0) return -1;
+    if (es_load_config(&config) != 0) return -1;
     long long id = es_new_id();
     if (id <= 0) return -1;
     /* The same previews as the SQLite store (traffic_capture.c, Java TrafficInspectionService). */
@@ -516,6 +891,18 @@ int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
     st_traffic_http_text_preview(record->response_body, record->response_body_len, record->response_content_type,
                                  record->response_content_encoding, preview_bytes,
                                  response_text, sizeof(response_text));
+    /* The kept bodies as Java's binary requestBodyData/responseBodyData, base64 in the document. */
+    size_t request_kept = record->request_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+        ? record->request_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+    size_t response_kept = record->response_body_len < ST_TRAFFIC_BODY_CAPTURE_BYTES
+        ? record->response_body_len : ST_TRAFFIC_BODY_CAPTURE_BYTES;
+    char *request_data = request_kept == 0U ? NULL : es_base64(record->request_body, request_kept);
+    char *response_data = response_kept == 0U ? NULL : es_base64(record->response_body, response_kept);
+    if ((request_kept > 0U && request_data == NULL) || (response_kept > 0U && response_data == NULL)) {
+        free(request_data);
+        free(response_data);
+        return -1;
+    }
     st_es_buffer json = {0};
     int first = 1;
     int rc = es_buffer_append(&json, "{")
@@ -548,16 +935,18 @@ int st_elasticsearch_record_http(const st_storage_http_exchange_record *record)
         || es_json_string_field(&json, "requestPreviewText", request_text, &first)
         || es_json_string_field(&json, "responsePreviewHex", response_hex, &first)
         || es_json_string_field(&json, "responsePreviewText", response_text, &first)
-        || es_json_bool_field(&json, "requestTruncated", record->request_body_len > preview_bytes, &first)
-        || es_json_bool_field(&json, "responseTruncated", record->response_body_len > preview_bytes, &first)
+        || es_json_bool_field(&json, "requestTruncated",
+                              request_kept > 0U && record->request_bytes > (long long)request_kept, &first)
+        || es_json_bool_field(&json, "responseTruncated",
+                              response_kept > 0U && record->response_bytes > (long long)response_kept, &first)
         || es_json_string_field(&json, "capturedAt", record->captured_at, &first)
+        || es_json_string_field(&json, "requestBodyData", request_data, &first)
+        || es_json_string_field(&json, "responseBodyData", response_data, &first)
         || es_buffer_append(&json, "}");
+    free(request_data);
+    free(response_data);
     if (rc) { free(json.data); return -1; }
-    rc = es_index_document(&config, config.http_index, id, json.data);
-    free(json.data);
-    if (rc == 0) es_trim_if_needed(&config, config.http_index, config.http_max_bytes,
-                                   &es_http_last_trim_ms);
-    return rc;
+    return es_enqueue(&es_http_queue, id, json.data, json.len);
 }
 
 static char *es_base64(const uint8_t *data, size_t len)
@@ -578,8 +967,7 @@ int st_elasticsearch_record_tcp(const st_storage_tcp_frame_record *record)
     if (record == NULL || record->client_id <= 0 || record->client_name == NULL
         || record->channel_id == NULL || record->direction == NULL) return -1;
     st_es_config config;
-    if (es_load_config(&config) != 0
-        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, &es_tcp_ready) != 0) return -1;
+    if (es_load_config(&config) != 0) return -1;
     long long id = es_new_id();
     char *payload = es_base64(record->payload_data, record->payload_data_len);
     if (id <= 0 || payload == NULL) { free(payload); return -1; }
@@ -621,11 +1009,7 @@ int st_elasticsearch_record_tcp(const st_storage_tcp_frame_record *record)
         || es_buffer_append(&json, "}");
     free(payload);
     if (rc) { free(json.data); return -1; }
-    rc = es_index_document(&config, config.tcp_index, id, json.data);
-    free(json.data);
-    if (rc == 0) es_trim_if_needed(&config, config.tcp_index, config.tcp_max_bytes,
-                                   &es_tcp_last_trim_ms);
-    return rc;
+    return es_enqueue(&es_tcp_queue, id, json.data, json.len);
 }
 
 static int es_visible_client_ids(const char *database_path,
@@ -699,13 +1083,26 @@ static int es_append_term_i64(st_es_buffer *json, const char *field, long long v
         || es_buffer_appendf(json, ":%lld}}", value) ? -1 : 0;
 }
 
-static int es_append_client_filter(st_es_buffer *json,
+/*
+ * The tenant, then which clients: one client when the caller names one it may see, the caller's
+ * visible clients otherwise, and no client filter for an administrator, who sees the whole tenant
+ * (Java passes visibleClientIds = null for an administrator), deleted clients' traffic included.
+ */
+static int es_append_scope_filters(st_es_buffer *json,
+                                   const char *tenant_id,
+                                   int all_clients,
                                    const long long *ids,
                                    size_t id_count,
                                    long long client_id)
 {
-    if (client_id > 0) return es_append_term_i64(json, "clientId", client_id);
-    if (es_buffer_append(json, "{\"terms\":{\"clientId\":[") != 0) return -1;
+    if (es_append_term_string(json, "tenantId", tenant_id == NULL || *tenant_id == '\0' ? "default" : tenant_id) != 0) {
+        return -1;
+    }
+    if (client_id > 0) {
+        return es_buffer_append(json, ",") || es_append_term_i64(json, "clientId", client_id) ? -1 : 0;
+    }
+    if (all_clients) return 0;
+    if (es_buffer_append(json, ",{\"terms\":{\"clientId\":[") != 0) return -1;
     for (size_t i = 0; i < id_count; ++i) {
         if ((i > 0U && es_buffer_append(json, ",") != 0)
             || es_buffer_appendf(json, "%lld", ids[i]) != 0) return -1;
@@ -713,80 +1110,334 @@ static int es_append_client_filter(st_es_buffer *json,
     return es_buffer_append(json, "]}}") == 0 ? 0 : -1;
 }
 
-static const char *es_http_search_fields(const char *field)
+/* Java HttpTrafficSearchField: which fields one keyword token is looked for in. */
+typedef struct {
+    const char *code;
+    const char *name;
+    const char *const *text_fields;
+    const char *const *keyword_fields;
+    int search_id;
+    int search_client_id;
+    int search_status_code;
+    int search_resource_id;
+} es_search_field;
+
+static const char *const es_no_fields[] = {NULL};
+static const char *const es_summary_text[] = {"resourceName", "relativePath", "rawQuery", "error", NULL};
+static const char *const es_summary_keyword[] = {
+    "clientName", "route", "method", "remoteAddress",
+    "requestContentType", "responseContentType", "responseBodyType", "capturedAt", NULL
+};
+static const char *const es_all_text[] = {
+    "resourceName", "relativePath", "rawQuery", "error",
+    "requestHeaders", "responseHeaders", "requestPreviewText", "responsePreviewText", NULL
+};
+static const char *const es_method_keyword[] = {"method", NULL};
+static const char *const es_path_text[] = {"relativePath", "rawQuery", NULL};
+static const char *const es_route_keyword[] = {"route", NULL};
+static const char *const es_client_keyword[] = {"clientName", NULL};
+static const char *const es_resource_text[] = {"resourceName", NULL};
+static const char *const es_remote_keyword[] = {"remoteAddress", NULL};
+static const char *const es_content_type_keyword[] = {
+    "requestContentType", "responseContentType", "responseBodyType", NULL
+};
+static const char *const es_error_text[] = {"error", NULL};
+static const char *const es_request_headers_text[] = {"requestHeaders", NULL};
+static const char *const es_response_headers_text[] = {"responseHeaders", NULL};
+static const char *const es_request_body_text[] = {"requestPreviewText", NULL};
+static const char *const es_response_body_text[] = {"responsePreviewText", NULL};
+
+static const es_search_field es_search_fields[] = {
+    {"summary", "SUMMARY", es_summary_text, es_summary_keyword, 1, 1, 1, 0},
+    {"all", "ALL", es_all_text, es_summary_keyword, 1, 1, 1, 1},
+    {"id", "ID", es_no_fields, es_no_fields, 1, 0, 0, 0},
+    {"method", "METHOD", es_no_fields, es_method_keyword, 0, 0, 0, 0},
+    {"status", "STATUS", es_no_fields, es_no_fields, 0, 0, 1, 0},
+    {"path", "PATH", es_path_text, es_no_fields, 0, 0, 0, 0},
+    {"route", "ROUTE", es_no_fields, es_route_keyword, 0, 0, 0, 0},
+    {"client", "CLIENT", es_no_fields, es_client_keyword, 0, 1, 0, 0},
+    {"resource", "RESOURCE", es_resource_text, es_no_fields, 0, 0, 0, 1},
+    {"remote", "REMOTE", es_no_fields, es_remote_keyword, 0, 0, 0, 0},
+    {"contentType", "CONTENT_TYPE", es_no_fields, es_content_type_keyword, 0, 0, 0, 0},
+    {"error", "ERROR", es_error_text, es_no_fields, 0, 0, 0, 0},
+    {"requestHeaders", "REQUEST_HEADERS", es_request_headers_text, es_no_fields, 0, 0, 0, 0},
+    {"responseHeaders", "RESPONSE_HEADERS", es_response_headers_text, es_no_fields, 0, 0, 0, 0},
+    {"requestBody", "REQUEST_BODY", es_request_body_text, es_no_fields, 0, 0, 0, 0},
+    {"responseBody", "RESPONSE_BODY", es_response_body_text, es_no_fields, 0, 0, 0, 0},
+};
+
+/* HttpTrafficSearchField.fromCode: the code or the constant name, any case; anything else is summary. */
+static const es_search_field *es_search_field_from_code(const char *code)
 {
-    if (field == NULL || *field == '\0')
-        return "[\"clientName\",\"route\",\"method\",\"resourceName\",\"relativePath\",\"rawQuery\",\"error\",\"remoteAddress\"]";
-    char normalized[64];
-    size_t offset = 0U;
-    for (const unsigned char *cursor = (const unsigned char *)field; *cursor != '\0' && offset + 1U < sizeof(normalized); ++cursor)
-        if (*cursor != '_' && *cursor != '-') normalized[offset++] = (char)tolower(*cursor);
-    normalized[offset] = '\0';
-    if (strcmp(normalized, "method") == 0) return "[\"method\"]";
-    if (strcmp(normalized, "route") == 0) return "[\"route\"]";
-    if (strcmp(normalized, "path") == 0 || strcmp(normalized, "relativepath") == 0)
-        return "[\"relativePath\",\"rawQuery\"]";
-    if (strcmp(normalized, "query") == 0 || strcmp(normalized, "rawquery") == 0) return "[\"rawQuery\"]";
-    if (strncmp(normalized, "client", 6U) == 0) return "[\"clientName\"]";
-    if (strncmp(normalized, "resource", 8U) == 0) return "[\"resourceName\"]";
-    if (strncmp(normalized, "remote", 6U) == 0) return "[\"remoteAddress\"]";
-    if (strcmp(normalized, "error") == 0) return "[\"error\"]";
-    if (strcmp(normalized, "requestheaders") == 0) return "[\"requestHeaders\"]";
-    if (strcmp(normalized, "responseheaders") == 0) return "[\"responseHeaders\"]";
-    if (strcmp(normalized, "headers") == 0) return "[\"requestHeaders\",\"responseHeaders\"]";
-    if (strcmp(normalized, "requestbody") == 0) return "[\"requestPreviewText\"]";
-    if (strcmp(normalized, "responsebody") == 0) return "[\"responsePreviewText\"]";
-    if (strcmp(normalized, "body") == 0) return "[\"requestPreviewText\",\"responsePreviewText\"]";
-    return "[\"clientName\",\"route\",\"method\",\"resourceName\",\"relativePath\",\"rawQuery\",\"error\",\"remoteAddress\"]";
+    char trimmed[64];
+    if (code == NULL || es_copy_trimmed(trimmed, sizeof(trimmed), code) != 0 || trimmed[0] == '\0') {
+        return &es_search_fields[0];
+    }
+    for (size_t i = 0; i < sizeof(es_search_fields) / sizeof(es_search_fields[0]); ++i) {
+        if (strcasecmp(trimmed, es_search_fields[i].code) == 0 || strcasecmp(trimmed, es_search_fields[i].name) == 0) {
+            return &es_search_fields[i];
+        }
+    }
+    return &es_search_fields[0];
 }
 
-static int es_build_query(st_es_buffer *json,
-                          const char *tenant_id,
-                          const long long *visible_ids,
-                          size_t visible_count,
-                          long long client_id,
-                          const char *route,
-                          const char *body_type,
-                          int listen_port,
-                          const char *channel_id,
-                          long long document_id,
-                          const char *field,
-                          const char *query,
-                          int page,
-                          int size,
-                          int tcp,
-                          int stream)
+/* Java Long.parseLong: an optional sign and decimal digits only, within 64 bits. */
+static int es_parse_long(const char *value, long long *out)
+{
+    const char *digits = value;
+    if (*digits == '+' || *digits == '-') ++digits;
+    if (*digits == '\0') return 0;
+    for (const char *cursor = digits; *cursor != '\0'; ++cursor) {
+        if (*cursor < '0' || *cursor > '9') return 0;
+    }
+    errno = 0;
+    char *end = NULL;
+    long long number = strtoll(value, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0') return 0;
+    *out = number;
+    return 1;
+}
+
+static size_t es_field_count(const char *const *fields)
+{
+    size_t count = 0U;
+    while (fields[count] != NULL) ++count;
+    return count;
+}
+
+/* A case-insensitive *value* wildcard; \, * and ? in value are taken literally. */
+static int es_append_wildcard(st_es_buffer *json, const char *field, const char *value)
+{
+    st_es_buffer pattern = {0};
+    int rc = es_buffer_append(&pattern, "*");
+    for (const char *cursor = value; rc == 0 && *cursor != '\0'; ++cursor) {
+        if (*cursor == '\\' || *cursor == '*' || *cursor == '?') rc = es_buffer_append(&pattern, "\\");
+        if (rc == 0) rc = es_buffer_append_n(&pattern, cursor, 1U);
+    }
+    if (rc == 0) rc = es_buffer_append(&pattern, "*");
+    if (rc == 0) {
+        rc = es_buffer_append(json, "{\"wildcard\":{")
+            || es_append_json_string(json, field)
+            || es_buffer_append(json, ":{\"value\":")
+            || es_append_json_string(json, pattern.data)
+            || es_buffer_append(json, ",\"case_insensitive\":true}}}");
+    }
+    free(pattern.data);
+    return rc ? -1 : 0;
+}
+
+static int es_append_field_array(st_es_buffer *json, const char *const *fields)
+{
+    if (es_buffer_append(json, "[") != 0) return -1;
+    for (size_t i = 0; fields[i] != NULL; ++i) {
+        if ((i > 0U && es_buffer_append(json, ",") != 0) || es_append_json_string(json, fields[i]) != 0) return -1;
+    }
+    return es_buffer_append(json, "]");
+}
+
+/* The query that matches no document, as Java's noMatch(). */
+static int es_append_no_match(st_es_buffer *json)
+{
+    return es_append_term_string(json, "_id", "__specus_no_match__");
+}
+
+/* Java keywordTokenQuery: one whitespace separated token of the search text. */
+static int es_append_token_query(st_es_buffer *json, const es_search_field *field, const char *token)
+{
+    if (strcmp(field->code, "method") == 0) {
+        char upper[256];
+        size_t len = strlen(token);
+        if (len >= sizeof(upper)) return es_append_no_match(json);
+        for (size_t i = 0; i <= len; ++i) upper[i] = (char)toupper((unsigned char)token[i]);
+        return es_append_term_string(json, "method", upper);
+    }
+    long long number = 0;
+    int numeric = es_parse_long(token, &number);
+    size_t text_count = es_field_count(field->text_fields);
+    size_t keyword_count = es_field_count(field->keyword_fields);
+    if (text_count == 0U && keyword_count == 0U && !numeric) return es_append_no_match(json);
+    int first = 1;
+    int rc = es_buffer_append(json, "{\"bool\":{\"should\":[");
+    if (rc == 0 && text_count > 0U) {
+        rc = es_buffer_append(json, "{\"multi_match\":{\"query\":")
+            || es_append_json_string(json, token)
+            || es_buffer_append(json, ",\"fields\":")
+            || es_append_field_array(json, field->text_fields)
+            || es_buffer_append(json, "}}");
+        first = 0;
+    }
+    for (size_t i = 0; rc == 0 && i < keyword_count; ++i) {
+        rc = (!first && es_buffer_append(json, ",") != 0) || es_append_wildcard(json, field->keyword_fields[i], token);
+        first = 0;
+    }
+    if (rc == 0 && numeric) {
+        static const char *const numeric_fields[] = {"id", "clientId", "statusCode", "resourceId"};
+        int wanted[] = {
+            field->search_id,
+            field->search_client_id,
+            field->search_status_code && number >= INT_MIN && number <= INT_MAX,
+            field->search_resource_id
+        };
+        for (size_t i = 0; rc == 0 && i < 4U; ++i) {
+            if (!wanted[i]) continue;
+            rc = (!first && es_buffer_append(json, ",") != 0) || es_append_term_i64(json, numeric_fields[i], number);
+            first = 0;
+        }
+    }
+    if (rc == 0) rc = es_buffer_append(json, "],\"minimum_should_match\":\"1\"}}");
+    return rc ? -1 : 0;
+}
+
+/* Java responseContentTypePatterns: the media types a body type also matches by Content-Type. */
+static const char *const *es_body_type_patterns(const char *body_type)
+{
+    static const char *const json_patterns[] = {"application/json", "+json", NULL};
+    static const char *const html_patterns[] = {"text/html", NULL};
+    static const char *const xml_patterns[] = {"application/xml", "text/xml", "+xml", NULL};
+    static const char *const image_patterns[] = {"image/", NULL};
+    static const char *const video_patterns[] = {"video/", NULL};
+    static const char *const audio_patterns[] = {"audio/", NULL};
+    static const char *const form_patterns[] = {"application/x-www-form-urlencoded", "multipart/form-data", NULL};
+    static const char *const script_patterns[] = {"javascript", "ecmascript", NULL};
+    static const char *const text_patterns[] = {"text/", NULL};
+    static const char *const binary_patterns[] = {
+        "application/octet-stream", "application/pdf", "application/zip", "application/x-", "application/vnd.", NULL
+    };
+    static const struct {
+        const char *type;
+        const char *const *patterns;
+    } table[] = {
+        {"json", json_patterns}, {"html", html_patterns}, {"xml", xml_patterns}, {"image", image_patterns},
+        {"video", video_patterns}, {"audio", audio_patterns}, {"form", form_patterns},
+        {"script", script_patterns}, {"text", text_patterns}, {"binary", binary_patterns},
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
+        if (strcmp(table[i].type, body_type) == 0) return table[i].patterns;
+    }
+    return es_no_fields;
+}
+
+/* Java responseBodyTypeQuery: the stored type, or an empty body, or a matching Content-Type. */
+static int es_append_body_type_query(st_es_buffer *json, const char *body_type)
+{
+    int rc = es_buffer_append(json, "{\"bool\":{\"should\":[")
+        || es_append_term_string(json, "responseBodyType", body_type);
+    if (rc == 0 && strcmp(body_type, "empty") == 0) {
+        rc = es_buffer_append(json, ",") || es_append_term_i64(json, "responseBytes", 0);
+    } else {
+        const char *const *patterns = es_body_type_patterns(body_type);
+        for (size_t i = 0; rc == 0 && patterns[i] != NULL; ++i) {
+            rc = es_buffer_append(json, ",") || es_append_wildcard(json, "responseContentType", patterns[i]);
+        }
+    }
+    if (rc == 0) rc = es_buffer_append(json, "],\"minimum_should_match\":\"1\"}}");
+    return rc ? -1 : 0;
+}
+
+/* Java exactText: a channel id matched as a keyword, a .keyword sub-field or a phrase. */
+static int es_append_exact_text(st_es_buffer *json, const char *field, const char *value)
+{
+    char keyword_field[128];
+    snprintf(keyword_field, sizeof(keyword_field), "%s.keyword", field);
+    return es_buffer_append(json, "{\"bool\":{\"minimum_should_match\":\"1\",\"should\":[")
+        || es_append_term_string(json, field, value)
+        || es_buffer_append(json, ",")
+        || es_append_term_string(json, keyword_field, value)
+        || es_buffer_append(json, ",{\"match_phrase\":{")
+        || es_append_json_string(json, field)
+        || es_buffer_append(json, ":{\"query\":")
+        || es_append_json_string(json, value)
+        || es_buffer_append(json, "}}}]}}") ? -1 : 0;
+}
+
+/* The search of Java SpringDataElasticsearchHttpTrafficExchangeStore: summary page or one detail. */
+static int es_build_http_query(st_es_buffer *json,
+                               const char *tenant_id,
+                               int all_clients,
+                               const long long *visible_ids,
+                               size_t visible_count,
+                               long long client_id,
+                               long long document_id,
+                               const char *route,
+                               const char *body_type,
+                               const char *field_code,
+                               const char *query,
+                               long long from,
+                               int size)
 {
     int rc = es_buffer_append(json, "{\"query\":{\"bool\":{\"filter\":[")
-        || es_append_term_string(json, "tenantId", tenant_id == NULL || *tenant_id == '\0' ? "default" : tenant_id)
-        || es_buffer_append(json, ",")
-        || es_append_client_filter(json, visible_ids, visible_count, client_id);
-    if (!rc && route != NULL && *route != '\0') rc = es_buffer_append(json, ",") || es_append_term_string(json, "route", route);
-    if (!rc && body_type != NULL && *body_type != '\0') rc = es_buffer_append(json, ",") || es_append_term_string(json, "responseBodyType", body_type);
-    if (!rc && listen_port > 0) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "listenPort", listen_port);
-    if (!rc && channel_id != NULL && *channel_id != '\0') rc = es_buffer_append(json, ",") || es_append_term_string(json, "channelId", channel_id);
-    if (!rc && document_id > 0) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "id", document_id);
-    if (!rc) rc = es_buffer_append(json, "]");
-    if (!rc && query != NULL && *query != '\0') {
-        rc = es_buffer_append(json, ",\"must\":[{\"simple_query_string\":{\"query\":")
-            || es_append_json_string(json, query)
-            || es_buffer_append(json, ",\"fields\":")
-            || es_buffer_append(json, es_http_search_fields(field))
-            || es_buffer_append(json, ",\"default_operator\":\"and\"}}]");
+        || es_append_scope_filters(json, tenant_id, all_clients, visible_ids, visible_count,
+                                   document_id > 0 ? 0 : client_id);
+    if (rc == 0 && document_id > 0) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "id", document_id);
+    char trimmed_route[512];
+    if (rc == 0 && route != NULL && es_copy_trimmed(trimmed_route, sizeof(trimmed_route), route) == 0
+        && trimmed_route[0] != '\0') {
+        rc = es_buffer_append(json, ",") || es_append_term_string(json, "route", trimmed_route);
     }
-    if (!rc) rc = es_buffer_append(json, "}},\"from\":")
-        || es_buffer_appendf(json, "%d,\"size\":%d,\"sort\":[", page * size, size);
-    if (!rc) {
-        if (tcp && stream) rc = es_buffer_append(json,
-            "{\"frameIndex\":{\"order\":\"asc\"}},{\"id\":{\"order\":\"asc\"}}]");
-        else rc = es_buffer_append(json, "{\"id\":{\"order\":\"desc\"}}]");
+    const char *normalized_type = st_traffic_body_type_normalize(body_type);
+    if (rc == 0 && normalized_type != NULL) {
+        rc = es_buffer_append(json, ",") || es_append_body_type_query(json, normalized_type);
+    }
+    if (rc == 0) rc = es_buffer_append(json, "]");
+    if (rc == 0 && query != NULL) {
+        const es_search_field *field = es_search_field_from_code(field_code);
+        char *copy = strdup(query);
+        if (copy == NULL) return -1;
+        int tokens = 0;
+        char *save = NULL;
+        for (char *token = strtok_r(copy, " \t\n\v\f\r", &save); rc == 0 && token != NULL;
+             token = strtok_r(NULL, " \t\n\v\f\r", &save)) {
+            rc = es_buffer_append(json, tokens == 0 ? ",\"must\":[" : ",")
+                || es_append_token_query(json, field, token);
+            ++tokens;
+        }
+        if (rc == 0 && tokens > 0) rc = es_buffer_append(json, "]");
+        free(copy);
+    }
+    if (rc == 0) rc = es_buffer_append(json, "}}");
+    if (rc == 0 && document_id > 0) {
+        rc = es_buffer_append(json, ",\"from\":0,\"size\":1}");
+        return rc ? -1 : 0;
     }
     /* A summary (Java summarySourceFilter) leaves the large fields out; one exchange by id is a
      * detail and reads them. */
-    if (!rc && !tcp && document_id <= 0) rc = es_buffer_append(json,
-        ",\"_source\":{\"excludes\":[\"requestHeaders\",\"responseHeaders\","
-        "\"requestPreviewHex\",\"requestPreviewText\",\"responsePreviewHex\",\"responsePreviewText\"]}");
-    if (!rc) rc = es_buffer_append(json, "}");
+    if (rc == 0) {
+        rc = es_buffer_appendf(json, ",\"from\":%lld,\"size\":%d,\"sort\":[{\"id\":{\"order\":\"desc\"}}]", from, size)
+            || es_buffer_append(json,
+                                ",\"_source\":{\"excludes\":[\"requestHeaders\",\"responseHeaders\","
+                                "\"requestPreviewHex\",\"requestPreviewText\",\"responsePreviewHex\","
+                                "\"responsePreviewText\",\"requestBodyData\",\"responseBodyData\"]}}");
+    }
+    return rc ? -1 : 0;
+}
+
+/*
+ * The searches of Java SpringDataElasticsearchTcpTrafficFrameStore: a page of frames (newest first,
+ * by client and listen port), one frame by id, or one channel's frames in capture order.
+ */
+static int es_build_tcp_query(st_es_buffer *json,
+                              const char *tenant_id,
+                              int all_clients,
+                              const long long *visible_ids,
+                              size_t visible_count,
+                              long long client_id,
+                              int listen_port,
+                              const char *channel_id,
+                              long long document_id,
+                              long long from,
+                              int size)
+{
+    int rc = es_buffer_append(json, "{\"query\":{\"bool\":{\"filter\":[")
+        || es_append_scope_filters(json, tenant_id, all_clients, visible_ids, visible_count, client_id);
+    if (rc == 0 && document_id > 0) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "id", document_id);
+    if (rc == 0 && listen_port != ST_STORAGE_ANY_LISTEN_PORT) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "listenPort", listen_port);
+    if (rc == 0 && channel_id != NULL) rc = es_buffer_append(json, ",") || es_append_exact_text(json, "channelId", channel_id);
+    if (rc == 0) rc = es_buffer_append(json, "]}}");
+    if (rc == 0 && document_id > 0) return es_buffer_append(json, ",\"from\":0,\"size\":1}") ? -1 : 0;
+    if (rc == 0) {
+        rc = es_buffer_appendf(json, ",\"from\":%lld,\"size\":%d,\"sort\":[{\"id\":{\"order\":\"%s\"}}]}",
+                               from, size, channel_id != NULL ? "asc" : "desc");
+    }
     return rc ? -1 : 0;
 }
 
@@ -881,6 +1532,27 @@ static uint8_t *es_decode_base64(const char *value, size_t *out_len)
     return out;
 }
 
+/* The stored bodies of one exchange, read for its detail only. */
+static int es_parse_http_bodies(const char *source, st_storage_http_exchange *item)
+{
+    static const char *const fields[] = {"requestBodyData", "responseBodyData"};
+    uint8_t **data[] = {&item->request_body_data, &item->response_body_data};
+    size_t *lengths[] = {&item->request_body_data_len, &item->response_body_data_len};
+    for (size_t i = 0; i < 2U; ++i) {
+        char *encoded = st_json_get_top_level_string(source, fields[i]);
+        if (encoded != NULL && *encoded != '\0') {
+            *data[i] = es_decode_base64(encoded, lengths[i]);
+            if (*data[i] == NULL) {
+                free(encoded);
+                st_storage_http_exchange_free_bodies(item);
+                return -1;
+            }
+        }
+        free(encoded);
+    }
+    return 0;
+}
+
 static int es_parse_tcp_source(const char *source, st_storage_tcp_frame *item, int include_payload)
 {
     memset(item, 0, sizeof(*item));
@@ -924,6 +1596,34 @@ static int es_parse_hit_source(const char *hit, char **source)
     return *source != NULL && st_json_is_valid_object(*source) ? 0 : -1;
 }
 
+/*
+ * Who may see what, as Java TrafficViewService.visibleClientIds: an administrator the whole tenant
+ * (no client lookup at all), anyone else the clients it owns. *denied is set when nothing can
+ * match: no visible client, or a named client outside them.
+ */
+static int es_visible_scope(const char *database_path,
+                            const char *tenant_id,
+                            const char *owner_username,
+                            int all_clients,
+                            long long client_id,
+                            long long **visible,
+                            size_t *visible_count,
+                            int *denied)
+{
+    *visible = NULL;
+    *visible_count = 0U;
+    *denied = 0;
+    if (all_clients) return 0;
+    if (es_visible_client_ids(database_path, tenant_id, owner_username, 0, visible, visible_count) != 0) return -1;
+    if (*visible_count == 0U || (client_id > 0 && !es_contains_id(*visible, *visible_count, client_id))) {
+        free(*visible);
+        *visible = NULL;
+        *visible_count = 0U;
+        *denied = 1;
+    }
+    return 0;
+}
+
 static int es_query_http(const char *database_path,
                          long long document_id,
                          long long client_id,
@@ -949,20 +1649,19 @@ static int es_query_http(const char *database_path,
     if ((size_t)size > max_items) size = (int)max_items;
     long long *visible = NULL;
     size_t visible_count = 0U;
-    if (es_visible_client_ids(database_path, tenant_id, owner_username, include_all_clients,
-                              &visible, &visible_count) != 0) return -1;
-    if (visible_count == 0U || (client_id > 0 && !es_contains_id(visible, visible_count, client_id))) {
-        free(visible);
-        return 0;
-    }
+    int denied = 0;
+    if (es_visible_scope(database_path, tenant_id, owner_username, include_all_clients,
+                         document_id > 0 ? 0 : client_id, &visible, &visible_count, &denied) != 0) return -1;
+    if (denied) return 0;
     st_es_config config;
     if (es_load_config(&config) != 0
-        || es_ensure_index(&config, config.http_index, es_http_mapping, &es_http_ready) != 0) {
+        || es_ensure_index(&config, config.http_index, es_http_mapping, es_http_body_mapping, &es_http_ready) != 0) {
         free(visible); return -1;
     }
     st_es_buffer request = {0};
-    if (es_build_query(&request, tenant_id, visible, visible_count, client_id, route,
-                       response_body_type, 0, NULL, document_id, field, query, page, size, 0, 0) != 0) {
+    if (es_build_http_query(&request, tenant_id, include_all_clients, visible, visible_count, client_id,
+                            document_id, route, response_body_type, field, query,
+                            (long long)page * (long long)size, size) != 0) {
         free(visible); free(request.data); return -1;
     }
     free(visible);
@@ -978,7 +1677,8 @@ static int es_query_http(const char *database_path,
     for (size_t i = 0; i < hit_count; ++i) {
         char *source = NULL;
         if (es_parse_hit_source(hits[i], &source) != 0
-            || es_parse_http_source(source, &items[*item_count]) != 0) {
+            || es_parse_http_source(source, &items[*item_count]) != 0
+            || (document_id > 0 && es_parse_http_bodies(source, &items[*item_count]) != 0)) {
             free(source); st_json_free_string_array(hits, hit_count); return -1;
         }
         free(source);
@@ -1038,7 +1738,6 @@ static int es_list_tcp_internal(const char *database_path,
                                 int page,
                                 int size,
                                 int include_payload,
-                                int stream,
                                 st_storage_tcp_frame *items,
                                 size_t max_items,
                                 size_t *item_count,
@@ -1052,20 +1751,18 @@ static int es_list_tcp_internal(const char *database_path,
     if ((size_t)size > max_items) size = (int)max_items;
     long long *visible = NULL;
     size_t visible_count = 0U;
-    if (es_visible_client_ids(database_path, tenant_id, owner_username, include_all_clients,
-                              &visible, &visible_count) != 0) return -1;
-    if (visible_count == 0U || (client_id > 0 && !es_contains_id(visible, visible_count, client_id))) {
-        free(visible);
-        return document_id > 0 ? -1 : 0;
-    }
+    int denied = 0;
+    if (es_visible_scope(database_path, tenant_id, owner_username, include_all_clients, client_id,
+                         &visible, &visible_count, &denied) != 0) return -1;
+    if (denied) return document_id > 0 ? -1 : 0;
     st_es_config config;
     if (es_load_config(&config) != 0
-        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, &es_tcp_ready) != 0) {
+        || es_ensure_index(&config, config.tcp_index, es_tcp_mapping, NULL, &es_tcp_ready) != 0) {
         free(visible); return -1;
     }
     st_es_buffer request = {0};
-    if (es_build_query(&request, tenant_id, visible, visible_count, client_id, NULL, NULL,
-                       listen_port, channel_id, document_id, NULL, NULL, page, size, 1, stream) != 0) {
+    if (es_build_tcp_query(&request, tenant_id, include_all_clients, visible, visible_count, client_id,
+                           listen_port, channel_id, document_id, (long long)page * (long long)size, size) != 0) {
         free(visible); free(request.data); return -1;
     }
     free(visible);
@@ -1112,7 +1809,7 @@ int st_elasticsearch_list_tcp(const char *database_path,
 {
     return es_list_tcp_internal(database_path, client_id, listen_port, NULL, 0,
                                 tenant_id, owner_username, include_all_clients, page, size,
-                                0, 0, items, max_items, item_count, total_count);
+                                0, items, max_items, item_count, total_count);
 }
 
 int st_elasticsearch_get_tcp(const char *database_path,
@@ -1125,9 +1822,9 @@ int st_elasticsearch_get_tcp(const char *database_path,
     if (frame == NULL || id <= 0) return -1;
     size_t count = 0U;
     long long total = 0;
-    int rc = es_list_tcp_internal(database_path, 0, 0, NULL, id,
+    int rc = es_list_tcp_internal(database_path, 0, ST_STORAGE_ANY_LISTEN_PORT, NULL, id,
                                   tenant_id, owner_username, include_all_clients, 0, 1,
-                                  1, 0, frame, 1U, &count, &total);
+                                  1, frame, 1U, &count, &total);
     return rc == 0 && count == 1U ? 0 : -1;
 }
 
@@ -1136,15 +1833,21 @@ int st_elasticsearch_list_tcp_stream(const char *database_path,
                                      const char *tenant_id,
                                      const char *owner_username,
                                      int include_all_clients,
-                                     int limit,
+                                     int page,
+                                     int size,
                                      st_storage_tcp_frame *items,
                                      size_t max_items,
-                                     size_t *item_count)
+                                     size_t *item_count,
+                                     long long *total_count)
 {
-    if (channel_id == NULL || *channel_id == '\0') { *item_count = 0U; return 0; }
-    if (limit <= 0 || limit > 1000) limit = 500;
-    long long total = 0;
-    return es_list_tcp_internal(database_path, 0, 0, channel_id, 0,
-                                tenant_id, owner_username, include_all_clients, 0, limit,
-                                1, 1, items, max_items, item_count, &total);
+    *item_count = 0U;
+    *total_count = 0;
+    char trimmed[256];
+    /* Java findStream: a blank channel id is an empty page. */
+    if (channel_id == NULL || es_copy_trimmed(trimmed, sizeof(trimmed), channel_id) != 0 || trimmed[0] == '\0') {
+        return 0;
+    }
+    return es_list_tcp_internal(database_path, 0, ST_STORAGE_ANY_LISTEN_PORT, trimmed, 0,
+                                tenant_id, owner_username, include_all_clients, page, size,
+                                1, items, max_items, item_count, total_count);
 }

@@ -33,7 +33,7 @@ func TestPeerEgressRoutesAnswerRefusalsWithTheirStatus(t *testing.T) {
 		{Username: "bob", TenantID: "tenant-a", Role: store.ManagementRoleUser},
 	} {
 		user.PasswordHash, user.Enabled, user.CreatedAt, user.UpdatedAt = "test-password-hash", true, now, now
-		if err := db.InsertManagementUser(ctx, user); err != nil {
+		if _, err := db.InsertManagementUser(ctx, user); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -209,7 +209,7 @@ class PeerEgressDomainPolicyVectorTests {
                     reader -> {
                     },
                     () -> EPOCH);
-            runtime.resolve = name -> List.of(address(resolvesTo));
+            runtime.resolve = name -> List.of(resolvesTo);
         }
 
         List<String> rejectCodes() {

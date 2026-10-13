@@ -121,8 +121,8 @@ internal static class EgressEdit
     internal static string Explanation(string code) => code switch
     {
         PeerEgressCodes.RuleDomainUnsupported => "domain rules are not supported yet; use an IPv4 address or CIDR range",
-        PeerEgressCodes.RuleIpv6Unsupported => "IPv6 rules are not supported; use an IPv4 address or CIDR range",
-        PeerEgressCodes.RuleMalformed => "not an IPv4 address or CIDR range with zero host bits, or an unknown action",
+        PeerEgressCodes.RuleIpv6Unsupported => "IPv6 rules are not in force yet: this client cannot carry IPv6 traffic",
+        PeerEgressCodes.RuleMalformed => "not an IPv4 or IPv6 address or CIDR range with zero host bits (IPv4-mapped IPv6 is written as IPv4), or an unknown action",
         PeerEgressCodes.RuleDefaultRoute => "0.0.0.0/0 would take over the default route, which is not allowed",
         PeerEgressCodes.RuleMeshOverlap => "overlaps the Peer Mesh network",
         PeerEgressCodes.RuleFakeIpOverlap => "overlaps the fake-IP pool (peerEgressFakeIpCidr), whose addresses only domain rules hand out",

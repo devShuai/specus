@@ -55,8 +55,8 @@ public sealed class HttpRouteLifecycleVectorTests
         var ids = ScenarioIdList();
         Assert.Equal(ids.Count, ScenarioIds().Count);
         Assert.Equal(ids.Count, ids.Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(7, scenarios.Count);
-        Assert.Equal(46, scenarios.Sum(scenario => scenario.GetProperty("steps").GetArrayLength()));
+        Assert.Equal(9, scenarios.Count);
+        Assert.Equal(61, scenarios.Sum(scenario => scenario.GetProperty("steps").GetArrayLength()));
     }
 
     [Theory]
@@ -116,6 +116,9 @@ public sealed class HttpRouteLifecycleVectorTests
         private string _clientName;
         private string? _formerName;
         private ClientAuthSession? _session;
+        // The token and name the last connect logged in with; reconnect presents them again.
+        private ClientAuthSession? _connectedSession;
+        private string? _connectedName;
         private FakeClient? _fake;
 
         private ScenarioRun(TestServerFixture server, HttpClient admin, JsonElement vector, string clientName)
@@ -216,8 +219,14 @@ public sealed class HttpRouteLifecycleVectorTests
                 case "createClient":
                     await CreateClientAsync(label);
                     break;
+                case "createFormerNameClient":
+                    await CreateFormerNameClientAsync(step, label);
+                    break;
                 case "connect":
                     await ConnectAsync(step, label);
+                    break;
+                case "reconnect":
+                    await ReconnectAsync(step, label);
                     break;
                 case "disconnect":
                     Assert.True(_fake is not null, $"{label}: no fake client is connected");
@@ -245,6 +254,22 @@ public sealed class HttpRouteLifecycleVectorTests
             _session = null;
         }
 
+        /// <summary>Another account under the name before the last rename, with these routes; it never logs in.</summary>
+        private async Task CreateFormerNameClientAsync(JsonElement step, string label)
+        {
+            Assert.True(_formerName is not null, $"{label}: no earlier renameClient");
+            var created = await AdminAsync(HttpMethod.Post, "/api/admin/clients",
+                new { clientName = _formerName, enabled = true }, label);
+            var id = created.GetProperty("client").GetProperty("id").GetInt64();
+            Assert.NotEqual(_clientId, id);
+            foreach (var route in step.GetProperty("routes").EnumerateArray())
+            {
+                await AdminAsync(HttpMethod.Post, $"/api/admin/clients/{id}/http-routes",
+                    new { route = route.GetString(), targetBaseUrl = _targetBaseUrl, enabled = true, authEnabled = false },
+                    label);
+            }
+        }
+
         private async Task ConnectAsync(JsonElement step, string label)
         {
             Assert.True(_fake is null, $"{label}: the fake client is already connected");
@@ -253,6 +278,28 @@ public sealed class HttpRouteLifecycleVectorTests
             _session ??= await IssueSessionAsync();
             _fake = await FakeClient.ConnectAsync(_server.ControlPort, _clientName, _session, _response, _opens,
                 label);
+            _connectedSession = _session;
+            _connectedName = _clientName;
+            var push = await _fake.NatControlAsync(0, label + " login push");
+            AssertRouteList(push, step.GetProperty("expectLoginPush"), label + " login push");
+        }
+
+        /// <summary>The token of the last connect again, under the name it logged in with then.</summary>
+        private async Task ReconnectAsync(JsonElement step, string label)
+        {
+            Assert.True(_fake is null, $"{label}: the fake client is already connected");
+            Assert.True(_connectedSession is not null && _connectedName is not null, $"{label}: no earlier connect");
+            if (step.GetProperty("expectRefused").GetBoolean())
+            {
+                var answer = await FakeClient.ControlLoginAnswerAsync(_server.ControlPort, _connectedName,
+                    _connectedSession);
+                Assert.False(answer.Success,
+                    $"{label}: the token of {_connectedName} logged in again as {answer.ClientName}");
+                return;
+            }
+            _fake = await FakeClient.ConnectAsync(_server.ControlPort, _connectedName, _connectedSession, _response,
+                _opens, label);
+            Assert.Equal(_clientName, _fake.ControlLoginName);
             var push = await _fake.NatControlAsync(0, label + " login push");
             AssertRouteList(push, step.GetProperty("expectLoginPush"), label + " login push");
         }
@@ -489,6 +536,9 @@ public sealed class HttpRouteLifecycleVectorTests
         private FakeConnection? _control;
         private FakeConnection? _data;
 
+        /// <summary>The client name the server answered the control login with: the name it bound it under.</summary>
+        public string? ControlLoginName { get; private set; }
+
         private FakeClient(FakeResponse response, OpenCounter opens)
         {
             _response = response;
@@ -515,6 +565,7 @@ public sealed class HttpRouteLifecycleVectorTests
                 client._control = await FakeConnection.ConnectAsync(port);
                 var control = await client._control.LoginAsync(Login(clientName, session, ConnectionRole.Control));
                 Assert.True(control.Success, $"{label}: control login failed: {control.Reason}");
+                client.ControlLoginName = control.ClientName;
                 client._control.Start(client.OnControlAsync);
 
                 client._data = await FakeConnection.ConnectAsync(port);
@@ -528,6 +579,14 @@ public sealed class HttpRouteLifecycleVectorTests
                 await client.DisposeAsync();
                 throw;
             }
+        }
+
+        /// <summary>One control login with the token, whose answer is returned whatever it is.</summary>
+        public static async Task<LoginResponsePacket> ControlLoginAnswerAsync(int port, string clientName,
+            ClientAuthSession session)
+        {
+            await using var connection = await FakeConnection.ConnectAsync(port);
+            return await connection.LoginAsync(Login(clientName, session, ConnectionRole.Control));
         }
 
         public async Task<string> NatControlAsync(int index, string label)

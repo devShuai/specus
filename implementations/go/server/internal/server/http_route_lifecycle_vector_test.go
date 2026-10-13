@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -47,9 +48,11 @@ type httpRouteLifecycleStep struct {
 	Auth                bool      `json:"auth"`
 	Enabled             *bool     `json:"enabled"`
 	Suffix              string    `json:"suffix"`
+	Routes              []string  `json:"routes"`
 	ExpectPush          *[]string `json:"expectPush"`
 	ExpectLoginPush     *[]string `json:"expectLoginPush"`
 	ExpectSessionClosed bool      `json:"expectSessionClosed"`
+	ExpectRefused       *bool     `json:"expectRefused"`
 	Path                string    `json:"path"`
 	Credentials         string    `json:"credentials"`
 	WebSocket           bool      `json:"websocket"`
@@ -116,6 +119,9 @@ type httpRouteLifecycleRun struct {
 	formerName  string
 	deletedName string
 	routeIDs    map[string]int64
+
+	// lastLogin is the login of the most recent connect, which reconnect presents again.
+	lastLogin *protocol.LoginRequest
 
 	// opened counts HTTP OPENs across every fake client connection of the scenario.
 	opened atomic.Int32
@@ -219,8 +225,27 @@ func (r *httpRouteLifecycleRun) apply(step httpRouteLifecycleStep) {
 			http.StatusCreated, &created)
 		r.clientID, r.clientName = created.Client.ID, created.Client.ClientName
 		r.routeIDs = map[string]int64{}
+	case "createFormerNameClient":
+		if r.formerName == "" {
+			r.fatalf("createFormerNameClient needs an earlier renameClient")
+		}
+		var created struct {
+			Client struct {
+				ID int64 `json:"id"`
+			} `json:"client"`
+		}
+		r.admin(http.MethodPost, "/api/admin/clients", map[string]any{"clientName": r.formerName},
+			http.StatusCreated, &created)
+		for _, route := range step.Routes {
+			r.admin(http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/http-routes", map[string]any{
+				"route": route, "targetBaseUrl": r.vector.TargetBaseURL, "enabled": true,
+			}, http.StatusCreated, nil)
+		}
 	case "connect":
 		r.connect(step)
+		return
+	case "reconnect":
+		r.reconnect(step)
 		return
 	case "disconnect":
 		r.disconnect()
@@ -303,16 +328,93 @@ func (r *httpRouteLifecycleRun) connect(step httpRouteLifecycleStep) {
 	if runtime.ClientName != r.clientName {
 		r.fatalf("HTTP login signed in as %q, want %q", runtime.ClientName, r.clientName)
 	}
-	control, controlReader, data, dataReader := loginControlAndDataChannels(r.t, r.port, protocol.LoginRequest{
+	r.lastLogin = &protocol.LoginRequest{
 		ClientName:      runtime.ClientName,
 		ClientSessionID: runtime.ClientSessionID,
 		AccessToken:     runtime.AccessToken,
-	})
-	session := &httpRouteLifecycleSession{control: control, data: data, natControls: make(chan string, 64)}
-	session.controlClosed = collectNatControlPushes(controlReader, session.natControls)
-	session.dataClosed = serveFakeForwardingClient(data, dataReader, &r.opened)
-	r.online = session
+	}
+	if answer := r.login(*r.lastLogin); !answer.Success {
+		r.fatalf("control login refused: %#v", answer)
+	}
 	r.expectNatControl(*step.ExpectLoginPush, "login push")
+}
+
+// reconnect logs in again with the token of the last connect and no new HTTP login, still naming
+// the account as it was called then.
+func (r *httpRouteLifecycleRun) reconnect(step httpRouteLifecycleStep) {
+	r.t.Helper()
+	if r.online != nil {
+		r.fatalf("reconnect while the client is already connected")
+	}
+	if r.lastLogin == nil || step.ExpectRefused == nil {
+		r.fatalf("reconnect needs an earlier connect and expectRefused")
+	}
+	answer := r.login(*r.lastLogin)
+	if *step.ExpectRefused {
+		if answer.Success {
+			r.dropSession()
+			r.fatalf("the token of %q logged in again as %q, want it refused", r.lastLogin.ClientName, answer.ClientName)
+		}
+		return
+	}
+	if !answer.Success {
+		r.fatalf("control login refused: %#v", answer)
+	}
+	if answer.ClientName != r.clientName {
+		r.fatalf("control login answered as %q, want the account's current name %q", answer.ClientName, r.clientName)
+	}
+	if step.ExpectLoginPush == nil {
+		r.fatalf("an accepted reconnect needs expectLoginPush")
+	}
+	r.expectNatControl(*step.ExpectLoginPush, "login push")
+}
+
+// login logs the fake client in: the control connection, and when the server accepts it, the data
+// connection, which must be accepted too. It returns the control connection's answer. A refused
+// control connection must then be closed by the server.
+func (r *httpRouteLifecycleRun) login(request protocol.LoginRequest) protocol.LoginResponse {
+	r.t.Helper()
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(r.port))
+	dial := func(role string) (net.Conn, *bufio.Reader, protocol.LoginResponse) {
+		conn, err := net.Dial("tcp", address)
+		if err != nil {
+			r.fatalf("dial %s connection: %v", role, err)
+		}
+		request.ConnectionRole = role
+		if err := protocol.WritePacket(conn, request); err != nil {
+			_ = conn.Close()
+			r.fatalf("write %s login: %v", role, err)
+		}
+		reader := bufio.NewReader(conn)
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		packet, err := readProtocolPacket(reader)
+		_ = conn.SetReadDeadline(time.Time{})
+		answer, ok := packet.(protocol.LoginResponse)
+		if err != nil || !ok {
+			_ = conn.Close()
+			r.fatalf("%s login answered %#v (%v), want LOGIN_RESPONSE", role, packet, err)
+		}
+		return conn, reader, answer
+	}
+	control, controlReader, answer := dial(protocol.ConnectionRoleControl)
+	if !answer.Success {
+		defer control.Close()
+		_ = control.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.Copy(io.Discard, controlReader); err != nil {
+			r.fatalf("the server kept the refused control connection open: %v", err)
+		}
+		return answer
+	}
+	session := &httpRouteLifecycleSession{control: control, natControls: make(chan string, 64)}
+	session.controlClosed = collectNatControlPushes(controlReader, session.natControls)
+	r.online = session
+	data, dataReader, dataAnswer := dial(protocol.ConnectionRoleData)
+	session.data = data
+	session.dataClosed = serveFakeForwardingClient(data, dataReader, &r.opened)
+	if !dataAnswer.Success {
+		r.fatalf("data login refused after an accepted control login: %#v", dataAnswer)
+	}
+	return answer
 }
 
 // collectNatControlPushes forwards every NAT_CONTROL payload read from the control connection.
@@ -368,7 +470,9 @@ func (r *httpRouteLifecycleRun) dropSession() {
 		return
 	}
 	_ = r.online.control.Close()
-	_ = r.online.data.Close()
+	if r.online.data != nil {
+		_ = r.online.data.Close()
+	}
 	r.online = nil
 }
 

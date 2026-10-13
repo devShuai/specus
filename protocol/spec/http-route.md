@@ -102,7 +102,8 @@ header 或 body 中；它只用于服务端诊断：写入日志（以及实现�
 `protocol/test-vectors/http-route-lifecycle-v1.json`（由 `tools/protocol/generate_http_route_lifecycle_vectors.py`
 生成）固定本节与第 1 节的跨实现行为：Java、Go、.NET 与 C server 重放其中的 server 场景（删除在线客户端的最后一条
 受保护 route、客户端离线时删除后凭 token 重连、停用其中一条 route、未知 route 与缺 route 段、停用 / 改名 / 删除
-客户端、删除后同名重建），Java、Go、.NET 与 Android 客户端重放 client 用例。
+客户端、删除后同名重建，以及删除、停用或改名后凭旧 token 重连：token 只登录签发它的账户，见
+[`client-auth.md`](client-auth.md)），Java、Go、.NET 与 Android 客户端重放 client 用例。
 
 ## 3. 请求流
 

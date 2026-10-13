@@ -97,9 +97,14 @@ public sealed class RegistrationAuthenticationTests
         await using (var scope = server.HostServices.CreateAsyncScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
-            Assert.True(await db.ManagementUsers.AnyAsync(user => user.Username == "registered-user"));
+            // The account is keyed by a random UUID; the login name is what was registered, and the
+            // email record points at the account key.
+            var account = await db.ManagementUsers.SingleAsync(user => user.LoginName == "registered-user");
+            Assert.True(Guid.TryParseExact(account.Username, "D", out _));
+            Assert.Equal("default", account.TenantId);
+            Assert.Equal("registered-user", account.LoginNameNormalized);
             Assert.True(await db.ManagementUserEmails.AnyAsync(item =>
-                item.Username == "registered-user" && item.Email == "tester@example.com"));
+                item.Username == account.Username && item.Email == "tester@example.com"));
             Assert.False(await db.ManagementRegistrationChallenges.AnyAsync(item =>
                 item.RegistrationId == challenge.RegistrationId));
         }

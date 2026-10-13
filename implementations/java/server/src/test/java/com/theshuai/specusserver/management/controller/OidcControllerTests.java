@@ -78,7 +78,7 @@ class OidcControllerTests {
         assertThat(body.get("expiresIn")).isEqualTo(28800L);
         assertThat(authorization.get()).startsWith("Basic ");
         verify(fixture.localTokenService)
-                .issueToken("alice", "default", ManagementRole.USER);
+                .issueToken("alice", "default", ManagementRole.USER, "alice");
     }
 
     @Test
@@ -90,7 +90,7 @@ class OidcControllerTests {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
         verify(fixture.localTokenService, never())
-                .issueToken("alice", "default", ManagementRole.USER);
+                .issueToken("alice", "default", ManagementRole.USER, "alice");
     }
 
     @Test
@@ -102,7 +102,7 @@ class OidcControllerTests {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         verify(fixture.localTokenService, never())
-                .issueToken("unknown", "default", ManagementRole.USER);
+                .issueToken("unknown", "default", ManagementRole.USER, "unknown");
     }
 
     @Test
@@ -114,7 +114,7 @@ class OidcControllerTests {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
         verify(fixture.localTokenService, never())
-                .issueToken("alice", "default", ManagementRole.USER);
+                .issueToken("alice", "default", ManagementRole.USER, "alice");
     }
 
     private Fixture fixture(String tokenNonce, String username, boolean provisioned) {
@@ -129,7 +129,7 @@ class OidcControllerTests {
 
         LocalTokenService localTokenService = mock(LocalTokenService.class);
         when(localTokenService.getTtlSeconds()).thenReturn(28800L);
-        when(localTokenService.issueToken("alice", "default", ManagementRole.USER))
+        when(localTokenService.issueToken("alice", "default", ManagementRole.USER, "alice"))
                 .thenReturn("local-specus-token");
         ManagementUserService users = mock(ManagementUserService.class);
         when(users.resolveOrProvisionOidcUser(

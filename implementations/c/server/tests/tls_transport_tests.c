@@ -10,10 +10,13 @@
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -101,6 +104,154 @@ static int test_self_signed_handshake(void)
     st_tls_server_context_free(context);
     if (!client_ok || fixture.result != 0) {
         fprintf(stderr, "self-signed TLS 1.2+ round trip failed\n");
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    st_tls_server_context *context;
+    int fd;
+    st_tls_connection *connection;
+} tls_accept_fixture;
+
+static void *tls_accept_run(void *arg)
+{
+    tls_accept_fixture *fixture = (tls_accept_fixture *)arg;
+    char error[512];
+    if (st_tls_connection_accept(fixture->context, fixture->fd, &fixture->connection, error, sizeof(error)) != 0) {
+        fprintf(stderr, "test TLS server handshake failed: %s\n", error);
+    }
+    return NULL;
+}
+
+/*
+ * The client goes away right after the handshake and the server writes next, as a server does
+ * whenever a client disconnects while a NAT_CONTROL or a stream frame is on its way. The write
+ * meets a closed socket: it fails with EPIPE, which st_tls_connection_write_all reports, and the
+ * close_notify that st_tls_connection_free then tries fails the same way. Neither may end the
+ * process, which holds only because SIGPIPE is ignored, as main() of the server does first thing.
+ */
+static int test_write_after_peer_closed(void)
+{
+    st_tls_config config;
+    memset(&config, 0, sizeof(config));
+    config.mode = ST_TLS_SELF_SIGNED;
+    st_tls_server_context *context = NULL;
+    char error[512];
+    if (st_tls_server_context_create(&config, &context, error, sizeof(error)) != 0) {
+        fprintf(stderr, "self-signed context creation failed: %s\n", error);
+        return 1;
+    }
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+        st_tls_server_context_free(context);
+        return 1;
+    }
+    tls_accept_fixture fixture = {.context = context, .fd = sockets[0], .connection = NULL};
+    pthread_t accept_thread;
+    if (pthread_create(&accept_thread, NULL, tls_accept_run, &fixture) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        st_tls_server_context_free(context);
+        return 1;
+    }
+    SSL_CTX *client_context = SSL_CTX_new(TLS_client_method());
+    SSL *client = client_context == NULL ? NULL : SSL_new(client_context);
+    int connected = client != NULL
+        && SSL_set_fd(client, sockets[1]) == 1
+        && SSL_connect(client) == 1;
+    if (!connected) {
+        /* Ends a handshake the server may still be waiting in. */
+        shutdown(sockets[1], SHUT_RDWR);
+    }
+    pthread_join(accept_thread, NULL);
+    /* Gone without a close_notify, before the server writes anything more. */
+    SSL_free(client);
+    SSL_CTX_free(client_context);
+    close(sockets[1]);
+    int accepted = fixture.connection != NULL;
+    int write_rc = accepted
+        ? st_tls_connection_write_all(fixture.connection, (const uint8_t *)"late", 4U)
+        : 0;
+    st_tls_connection_free(fixture.connection);
+    close(sockets[0]);
+    st_tls_server_context_free(context);
+    if (!connected || !accepted || write_rc != -1) {
+        fprintf(stderr, "write after the peer closed: connected=%d accepted=%d write=%d, expected a failed write\n",
+                connected, accepted, write_rc);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * The client stays connected but stops reading, and the server writes more than the socket can
+ * hold. Once the socket's write timeout runs out the write fails, as on a plain socket, so the
+ * server can close a connection a frame may have been cut short on. It used to retry for as long as
+ * the client did not read, holding the connection's send lock; the alarm ends such a run.
+ */
+static int test_write_times_out_when_peer_stops_reading(void)
+{
+    st_tls_config config;
+    memset(&config, 0, sizeof(config));
+    config.mode = ST_TLS_SELF_SIGNED;
+    st_tls_server_context *context = NULL;
+    char error[512];
+    if (st_tls_server_context_create(&config, &context, error, sizeof(error)) != 0) {
+        fprintf(stderr, "self-signed context creation failed: %s\n", error);
+        return 1;
+    }
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+        st_tls_server_context_free(context);
+        return 1;
+    }
+    tls_accept_fixture fixture = {.context = context, .fd = sockets[0], .connection = NULL};
+    pthread_t accept_thread;
+    if (pthread_create(&accept_thread, NULL, tls_accept_run, &fixture) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        st_tls_server_context_free(context);
+        return 1;
+    }
+    SSL_CTX *client_context = SSL_CTX_new(TLS_client_method());
+    SSL *client = client_context == NULL ? NULL : SSL_new(client_context);
+    int connected = client != NULL
+        && SSL_set_fd(client, sockets[1]) == 1
+        && SSL_connect(client) == 1;
+    if (!connected) {
+        shutdown(sockets[1], SHUT_RDWR);
+    }
+    pthread_join(accept_thread, NULL);
+    int accepted = fixture.connection != NULL;
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    int timeout_set = setsockopt(sockets[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0;
+    size_t len = 8U * 1024U * 1024U;
+    uint8_t *buffer = (uint8_t *)calloc(1U, len);
+    int write_rc = 0;
+    time_t started = time(NULL);
+    if (connected && accepted && timeout_set && buffer != NULL) {
+        alarm(60);
+        write_rc = st_tls_connection_write_all(fixture.connection, buffer, len);
+        alarm(0);
+    }
+    long elapsed = (long)(time(NULL) - started);
+    free(buffer);
+    /* close_notify may wait out the timeout once more on the full socket; then both ends go. */
+    st_tls_connection_free(fixture.connection);
+    SSL_free(client);
+    SSL_CTX_free(client_context);
+    close(sockets[1]);
+    close(sockets[0]);
+    st_tls_server_context_free(context);
+    if (!connected || !accepted || !timeout_set || write_rc != -1) {
+        fprintf(stderr, "write to a peer that stopped reading: connected=%d accepted=%d timeout=%d write=%d, "
+                "expected a failed write\n", connected, accepted, timeout_set, write_rc);
+        return 1;
+    }
+    if (elapsed > 30) {
+        fprintf(stderr, "write to a peer that stopped reading failed only after %ld s\n", elapsed);
         return 1;
     }
     return 0;
@@ -547,6 +698,14 @@ static int expect_deployment(const char *name,
 
 int main(void)
 {
+    /*
+     * As main() of the server does first thing: a write to a peer that has gone away fails with
+     * EPIPE instead of ending the process. The round trips below need it. Once the server thread
+     * has written "pong", st_tls_connection_free sends its close_notify (SSL_shutdown), and by
+     * then the client may have read the answer, sent its own close_notify and closed its end; that
+     * write then raised SIGPIPE and ended the run with 141 now and then (issue #192).
+     */
+    signal(SIGPIPE, SIG_IGN);
     if (expect_deployment("prod public plaintext",
                           ST_TLS_DISABLED, 0, 0, "prod", "0.0.0.0", 0) != 0
         || expect_deployment("unknown environment fails safe",
@@ -588,6 +747,8 @@ int main(void)
         return 1;
     }
     return test_self_signed_handshake() != 0
+        || test_write_after_peer_closed() != 0
+        || test_write_times_out_when_peer_stops_reading() != 0
         || test_pkcs12_file_context() != 0
         || test_pem_file_context() != 0 ? 1 : 0;
 }

@@ -334,11 +334,10 @@ public class SpecusClientApplication {
                 com.theshuai.specusclient.peer.PeerEgressRouteCommanders.takeoverSupported());
         // An egress needs nothing but ordinary sockets.
         egress.setEgressCapable(true);
-        // The egress resolves names consumers bind (protocol/spec/peer-egress-dns.md). IPv6 targets are
-        // not announced: the outbound socket binding that keeps forwarded traffic out of this device's
-        // own tunnel is IPv4 only.
+        // The egress resolves names consumers bind (protocol/spec/peer-egress-dns.md), and dials a name
+        // with no A record over its AAAA records (PeerEgressRuntime.IPV6_TARGET_CAPABLE).
         egress.setDomainTargetCapable(true);
-        egress.setIpv6TargetCapable(false);
+        egress.setIpv6TargetCapable(true);
         info.setClientEgressCapabilities(egress);
         // HTTP route streams that fail before their response head say why on the RST, so the
         // connectivity check can tell a refused target from a route this device has not loaded.

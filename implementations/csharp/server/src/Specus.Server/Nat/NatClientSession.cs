@@ -69,7 +69,7 @@ internal sealed class NatClientSession : IAsyncDisposable
             case NatMessageType.Keepalive:
                 return;
             case NatMessageType.Open:
-                if (HandleHttpResponseHead(packet))
+                if (await HandleHttpResponseHeadAsync(packet).ConfigureAwait(false))
                 {
                     return;
                 }
@@ -77,15 +77,17 @@ internal sealed class NatClientSession : IAsyncDisposable
             case NatMessageType.Data:
                 if (_httpStreams.TryGetValue(packet.StreamId, out var httpData))
                 {
-                    if (!httpData.OnResponseData(packet.Data))
+                    var ingest = httpData.OnResponseData(packet.Data);
+                    if (ingest != HttpStreamIngestResult.Accepted)
                     {
-                        ProtocolViolation("invalid HTTP DATA");
+                        await SettleHttpFrameAsync(httpData, ingest, "invalid HTTP DATA",
+                            "DATA for closed stream").ConfigureAwait(false);
                         return;
                     }
-                    if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0
-                        && !httpData.OnResponseEnd(packet.MetaData))
+                    if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
                     {
-                        ProtocolViolation("invalid HTTP terminal frame");
+                        await SettleHttpFrameAsync(httpData, httpData.OnResponseEnd(packet.MetaData),
+                            "invalid HTTP terminal frame", "DATA for closed stream").ConfigureAwait(false);
                     }
                     return;
                 }
@@ -119,14 +121,14 @@ internal sealed class NatClientSession : IAsyncDisposable
             case NatMessageType.Rst:
                 if (_httpStreams.TryGetValue(packet.StreamId, out var httpEnd))
                 {
-                    var valid = packet.NatMessageType == NatMessageType.Rst
-                        ? httpEnd.OnReset(packet.Value, AsString(packet.MetaData, "reason"),
-                            AsFailure(packet.MetaData))
-                        : httpEnd.OnResponseEnd(packet.MetaData);
-                    if (!valid)
+                    if (packet.NatMessageType == NatMessageType.Rst)
                     {
-                        ProtocolViolation("invalid HTTP terminal frame");
+                        httpEnd.OnReset(packet.Value, AsString(packet.MetaData, "reason"),
+                            AsFailure(packet.MetaData));
+                        return;
                     }
+                    await SettleHttpFrameAsync(httpEnd, httpEnd.OnResponseEnd(packet.MetaData),
+                        "invalid HTTP terminal frame", "FIN for closed stream").ConfigureAwait(false);
                     return;
                 }
                 if (_webSocketStreams.TryGetValue(packet.StreamId, out var webSocketEnd))
@@ -199,10 +201,11 @@ internal sealed class NatClientSession : IAsyncDisposable
     }
 
     internal async Task<HttpSpecusStream> OpenHttpStreamAsync(
-        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken,
+        bool discardResponseBody = false)
     {
         var streamId = AllocateStreamId();
-        var stream = new HttpSpecusStream(_context, streamId, RemoveHttpStream);
+        var stream = new HttpSpecusStream(_context, streamId, RemoveHttpStream, discardResponseBody);
         if (!_httpStreams.TryAdd(streamId, stream))
         {
             await stream.DisposeAsync().ConfigureAwait(false);
@@ -608,19 +611,53 @@ internal sealed class NatClientSession : IAsyncDisposable
         }
     }
 
-    private bool HandleHttpResponseHead(NatMessagePacket packet)
+    private async Task<bool> HandleHttpResponseHeadAsync(NatMessagePacket packet)
     {
         if (!string.Equals(AsString(packet.MetaData, "source"), "http", StringComparison.Ordinal)
-            || !string.Equals(AsString(packet.MetaData, "phase"), "response", StringComparison.Ordinal)
-            || !_httpStreams.TryGetValue(packet.StreamId, out var stream))
+            || !string.Equals(AsString(packet.MetaData, "phase"), "response", StringComparison.Ordinal))
         {
             return false;
         }
-        if (!stream.OnResponseHead(packet.MetaData))
+        if (_httpStreams.TryGetValue(packet.StreamId, out var stream))
         {
-            ProtocolViolation("duplicate HTTP response OPEN");
+            await SettleHttpFrameAsync(stream, stream.OnResponseHead(packet.MetaData),
+                "duplicate HTTP response OPEN", "OPEN for closed stream").ConfigureAwait(false);
+            return true;
         }
-        return true;
+        if (IsClosedStream(packet.StreamId))
+        {
+            // A response head that crossed the server's close, e.g. a browser that left before
+            // the device answered, is as late as a DATA frame would be.
+            await RejectTcpStreamAsync(packet.StreamId, 7, "OPEN for closed stream").ConfigureAwait(false);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Settles a response frame an HTTP stream did not accept. Only a real violation of the
+    /// stream's state machine closes the data connection. A stream that Close() has already marked
+    /// but not yet taken out of <see cref="_httpStreams"/> answers like its tombstone will, and a
+    /// reader that fell behind costs only its own stream (RST 8, as Java answers it).
+    /// </summary>
+    private async Task SettleHttpFrameAsync(HttpSpecusStream stream, HttpStreamIngestResult result,
+        string violation, string closedReason)
+    {
+        switch (result)
+        {
+            case HttpStreamIngestResult.Accepted:
+                return;
+            case HttpStreamIngestResult.Closed:
+                await RejectTcpStreamAsync(stream.StreamId, 7, closedReason).ConfigureAwait(false);
+                return;
+            case HttpStreamIngestResult.QueueFull:
+                await stream.ResetOverflowAsync(8, "HTTP response queue exceeded", _context.Lifetime)
+                    .ConfigureAwait(false);
+                return;
+            default:
+                ProtocolViolation(violation);
+                return;
+        }
     }
 
     private void RemoveHttpStream(uint streamId, HttpSpecusStream expected)

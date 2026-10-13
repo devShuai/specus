@@ -59,6 +59,10 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
     private long _lastReadTicks;
     private long _lastWriteTicks;
 
+    /// <summary>Set under <see cref="_writeLock"/> once a frame's write failed or was cut short;
+    /// nothing is written to the connection after it (see <see cref="WriteEncodedAsync"/>).</summary>
+    private bool _writeFailed;
+
     public SpecusConnectionContext Context { get; }
 
     public SpecusConnection(Socket socket, Stream stream, IControlChannelDispatcher dispatcher,
@@ -210,8 +214,8 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
                     // Java's SocketIdleStateHandler sends a HeartBeatResponsePacket — yes, response,
                     // not request. It's just keep-alive bytes; the client doesn't decode it as
                     // anything that triggers an ack.
-                    await WriteAsync(new HeartbeatResponsePacket(), _lifetimeCts.Token)
-                        .ConfigureAwait(false);
+                    await WriteDirectAsync(PacketCodec.Encode(new HeartbeatResponsePacket()), _lifetimeCts.Token,
+                        DisconnectReason.HeartbeatWriteFailed).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException
                     or OperationCanceledException)
@@ -239,12 +243,19 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         return WriteDirectAsync(bytes, cancellationToken);
     }
 
-    private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken)
+    private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken,
+        DisconnectReason failureReason = DisconnectReason.IoError)
     {
         var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
         try
         {
-            await WriteEncodedAsync(bytes, cancellationToken).ConfigureAwait(false);
+            await WriteEncodedAsync(bytes, cancellationToken, failureReason).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Only the connection's own lifetime cancels a frame once it is being written: to a
+            // caller that did not cancel, the connection closed under the write.
+            throw new ObjectDisposedException(nameof(SpecusConnection));
         }
         finally
         {
@@ -292,18 +303,52 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         }
     }
 
-    private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken)
+    /// <summary>
+    /// Writes one encoded frame under the connection's write lock. <paramref name="cancellationToken"/>
+    /// only covers the wait for the lock, while nothing is written yet. Once the frame's first byte
+    /// may be on the wire it is written to the end, cancellable by the connection's own lifetime
+    /// alone: a caller giving up (an HTTP request aborted mid-push) must not cut it short. A write
+    /// that fails or is cancelled partway leaves part of a frame behind, after which any frame would
+    /// be read out of step, so the connection is closed and never written again ("帧写入失败" in
+    /// protocol/spec/control-protocol.md).
+    /// </summary>
+    private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken,
+        DisconnectReason failureReason = DisconnectReason.IoError)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var failed = false;
         try
         {
-            await _stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
-            await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (_writeFailed)
+            {
+                throw new IOException("the connection was closed after a failed write");
+            }
+            try
+            {
+                await _stream.WriteAsync(bytes, _lifetimeCts.Token).ConfigureAwait(false);
+                await _stream.FlushAsync(_lifetimeCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _writeFailed = true;
+                failed = true;
+                if (!_lifetimeCts.IsCancellationRequested)
+                {
+                    Context.MarkDisconnectIfAbsent(failureReason);
+                    _logger.LogDebug(ex, "[{ChannelId}] frame write failed, closing the connection",
+                        Context.ChannelId);
+                }
+                throw;
+            }
             Volatile.Write(ref _lastWriteTicks, Environment.TickCount64);
         }
         finally
         {
             _writeLock.Release();
+            if (failed)
+            {
+                CloseTransport();
+            }
         }
     }
 
@@ -360,6 +405,9 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
                         queued.Completion.TrySetCanceled(queued.CancellationToken);
                         continue;
                     }
+                    // The frame's own token cancels it only while it waits for the write lock: once
+                    // started, WriteEncodedAsync writes it to the end or closes the connection, and a
+                    // caller that gave up has had its completion cancelled already.
                     using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(
                         queued.CancellationToken, _lifetimeCts.Token);
                     await WriteEncodedAsync(queued.Bytes, writeCts.Token).ConfigureAwait(false);
@@ -407,7 +455,9 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
 
     private void CloseTransport()
     {
-        _lifetimeCts.Cancel();
+        // A write that fails while the connection is being disposed may get here after the
+        // lifetime source is gone; it is cancelled already.
+        try { _lifetimeCts.Cancel(); } catch (ObjectDisposedException) { }
         try { _socket.Dispose(); } catch { }
     }
 

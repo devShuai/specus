@@ -9,7 +9,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 
 | 文档 | 说明 |
 | --- | --- |
-| [control-protocol.md](control-protocol.md) | 控制连接二进制帧、`Command`、`MessageType`、`NAT_MESSAGE`、心跳和 `NAT_CONTROL` |
+| [control-protocol.md](control-protocol.md) | 控制连接二进制帧、`Command`、`MessageType`、`NAT_MESSAGE`、心跳和 `NAT_CONTROL`（含管理接口如何守住它的 1 MiB 上限） |
 | [client-auth.md](client-auth.md) | 客户端启动 HTTP 登录、apiKey/secret 签名、运行时 token 和刷新机制 |
 | [http-route.md](http-route.md) | HTTP route 直转语义、WebSocket 隧道、Header 透传、响应改写和流量观测 |
 | [peer-mesh.md](peer-mesh.md) | Peer Mesh 私有组网、虚拟 IP、信令、标准 STUN/TURN 子集、加密数据帧和管理面 |
@@ -22,6 +22,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | [service-connectivity-check.md](service-connectivity-check.md) | 对单条 HTTP route 的有界端到端检查，四阶段结果码、客户端 RST 分类与限流；实现进行中 |
 | [service-workbench.md](service-workbench.md) | 管理前端服务工作台，按管理身份保存的常用服务与最近打开接口，以及只在前端推导的待处理问题；四个服务端与管理前端已实现 |
 | [product-metrics.md](product-metrics.md) | 租户显式开启的产品指标：服务端接入里程碑、封闭 schema 的互传结果上报、按日计数、保存期限与清除；四个服务端与管理前端已实现 |
+| [management-accounts.md](management-accounts.md) | 管理账号的身份模型：登录名按租户唯一、账号键、迁移、带租户的登录与 token、续期与每次请求的解析、OIDC 绑定、以（租户，登录名）为键的数据；四个服务端已实现 |
 
 ## 参考实现入口
 
@@ -31,6 +32,7 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | 紧凑二进制序列化 | `implementations/java/common/src/main/java/com/theshuai/common/serialize/impl/CompactBinarySerializer.java` |
 | 客户端启动登录 | `implementations/java/client/src/main/java/com/theshuai/specusclient/SpecusClientApplication.java` |
 | 服务端客户端认证 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/ClientAuthService.java` |
+| 管理账号与登录 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/ManagementUserService.java` |
 | `NAT_CONTROL` 下发 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/NatControlService.java` |
 | HTTP 直转 | `implementations/java/server/src/main/java/com/theshuai/specusserver/http/HttpSpecusController.java` |
 | Peer Mesh 控制面 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/PeerSignalService.java` |

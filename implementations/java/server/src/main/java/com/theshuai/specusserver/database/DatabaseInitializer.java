@@ -22,9 +22,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Startup runs {@link #initialize()} without a transaction, from {@code @PostConstruct}; the admin
+ * initialize endpoint runs it through the proxy, inside one. Each step reads the schema from
+ * {@link SchemaMetadata} before touching it, because on PostgreSQL a statement that fails, even
+ * one caught here, aborts that transaction and every statement after it.
+ */
 @Component
 @Slf4j
 public class DatabaseInitializer {
+    private static final String HTTP_EXCHANGE_TABLE = "specus_http_traffic_exchange";
+
     private final ClientAccountRepository clientAccountRepository;
     private final ClientCredentialRepository clientCredentialRepository;
     private final ClientAuthProperties clientAuthProperties;
@@ -34,6 +42,7 @@ public class DatabaseInitializer {
     private final PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator;
     private final TransferTimestampMigrator transferTimestampMigrator;
     private final LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer;
+    private final SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator;
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
@@ -48,6 +57,7 @@ public class DatabaseInitializer {
                                PeerServiceDiscoverySchemaMigrator peerServiceDiscoverySchemaMigrator,
                                TransferTimestampMigrator transferTimestampMigrator,
                                LegacyDemoCredentialSanitizer legacyDemoCredentialSanitizer,
+                               SqliteUniqueIndexMigrator sqliteUniqueIndexMigrator,
                                @Value("${specus.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${specus.env:}") String environmentName,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
@@ -62,6 +72,7 @@ public class DatabaseInitializer {
         this.peerServiceDiscoverySchemaMigrator = peerServiceDiscoverySchemaMigrator;
         this.transferTimestampMigrator = transferTimestampMigrator;
         this.legacyDemoCredentialSanitizer = legacyDemoCredentialSanitizer;
+        this.sqliteUniqueIndexMigrator = sqliteUniqueIndexMigrator;
         // Demo data is convenience-only; prod never seeds it regardless of the requested flag.
         this.seedDemoClient = seedDemoClient && DeploymentEnvironment.parse(environmentName).allowsDemoData();
         this.databasePlatform = databasePlatform;
@@ -90,6 +101,8 @@ public class DatabaseInitializer {
         ensureHttpBinaryBodyColumns();
         backfillDefaultOwner();
         legacyDemoCredentialSanitizer.sanitize();
+        // After the backfills: a NULL tenant never collides in a unique index, 'default' can.
+        sqliteUniqueIndexMigrator.migrate();
         if (seedDemoClient && clientAccountRepository
                 .findByTenantIdAndClientName(tenant.tenantId(), "Demo client").isEmpty()) {
             String now = Instant.now().toString();
@@ -148,6 +161,10 @@ public class DatabaseInitializer {
                 "peer_mesh_session",
                 "peer_mesh_service_sharing",
                 "peer_mesh_shared_service")) {
+            if (!SchemaMetadata.hasColumn(jdbcTemplate, table, "tenant_id")) {
+                log.debug("[tenant] skip backfill for {}: no tenant_id column", table);
+                continue;
+            }
             try {
                 int rows = jdbcTemplate.update(
                         "update " + table + " set tenant_id = ? where tenant_id is null or tenant_id = ''",
@@ -167,6 +184,10 @@ public class DatabaseInitializer {
                 "specus_client_credential",
                 "peer_mesh_device",
                 "peer_mesh_acl")) {
+            if (!SchemaMetadata.hasColumn(jdbcTemplate, table, "owner_username")) {
+                log.debug("[tenant] skip owner backfill for {}: no owner_username column", table);
+                continue;
+            }
             try {
                 int rows = jdbcTemplate.update(
                         "update " + table + " set owner_username = ? where owner_username is null or owner_username = ''",
@@ -181,47 +202,47 @@ public class DatabaseInitializer {
     }
 
     private void widenHttpBodyTextColumns() {
+        // On MySQL and MariaDB MySqlLobColumnMigrator widens them, and only while they are narrow.
         String normalizedPlatform = databasePlatform == null ? "" : databasePlatform.toLowerCase();
-        List<String> sql = List.of();
-        if (normalizedPlatform.contains("mysql") || normalizedPlatform.contains("mariadb")) {
-            sql = List.of(
-                    "alter table specus_http_traffic_exchange modify column request_preview_text longtext",
-                    "alter table specus_http_traffic_exchange modify column response_preview_text longtext"
-            );
-        } else if (normalizedPlatform.contains("postgres")) {
-            sql = List.of(
-                    "alter table specus_http_traffic_exchange alter column request_preview_text type text",
-                    "alter table specus_http_traffic_exchange alter column response_preview_text type text"
-            );
+        if (!normalizedPlatform.contains("postgres")) {
+            return;
         }
-        for (String statement : sql) {
+        String statement = "alter table " + HTTP_EXCHANGE_TABLE + " alter column %s type text";
+        SchemaMetadata.Table table = SchemaMetadata.table(jdbcTemplate, HTTP_EXCHANGE_TABLE);
+        for (String column : List.of("request_preview_text", "response_preview_text")) {
+            if (table == null || !table.hasColumn(column)) {
+                continue;
+            }
             try {
-                jdbcTemplate.execute(statement);
+                jdbcTemplate.execute(statement.formatted(column));
             } catch (DataAccessException e) {
-                log.debug("[schema] skip widening HTTP body text column with '{}': {}", statement, e.getMessage());
+                log.debug("[schema] skip widening HTTP body text column {}: {}", column, e.getMessage());
             }
         }
     }
 
     private void ensureHttpBinaryBodyColumns() {
         String normalizedPlatform = databasePlatform == null ? "" : databasePlatform.toLowerCase();
-        List<String> sql = List.of();
+        String type;
         if (normalizedPlatform.contains("mysql") || normalizedPlatform.contains("mariadb")) {
-            sql = List.of(
-                    "alter table specus_http_traffic_exchange add column request_body_data longblob",
-                    "alter table specus_http_traffic_exchange add column response_body_data longblob"
-            );
+            type = "longblob";
         } else if (normalizedPlatform.contains("postgres")) {
-            sql = List.of(
-                    "alter table specus_http_traffic_exchange add column request_body_data bytea",
-                    "alter table specus_http_traffic_exchange add column response_body_data bytea"
-            );
+            type = "bytea";
+        } else {
+            return;
         }
-        for (String statement : sql) {
+        SchemaMetadata.Table table = SchemaMetadata.table(jdbcTemplate, HTTP_EXCHANGE_TABLE);
+        if (table == null) {
+            return;
+        }
+        for (String column : List.of("request_body_data", "response_body_data")) {
+            if (table.hasColumn(column)) {
+                continue;
+            }
             try {
-                jdbcTemplate.execute(statement);
+                jdbcTemplate.execute("alter table " + HTTP_EXCHANGE_TABLE + " add column " + column + " " + type);
             } catch (DataAccessException e) {
-                log.debug("[schema] skip adding HTTP binary body column with '{}': {}", statement, e.getMessage());
+                log.debug("[schema] skip adding HTTP binary body column {}: {}", column, e.getMessage());
             }
         }
     }

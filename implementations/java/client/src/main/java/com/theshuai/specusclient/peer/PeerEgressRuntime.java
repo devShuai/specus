@@ -1,6 +1,7 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import com.theshuai.common.peeregress.PeerEgressAuthorization;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressFrame;
@@ -10,6 +11,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.security.SecureRandom;
 import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -18,7 +20,6 @@ import java.util.Set;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
-import java.util.function.IntFunction;
 import java.util.function.LongPredicate;
 import java.util.function.LongSupplier;
 import lombok.extern.slf4j.Slf4j;
@@ -180,7 +181,7 @@ final class PeerEgressRuntime {
     // new flows are waiting on a lookup (protocol/spec/peer-egress-dns.md).
     private final PeerEgressNameTable names = new PeerEgressNameTable();
     private final Set<PeerEgressFlowTable.Key> resolving = new HashSet<>();
-    Function<String, List<Integer>> resolve = PeerEgressRuntime::resolveName;
+    Function<String, List<String>> resolve = PeerEgressRuntime::resolveName;
     private final PeerEgressRejectionLog rejections = new PeerEgressRejectionLog();
     private long totalFlows;
     private long bytesIn;
@@ -480,7 +481,7 @@ final class PeerEgressRuntime {
         Socket socket = null;
         IOException failure = null;
         try {
-            socket = dialer.dial("tcp", Ipv4Cidr.format(destination.address()), key.remotePort(), CONNECT_TIMEOUT_MS);
+            socket = dialer.dial("tcp", destination.address(), key.remotePort(), CONNECT_TIMEOUT_MS);
         } catch (IOException error) {
             failure = error;
         }
@@ -689,7 +690,7 @@ final class PeerEgressRuntime {
             Socket socket = null;
             IOException failure = null;
             try {
-                socket = dialer.dial("udp", Ipv4Cidr.format(destination.address()), key.remotePort(),
+                socket = dialer.dial("udp", destination.address(), key.remotePort(),
                         CONNECT_TIMEOUT_MS);
             } catch (IOException error) {
                 failure = error;
@@ -859,7 +860,7 @@ final class PeerEgressRuntime {
      * reservation already there, and must not dial again.
      */
     private Reservation reserve(long consumer, PeerEgressFlowTable.Key key, long nowMs) {
-        return reserveTo(consumer, key, key.remoteIp(), null, nowMs);
+        return reserveTo(consumer, key, Ipv4Cidr.format(key.remoteIp()), null, nowMs);
     }
 
     /**
@@ -869,7 +870,7 @@ final class PeerEgressRuntime {
      * resolved from (null for a flow to the address itself). The flow this opens remembers both, so
      * a policy refresh judges it the same way.
      */
-    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, int destination, String name,
+    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, String destination, String name,
             long nowMs) {
         String code = authorizeTo(consumer, key, destination, name);
         if (code != null) {
@@ -894,7 +895,7 @@ final class PeerEgressRuntime {
      * flow is opened under, which lets a domain rule covering it admit the flow; null for a flow to
      * the address itself, which no domain rule admits. Called with the lock held.
      */
-    private String authorizeTo(long consumer, PeerEgressFlowTable.Key key, int destination, String name) {
+    private String authorizeTo(long consumer, PeerEgressFlowTable.Key key, String destination, String name) {
         if (closed || !enabled) {
             return PeerEgressCodes.DISABLED;
         }
@@ -902,7 +903,7 @@ final class PeerEgressRuntime {
 
         PeerEgressRequest request = new PeerEgressRequest();
         request.setConsumerClientId(consumer);
-        request.setDestinationIp(Ipv4Cidr.format(destination));
+        request.setDestinationIp(destination);
         request.setName(name);
         request.setDestinationPort(key.remotePort());
         request.setProtocol(key.protocolName());
@@ -919,8 +920,8 @@ final class PeerEgressRuntime {
      * Where a new flow goes: the address to dial, or the code that refuses it, and the name it was
      * resolved from (null for a flow to the address itself).
      */
-    record Choice(int address, String code, String name) {
-        Choice(int address, String code) {
+    record Choice(String address, String code, String name) {
+        Choice(String address, String code) {
             this(address, code, null);
         }
     }
@@ -960,12 +961,12 @@ final class PeerEgressRuntime {
      * allows. With none allowed, the first address's refusal is the answer, so the code the consumer
      * sees is about the address it would have gone to. With nothing resolved, the name did not resolve.
      */
-    static Choice chooseAddress(List<Integer> addresses, IntFunction<String> authorize) {
+    static Choice chooseAddress(List<String> addresses, Function<String, String> authorize) {
         if (addresses == null || addresses.isEmpty()) {
-            return new Choice(0, PeerEgressCodes.NAME_UNRESOLVED);
+            return new Choice(null, PeerEgressCodes.NAME_UNRESOLVED);
         }
         String first = null;
-        for (int address : addresses) {
+        for (String address : addresses) {
             String code = authorize.apply(address);
             if (code == null) {
                 return new Choice(address, null);
@@ -974,7 +975,40 @@ final class PeerEgressRuntime {
                 first = code;
             }
         }
-        return new Choice(0, first);
+        return new Choice(null, first);
+    }
+
+    /**
+     * Whether this egress connects to IPv6 targets, and so announces {@code ipv6TargetCapable}: a
+     * name with no A record is dialled over its AAAA records. Only the egress's own socket is IPv6;
+     * the consumer still reaches the flow at its IPv4 fake address.
+     */
+    static final boolean IPV6_TARGET_CAPABLE = true;
+
+    /**
+     * The order a name's addresses are tried in: its A records, or, when it has none and this egress
+     * connects to IPv6 targets, its AAAA records ({@code protocol/spec/peer-egress-dns.md}).
+     */
+    static List<String> dialCandidates(List<String> a, List<String> aaaa, boolean ipv6Capable) {
+        return !a.isEmpty() || !ipv6Capable ? a : aaaa;
+    }
+
+    /**
+     * An address the way the judgment reads it: dotted for IPv4 and RFC 5952 for IPv6, without a
+     * scope; {@link InetAddress#getHostAddress()} writes neither form for IPv6.
+     */
+    static String formatTarget(InetAddress address) {
+        byte[] bytes = address.getAddress();
+        if (bytes.length == 4) {
+            return address.getHostAddress();
+        }
+        long high = 0;
+        long low = 0;
+        for (int index = 0; index < 8; index++) {
+            high = (high << 8) | (bytes[index] & 0xFFL);
+            low = (low << 8) | (bytes[index + 8] & 0xFFL);
+        }
+        return Ipv6Cidr.formatAddress(high, low);
     }
 
     /**
@@ -987,12 +1021,12 @@ final class PeerEgressRuntime {
      */
     private Choice resolveDestination(long consumer, PeerEgressFlowTable.Key key) {
         String name;
-        Function<String, List<Integer>> resolver;
+        Function<String, List<String>> resolver;
         lock.lock();
         try {
             name = names.lookup(consumer, key.remoteIp());
             if (name == null) {
-                return new Choice(key.remoteIp(), null);
+                return new Choice(Ipv4Cidr.format(key.remoteIp()), null);
             }
             if (!resolving.add(key)) {
                 return null;
@@ -1001,7 +1035,7 @@ final class PeerEgressRuntime {
         } finally {
             lock.unlock();
         }
-        List<Integer> addresses;
+        List<String> addresses;
         try {
             addresses = resolver.apply(name);
         } catch (RuntimeException failed) {
@@ -1019,21 +1053,26 @@ final class PeerEgressRuntime {
 
     /**
      * This device's own resolver: the egress resolves in its own network, which is the point of
-     * sending the name rather than an address. IPv4 only, in the order the resolver returned them.
+     * sending the name rather than an address. A records in the order the resolver returned them, and
+     * AAAA records only for a name that has none ({@link #dialCandidates}). An address of either
+     * family then goes through the same authorization, so a name rebound to an IPv6 loopback or
+     * private address is refused like an IPv4 one.
      */
-    static List<Integer> resolveName(String name) {
-        List<Integer> addresses = new ArrayList<>();
+    static List<String> resolveName(String name) {
+        List<String> a = new ArrayList<>();
+        List<String> aaaa = new ArrayList<>();
         try {
             for (InetAddress address : InetAddress.getAllByName(name)) {
-                if (address instanceof Inet4Address v4) {
-                    byte[] b = v4.getAddress();
-                    addresses.add(((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF));
+                if (address instanceof Inet4Address) {
+                    a.add(formatTarget(address));
+                } else if (address instanceof Inet6Address) {
+                    aaaa.add(formatTarget(address));
                 }
             }
         } catch (java.net.UnknownHostException unresolved) {
             return List.of();
         }
-        return addresses;
+        return dialCandidates(a, aaaa, IPV6_TARGET_CAPABLE);
     }
 
     /**

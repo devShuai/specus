@@ -74,7 +74,7 @@
           "match": {
             "type": "string",
             "minLength": 1,
-            "description": "IPv4 地址或 CIDR，主机位必须为零。域名与 IPv6 在一期被拒绝（EGRESS_RULE_DOMAIN_UNSUPPORTED / EGRESS_RULE_IPV6_UNSUPPORTED），0.0.0.0/0 被拒绝（EGRESS_RULE_DEFAULT_ROUTE）。"
+            "description": "IPv4 或 IPv6 地址或 CIDR，主机位必须为零；IPv6 只写十六进制（不带区域、方括号或点分 IPv4），IPv4 映射段 ::ffff:0:0/96 内的被拒绝（EGRESS_RULE_MALFORMED）。未开启 DNS 接管时域名被拒绝（EGRESS_RULE_DOMAIN_UNSUPPORTED）；客户端还不能承载 IPv6 流量，写法正确的 IPv6 规则暂不生效（EGRESS_RULE_IPV6_UNSUPPORTED）；0.0.0.0/0 与 ::/0 被拒绝（EGRESS_RULE_DEFAULT_ROUTE）。"
           },
           "action": {
             "enum": [

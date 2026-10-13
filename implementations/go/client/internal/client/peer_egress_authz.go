@@ -125,6 +125,42 @@ func (c egressCIDR) contains(address uint32) bool {
 	return address&mask == c.network&mask
 }
 
+// egressTarget is a destination as the judgment reads it, IPv4 or IPv6.
+type egressTarget struct {
+	v4  uint32
+	v6  [16]byte
+	is6 bool
+}
+
+// parseEgressTarget reads a destination: IPv6 when it has a colon, with the spelling the rules use,
+// IPv4 otherwise. Anything else is refused by the caller.
+func parseEgressTarget(text string) (egressTarget, bool) {
+	if strings.Contains(text, ":") {
+		address, ok := parseEgressAddress6(text)
+		return egressTarget{v6: address, is6: true}, ok
+	}
+	address, ok := parseEgressAddress(text)
+	return egressTarget{v4: address}, ok
+}
+
+// in reports whether a prefix of the target's own family in cidrs contains it. Prefixes of the
+// other family, and anything that does not read, are passed over: a list can mix both.
+func (t egressTarget) in(cidrs []string) bool {
+	if !t.is6 {
+		return egressContainedIn(t.v4, cidrs)
+	}
+	for _, text := range cidrs {
+		text = strings.TrimSpace(text)
+		if !strings.Contains(text, ":") {
+			continue
+		}
+		if cidr, _, ok := parseEgressCIDR6(text); ok && cidr.contains(t.v6) {
+			return true
+		}
+	}
+	return false
+}
+
 func egressContainedIn(address uint32, cidrs []string) bool {
 	for _, text := range cidrs {
 		if cidr, ok := parseEgressCIDR(text); ok && cidr.contains(address) {
@@ -231,16 +267,16 @@ func authorizeEgressFlow(request egressRequest, policy egressPolicy, peerACLAllo
 		return egressDeny(egressCodeConsumerDenied)
 	}
 
-	destination, ok := parseEgressAddress(request.DestinationIP)
+	destination, ok := parseEgressTarget(request.DestinationIP)
 	if !ok {
 		return egressDeny(egressCodeDestinationDenied)
 	}
-	if egressContainedIn(destination, egressForcedDenyFor(context, request)) {
+	if destination.in(egressForcedDenyFor(context, request)) {
 		return egressDeny(egressCodeForbiddenDestType)
 	}
 
 	scope := egressScopePublic
-	if egressContainedIn(destination, egressLANCIDRs) {
+	if destination.in(egressLANCIDRs) || destination.in(egressLANCIDRs6) {
 		scope = egressScopeLAN
 	}
 	if scope != policy.Scope {
@@ -263,9 +299,10 @@ func authorizeEgressFlow(request egressRequest, policy egressPolicy, peerACLAllo
 			portMatched = true
 		}
 	}
+	// A rule covers addresses of its own family only: 0.0.0.0/0 grants no IPv6 address and ::/0
+	// no IPv4 one.
 	for _, rule := range policy.DestinationRules {
-		cidr, ok := parseEgressCIDR(rule.CIDR)
-		if ok && cidr.contains(destination) {
+		if destination.in([]string{rule.CIDR}) {
 			consider(rule.Protocols, rule.PortRanges)
 		}
 	}
@@ -303,9 +340,12 @@ func authorizeEgressFlow(request egressRequest, policy egressPolicy, peerACLAllo
 
 func egressForcedDenyFor(context egressContext, request egressRequest) []string {
 	denied := make([]string, 0, len(egressForcedDenyCIDRs)+len(egressCloudMetadataCIDRs)+
+		len(egressForcedDenyCIDRs6)+len(egressCloudMetadataCIDRs6)+
 		len(context.DeploymentDenyCIDRs)+len(request.LocalInterfaceCIDRs)+1)
 	denied = append(denied, egressForcedDenyCIDRs...)
 	denied = append(denied, egressCloudMetadataCIDRs...)
+	denied = append(denied, egressForcedDenyCIDRs6...)
+	denied = append(denied, egressCloudMetadataCIDRs6...)
 	mesh := context.MeshCIDR
 	if mesh == "" {
 		mesh = egressDefaultMeshCIDR

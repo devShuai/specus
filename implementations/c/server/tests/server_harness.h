@@ -80,6 +80,9 @@ int read_login_response(int fd, int timeout_ms, int *command, int *success, char
  */
 int channel_login(int port, const runtime_session *runtime, const char *role,
                   int *fd_out, char *reason, size_t reason_len);
+/* channel_login that also copies the client name the LOGIN_RESPONSE carries into answered_name. */
+int channel_login_answer(int port, const runtime_session *runtime, const char *role, int *fd_out,
+                         char *answered_name, size_t answered_name_len, char *reason, size_t reason_len);
 /* Reads and discards frames until the server closes the connection. */
 int expect_channel_closed(int fd, int timeout_ms);
 /* A heartbeat answered proves the channel is still bound and served. */
@@ -103,6 +106,9 @@ extern const char *harness_login_environment_extra;
 /* A POST /api/client/auth/login body, signed exactly as protocol/spec/client-auth.md describes. */
 void signed_login_body(const char *api_key, const char *secret, const char *fingerprint,
                        const char *os_user, char *body, size_t body_len);
+/* The same with a chosen nonce. */
+void signed_login_body_with_nonce(const char *api_key, const char *secret, const char *fingerprint,
+                                  const char *os_user, const char *nonce, char *body, size_t body_len);
 /* The real POST /api/client/auth/login with a freshly signed body. */
 int http_client_login(const test_server *server, const char *api_key, const char *secret,
                       const char *fingerprint, const char *os_user, runtime_session *out);

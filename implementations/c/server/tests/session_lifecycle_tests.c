@@ -18,10 +18,17 @@
 #include "protocol.h"
 #include "storage.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+
+#ifndef ST_NAT_CONTROL_SIZE_VECTOR_FILE
+#define ST_NAT_CONTROL_SIZE_VECTOR_FILE "../../../protocol/test-vectors/nat-control-size-v1.json"
+#endif
 
 /* An admin bearer token from the real /auth/login, or NULL; the caller frees it. */
 static char *admin_access_token(const test_server *server)
@@ -774,6 +781,59 @@ static int test_replayed_login_is_rejected(test_server *server)
     return 0;
 }
 
+/*
+ * ClientAuthNonceServiceIntegrationTests.consumesEachApiKeyAndNoncePairOnlyOnce on the real
+ * process: the consumed pairs live in the database (Java's specus_client_auth_nonce), so a login
+ * replayed after a restart, still inside its 60 s timestamp window, is refused; the same nonce
+ * under another api key is a different pair and is accepted.
+ */
+static int scenario_nonce_survives_restart(test_server *server)
+{
+    CHECK(create_credential(server->db_path, "ck_nonce_a", "nonce-secret-a", 2) == 0
+              && create_credential(server->db_path, "ck_nonce_b", "nonce-secret-b", 2) == 0,
+          "credentials not stored");
+    static const char nonce[] = "0123456789abcdef0123456789abcdef";
+    char body[2048];
+    signed_login_body_with_nonce("ck_nonce_a", "nonce-secret-a", "machine-nonce", "alice", nonce,
+                                 body, sizeof(body));
+    int status = 0;
+    char *response = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) == 0
+          && status == 200, "first login answered %d: %s", status, response == NULL ? "" : response);
+    free(response);
+    char rows[32] = "";
+    CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_client_auth_nonce", NULL, 0, rows, sizeof(rows)) == 0
+              && strcmp(rows, "1") == 0,
+          "the consumed nonce is not in the database: %s row(s)", rows);
+
+    int exit_status = server_stop(server, SHUTDOWN_TIMEOUT_MS);
+    char exit_text[160];
+    CHECK(exit_status == 0, "SIGTERM: %s", describe_server_exit(exit_status, exit_text, sizeof(exit_text)));
+    CHECK(server_start(server) == 0, "restart: the server did not come up (its startup error, if any, is above)");
+
+    response = NULL;
+    int replay_ok = http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL,
+                                 &status, &response) == 0
+        && status == 400 && response != NULL
+        && strstr(response, "{\"error\":\"客户端签名 nonce 已使用\"}") != NULL;
+    if (!replay_ok) {
+        fprintf(stderr, "replay after the restart answered %d: %s\n", status, response == NULL ? "" : response);
+    }
+    free(response);
+    CHECK(replay_ok, "a login replayed after a restart was not refused");
+
+    signed_login_body_with_nonce("ck_nonce_b", "nonce-secret-b", "machine-nonce", "bob", nonce, body, sizeof(body));
+    response = NULL;
+    CHECK(http_request(server->admin_port, "POST", "/api/client/auth/login", body, NULL, &status, &response) == 0
+          && status == 200, "the same nonce under another api key answered %d: %s", status,
+          response == NULL ? "" : response);
+    free(response);
+    CHECK(db_scalar(server->db_path, "SELECT COUNT(*) FROM specus_client_auth_nonce", NULL, 0, rows, sizeof(rows)) == 0
+              && strcmp(rows, "2") == 0,
+          "expected one row per (api key, nonce) pair, found %s", rows);
+    return 0;
+}
+
 /* ------------------------------------------------------------------------------------------- */
 /* Login response order                                                                          */
 
@@ -1363,6 +1423,332 @@ static int test_route_change_before_data_published(test_server *server)
     return 0;
 }
 
+static char *read_text_file(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    char *text = NULL;
+    long size = fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
+    if (size > 0 && fseek(file, 0, SEEK_SET) == 0) {
+        text = (char *)malloc((size_t)size + 1U);
+        if (text != NULL && fread(text, 1, (size_t)size, file) == (size_t)size) {
+            text[size] = '\0';
+        } else {
+            free(text);
+            text = NULL;
+        }
+    }
+    fclose(file);
+    return text;
+}
+
+/* Closes a socket with a TCP RST rather than a FIN, so the server's next write to it fails. */
+static void reset_fd(int *fd)
+{
+    struct linger reset = {.l_onoff = 1, .l_linger = 0};
+    (void)setsockopt(*fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    close_fd(fd);
+}
+
+/* The whole answer to a request sent with http_request_start, read until the server closes it. */
+static void http_response_text(int fd, char *out, size_t out_len)
+{
+    size_t used = 0U;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    uint8_t byte = 0U;
+    while (used + 1U < out_len && recv_exact(fd, &byte, 1U, deadline) == 1) {
+        out[used++] = (char)byte;
+    }
+    out[used] = '\0';
+}
+
+/*
+ * One manual push into a control connection that cannot be written. The push is sent while the
+ * control login is held at the gate, published but not yet answered, so it waits for the connection's
+ * send lock; the client then resets the connection and the login is let go, and the login response
+ * and then the push are written into a connection that is gone.
+ */
+static int push_into_reset_control(test_server *server, int index, const char *endpoint, int expect,
+                                   const char *error_contains)
+{
+    char key[64];
+    char secret[64];
+    char machine[64];
+    char what[160];
+    char answer[1024];
+    runtime_session runtime;
+    int control = -1;
+    snprintf(key, sizeof(key), "ck_write_failure_%d", index);
+    snprintf(secret, sizeof(secret), "write-failure-secret-%d", index);
+    snprintf(machine, sizeof(machine), "machine-write-failure-%d", index);
+    CHECK(create_credential(server->db_path, key, secret, 2) == 0, "credential %s not stored", key);
+    CHECK(http_client_login(server, key, secret, machine, "wanda", &runtime) == 0,
+          "http login (status and body above)");
+    char *token = admin_access_token(server);
+    CHECK(token != NULL, "admin login failed");
+
+    CHECK(start_held_login(server, &runtime, "control", "published", &control) == 0,
+          "%s: the control login was never published and held at the gate", endpoint);
+    char path[192];
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld/%s", runtime.client_id, endpoint);
+    int push = http_request_start(server->admin_port, "POST", path, NULL, token);
+    free(token);
+    CHECK(push >= 0, "%s: request not sent", endpoint);
+    CHECK(expect_quiet_while_held(control, push, what, sizeof(what)) == 0,
+          "%s: control login held after publishing, NAT_CONTROL pushed at it: %s", endpoint, what);
+    reset_fd(&control);
+    sleep_ms(100);
+    char release[400];
+    login_gate_path("control", "published-release", release, sizeof(release));
+    int gate = open(release, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK(gate >= 0, "%s: cannot release the control login: %s", endpoint, strerror(errno));
+    close(gate);
+
+    http_response_text(push, answer, sizeof(answer));
+    close_fd(&push);
+    int status = -1;
+    CHECK(sscanf(answer, "HTTP/1.1 %d", &status) == 1 && status == expect,
+          "%s into a reset control connection answered %d, expected %d: %s", endpoint, status, expect, answer);
+    CHECK(status != 409 || strstr(answer, error_contains) != NULL,
+          "%s: the 409 does not name %s: %s", endpoint, error_contains, answer);
+    CHECK(wait_session_status(server->db_path, runtime.session_id, "DISCONNECTED", IO_TIMEOUT_MS) == 0,
+          "%s: session not DISCONNECTED after the client reset its connection", endpoint);
+    clear_login_gate();
+    return 0;
+}
+
+/*
+ * Replays writeFailure of protocol/test-vectors/nat-control-size-v1.json as far as the manual pushes
+ * go: a push that finds the client's control connection but cannot write to it answers the 409 of an
+ * offline client, as the other servers do, where it used to answer 500. Route changes ignore how their
+ * push went, so the vector's createRoute and deleteRoute are not replayed here.
+ */
+static int test_push_into_reset_control_answers_offline(test_server *server)
+{
+    char *vector = read_text_file(ST_NAT_CONTROL_SIZE_VECTOR_FILE);
+    char *scenario = vector == NULL ? NULL : st_json_get_top_level_raw(vector, "writeFailure");
+    free(vector);
+    char *error_contains = scenario == NULL ? NULL : st_json_get_string(scenario, "errorContains");
+    char **steps = NULL;
+    size_t step_count = 0U;
+    int loaded = error_contains != NULL && st_json_get_raw_array(scenario, "steps", &steps, &step_count) == 0;
+    free(scenario);
+    CHECK(loaded, "cannot read writeFailure of %s", ST_NAT_CONTROL_SIZE_VECTOR_FILE);
+
+    int failed = 0;
+    int replayed = 0;
+    for (size_t i = 0; i < step_count && !failed; ++i) {
+        char *op = st_json_get_string(steps[i], "op");
+        int expect = 0;
+        (void)st_json_get_int(steps[i], "expect", &expect);
+        const char *endpoint = op == NULL ? NULL
+            : strcmp(op, "pushNatControl") == 0 ? "nat-control"
+            : strcmp(op, "forceRefreshPortMapping") == 0 ? "force-refresh-port-mapping"
+            : NULL;
+        if (endpoint != NULL) {
+            failed = push_into_reset_control(server, (int)i, endpoint, expect, error_contains);
+            ++replayed;
+        }
+        free(op);
+    }
+    st_json_free_string_array(steps, step_count);
+    free(error_contains);
+    CHECK(!failed, "a manual push into a reset control connection (see above)");
+    CHECK(replayed == 2, "writeFailure has %d manual push step(s), expected 2", replayed);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* A write cut short                                                                             */
+
+/*
+ * The cut-write scenario's server runs with a one-second write timeout. The public connections
+ * opened through one registered port can, with their streams' send windows, carry far more than the
+ * data connection, the server's send buffer and the client's small receive buffer hold. A send that
+ * times out after the receiver let a few bytes through still returns them, so a write can take a few
+ * timeouts to fail: the client waits up to CUT_WRITE_STALL_MAX_MS for the server to log it.
+ */
+#define CUT_WRITE_STREAMS 16
+#define CUT_WRITE_STREAM_BYTES (1024U * 1024U)
+#define CUT_WRITE_FEED_MS 1000
+#define CUT_WRITE_STALL_MAX_MS 20000
+#define CUT_WRITE_DRAIN_MS 15000
+#define CUT_WRITE_LOGGED "[data] write failed"
+
+/*
+ * A connection to the server that receives into a small buffer, so the server's writes to it block
+ * as soon as the test stops reading. SO_RCVBUF is set before connecting, so the window is never
+ * scaled past it.
+ */
+static int connect_local_small_window(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int size = 4096;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0
+        || connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Writes up to len bytes into each public connection, without blocking, until deadline; returns
+ * how many the server took in all. */
+static size_t feed_public_connections(const int *fds, size_t count, size_t len, long long deadline)
+{
+    static uint8_t chunk[64U * 1024U];
+    size_t remaining[CUT_WRITE_STREAMS];
+    size_t fed = 0U;
+    for (size_t i = 0; i < count; ++i) {
+        remaining[i] = len;
+    }
+    while (monotonic_ms() < deadline) {
+        int progressed = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (remaining[i] == 0U) {
+                continue;
+            }
+            ssize_t sent = send(fds[i], chunk, remaining[i] < sizeof(chunk) ? remaining[i] : sizeof(chunk),
+                                MSG_DONTWAIT);
+            if (sent > 0) {
+                remaining[i] -= (size_t)sent;
+                fed += (size_t)sent;
+                progressed = 1;
+            }
+        }
+        if (!progressed) {
+            sleep_ms(20);
+        }
+    }
+    return fed;
+}
+
+/*
+ * Reads a connection until it ends. 0 when the server closed it, having written whole frames up to
+ * then, the last one possibly cut short by the close; -1, with what happened in what, when a frame
+ * was out of step or the connection stayed open.
+ */
+static int read_until_closed(int fd, int timeout_ms, size_t *frames, char *what, size_t what_len)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+    *frames = 0U;
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        st_frame_header header;
+        uint8_t *body = NULL;
+        int rc = remaining <= 0 ? -2 : read_frame(fd, (int)remaining, &header, &body);
+        if (rc == 1) {
+            free(body);
+            ++*frames;
+            continue;
+        }
+        if (rc == 0) {
+            return 0;
+        }
+        if (rc == -2) {
+            snprintf(what, what_len, "still open %d ms after the client read again, after %zu whole frame(s)",
+                     timeout_ms, *frames);
+        } else {
+            snprintf(what, what_len, "frame %zu is out of step: it does not start with a frame header", *frames);
+        }
+        return -1;
+    }
+}
+
+/* Waits until the server's log has a line with text in it: 0, or -1 after timeout_ms. */
+static int wait_server_log(const test_server *server, const char *text, int timeout_ms)
+{
+    long long deadline = monotonic_ms() + timeout_ms;
+    for (;;) {
+        char *log = read_text_file(server->log_path);
+        int found = log != NULL && strstr(log, text) != NULL;
+        free(log);
+        if (found) {
+            return 0;
+        }
+        if (monotonic_ms() >= deadline) {
+            return -1;
+        }
+        sleep_ms(100);
+    }
+}
+
+/*
+ * A write the server's write timeout cuts short leaves part of a frame on the wire, and nothing may
+ * follow it ("帧写入失败" in protocol/spec/control-protocol.md). The client stops reading its data
+ * connection while public connections pour into it; once a write times out partway, the server
+ * writes no other frame there and closes the connection, so the client reads whole frames, then at
+ * most the start of one, then the end. Before, the other streams went on writing after the cut frame
+ * and the connection stayed open. The control connection is not affected.
+ */
+static int test_cut_write_closes_the_connection(test_server *server)
+{
+    char reason[256];
+    char what[200];
+    runtime_session runtime;
+    int control = -1, data = -1;
+    int public_fds[CUT_WRITE_STREAMS];
+    for (size_t i = 0; i < CUT_WRITE_STREAMS; ++i) {
+        public_fds[i] = -1;
+    }
+    int public_port = pick_free_port();
+    CHECK(public_port > 0, "no free port for the public mapping");
+    CHECK(create_credential(server->db_path, "ck_cut_write", "cut-write-secret", 2) == 0,
+          "credential ck_cut_write not stored");
+    CHECK(http_client_login(server, "ck_cut_write", "cut-write-secret", "machine-cut-write", "gina", &runtime) == 0,
+          "http login (status and body above)");
+    CHECK(create_mapping(server->db_path, runtime.client_id, public_port) == 0,
+          "mapping of port %d not stored", public_port);
+    CHECK(channel_login(server->control_port, &runtime, "control", &control, reason, sizeof(reason)) == 1,
+          "control: %s", reason);
+    data = connect_local_small_window(server->control_port);
+    CHECK(data >= 0 && send_login_request(data, &runtime, "data") == 0, "data login not sent");
+    int command = 0;
+    int success = 0;
+    CHECK(read_login_response(data, IO_TIMEOUT_MS, &command, &success, reason, sizeof(reason)) == 1 && success,
+          "data login: %s", reason);
+    CHECK(TIMED(nat_register(data, runtime.client_name, public_port, 9)) == 0,
+          "REGISTER of port %d: %s", public_port, timed_outcome(IO_TIMEOUT_MS));
+    for (size_t i = 0; i < CUT_WRITE_STREAMS; ++i) {
+        CHECK(open_public_stream(data, public_port, &public_fds[i]) == 0,
+              "no OPEN for public connection %zu to port %d", i, public_port);
+    }
+
+    /* The client reads nothing more until a write has timed out, or for long enough that one has. */
+    size_t fed = feed_public_connections(public_fds, CUT_WRITE_STREAMS, CUT_WRITE_STREAM_BYTES,
+                                         monotonic_ms() + CUT_WRITE_FEED_MS);
+    int logged = wait_server_log(server, CUT_WRITE_LOGGED, CUT_WRITE_STALL_MAX_MS);
+    /* Then it reads fast: the window was fixed small at connect time, the buffer need not stay so. */
+    int drain_buffer = 256 * 1024;
+    (void)setsockopt(data, SOL_SOCKET, SO_RCVBUF, &drain_buffer, sizeof(drain_buffer));
+    size_t frames = 0U;
+    CHECK(read_until_closed(data, CUT_WRITE_DRAIN_MS, &frames, what, sizeof(what)) == 0,
+          "data connection after %zu byte(s) were fed through %d public connections: %s",
+          fed, CUT_WRITE_STREAMS, what);
+    CHECK(frames > 0U, "the data connection closed before any DATA frame reached the client");
+    CHECK(logged == 0, "the data connection closed, but no failed write was logged in %d ms",
+          CUT_WRITE_STALL_MAX_MS);
+    CHECK(TIMED(expect_channel_alive(control)) == 0, "control not served after its data connection was closed: %s",
+          timed_outcome(IO_TIMEOUT_MS));
+
+    for (size_t i = 0; i < CUT_WRITE_STREAMS; ++i) {
+        close_fd(&public_fds[i]);
+    }
+    close_fd(&data);
+    close_fd(&control);
+    return 0;
+}
+
 /* Counts the client's closed connection records with the given disconnect reason, or -1. */
 static int connection_reason_count(const char *db_path, const char *client_name, const char *reason)
 {
@@ -1550,6 +1936,10 @@ int main(int argc, char **argv)
     failures += run_on_fresh_server("dead channel cleanup", test_dead_channel_is_cleaned_up, short_idle);
     failures += run_on_fresh_server("connection roles refuse the other role's frames", test_connection_roles, NULL);
     failures += run_on_fresh_server("SIGTERM shutdown and restart cleanup", scenario_shutdown_and_restart, NULL);
+    failures += run_on_fresh_server("consumed login nonces survive a restart", scenario_nonce_survives_restart, NULL);
+    static const char *const short_write_timeout[] = {"SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS=1", NULL};
+    failures += run_on_fresh_server("a write cut short by the write timeout closes the connection, nothing follows it",
+                                    test_cut_write_closes_the_connection, short_write_timeout);
 
     const char *tmp = getenv("TMPDIR");
     snprintf(login_gate_dir, sizeof(login_gate_dir), "%s/specus-c-login-gate-XXXXXX",
@@ -1574,6 +1964,9 @@ int main(int argc, char **argv)
     clear_login_gate();
     failures += run_on_fresh_server("a route change before a data login is published reaches its routes",
                                     test_route_change_before_data_published, login_gate);
+    clear_login_gate();
+    failures += run_on_fresh_server("a manual NAT_CONTROL push into a reset control connection answers offline",
+                                    test_push_into_reset_control_answers_offline, login_gate);
     clear_login_gate();
     rmdir(login_gate_dir);
 

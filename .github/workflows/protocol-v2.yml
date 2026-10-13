@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/protocol-v2.yml"
       - "apps/admin-web/**"
+      - "implementations/android/**"
       - "implementations/c/**"
       - "implementations/csharp/**"
       - "implementations/go/**"
@@ -17,6 +18,7 @@ on:
     paths:
       - ".github/workflows/protocol-v2.yml"
       - "apps/admin-web/**"
+      - "implementations/android/**"
       - "implementations/c/**"
       - "implementations/csharp/**"
       - "implementations/go/**"
@@ -134,6 +136,61 @@ jobs:
         working-directory: implementations/go/server
         run: go test ./... -count=1
 
+  # The Java and .NET suites ran only in the release, so a pull request could break either server
+  # with every check here green. Both run whole, with the management page built as the release
+  # builds it: a few tests fetch its real assets.
+  java-server:
+    name: Java server
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+
+      - name: Build admin web into Java server resources
+        run: |
+          npm --prefix apps/admin-web ci
+          npm --prefix apps/admin-web run deploy:java
+
+      - name: Test Java modules
+        run: >-
+          mvn -B -pl implementations/java/server,implementations/java/client,implementations/java/stun-server -am
+          -Dspecus.server.web.skip=true test
+
+  dotnet-server:
+    name: .NET server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+
+      - name: Build admin web into .NET server wwwroot
+        run: |
+          npm --prefix apps/admin-web ci
+          npm --prefix apps/admin-web run deploy:csharp
+
+      - name: Test .NET server
+        run: >-
+          dotnet test implementations/csharp/server/Specus.slnx
+          -p:SpecusServerWebSkip=true
+
   c-linux:
     name: C server (Linux)
     runs-on: ubuntu-latest
@@ -148,7 +205,7 @@ jobs:
       - name: Refresh package metadata
         run: sudo apt-get update
       - name: Install native dependencies
-        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev redis-server
+        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev libbrotli-dev redis-server
       - name: Configure
         run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -167,11 +224,15 @@ jobs:
       # upstream logs here on exit, passed or failed; the last step uploads them for review.
       - name: Keep client E2E logs
         run: echo "SPECUS_E2E_LOG_DIR=$RUNNER_TEMP/c-server-e2e-logs" >> "$GITHUB_ENV"
+      # The Makefile build is checked on its own: its unit tests take minutes, and the E2E steps below
+      # each have a few minutes for the end-to-end part alone.
+      - name: Makefile build and unit tests
+        run: timeout --preserve-status 600s make -C implementations/c/server test
       - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
-        run: timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+        run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Java client SQLite runtime configuration E2E
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
-        run: timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
+        run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
       - name: Java client Direct HTTP and WebSocket E2E
         if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.java-client.outcome == 'success' }}
         run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
@@ -256,6 +317,49 @@ jobs:
         run: |
           dll="$GITHUB_WORKSPACE/implementations/csharp/client/src/Specus.Client/bin/Release/net10.0/specus-client.dll"
           SPECUS_CLIENT_COMMAND="dotnet $dll" SPECUS_CLIENT_LABEL=.NET SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/peer_mesh_e2e.sh
+      # The Android client core (SpecusCore.Runtime) on this JVM: :app:jvmClientLauncher writes a
+      # launcher for JvmClientMain from its unit-test sources, which takes the same arguments as the
+      # other clients (and answers `peers` for the Peer Mesh roster checks). It runs without a VPN
+      # platform, as peerMeshDevice=noop; foreground service, VpnService/TUN and UI stay with the
+      # device tests. The runner image ships the Android SDK the Gradle build needs.
+      - name: Set up Gradle for the Android client
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build the Android client for the JVM
+        id: android-client
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
+        working-directory: implementations/android/client
+        run: ./gradlew :app:jvmClientLauncher --no-daemon
+      - name: Android client NAT, heartbeat and Direct HTTP/WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
+      - name: Android client SQLite runtime configuration E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/runtime_config_e2e.sh
+      - name: Android client Direct HTTP and WebSocket E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/direct_route_e2e.sh
+      - name: Android client control TLS E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
+            timeout --preserve-status 180s bash implementations/c/server/scripts/tls_client_e2e.sh
+      - name: Android client Peer Mesh signalling and TURN relay E2E
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' && steps.android-client.outcome == 'success' }}
+        run: |
+          SPECUS_CLIENT_COMMAND="$GITHUB_WORKSPACE/implementations/android/client/app/build/jvm-client/specus-android-jvm-client" \
+          SPECUS_CLIENT_LABEL=Android SPECUS_SMOKE_REUSE_BUILD=1 \
             timeout --preserve-status 180s bash implementations/c/server/scripts/peer_mesh_e2e.sh
 
       - name: Validate netem helper
