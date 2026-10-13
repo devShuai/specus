@@ -205,14 +205,24 @@ jobs:
       - name: Refresh package metadata
         run: sudo apt-get update
       - name: Install native dependencies
-        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev libbrotli-dev redis-server
+        run: sudo apt-get install -y cmake build-essential gdb zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev libbrotli-dev redis-server
+      - name: Configure native crash evidence
+        run: |
+          mkdir -p "$RUNNER_TEMP/c-server-cores"
+          # This job owns its ephemeral runner. %E identifies the exact executable; %P avoids
+          # collisions between native tests and the server processes they launch.
+          sudo sysctl -w "kernel.core_pattern=$RUNNER_TEMP/c-server-cores/core.%P.%E"
+      - name: Test native crash diagnostics
+        run: bash implementations/c/server/scripts/collect_core_diagnostics_test.sh
       - name: Configure
-        run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -g"
       - name: Build
         id: c-build
         run: cmake --build build/c-server --parallel
       - name: Test
-        run: ctest --test-dir build/c-server --output-on-failure
+        run: |
+          ulimit -c unlimited
+          ctest --test-dir build/c-server --output-on-failure
       - name: TLS full-duplex and KeyUpdate under ThreadSanitizer
         run: |
           cmake -S implementations/c/server -B build/c-server-tsan \
@@ -237,7 +247,10 @@ jobs:
       # The Makefile build is checked on its own: its unit tests take minutes, and the E2E steps below
       # each have a few minutes for the end-to-end part alone.
       - name: Makefile build and unit tests
-        run: timeout --preserve-status 600s make -C implementations/c/server test
+        run: |
+          ulimit -c unlimited
+          timeout --preserve-status 600s make -C implementations/c/server test \
+            CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -g"
       - name: Java client NAT, heartbeat and Direct HTTP/WebSocket E2E
         run: SPECUS_SMOKE_REUSE_BUILD=1 timeout --preserve-status 180s bash implementations/c/server/scripts/nat_e2e_smoke.sh
       - name: Java client SQLite runtime configuration E2E
@@ -374,6 +387,17 @@ jobs:
 
       - name: Validate netem helper
         run: bash -n tools/loadtest/netem-profile.sh
+      - name: Collect native crash evidence
+        if: always()
+        run: bash implementations/c/server/scripts/collect_core_diagnostics.sh "$RUNNER_TEMP/c-server-cores" "$GITHUB_WORKSPACE"
+      - name: Upload native crash diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-server-crash-diagnostics
+          path: ${{ runner.temp }}/c-server-cores/*.backtrace.txt
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload client E2E logs
         if: always()
         uses: actions/upload-artifact@v4
