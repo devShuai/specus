@@ -20,6 +20,17 @@ import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.service.ClientAccountService.ClientMutation;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import jakarta.persistence.EntityManager;
+import com.theshuai.specusserver.management.model.PeerMeshEgressPolicy;
+import com.theshuai.specusserver.management.model.PeerMeshSharedService;
+import com.theshuai.specusserver.management.model.PeerMeshSession;
+import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
+import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import io.netty.channel.embedded.EmbeddedChannel;
+import com.theshuai.common.session.Session;
+import com.theshuai.specusserver.session.SessionUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -49,9 +60,16 @@ class ClientAccountServiceTests {
     @Autowired private TrafficUsageRepository trafficUsageRepository;
     @Autowired private ResourceTrafficUsageRepository resourceTrafficUsageRepository;
     @Autowired private EntityManager entityManager;
+    @Autowired private PeerMeshEgressPolicyRepository egressRepository;
+    @Autowired private PeerMeshSharedServiceRepository sharedServiceRepository;
+    @Autowired private PeerMeshSessionRepository peerSessionRepository;
+    @Autowired private PlatformTransactionManager transactionManager;
 
     @AfterEach
     void tearDown() {
+        peerSessionRepository.deleteAll();
+        sharedServiceRepository.deleteAll();
+        egressRepository.deleteAll();
         resourceTrafficUsageRepository.deleteAll();
         trafficUsageRepository.deleteAll();
         peerMeshAclRepository.deleteAll();
@@ -176,6 +194,144 @@ class ClientAccountServiceTests {
         assertThat(peerMeshAclRepository.findById(acl.getId()).orElseThrow().getSourceClientName()).isEqualTo("source-new");
         assertThat(trafficUsageRepository.findById(traffic.getId()).orElseThrow().getClientName()).isEqualTo("source-new");
         assertThat(resourceTrafficUsageRepository.findById(resourceTraffic.getId()).orElseThrow().getClientName()).isEqualTo("source-new");
+    }
+
+    @Test
+    void deleteCleansBothAclDirectionsAndPeerReferencesWithoutWideningAllowLists() {
+        ClientAccount removed = createClient(TenantContext.defaultTenant(), "removed");
+        ClientAccount kept = createClient(TenantContext.defaultTenant(), "kept");
+        ClientAccount other = createClient(TenantContext.defaultTenant(), "other");
+        PeerMeshDevice device = saveDevice(removed, removed.getTenantId());
+        PeerMeshDevice foreignDevice = saveDevice(removed, "foreign");
+        saveAcl(removed, kept, removed.getTenantId());
+        saveAcl(kept, removed, removed.getTenantId());
+        PeerMeshAcl unrelated = saveAcl(kept, other, kept.getTenantId());
+        PeerMeshAcl foreignAcl = saveAcl(removed, kept, "foreign");
+        PeerMeshEgressPolicy ownPolicy = savePolicy(removed, kept.getId().toString());
+        PeerMeshEgressPolicy otherPolicy = savePolicy(kept, removed.getId() + "," + other.getId());
+        PeerMeshSharedService ownService = saveService(removed, "own", "");
+        PeerMeshSharedService lastRecipient = saveService(kept, "last", removed.getId().toString());
+        PeerMeshSharedService remaining = saveService(kept, "remaining", removed.getId() + "," + other.getId());
+        PeerMeshSharedService allPeers = saveService(kept, "all", "");
+        PeerMeshSession session = saveSession(removed, kept);
+
+        clientAccountService.deleteClient(TenantContext.defaultTenant(), removed.getId());
+
+        assertThat(clientAccountRepository.findById(removed.getId())).isEmpty();
+        assertThat(peerMeshDeviceRepository.findById(device.getId())).isEmpty();
+        assertThat(peerMeshDeviceRepository.findById(foreignDevice.getId())).isPresent();
+        assertThat(peerMeshAclRepository.findAll()).extracting(PeerMeshAcl::getId)
+                .containsExactlyInAnyOrder(unrelated.getId(), foreignAcl.getId());
+        assertThat(egressRepository.findById(ownPolicy.getId())).isEmpty();
+        assertThat(egressRepository.findById(otherPolicy.getId()).orElseThrow().getAllowedConsumerClientIds())
+                .isEqualTo(other.getId().toString());
+        assertThat(sharedServiceRepository.findById(ownService.getId())).isEmpty();
+        PeerMeshSharedService disabled = sharedServiceRepository.findById(lastRecipient.getId()).orElseThrow();
+        assertThat(disabled.getAllowedClientIds()).isEmpty();
+        assertThat(disabled.isEnabled()).isFalse();
+        assertThat(sharedServiceRepository.findById(remaining.getId()).orElseThrow().getAllowedClientIds())
+                .isEqualTo(other.getId().toString());
+        assertThat(sharedServiceRepository.findById(allPeers.getId()).orElseThrow().isEnabled()).isTrue();
+        PeerMeshSession history = peerSessionRepository.findById(session.getId()).orElseThrow();
+        assertThat(history.getStatus()).isEqualTo(PeerMeshService.STATUS_CLOSED);
+        assertThat(history.getClosedAt()).isNotBlank();
+        assertThat(history.getSourceClientName()).isEqualTo("removed");
+    }
+
+    @Test
+    void deleteRollsBackClientPeerRowsAndSessionTogether() {
+        ClientAccount removed = createClient(TenantContext.defaultTenant(), "rollback-removed");
+        ClientAccount kept = createClient(TenantContext.defaultTenant(), "rollback-kept");
+        PeerMeshDevice device = saveDevice(removed, removed.getTenantId());
+        PeerMeshAcl acl = saveAcl(removed, kept, removed.getTenantId());
+        PeerMeshEgressPolicy policy = savePolicy(kept, removed.getId().toString());
+        PeerMeshSharedService service = saveService(kept, "rollback", removed.getId().toString());
+        PeerMeshSession session = saveSession(removed, kept);
+        new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+            clientAccountService.deleteClient(TenantContext.defaultTenant(), removed.getId());
+            status.setRollbackOnly();
+        });
+        assertThat(clientAccountRepository.findById(removed.getId())).isPresent();
+        assertThat(peerMeshDeviceRepository.findById(device.getId())).isPresent();
+        assertThat(peerMeshAclRepository.findById(acl.getId())).isPresent();
+        assertThat(egressRepository.findById(policy.getId()).orElseThrow().getAllowedConsumerClientIds())
+                .isEqualTo(removed.getId().toString());
+        assertThat(sharedServiceRepository.findById(service.getId()).orElseThrow().isEnabled()).isTrue();
+        assertThat(peerSessionRepository.findById(session.getId()).orElseThrow().getStatus()).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    void deletingAnOnlineClientClosesItOnlyAfterCommit() {
+        ClientAccount removed = createClient(TenantContext.defaultTenant(), "online-delete");
+        EmbeddedChannel channel = new EmbeddedChannel();
+        SessionUtil.bindSession(new Session(removed.getClientName()), channel);
+        try {
+            new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                clientAccountService.deleteClient(TenantContext.defaultTenant(), removed.getId());
+                assertThat(channel.isOpen()).isTrue();
+                status.setRollbackOnly();
+            });
+            assertThat(channel.isOpen()).isTrue();
+            assertThat(clientAccountService.findClientByName(removed.getClientName())).isPresent();
+            new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                clientAccountService.deleteClient(TenantContext.defaultTenant(), removed.getId());
+                assertThat(channel.isOpen()).isTrue();
+            });
+            assertThat(channel.isOpen()).isFalse();
+            assertThat(clientAccountService.findClientByName(removed.getClientName())).isEmpty();
+        } finally {
+            SessionUtil.unBindSession(channel);
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    private PeerMeshDevice saveDevice(ClientAccount account, String tenant) {
+        PeerMeshDevice row = new PeerMeshDevice();
+        row.setId(ClientIdGenerator.newId()); row.setTenantId(tenant); row.setOwnerUsername("admin");
+        row.setClientId(account.getId()); row.setClientName(account.getClientName());
+        row.setVirtualIp("100.96.0.10"); row.setCidr("100.96.0.0/11");
+        row.setCreatedAt("2026-10-13T00:00:00Z"); row.setUpdatedAt(row.getCreatedAt());
+        return peerMeshDeviceRepository.save(row);
+    }
+
+    private PeerMeshAcl saveAcl(ClientAccount source, ClientAccount target, String tenant) {
+        PeerMeshAcl row = new PeerMeshAcl();
+        row.setId(ClientIdGenerator.newId()); row.setTenantId(tenant); row.setOwnerUsername("admin");
+        row.setSourceClientId(source.getId()); row.setSourceClientName(source.getClientName());
+        row.setTargetClientId(target.getId()); row.setTargetClientName(target.getClientName());
+        row.setCreatedAt("2026-10-13T00:00:00Z"); row.setUpdatedAt(row.getCreatedAt());
+        return peerMeshAclRepository.save(row);
+    }
+
+    private PeerMeshEgressPolicy savePolicy(ClientAccount account, String allowed) {
+        PeerMeshEgressPolicy row = new PeerMeshEgressPolicy();
+        row.setId(ClientIdGenerator.newId()); row.setTenantId(account.getTenantId()); row.setOwnerUsername("admin");
+        row.setEgressClientId(account.getId()); row.setEgressClientName(account.getClientName());
+        row.setAllowedConsumerClientIds(allowed); row.setEnabled(true);
+        row.setCreatedAt("2026-10-13T00:00:00Z"); row.setUpdatedAt(row.getCreatedAt());
+        return egressRepository.save(row);
+    }
+
+    private PeerMeshSharedService saveService(ClientAccount account, String name, String allowed) {
+        PeerMeshSharedService row = new PeerMeshSharedService();
+        row.setId(ClientIdGenerator.newId()); row.setTenantId(account.getTenantId());
+        row.setClientId(account.getId()); row.setClientName(account.getClientName());
+        row.setServiceId(name); row.setName(name); row.setApplication("http");
+        row.setTargetHost("127.0.0.1"); row.setTargetPort(8080); row.setPublishedPort(8080);
+        row.setVisibility("ACL"); row.setAllowedClientIds(allowed); row.setEnabled(true);
+        row.setCreatedAt("2026-10-13T00:00:00Z"); row.setUpdatedAt(row.getCreatedAt());
+        return sharedServiceRepository.save(row);
+    }
+
+    private PeerMeshSession saveSession(ClientAccount source, ClientAccount target) {
+        PeerMeshSession row = new PeerMeshSession();
+        row.setId(ClientIdGenerator.newId()); row.setTenantId(source.getTenantId());
+        row.setSourceClientId(source.getId()); row.setSourceClientName(source.getClientName());
+        row.setTargetClientId(target.getId()); row.setTargetClientName(target.getClientName());
+        row.setPathType("DIRECT"); row.setStatus("ACTIVE");
+        row.setStartedAt("2026-10-13T00:00:00Z"); row.setUpdatedAt(row.getStartedAt());
+        row.setExpiresAt("2099-01-01T00:00:00.000000000Z");
+        return peerSessionRepository.save(row);
     }
 
     private ClientAccount createClient(TenantContext tenant, String clientName) {

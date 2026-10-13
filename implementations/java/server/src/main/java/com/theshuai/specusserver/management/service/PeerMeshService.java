@@ -771,16 +771,32 @@ public class PeerMeshService {
     @Transactional
     public List<PeerMeshSessionView> closeOpenSessionsForDevice(ManagementContext context, long clientId) {
         PeerMeshDevice device = findAccessibleDevice(context, clientId);
+        return closeOpenSessionsForClient(context.tenant().tenantId(), device.getClientId());
+    }
+
+    /** Also closes sessions for a deleted client whose device row was already absent. */
+    @Transactional
+    public List<PeerMeshSessionView> closeOpenSessionsForClient(String tenantId, long clientId) {
         Instant now = Instant.now();
         List<PeerMeshSession> sessions = sessionRepository.findOpenByClientId(
-                context.tenant().tenantId(),
-                device.getClientId(),
+                tenantId,
+                clientId,
                 STATUS_CLOSED);
         for (PeerMeshSession session : sessions) {
-            markClosed(session, now);
+            markClosedState(session, now);
         }
         if (!sessions.isEmpty()) {
             sessionRepository.saveAll(sessions);
+            List<Long> ids = sessions.stream().map(PeerMeshSession::getId).toList();
+            Runnable evict = () -> ids.forEach(this::evictClosedSession);
+            if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()) {
+                org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                        new org.springframework.transaction.support.TransactionSynchronization() {
+                            @Override public void afterCommit() { evict.run(); }
+                        });
+            } else {
+                evict.run();
+            }
         }
         return sessions.stream().map(this::toSessionView).toList();
     }
@@ -1435,6 +1451,11 @@ public class PeerMeshService {
     }
 
     private void markClosed(PeerMeshSession session, Instant now) {
+        markClosedState(session, now);
+        evictClosedSession(session.getId());
+    }
+
+    private void markClosedState(PeerMeshSession session, Instant now) {
         if (!STATUS_CLOSED.equals(session.getStatus())) {
             session.setStatus(STATUS_CLOSED);
         }
@@ -1442,10 +1463,13 @@ public class PeerMeshService {
             session.setClosedAt(now.toString());
         }
         session.setUpdatedAt(now.toString());
-        if (session.getId() != null) {
-            relayAuthorizationCache.remove(session.getId());
-            pendingRelayBytes.remove(session.getId());
-            sessionTokenCache.remove(session.getId());
+    }
+
+    private void evictClosedSession(Long sessionId) {
+        if (sessionId != null) {
+            relayAuthorizationCache.remove(sessionId);
+            pendingRelayBytes.remove(sessionId);
+            sessionTokenCache.remove(sessionId);
         }
     }
 

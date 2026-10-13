@@ -322,6 +322,42 @@ class PeerServiceDiscoveryServiceTests {
         }
     }
 
+    @Test
+    void deletedPublisherWithdrawsCatalogEvenAfterItsAccountRowIsGone() {
+        ClientAccount publisher = client(1, "alice", "deleted-publisher");
+        ClientAccount peer = client(2, "alice", "remaining-recipient");
+        PeerMeshSharedService definition = definition(publisher);
+        PeerMeshServiceSharing sharing = new PeerMeshServiceSharing();
+        sharing.setTenantId("tenant-a"); sharing.setEnabled(true);
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.of(sharing));
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L))
+                .thenReturn(Optional.of(device(1, publisher.getClientName(), true)));
+        when(serviceRepository.findByTenantIdAndClientIdOrderByNameAsc("tenant-a", 1L))
+                .thenReturn(List.of(definition));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, peer));
+        when(peerMeshService.allowedRoster(publisher)).thenReturn(List.of(new PeerMeshService.PeerRosterItem(
+                2L, peer.getClientName(), "100.96.0.2", "pk", true, false, false, false, false, 0, 2, List.of("ssh"))));
+        service.acceptReport(publisher, reportMessage(definition.getServiceId()), 99L);
+        assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNotNull();
+
+        when(clientAccountRepository.findByIdAndTenantId(1L, "tenant-a")).thenReturn(Optional.empty());
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(peer));
+        EmbeddedChannel recipient = new EmbeddedChannel();
+        SessionUtil.bindSession(new Session(peer.getClientName()), recipient);
+        try {
+            var deliveries = service.withdrawDeletedClient(publisher);
+            assertThat(deliveries).hasSize(1);
+            assertThat(deliveries.getFirst().catalog().getPublisherClientId()).isEqualTo(1L);
+            assertThat(deliveries.getFirst().catalog().getServices()).isEmpty();
+            assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNull();
+            assertThat(service.trackedCatalogRevisionCount()).isZero();
+        } finally {
+            SessionUtil.unBindSession(recipient);
+            recipient.finishAndReleaseAll();
+        }
+    }
+
     private static ManagementContext admin() {
         return new ManagementContext(new TenantContext("tenant-a"), "admin", true);
     }

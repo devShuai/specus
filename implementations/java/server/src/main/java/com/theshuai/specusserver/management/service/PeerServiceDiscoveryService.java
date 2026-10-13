@@ -391,8 +391,29 @@ public class PeerServiceDiscoveryService {
     }
 
     private List<CatalogDelivery> republishClient(String tenantId, long clientId, String reason) {
-        List<CatalogDelivery> deliveries = new ArrayList<>();
         ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(clientId, tenantId).orElse(null);
+        return withdrawClientCatalogs(tenantId, clientId, publisher, reason);
+    }
+
+    /** The publisher row is gone, but peers still need an empty snapshot for its old catalog. */
+    public List<CatalogDelivery> withdrawDeletedClient(ClientAccount publisher) {
+        List<CatalogDelivery> deliveries = withdrawClientCatalogs(
+                publisher.getTenantId(), publisher.getId(), publisher, "client-deleted");
+        catalogRevisions.keySet().removeIf(key -> {
+            if (!key.tenantId().equals(publisher.getTenantId()) || key.publisherClientId() != publisher.getId()) {
+                return false;
+            }
+            reportRevisions.remove(key);
+            mdnsCandidates.remove(key);
+            reportTimestamps.remove(key.publisherSessionId());
+            return true;
+        });
+        return deliveries;
+    }
+
+    private List<CatalogDelivery> withdrawClientCatalogs(String tenantId, long clientId,
+                                                        ClientAccount publisher, String reason) {
+        List<CatalogDelivery> deliveries = new ArrayList<>();
         catalogs.entrySet().removeIf(entry -> {
             if (!tenantId.equals(entry.getKey().tenantId()) || entry.getKey().publisherClientId() != clientId) {
                 return false;

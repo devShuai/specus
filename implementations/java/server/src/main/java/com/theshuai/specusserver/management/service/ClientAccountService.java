@@ -19,6 +19,8 @@ import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
@@ -53,6 +55,7 @@ public class ClientAccountService {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final HttpShareService httpShareService;
     private final WorkbenchReferences workbenchReferences;
+    private final ClientPeerReferences clientPeerReferences;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
@@ -60,7 +63,8 @@ public class ClientAccountService {
                                 ClientNameReferenceRepository clientNameReferenceRepository,
                                 HttpRouteMappingRepository httpRouteMappingRepository,
                                 HttpShareService httpShareService,
-                                WorkbenchReferences workbenchReferences) {
+                                WorkbenchReferences workbenchReferences,
+                                ClientPeerReferences clientPeerReferences) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
@@ -68,6 +72,7 @@ public class ClientAccountService {
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
+        this.clientPeerReferences = clientPeerReferences;
     }
 
     @Transactional(readOnly = true)
@@ -247,13 +252,20 @@ public class ClientAccountService {
         // Every identity's workbench reference to the client's services goes in this transaction,
         // looked up by client id while the route rows still exist.
         workbenchReferences.forgetClientServices(account.getId());
+        clientPeerReferences.forgetClient(account);
         List<HttpRouteMapping> routes = httpRouteMappingRepository.findByClientIdOrderByIdDesc(account.getId());
         httpShareService.onClientDeleted(actor, routes);
         httpRouteMappingRepository.deleteAll(routes);
         httpRouteMappingRepository.flush();
-        closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
-        invalidateNameCache(account.getClientName());
         clientAccountRepository.delete(account);
+        // A failed delete must not disconnect a client that still exists after rollback.
+        String clientName = account.getClientName();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() {
+                invalidateNameCache(clientName);
+                closeOnlineChannel(clientName, DisconnectReason.ADMIN_DELETED);
+            }
+        });
     }
 
     @Transactional(readOnly = true)

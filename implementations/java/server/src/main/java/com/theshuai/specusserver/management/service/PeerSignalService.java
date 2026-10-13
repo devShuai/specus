@@ -20,6 +20,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.event.TransactionalEventListener;
 import org.springframework.util.StringUtils;
 
 import java.nio.charset.StandardCharsets;
@@ -28,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 @Service
 @Slf4j
@@ -37,6 +39,7 @@ public class PeerSignalService {
     private final PeerServiceDiscoveryService peerServiceDiscoveryService;
     private final ClientSessionRepository clientSessionRepository;
     private final PeerEgressService peerEgressService;
+    private final ConcurrentLinkedQueue<ClientPeerReferences.Deleted> deletedClients = new ConcurrentLinkedQueue<>();
 
     public PeerSignalService(ClientAccountService clientAccountService,
                              PeerMeshService peerMeshService,
@@ -229,6 +232,46 @@ public class PeerSignalService {
                 pushEgress(target);
             }
         });
+    }
+
+    @TransactionalEventListener
+    public void onClientDeleted(ClientPeerReferences.Deleted event) {
+        // The committing thread still owns its JDBC connection here. Queue the refresh so SQLite's
+        // one-connection pool is released before any snapshot query needs that connection again.
+        deletedClients.add(event);
+    }
+
+    @Scheduled(fixedDelay = 100)
+    public void refreshDeletedClients() {
+        for (int i = 0; i < 64; i++) {
+            ClientPeerReferences.Deleted event = deletedClients.poll();
+            if (event == null) return;
+            try {
+                refreshDeletedClient(event);
+            } catch (RuntimeException failure) {
+                deletedClients.add(event);
+                log.warn("[peer-mesh] retrying deleted client refresh tenant={} client={}",
+                        event.tenantId(), event.clientId(), failure);
+                return;
+            }
+        }
+    }
+
+    private void refreshDeletedClient(ClientPeerReferences.Deleted event) {
+        for (PeerMeshSessionView closed : event.closedSessions()) {
+            sendClose(closed);
+        }
+        ClientAccount departed = new ClientAccount();
+        departed.setId(event.clientId());
+        departed.setTenantId(event.tenantId());
+        departed.setClientName(event.clientName());
+        pushCatalogs(peerServiceDiscoveryService.withdrawDeletedClient(departed));
+        pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(event.tenantId()));
+        for (ClientAccount account : clientAccountService.listTenantAccounts(event.tenantId())) {
+            pushConfig(account);
+            pushRoster(account);
+            pushEgress(account);
+        }
     }
 
     public void onClientDisconnected(Long sessionId) {
