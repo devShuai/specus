@@ -6,7 +6,7 @@ import sys
 import threading
 from pathlib import Path
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from lab import (BROAD_GRANT, BURST_SCRIPT, CODE_LIMIT, HOLD_SCRIPT, METADATA_IP, RULE_GRANT,
                  Lab, Proc, p95)
@@ -104,6 +104,33 @@ class PerformanceGateTests(unittest.TestCase):
         instance.gate_median("download", [9.0, 9.0, 9.0, 9.0, 9.0], False, 4.0)
         self.assertFalse(instance.results[-1]["ok"])
         self.assertEqual({}, instance.measurements)
+
+
+class ElapsedClockTests(unittest.TestCase):
+    def lab(self):
+        instance = Lab.__new__(Lab)
+        instance.say = Mock()
+        return instance
+
+    def test_success_duration_does_not_turn_negative_after_wall_clock_rollback(self):
+        instance = self.lab()
+        with patch("lab.time.time", side_effect=[1000, 1000, 995]) as wall, \
+             patch("lab.time.monotonic", side_effect=[10, 10, 10.75]):
+            value, elapsed = instance.wait_for("success", lambda: True, 5)
+        self.assertTrue(value)
+        self.assertEqual(0.75, elapsed)
+        wall.assert_not_called()
+
+    def test_wall_clock_jump_cannot_spend_timeout_budget(self):
+        instance = self.lab()
+        predicate = Mock(side_effect=[False, True])
+        with patch("lab.time.time", side_effect=[1000, 1000, 9_999_999, 9_999_999]) as wall, \
+             patch("lab.time.monotonic", side_effect=[10, 10, 10.5, 11]), patch("lab.time.sleep"):
+            value, elapsed = instance.wait_for("success", predicate, 1)
+        self.assertTrue(value)
+        self.assertEqual(1, elapsed)
+        self.assertEqual(2, predicate.call_count)
+        wall.assert_not_called()
 
 
 class RefusalEvidenceTests(unittest.TestCase):
