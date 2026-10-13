@@ -220,7 +220,9 @@ jobs:
             -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
           cmake --build build/c-server-tsan --target specus_c_tls_transport_tests --parallel
-          TSAN_OPTIONS=halt_on_error=1 timeout 90s build/c-server-tsan/specus_c_tls_transport_tests
+          # Disable ASLR only for this process: newer runner kernels can otherwise map a DSO
+          # into GCC TSan's fixed shadow range before the test even starts.
+          TSAN_OPTIONS=halt_on_error=1 timeout 90s setarch "$(uname -m)" -R build/c-server-tsan/specus_c_tls_transport_tests
       - name: Build Java reference server
         run: mvn -pl :specus-server -am package -DskipTests -Dspecus.server.web.skip=true
       - name: C and Java Redis discovery interoperability E2E
