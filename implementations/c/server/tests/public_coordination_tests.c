@@ -3,6 +3,7 @@
 #include "public_coordination.h"
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -260,6 +261,8 @@ static int run_second_instance(void)
 
 int main(int argc, char **argv)
 {
+    /* hiredis writes without MSG_NOSIGNAL; a dropped Redis connection must fail a call, not the run. */
+    (void)signal(SIGPIPE, SIG_IGN);
     if (argc > 1 && strcmp(argv[1], "--second-instance") == 0) return second_instance();
     if (!st_public_coordination_enabled()
         || st_public_coordination_initialize(capture_event, NULL) != 0) {
