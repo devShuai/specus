@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2732,6 +2733,13 @@ static void apply_runtime_route_config(specus_session *session, server_config *r
 }
 
 static pthread_mutex_t runtime_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * Counts runtime NAT_CONTROL pushes, each counted before it looks for the client's connections.
+ * A login loads its routes in verify_login but publishes its connection only later, and a push in
+ * between finds no connection of that login, so a login that sees the count move pushes again
+ * once it has answered (push_routes_changed_during_login).
+ */
+static atomic_ulong runtime_nat_control_generation;
 
 /*
  * The error a NAT_CONTROL that does not fit one MESSAGE leaves: it was not sent, and the connection is
@@ -2761,6 +2769,7 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
         return -2;
     }
 
+    atomic_fetch_add(&runtime_nat_control_generation, 1UL);
     pthread_mutex_lock(&runtime_nat_control_lock);
     pthread_mutex_lock(&active_session_lock);
     specus_session *control = active_session_find_role_locked(client_name, 0);
@@ -2842,6 +2851,24 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
     session_reference_release(control);
     pthread_mutex_unlock(&runtime_nat_control_lock);
     return result;
+}
+
+/*
+ * A push that began after the login read login_generation may have looked for the client's
+ * connections before this one was published and missed it, leaving it with the routes loaded in
+ * verify_login. If any push began, the routes of the client's control and data are reloaded and
+ * pushed again, this connection's among them. Called once the login has answered and released
+ * send_lock, which a push waits for while holding runtime_nat_control_lock.
+ */
+static void push_routes_changed_during_login(specus_session *session, unsigned long login_generation)
+{
+    if (!session->config.client_session_db_backed
+        || atomic_load(&runtime_nat_control_generation) == login_generation) {
+        return;
+    }
+    int rc = push_runtime_nat_control(NULL, session->config.client_id, session->config.client_name);
+    printf("[nat-control] routes changed during the %s login client=%s, pushed again rc=%d\n",
+           session->is_data_connection ? "data" : "control", session->config.client_name, rc);
 }
 
 static int push_runtime_client_message(void *ctx,
@@ -4923,11 +4950,12 @@ static void session_shutdown(specus_session *session)
 }
 
 /*
- * SPECUS_LOGIN_TEST_GATE_DIR, honoured outside production only, holds every successful login
- * between publishing its connection and writing its response, with send_lock held, as a slow
- * scheduler could: the login creates <dir>/<role>-published, waits for <dir>/<role>-release (at
- * most LOGIN_TEST_GATE_MAX_WAIT_MS) and removes both, role being "control" or "data". The session
- * lifecycle tests use it to send on a connection inside that window.
+ * SPECUS_LOGIN_TEST_GATE_DIR, honoured outside production only, holds every successful login at
+ * two points, as a slow scheduler could: "loaded", once its routes are loaded and before its
+ * connection is published, and "published", once published and before its response is written,
+ * with send_lock held. At each point the login creates <dir>/<role>-<point>, waits for
+ * <dir>/<role>-<point>-release (at most LOGIN_TEST_GATE_MAX_WAIT_MS) and removes both, role being
+ * "control" or "data". The session lifecycle tests use it to act inside those windows.
  */
 #define LOGIN_TEST_GATE_MAX_WAIT_MS 30000
 static char login_test_gate_dir[256];
@@ -4950,17 +4978,17 @@ static int configure_login_test_gate(void)
     return 0;
 }
 
-static void login_test_gate_wait(const specus_session *session)
+static void login_test_gate_wait(const specus_session *session, const char *point)
 {
     if (login_test_gate_dir[0] == '\0') {
         return;
     }
     const char *role = session->is_data_connection ? "data" : "control";
-    char published[320];
-    char release[320];
-    snprintf(published, sizeof(published), "%s/%s-published", login_test_gate_dir, role);
-    snprintf(release, sizeof(release), "%s/%s-release", login_test_gate_dir, role);
-    int fd = open(published, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    char reached[320];
+    char release[336];
+    snprintf(reached, sizeof(reached), "%s/%s-%s", login_test_gate_dir, role, point);
+    snprintf(release, sizeof(release), "%s-release", reached);
+    int fd = open(reached, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) {
         close(fd);
     }
@@ -4971,7 +4999,7 @@ static void login_test_gate_wait(const specus_session *session)
         nanosleep(&poll_interval, NULL);
     }
     unlink(release);
-    unlink(published);
+    unlink(reached);
 }
 
 static void *client_thread(void *arg)
@@ -5093,7 +5121,10 @@ static void *client_thread(void *arg)
              * session is published, while nothing else can touch its config, and written right
              * after the response under the same send_lock. A runtime push that finds the session
              * replaces those routes under map_lock and then waits for send_lock, so its newer
-             * NAT_CONTROL follows and the client ends with the newest routes.
+             * NAT_CONTROL follows and the client ends with the newest routes. A push that runs
+             * after verify_login loaded the routes but before the session is published finds no
+             * session of this login, so once answered the login reloads and pushes the routes
+             * again itself if any push began since it started.
              */
             const char *reason = NULL;
             displaced_sessions displaced = {.count = 0U};
@@ -5105,6 +5136,7 @@ static void *client_thread(void *arg)
             if (control_login) {
                 pthread_mutex_lock(&control_admission_lock);
             }
+            unsigned long route_generation = atomic_load(&runtime_nat_control_generation);
             logged_in = verify_login(session, &request, &reason);
             if (logged_in && control_login) {
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
@@ -5113,6 +5145,9 @@ static void *client_thread(void *arg)
                 nat_control_http_routes = session->config.http_route_count;
                 nat_control_json_bytes = session->config.nat_control_json == NULL
                     ? 0U : strlen(session->config.nat_control_json);
+            }
+            if (logged_in) {
+                login_test_gate_wait(session, "loaded");
             }
             pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
@@ -5125,7 +5160,7 @@ static void *client_thread(void *arg)
                 pthread_mutex_unlock(&control_admission_lock);
             }
             if (logged_in) {
-                login_test_gate_wait(session);
+                login_test_gate_wait(session, "published");
             }
             /* An accepted login answers with the name it is bound under: the account's current name. */
             st_buffer response = st_protocol_encode_login_response(
@@ -5191,12 +5226,13 @@ static void *client_thread(void *arg)
                     log_nat_control_not_sent(session->config.client_name, nat_control_tcp_routes,
                                              nat_control_http_routes, nat_control_json_bytes);
                 }
-                if (session->config.database_path[0] != '\0') {
-                    st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
-                    if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
-                        fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n",
-                                session->config.client_name);
-                    }
+            }
+            push_routes_changed_during_login(session, route_generation);
+            if (!session->is_data_connection && session->config.database_path[0] != '\0') {
+                st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+                if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
+                    fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n",
+                            session->config.client_name);
                 }
             }
             st_login_request_free(&request);
