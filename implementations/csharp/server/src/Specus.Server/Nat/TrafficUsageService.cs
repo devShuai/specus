@@ -16,6 +16,7 @@ public sealed class TrafficUsageService : BackgroundService
 
     private readonly ConcurrentDictionary<string, TrafficCounter> _counters = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<ResourceCounterKey, TrafficCounter> _resourceCounters = new();
+    private readonly SemaphoreSlim _flushLock = new(1, 1);
     private readonly IServiceProvider _services;
     private readonly TrafficOptions _options;
     private readonly ILogger<TrafficUsageService> _logger;
@@ -111,11 +112,27 @@ public sealed class TrafficUsageService : BackgroundService
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        await FlushAsync(CancellationToken.None).ConfigureAwait(false);
         await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        await FlushAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     public async Task FlushAsync(CancellationToken cancellationToken)
+    {
+        // Periodic, API and shutdown callers share one durability barrier. A second caller must
+        // not reset another snapshot or read/modify the same row while an earlier save is pending.
+        // Record* stays lock-free; a failed/cancelled save restores only its uncommitted snapshot.
+        await _flushLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await FlushCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _flushLock.Release();
+        }
+    }
+
+    private async Task FlushCoreAsync(CancellationToken cancellationToken)
     {
         foreach (var (clientName, counter) in _counters)
         {
