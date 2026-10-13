@@ -140,6 +140,8 @@ internal sealed class PeerEgressTcpConnection
     // Nonblocking admission; null preserves the deterministic output-only model.
     internal Func<byte[], bool>? TryTransmit { get; set; }
     internal bool SendBlocked { get; private set; }
+    private bool _synAckPending;
+    private int _synAckMss;
     private long _persistAtMs = -1;
     internal const int SendBuffer = 65536;
 
@@ -195,11 +197,18 @@ internal sealed class PeerEgressTcpConnection
     /// </remarks>
     public static PeerEgressTcpConnection Accept(
         Segment syn, uint iss, int pathMtu, long idleTimeoutMs, long nowMs, Output output)
+        => Accept(syn, iss, pathMtu, idleTimeoutMs, nowMs, output, null);
+
+    public static PeerEgressTcpConnection Accept(
+        Segment syn, uint iss, int pathMtu, long idleTimeoutMs, long nowMs, Output output,
+        Func<byte[], bool>? transmit)
     {
         var connection = new PeerEgressTcpConnection(syn, iss, idleTimeoutMs, nowMs);
         var advertised = AdvertisedMss(pathMtu);
         connection._sndMss = syn.Mss > 0 ? Math.Min(syn.Mss, advertised) : advertised;
-        connection.Emit(
+        connection.TryTransmit = transmit;
+        connection._synAckMss = advertised;
+        connection._synAckPending = !connection.Emit(
             output, PeerEgressSegment.FlagSyn | PeerEgressSegment.FlagAck, [], nowMs, advertised);
         return connection;
     }
@@ -340,7 +349,7 @@ internal sealed class PeerEgressTcpConnection
 
         if (_state == State.SynReceived)
         {
-            if (!segment.Has(PeerEgressSegment.FlagAck) || _sndUna != _sndNxt)
+            if (_synAckPending || !segment.Has(PeerEgressSegment.FlagAck) || _sndUna != _sndNxt)
             {
                 // A duplicate SYN: resend the SYN-ACK rather than opening a second flow.
                 return output;
@@ -708,6 +717,14 @@ internal sealed class PeerEgressTcpConnection
             // letting a forgotten consumer pin resources. Checked before the keepalive so a probe
             // cannot hold a flow past the limit the policy set.
             ResetFlow(output);
+            return output;
+        }
+        if (_state == State.SynReceived && _synAckPending)
+        {
+            // Queue rejection is local backpressure, not network loss. Neither sequence
+            // space nor the RTO/retransmission budget moves until admission succeeds.
+            _synAckPending = !Emit(output, PeerEgressSegment.FlagSyn | PeerEgressSegment.FlagAck,
+                [], nowMs, _synAckMss);
             return output;
         }
         FlushSend(output, nowMs);

@@ -141,9 +141,11 @@ type tcpConn struct {
 	pending []byte
 	// Optional nonblocking transport admission. A rejected segment stays in TCP state,
 	// rather than being counted as sent and silently dropped by a full local queue.
-	tryTransmit func([]byte) bool
-	sendBlocked bool
-	persistAt   time.Time
+	tryTransmit   func([]byte) bool
+	sendBlocked   bool
+	synAckPending bool
+	synAckMSS     int
+	persistAt     time.Time
 
 	// Receive sequence space.
 	irs    uint32
@@ -178,6 +180,11 @@ type tcpConn struct {
 // iss is supplied rather than generated here so tests are deterministic; production passes a random
 // value, which is what keeps an off-path attacker from guessing the sequence space.
 func acceptTCPSyn(syn tcpSegment, iss uint32, pathMTU int, idleTimeout time.Duration, now time.Time) (*tcpConn, tcpOutput) {
+	return acceptTCPSynWithTransmit(syn, iss, pathMTU, idleTimeout, now, nil)
+}
+
+func acceptTCPSynWithTransmit(syn tcpSegment, iss uint32, pathMTU int, idleTimeout time.Duration, now time.Time,
+	transmit func([]byte) bool) (*tcpConn, tcpOutput) {
 	conn := &tcpConn{
 		localIP:      syn.DestinationIP,
 		remoteIP:     syn.SourceIP,
@@ -210,7 +217,9 @@ func acceptTCPSyn(syn tcpSegment, iss uint32, pathMTU int, idleTimeout time.Dura
 	}
 
 	var output tcpOutput
-	conn.emit(&output, tcpFlagSYN|tcpFlagACK, nil, now, conn.advertisedMSS(pathMTU))
+	conn.tryTransmit = transmit
+	conn.synAckMSS = conn.advertisedMSS(pathMTU)
+	conn.synAckPending = !conn.emit(&output, tcpFlagSYN|tcpFlagACK, nil, now, conn.synAckMSS)
 	return conn, output
 }
 
@@ -346,7 +355,7 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 	}
 
 	if c.state == tcpStateSynReceived {
-		if !segment.has(tcpFlagACK) || c.sndUna != c.iss+1 {
+		if c.synAckPending || !segment.has(tcpFlagACK) || c.sndUna != c.iss+1 {
 			// A duplicate SYN: resend the SYN-ACK rather than opening a second flow.
 			return output
 		}
@@ -683,6 +692,12 @@ func (c *tcpConn) onTick(now time.Time) tcpOutput {
 		// letting a forgotten consumer pin resources. This is checked before the keepalive so a
 		// probe cannot hold a flow past the limit the policy set.
 		c.reset(&output)
+		return output
+	}
+	if c.state == tcpStateSynReceived && c.synAckPending {
+		// A local queue rejection is not network loss: retry without waiting for RTO,
+		// advancing sequence space, or spending the retransmission budget.
+		c.synAckPending = !c.emit(&output, tcpFlagSYN|tcpFlagACK, nil, now, c.synAckMSS)
 		return output
 	}
 	c.flushSend(&output, now)

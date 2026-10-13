@@ -36,6 +36,50 @@ class PeerEgressRuntimeTests {
     private static final long EPOCH = 1_800_000_000_000L;
     private static final Object END_OF_STREAM = new Object();
 
+    @Test
+    void initialSynAckResumesWhenQueueDrains() throws Exception {
+        Harness harness = new Harness();
+        java.util.concurrent.ArrayBlockingQueue<byte[]> queue = new java.util.concurrent.ArrayBlockingQueue<>(1);
+        queue.add(new byte[0]);
+        harness.runtime.trySend = (consumer, frame) -> queue.offer(frame.clone());
+        try {
+            PeerEgressSegment.Segment opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+            assertEquals(1, harness.dialCount());
+            assertTrue(harness.segments().isEmpty(), "initial SYN-ACK bypassed queue admission");
+            queue.remove();
+            harness.runtime.sendReady(EPOCH + 1);
+            byte[] admitted = queue.poll();
+            assertNotNull(admitted, "queue drain did not resume the initial SYN-ACK");
+            PeerEgressFrame.Decoded decoded = PeerEgressFrame.parse(admitted);
+            assertTrue(decoded.accepted());
+            PeerEgressSegment.Segment response = PeerEgressSegment.parse(decoded.body());
+            assertNotNull(response);
+            assertEquals(PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK, response.flags());
+            assertEquals(opening.seq() + 1, response.ack());
+        } finally {
+            harness.runtime.shutdown(EPOCH);
+        }
+    }
+
+    @Test
+    void pendingSynAckDoesNotSurviveRevocation() {
+        Harness harness = new Harness();
+        harness.runtime.trySend = (consumer, frame) -> false;
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+            harness.runtime.revokeConsumer(7, EPOCH);
+            assertTrue(harness.socket(0).isClosed());
+            var admitted = new java.util.concurrent.atomic.AtomicInteger();
+            harness.runtime.trySend = (consumer, frame) -> { admitted.incrementAndGet(); return true; };
+            harness.runtime.sendReady(EPOCH + 1);
+            harness.runtime.onTick(EPOCH + 2000);
+            assertEquals(0, admitted.get());
+            assertEquals(1, harness.dialCount());
+        } finally { harness.runtime.shutdown(EPOCH); }
+    }
+
     /**
      * One end of a socket the runtime believes in. A read blocks until a test supplies data, an end
      * of stream, or an error, which is what lets each failure path be driven on purpose.

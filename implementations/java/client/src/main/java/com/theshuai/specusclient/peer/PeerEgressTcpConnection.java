@@ -131,6 +131,8 @@ final class PeerEgressTcpConnection {
     private final SendQueue pending = new SendQueue();
     // Nonblocking transport admission; null keeps the deterministic output-only model.
     java.util.function.Predicate<byte[]> tryTransmit;
+    private boolean synAckPending;
+    private int synAckMss;
     boolean sendBlocked;
     private long persistAtMs = -1;
 
@@ -187,11 +189,19 @@ final class PeerEgressTcpConnection {
      */
     static PeerEgressTcpConnection accept(
             Segment syn, int iss, int pathMtu, long idleTimeoutMs, long nowMs, Output output) {
+        return accept(syn, iss, pathMtu, idleTimeoutMs, nowMs, output, null);
+    }
+
+    static PeerEgressTcpConnection accept(
+            Segment syn, int iss, int pathMtu, long idleTimeoutMs, long nowMs, Output output,
+            java.util.function.Predicate<byte[]> transmit) {
         PeerEgressTcpConnection connection =
                 new PeerEgressTcpConnection(syn, iss, idleTimeoutMs, nowMs);
         int advertised = connection.advertisedMss(pathMtu);
         connection.sndMss = syn.mss() > 0 ? Math.min(syn.mss(), advertised) : advertised;
-        connection.emit(output, PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK,
+        connection.tryTransmit = transmit;
+        connection.synAckMss = advertised;
+        connection.synAckPending = !connection.emit(output, PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK,
                 new byte[0], nowMs, advertised);
         return connection;
     }
@@ -320,7 +330,7 @@ final class PeerEgressTcpConnection {
         }
 
         if (state == State.SYN_RECEIVED) {
-            if (!segment.has(PeerEgressSegment.FLAG_ACK) || sndUna != iss + 1) {
+            if (synAckPending || !segment.has(PeerEgressSegment.FLAG_ACK) || sndUna != iss + 1) {
                 // A duplicate SYN: resend the SYN-ACK rather than opening a second flow.
                 return output;
             }
@@ -633,6 +643,13 @@ final class PeerEgressTcpConnection {
             // letting a forgotten consumer pin resources. Checked before the keepalive so a probe
             // cannot hold a flow past the limit the policy set.
             reset(output);
+            return output;
+        }
+        if (state == State.SYN_RECEIVED && synAckPending) {
+            // Queue rejection is local backpressure, not network loss. Neither sequence
+            // space nor the RTO/retransmission budget moves until admission succeeds.
+            synAckPending = !emit(output, PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK,
+                    new byte[0], nowMs, synAckMss);
             return output;
         }
         flushSend(output, nowMs);
