@@ -1,6 +1,6 @@
 # 公共互传多实例协调协议
 
-本文定义 Java、Go 与 .NET 服务端在多实例部署时共享的 Redis 状态和内部 Pub/Sub 帧。它承载公共互传协调、
+本文定义 Java、Go、.NET 与 C 服务端在多实例部署时共享的 Redis 状态和内部 Pub/Sub 帧。它承载公共互传协调、
 管理连接事件与管理身份失效，只用于服务端实例之间，不会替换浏览器可见的 STWR2、STAP2、JSON discovery 或管理 WebSocket 消息。
 
 ## 1. 启用与故障边界
@@ -21,6 +21,9 @@
 合并可见域（`nets:<netId>` 索引与 net 维度 revision）是后加能力：新旧节点混部会使 roster 读取与定向路由不一致。
 升级包含该能力的版本时集群所有节点必须同时发布；需要灰度时必须 bump `redis-key-prefix`，让新旧 fleet 使用隔离的
 keyspace。
+
+C 同样参与 kind 4/5 的管理事件协调，但仍只用 SQLite。Redis 事件互通不提供共享管理数据库、数据复制或 HA
+接管；跨语言事件测试使用独立初始化的隔离库验证线协议，不等于跨语言共享数据库部署验收。
 
 ## 2. 标识与 Redis key
 

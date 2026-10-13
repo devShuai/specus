@@ -444,6 +444,15 @@ static void cluster_sha_hex(const char *value, char out[65])
                           out);
 }
 
+void st_public_coordination_management_group(const char *tenant_id, char out[65])
+{
+    const char *start = tenant_id == NULL ? "" : tenant_id;
+    while (*start != '\0' && (unsigned char)*start <= 0x20U) ++start;
+    size_t len = strlen(start);
+    while (len > 0U && (unsigned char)start[len - 1U] <= 0x20U) --len;
+    cluster_sha_hex_bytes((const uint8_t *)start, len, out);
+}
+
 static int cluster_random(uint8_t *out, size_t len)
 {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -1400,7 +1409,7 @@ static int cluster_event_encode(uint8_t kind,
     size_t group_len = group_id == NULL ? 0U : strlen(group_id);
     size_t target_len = target_peer_id == NULL ? 0U : strlen(target_peer_id);
     size_t source_len = source_lease_id == NULL ? 0U : strlen(source_lease_id);
-    if (kind < ST_PUBLIC_CLUSTER_EVENT_ROSTER || kind > ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+    if (kind < ST_PUBLIC_CLUSTER_EVENT_ROSTER || kind > ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION
         || group_len == 0U || group_len > ST_CLUSTER_EVENT_MAX_GROUP_BYTES
         || target_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
         || source_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
@@ -1408,7 +1417,7 @@ static int cluster_event_encode(uint8_t kind,
         || (payload_len > 0U && payload == NULL)
         || (kind == ST_PUBLIC_CLUSTER_EVENT_ROSTER && payload_len != 0U)
         || (kind == ST_PUBLIC_CLUSTER_EVENT_BINARY && target_len == 0U)
-        || (kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+        || ((kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT || kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION)
             && !cluster_management_shape_valid(target_len, source_len, exclude_source,
                                                revision, payload_len))) return -1;
     size_t total = ST_CLUSTER_EVENT_HEADER_BYTES + group_len + target_len + source_len + payload_len;
@@ -1448,7 +1457,7 @@ static int cluster_event_decode(const uint8_t *encoded,
     size_t target_len = cluster_read_u16(encoded + 18U);
     size_t source_len = cluster_read_u16(encoded + 20U);
     size_t payload_len = cluster_read_u32(encoded + 22U);
-    if (kind < ST_PUBLIC_CLUSTER_EVENT_ROSTER || kind > ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+    if (kind < ST_PUBLIC_CLUSTER_EVENT_ROSTER || kind > ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION
         || (flags & ~1U) != 0U || encoded[7] != 0U
         || group_len == 0U || group_len > ST_CLUSTER_EVENT_MAX_GROUP_BYTES
         || target_len > ST_CLUSTER_EVENT_MAX_ID_BYTES
@@ -1457,7 +1466,7 @@ static int cluster_event_decode(const uint8_t *encoded,
         || ST_CLUSTER_EVENT_HEADER_BYTES + group_len + target_len + source_len + payload_len
             != encoded_len
         || (kind == ST_PUBLIC_CLUSTER_EVENT_ROSTER && payload_len != 0U)
-        || (kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+        || ((kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT || kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION)
             && !cluster_management_shape_valid(target_len, source_len, (flags & 1U) != 0U,
                                                cluster_read_u64(encoded + 8U), payload_len))) return -1;
     const uint8_t *group = encoded + ST_CLUSTER_EVENT_HEADER_BYTES;
@@ -1566,6 +1575,16 @@ int st_public_coordination_publish_roster(const char *group_id, uint64_t revisio
                            revision,
                            NULL,
                            0U);
+}
+
+int st_public_coordination_publish_management(uint8_t kind, const char *tenant_id,
+                                              const uint8_t *payload, size_t payload_len)
+{
+    if (kind != ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT && kind != ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION)
+        return -1;
+    char group[65];
+    st_public_coordination_management_group(tenant_id, group);
+    return cluster_publish(kind, group, "", "", 0, 0U, payload, payload_len);
 }
 
 int st_public_coordination_publish_text(const char *group_id,

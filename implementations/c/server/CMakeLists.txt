@@ -298,6 +298,10 @@ add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(public_discovery_cluster_e2e PROPERTIES TIMEOUT 45)
+add_test(NAME management_cluster_e2e
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/management_cluster_e2e.py
+                    $<TARGET_FILE:specus-server-c>)
+set_tests_properties(management_cluster_e2e PROPERTIES TIMEOUT 90)
 # The STCE envelope and the cluster identifiers against protocol/test-vectors/public-transfer-cluster-v2.json
 # (Java PublicTransferClusterFrameTests and PublicTransferCoordinationServiceTests).
 add_executable(specus_c_public_cluster_codec_tests tests/public_cluster_codec_tests.c)

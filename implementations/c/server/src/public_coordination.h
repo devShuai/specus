@@ -40,6 +40,7 @@ enum {
     ST_PUBLIC_CLUSTER_EVENT_TEXT = 2,
     ST_PUBLIC_CLUSTER_EVENT_BINARY = 3,
     ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT = 4,
+    ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION = 5,
     ST_PUBLIC_CLUSTER_EVENT_UNAVAILABLE = 255
 };
 
@@ -103,6 +104,10 @@ int st_public_cluster_event_decode(const uint8_t *encoded,
                                    st_public_cluster_event *event);
 
 int st_public_coordination_publish_roster(const char *group_id, uint64_t revision);
+/* Java's SHA-256(trim(tenantId)); NULL has the same digest as an empty string. */
+void st_public_coordination_management_group(const char *tenant_id, char out[65]);
+int st_public_coordination_publish_management(uint8_t kind, const char *tenant_id,
+                                              const uint8_t *payload, size_t payload_len);
 int st_public_coordination_publish_text(const char *group_id,
                                         const char *target_peer_id,
                                         const char *source_lease_id,
