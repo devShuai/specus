@@ -2,7 +2,6 @@ package com.theshuai.specusserver.database;
 
 import com.theshuai.specusserver.management.model.SortableInstant;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.stereotype.Component;
@@ -96,13 +95,12 @@ public class SortableTimestampMigrator {
         }
     }
 
+    /**
+     * From the metadata: the admin initialize endpoint runs this inside a transaction, which a
+     * failed probe would abort on PostgreSQL.
+     */
     private boolean tableExists(String table) {
-        try {
-            jdbcTemplate.query("select 1 from " + table + " where 1 = 0", rs -> null);
-            return true;
-        } catch (DataAccessException missing) {
-            return false;
-        }
+        return SchemaMetadata.table(jdbcTemplate, table) != null;
     }
 
     /** A string-compared timestamp column, with the primary key that addresses its rows. */

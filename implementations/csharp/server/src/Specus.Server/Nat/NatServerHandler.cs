@@ -38,7 +38,14 @@ public sealed class NatServerHandler
         return session.HandleAsync(packet);
     }
 
-    public void Attach(SpecusConnectionContext context) => GetOrAttach(context);
+    /// <summary>Runs at the end of <see cref="Attach"/>, so a test can hold a data login there.</summary>
+    internal Action<SpecusConnectionContext>? AttachedForTests { get; set; }
+
+    public void Attach(SpecusConnectionContext context)
+    {
+        GetOrAttach(context);
+        AttachedForTests?.Invoke(context);
+    }
 
     private NatClientSession GetOrAttach(SpecusConnectionContext context)
     {
@@ -51,13 +58,14 @@ public sealed class NatServerHandler
     }
 
     internal Task<HttpSpecusStream> OpenHttpStreamAsync(string clientName,
-        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken,
+        bool discardResponseBody = false)
     {
         if (!_sessionsByName.TryGetValue(clientName, out var session))
         {
             throw new InvalidOperationException($"client is offline: {clientName}");
         }
-        return session.OpenHttpStreamAsync(metadata, cancellationToken);
+        return session.OpenHttpStreamAsync(metadata, cancellationToken, discardResponseBody);
     }
 
     internal Task<WebSocketSpecusStream> OpenWebSocketStreamAsync(string clientName,

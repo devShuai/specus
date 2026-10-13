@@ -67,8 +67,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * API credential and a new client account with no routes, nothing another scenario touches. The
  * account comes from the real HTTP client login with that credential, the only way to obtain the
  * access token a Netty login needs, so its name is the one the server generates. Every
- * {@code connect} reuses that token without a new HTTP login, as the Java client does when it
- * reconnects: the login push is then the only way the client learns what changed while it was away.
+ * {@code connect} and {@code reconnect} reuses that token without a new HTTP login, as the Java
+ * client does when it reconnects: the login push is then the only way the client learns what changed
+ * while it was away.
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -132,6 +133,8 @@ class HttpRouteLifecycleVectorTests {
         private long clientId;
         private String clientName;
         private String formerName;
+        /** The name the last connect logged in with; reconnect presents the token under it again. */
+        private String connectedName;
         private FakeTunnelClient client;
 
         Scenario(String id) throws Exception {
@@ -163,7 +166,9 @@ class HttpRouteLifecycleVectorTests {
                 }
                 case "deleteClient" -> deleteClient(step);
                 case "createClient" -> createClient();
+                case "createFormerNameClient" -> createFormerNameClient(step);
                 case "connect" -> connect(step);
+                case "reconnect" -> reconnect(step);
                 case "disconnect" -> disconnect();
                 case "request" -> request(step);
                 default -> throw new IllegalArgumentException("unknown op " + step.get("op").asText());
@@ -229,15 +234,54 @@ class HttpRouteLifecycleVectorTests {
             assertThat(created.get("client").get("clientName").asText()).isEqualTo(clientName);
         }
 
+        /** Another account under the name before the last rename, with these routes; it never logs in. */
+        private void createFormerNameClient(JsonNode step) throws Exception {
+            assertThat(formerName).as("an earlier renameClient").isNotNull();
+            JsonNode created = ok(201, send("POST", "/api/admin/clients",
+                    JSON.createObjectNode().put("clientName", formerName).toString(), adminToken));
+            long id = created.get("client").get("id").asLong();
+            assertThat(id).as("a new account").isNotEqualTo(clientId);
+            for (JsonNode route : step.get("routes")) {
+                ok(201, send("POST", "/api/admin/clients/" + id + "/http-routes", JSON.createObjectNode()
+                        .put("route", route.asText())
+                        .put("targetBaseUrl", VECTOR.get("targetBaseUrl").asText())
+                        .put("enabled", true)
+                        .put("authEnabled", false)
+                        .toString(), adminToken));
+            }
+        }
+
         private void connect(JsonNode step) throws Exception {
             assertThat(client).as("the fake client is offline before connect").isNull();
+            client = connectFakeClient(clientName);
+            connectedName = clientName;
+            assertRoutes("login push", awaitPush(0), step.get("expectLoginPush"));
+        }
+
+        /** The token of the last connect again, under the name it logged in with then. */
+        private void reconnect(JsonNode step) throws Exception {
+            assertThat(client).as("the fake client is offline before reconnect").isNull();
+            assertThat(connectedName).as("an earlier connect").isNotNull();
+            if (step.get("expectRefused").asBoolean()) {
+                var answer = FakeTunnelClient.controlLoginAnswer(nettyServer.getBoundPort(), connectedName,
+                        clientSessionId, accessToken);
+                assertThat(answer.isSuccess()).as("the token of " + connectedName + " logged in again as "
+                        + answer.getClientName()).isFalse();
+                return;
+            }
+            client = connectFakeClient(connectedName);
+            assertThat(client.controlLoginName()).as("the name the control login answered with")
+                    .isEqualTo(clientName);
+            assertRoutes("login push", awaitPush(0), step.get("expectLoginPush"));
+        }
+
+        private FakeTunnelClient connectFakeClient(String loginName) throws Exception {
             JsonNode answer = VECTOR.get("fakeClientResponse");
             List<String> headers = new ArrayList<>();
             answer.get("headers").forEach(header -> headers.add(header.asText()));
-            client = FakeTunnelClient.connect(nettyServer.getBoundPort(), clientName, clientSessionId, accessToken,
+            return FakeTunnelClient.connect(nettyServer.getBoundPort(), loginName, clientSessionId, accessToken,
                     opens, new FakeTunnelClient.Response(
                             answer.get("status").asInt(), headers, answer.get("body").asText()));
-            assertRoutes("login push", awaitPush(0), step.get("expectLoginPush"));
         }
 
         private void disconnect() {

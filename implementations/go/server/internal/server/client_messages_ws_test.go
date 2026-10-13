@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -257,6 +259,82 @@ func TestClientMessagesWebSocketClosesOnBinaryMessageLikeJava(t *testing.T) {
 	if status := websocket.CloseStatus(err); status != websocket.StatusUnsupportedData {
 		t.Fatalf("binary close status = %d err=%v, want %d", status, err, websocket.StatusUnsupportedData)
 	}
+}
+
+// Java ManagementAccountsHttpTests.deletingAnAccountClosesItsManagementWebSockets
+// (management-accounts.md section 7.1).
+func TestDeletingAnAccountClosesItsManagementWebSockets(t *testing.T) {
+	app, ts := newAPIServer(t)
+	admin := adminToken(t, ts)
+	created := authRequest(t, ts, http.MethodPost, "/api/admin/users", admin,
+		`{"username":"bob","password":"bob-password-1","role":"USER"}`)
+	created.Body.Close()
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create bob: status %d", created.StatusCode)
+	}
+	bob := loginToken(t, ts, "bob", "bob-password-1")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dial := func(token, endpoint string) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.Dial(ctx, webSocketURLFor(t, ts, token, endpoint), nil)
+		if err != nil {
+			t.Fatalf("dial %s: %v", endpoint, err)
+		}
+		t.Cleanup(func() { conn.CloseNow() })
+		return conn
+	}
+	bobMessages := dial(bob, "client-messages")
+	_ = readClientMessageJSON(t, bobMessages)
+	bobEvents := dial(bob, "connections")
+	// The hub answers a ping only from its read loop, which starts once the socket is registered.
+	bobEventsClosed := bobEvents.CloseRead(ctx)
+	if err := bobEvents.Ping(ctx); err != nil {
+		t.Fatalf("ping connections: %v", err)
+	}
+	adminMessages := dial(admin, "client-messages")
+	_ = readClientMessageJSON(t, adminMessages)
+
+	deleted := authRequest(t, ts, http.MethodDelete, "/api/admin/users/bob", admin, "")
+	deleted.Body.Close()
+	if deleted.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete bob: status %d", deleted.StatusCode)
+	}
+
+	if _, _, err := bobMessages.Read(ctx); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("bob's client-messages socket after the delete: %v", err)
+	}
+	select {
+	case <-bobEventsClosed.Done():
+	case <-ctx.Done():
+		t.Fatal("bob's connections socket stayed open after the delete")
+	}
+	source := store.ClientAccount{TenantID: "default", ClientName: "deleted-account-client"}
+	if app.clientMessages.deliverFromClient(source, "admin:bob", "to the deleted account") {
+		t.Fatal("a message for the deleted account was still delivered")
+	}
+	// Another identity's connection stays open.
+	if !app.clientMessages.deliverFromClient(source, "admin:admin", "still here") {
+		t.Fatal("the administrator's connection was closed too")
+	}
+	if message := readClientMessageJSON(t, adminMessages); message["message"] != "still here" {
+		t.Fatalf("administrator received %#v", message)
+	}
+}
+
+// webSocketURLFor issues a management WebSocket ticket for token and returns the upgrade URL.
+func webSocketURLFor(t *testing.T, ts *httptest.Server, token, endpoint string) string {
+	t.Helper()
+	response := authRequest(t, ts, http.MethodPost, "/api/admin/ws-tickets", token, `{"endpoint":"`+endpoint+`"}`)
+	defer response.Body.Close()
+	var issued struct {
+		Ticket string `json:"ticket"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&issued) != nil ||
+		issued.Ticket == "" {
+		t.Fatalf("websocket ticket for %s: status %d", endpoint, response.StatusCode)
+	}
+	return "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/" + endpoint + "?ticket=" + url.QueryEscape(issued.Ticket)
 }
 
 func readClientMessageJSON(t *testing.T, conn *websocket.Conn) map[string]any {

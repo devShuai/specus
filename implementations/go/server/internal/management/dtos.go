@@ -338,6 +338,9 @@ type loginRequest struct {
 	Username       string `json:"username"`
 	Password       string `json:"password"`
 	TurnstileToken string `json:"turnstileToken"`
+	// TenantID selects the tenant whose login name this is. Omitted, the default tenant is searched
+	// first and then an account that predates tenant-scoped login names (management-accounts.md 4.1).
+	TenantID string `json:"tenantId"`
 }
 
 type registrationRequest struct {

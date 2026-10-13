@@ -26,14 +26,26 @@ public class PeerServiceDiscoverySchemaMigrator {
         this.databasePlatform = databasePlatform == null ? "" : databasePlatform;
     }
 
+    /**
+     * Reads the schema from {@link SchemaMetadata} instead of probing it with statements that may
+     * fail: on PostgreSQL a failed statement aborts this transaction and every statement after it.
+     */
     @Transactional
     public void migrate() {
         Dialect dialect = dialect();
-        for (String statement : createStatements(dialect)) {
-            try {
-                jdbcTemplate.execute(statement);
-            } catch (DataAccessException e) {
-                log.debug("[peer-service] skip schema statement: {}", e.getMessage());
+        for (String statement : createTableStatements(dialect)) {
+            execute(statement);
+        }
+        SchemaMetadata.Table sharedServices = SchemaMetadata.table(jdbcTemplate, "peer_mesh_shared_service");
+        if (sharedServices != null) {
+            // CREATE INDEX IF NOT EXISTS is not MySQL syntax, so look the indexes up by name.
+            if (sharedServices.index("uk_peer_shared_service_id") == null) {
+                execute("create unique index uk_peer_shared_service_id"
+                        + " on peer_mesh_shared_service (tenant_id, client_id, service_id)");
+            }
+            if (sharedServices.index("idx_peer_shared_service_tenant_client") == null) {
+                execute("create index idx_peer_shared_service_tenant_client"
+                        + " on peer_mesh_shared_service (tenant_id, client_id)");
             }
         }
         ensureColumn("specus_client_session", "peer_service_discovery_version", dialect.intDefaultZero());
@@ -75,25 +87,30 @@ public class PeerServiceDiscoverySchemaMigrator {
         }
     }
 
-    private void ensureColumn(String table, String column, String definition) {
+    /**
+     * Runs only for an object the metadata says is missing. A failure is logged, not thrown, so
+     * rows that refuse the unique index do not stop the server: SqliteUniqueIndexMigrator reports them.
+     */
+    private void execute(String statement) {
         try {
-            jdbcTemplate.query("select " + column + " from " + table + " where 1 = 0", rs -> null);
-        } catch (DataAccessException missing) {
+            jdbcTemplate.execute(statement);
+        } catch (DataAccessException e) {
+            log.debug("[peer-service] skip schema statement: {}", e.getMessage());
+        }
+    }
+
+    private void ensureColumn(String table, String column, String definition) {
+        if (!SchemaMetadata.hasColumn(jdbcTemplate, table, column)) {
             jdbcTemplate.execute("alter table " + table + " add column " + column + " " + definition);
             log.info("[peer-service] added {}.{}", table, column);
         }
     }
 
     private boolean tableExists(String table) {
-        try {
-            jdbcTemplate.query("select 1 from " + table + " where 1 = 0", rs -> null);
-            return true;
-        } catch (DataAccessException missing) {
-            return false;
-        }
+        return SchemaMetadata.table(jdbcTemplate, table) != null;
     }
 
-    private List<String> createStatements(Dialect dialect) {
+    private List<String> createTableStatements(Dialect dialect) {
         return List.of(
                 """
                 create table if not exists peer_mesh_service_sharing (
@@ -142,9 +159,7 @@ public class PeerServiceDiscoverySchemaMigrator {
                         dialect.boolNotNullFalse(),
                         dialect.varchar(16),
                         dialect.varchar(40),
-                        dialect.varchar(40)),
-                "create unique index if not exists uk_peer_shared_service_id on peer_mesh_shared_service (tenant_id, client_id, service_id)",
-                "create index if not exists idx_peer_shared_service_tenant_client on peer_mesh_shared_service (tenant_id, client_id)"
+                        dialect.varchar(40))
         );
     }
 

@@ -66,9 +66,10 @@ public final class SessionUtil {
      * the data connection opened under it is closed too, whoever closed the control connection:
      * the server closing it for a disabled, renamed or deleted client must not leave a data
      * connection bound under that name. This has to happen here: the close-future listener runs
-     * before {@code channelInactive} and clears the session attribute handlers would read there.
+     * before {@code channelInactive} and clears the session attribute handlers would read there,
+     * which is also why the departed client is left in {@link ServerAttributes#DEPARTED_CLIENT}.
      * A control connection replaced by a new login lost its session when it was replaced, so its
-     * close leaves the new data connection alone.
+     * close leaves the new data connection alone and takes no one offline.
      */
     public static void unBindSession(Channel channel) {
         Session session = getSession(channel);
@@ -77,6 +78,7 @@ public final class SessionUtil {
         }
         if (controlChannels.remove(session.getClientName(), channel)) {
             closeDataSession(session.getClientName());
+            channel.attr(ServerAttributes.DEPARTED_CLIENT).set(session.getClientName());
         }
         dataChannels.remove(session.getClientName(), channel);
         channel.attr(ServerAttributes.SESSION).set(null);

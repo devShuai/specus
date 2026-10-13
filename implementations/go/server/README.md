@@ -50,7 +50,7 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 | `SPECUS_NETTY_WORKER_THREADS` / `SPECUS_NETTY_REMOTE_WORKER_THREADS` | Java Netty event-loop 配置兼容字段；Go 由运行时以 goroutine 多路复用连接，无安全的一对一线程映射 | 0 / 0 |
 | `SPECUS_NETTY_SO_BACKLOG` | Java 监听 backlog 配置兼容字段；Go 标准库不暴露逐 listener backlog，实际采用操作系统 `somaxconn` | 8192 |
 | `SPECUS_NETTY_REUSE_ADDRESS` / `SPECUS_NETTY_KEEP_ALIVE` / `SPECUS_NETTY_TCP_NO_DELAY` | listener 地址复用与 accepted socket 选项 | true / true / true |
-| `SPECUS_NETTY_MAX_FRAME_SIZE` | 完整控制帧上限，包含 11 字节 header；值必须不小于 11（等于 11 时仅容纳零字节 body） | 33554432 |
+| `SPECUS_NETTY_MAX_FRAME_SIZE` | 完整控制帧上限，包含 11 字节 header；登录后收发的帧都受它约束。值必须不小于 1048587（11 字节 header 加 1 MiB 的 `MESSAGE_*` body 上限），否则启动失败：更小的值会让协议允许的 MESSAGE（例如 NAT_CONTROL）发不出去 | 33554432 |
 | `SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE` | 登录完成前的完整控制帧上限 | 16384 |
 | `SPECUS_MANAGEMENT_ADDR` | 管理 HTTP 监听地址 | `:8088` |
 | `SPECUS_LOG_FILE` | 独立运行时可选的日志文件绝对路径；配置后与标准输出双写。systemd 部署直接捕获完整 stdout/stderr 并强制留空，避免重复日志 | - |

@@ -11,6 +11,9 @@
 #define ST_PUBLIC_CLUSTER_ROOM_BYTES 480U
 #define ST_PUBLIC_CLUSTER_ADDRESS_BYTES 128U
 #define ST_PUBLIC_CLUSTER_ROOM_KEY_BYTES 80U
+/* STCE v2 frame limits (protocol/spec/public-transfer-cluster.md): group and identity UTF-8 bytes. */
+#define ST_PUBLIC_CLUSTER_EVENT_GROUP_BYTES 128U
+#define ST_PUBLIC_CLUSTER_EVENT_ID_BYTES 512U
 
 typedef struct {
     char lease_id[ST_PUBLIC_CLUSTER_LEASE_BYTES + 1U];
@@ -44,9 +47,9 @@ typedef struct {
     uint8_t kind;
     int exclude_source;
     uint64_t revision;
-    char group_id[ST_PUBLIC_CLUSTER_ID_BYTES + 1U];
-    char target_peer_id[ST_PUBLIC_CLUSTER_PEER_BYTES + 1U];
-    char source_lease_id[ST_PUBLIC_CLUSTER_LEASE_BYTES + 1U];
+    char group_id[ST_PUBLIC_CLUSTER_EVENT_GROUP_BYTES + 1U];
+    char target_peer_id[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
+    char source_lease_id[ST_PUBLIC_CLUSTER_EVENT_ID_BYTES + 1U];
     uint8_t *payload;
     size_t payload_len;
 } st_public_cluster_event;
@@ -86,6 +89,18 @@ int st_public_coordination_allow_rate(const char *bucket,
                                       long limit,
                                       long window_seconds,
                                       int *allowed);
+
+/*
+ * The STCE v2 Pub/Sub envelope (protocol/spec/public-transfer-cluster.md). Both return 0 on success
+ * and -1 for an event Java's PublicTransferClusterFrame refuses; the encoded buffer and a decoded
+ * payload are malloc'ed and owned by the caller.
+ */
+int st_public_cluster_event_encode(const st_public_cluster_event *event,
+                                   uint8_t **encoded,
+                                   size_t *encoded_len);
+int st_public_cluster_event_decode(const uint8_t *encoded,
+                                   size_t encoded_len,
+                                   st_public_cluster_event *event);
 
 int st_public_coordination_publish_roster(const char *group_id, uint64_t revision);
 int st_public_coordination_publish_text(const char *group_id,

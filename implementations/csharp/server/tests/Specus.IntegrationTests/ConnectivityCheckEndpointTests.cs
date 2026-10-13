@@ -340,6 +340,50 @@ public sealed class ConnectivityCheckEndpointTests : IAsyncLifetime
         Assert.Null(device.DataDisconnectReason);
     }
 
+    /// <summary>
+    /// The device answers each probe before the server has even finished writing its OPEN: the
+    /// response head, and for the GET more body frames than an event queue holds, all land while
+    /// the stream is still being opened. The probe drops that body from the start, so the check
+    /// succeeds and the data connection is never closed as a protocol violation.
+    /// </summary>
+    [Fact]
+    public async Task ProbeAnsweredBeforeItsOpenReturnsDropsTheBodyAndKeepsTheDataConnection()
+    {
+        using var admin = await AuthenticatedClientAsync();
+        var demo = await ReadDemoClientAsync(admin);
+        var routeId = await CreateRouteAsync(admin, demo.Id, "eager");
+        await using var device = await BindDeviceAsync(HttpRouteFailure.CapabilityVersion);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        device.Writer.AnswerOpen = async open =>
+        {
+            if (Equals(open.MetaData?["method"], "HEAD"))
+            {
+                await device.Writer.InjectAsync(ResponseHead(open.StreamId, 405));
+                return;
+            }
+            await device.Writer.InjectAsync(ResponseHead(open.StreamId, 200));
+            for (var i = 0; i < 64; i++)
+            {
+                await device.Writer.InjectAsync(new NatMessagePacket
+                {
+                    NatMessageType = NatMessageType.Data,
+                    StreamId = open.StreamId,
+                    Data = new byte[1024],
+                });
+            }
+        };
+
+        using var check = await admin.PostAsync(CheckPath(routeId.ToString()), Json(""), timeout.Token);
+        Assert.Equal(HttpStatusCode.OK, check.StatusCode);
+        var body = JsonNode.Parse(await check.Content.ReadAsStringAsync(timeout.Token))!.AsObject();
+        Assert.Equal("succeeded", body["outcome"]!.GetValue<string>());
+        Assert.Equal("ACCESS_OK", body["code"]!.GetValue<string>());
+        Assert.Equal(["HEAD", "GET"], body["requests"]!.AsArray().Select(m => m!.GetValue<string>()));
+        Assert.Equal("2xx", body["statusClass"]!.GetValue<string>());
+        Assert.DoesNotContain(device.Writer.Snapshot(), p => p.NatMessageType == NatMessageType.WindowUpdate);
+        Assert.Null(device.DataDisconnectReason);
+    }
+
     [Fact]
     public async Task LostDataConnectionAndLegacySessionsAreNeverReportedAsClassified()
     {
@@ -561,7 +605,13 @@ public sealed class ConnectivityCheckEndpointTests : IAsyncLifetime
 
         public SpecusConnectionContext Context { get; set; } = null!;
 
-        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        /// <summary>
+        /// When set, plays the device answering an OPEN before the server's write of it returns,
+        /// the order a loaded server can see the frames in.
+        /// </summary>
+        public Func<NatMessagePacket, Task>? AnswerOpen { get; set; }
+
+        public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
         {
             if (packet is NatMessagePacket natPacket)
             {
@@ -579,8 +629,11 @@ public sealed class ConnectivityCheckEndpointTests : IAsyncLifetime
                     _snapshot.Add(captured);
                 }
                 _packets.Writer.TryWrite(captured);
+                if (captured.NatMessageType == NatMessageType.Open && AnswerOpen is { } answer)
+                {
+                    await answer(captured);
+                }
             }
-            return ValueTask.CompletedTask;
         }
 
         public Task InjectAsync(NatMessagePacket packet) => nat.HandleAsync(Context, packet);

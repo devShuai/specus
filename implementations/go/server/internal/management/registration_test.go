@@ -37,7 +37,7 @@ func TestRegistrationRequiresEmailCodeBeforeCreatingUser(t *testing.T) {
 	if challenge.RegistrationID == "" || challenge.EmailMasked != "al***@example.com" || len(mailer.code) != 6 {
 		t.Fatalf("unexpected challenge=%+v mailer=%+v", challenge, mailer)
 	}
-	if user, err := db.FindManagementUserByUsername(ctx, "alice"); err != nil || user != nil {
+	if user, err := db.FindManagementUserByLogin(ctx, "default", "alice"); err != nil || user != nil {
 		t.Fatalf("user exists before verification: user=%+v err=%v", user, err)
 	}
 	stored, err := db.FindRegistrationChallengeByID(ctx, challenge.RegistrationID)

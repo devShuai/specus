@@ -37,7 +37,7 @@ func newDiagramTestServer(t *testing.T) (*httptest.Server, *security.LocalTokenS
 		user.Enabled = true
 		user.CreatedAt = now
 		user.UpdatedAt = now
-		if err := db.InsertManagementUser(context.Background(), user); err != nil {
+		if _, err := db.InsertManagementUser(context.Background(), user); err != nil {
 			t.Fatal(err)
 		}
 	}

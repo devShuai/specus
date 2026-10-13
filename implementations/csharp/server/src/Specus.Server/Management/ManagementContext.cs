@@ -25,7 +25,10 @@ public sealed record ManagementContext(
         var tenantId = NormalizeTenant(httpContext.User.FindFirst("tenant_id")?.Value ?? auth.TenantId);
         var role = ParseRole(httpContext.User.FindFirst(ClaimTypes.Role)?.Value
             ?? httpContext.User.FindFirst("role")?.Value);
-        var builtIn = string.Equals(username, auth.Username, StringComparison.OrdinalIgnoreCase);
+        // The built-in administrator exists only in the default tenant; the same name elsewhere would
+        // be an ordinary login name of that tenant.
+        var builtIn = string.Equals(username, auth.Username, StringComparison.OrdinalIgnoreCase)
+            && SameTenant(tenantId, auth.TenantId);
         if (builtIn)
         {
             role = ManagementRole.Admin;

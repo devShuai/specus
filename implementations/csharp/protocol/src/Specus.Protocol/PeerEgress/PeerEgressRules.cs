@@ -120,7 +120,27 @@ public static class PeerEgressRules
     /// whose addresses only a domain rule hands out. The overlap is checked only while phase two
     /// runs; without it the pool is an ordinary range an address rule is free to cover.
     /// </remarks>
-    public static string? Validate(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool)
+    public static string? Validate(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool) =>
+        Validate(rule, meshCidr, fakeIpPool, ConsumerCarriesIpv6);
+
+    /// <summary>
+    /// Whether this consumer has an IPv6 data plane: IPv6 packets read from the TUN, IPv6 routes
+    /// installed into it, and IPv6 carried to the egress. It does not yet, so a well-formed IPv6 rule
+    /// is refused with <c>EGRESS_RULE_IPV6_UNSUPPORTED</c>: installing nothing for it and reporting it
+    /// in force would send its destinations straight out of the local interface.
+    /// </summary>
+    /// <remarks>
+    /// The rule is still read and checked in full first, so a mistake in it is reported as one, and
+    /// how IPv6 rules match is pinned by the vector's <c>ipv6</c> section, which the tests run with
+    /// this set.
+    /// </remarks>
+    public const bool ConsumerCarriesIpv6 = false;
+
+    /// <summary>
+    /// As <see cref="Validate(PeerEgressRule, string?, Ipv4Cidr?)"/>, with the consumer's IPv6 data
+    /// plane stated.
+    /// </summary>
+    public static string? Validate(PeerEgressRule rule, string? meshCidr, Ipv4Cidr? fakeIpPool, bool carriesIpv6)
     {
         // Ahead of anything about the rule's content: a switched-off rule is the user's choice, and
         // should not have to be fixed before it may sit in the list.
@@ -133,9 +153,23 @@ public static class PeerEgressRules
         {
             return PeerEgressCodes.RuleMalformed;
         }
+        // A colon is unambiguous: the match is an IPv6 address or prefix, or it is malformed. The
+        // mesh and the fake-IP pool are IPv4, so an IPv6 rule has neither to stay clear of.
         if (match.Contains(':', StringComparison.Ordinal))
         {
-            return PeerEgressCodes.RuleIpv6Unsupported;
+            if (!Ipv6Cidr.TryParse(match, out var prefix) || prefix.Mapped)
+            {
+                // An IPv4-mapped prefix reads, but no packet is ever addressed to one: the rule would
+                // match nothing while its writer believed the IPv4 addresses covered.
+                return PeerEgressCodes.RuleMalformed;
+            }
+            if (prefix.PrefixLength == 0)
+            {
+                return PeerEgressCodes.RuleDefaultRoute;
+            }
+            // Last: everything about the rule is right, and what is missing is this device's ability
+            // to carry IPv6 at all.
+            return ValidateTarget(rule) ?? (carriesIpv6 ? null : PeerEgressCodes.RuleIpv6Unsupported);
         }
         if (LooksLikeDomain(match))
         {
@@ -172,6 +206,15 @@ public static class PeerEgressRules
                 return PeerEgressCodes.RuleFakeIpOverlap;
             }
         }
+        return ValidateTarget(rule);
+    }
+
+    /// <summary>
+    /// The part of the order after the match: no port, a known action, and the egress an egress rule
+    /// needs.
+    /// </summary>
+    private static string? ValidateTarget(PeerEgressRule rule)
+    {
         if (rule.Port is not null)
         {
             return PeerEgressCodes.RulePortUnsupported;
@@ -209,9 +252,26 @@ public static class PeerEgressRules
     /// </remarks>
     public static PeerEgressRuleMatch Match(
         IReadOnlyList<PeerEgressRule> rules, string? destination, string? meshCidr,
-        Ipv4Cidr? fakeIpPool = null)
+        Ipv4Cidr? fakeIpPool = null) => Match(rules, destination, meshCidr, fakeIpPool, ConsumerCarriesIpv6);
+
+    /// <summary>
+    /// As above, with the consumer's IPv6 data plane stated.
+    /// </summary>
+    /// <remarks>
+    /// The families never compete: an IPv4 destination is decided by IPv4 rules alone and an IPv6 one
+    /// by IPv6 rules alone, longest prefix within the family. Both are compared by value, so how a
+    /// rule or a destination is spelled does not change the result.
+    /// </remarks>
+    public static PeerEgressRuleMatch Match(
+        IReadOnlyList<PeerEgressRule> rules, string? destination, string? meshCidr,
+        Ipv4Cidr? fakeIpPool, bool carriesIpv6)
     {
-        if (rules.Count == 0 || !Ipv4Cidr.TryParseAddress(destination, out var address))
+        var text = destination?.Trim() ?? string.Empty;
+        var ipv6 = text.Contains(':', StringComparison.Ordinal);
+        uint address = 0;
+        var address6 = UInt128.Zero;
+        var readable = ipv6 ? Ipv6Cidr.TryParseAddress(text, out address6) : Ipv4Cidr.TryParseAddress(text, out address);
+        if (rules.Count == 0 || !readable)
         {
             return Unmatched;
         }
@@ -220,21 +280,30 @@ public static class PeerEgressRules
         for (var index = 0; index < rules.Count; index++)
         {
             var rule = rules[index];
-            if (Validate(rule, meshCidr, fakeIpPool) is not null)
+            if (Validate(rule, meshCidr, fakeIpPool, carriesIpv6) is not null)
             {
                 continue;
             }
             // A domain rule in force does not parse as a prefix and is passed over: it steers by the
             // name a pool address was handed out for, never by an address outside the pool.
-            if (!Ipv4Cidr.TryParse(rule.Match, out var cidr) || !cidr.Contains(address))
+            var match = rule.Match.Trim();
+            var prefixLength = -1;
+            if (match.Contains(':', StringComparison.Ordinal))
+            {
+                if (ipv6 && Ipv6Cidr.TryParse(match, out var cidr6) && cidr6.Contains(address6))
+                {
+                    prefixLength = cidr6.PrefixLength;
+                }
+            }
+            else if (!ipv6 && Ipv4Cidr.TryParse(match, out var cidr) && cidr.Contains(address))
+            {
+                prefixLength = cidr.PrefixLength;
+            }
+            if (prefixLength <= bestPrefix)
             {
                 continue;
             }
-            if (cidr.PrefixLength <= bestPrefix)
-            {
-                continue;
-            }
-            bestPrefix = cidr.PrefixLength;
+            bestPrefix = prefixLength;
             best = new PeerEgressRuleMatch(rule.Action,
                 index,
                 rule.Action == ActionEgress ? rule.EgressClientId : null);

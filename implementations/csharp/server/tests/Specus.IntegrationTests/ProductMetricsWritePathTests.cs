@@ -13,6 +13,7 @@ using Specus.Protocol.Packets;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.Data.Entities;
+using Specus.Server.Management;
 using Specus.Server.ProductMetrics;
 
 namespace Specus.IntegrationTests;
@@ -148,6 +149,65 @@ public sealed class ProductMetricsWritePathTests
         };
         oversize.Headers.Authorization = new AuthenticationHeaderValue("Bearer", admin);
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, (await run.Http.SendAsync(oversize)).StatusCode);
+
+        // No tenant collects, so the sweep drops progress rows even of a tenant whose switch is on.
+        await run.WithDbAsync(async db =>
+        {
+            db.ProductMetricsSwitches.Add(new ProductMetricsSwitch { TenantId = Tenant, Enabled = true });
+            db.ProductMetricsOnboardingProgress.Add(new ProductMetricsOnboardingProgress
+            {
+                TenantId = Tenant, Username = "pm-bob",
+                StartedAt = ProductMetricsVectorTests.Instant("2026-09-01T08:00:00Z"),
+            });
+            await db.SaveChangesAsync();
+        });
+        await run.Metrics.SweepAsync(CancellationToken.None);
+        await run.WithDbAsync(async db => Assert.Equal(0, await db.ProductMetricsOnboardingProgress.CountAsync()));
+    }
+
+    /// <summary>
+    /// Section 9: sweep steps 1 and 4 decide on the switch when they delete, not on the switches the
+    /// sweep read first. A tenant that is off and purged in that snapshot but switched back on before
+    /// the deletes keeps the progress and counts it collected since.
+    /// </summary>
+    [Fact]
+    public async Task ATenantSwitchedBackOnBeforeTheSweepDeletesKeepsWhatItCollects()
+    {
+        await using var run = await ProductMetricsVectorTests.Run.StartAsync();
+        run.SetClock(ProductMetricsVectorTests.Instant("2026-09-01T08:00:00Z"));
+        var metrics = run.Metrics;
+        var admin = new ManagementContext("t1", "pm-admin", ManagementRole.Admin, false);
+        var on = Encoding.UTF8.GetBytes("{\"enabled\":true,\"disclosureVersion\":1}");
+        Assert.Equal(200, (await metrics.PutSettingsAsync(admin, on, CancellationToken.None)).Status);
+        Assert.Equal(200, (await metrics.PutSettingsAsync(admin, Encoding.UTF8.GetBytes("{\"enabled\":false}"),
+            CancellationToken.None)).Status);
+        Assert.Equal(200, (await metrics.PurgeAsync(admin, CancellationToken.None)).Status);
+        List<ProductMetricsSwitch> switches = null!;
+        await run.WithDbAsync(async db => switches = await db.ProductMetricsSwitches.AsNoTracking().ToListAsync());
+        var snapshot = Assert.Single(switches);
+        Assert.False(snapshot.Enabled);
+        Assert.NotNull(snapshot.PurgedAt);
+
+        // Between the snapshot and the deletes: switched back on, then a transfer, a started account
+        // and a completed one.
+        Assert.Equal(200, (await metrics.PutSettingsAsync(admin, on, CancellationToken.None)).Status);
+        var ingest = Encoding.UTF8.GetBytes("{\"schemaVersion\":1,\"events\":[{\"mode\":\"device\",\"path\":\"direct\","
+            + "\"sizeBucket\":\"lt1m\",\"attempt\":\"first\",\"outcome\":\"success\"}]}");
+        Assert.Equal(200, (await metrics.IngestAsync(admin, ingest, CancellationToken.None)).Status);
+        Assert.Equal("started", await metrics.MilestoneAsync("t1", "bob", ProductMetricsModel.StepAccountCreated));
+        Assert.Equal("started", await metrics.MilestoneAsync("t1", "carol", ProductMetricsModel.StepAccountCreated));
+        Assert.Equal("completed", await metrics.MilestoneAsync("t1", "carol", ProductMetricsModel.StepServicePublished));
+
+        await metrics.SweepAsync(switches, CancellationToken.None);
+        await run.WithDbAsync(async db =>
+        {
+            var progress = await db.ProductMetricsOnboardingProgress.AsNoTracking().ToListAsync();
+            Assert.Equal("bob", Assert.Single(progress).Username);
+            var cohorts = await db.ProductMetricsOnboardingDaily.AsNoTracking().ToListAsync();
+            Assert.Equal(1L, Assert.Single(cohorts).Users);
+            var transfers = await db.ProductMetricsTransferDaily.AsNoTracking().ToListAsync();
+            Assert.Equal(1L, Assert.Single(transfers).Count);
+        });
     }
 
     [Fact]

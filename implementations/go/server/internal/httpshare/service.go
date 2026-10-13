@@ -144,7 +144,9 @@ func (s *Service) CutStreams(shareIDs []string) {
 	}
 }
 
-func (s *Service) principalFor(user *store.ManagementUser, username string) *principal {
+// principalFor turns the user read for (tenantID, username) into the principal it is now. The
+// built-in admin has no row and belongs to its configured tenant only.
+func (s *Service) principalFor(user *store.ManagementUser, tenantID, username string) *principal {
 	if user != nil {
 		if !user.Enabled {
 			return nil
@@ -153,6 +155,7 @@ func (s *Service) principalFor(user *store.ManagementUser, username string) *pri
 			admin: strings.EqualFold(user.Role, roleAdmin)}
 	}
 	if s.builtIn.Username != "" && strings.EqualFold(username, s.builtIn.Username) &&
+		normalizeTenant(tenantID) == normalizeTenant(s.builtIn.TenantID) &&
 		(s.builtIn.Enabled == nil || s.builtIn.Enabled()) {
 		return &principal{username: s.builtIn.Username, tenantID: normalizeTenant(s.builtIn.TenantID), admin: true}
 	}
@@ -193,7 +196,7 @@ func (s *Service) LapseReason(snapshot store.HTTPShareSnapshot) string {
 	case ExposurePublic:
 		return ReasonRouteMadePublic
 	}
-	if !s.principalFor(snapshot.Creator, snapshot.Share.CreatedBy).canManage(route, snapshot.Client) {
+	if !s.principalFor(snapshot.Creator, snapshot.Share.TenantID, snapshot.Share.CreatedBy).canManage(route, snapshot.Client) {
 		return ReasonCreatorLostAccess
 	}
 	return ""
@@ -309,12 +312,12 @@ type routeAccess struct {
 // the same 404.
 func (s *Service) manageable(ctx context.Context, caller Caller, routeIDText string) (routeAccess, *Result) {
 	var access routeAccess
-	user, err := s.db.FindManagementUserByUsername(ctx, caller.Username)
+	user, err := s.db.FindManagementUserByLogin(ctx, caller.TenantID, caller.Username)
 	if err != nil {
 		result := failure(http.StatusServiceUnavailable, CodeUnavailable)
 		return access, &result
 	}
-	access.caller = s.principalFor(user, caller.Username)
+	access.caller = s.principalFor(user, caller.TenantID, caller.Username)
 	routeID, err := strconv.ParseInt(routeIDText, 10, 64)
 	if err != nil {
 		result := failure(http.StatusNotFound, CodeRouteNotFound)
@@ -573,11 +576,11 @@ func (s *Service) TenantAudit(ctx context.Context, caller Caller, query AuditQue
 		}
 		routeID = &value
 	}
-	user, err := s.db.FindManagementUserByUsername(ctx, caller.Username)
+	user, err := s.db.FindManagementUserByLogin(ctx, caller.TenantID, caller.Username)
 	if err != nil {
 		return failure(http.StatusServiceUnavailable, CodeUnavailable)
 	}
-	p := s.principalFor(user, caller.Username)
+	p := s.principalFor(user, caller.TenantID, caller.Username)
 	if p == nil || !p.admin {
 		return failure(http.StatusForbidden, CodeForbidden)
 	}

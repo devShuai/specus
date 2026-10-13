@@ -14,6 +14,10 @@ sections 1 and 2. What the four servers and four clients must agree on, and what
   learns that its last route was deleted while it was away;
 - disabling, renaming or deleting a client account closes its online connections, so no session
   keeps serving under a name or a route set the server no longer has;
+- a runtime access token belongs to the account it was issued for, not to its name (see
+  protocol/spec/client-auth.md): a reconnect with it is refused once that account is deleted or
+  disabled, logs in under the new name after a rename, and never logs in as, or receives the
+  traffic of, another account that later takes the old name;
 - a client replaces its whole route table with every NAT_CONTROL. An empty array, null or a
   missing field all mean "no routes": no client defines routes locally any more, so there is
   nothing a missing field could keep.
@@ -40,7 +44,9 @@ class Model:
         self.client_enabled = True
         self.online = False
         self.renamed = False
-        self.former_exists = False      # an account still answers to the name before a rename
+        self.account = 1                # which account is current; createClient makes a new one
+        self.token_account = None       # the account the token of the last connect was issued for
+        self.former = None              # routes of the account created under the name before a rename
         self.routes = {}                # name -> {"enabled", "auth"}, in creation (id) order
 
     def enabled_routes(self):
@@ -51,9 +57,10 @@ class Model:
 
     def request(self, route, credentials, websocket, client):
         if client == "former":
-            exists, enabled, routes = self.former_exists, False, {}
+            # The account created under the former name never logs in: no token was issued for it.
+            exists, enabled, routes, online = self.former is not None, True, self.former or {}, False
         else:
-            exists, enabled, routes = self.client_exists, self.client_enabled, self.routes
+            exists, enabled, routes, online = self.client_exists, self.client_enabled, self.routes, self.online
         not_found = {"status": 404, "noStore": True, "forwarded": False}
         if route is None:
             # No route segment: there is nothing to look up. Frameworks answer this path before
@@ -63,7 +70,7 @@ class Model:
             return not_found
         if routes[route]["auth"] and credentials != "valid":
             return {"status": 401, "basicChallenge": True, "forwarded": False}
-        if not self.online:
+        if not online:
             return {"statusAnyOf": [502, 503], "forwarded": False}
         if websocket:
             raise AssertionError("an accepted WebSocket needs SWS2; the vector only refuses upgrades")
@@ -90,7 +97,18 @@ def server_scenario(scenario_id, title, ops):
         elif kind == "connect":
             assert model.client_exists and model.client_enabled and not model.online
             model.online = True
+            model.token_account = model.account
             step["expectLoginPush"] = model.enabled_routes()
+        elif kind == "reconnect":
+            assert model.token_account is not None and not model.online
+            # The token logs in as the account it was issued for, whatever that account is called
+            # now, and only while it exists and is enabled.
+            accepted = (model.token_account == model.account and model.client_exists
+                        and model.client_enabled)
+            step["expectRefused"] = not accepted
+            if accepted:
+                model.online = True
+                step["expectLoginPush"] = model.enabled_routes()
         elif kind == "disconnect":
             assert model.online
             model.online = False
@@ -112,6 +130,10 @@ def server_scenario(scenario_id, title, ops):
             assert not model.client_exists
             model.client_exists = True
             model.client_enabled = True
+            model.account += 1
+        elif kind == "createFormerNameClient":
+            assert model.renamed and model.former is None
+            model.former = {route: {"enabled": True, "auth": False} for route in op["routes"]}
         elif kind == "request":
             step.setdefault("path", "/secret")
             step.setdefault("credentials", "none")
@@ -189,6 +211,7 @@ def server_scenarios():
                 {"op": "setClientEnabled", "enabled": False},
                 request("web"),
                 request("web", websocket=True),
+                {"op": "reconnect"},
             ]),
         server_scenario(
             "renamed-client",
@@ -211,6 +234,30 @@ def server_scenarios():
                 {"op": "createClient"},
                 {"op": "createRoute", "route": "web", "auth": False},
                 request("web"),
+            ]),
+        server_scenario(
+            "deleted-client-token-refused",
+            "删除客户端后凭旧 token 重连被拒：不会登录成同名新建的客户端，也收不到它的流量",
+            [
+                {"op": "createRoute", "route": "web", "auth": False},
+                {"op": "connect"},
+                {"op": "deleteClient"},
+                {"op": "createClient"},
+                {"op": "createRoute", "route": "web", "auth": False},
+                {"op": "reconnect"},
+                request("web"),
+            ]),
+        server_scenario(
+            "renamed-client-token-follows-account",
+            "改名后凭旧 token 重连：登录到改名后的账户并以新名绑定，原名新建的客户端收不到转发",
+            [
+                {"op": "createRoute", "route": "web", "auth": False},
+                {"op": "connect"},
+                {"op": "renameClient", "suffix": "-renamed"},
+                {"op": "createFormerNameClient", "routes": ["web"]},
+                {"op": "reconnect"},
+                request("web"),
+                request("web", client="former"),
             ]),
     ]
 
@@ -287,6 +334,12 @@ EXPECTED = {
     ("deleted-client-name-reused", 3): {"status": 404, "noStore": True, "forwarded": False},
     ("deleted-client-name-reused", 5): {"expectPush": None},
     ("deleted-client-name-reused", 6): {"statusAnyOf": [502, 503], "forwarded": False},
+    ("disabled-client", 5): {"expectRefused": True, "expectLoginPush": None},
+    ("deleted-client-token-refused", 5): {"expectRefused": True, "expectLoginPush": None},
+    ("deleted-client-token-refused", 6): {"statusAnyOf": [502, 503], "forwarded": False},
+    ("renamed-client-token-follows-account", 4): {"expectRefused": False, "expectLoginPush": ["web"]},
+    ("renamed-client-token-follows-account", 5): {"status": 200, "body": "forwarded", "forwarded": True},
+    ("renamed-client-token-follows-account", 6): {"statusAnyOf": [502, 503], "forwarded": False},
 }
 
 
@@ -314,8 +367,9 @@ def build():
         "description": "When an HTTP route stops being reachable, and how the client learns it: the "
                        "fail-closed public entry, the full route list on every NAT_CONTROL (login "
                        "included), connections closed with a disabled, renamed or deleted client, "
-                       "and clients replacing their route table on every push. See "
-                       "protocol/spec/http-route.md.",
+                       "reconnect tokens that stay with the account they were issued for, and "
+                       "clients replacing their route table on every push. See "
+                       "protocol/spec/http-route.md and protocol/spec/client-auth.md.",
         "notes": [
             "server.scenarios：每个 scenario 在一台全新服务端上用一个新客户端账户（或种子客户端）从空 route 开始顺序重放 "
             "steps。createRoute/setRouteEnabled/deleteRoute/setClientEnabled/renameClient/deleteClient/"
@@ -337,6 +391,15 @@ def build():
             "createRoute 的 targetBaseUrl 用 targetBaseUrl 字段，auth 为 true 时启用 Basic，凭据见 basicCredentials。"
             "renameClient 把当前账户名改为原名加 suffix。deleteClient 连同其 route 一起删除；createClient 用被删"
             "账户的原名新建账户，之后的 createRoute 属于新账户。",
+            "reconnect：假客户端不做新的 HTTP 登录，用最近一次 connect 所用的 clientSessionId + accessToken 重新登录，"
+            "LOGIN_REQUEST 的 clientName 仍填那次 connect 时的账户名。expectRefused 为 true 时控制连接登录必须被拒绝"
+            "（LOGIN_RESPONSE success 为 false，原因不比较，服务端随后关闭连接），不再登录数据连接，客户端仍离线；"
+            "为 false 时控制与数据连接都必须登录成功，控制连接 LOGIN_RESPONSE 的 clientName 必须是当前账户名（改名后"
+            "即新名），expectLoginPush 与 connect 相同。token 属于签发它时的账户而不是名字，见 "
+            "protocol/spec/client-auth.md。",
+            "createFormerNameClient 用最近一次 renameClient 之前的名字另建一个账户，并为它建 routes 列出的 route"
+            "（启用、无认证、targetBaseUrl 同上）；当前账户仍是改名后的账户，之后的 createRoute 仍属于当前账户，"
+            "request 的 client=former 指向这个新账户。",
             "client.cases：客户端先以 loginSnapshot 作为 HTTP 登录快照，再依次处理 natControl（真实推送的 JSON 原文），"
             "每步之后的 route 表（route 名到 targetBaseUrl）必须等于 expectRoutes。",
         ],

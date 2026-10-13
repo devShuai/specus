@@ -375,15 +375,23 @@ public class ProductMetricsService {
      * while collecting.
      */
     public void sweep() {
+        sweep(store.switches());
+    }
+
+    /**
+     * Runs the four steps on switches read beforehand. They only pick the candidates of steps 1 and
+     * 4: each delete checks the switch again when it runs, so a tenant switched back on since the
+     * read keeps what it collects from then on.
+     */
+    void sweep(List<SwitchRow> switches) {
         long now = clock.millis();
-        List<SwitchRow> switches = store.switches();
         Map<String, Boolean> enabled = new HashMap<>();
         switches.forEach(row -> enabled.put(row.tenantId(), collecting(row)));
         List<ProgressRow> progress = new ArrayList<>(store.progressRows(null));
         progress.sort(Comparator.comparing(ProgressRow::tenantId).thenComparing(ProgressRow::username));
         for (ProgressRow row : progress) {
             if (!enabled.getOrDefault(row.tenantId(), false)) {
-                store.deleteProgress(row.tenantId(), row.username());
+                dropProgress(row);
             } else if (now >= row.startedAt() + WINDOW_MS) {
                 close(row.tenantId(), row.username(), null);
             }
@@ -391,9 +399,21 @@ public class ProductMetricsService {
         store.deleteCountsBefore(dayOf(now - (RETENTION_DAYS - 1) * DAY_MS));
         for (SwitchRow row : switches) {
             if (!row.enabled() && row.purgedAt() != null) {
-                store.deleteTenantCounts(row.tenantId());
-                store.deleteTenantProgress(row.tenantId());
+                store.deletePurgedTenantRows(row.tenantId());
             }
+        }
+    }
+
+    /**
+     * Step 1 for one row of a tenant that was not collecting when the sweep read the switches. The
+     * delete checks the switch again, so a tenant switched on since keeps the row; when the
+     * deployment does not allow metrics no tenant collects and the row goes regardless.
+     */
+    private void dropProgress(ProgressRow row) {
+        if (properties.isAllowed()) {
+            store.deleteProgressUnlessEnabled(row.tenantId(), row.username());
+        } else {
+            store.deleteProgress(row.tenantId(), row.username());
         }
     }
 

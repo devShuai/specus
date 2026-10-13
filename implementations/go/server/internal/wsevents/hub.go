@@ -136,6 +136,25 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// CloseIdentity ends the open connections of one identity, whose account was deleted. A connection
+// keeps the identity it was opened with, so it would otherwise receive the events of a later account
+// of the same name (management-accounts.md section 7.1).
+func (h *Hub) CloseIdentity(tenantID, username string) {
+	h.mu.Lock()
+	var closing []*websocket.Conn
+	for socket, access := range h.sockets {
+		if access.TenantID == tenantID && access.Username == username {
+			closing = append(closing, socket)
+			delete(h.sockets, socket)
+		}
+	}
+	h.mu.Unlock()
+	for _, socket := range closing {
+		// The close handshake waits for the peer; the caller does not.
+		go socket.Close(websocket.StatusPolicyViolation, "account deleted")
+	}
+}
+
 // Broadcast sends an event to all connected admins as a JSON text frame.
 func (h *Hub) Broadcast(event Event) {
 	payload, err := json.Marshal(event)

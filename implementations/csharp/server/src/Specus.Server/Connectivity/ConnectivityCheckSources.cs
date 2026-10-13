@@ -63,7 +63,11 @@ internal sealed class NatConnectivityDeviceGateway(
         HttpSpecusStream stream;
         try
         {
-            stream = await dispatcher.OpenAsync(clientName, metadata, budgetCts.Token).ConfigureAwait(false);
+            // Only the head matters: a body relayed before the RST lands is dropped, never queued
+            // and never credited back. That holds from before OPEN is written, since the device
+            // can answer before this call returns.
+            stream = await dispatcher.OpenAsync(clientName, metadata, budgetCts.Token,
+                discardResponseBody: true).ConfigureAwait(false);
         }
         catch (DirectHttpSpecusException)
         {
@@ -76,9 +80,6 @@ internal sealed class NatConnectivityDeviceGateway(
             return ConnectivityProbeAnswer.NoAnswer();
         }
 
-        // Only the head matters: a body relayed before the RST lands is dropped, never queued and
-        // never credited back.
-        stream.DiscardResponseBody();
         // The session owning the connection this probe actually runs on decides whether its RST
         // classification is trusted, not whichever session is current by the time it answers.
         var capability = clientSessions.FindById(stream.ConnectionSessionId)?.HttpRouteCapabilityVersion ?? 0;

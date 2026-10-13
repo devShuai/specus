@@ -84,8 +84,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err := cfg.ValidateSecurityBaseline(); err != nil {
 		return nil, err
 	}
-	if cfg.Netty.MaxFrameSize < protocol.FrameHeaderSize {
-		return nil, fmt.Errorf("netty max frame size must be at least %d", protocol.FrameHeaderSize)
+	if cfg.Netty.MaxFrameSize < config.MinMaxFrameSize {
+		return nil, fmt.Errorf("netty max frame size must be at least %d", config.MinMaxFrameSize)
 	}
 	if err := security.ValidateTLSDeployment(cfg.TLS, cfg.Netty.BindAddress, cfg.ManagementAddr); err != nil {
 		return nil, err
@@ -269,6 +269,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, addressResolver, logger)
 	api.SetMediaCapture(mediaCapture)
+	api.SetClientTokenSessions(clientSessions)
 	api.ProductMetrics().SetAllowed(cfg.ProductMetrics.Allowed)
 	directHTTP.SetHTTPShares(api.HTTPShares())
 	api.SetConnectivityChecker(connectivity.NewChecker(
@@ -313,6 +314,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		})
 	}
 	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, addressResolver, logger)
+	api.SetAccountDeleted(func(tenantID, username string) {
+		wsHub.CloseIdentity(tenantID, username)
+		clientMessages.closeIdentity(tenantID, username)
+	})
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
 		_ = publicTransferDiscovery.Close()
@@ -353,6 +358,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	dispatcher.SetOnLoginSuccess(func(conn *control.Conn) {
 		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// A NAT_CONTROL that cannot be sent is only logged: the connection stays, and the Peer Mesh
+		// push below still runs. Closing it would only have the client log in into the same failure.
 		if _, _, err := natControl.PushToName(pushCtx, conn.ClientName()); err != nil {
 			logger.Error("NAT_CONTROL push failed", "client", conn.ClientName(), "err", err)
 		}

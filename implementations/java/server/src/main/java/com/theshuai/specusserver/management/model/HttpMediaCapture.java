@@ -10,6 +10,7 @@ import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
+import org.hibernate.Length;
 
 @Entity
 @Table(name = "specus_http_media_capture",
@@ -109,8 +110,9 @@ public class HttpMediaCapture {
     @Column(name = "failure_reason", length = 2048)
     private String failureReason;
 
+    // A @Lob column keeps @Column's default length of 255, which MySQL turns into tinytext.
     @Lob
-    @Column(name = "response_headers")
+    @Column(name = "response_headers", length = Length.LONG32)
     private String responseHeaders;
 
     @Column(name = "captured_at", nullable = false, length = 40)

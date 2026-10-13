@@ -121,7 +121,7 @@ public sealed class OidcTokenExchangeService
                 cancellationToken).ConfigureAwait(false);
             return Results.Ok(new
             {
-                accessToken = _localTokens.IssueToken(user.Username, user.TenantId, user.Role),
+                accessToken = _localTokens.IssueToken(user.Username, user.TenantId, user.Role, user.AccountKey),
                 idToken = rawIdToken,
                 tokenType = ReadString(body.RootElement, "token_type") ?? "Bearer",
                 expiresIn = _localTokens.TtlSeconds,

@@ -25,4 +25,13 @@ public final class ServerAttributes {
 
     /** 已登录会话上下文。绑定 = 已登录；移除 = 未登录。 */
     public static final AttributeKey<Session> SESSION = AttributeKey.valueOf("session");
+
+    /**
+     * The client a control connection's unbind took offline, set by
+     * {@code SessionUtil.unBindSession} when it removes the client's current control connection.
+     * Unlike {@link #SESSION} it survives the unbind, so {@code channelInactive}, which runs after
+     * the close-future unbind, can still tell the client's peers that it left. Never set on a data
+     * connection, nor on a control connection replaced by a newer login: that client is still online.
+     */
+    public static final AttributeKey<String> DEPARTED_CLIENT = AttributeKey.valueOf("departedClient");
 }
