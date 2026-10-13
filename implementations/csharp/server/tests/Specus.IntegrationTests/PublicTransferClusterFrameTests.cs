@@ -81,6 +81,30 @@ public sealed class PublicTransferClusterFrameTests
             clusterEvent with { TargetPeerId = "unexpected-target" }));
     }
 
+    [Fact]
+    public void ManagementRevocationMatchesCanonicalVectorAndRejectsInvalidShape()
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(FindVector()));
+        var vector = document.RootElement.GetProperty("canonicalManagementRevocation");
+        var frame = new PublicTransferClusterEvent(PublicTransferClusterFrame.KindManagementRevocation,
+            false, 0, vector.GetProperty("groupId").GetString()!, "", "",
+            Encoding.UTF8.GetBytes(vector.GetProperty("payloadUtf8").GetString()!));
+        var encoded = PublicTransferClusterFrame.Encode(frame);
+        Assert.Equal(Convert.FromHexString(vector.GetProperty("frameHex").GetString()!), encoded);
+        var decoded = PublicTransferClusterFrame.Decode(encoded);
+        Assert.Equal(frame.Kind, decoded.Kind);
+        Assert.Equal(frame.Payload, decoded.Payload);
+        Assert.Equal(PublicTransferCoordinationService.ManagementGroupId(vector.GetProperty("tenantId").GetString()),
+            decoded.GroupId);
+        Assert.Throws<ArgumentException>(() => PublicTransferClusterFrame.Encode(frame with { TargetPeerId = "x" }));
+        Assert.Throws<ArgumentException>(() => PublicTransferClusterFrame.Encode(frame with { SourceLeaseId = "x" }));
+        Assert.Throws<ArgumentException>(() => PublicTransferClusterFrame.Encode(frame with { Revision = 1 }));
+        Assert.Throws<ArgumentException>(() => PublicTransferClusterFrame.Encode(frame with { ExcludeSource = true }));
+        Assert.Throws<ArgumentException>(() => PublicTransferClusterFrame.Encode(frame with { Payload = [] }));
+        encoded[15] = 1;
+        Assert.Throws<ArgumentException>(() => PublicTransferClusterFrame.Decode(encoded));
+    }
+
     private static string FindVector()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

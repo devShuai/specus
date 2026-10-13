@@ -10,6 +10,7 @@ public sealed class ClientAuthNonce
 
 public sealed class WebSocketTicket
 {
+    public string? AccountKey { get; set; }
     public string TokenHash { get; set; } = string.Empty;
     public string Scope { get; set; } = string.Empty;
     public string? Username { get; set; }

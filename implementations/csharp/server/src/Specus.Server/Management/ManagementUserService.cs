@@ -6,6 +6,7 @@ using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
+using Specus.Server.WebSockets;
 
 namespace Specus.Server.Management;
 
@@ -26,14 +27,16 @@ public sealed class ManagementUserService
     private readonly AuthOptions _auth;
     private readonly HttpShareService _shares;
     private readonly ILogger<ManagementUserService>? _logger;
+    private readonly ManagementAccessRevocations? _revocations;
 
     public ManagementUserService(SpecusDbContext db, IOptions<AuthOptions> auth, HttpShareService shares,
-        ILogger<ManagementUserService>? logger = null)
+        ILogger<ManagementUserService>? logger = null, ManagementAccessRevocations? revocations = null)
     {
         _db = db;
         _auth = auth.Value;
         _shares = shares;
         _logger = logger;
+        _revocations = revocations;
     }
 
     /// <summary>
@@ -452,6 +455,8 @@ public sealed class ManagementUserService
         }
         var user = await RequireMutableUserInTenantAsync(context, normalized, "update", cancellationToken)
             .ConfigureAwait(false);
+        var wasEnabled = user.Enabled;
+        var previousRole = user.Role;
         if (!string.IsNullOrWhiteSpace(request.Password))
         {
             user.PasswordHash = PasswordHasher.Hash(RequirePassword(request.Password));
@@ -465,6 +470,8 @@ public sealed class ManagementUserService
             user.Enabled = request.Enabled.Value;
         }
         user.UpdatedAt = DateTimeOffset.UtcNow;
+        var revocationReason = wasEnabled && !user.Enabled ? ManagementAccessRevocations.Disabled
+            : wasEnabled && previousRole != user.Role ? ManagementAccessRevocations.RoleChanged : null;
         // Disabling a user or changing its role ends the shares it created that it could no longer
         // create now, in the same transaction.
         List<string> revokedShares;
@@ -472,11 +479,21 @@ public sealed class ManagementUserService
                          .ConfigureAwait(false))
         {
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            if (revocationReason is not null)
+            {
+                await ManagementAccessRevocations.RevokeTicketsAsync(_db, user.TenantId,
+                    user.EffectiveLoginName(), cancellationToken).ConfigureAwait(false);
+            }
             revokedShares = await _shares.OnUserChangedAsync(context.Username, user.EffectiveLoginName(),
                 user.TenantId, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         _shares.CutStreams(revokedShares);
+        if (revocationReason is not null && _revocations is not null)
+        {
+            await _revocations.CommittedAsync(user.TenantId, user.EffectiveLoginName(), revocationReason)
+                .ConfigureAwait(false);
+        }
         return ToView(user);
     }
 
@@ -530,10 +547,17 @@ public sealed class ManagementUserService
             .ConfigureAwait(false);
         _db.ManagementUsers.Remove(user);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await ManagementAccessRevocations.RevokeTicketsAsync(_db, tenantId, loginName, cancellationToken)
+            .ConfigureAwait(false);
         var revokedShares = await _shares.OnUserChangedAsync(context.Username, loginName, tenantId,
             cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
+        if (_revocations is not null)
+        {
+            await _revocations.CommittedAsync(tenantId, loginName, ManagementAccessRevocations.Deleted)
+                .ConfigureAwait(false);
+        }
         return (tenantId, loginName);
     }
 

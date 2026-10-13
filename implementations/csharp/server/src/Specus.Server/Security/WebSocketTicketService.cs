@@ -30,6 +30,7 @@ public sealed class WebSocketTicketService
         var now = DateTimeOffset.UtcNow;
         var row = new WebSocketTicket
         {
+            AccountKey = claims.AccountKey,
             TokenHash = Digest(token),
             Scope = scope,
             Username = NullIfEmpty(claims.Username),
@@ -86,7 +87,7 @@ public sealed class WebSocketTicketService
         }
         return new WebSocketTicketClaims(row.Username, row.TenantId, row.IsAdmin, row.RoomId,
             row.RoomKey, row.PeerId, row.DisplayName, row.SharedRoom, row.RoomRole,
-            row.Discoverable);
+            row.Discoverable, row.AccountKey);
     }
 
     public static string? ExtractTicket(HttpRequest request)
@@ -131,7 +132,7 @@ public sealed class WebSocketTicketService
 public sealed record WebSocketTicketClaims(string? Username = null, string? TenantId = null,
     bool Admin = false, string? RoomId = null, string? RoomKey = null, string? PeerId = null,
     string? DisplayName = null, bool SharedRoom = false, string? RoomRole = null,
-    bool Discoverable = true)
+    bool Discoverable = true, string? AccountKey = null)
 {
     public ClaimsPrincipal ToPrincipal()
     {
@@ -143,6 +144,10 @@ public sealed record WebSocketTicketClaims(string? Username = null, string? Tena
             identity.AddClaim(new Claim(ClaimTypes.Name, username));
         }
         identity.AddClaim(new Claim("tenant_id", ManagementContext.NormalizeTenant(TenantId)));
+        if (!string.IsNullOrEmpty(AccountKey))
+        {
+            identity.AddClaim(new Claim(LocalTokenService.AccountKeyClaim, AccountKey));
+        }
         identity.AddClaim(new Claim(ClaimTypes.Role, Admin ? "ADMIN" : "USER"));
         return new ClaimsPrincipal(identity);
     }

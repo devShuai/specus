@@ -3230,6 +3230,11 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("token_hash");
 
+                    b.Property<string>("AccountKey")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("account_key");
+
                     b.Property<string>("CreatedAt")
                         .IsRequired()
                         .HasMaxLength(40)

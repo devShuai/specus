@@ -170,6 +170,7 @@ public sealed class SpecusDbContext : DbContext
         modelBuilder.Entity<WebSocketTicket>(b =>
         {
             b.ToTable("specus_websocket_ticket");
+            b.Property(x => x.AccountKey).HasColumnName("account_key").HasMaxLength(80);
             b.HasKey(x => x.TokenHash);
             b.Property(x => x.TokenHash).HasColumnName("token_hash").HasMaxLength(64).IsRequired();
             b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(40).IsRequired();

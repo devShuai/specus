@@ -3253,6 +3253,11 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("token_hash");
 
+                    b.Property<string>("AccountKey")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("account_key");
+
                     b.Property<string>("CreatedAt")
                         .IsRequired()
                         .HasMaxLength(40)

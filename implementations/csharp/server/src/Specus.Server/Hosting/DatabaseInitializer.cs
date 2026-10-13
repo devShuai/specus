@@ -610,6 +610,8 @@ public sealed partial class DatabaseInitializer
         };
         await EnsureColumnAsync(db, "specus_websocket_ticket", "room_role", "VARCHAR(16)",
             cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "specus_websocket_ticket", "account_key", "VARCHAR(80)",
+            cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "specus_websocket_ticket", "discoverable", discoverableType,
             cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "transfer_attachment", "public_transfer_room_id", "BIGINT",

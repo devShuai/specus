@@ -16,16 +16,19 @@ public sealed class ConnectionEventsHub
     private readonly ConcurrentDictionary<Guid, ConnectionEventSubscription> _sockets = new();
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly WebSocketTicketService _tickets;
+    private readonly ManagementWebSocketIdentity _identity;
     private readonly ClientAddressResolver _addressResolver;
     private readonly PublicTransferCoordinationService _coordination;
     private readonly ILogger<ConnectionEventsHub> _logger;
 
     public ConnectionEventsHub(IServiceScopeFactory scopeFactory, WebSocketTicketService tickets,
         ClientAddressResolver addressResolver,
-        PublicTransferCoordinationService coordination, ILogger<ConnectionEventsHub> logger)
+        PublicTransferCoordinationService coordination, ILogger<ConnectionEventsHub> logger,
+        ManagementWebSocketIdentity identity)
     {
         _scopeFactory = scopeFactory;
         _tickets = tickets;
+        _identity = identity;
         _addressResolver = addressResolver;
         _coordination = coordination;
         _logger = logger;
@@ -50,6 +53,12 @@ public sealed class ConnectionEventsHub
             return;
         }
 
+        if (!await _identity.CurrentAsync(claims, context.RequestAborted).ConfigureAwait(false))
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            context.Response.Headers["X-Auth-Reason"] = ManagementWebSocketIdentity.Revoked;
+            return;
+        }
         var principal = claims.ToPrincipal();
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
@@ -57,6 +66,13 @@ public sealed class ConnectionEventsHub
         _sockets[id] = new ConnectionEventSubscription(socket, SubscriptionPrincipal.From(principal));
         try
         {
+            // A revocation can commit after the first check but before registration.
+            if (!await _identity.CurrentAsync(claims, context.RequestAborted).ConfigureAwait(false))
+            {
+                await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
+                    ManagementWebSocketIdentity.Revoked, context.RequestAborted).ConfigureAwait(false);
+                return;
+            }
             var buffer = new byte[1024];
             while (!context.RequestAborted.IsCancellationRequested
                 && socket.State is WebSocketState.Open or WebSocketState.CloseSent)
@@ -115,7 +131,7 @@ public sealed class ConnectionEventsHub
     /// section 7.1). A session keeps the identity it was opened with, so it would otherwise receive the
     /// events of a later account of the same name.
     /// </summary>
-    public async Task CloseIdentityAsync(string tenantId, string username)
+    public async Task CloseIdentityAsync(string tenantId, string username, string reason = "account deleted")
     {
         foreach (var (id, subscription) in _sockets.ToArray())
         {
@@ -130,7 +146,7 @@ public sealed class ConnectionEventsHub
                 if (subscription.Socket.State == WebSocketState.Open)
                 {
                     await subscription.Socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
-                        "account deleted", CancellationToken.None).ConfigureAwait(false);
+                        reason, CancellationToken.None).ConfigureAwait(false);
                 }
             }
             catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException

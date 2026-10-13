@@ -419,6 +419,11 @@ public sealed class PublicTransferCoordinationService : BackgroundService
     internal static string GroupId(string roomId, string roomKey) =>
         Digest((roomId ?? string.Empty) + "\0" + (roomKey ?? string.Empty));
 
+    internal Task PublishManagementRevocationAsync(string tenantId, byte[] payload,
+        CancellationToken cancellationToken) => PublishAsync(new PublicTransferClusterEvent(
+            PublicTransferClusterFrame.KindManagementRevocation, false, 0, ManagementGroupId(tenantId),
+            string.Empty, string.Empty, payload), cancellationToken);
+
     // Fallback PublicAddress when no usable client address could be resolved; the same
     // literal is produced by WebSocketTicketService.RequestAddress and the discovery
     // hub's address resolution. Peers with this (or a blank) address are never grouped

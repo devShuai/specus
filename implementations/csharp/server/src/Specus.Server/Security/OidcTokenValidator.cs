@@ -75,6 +75,10 @@ public sealed class AdminBearerTokenValidator
         identity.AddClaim(new Claim(ClaimTypes.Name, user.Username));
         identity.AddClaim(new Claim("iss", externalIdentity.Issuer));
         identity.AddClaim(new Claim("oidc_sub", externalIdentity.Subject));
+        if (!string.IsNullOrEmpty(user.AccountKey))
+        {
+            identity.AddClaim(new Claim(LocalTokenService.AccountKeyClaim, user.AccountKey));
+        }
         identity.AddClaim(new Claim("tenant_id", user.TenantId));
         identity.AddClaim(new Claim(ClaimTypes.Role, ManagementContext.RoleWire(user.Role)));
         identity.AddClaim(new Claim("role", ManagementContext.RoleWire(user.Role)));
