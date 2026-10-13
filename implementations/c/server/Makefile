@@ -234,7 +234,10 @@ $(WORKBENCH_TESTS): $(CORE_OBJS) tests/workbench_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/workbench_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) \
+	  -DST_MANAGEMENT_ACCOUNTS_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/management-accounts-v1.json)"' \
+	  -DST_CLIENT_PEER_DELETION_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/client-peer-deletion-v1.json)"' \
+	  tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 test: all
 	@for test in $(TESTS); do $$test || exit 1; done

@@ -26,6 +26,9 @@
 #ifndef ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE
 #define ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE "../../../protocol/test-vectors/management-accounts-v1.json"
 #endif
+#ifndef ST_CLIENT_PEER_DELETION_VECTOR_FILE
+#define ST_CLIENT_PEER_DELETION_VECTOR_FILE "../../../protocol/test-vectors/client-peer-deletion-v1.json"
+#endif
 
 #define JWT_SECRET "c-management-accounts-test-secret"
 #define ADMIN_PASSWORD "admin-accounts-password"
@@ -191,11 +194,11 @@ static const char *body_of_response(void)
     return body == NULL ? "" : body + 4;
 }
 
-static char *read_vector(void)
+static char *read_vector_file(const char *path)
 {
-    FILE *file = fopen(ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE, "rb");
+    FILE *file = fopen(path, "rb");
     if (file == NULL) {
-        perror(ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE);
+        perror(path);
         return NULL;
     }
     char *vector = NULL;
@@ -823,9 +826,95 @@ static int test_init_removes_email_records_of_deleted_accounts(void)
     return failed ? 1 : 0;
 }
 
+/* The same deletion/late-rollback contract is replayed by all four runtimes. */
+static int test_client_peer_deletion_vector(void)
+{
+    char *vector = read_vector_file(ST_CLIENT_PEER_DELETION_VECTOR_FILE);
+    char **setup = NULL, **checks = NULL;
+    size_t setup_count = 0U, check_count = 0U;
+    long long client_id = 0;
+    int version = 0;
+    char *actor = vector == NULL ? NULL : st_json_get_top_level_string(vector, "actor");
+    int failed = vector == NULL || actor == NULL
+        || st_json_get_int(vector, "version", &version) != 0 || version != 1
+        || st_json_get_i64(vector, "clientId", &client_id) != 0 || client_id != 1001
+        || st_json_get_string_array(vector, "setup", &setup, &setup_count) != 0 || setup_count != 7U
+        || st_json_get_raw_array(vector, "checks", &checks, &check_count) != 0 || check_count != 23U;
+    char *overrides = vector == NULL ? NULL : st_json_get_top_level_raw(vector, "implementationSetupOverrides");
+    char **c_overrides = NULL;
+    size_t override_count = 0U;
+    if (!failed) {
+        failed = overrides == NULL
+            || st_json_get_raw_array(overrides, "c", &c_overrides, &override_count) != 0
+            || override_count != 2U;
+    }
+    for (size_t i = 0U; !failed && i < override_count; ++i) {
+        int index = -1;
+        char *sql = st_json_get_top_level_string(c_overrides[i], "sql");
+        failed = st_json_get_int(c_overrides[i], "index", &index) != 0
+            || index != (int)i || sql == NULL;
+        if (!failed) { free(setup[index]); setup[index] = sql; }
+        else free(sql);
+    }
+    st_json_free_string_array(c_overrides, override_count);
+    free(overrides);
+    if (failed) fprintf(stderr, "incomplete client peer deletion vector\n");
+    for (int audited = 0; !failed && audited <= 1; ++audited) {
+        for (int rollback = 0; !failed && rollback <= 1; ++rollback) {
+            char label[64];
+            snprintf(label, sizeof(label), "peer-delete-%d-%d", audited, rollback);
+            failed = open_fresh_database(label) != 0;
+            for (size_t i = 0U; !failed && i < setup_count; ++i) failed = exec_sql(setup[i]) != 0;
+            if (!failed && rollback) failed = exec_sql(
+                "CREATE TRIGGER fail_vector_delete BEFORE DELETE ON client_account "
+                "WHEN OLD.id=1001 BEGIN SELECT RAISE(ABORT,'injected failure'); END") != 0;
+            if (!failed) {
+                st_storage_share_ids revoked = {0};
+                st_storage_peer_close *closed = NULL;
+                size_t closed_count = 0U;
+                int rc = audited ? st_storage_delete_client_audited_with_peers(
+                    db_path, client_id, actor, 1791870000000LL, &revoked, &closed, &closed_count)
+                    : st_storage_delete_client(db_path, client_id);
+                failed = (rc == 0) == rollback;
+                if (audited) {
+                    failed |= rollback ? closed != NULL || closed_count != 0U
+                        : closed_count != 1U || closed == NULL || closed[0].id != 40
+                            || strcmp(closed[0].tenant_id, "tenant-a") != 0
+                            || closed[0].source_client_id != 1001 || closed[0].target_client_id != 1002;
+                }
+                st_storage_share_ids_free(&revoked);
+                free(closed);
+                if (failed) fprintf(stderr, "deletion outcome/snapshot mismatch audited=%d rollback=%d\n",
+                                    audited, rollback);
+            }
+            for (size_t i = 0U; !failed && i < check_count; ++i) {
+                char *name = st_json_get_top_level_string(checks[i], "name");
+                char *query = st_json_get_top_level_string(checks[i], "query");
+                int expected = -1;
+                long long actual = query == NULL ? -1 : count_rows(query);
+                failed = name == NULL || query == NULL
+                    || st_json_get_int(checks[i], rollback ? "retained" : "deleted", &expected) != 0
+                    || actual != expected;
+                if (failed) fprintf(stderr, "client peer vector %s: got=%lld want=%d audited=%d rollback=%d\n",
+                                    name == NULL ? "?" : name, actual, expected, audited, rollback);
+                free(name);
+                free(query);
+            }
+            if (!failed) printf("client peer deletion vector passed: audited=%d rollback=%d checks=%zu\n",
+                                audited, rollback, check_count);
+            unlink(db_path);
+        }
+    }
+    st_json_free_string_array(setup, setup_count);
+    st_json_free_string_array(checks, check_count);
+    free(actor);
+    free(vector);
+    return failed ? 1 : 0;
+}
+
 int main(void)
 {
-    char *vector = read_vector();
+    char *vector = read_vector_file(ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE);
     if (vector == NULL) {
         fprintf(stderr, "management accounts vector could not be read\n");
         return 1;
@@ -835,7 +924,8 @@ int main(void)
         | test_deleted_account_tokens_do_not_pass_to_a_recreated_account()
         | test_deleting_an_account_releases_its_email()
         | test_init_removes_email_records_of_deleted_accounts()
-        | test_account_deletion_vector(vector);
+        | test_account_deletion_vector(vector)
+        | test_client_peer_deletion_vector();
     free(vector);
     unsetenv("SPECUS_DATABASE_PATH");
     unsetenv("SPECUS_AUTH_PASSWORD");

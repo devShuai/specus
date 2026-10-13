@@ -33,6 +33,12 @@ import com.theshuai.common.session.Session;
 import com.theshuai.specusserver.session.SessionUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
@@ -236,6 +242,51 @@ class ClientAccountServiceTests {
         assertThat(history.getStatus()).isEqualTo(PeerMeshService.STATUS_CLOSED);
         assertThat(history.getClosedAt()).isNotBlank();
         assertThat(history.getSourceClientName()).isEqualTo("removed");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void replaysSharedClientPeerDeletionVector(boolean rollback) throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        while (root != null && !Files.exists(root.resolve("protocol/test-vectors/client-peer-deletion-v1.json"))) {
+            root = root.getParent();
+        }
+        assertThat(root).as("repository vector root").isNotNull();
+        JsonNode vector = new ObjectMapper().readTree(Files.readString(
+                root.resolve("protocol/test-vectors/client-peer-deletion-v1.json")));
+        assertThat(vector.path("version").asInt()).isEqualTo(1);
+        assertThat(vector.path("setup").size()).isEqualTo(7);
+        assertThat(vector.path("checks").size()).isEqualTo(23);
+        TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+        transaction.executeWithoutResult(status -> {
+            for (JsonNode sql : vector.path("setup")) {
+                entityManager.createNativeQuery(sql.asText().replace("client_account", "specus_client_account")).executeUpdate();
+            }
+            if (rollback) {
+                entityManager.createNativeQuery("CREATE TRIGGER fail_vector_delete BEFORE DELETE ON specus_client_account "
+                        + "WHEN OLD.id=1001 BEGIN SELECT RAISE(ABORT,'injected failure'); END").executeUpdate();
+            }
+        });
+        try {
+            Runnable deletion = () -> clientAccountService.deleteClient(
+                    new ManagementContext(new TenantContext(vector.path("tenantId").asText()),
+                            vector.path("actor").asText(), true), vector.path("clientId").asLong());
+            if (rollback) assertThatThrownBy(deletion::run).isInstanceOf(RuntimeException.class);
+            else deletion.run();
+            transaction.executeWithoutResult(status -> {
+                for (JsonNode check : vector.path("checks")) {
+                    Number count = (Number) entityManager.createNativeQuery(check.path("query").asText()
+                            .replace("client_account", "specus_client_account")).getSingleResult();
+                    assertThat(count.longValue()).as(check.path("name").asText())
+                            .isEqualTo(check.path(rollback ? "retained" : "deleted").asLong());
+                }
+            });
+        } finally {
+            transaction.executeWithoutResult(status -> {
+                entityManager.createNativeQuery("DROP TRIGGER IF EXISTS fail_vector_delete").executeUpdate();
+                entityManager.createNativeQuery("DELETE FROM management_workbench_item WHERE tenant_id='tenant-a'").executeUpdate();
+            });
+        }
     }
 
     @Test
