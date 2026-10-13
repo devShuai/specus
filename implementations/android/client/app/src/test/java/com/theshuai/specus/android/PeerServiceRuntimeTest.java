@@ -5,6 +5,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.net.BindException;
 import java.net.ConnectException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -452,6 +453,51 @@ public class PeerServiceRuntimeTest {
     }
 
     @Test
+    public void udpCloseWaitsForOwnedIoBeforeItsPortCanBeReused() throws Exception {
+        int port = freeUdpPort();
+        SpecusCore.LocalPeerService local = config(true, port, true).localServices.get(0);
+        local.publishedPort = port;
+        local.transport = "udp";
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.ExecutorService closer = Executors.newSingleThreadExecutor();
+        PeerServiceUdpBridge bridge = PeerServiceUdpBridge.bind("127.0.0.1", local);
+        java.lang.reflect.Field field = PeerServiceUdpBridge.class.getDeclaredField("executor");
+        field.setAccessible(true);
+        java.util.concurrent.ExecutorService io = (java.util.concurrent.ExecutorService) field.get(bridge);
+        java.util.concurrent.Future<?> closed = null;
+        try {
+            io.execute(() -> {
+                entered.countDown();
+                // Model owned native I/O still unwinding after close/shutdownNow. The
+                // barrier is released in finally even when the old implementation fails.
+                boolean interrupted = false;
+                while (release.getCount() != 0) {
+                    try { release.await(); }
+                    catch (InterruptedException expected) { interrupted = true; }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+            });
+            assertTrue("owned I/O task never entered", entered.await(1, TimeUnit.SECONDS));
+            closed = closer.submit(bridge::close);
+            try {
+                closed.get(200, TimeUnit.MILLISECONDS);
+                throw new AssertionError("UDP close returned before owned I/O finished");
+            } catch (java.util.concurrent.TimeoutException expected) {
+                // close must wait for completion, not just mark DatagramSocket closed.
+            }
+        } finally {
+            release.countDown();
+            if (closed != null) closed.get(2, TimeUnit.SECONDS);
+            bridge.close();
+            closer.shutdownNow();
+            assertTrue("close executor leaked", closer.awaitTermination(1, TimeUnit.SECONDS));
+            assertTrue("owned UDP I/O did not terminate", io.awaitTermination(1, TimeUnit.SECONDS));
+        }
+        assertUdpPortReleased("owned UDP I/O drained", port);
+    }
+
+    @Test
     public void expiredCatalogIsPrunedAndSnapshotUpdated() throws Exception {
         runtime = newRuntime();
         runtime.setRoster(Map.of(2L, new PeerServiceRuntime.RosterHint("100.96.0.2", true)));
@@ -842,6 +888,9 @@ public class PeerServiceRuntimeTest {
     private static void assertUdpPortReleased(String phase, int port) throws Exception {
         try (DatagramSocket reservation = new DatagramSocket(new InetSocketAddress("127.0.0.1", port))) {
             assertEquals(phase, port, reservation.getLocalPort());
+        } catch (BindException retained) {
+            throw new AssertionError(phase + ": UDP port still bound port=" + port
+                    + " runtime=" + PeerServiceRuntime.lastSnapshotJson(), retained);
         }
     }
 

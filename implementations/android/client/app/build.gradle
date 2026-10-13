@@ -14,6 +14,7 @@ plugins {
 // run. Declaring the directory as an input is what makes a new case actually execute here, which is
 // the entire point of sharing the corpus across the four implementations.
 tasks.withType(Test).configureEach {
+    testLogging.exceptionFormat = "full"
     inputs.dir(layout.settingsDirectory.dir("../../../protocol/test-vectors"))
             .withPropertyName("sharedProtocolVectors")
             .withPathSensitivity(PathSensitivity.RELATIVE)

@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -156,16 +157,26 @@ final class PeerServiceUdpBridge implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!open.compareAndSet(true, false)) {
-            return;
+        if (open.compareAndSet(true, false)) {
+            LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
+                    + " activePeers=" + peers.size()
+                    + " reason=config-withdrawn-or-shutdown");
+            inbound.close();
+            peers.values().forEach(UdpPeer::close);
+            peers.clear();
+            executor.shutdownNow();
         }
-        LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
-                + " activePeers=" + peers.size()
-                + " reason=config-withdrawn-or-shutdown");
-        inbound.close();
-        peers.values().forEach(UdpPeer::close);
-        peers.clear();
-        executor.shutdownNow();
+        // DatagramSocket.close may pre-close a descriptor and defer its final release
+        // until blocking receive/send returns. Await owned I/O before reusing the port;
+        // a timeout/interruption is a failed close, not permission to continue silently.
+        try {
+            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("UDP bridge I/O did not terminate for " + service.serviceId);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted closing UDP bridge " + service.serviceId, interrupted);
+        }
     }
 
     private static final class UdpPeer implements AutoCloseable {

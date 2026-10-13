@@ -468,6 +468,15 @@ jobs:
         working-directory: implementations/android/client
         run: ./gradlew test assembleDebug --no-daemon
 
+      - name: Upload Android JVM test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-jvm-test-results
+          path: implementations/android/client/app/build/test-results/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
   benchmark-builds:
     name: Protocol benchmark (${{ matrix.runtime }})
     runs-on: ubuntu-latest
