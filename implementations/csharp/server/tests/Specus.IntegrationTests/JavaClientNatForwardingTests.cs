@@ -71,11 +71,15 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
     {
         if (!File.Exists(ClientJar))
         {
+            Assert.False(Environment.GetEnvironmentVariable("SPECUS_REQUIRE_JAVA_CLIENT") == "1",
+                "Build the Java client first: mvn -pl :specus-client -am package -DskipTests");
             return;
         }
         (_javaExecutable, _javaHome) = ResolveJava();
         if (_javaExecutable is null)
         {
+            Assert.False(Environment.GetEnvironmentVariable("SPECUS_REQUIRE_JAVA_CLIENT") == "1",
+                "Java 21 must be available through JAVA_HOME or PATH for cross-language tests");
             return;
         }
 
@@ -215,6 +219,8 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         {
             psi.Environment["JAVA_HOME"] = _javaHome;
         }
+        // Each child owns its snapshots; do not depend on or modify real user state.
+        psi.Environment["SPECUS_CLI_STATE_DIR"] = Path.Combine(_clientWorkDir!, "state");
         psi.ArgumentList.Add("-Dlogging.level.com.theshuai=info");
         // The Java specus-client embeds a Spring Boot Tomcat fixed at 8087. Two integration
         // tests running in parallel both try to bind that port and the loser dies with

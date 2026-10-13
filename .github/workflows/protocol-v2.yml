@@ -172,6 +172,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build Java client for .NET cross-language tests
+        run: mvn -B -pl :specus-client -am package -DskipTests
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
@@ -187,6 +194,8 @@ jobs:
           npm --prefix apps/admin-web run deploy:csharp
 
       - name: Test .NET server
+        env:
+          SPECUS_REQUIRE_JAVA_CLIENT: "1"
         run: >-
           dotnet test implementations/csharp/server/Specus.slnx
           -p:SpecusServerWebSkip=true

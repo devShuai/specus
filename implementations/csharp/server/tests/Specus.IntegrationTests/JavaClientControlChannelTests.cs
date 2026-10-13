@@ -38,11 +38,11 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        // Skip-mark: if the client jar isn't built we don't fail the suite — print and bail.
-        // CI is expected to run `mvn -pl :specus-client -am package -DskipTests` before the
-        // .NET tests so this branch only triggers in local dev where someone forgot.
+        // Local .NET-only development may omit Java; CI must exercise the real client.
         if (!File.Exists(ClientJar))
         {
+            Assert.False(Environment.GetEnvironmentVariable("SPECUS_REQUIRE_JAVA_CLIENT") == "1",
+                "Build the Java client first: mvn -pl :specus-client -am package -DskipTests");
             _skipped = true;
             return;
         }
@@ -50,6 +50,8 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         (_javaExecutable, _javaHome) = ResolveJava();
         if (_javaExecutable is null)
         {
+            Assert.False(Environment.GetEnvironmentVariable("SPECUS_REQUIRE_JAVA_CLIENT") == "1",
+                "Java 21 must be available through JAVA_HOME or PATH for cross-language tests");
             _skipped = true;
             return;
         }
@@ -172,6 +174,9 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         {
             psi.Environment["JAVA_HOME"] = _javaHome;
         }
+        // Never read or publish test snapshots in the developer's real CLI state directory.
+        // Leave this path absent so the client creates it with its normal private permissions.
+        psi.Environment["SPECUS_CLI_STATE_DIR"] = Path.Combine(_clientWorkDir!, "state");
         psi.ArgumentList.Add("-Dlogging.level.com.theshuai=info");
         // The Java specus-client embeds a Spring Boot Tomcat fixed at 8087. Two integration
         // tests running in parallel both try to bind that port and the loser dies with
