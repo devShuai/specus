@@ -70,6 +70,8 @@ jobs:
         working-directory: implementations/go/${{ matrix.module }}
         run: |
           mkdir -p "$RUNNER_TEMP/sca"
+          go version > "$RUNNER_TEMP/sca/go-${{ matrix.module }}-compiler.txt"
+          go env GOVERSION GOTOOLCHAIN >> "$RUNNER_TEMP/sca/go-${{ matrix.module }}-compiler.txt"
           go list -m -json all > "$RUNNER_TEMP/sca/go-${{ matrix.module }}-modules.json"
 
       # govulncheck reports only vulnerabilities the code can actually reach, so a finding here is
