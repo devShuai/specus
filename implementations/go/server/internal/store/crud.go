@@ -153,6 +153,9 @@ func (db *DB) DeleteClient(ctx context.Context, id int64) error {
 	if err := deleteClientWorkbenchReferences(ctx, db, tx, id); err != nil {
 		return err
 	}
+	if _, err := db.deleteClientPeerReferences(ctx, tx, id, time.Now().UTC()); err != nil {
+		return err
+	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
 			return err

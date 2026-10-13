@@ -1180,12 +1180,13 @@ func (a *API) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, forbidden("无权访问客户端"))
 		return
 	}
-	revoked, err := a.db.DeleteClientAudited(r.Context(), id, principal.Username, a.shareNow(), routeExposure)
+	revoked, closed, err := a.db.DeleteClientAuditedWithPeerSessions(r.Context(), id, principal.Username, a.shareNow(), routeExposure)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	a.shares.CutStreams(revoked)
+	a.peerMesh.OnClientDeleted(r.Context(), *account, closed)
 	a.revokeClientTokens(r.Context(), account.ID)
 	a.kick(account.ClientName, store.ReasonAdminDeleted)
 	w.WriteHeader(http.StatusNoContent)

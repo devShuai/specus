@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 )
 
 // Temporary HTTP shares (protocol/spec/temporary-http-share.md). Times are integer epoch seconds:
@@ -527,6 +528,23 @@ func (db *DB) UpdateClientAudited(ctx context.Context, account ClientAccount, ol
 // the routes' active shares, all in one transaction.
 func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, now int64,
 	exposure func(HTTPRouteMapping) string) ([]string, error) {
+	return db.deleteClientAudited(ctx, id, actor, now, exposure, nil)
+}
+
+// DeleteClientAuditedWithPeerSessions also returns the sessions closed in the transaction.
+// Callers must not evict caches or notify peers unless this returns without error.
+func (db *DB) DeleteClientAuditedWithPeerSessions(ctx context.Context, id int64, actor string, now int64,
+	exposure func(HTTPRouteMapping) string) ([]string, []PeerMeshSession, error) {
+	var closed []PeerMeshSession
+	revoked, err := db.deleteClientAudited(ctx, id, actor, now, exposure, &closed)
+	if err != nil {
+		return nil, nil, err
+	}
+	return revoked, closed, nil
+}
+
+func (db *DB) deleteClientAudited(ctx context.Context, id int64, actor string, now int64,
+	exposure func(HTTPRouteMapping) string, closed *[]PeerMeshSession) ([]string, error) {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -577,6 +595,13 @@ func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, n
 	// Every workbench reference to a service the client carries goes while its rows still exist.
 	if err := deleteClientWorkbenchReferences(ctx, db, tx, id); err != nil {
 		return nil, err
+	}
+	closedSessions, err := db.deleteClientPeerReferences(ctx, tx, id, time.Unix(now, 0).UTC())
+	if err != nil {
+		return nil, err
+	}
+	if closed != nil {
+		*closed = closedSessions
 	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
