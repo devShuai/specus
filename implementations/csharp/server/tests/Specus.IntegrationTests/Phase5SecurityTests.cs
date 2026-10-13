@@ -273,6 +273,48 @@ public sealed class Phase5SecurityTests
         Assert.Equal(HttpStatusCode.BadRequest, refresh.StatusCode);
     }
 
+    [Theory]
+    [InlineData("connections")]
+    [InlineData("client-messages")]
+    public async Task OidcBearerWebSocketTicketIsBoundToTheOriginalAccount(string endpoint)
+    {
+        using var rsa = RSA.Create(2048);
+        var token = CreateOidcToken(rsa, "ticket-key");
+        await using var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Specus:Oidc:Issuer"] = "https://issuer.example",
+            ["Specus:Oidc:Audience"] = "admin-api",
+            ["Specus:Oidc:JwkSetUri"] = "https://issuer.example/jwks",
+        }, services =>
+        {
+            services.RemoveAll<IOidcJwkProvider>();
+            services.AddSingleton<IOidcJwkProvider>(new StaticOidcJwkProvider(CreateJwks(rsa, "ticket-key")));
+        });
+        await BindOidcUserAsync(server, tenantId: "default", role: ManagementRole.User);
+        using var client = server.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var response = await client.PostAsJsonAsync("/api/admin/ws-tickets", new { endpoint });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var ticket = document.RootElement.GetProperty("ticket").GetString();
+        await using (var scope = server.HostServices.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ManagementUsers.SingleAsync();
+            Assert.Equal(account.Username, (await db.WebSocketTickets.SingleAsync()).AccountKey);
+            db.ManagementUsers.Remove(account);
+            await db.SaveChangesAsync();
+            db.ChangeTracker.Clear();
+            account.Username = "replacement-account";
+            db.ManagementUsers.Add(account);
+            await db.SaveChangesAsync();
+        }
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => server.Server.CreateWebSocketClient()
+            .ConnectAsync(new Uri($"ws://localhost/ws/{endpoint}?ticket={ticket}"), timeout.Token));
+        Assert.Contains("403", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task OidcRs256BearerUsesCurrentLocalTenantInsteadOfExternalClaim()
     {

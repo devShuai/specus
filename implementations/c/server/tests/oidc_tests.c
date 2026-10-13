@@ -1306,6 +1306,75 @@ static void test_tenant_claim_does_not_choose_tenant(void)
     free(access);
 }
 
+/* Speak HTTP to the real listener so tickets and upgrades have the same address binding. */
+static int oidc_management_wire(int port, const char *request)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval timeout = {5, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    int rc = connect(fd, (struct sockaddr *)&address, sizeof(address));
+    size_t sent = 0U;
+    while (rc == 0 && sent < strlen(request)) {
+        ssize_t n = send(fd, request + sent, strlen(request) - sent, 0);
+        if (n <= 0) rc = -1;
+        else sent += (size_t)n;
+    }
+    size_t received = 0U;
+    if (rc == 0) rc = idp_read_request(fd, response, sizeof(response), &received);
+    close(fd);
+    return rc == 0 ? status_of(response) : -1;
+}
+
+static void test_oidc_ticket_account_binding(const char *bearer)
+{
+    static st_admin_server listener;
+    listener.fd = -1;
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    int started = st_admin_server_start(&listener, 0, "") == 0
+        && getsockname(listener.fd, (struct sockaddr *)&address, &address_len) == 0;
+    CHECK(started, "OIDC ticket listener");
+    if (!started) return;
+    int port = ntohs(address.sin_port);
+    const char *endpoints[] = {"connections", "client-messages"};
+    char *tickets[2] = {NULL, NULL};
+    char *original_key = db_text("SELECT username FROM specus_management_user WHERE login_name=?", "alice");
+    CHECK(original_key != NULL, "original OIDC account key");
+    if (original_key == NULL) return;
+    for (size_t i = 0; i < 2U; ++i) {
+        char *body = format("{\"endpoint\":\"%s\"}", endpoints[i]);
+        char *request = format("POST /api/admin/ws-tickets HTTP/1.1\r\nHost: localhost\r\n"
+            "Authorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+            bearer, strlen(body), body);
+        int status = oidc_management_wire(port, request);
+        CHECK(status == 200, "external OIDC bearer can issue management ticket");
+        if (status == 200) tickets[i] = st_json_get_top_level_string(body_of(response), "ticket");
+        free(request); free(body);
+    }
+    // Changing the immutable key simulates a replacement account while leaving the login identity intact.
+    CHECK(db_exec("UPDATE specus_management_user SET username='oidc-replacement-key' WHERE login_name='alice'") == 0,
+        "replace OIDC account key after ticket issuance");
+    for (size_t i = 0; i < 2U; ++i) {
+        CHECK(tickets[i] != NULL, "OIDC ticket present");
+        if (tickets[i] == NULL) continue;
+        char *request = format("GET /ws/%s?ticket=%s HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+            "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            endpoints[i], tickets[i]);
+        CHECK(oidc_management_wire(port, request) == 403 && contains(response, "X-Auth-Reason: identity revoked"),
+            "OIDC ticket cannot authenticate a replacement account");
+        free(request); free(tickets[i]);
+    }
+    char *restore = sqlite3_mprintf("UPDATE specus_management_user SET username=%Q WHERE login_name='alice'", original_key);
+    CHECK(db_exec(restore) == 0, "restore OIDC fixture account key");
+    sqlite3_free(restore); free(original_key);
+}
+
 static void test_direct_bearer_tokens(void)
 {
     claims_spec spec = id_claims("subject-alice", NULL, NULL);
@@ -1325,6 +1394,7 @@ static void test_direct_bearer_tokens(void)
               && contains(response, "\"role\":\"USER\""),
           "a bound bearer did not resolve to its local user, tenant and role");
     CHECK(admin_request("GET", "/api/admin/users", alice) == 403, "a USER bearer reached an admin endpoint");
+    test_oidc_ticket_account_binding(alice);
     CHECK(admin_request("POST", "/auth/refresh", alice) == 400
               && contains(response, "OIDC 令牌不能通过该端点续期"),
           "an identity provider token was renewed");

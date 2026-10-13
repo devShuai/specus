@@ -158,6 +158,7 @@ typedef struct st_admin_ws_ticket {
     uint8_t remote_address_hash[ST_SHA256_LEN];
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
     char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
+    char account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1];
     char endpoint[32];
     int admin;
     time_t expires_at;
@@ -258,7 +259,7 @@ static void admin_direct_ws_share_cut(st_admin_direct_ws_stream *stream);
 static pthread_mutex_t admin_direct_ws_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
-static void admin_ws_close_identity(const char *tenant_id, const char *username);
+static void admin_ws_revoke_identity(const char *tenant_id, const char *username, const char *reason);
 static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_ticket *admin_ws_tickets = NULL;
 static pthread_mutex_t admin_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1438,6 +1439,7 @@ static int admin_context_from_oidc_bearer(const char *token, st_admin_context *c
             snprintf(context->username, sizeof(context->username), "%s", user.username);
             snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", user.tenant_id);
             snprintf(context->role, sizeof(context->role), "%s", normalize_management_role(user.role));
+            snprintf(context->account_key, sizeof(context->account_key), "%s", user.account_key);
             context->admin = strcmp(context->role, "ADMIN") == 0;
             context->authenticated = 1;
             result = 0;
@@ -2348,6 +2350,18 @@ static size_t admin_prune_websocket_tickets_locked(time_t now)
     return count;
 }
 
+/* A consumed ticket is a snapshot, not authority to keep an account's old privileges. */
+static int admin_ws_identity_current(const st_admin_context *ticket)
+{
+    st_security_token_claims claims = {0};
+    st_admin_context current;
+    snprintf(claims.username, sizeof(claims.username), "%s", ticket->username);
+    snprintf(claims.tenant_id, sizeof(claims.tenant_id), "%s", ticket->tenant_id);
+    snprintf(claims.account_key, sizeof(claims.account_key), "%s", ticket->account_key);
+    claims.has_tenant = 1;
+    return admin_resolve_token_user(&claims, &current) == 0 && current.admin == ticket->admin;
+}
+
 static int admin_issue_websocket_ticket(const st_admin_context *context,
                                         const char *endpoint,
                                         const char *remote_address,
@@ -2376,6 +2390,7 @@ static int admin_issue_websocket_ticket(const st_admin_context *context,
     memcpy(ticket->remote_address_hash, remote_address_hash, sizeof(remote_address_hash));
     snprintf(ticket->username, sizeof(ticket->username), "%s", context->username);
     snprintf(ticket->tenant_id, sizeof(ticket->tenant_id), "%s", context->tenant_id);
+    snprintf(ticket->account_key, sizeof(ticket->account_key), "%s", context->account_key);
     snprintf(ticket->endpoint, sizeof(ticket->endpoint), "%s", endpoint);
     ticket->admin = context->admin;
     ticket->expires_at = time(NULL) + ST_ADMIN_WS_TICKET_TTL_SECONDS;
@@ -2435,6 +2450,7 @@ static int admin_consume_websocket_ticket(const char *token,
         memset(context, 0, sizeof(*context));
         snprintf(context->username, sizeof(context->username), "%s", ticket->username);
         snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", ticket->tenant_id);
+        snprintf(context->account_key, sizeof(context->account_key), "%s", ticket->account_key);
         snprintf(context->role, sizeof(context->role), "%s", ticket->admin ? "ADMIN" : "USER");
         context->admin = ticket->admin;
         context->authenticated = 1;
@@ -12297,6 +12313,12 @@ static int handle_management_user_update(const st_admin_context *context,
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"user update failed\"}");
     }
+    /* Memory tickets are invalidated only after SQLite commits; failed mutations leave them usable. */
+    if (existing.enabled && !user.enabled) {
+        admin_ws_revoke_identity(user.tenant_id, user.username, "account disabled");
+    } else if (existing.enabled && strcmp(existing.role, user.role) != 0) {
+        admin_ws_revoke_identity(user.tenant_id, user.username, "account role changed");
+    }
     st_admin_string_builder builder = {0};
     if (append_stored_management_user_view(&builder, &user) != 0 || builder.data == NULL) {
         free(builder.data);
@@ -12353,7 +12375,7 @@ static int handle_management_user_delete(const st_admin_context *context, const 
     }
     if (rc == 0 && have_target) {
         /* Committed: the identity's open management WebSockets end. */
-        admin_ws_close_identity(target.tenant_id, target.username);
+        admin_ws_revoke_identity(target.tenant_id, target.username, "account deleted");
         (void)st_product_metrics_user_deleted(database_path, target.tenant_id, target.username);
     }
     int response_len = rc != 0
@@ -16768,25 +16790,43 @@ static int admin_ws_send_frame(st_admin_ws_client *client,
 }
 
 /*
- * The account of this identity was deleted (management-accounts.md 7.1): its client-messages and
+ * The account of this identity was revoked (management-accounts.md 7.2): its client-messages and
  * connections sockets end. A socket keeps the identity it was opened with, so it would otherwise go
  * on as the deleted account and receive what is meant for a later account of the same name. The
  * reading thread of each socket sees the shutdown and removes it.
  */
-static void admin_ws_close_identity(const char *tenant_id, const char *username)
+static void admin_ws_close_revoked_locked(st_admin_ws_client *client, const char *reason)
+{
+    if (client->closing) return;
+    uint8_t payload[125];
+    size_t payload_len = admin_ws_close_payload(1008U, reason, payload);
+    client->closing = 1;
+    (void)admin_ws_send_frame(client, 0x8U, payload, payload_len);
+    shutdown(client->fd, SHUT_RDWR);
+}
+
+static void admin_ws_revoke_identity(const char *tenant_id, const char *username, const char *reason)
 {
     if (tenant_id == NULL || username == NULL) {
         return;
     }
-    uint8_t payload[125];
-    size_t payload_len = admin_ws_close_payload(1008U, "account deleted", payload);
+    pthread_mutex_lock(&admin_ws_ticket_lock);
+    st_admin_ws_ticket **cursor = &admin_ws_tickets;
+    while (*cursor != NULL) {
+        st_admin_ws_ticket *ticket = *cursor;
+        if (strcmp(ticket->tenant_id, tenant_id) == 0 && strcmp(ticket->username, username) == 0) {
+            *cursor = ticket->next;
+            free(ticket);
+        } else {
+            cursor = &ticket->next;
+        }
+    }
+    pthread_mutex_unlock(&admin_ws_ticket_lock);
     pthread_mutex_lock(&admin_ws_lock);
     for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
         if (!client->closing && strcmp(client->tenant_id, tenant_id) == 0
             && strcmp(client->username, username) == 0) {
-            client->closing = 1;
-            (void)admin_ws_send_frame(client, 0x8U, payload, payload_len);
-            shutdown(client->fd, SHUT_RDWR);
+            admin_ws_close_revoked_locked(client, reason);
         }
     }
     pthread_mutex_unlock(&admin_ws_lock);
@@ -17263,9 +17303,10 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         && *ticket != '\0'
         && admin_consume_websocket_ticket(ticket, "connections", remote_address, &context) == 0;
     free(ticket);
-    if (!ticket_valid) {
+    int identity_current = ticket_valid && admin_ws_identity_current(&context);
+    if (!identity_current) {
         char header[256];
-        const char *reason = single_ticket_query
+        const char *reason = ticket_valid ? "identity revoked" : single_ticket_query
             ? "invalid or consumed ticket"
             : "single-use ticket required";
         char body[128];
@@ -17319,7 +17360,14 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
         return 1;
     }
-    admin_drain_text_websocket(client, ST_ADMIN_CONNECTIONS_MAX_CHARS, NULL);
+    /* A revocation may have completed before this subscription was registered. */
+    if (!admin_ws_identity_current(&context)) {
+        pthread_mutex_lock(&admin_ws_lock);
+        admin_ws_close_revoked_locked(client, "identity revoked");
+        pthread_mutex_unlock(&admin_ws_lock);
+    } else {
+        admin_drain_text_websocket(client, ST_ADMIN_CONNECTIONS_MAX_CHARS, NULL);
+    }
     admin_ws_remove(client);
     return 1;
 }
@@ -17374,9 +17422,10 @@ static int handle_client_messages_websocket_request(int fd,
         && *ticket != '\0'
         && admin_consume_websocket_ticket(ticket, "client-messages", remote_address, &context) == 0;
     free(ticket);
-    if (!ticket_valid) {
+    int identity_current = ticket_valid && admin_ws_identity_current(&context);
+    if (!identity_current) {
         char header[256];
-        const char *reason = single_ticket_query
+        const char *reason = ticket_valid ? "identity revoked" : single_ticket_query
             ? "invalid or consumed ticket"
             : "single-use ticket required";
         char body[128];
@@ -17430,7 +17479,11 @@ static int handle_client_messages_websocket_request(int fd,
         admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
         return 1;
     }
-    if (admin_ws_send_client_messages_hello(client) == 0) {
+    if (!admin_ws_identity_current(&context)) {
+        pthread_mutex_lock(&admin_ws_lock);
+        admin_ws_close_revoked_locked(client, "identity revoked");
+        pthread_mutex_unlock(&admin_ws_lock);
+    } else if (admin_ws_send_client_messages_hello(client) == 0) {
         admin_drain_text_websocket(client, ST_ADMIN_CLIENT_MESSAGE_MAX_CHARS, admin_client_messages_text);
     }
     admin_ws_remove(client);

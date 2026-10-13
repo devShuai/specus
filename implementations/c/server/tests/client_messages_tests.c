@@ -131,9 +131,9 @@ static char *ws_ticket(int port, const char *token, const char *endpoint)
 }
 
 /* Opens /ws/<endpoint> and, when hello is given, reads the first message; the socket, or -1. */
-static int ws_open_endpoint(int port, const char *token, const char *endpoint, char *hello, size_t hello_len)
+static int ws_use_ticket(int port, const char *ticket, const char *endpoint, int expected_status,
+                         const char *expected_reason, char *hello, size_t hello_len)
 {
-    char *ticket = ws_ticket(port, token, endpoint);
     if (ticket == NULL) return -1;
     int fd = connect_local(port);
     char request[1024];
@@ -141,7 +141,6 @@ static int ws_open_endpoint(int port, const char *token, const char *endpoint, c
              "GET /ws/%s?ticket=%s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\n"
              "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
              endpoint, ticket);
-    free(ticket);
     if (fd < 0 || send_all(fd, (const uint8_t *)request, strlen(request)) != 0) {
         if (fd >= 0) close(fd);
         return -1;
@@ -154,12 +153,22 @@ static int ws_open_endpoint(int port, const char *token, const char *endpoint, c
         ++used;
         if (used >= 4U && memcmp(response + used - 4U, "\r\n\r\n", 4U) == 0) break;
     }
-    if (strncmp(response, "HTTP/1.1 101", 12U) != 0
-        || (hello != NULL && ws_read_text(fd, hello, hello_len, IO_TIMEOUT_MS) != 1)) {
+    int status = 0;
+    (void)sscanf(response, "HTTP/1.1 %d", &status);
+    if (status != expected_status || (expected_reason != NULL && strstr(response, expected_reason) == NULL)
+        || (status == 101 && hello != NULL && ws_read_text(fd, hello, hello_len, IO_TIMEOUT_MS) != 1)) {
         fprintf(stderr, "%s upgrade: %s\n", endpoint, response);
         close(fd);
         return -1;
     }
+    return fd;
+}
+
+static int ws_open_endpoint(int port, const char *token, const char *endpoint, char *hello, size_t hello_len)
+{
+    char *ticket = ws_ticket(port, token, endpoint);
+    int fd = ws_use_ticket(port, ticket, endpoint, 101, NULL, hello, hello_len);
+    free(ticket);
     return fd;
 }
 
@@ -594,6 +603,8 @@ static int test_account_deletion_closes_sockets(void)
     return 0;
 }
 
+#include "client_messages_revocation_tests.h"
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -602,6 +613,8 @@ int main(int argc, char **argv)
     }
     server_binary = argv[1];
     int failed = run_on_fresh_server("client message channel on a real server", scenario_message_channel, NULL);
+    if (!failed) failed = run_on_fresh_server("management WebSocket revocation vector", scenario_revocation_vector, NULL);
+    if (!failed) failed = run_on_fresh_server("management WebSocket stale tickets and rollback", scenario_revocation_edges, NULL);
     if (!failed) {
         failed = test_write_failure();
         printf("%s a failed write after the checks\n", failed ? "FAIL" : "ok  ");

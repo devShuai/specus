@@ -194,7 +194,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 
 **失效时服务端做的事**
 
-1. 与账号的修改或删除在**同一事务**里，删除该身份尚未使用的管理 ticket：scope 为 `connections` 或 `client-messages`，租户与登录名都与账号逐字相等。Java、Go、.NET 的 ticket 存在共享数据库的 `specus_websocket_ticket` 里，这一步对所有实例都生效；C 存在进程内存里。
+1. 删除该身份尚未使用的管理 ticket：scope 为 `connections` 或 `client-messages`，租户与登录名都与账号逐字相等。Java、Go、.NET 的 ticket 存在共享数据库的 `specus_websocket_ticket` 里，与账号的修改或删除在**同一事务**里删除，对所有实例都生效。C 的 ticket 在进程内存里，在 SQLite 提交成功后、关闭连接前删除；数据库操作回滚时不动 ticket 和连接。提交与内存失效之间的握手仍由下面的当前身份检查保护。
 2. 提交之后，以 `1008` 关闭本实例上该身份（租户与登录名逐字相等）的 `/ws/client-messages` 与 `/ws/connections`，原因文本为 `account deleted`、`account disabled` 或 `account role changed`。其他身份的连接不受影响，另一租户的同名身份也不受影响。
 3. 集群模式（Java、Go、.NET 的 `cluster-enabled=true`）：经公共互传协调的 Redis 事件频道发布 STCE kind 5（[public-transfer-cluster.md](public-transfer-cluster.md) 第 4 节与 5.2 节），各实例（含发布者自己）按第 2 步关闭本地连接。发布失败只记日志，账号的修改照常成功。
 
@@ -273,5 +273,7 @@ MySQL 上（Java、Go、.NET）：库的默认排序规则（如 `utf8mb4_0900_a
 - 共享向量的 `webSocketRevocation`：停用、降级、升级、删除后，目标已打开的两种连接以 `1008` 关闭、它未用的 ticket 握手得 `403`；只改口令、提交相同角色与启用状态时连接保留、ticket 可用；旁观者（执行操作的管理员、另一租户的同名账号）的连接始终保留（Java `ManagementAccountsHttpTests.replaysTheWebSocketRevocationVector`）。
 - 握手再校验：签发 ticket 后直接在库里停用账号、改角色、删除后重建同名账号，握手都得 `403`；账号不变时照常连接（Java `ManagementAccountsHttpTests.aTicketWhoseAccountChangedIsRefusedAtTheHandshake`）。
 - 集群：两个连到同一 Redis 的实例，一个发布 kind 5，另一个关闭该身份的本地连接、不动其他身份（Java `PublicTransferCoordinationRedisIT.managementRevocationClosesTheIdentityOnAnotherInstance`）；STCE kind 5 的编码与共享向量 `canonicalManagementRevocation` 逐字节一致（各端 `PublicTransferClusterFrameTests`）。
+
+.NET 的 `ManagementWebSocketRevocationTests.cs` 重放共享向量，并用真实 Redis 的两个服务实例验证撤销；另有 ticket 删除失败回滚与握手检查后、登记前撤销的确定性测试。C 的 `client_messages_tests` 在真实服务进程上重放共享向量、账号变化后的 ticket 与失败回滚；`oidc_tests` 和 .NET `Phase5SecurityTests` 验证直接使用外部 OIDC bearer 签发的 ticket 同样绑定原账号键，不能被同名替代账号继承。
 
 其他三端的对应：Go `internal/management/management_accounts_test.go` 与 `internal/store/management_user_schema_test.go`；.NET `ManagementAccountLifecycleTests` 与 `ManagementLoginNameMigrationTests.StartupStepRemovesEmailRecordsOfDeletedAccounts`；C ctest `management_accounts_tests`（`tests/management_accounts_tests.c`）。关闭 WebSocket 的用例：Go `internal/server/client_messages_ws_test.go` 的 `TestDeletingAnAccountClosesItsManagementWebSockets`，.NET `ManagementAccountLifecycleTests.DeletingAnAccountClosesItsManagementWebSockets`，C ctest `client_messages_tests`。
