@@ -18,6 +18,92 @@ namespace Specus.IntegrationTests;
 public sealed class ExternalConnectionTests
 {
     [Fact]
+    public async Task PublicEofIsPublishedBeforeFinWriteCompletes()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var (server, peer) = await ConnectedPairAsync(timeout.Token);
+        using var peerOwner = peer;
+        using var services = new TestServices();
+        var writer = new HeldFinFrameWriter(timeout.Token);
+        await using var external = new ExternalConnection(
+            server, 31, 7031, "server-test", CreateContext(writer, timeout.Token),
+            services.Traffic, services.Inspection, new NettyServerOptions(), NullLogger.Instance);
+        var run = external.RunAsync(timeout.Token);
+        try
+        {
+            Assert.Equal(NatMessageType.Open, (await writer.WaitAsync(timeout.Token)).NatMessageType);
+            var peerStream = peer.GetStream();
+            peer.Client.Shutdown(SocketShutdown.Send);
+            Assert.Equal(NatMessageType.Fin, (await writer.WaitAsync(timeout.Token)).NatMessageType);
+            // The writer has exposed FIN but cannot complete until this test releases it.
+            Assert.True(external.PublicFinished);
+            Assert.False(external.ClientFinished);
+            Assert.False(external.IsClosed);
+
+            var response = "reply-while-fin-write-is-pending"u8.ToArray();
+            Assert.Equal(ExternalWriteResult.Written,
+                await external.WriteFromClientAsync(response, timeout.Token));
+            var received = new byte[response.Length];
+            await peerStream.ReadExactlyAsync(received, timeout.Token);
+            Assert.Equal(response, received);
+
+            Assert.Equal(ExternalFinResult.Completed, external.FinishClientDirection());
+            Assert.True(external.ClientFinished);
+            Assert.False(run.IsCompleted);
+            Assert.False(external.IsClosed);
+            writer.ReleaseFin();
+            await run.WaitAsync(timeout.Token);
+            Assert.True(external.IsClosed);
+        }
+        finally
+        {
+            external.ResetFromClient();
+            writer.ReleaseFin();
+            await run.WaitAsync(timeout.Token);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task PendingPublicFinHandlesWriteFailureAndClientReset(bool reset, bool writeFails)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var (server, peer) = await ConnectedPairAsync(timeout.Token);
+        using var peerOwner = peer;
+        using var services = new TestServices();
+        var writer = new HeldFinFrameWriter(timeout.Token);
+        await using var external = new ExternalConnection(
+            server, 32, 7032, "server-test", CreateContext(writer, timeout.Token),
+            services.Traffic, services.Inspection, new NettyServerOptions(), NullLogger.Instance);
+        var run = external.RunAsync(timeout.Token);
+        try
+        {
+            Assert.Equal(NatMessageType.Open, (await writer.WaitAsync(timeout.Token)).NatMessageType);
+            peer.Client.Shutdown(SocketShutdown.Send);
+            Assert.Equal(NatMessageType.Fin, (await writer.WaitAsync(timeout.Token)).NatMessageType);
+            Assert.True(external.PublicFinished);
+            if (reset)
+            {
+                external.ResetFromClient();
+                Assert.True(external.IsClosed);
+            }
+            writer.ReleaseFin(writeFails);
+            await run.WaitAsync(timeout.Token);
+            Assert.True(external.IsClosed);
+            Assert.Equal(ExternalWriteResult.Reset,
+                await external.WriteFromClientAsync([1], timeout.Token));
+        }
+        finally
+        {
+            external.ResetFromClient();
+            writer.ReleaseFin();
+            await run.WaitAsync(timeout.Token);
+        }
+    }
+
+    [Fact]
     public async Task PublicEofKeepsClientToPublicDirectionUntilClientFin()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -473,6 +559,26 @@ public sealed class ExternalConnectionTests
         {
             await Task.Delay(10, cancellationToken);
         }
+    }
+
+    private sealed class HeldFinFrameWriter(CancellationToken lifetime) : IFrameWriter
+    {
+        private readonly CapturingFrameWriter _capture = new();
+        private readonly TaskCompletionSource<bool> _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        {
+            await _capture.WriteAsync(packet, cancellationToken);
+            if (packet is NatMessagePacket { NatMessageType: NatMessageType.Fin })
+            {
+                if (await _release.Task.WaitAsync(lifetime))
+                    throw new IOException("injected FIN write failure");
+            }
+        }
+
+        public void ReleaseFin(bool fail = false) => _release.TrySetResult(fail);
+        public ValueTask<NatMessagePacket> WaitAsync(CancellationToken cancellationToken) =>
+            _capture.WaitAsync(cancellationToken);
     }
 
     private sealed class CapturingFrameWriter : IFrameWriter
