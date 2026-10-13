@@ -521,7 +521,7 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev
+          sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev libhiredis-dev libutf8proc-dev libbrotli-dev
 
       - name: Build C server
         run: |

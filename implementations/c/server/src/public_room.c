@@ -4,6 +4,8 @@
 
 #include "crypto.h"
 #include "json.h"
+#include "public_coordination.h"
+#include "public_discovery.h"
 #include "security.h"
 
 #include <ctype.h>
@@ -790,11 +792,14 @@ static long room_env_long(const char *name, long fallback)
     return end != value && *end == '\0' && parsed > 0 ? parsed : fallback;
 }
 
+/* 1 allowed, 0 rate limited, -1 the cluster's shared window is unavailable (fails closed). */
 static int room_pairing_rate_allowed(const char *remote_address)
 {
     const char *address = remote_address == NULL || *remote_address == '\0' ? "unknown" : remote_address;
     long limit = room_env_long("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP", 10);
     long window = room_env_long("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS", 300);
+    if (st_public_coordination_enabled())
+        return st_public_discovery_shared_rate_allow("pairing-code-redeem", address, limit, window);
     time_t now = time(NULL);
     pthread_mutex_lock(&room_rate_lock);
     size_t count = 0U;
@@ -933,8 +938,9 @@ static int room_redeem_pairing(const char *body,
                                char *out,
                                size_t out_len)
 {
-    if (!room_pairing_rate_allowed(remote_address))
-        return room_error(out, out_len, 429, "请求过于频繁,请稍后再试");
+    int rate = room_pairing_rate_allowed(remote_address);
+    if (rate <= 0)
+        return room_error(out, out_len, 429, rate < 0 ? "服务暂时不可用,请稍后再试" : "请求过于频繁,请稍后再试");
     if (body == NULL || strlen(body) > ST_ROOM_MAX_BODY || strstr(body, "\\u0000") != NULL
         || !st_json_is_valid_object(body))
         return room_error(out, out_len, 400, "请求体无效");

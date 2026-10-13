@@ -21,6 +21,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <utf8proc.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -408,6 +409,57 @@ static int public_has_iso_control(const uint8_t *data, size_t len)
     return 0;
 }
 
+/* Java Character.isWhitespace: separators other than the no-break spaces, plus TAB..CR and FS..US. */
+static int public_java_whitespace(uint32_t codepoint)
+{
+    if ((codepoint >= 0x09U && codepoint <= 0x0dU) || (codepoint >= 0x1cU && codepoint <= 0x1fU)) return 1;
+    if (codepoint == 0xa0U || codepoint == 0x2007U || codepoint == 0x202fU) return 0;
+    utf8proc_category_t category = utf8proc_category((utf8proc_int32_t)codepoint);
+    return category == UTF8PROC_CATEGORY_ZS || category == UTF8PROC_CATEGORY_ZL
+        || category == UTF8PROC_CATEGORY_ZP;
+}
+
+/* Java String.isBlank of valid UTF-8 text: empty or whitespace only. */
+static int public_text_blank(const uint8_t *data, size_t len)
+{
+    size_t offset = 0U;
+    while (offset < len) {
+        uint32_t codepoint = 0U;
+        if (public_utf8_next(data, len, &offset, &codepoint, NULL) < 0) return 0;
+        if (!public_java_whitespace(codepoint)) return 0;
+    }
+    return 1;
+}
+
+/*
+ * Java String.equalsIgnoreCase for the in-process name checks: code point by code point, two code
+ * points match when equal, when their simple upper-case mappings are equal, or when the lower-case
+ * mappings of those are. Invalid UTF-8 only matches byte for byte.
+ */
+static int public_names_equal_ignore_case(const char *left, const char *right)
+{
+    const uint8_t *a = (const uint8_t *)left;
+    const uint8_t *b = (const uint8_t *)right;
+    size_t a_len = strlen(left);
+    size_t b_len = strlen(right);
+    size_t a_offset = 0U;
+    size_t b_offset = 0U;
+    while (a_offset < a_len && b_offset < b_len) {
+        uint32_t a_codepoint = 0U;
+        uint32_t b_codepoint = 0U;
+        if (public_utf8_next(a, a_len, &a_offset, &a_codepoint, NULL) < 0
+            || public_utf8_next(b, b_len, &b_offset, &b_codepoint, NULL) < 0) {
+            return strcmp(left, right) == 0;
+        }
+        if (a_codepoint == b_codepoint) continue;
+        utf8proc_int32_t a_upper = utf8proc_toupper((utf8proc_int32_t)a_codepoint);
+        utf8proc_int32_t b_upper = utf8proc_toupper((utf8proc_int32_t)b_codepoint);
+        if (a_upper == b_upper || utf8proc_tolower(a_upper) == utf8proc_tolower(b_upper)) continue;
+        return 0;
+    }
+    return a_offset == a_len && b_offset == b_len;
+}
+
 static int public_write_response(char *out,
                                  size_t out_len,
                                  int status,
@@ -666,7 +718,7 @@ int st_public_discovery_name_availability_response(const char *path,
         pthread_mutex_lock(&public_peer_lock);
         for (st_public_peer *peer = public_peers; peer != NULL; peer = peer->next) {
             if ((exclude == NULL || *exclude == '\0' || strcmp(peer->peer_id, exclude) != 0)
-                && strcasecmp(peer->display_name, normalized) == 0) {
+                && public_names_equal_ignore_case(peer->display_name, normalized)) {
                 available = 0;
                 break;
             }
@@ -685,6 +737,19 @@ int st_public_discovery_name_availability_response(const char *path,
         return public_write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"availability response failed\"}");
     }
     return public_write_response(out, out_len, 200, "OK", response);
+}
+
+int st_public_discovery_shared_rate_allow(const char *bucket,
+                                          const char *identity,
+                                          long limit,
+                                          long window_seconds)
+{
+    int allowed = 0;
+    if (!st_public_coordination_enabled() || st_public_discovery_initialize() != 0
+        || st_public_coordination_allow_rate(bucket, identity, limit, window_seconds, &allowed) != 0) {
+        return -1;
+    }
+    return allowed ? 1 : 0;
 }
 
 static int public_builder_reserve(st_public_builder *builder, size_t extra)
@@ -889,9 +954,16 @@ static int public_same_group(const st_public_peer *left, const st_public_peer *r
         && strcmp(left->room_key, right->room_key) == 0;
 }
 
+/*
+ * Java PublicTransferCoordinationService.sameNetAddress: an empty, blank or "unknown" address is
+ * not identifiable, so two such participants never share a net even when the strings are equal.
+ */
 static int public_address_known(const char *address)
 {
-    return address != NULL && *address != '\0' && strcasecmp(address, "unknown") != 0;
+    if (address == NULL || strcasecmp(address, "unknown") == 0) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)address; *cursor != '\0'; ++cursor)
+        if (!isspace(*cursor)) return 1;
+    return 0;
 }
 
 static int public_same_net(const st_public_peer *left, const st_public_peer *right)
@@ -1207,7 +1279,7 @@ static int public_register_peer(st_public_peer *peer)
         }
     }
     for (st_public_peer *existing = public_peers; existing != NULL; existing = existing->next) {
-        if (strcasecmp(existing->display_name, peer->display_name) == 0) {
+        if (public_names_equal_ignore_case(existing->display_name, peer->display_name)) {
             pthread_mutex_unlock(&public_peer_lock);
             return -4;
         }
@@ -1528,7 +1600,8 @@ static int public_route_binary(st_public_peer *source, const uint8_t *frame, siz
     if (target_len == 0U || target_len > 512U || source_len != 0U
         || (size_t)app_len != len - 14U - target_len
         || public_utf8_units(frame + 14U, target_len, 512U, NULL) != 0
-        || memchr(frame + 14U, '\0', target_len) != NULL
+        || public_has_iso_control(frame + 14U, target_len)
+        || public_text_blank(frame + 14U, target_len)
         || public_validate_stap2(frame + 14U + target_len, app_len) != 0) {
         (void)public_peer_send_error(source, "invalid binary relay frame");
         public_peer_close(source, 1008U);
@@ -1811,11 +1884,19 @@ int st_public_discovery_handle_websocket(int fd,
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
     pthread_mutex_init(&peer->send_lock, NULL);
     free(ticket);
+    /* Java normalizeDisplayName refuses ISO control characters when the connection joins. */
+    if (public_has_iso_control((const uint8_t *)peer->display_name, strlen(peer->display_name))) {
+        (void)public_peer_send_error(peer, "client name contains invalid characters");
+        public_peer_close(peer, 1008U);
+        pthread_mutex_destroy(&peer->send_lock);
+        free(peer);
+        return 1;
+    }
     int registered = public_register_peer(peer);
     if (registered != 0) {
         if (registered == -2) (void)public_peer_send_error(peer, "peer id is already connected");
         else if (registered == -3) (void)public_peer_send_error(peer, "room is full");
-        else if (registered == -4) (void)public_peer_send_error(peer, "display name is already connected");
+        else if (registered == -4) (void)public_peer_send_error(peer, "client name is already in use");
         if (registered != -1) public_peer_close(peer, 1008U);
         pthread_mutex_destroy(&peer->send_lock);
         free(peer);

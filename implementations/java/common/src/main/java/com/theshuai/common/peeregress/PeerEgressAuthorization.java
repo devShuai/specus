@@ -38,6 +38,34 @@ public final class PeerEgressAuthorization {
             "192.168.0.0/16",
             "100.64.0.0/10");
 
+    /**
+     * The IPv6 counterparts of {@link #FORCED_DENY_CIDRS} ({@code protocol/spec/peer-egress.md},
+     * 强制拒绝清单). A destination is checked against both lists; only a prefix of its own family can
+     * contain it.
+     */
+    public static final List<String> FORCED_DENY_CIDRS6 = List.of(
+            "::/128",
+            "::1/128",
+            // A socket connected to an IPv4-mapped address reaches the IPv4 address, past every
+            // IPv4 entry.
+            "::ffff:0:0/96",
+            // Prefixes that embed an IPv4 address a NAT64 gateway or a 6to4 relay forwards to,
+            // metadata and private ranges included.
+            "64:ff9b::/96",
+            "64:ff9b:1::/48",
+            "2002::/16",
+            "fe80::/10",
+            "fec0::/10",
+            "ff00::/8");
+
+    /** The IPv6 instance metadata endpoint, in the unique local range a LAN policy can grant. */
+    public static final List<String> CLOUD_METADATA_CIDRS6 = List.of(
+            "fd00:ec2::254/128");
+
+    /** Unique local addresses, the IPv6 counterpart of the private ranges. */
+    public static final List<String> LAN_CIDRS6 = List.of(
+            "fc00::/7");
+
     public record Decision(boolean allowed, String code) {
         public static Decision deny(String code) {
             return new Decision(false, code);
@@ -86,15 +114,15 @@ public final class PeerEgressAuthorization {
             return Decision.deny(PeerEgressCodes.CONSUMER_DENIED);
         }
 
-        Integer destination = Ipv4Cidr.parseAddress(request.getDestinationIp());
+        Target destination = Target.parse(request.getDestinationIp());
         if (destination == null) {
             return Decision.deny(PeerEgressCodes.DEST_DENIED);
         }
-        if (containedIn(destination, forcedDenyFor(effective, request))) {
+        if (destination.in(forcedDenyFor(effective, request))) {
             return Decision.deny(PeerEgressCodes.FORBIDDEN_DESTINATION);
         }
 
-        String scope = containedIn(destination, LAN_CIDRS)
+        String scope = destination.in(LAN_CIDRS) || destination.in(LAN_CIDRS6)
                 ? PeerEgressPolicy.SCOPE_LAN
                 : PeerEgressPolicy.SCOPE_PUBLIC;
         if (!scope.equals(policy.getScope())) {
@@ -104,12 +132,13 @@ public final class PeerEgressAuthorization {
         // The destination, protocol and port steps look at the destination rules that contain the
         // address together with, for a flow that carries a name, the domain rules that cover it.
         // A domain rule can only add to what the destination rules allow, never narrow it.
+        // A rule covers addresses of its own family only: 0.0.0.0/0 grants no IPv6 address and ::/0
+        // no IPv4 one.
         List<Grant> matches = new ArrayList<>();
         List<PeerEgressPolicy.PeerEgressDestinationRule> rules = policy.getDestinationRules();
         if (rules != null) {
             for (PeerEgressPolicy.PeerEgressDestinationRule rule : rules) {
-                Ipv4Cidr cidr = rule == null ? null : Ipv4Cidr.parse(rule.getCidr());
-                if (cidr != null && cidr.contains(destination)) {
+                if (rule != null && rule.getCidr() != null && destination.in(List.of(rule.getCidr()))) {
                     matches.add(new Grant(rule.getProtocols(), rule.getPortRanges()));
                 }
             }
@@ -144,6 +173,8 @@ public final class PeerEgressAuthorization {
     private static List<String> forcedDenyFor(Context context, PeerEgressRequest request) {
         List<String> denied = new ArrayList<>(FORCED_DENY_CIDRS);
         denied.addAll(CLOUD_METADATA_CIDRS);
+        denied.addAll(FORCED_DENY_CIDRS6);
+        denied.addAll(CLOUD_METADATA_CIDRS6);
         denied.add(context.meshCidr() == null || context.meshCidr().isBlank()
                 ? PeerEgressRules.DEFAULT_MESH_CIDR
                 : context.meshCidr());
@@ -164,6 +195,40 @@ public final class PeerEgressAuthorization {
             }
         }
         return false;
+    }
+
+    /** A destination as the judgment reads it, IPv4 or IPv6 ({@code v6} null for IPv4). */
+    private record Target(int v4, long[] v6) {
+        /** IPv6 when the text has a colon, with the spelling the rules use; IPv4 otherwise. Null if neither. */
+        static Target parse(String text) {
+            if (text != null && text.indexOf(':') >= 0) {
+                long[] address = Ipv6Cidr.parseAddress(text);
+                return address == null ? null : new Target(0, address);
+            }
+            Integer address = Ipv4Cidr.parseAddress(text);
+            return address == null ? null : new Target(address, null);
+        }
+
+        /**
+         * Whether a prefix of the target's own family in the list contains it. Prefixes of the other
+         * family, and anything that does not read, are passed over: a list can mix both.
+         */
+        boolean in(List<String> cidrs) {
+            if (v6 == null) {
+                return containedIn(v4, cidrs);
+            }
+            for (String text : cidrs) {
+                String trimmed = text == null ? "" : text.trim();
+                if (trimmed.indexOf(':') < 0) {
+                    continue;
+                }
+                Ipv6Cidr cidr = Ipv6Cidr.parse(trimmed);
+                if (cidr != null && cidr.contains(v6)) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 
     /**

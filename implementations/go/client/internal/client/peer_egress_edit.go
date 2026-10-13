@@ -110,9 +110,9 @@ func EgressCodeExplanation(code string) string {
 	case egressCodeRuleDomainUnsupported:
 		return "domain rules are not supported yet; use an IPv4 address or CIDR range"
 	case egressCodeRuleIPv6Unsupported:
-		return "IPv6 rules are not supported; use an IPv4 address or CIDR range"
+		return "IPv6 rules are not in force yet: this client cannot carry IPv6 traffic"
 	case egressCodeRuleMalformed:
-		return "not an IPv4 address or CIDR range with zero host bits, or an unknown action"
+		return "not an IPv4 or IPv6 address or CIDR range with zero host bits (IPv4-mapped IPv6 is written as IPv4), or an unknown action"
 	case egressCodeRuleDefaultRoute:
 		return "0.0.0.0/0 would take over the default route, which is not allowed"
 	case egressCodeRuleMeshOverlap:

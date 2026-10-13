@@ -1374,6 +1374,83 @@ static int closed_schema_checks(void)
     return failures == before ? 0 : -1;
 }
 
+/* ---- The sweep decides on the switch when it deletes (section 9) ------------------------------- */
+
+/*
+ * Runs between the sweep's read of the switches and its deletes: the tenant is switched back on,
+ * then a transfer, a started account and a completed one are collected.
+ */
+static void switch_back_on_mid_sweep(void *context)
+{
+    const char *root_auth = (const char *)context;
+    expect_put("mid-sweep: enable", root_auth, "{\"enabled\":true,\"disclosureVersion\":1}", 200, NULL);
+    static const char batch[] = "{\"schemaVersion\":1,\"events\":[" SAMPLE_EVENT "]}";
+    expect_ingest("mid-sweep: ingest", root_auth, batch, sizeof(batch) - 1U, 200, NULL, 1);
+    static const struct {
+        const char *username;
+        const char *step;
+        const char *effect;
+    } milestones[] = {
+        {"sw-bob", ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED, "started"},
+        {"sw-carol", ST_PRODUCT_METRICS_STEP_ACCOUNT_CREATED, "started"},
+        {"sw-carol", ST_PRODUCT_METRICS_STEP_SERVICE_PUBLISHED, "completed"}
+    };
+    for (size_t i = 0; i < sizeof(milestones) / sizeof(milestones[0]); ++i) {
+        const char *effect = st_product_metrics_milestone(db_path, "t1", milestones[i].username, milestones[i].step);
+        EXPECT(strcmp(effect, milestones[i].effect) == 0, "mid-sweep: %s %s: %s", milestones[i].username,
+               milestones[i].step, effect);
+    }
+}
+
+/*
+ * Steps 1 and 4 check the switch again in the statement that deletes: a tenant that is off and
+ * purged when the sweep reads the switches, but switched back on before the deletes, keeps the
+ * progress and counts it collected since.
+ */
+static int sweep_rechecks_the_switch(void)
+{
+    int before = failures;
+    if (fresh_database() != 0) {
+        return -1;
+    }
+    actor_count = 0U;
+    test_now_ms = instant_ms("2026-09-01T08:00:00Z");
+    char root_auth[2200];
+    st_storage_management_user user;
+    if (st_storage_create_management_user(db_path, "sw-root", "t1", actor_password_hash, "ADMIN", 1, &user) != 0
+        || bearer_for("sw-root", "t1", root_auth, sizeof(root_auth)) != 0) {
+        return -1;
+    }
+    expect_put("enable", root_auth, "{\"enabled\":true,\"disclosureVersion\":1}", 200, NULL);
+    expect_put("disable", root_auth, "{\"enabled\":false}", 200, NULL);
+    pm_response response;
+    if (call_text("DELETE", "/api/admin/product-metrics/data", root_auth, NULL, &response) == 0) {
+        expect_answer("purge", &response, 200, NULL);
+    }
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_switch WHERE enabled = 0 AND purged_at IS NOT NULL") == 1,
+           "the tenant must be off and purged before the sweep");
+
+    st_product_metrics_set_sweep_hook_for_testing(switch_back_on_mid_sweep, root_auth);
+    int swept = st_product_metrics_sweep(db_path);
+    st_product_metrics_set_sweep_hook_for_testing(NULL, NULL);
+    EXPECT(swept == 0, "sweep failed");
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_progress WHERE username = 'sw-bob'") == 1
+               && sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_progress") == 1,
+           "the started account must keep its progress row");
+    EXPECT(sql_scalar("SELECT COALESCE(SUM(users), 0) FROM product_metrics_onboarding_daily") == 1,
+           "the completed account must stay counted");
+    EXPECT(transfer_total() == 1, "the transfer must stay counted, got %lld", transfer_total());
+
+    /* When the deployment does not allow metrics no tenant collects: step 1 drops the row anyway. */
+    setenv("SPECUS_PRODUCT_METRICS_ALLOWED", "false", 1);
+    EXPECT(st_product_metrics_sweep(db_path) == 0, "sweep failed while not allowed");
+    unsetenv("SPECUS_PRODUCT_METRICS_ALLOWED");
+    EXPECT(sql_scalar("SELECT COUNT(*) FROM product_metrics_onboarding_progress") == 0,
+           "a disallowed deployment keeps no progress rows");
+    printf("%s sweep re-checks the switch when it deletes\n", failures == before ? "ok  " : "FAIL");
+    return failures == before ? 0 : -1;
+}
+
 /* ---- Write paths fire the onboarding hooks ------------------------------------------------------ */
 
 static long long progress_column(const char *username, const char *column)
@@ -1824,6 +1901,7 @@ int main(int argc, char **argv)
     bad |= replay_ingest_validation(vector) != 0;
     bad |= replay_scenarios(vector) != 0;
     bad |= closed_schema_checks() != 0;
+    bad |= sweep_rechecks_the_switch() != 0;
     bad |= wiring_checks() != 0;
     jv_free(vector);
     free(text);

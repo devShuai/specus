@@ -400,6 +400,12 @@ type TLSConfig struct {
 	TerminatedUpstream bool   `json:"terminatedUpstream"`
 }
 
+// MinMaxFrameSize is the smallest netty.maxFrameSize: the 11-byte frame header plus the 1 MiB MESSAGE
+// body of protocol/spec/control-protocol.md. The Go server holds the frames it writes to the same
+// limit, so a smaller one would leave a NAT_CONTROL, or any other MESSAGE within the protocol's limit,
+// unsendable; no frame a client may send after login is larger either.
+const MinMaxFrameSize = 11 + 1024*1024
+
 // Default returns the configuration with the same defaults as the C# appsettings.json.
 func Default() Config {
 	return Config{
@@ -587,8 +593,10 @@ func Load(path string) (Config, error) {
 	if err := cfg.ValidateSecurityBaseline(); err != nil {
 		return Config{}, err
 	}
-	if cfg.Netty.MaxFrameSize < 11 {
-		return Config{}, fmt.Errorf("netty.maxFrameSize must be at least the 11-byte frame header")
+	if cfg.Netty.MaxFrameSize < MinMaxFrameSize {
+		return Config{}, fmt.Errorf(
+			"netty.maxFrameSize must be at least %d: the 11-byte frame header plus the 1 MiB MESSAGE body",
+			MinMaxFrameSize)
 	}
 	if cfg.Netty.PreAuthMaxFrameSize < 11 || cfg.Netty.PreAuthMaxFrameSize > cfg.Netty.MaxFrameSize {
 		return Config{}, fmt.Errorf("netty.preAuthMaxFrameSize must be between 11 and netty.maxFrameSize")

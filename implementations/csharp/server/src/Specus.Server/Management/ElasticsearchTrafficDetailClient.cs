@@ -226,15 +226,16 @@ public sealed class ElasticsearchTrafficDetailClient
     }
 
     private async Task EnsureHttpIndexAsync(CancellationToken cancellationToken) =>
-        await EnsureIndexAsync(_options.HttpIndex, HttpMapping(), () => _httpIndexReady, value => _httpIndexReady = value,
-            cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(_options.HttpIndex, HttpMapping(), HttpBodyMapping(), () => _httpIndexReady,
+            value => _httpIndexReady = value, cancellationToken).ConfigureAwait(false);
 
     private async Task EnsureTcpIndexAsync(CancellationToken cancellationToken) =>
-        await EnsureIndexAsync(_options.TcpIndex, TcpMapping(), () => _tcpIndexReady, value => _tcpIndexReady = value,
-            cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(_options.TcpIndex, TcpMapping(), existingUpdate: null, () => _tcpIndexReady,
+            value => _tcpIndexReady = value, cancellationToken).ConfigureAwait(false);
 
-    private async Task EnsureIndexAsync(string index, object mapping, Func<bool> getReady, Action<bool> setReady,
-        CancellationToken cancellationToken)
+    // existingUpdate, when not null, is put on the mapping of an index that exists already.
+    private async Task EnsureIndexAsync(string index, object mapping, object? existingUpdate, Func<bool> getReady,
+        Action<bool> setReady, CancellationToken cancellationToken)
     {
         if (getReady())
         {
@@ -251,6 +252,10 @@ public sealed class ElasticsearchTrafficDetailClient
                 .ConfigureAwait(false);
             if (head.StatusCode == HttpStatusCode.OK)
             {
+                if (existingUpdate is not null)
+                {
+                    await PutExistingMappingAsync(index, existingUpdate, cancellationToken).ConfigureAwait(false);
+                }
                 setReady(true);
                 return;
             }
@@ -612,6 +617,30 @@ public sealed class ElasticsearchTrafficDetailClient
     private static string Escape(string value) => Uri.EscapeDataString(value);
 
     private static object HttpMapping() => new { mappings = new { properties = HttpProperties() } };
+
+    // Java's putBinaryBodyMapping: an HTTP index made before bodies were stored gets them as binary.
+    private static object HttpBodyMapping() => new
+    {
+        properties = new Dictionary<string, object>
+        {
+            ["requestBodyData"] = Type("binary"),
+            ["responseBodyData"] = Type("binary"),
+        },
+    };
+
+    // As in Java, a refused update (the fields are mapped otherwise already) leaves the index as it
+    // is; documents still go in.
+    private async Task PutExistingMappingAsync(string index, object update, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var response = await SendAsync(HttpMethod.Put, $"/{Escape(index)}/_mapping", update,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException)
+        {
+        }
+    }
     private static object TcpMapping() => new { mappings = new { properties = TcpProperties() } };
 
     private static Dictionary<string, object> HttpProperties() => new()

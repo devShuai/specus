@@ -1,7 +1,7 @@
 {
   "name": "http-route-lifecycle-v1",
   "version": 1,
-  "description": "When an HTTP route stops being reachable, and how the client learns it: the fail-closed public entry, the full route list on every NAT_CONTROL (login included), connections closed with a disabled, renamed or deleted client, and clients replacing their route table on every push. See protocol/spec/http-route.md.",
+  "description": "When an HTTP route stops being reachable, and how the client learns it: the fail-closed public entry, the full route list on every NAT_CONTROL (login included), connections closed with a disabled, renamed or deleted client, reconnect tokens that stay with the account they were issued for, and clients replacing their route table on every push. See protocol/spec/http-route.md and protocol/spec/client-auth.md.",
   "notes": [
     "server.scenarios：每个 scenario 在一台全新服务端上用一个新客户端账户（或种子客户端）从空 route 开始顺序重放 steps。createRoute/setRouteEnabled/deleteRoute/setClientEnabled/renameClient/deleteClient/createClient 走各实现的管理 API；connect 用一个假客户端完成控制与数据连接的登录（凭已有 token 或重新 HTTP 登录均可），disconnect 关闭这两条连接并等服务端确认离线。",
     "假客户端对每个 HTTP OPEN 都回 200、Content-Type:text/plain、body 为 forwarded，模拟仍持有旧 route 列表、对任何 route 名都继续转发的客户端；它记录收到的 OPEN，expect.forwarded 断言该请求是否到达它。",
@@ -10,6 +10,8 @@
     "request：GET /http/{client}/{route}{path}，client 默认是当前账户名（URL 段按百分号编码），former 指最近一次 renameClient 之前的名字；route 为 null 时请求 /http/{client}/。credentials 为 none（不带 Authorization）、valid（Basic route-user:route-password）或 wrong（Basic route-user:wrong）。websocket 为 true 时带 Upgrade: websocket 与合法的 Sec-WebSocket-Key/Version 头。",
     "expect：status 或 statusAnyOf 比较状态码；noStore 为 true 时 Cache-Control 必须含 no-store；basicChallenge 为 true 时 WWW-Authenticate 必须以 Basic 开头；body 存在时比较响应体；forwarded 见上。WebSocket 被拒绝时不得返回 101。",
     "createRoute 的 targetBaseUrl 用 targetBaseUrl 字段，auth 为 true 时启用 Basic，凭据见 basicCredentials。renameClient 把当前账户名改为原名加 suffix。deleteClient 连同其 route 一起删除；createClient 用被删账户的原名新建账户，之后的 createRoute 属于新账户。",
+    "reconnect：假客户端不做新的 HTTP 登录，用最近一次 connect 所用的 clientSessionId + accessToken 重新登录，LOGIN_REQUEST 的 clientName 仍填那次 connect 时的账户名。expectRefused 为 true 时控制连接登录必须被拒绝（LOGIN_RESPONSE success 为 false，原因不比较，服务端随后关闭连接），不再登录数据连接，客户端仍离线；为 false 时控制与数据连接都必须登录成功，控制连接 LOGIN_RESPONSE 的 clientName 必须是当前账户名（改名后即新名），expectLoginPush 与 connect 相同。token 属于签发它时的账户而不是名字，见 protocol/spec/client-auth.md。",
+    "createFormerNameClient 用最近一次 renameClient 之前的名字另建一个账户，并为它建 routes 列出的 route（启用、无认证、targetBaseUrl 同上）；当前账户仍是改名后的账户，之后的 createRoute 仍属于当前账户，request 的 client=former 指向这个新账户。",
     "client.cases：客户端先以 loginSnapshot 作为 HTTP 登录快照，再依次处理 natControl（真实推送的 JSON 原文），每步之后的 route 表（route 名到 targetBaseUrl）必须等于 expectRoutes。"
   ],
   "basicCredentials": {"username": "route-user", "password": "route-password"},
@@ -242,7 +244,8 @@
             "credentials": "none",
             "client": "current",
             "expect": {"status": 404, "noStore": true, "forwarded": false}
-          }
+          },
+          {"op": "reconnect", "expectRefused": true}
         ]
       },
       {
@@ -306,6 +309,75 @@
             "credentials": "none",
             "websocket": false,
             "client": "current",
+            "expect": {
+              "statusAnyOf": [502, 503],
+              "forwarded": false
+            }
+          }
+        ]
+      },
+      {
+        "id": "deleted-client-token-refused",
+        "title": "删除客户端后凭旧 token 重连被拒：不会登录成同名新建的客户端，也收不到它的流量",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {"op": "deleteClient", "expectSessionClosed": true},
+          {"op": "createClient"},
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {"op": "reconnect", "expectRefused": true},
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {
+              "statusAnyOf": [502, 503],
+              "forwarded": false
+            }
+          }
+        ]
+      },
+      {
+        "id": "renamed-client-token-follows-account",
+        "title": "改名后凭旧 token 重连：登录到改名后的账户并以新名绑定，原名新建的客户端收不到转发",
+        "steps": [
+          {"op": "createRoute", "route": "web", "auth": false, "expectPush": null},
+          {
+            "op": "connect",
+            "expectLoginPush": ["web"]
+          },
+          {"op": "renameClient", "suffix": "-renamed", "expectSessionClosed": true},
+          {
+            "op": "createFormerNameClient",
+            "routes": ["web"]
+          },
+          {
+            "op": "reconnect",
+            "expectRefused": false,
+            "expectLoginPush": ["web"]
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
+            "client": "current",
+            "expect": {"status": 200, "body": "forwarded", "forwarded": true}
+          },
+          {
+            "op": "request",
+            "route": "web",
+            "client": "former",
+            "path": "/secret",
+            "credentials": "none",
+            "websocket": false,
             "expect": {
               "statusAnyOf": [502, 503],
               "forwarded": false

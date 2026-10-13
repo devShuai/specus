@@ -1,16 +1,11 @@
 package com.theshuai.specusserver.database;
 
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
-import java.sql.DatabaseMetaData;
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,13 +38,13 @@ public class ClientDownloadSchemaMigrator {
     }
 
     public void migrate() {
-        TableMetadata table = inspectTable();
+        SchemaMetadata.Table table = SchemaMetadata.table(jdbcTemplate, TABLE_NAME);
         if (table == null) {
             log.debug("[client-package] table {} does not exist; no legacy rows to migrate", TABLE_NAME);
             return;
         }
         for (ColumnDefinition column : COLUMNS) {
-            if (!table.columns().contains(column.name())) {
+            if (!table.hasColumn(column.name())) {
                 // Metadata distinguishes an expected idempotent restart from a genuine DDL error.
                 // Never swallow a permission, syntax or storage failure: running without the two
                 // unique keys would make the catalogue's invariants only best-effort.
@@ -104,71 +99,15 @@ public class ClientDownloadSchemaMigrator {
                     catalogKey, latest ? latestSlot : null, id);
         }
 
-        Set<String> indexes = inspectTable().indexes();
-        createUniqueIndex(indexes, "ux_client_download_catalog_key", "catalog_key");
-        createUniqueIndex(indexes, "ux_client_download_latest_slot", "latest_slot");
+        SchemaMetadata.Table migrated = SchemaMetadata.table(jdbcTemplate, TABLE_NAME);
+        createUniqueIndex(migrated, "ux_client_download_catalog_key", "catalog_key");
+        createUniqueIndex(migrated, "ux_client_download_latest_slot", "latest_slot");
     }
 
-    private void createUniqueIndex(Set<String> indexes, String name, String column) {
-        if (!indexes.contains(name.toLowerCase(Locale.ROOT))) {
+    private void createUniqueIndex(SchemaMetadata.Table table, String name, String column) {
+        if (table.index(name) == null) {
             jdbcTemplate.execute("create unique index " + name
                     + " on " + TABLE_NAME + " (" + column + ")");
-        }
-    }
-
-    private TableMetadata inspectTable() {
-        return jdbcTemplate.execute((ConnectionCallback<TableMetadata>) connection -> {
-            DatabaseMetaData metadata = connection.getMetaData();
-            TableLocation location = findTable(metadata, connection.getCatalog(), currentSchema(connection));
-            if (location == null) {
-                return null;
-            }
-            Set<String> columns = new LinkedHashSet<>();
-            try (ResultSet result = metadata.getColumns(
-                    location.catalog(), location.schema(), location.name(), "%")) {
-                while (result.next()) {
-                    columns.add(result.getString("COLUMN_NAME").toLowerCase(Locale.ROOT));
-                }
-            }
-            Set<String> indexes = new LinkedHashSet<>();
-            try (ResultSet result = metadata.getIndexInfo(
-                    location.catalog(), location.schema(), location.name(), false, false)) {
-                while (result.next()) {
-                    String name = result.getString("INDEX_NAME");
-                    if (StringUtils.hasText(name)) {
-                        indexes.add(name.toLowerCase(Locale.ROOT));
-                    }
-                }
-            }
-            return new TableMetadata(Set.copyOf(columns), Set.copyOf(indexes));
-        });
-    }
-
-    private TableLocation findTable(DatabaseMetaData metadata, String catalog, String currentSchema)
-            throws SQLException {
-        TableLocation fallback = null;
-        try (ResultSet result = metadata.getTables(catalog, null, "%", new String[]{"TABLE"})) {
-            while (result.next()) {
-                String name = result.getString("TABLE_NAME");
-                if (!TABLE_NAME.equalsIgnoreCase(name)) {
-                    continue;
-                }
-                TableLocation candidate = new TableLocation(
-                        result.getString("TABLE_CAT"), result.getString("TABLE_SCHEM"), name);
-                if (currentSchema != null && currentSchema.equalsIgnoreCase(candidate.schema())) {
-                    return candidate;
-                }
-                fallback = candidate;
-            }
-        }
-        return fallback;
-    }
-
-    private String currentSchema(java.sql.Connection connection) {
-        try {
-            return connection.getSchema();
-        } catch (SQLException | AbstractMethodError exception) {
-            return null;
         }
     }
 
@@ -209,8 +148,4 @@ public class ClientDownloadSchemaMigrator {
     }
 
     private record ColumnDefinition(String name, String ddl) { }
-
-    private record TableLocation(String catalog, String schema, String name) { }
-
-    private record TableMetadata(Set<String> columns, Set<String> indexes) { }
 }

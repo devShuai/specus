@@ -38,15 +38,25 @@ login (see below). With `SPECUS_DATABASE_PATH` configured,
 `/api/client/auth/login` can authenticate rows in `specus_client_credential`, create or reuse a
 machine/user-bound client identity, write a `HTTP_AUTHENTICATED` row to `specus_client_session`,
 and issue a runtime `cs_` token that the control-channel login later promotes to `NETTY_ONLINE`.
+The token belongs to the account it was issued for, not to its name (`protocol/spec/client-auth.md`):
+both logins load the account by id, refuse a deleted or disabled one, and answer and bind under its
+current name, so a renamed account's machine logs in under the new name and an account created
+later under the old name never receives its login or its traffic. Deleting an account ends its
+sessions. `client_account.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so no id is handed out twice;
+a database from before that column is migrated once at startup, keeping every account's rowid as its
+id and retiring freed ids other tables still refer to.
 The environment-token mode is a local smoke-test fixture, not an alternate wire protocol.
 In both modes a login whose signature verifies consumes its `(apiKey, nonce)` pair, as
 `protocol/spec/client-auth.md` requires: the same pair again within 120 s gets Java's
 `400 {"error":"客户端签名 nonce 已使用"}` and no token; a request whose signature fails consumes nothing.
-The digests live in process memory (Java and Go keep them in the database): at most 65536 at a time,
-expiring by the same wall clock as the +-60 s timestamp window, and a full store answers
-`503` with `Retry-After` rather than evicting a pair that could still be replayed. Being per process,
-they are not shared between C server instances and do not survive a restart; the timestamp window
-limits a replay after a restart to requests signed in the preceding 60 s.
+With a database the digests go to Java's `specus_client_auth_nonce` table (same id, `api_key_hash`
+and text `expires_at`), consumed in one write transaction that first deletes expired rows, so a
+restart does not forget them and instances sharing the database file share them; a failing database
+answers `503`. Without one (the environment-token mode) they live in process memory: at most 65536
+at a time, expiring by the same wall clock as the +-60 s timestamp window, and a full store answers
+`503` with `Retry-After` rather than evicting a pair that could still be replayed. That store is per
+process and empty after a restart; the timestamp window limits a replay after a restart to requests
+signed in the preceding 60 s.
 The login response carries `nettyTls`, derived as Java and Go derive it: `true` when
 `SPECUS_TLS_MODE` is `file` or `self-signed`, or `SPECUS_TLS_TERMINATED_UPSTREAM=true`. Clients
 whose `controlTls.enabled` is unset follow it.
@@ -116,7 +126,7 @@ Additional runtime knobs:
 | `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | Built-in password-login switch. `/oidc-config.passwordLoginEnabled` is true only when this switch is true and `SPECUS_AUTH_PASSWORD` contains non-whitespace text. SQLite management users keep their own password-login path, matching Java. |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_ENABLED` | `true` | Enables application-level management login throttling independently of captcha/OIDC. |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_IP` | `20` | Attempts allowed per source IP in one fixed window. |
-| `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT` | `10` | Attempts allowed per case-insensitive target username in one fixed window. |
+| `SPECUS_AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT` | `10` | Attempts allowed per case-insensitive target tenant and username in one fixed window. |
 | `SPECUS_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `300` | Fixed login-rate-limit window and maximum `Retry-After`. |
 | `SPECUS_AUTH_JWT_SECRET` | unset | Optional HS256 signing secret for local management Bearer JWTs and the domain-separated pairing-code HMAC. When unset the process uses an ephemeral key: old JWTs and persisted pairing codes fail after restart, so configure a stable high-entropy value when pairing codes are enabled. |
 | `SPECUS_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management Bearer JWT lifetime; values below 60 seconds are normalized to 60. |
@@ -135,7 +145,7 @@ Additional runtime knobs:
 | `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | Peer session authorization lifetime: the expiry stored for a new peer session and the `sessionTtlSeconds` sent in the login configuration. Non-positive values fall back to `3600`. |
 | `SPECUS_PEER_MESH_CATALOG_TTL_SECONDS` | `300` | Live service-catalog lease before stale withdrawal. Values outside `1..86400` fall back to `300`. |
 | `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | Maximum discoverable peers in one token/public room. |
-| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message limits. Redis failure closes discovery sockets; there is no process-local fallback. |
+| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | Enables Java-compatible Redis presence, merged roster revisions, Pub/Sub routing, global name checks, and shared discovery-message, pairing-code redemption and public presign-upload limits. Redis failure closes discovery sockets and answers the two source-address limits with 429; there is no process-local fallback. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | unset | Required in cluster mode. Supports `redis://[user[:password]@]host[:port][/0..15]`; TLS `rediss://` is intentionally rejected until a verified TLS transport is added. |
 | `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `specus:v2:public-transfer` | Redis keys/channel prefix. Use a distinct value per environment. |
 | `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | Shared discovery presence TTL. |
@@ -145,7 +155,7 @@ Additional runtime knobs:
 | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | `60` | Discovery connection rate-limit window in seconds. |
 | `SPECUS_PUBLIC_TRANSFER_DISCOVERY_WRITE_TIMEOUT_SECONDS` | `5` | Maximum blocking discovery-socket write time, clamped to at most 300 seconds. |
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS` | `300` | Pairing-code lifetime, clamped to `60..900` seconds. |
-| `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP` | `10` | Pairing-code redemption attempts per resolved source address in one fixed window. |
+| `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP` | `10` | Pairing-code redemption attempts per resolved source address in one fixed window (shared through Redis in cluster mode). |
 | `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS` | `300` | Pairing-code redemption fixed-window duration. |
 | `SPECUS_OBJECT_STORAGE_PROVIDER` | `disabled` | Attachment provider: `aliyun-oss` is the only supported value. Unset or `disabled` keeps attachment APIs fail-closed; any other value, or `aliyun-oss` without endpoint, bucket, access keys and an inferable or explicit region, is rejected at startup. |
 | `SPECUS_OBJECT_STORAGE_ENDPOINT` / `REGION` / `BUCKET` | unset | Object-storage endpoint, region and bucket. |
@@ -299,9 +309,10 @@ caller's favourites (at most 50) and recent opens (20, 30 days) as bare `(kind, 
 limited per identity in process memory; deleting a route, mapping, Peer service, client, or account deletes
 the references in the same transaction, and the maintenance thread sweeps expired recent opens hourly.
 The public-transfer discovery WebSocket works in process-local mode by default and can use Redis for
-multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message
-limits, and STCE2 Pub/Sub text/binary routing. Redis outages fail closed by terminating local discovery
-sockets rather than falling back to divergent local state. In SQLite mode it resolves
+multi-instance presence, revisioned merged rosters, global peer/name/capacity checks, distributed message,
+pairing-code redemption and presign-upload limits, and STCE2 Pub/Sub text/binary routing. Redis outages fail
+closed by terminating local discovery sockets and refusing the source-address limits rather than falling back
+to divergent local state. In SQLite mode it resolves
 owner, editor, and viewer credentials to one persistent room; access-token creation/list/revocation and
 domain-separated HMAC pairing-code creation/atomic redemption follow the Java API. Plaintext credentials
 are returned only at creation/redemption and are never persisted. The roster merges same-room peers across
@@ -332,7 +343,8 @@ random 16-byte salt and 210,000 iterations. Legacy unsalted SHA-256 rows remain 
 rewritten to the current format after a successful login. High-entropy client credentials and
 per-route Basic secrets intentionally remain single-round SHA-256 digests.
 The built-in password is blank by default, so `admin/admin` is never implicitly accepted. Every
-non-null login request is counted in fixed windows by source IP and case-insensitive username;
+non-null login request is counted in fixed windows by source IP and by the case-insensitive
+tenant and username of the request;
 defaults are 20/IP and 10/account per 300 seconds. Either budget exceeding its limit returns the
 same `429 Too Many Requests` body plus `Retry-After`, and a successful login clears only the account
 budget so the source-IP budget cannot be bypassed by cracking one account.
@@ -341,13 +353,30 @@ published weak management passwords and JWT placeholder as Java, and every SQLit
 path suppresses demo-client seeding. Forwarded client-address headers are ignored by default; after
 an operator configures `SPECUS_TRUSTED_PROXIES`, login throttling and WebSocket ticket binding share
 the same right-to-left trusted-proxy resolver.
+Login names are unique per tenant, as in Java (`protocol/spec/management-accounts.md`): the
+`specus_management_user.username` primary key is an opaque account key (accounts from before keep
+their username, new ones get a random UUID), `login_name` is the name shown and signed in with,
+and `uq_management_user_tenant_login_name` is unique on `(tenant_id, login_name_normalized)` (the
+login name trimmed, ASCII letters lower-cased). `st_storage_init` backfills the two columns of an
+older database and refuses to start when two accounts of one tenant would share a login name or
+an index of that name has another definition. `POST /auth/login` takes an optional `tenantId`:
+with it only that tenant's login names are searched; without it the default tenant
+(`SPECUS_AUTH_TENANT_ID`) first and then, only when it has no such name, an account whose legacy
+key is that name, ignoring case, provided exactly one does. The built-in admin signs in without a
+tenant or with the default one. A same-named account of another tenant is no conflict for
+`POST /api/admin/users`, and self-registration creates accounts in the default tenant.
 The login and refresh responses use the Java-shaped `accessToken/tokenType/expiresIn` fields. The
-token is a local HS256 JWT with `iss=specus`, `sub`, `tenant_id`, `role`, `iat`, and `exp`;
+token is a local HS256 JWT with `iss=specus`, `sub` (the login name), `tenant_id`, `uid` (the
+account key; the built-in admin's tokens have none), `role`, `iat`, and `exp`;
 real HTTP requests to `/api/admin/**` and `/auth/refresh` must include it as
 `Authorization: Bearer <token>`. As in Java's `ManagementContextResolver`, the token only names
 the account: every authenticated request and every refresh re-reads it (one read-only SQLite
 query, not cached). The built-in admin must still be allowed to sign in with its password; a stored
-user must exist, be enabled and still belong to the token's tenant; tenant, role and admin rights
+user is the login name `sub` of the tenant `tenant_id` (a token without `tenant_id` names the
+exact account key) and must exist and be enabled; a token with `uid` resolves only to the account
+whose key is exactly that, so it does not pass to a later account of the same name, and is never the
+built-in admin's (tokens without `uid` predate it and resolve as before until they expire). Deleting
+an account deletes its email record in the same transaction. Tenant, role and admin rights
 come from the record as it is now. Otherwise requests get `403 {"error":"账号未绑定、已禁用或权限已撤销"}`
 and refresh gets `401 {"error":"账号已禁用、不存在或不再允许本地登录"}`; an unreadable user store
 answers `500`. Refresh issues the new token from the current record, so a demoted admin is
@@ -399,10 +428,14 @@ written to `specus_http_traffic_exchange` with request/response headers, body pr
 content types, response body type, and elapsed time. Previews follow Java's
 `TrafficInspectionService`: `SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES` (default `256`, capped at
 `1024`) bytes as uppercase spaced hex, and for HTTP a text preview of the body decoded per
-`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. Unlike Java,
-the C server stores HTTP previews rather than whole bodies, so `requestTruncated` /
-`responseTruncated` say whether the preview holds the whole body. The exchange list returns
-summaries without headers or previews; `GET /api/admin/traffic/http-exchanges/{id}` returns them. The management endpoints
+`Content-Encoding` (gzip/deflate; `br` is not decoded), left empty for binary bodies. The bodies
+themselves go to `request_body_data` / `response_body_data` (Elasticsearch: binary
+`requestBodyData` / `responseBodyData`): the first 64 KiB of each, where Java keeps the whole
+body, so `requestTruncated` / `responseTruncated` say the body was longer than what was kept. A
+response that media capture took keeps its size but no body. The exchange list returns summaries
+without headers, previews or bodies; `GET /api/admin/traffic/http-exchanges/{id}` returns them, the
+preview texts showing the stored bodies as Java's `HttpBodyDataCodec` does (the decoded text, or
+`data:<type>;base64,...` for a binary body). The management endpoints
 `GET /api/admin/traffic/http-exchanges`, `GET /api/admin/traffic/tcp-frames`,
 `GET /api/admin/traffic/tcp-frames/{id}`, and `GET /api/admin/traffic/tcp-streams` now query these
 SQLite tables with the same basic tenant/owner visibility rule as other management APIs. HTTP
@@ -412,6 +445,13 @@ field aliases such as `responseDataType`, `contentType`, `requestHeaders`, and `
 accepted. The default summary search does not scan headers or body; `field=all` includes those
 large text fields. When `SPECUS_ELASTICSEARCH_URIS` is configured, the same management queries use the optional
 Elasticsearch HTTP/TCP indices and configured retention caps; otherwise SQLite remains authoritative.
+With Elasticsearch, search follows Java's `HttpTrafficSearchField` query (text fields by `multi_match`, keyword
+fields by a case-insensitive substring, numbers by id/client/status), an administrator sees the whole tenant
+including deleted clients, and captured documents go through Java's write queue
+(`SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS`, `SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE`,
+`SPECUS_TRAFFIC_CAPTURE_MAX_PENDING`; `flush=true` and shutdown write it out) instead of blocking the relay.
+`tcp-streams` returns Java's page (`page`, `size`, `limit`, `total`, `totalPages`, `truncated`) in capture order.
+See `docs/cross-language/alignment/c-server-api-inventory.md`.
 The client auth-login endpoint returns `tenantId`, runtime client identity, control-channel token,
 Java-shaped `peerMesh`, TCP `specusConfigList`, and `httpSpecusConfigList`. In SQLite mode it first
 looks up `specus_client_credential` by `apiKey`, verifies the same canonical HMAC signature
@@ -440,9 +480,17 @@ user instance limit, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`
   (`SERVER_RESTARTED`). When no matching SQLite credential exists, the explicitly configured environment-token
   smoke-test path is available. Partial environment client-auth configuration is treated as a
 server misconfiguration and returns `503` instead of silently falling back. The same listener also
-serves the SPA and `/specus-http-route-runtime.js` from `SPECUS_STATIC_ROOT`.
-`/api/admin/overview` and `/api/admin/metrics` use the same SQLite plus environment mapping snapshot
-as client auth login, and count only the current management context's visible TCP mappings.
+serves the SPA and `/specus-http-route-runtime.js` from `SPECUS_STATIC_ROOT`, with Java
+`SecurityConfig`'s portal headers: the `Content-Security-Policy` (`frame-ancestors 'none'`,
+`connect-src` with `https://api.github.com`, plus the bucket origin when `aliyun-oss` object storage
+is configured), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: strict-origin-when-cross-origin`. `/http/` and `/http-share/` answers never carry
+them. JSON API answers carry `nosniff` only (Java adds the whole set there as well, but a policy on a
+JSON answer is never applied as a page).
+`/api/admin/overview` returns Java `OverviewService`'s fields (clients, online clients, login counts,
+traffic, and for administrators the tenant's open and refused public connections) followed by C's
+`server`, `status` and `tcpMappings`; `/api/admin/metrics` uses the same SQLite plus environment mapping
+snapshot as client auth login, and both count only the current management context's visible TCP mappings.
 
 Requests under `/http/{clientName}/{route}/...` are recognized by the management listener and are
 forwarded to the active runtime session whose `clientName` matches the path and whose `route`
@@ -486,7 +534,17 @@ when the 4 MiB client-to-public queue overflows), and `DATA|END_STREAM` is DATA 
 data connection remembers its 1024 most recently closed stream ids so a late `RST` is ignored; an
 `RST` for a stream that was never opened, a `WINDOW_UPDATE` beyond the 16 MiB window and a NAT type a
 client never sends close the data connection. A data connection holds at most 1024 pending HTTP
-streams (the next request gets `502`), and request bodies over 16 MiB get `413`.
+streams (the next request gets `502`), and request bodies over 16 MiB get `413`; because every
+request body is read into memory before it is dispatched, that limit holds on the whole management
+listener (the client package upload has its own), where Java limits `/http/**` only.
+Trailers cross as `protocol/spec/http-route.md` sections 3 and 4 require, like Java
+`HttpSpecusController`: the names of the request's `Trailer` headers are declared in `trailerNames`
+(trimmed tokens, no hop-by-hop field, each once, without `Authorization` once the route gate
+consumed it) and only those fields of a chunked body's trailer section go out in
+`FIN.metadata.trailers`; of a response, only fields the head declared, with a valid name and no
+CR/LF, reach the browser. With detail capture on, refused and failed `/http/` requests are recorded
+as well: a `413` with the request headers and the body's first 64 KiB, the route gate's `401`,
+`503` and `404` without request headers, and forwarding failures with their reason.
 `tests/nat_stream_tests.c` checks each rule against a real server process.
 
 The C
@@ -542,8 +600,9 @@ Security skeleton endpoints:
   management user: the user already bound to it; otherwise, on the first login, an enabled and
   unbound user of the default tenant named `preferred_username`; otherwise a new `USER` in
   `SPECUS_AUTH_TENANT_ID` with a hash of a random password. `preferred_username` never claims the
-  built-in admin, a disabled account, an account bound to another identity, or (usernames being
-  a global key in C) an account of another tenant: those get `403`. The answer is
+  built-in admin, a disabled account or an account bound to another identity: those get `403`.
+  Accounts of other tenants take no part, so a same-named one there neither binds nor blocks the
+  new default-tenant account. The answer is
   `{"accessToken","idToken","tokenType","expiresIn"}` where `accessToken` is the local HS256 token
   password login issues, so it works on `/api/admin/**` and `/auth/refresh`. The identity
   provider's access and refresh tokens are not passed on; `idToken` is returned, as Java does, as

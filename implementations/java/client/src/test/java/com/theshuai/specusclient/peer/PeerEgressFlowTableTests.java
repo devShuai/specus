@@ -196,10 +196,10 @@ class PeerEgressFlowTableTests {
     void reauthorizesANamedFlowByTheAddressItDialled() {
         PeerEgressFlowTable table = new PeerEgressFlowTable(60_000);
         Flow byDestination = table.open(key(TCP, "100.96.0.1", 40000, "198.18.0.5", 443), 7, EPOCH);
-        byDestination.address = address("203.0.113.10");
+        byDestination.address = "203.0.113.10";
         byDestination.name = "other.example";
         Flow byDomain = table.open(key(TCP, "100.96.0.1", 40001, "198.18.0.6", 443), 7, EPOCH);
-        byDomain.address = address("192.0.2.10");
+        byDomain.address = "192.0.2.10";
         byDomain.name = "example.com";
 
         PeerEgressPolicy domain = policy("203.0.113.0/24");
@@ -219,7 +219,7 @@ class PeerEgressFlowTableTests {
         assertNotNull(table.lookup(byDestination.key));
 
         Flow lan = table.open(key(TCP, "100.96.0.1", 40002, "198.18.0.7", 443), 7, EPOCH);
-        lan.address = address("10.0.0.5");
+        lan.address = "10.0.0.5";
         lan.name = "intranet.example";
         PeerEgressPolicy lanPolicy = policy("10.0.0.0/8", "203.0.113.0/24");
         lanPolicy.setScope(PeerEgressPolicy.SCOPE_LAN);

@@ -100,9 +100,10 @@ func currentEgressCapabilities() clientEgressCapabilities {
 		Version:         egressProtocolVersion,
 		ConsumerCapable: egressRouteTakeoverSupported,
 		EgressCapable:   true,
-		// The egress resolves names consumers bind. IPv6 targets are not announced: the outbound
-		// socket binding that keeps forwarded traffic out of this device's own tunnel is IPv4 only.
+		// The egress resolves names consumers bind, and dials a name with no A record over its AAAA
+		// records (peer_egress_names.go).
 		DomainTargetCapable: true,
+		IPv6TargetCapable:   egressIPv6TargetCapable,
 	}
 }
 

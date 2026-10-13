@@ -110,6 +110,37 @@ public sealed class ConnectionEventsHub
         await BroadcastLocalAsync(connectionEvent, payload).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The account of this identity was deleted: its open sessions end (management-accounts.md
+    /// section 7.1). A session keeps the identity it was opened with, so it would otherwise receive the
+    /// events of a later account of the same name.
+    /// </summary>
+    public async Task CloseIdentityAsync(string tenantId, string username)
+    {
+        foreach (var (id, subscription) in _sockets.ToArray())
+        {
+            if (!ManagementContext.SameTenant(subscription.Principal.TenantId, tenantId)
+                || !string.Equals(subscription.Principal.Username, username, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            _sockets.TryRemove(id, out _);
+            try
+            {
+                if (subscription.Socket.State == WebSocketState.Open)
+                {
+                    await subscription.Socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
+                        "account deleted", CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException
+                or InvalidOperationException)
+            {
+                subscription.Socket.Abort();
+            }
+        }
+    }
+
     private async Task HandleClusterEventAsync(PublicTransferClusterEvent clusterEvent)
     {
         if (clusterEvent.Kind != PublicTransferClusterFrame.KindManagement)

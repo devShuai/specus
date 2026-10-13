@@ -43,6 +43,7 @@ start_server() {
   SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS=2 \
   SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS=200 \
   SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS=500 \
+  SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP=2 \
   "$SERVER_BINARY" >"$log" 2>&1 &
 }
 
@@ -222,11 +223,46 @@ one.json_until(lambda value: value.get("type") == "roster"
 
 hidden = WebSocket(ADMIN_TWO, issue_ticket(ADMIN_TWO, "peer-hidden", "Hidden", discoverable=False))
 hidden.json_until(lambda value: value.get("type") == "hello")
+# The hidden connection receives the merged roster but is never listed in it, on either instance.
+hidden_roster = hidden.json_until(lambda value: value.get("type") == "roster"
+                                  and "peer-a" in {peer["peerId"] for peer in value["peers"]})
+if "peer-hidden" in {peer["peerId"] for peer in hidden_roster["peers"]}:
+    raise RuntimeError(f"hidden peer listed in its own roster: {hidden_roster}")
 one.send(1, json.dumps({"type": "signal", "targetPeerId": "peer-hidden",
                         "payload": {"hidden": True}}, separators=(",", ":")).encode())
 hidden_message = hidden.json_until(lambda value: value.get("type") == "signal")
 if hidden_message.get("payload") != {"hidden": True}:
     raise RuntimeError(f"hidden peer fallback mismatch: {hidden_message}")
+
+# A hidden connection registers no shared presence, so the presence refresh (every 200 ms against a
+# 2 s lease) must skip it instead of finding its lease missing and closing it. Visible peers keep
+# their leases across the same period, and the hidden name never enters the shared name index.
+time.sleep(2.6)
+hidden.send(1, b'{"type":"ping"}')
+hidden.json_until(lambda value: value.get("type") == "pong")
+for name, available in (("Alice", False), ("Bob", False), ("Hidden", True)):
+    status, availability = request(ADMIN_ONE, "GET",
+        "/api/public/transfer/clients/name-availability?clientName=" + name)
+    if status != 200 or availability.get("available") is not available:
+        raise RuntimeError(f"presence after refresh cycles mismatch for {name}: {status} {availability}")
+for websocket in (one, two):
+    websocket.send(1, b'{"type":"ping"}')
+    while True:
+        value = websocket.json_until(lambda value: value.get("type") in ("pong", "roster"))
+        if value["type"] == "pong":
+            break
+        if "peer-hidden" in {peer["peerId"] for peer in value["peers"]}:
+            raise RuntimeError(f"a hidden peer was listed in a visible peer's roster: {value}")
+
+# The pairing-code redemption window (two per source in this run) lives in Redis, so the two
+# instances share it: the third and fourth attempts are refused whichever instance they reach.
+# These servers have no SPECUS_DATABASE_PATH, so an admitted attempt finds no room storage (503);
+# the window is checked before that, as Java checks it before the room service.
+redeem = {"code": "00000000", "peerId": "guest"}
+statuses = [request(port, "POST", "/api/public/transfer/rooms/pairing-codes/redeem", redeem)[0]
+            for port in (ADMIN_ONE, ADMIN_TWO, ADMIN_ONE, ADMIN_TWO)]
+if statuses != [503, 503, 429, 429]:
+    raise RuntimeError(f"pairing-code redemption limit was not shared: {statuses}")
 
 subprocess.run(["redis-cli", "-h", "127.0.0.1", "-p", str(REDIS_PORT),
                 "shutdown", "nosave"], check=True, stdout=subprocess.DEVNULL)
@@ -244,6 +280,9 @@ for websocket in (one, two):
         closed += 1
 if closed != 2:
     raise RuntimeError("Redis outage did not fail closed across both instances")
+status, refused = request(ADMIN_TWO, "POST", "/api/public/transfer/rooms/pairing-codes/redeem", redeem)
+if status != 429:
+    raise RuntimeError(f"pairing-code redemption did not fail closed without Redis: {status} {refused}")
 
 print("two-process Redis public discovery E2E passed")
 PY

@@ -66,6 +66,36 @@ class ManagementUserSchemaMigratorTests {
                 .hasMessageContaining("must be unique on (tenant_id, login_name_normalized)");
     }
 
+    @Test
+    void removesEmailRecordsOfAccountsThatNoLongerExist() {
+        JdbcTemplate jdbc = legacyDatabase();
+        jdbc.update("insert into specus_management_user(username, tenant_id) values (?, ?)", "kept-key", "default");
+        jdbc.execute("create table specus_management_user_email ("
+                + "username varchar(80) primary key, email varchar(254) not null unique)");
+        jdbc.update("insert into specus_management_user_email(username, email) values (?, ?)",
+                "kept-key", "kept@example.com");
+        jdbc.update("insert into specus_management_user_email(username, email) values (?, ?)",
+                "deleted-key", "released@example.com");
+
+        ManagementUserSchemaMigrator migrator = new ManagementUserSchemaMigrator(jdbc);
+        migrator.migrate();
+        migrator.migrate();
+
+        assertThat(jdbc.queryForList("select email from specus_management_user_email", String.class))
+                .containsExactly("kept@example.com");
+    }
+
+    @Test
+    void runsWithoutAnEmailTable() {
+        JdbcTemplate jdbc = legacyDatabase();
+        jdbc.update("insert into specus_management_user(username, tenant_id) values (?, ?)", "alice", "default");
+
+        new ManagementUserSchemaMigrator(jdbc).migrate();
+
+        assertThat(jdbc.queryForObject("select login_name from specus_management_user", String.class))
+                .isEqualTo("alice");
+    }
+
     private JdbcTemplate legacyDatabase() {
         dataSource = new SingleConnectionDataSource("jdbc:sqlite::memory:", true);
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);

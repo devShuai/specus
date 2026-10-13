@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
 
 CREATE TABLE IF NOT EXISTS specus_management_user (
   username VARCHAR(80) NOT NULL PRIMARY KEY,
+  login_name VARCHAR(80) NULL,
+  login_name_normalized VARCHAR(80) NULL,
   tenant_id VARCHAR(80) NOT NULL,
   password_hash VARCHAR(64) NOT NULL,
   oidc_issuer VARCHAR(255) NULL,
@@ -397,6 +399,8 @@ CREATE TABLE IF NOT EXISTS specus_http_traffic_exchange (
   request_preview_text LONGTEXT,
   response_preview_hex TEXT,
   response_preview_text LONGTEXT,
+  request_body_data LONGBLOB,
+  response_body_data LONGBLOB,
   request_truncated TINYINT(1) NOT NULL,
   response_truncated TINYINT(1) NOT NULL,
   captured_at VARCHAR(40) NOT NULL,

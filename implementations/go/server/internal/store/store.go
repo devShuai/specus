@@ -174,16 +174,19 @@ func (db *DB) ensureCompatibleColumns() error {
 	clientCapabilityBoolType := boolType
 	ticketAttributesType := "TEXT"
 	egressDomainRulesType := "TEXT NOT NULL DEFAULT '[]'"
+	bodyDataType := "BLOB"
 	switch db.dialect {
 	case DialectPostgres:
 		boolType = "SMALLINT NOT NULL DEFAULT 0"
 		clientCapabilityBoolType = "BOOLEAN NOT NULL DEFAULT FALSE"
 		egressDomainRulesType = "VARCHAR(4096) NOT NULL DEFAULT '[]'"
+		bodyDataType = "BYTEA"
 	case DialectMySQL:
 		boolType = "TINYINT(1) NOT NULL DEFAULT 0"
 		clientCapabilityBoolType = boolType
 		ticketAttributesType = "LONGTEXT"
 		egressDomainRulesType = "VARCHAR(4096) NOT NULL DEFAULT '[]'"
+		bodyDataType = "LONGBLOB"
 	}
 	columns := []struct {
 		table      string
@@ -242,6 +245,10 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"specus_websocket_ticket", "peer_id", "VARCHAR(120)"},
 		{"specus_websocket_ticket", "display_name", "VARCHAR(120)"},
 		{"specus_websocket_ticket", "shared_room", boolType},
+		// Captured HTTP bodies, as Java's DatabaseInitializer adds them (bytea / longblob). An
+		// exchange recorded before them keeps its preview text as its detail.
+		{"specus_http_traffic_exchange", "request_body_data", bodyDataType},
+		{"specus_http_traffic_exchange", "response_body_data", bodyDataType},
 	}
 	for _, column := range columns {
 		if err := db.ensureColumn(column.table, column.name, column.definition); err != nil {
@@ -277,6 +284,9 @@ func (db *DB) ensureCompatibleColumns() error {
 	}
 	if err := db.ensureUniqueIndex("uq_management_user_oidc_identity_key",
 		"specus_management_user", "oidc_identity_key"); err != nil {
+		return err
+	}
+	if err := db.migrateManagementLoginNames(); err != nil {
 		return err
 	}
 	if err := db.ensureIndex("idx_specus_connection_tenant", "specus_connection_record", "tenant_id"); err != nil {

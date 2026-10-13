@@ -123,7 +123,7 @@ SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID=test-access-key \
 SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET=test-secret-key \
 SPECUS_OBJECT_STORAGE_PREFIX=prefix \
 SPECUS_OBJECT_STORAGE_TEST_RESOLVE_ADDRESS=127.0.0.1 \
-SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP=1 \
+SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP=2 \
 stdbuf -oL -eL "$SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -233,8 +233,9 @@ if status != 401 or "storageUsedBytes" in json.dumps(anonymous):
 status, headers, _ = api("POST", CAPABILITIES, {}, token)
 if status != 405 or headers.get("Allow") != "GET":
     raise RuntimeError(f"capabilities POST contract mismatch: {status} {headers}")
-# The server allows one presign upload per source address in this run. Reading the snapshot
-# first must not consume it, so the upload below only succeeds if these reads reserved nothing.
+# The server allows two presign uploads per source address in this run: the VIEWER's refused one
+# and the owner's. Reading the snapshot first must not consume either, so the owner's upload below
+# only succeeds if these reads reserved nothing.
 for _ in range(3):
     capabilities(0, "before any upload")
 
@@ -247,8 +248,8 @@ upload_request = {
     "roomId": "object-e2e-room",
     "roomToken": room_token,
 }
-# A VIEWER invite resolves the room but may not upload. The refusal happens before the source-address
-# limiter, so the one presign this run allows is still available for the owner below.
+# A VIEWER invite resolves the room but may not upload. As in Java the source-address limiter runs
+# before the room is resolved, so the refusal uses the first of the two presigns this run allows.
 status, _, invite = api("POST", "/api/public/transfer/rooms/access-tokens",
                         {"roomId": "object-e2e-room", "roomToken": room_token, "role": "VIEWER"})
 if status != 200 or not invite.get("token"):
@@ -336,7 +337,7 @@ status, headers, _ = api("HEAD", grant["downloadUrl"])
 if status != 405 or headers.get("Allow") != "GET":
     raise RuntimeError(f"download HEAD contract mismatch: {status} {headers}")
 
-# The limiter is really active: a second upload from this address is refused.
+# The limiter is really active: a third upload from this address is refused.
 status, _, limited = api("POST", "/api/public/transfer/attachments/presign-upload", upload_request, token)
 if status != 429:
     raise RuntimeError(f"presign rate limit was not enforced: {status} {limited}")

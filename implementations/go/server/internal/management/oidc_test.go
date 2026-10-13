@@ -96,20 +96,16 @@ func TestOIDCCodeExchangeMintsLocalTokenAndBindsIdentity(t *testing.T) {
 		tokenForm.Get("redirect_uri") == "https://evil.example/" || tokenForm.Get("code_verifier") != "pkce-verifier" {
 		t.Fatalf("token exchange did not use canonical server inputs: form=%v result=%+v", tokenForm, result)
 	}
-	user, err := db.FindManagementUserByUsername(context.Background(), "certus-user")
+	user, err := db.FindManagementUserByLogin(context.Background(), "default", "certus-user")
 	if err != nil || user == nil || user.OIDCIssuer != idp.URL || user.OIDCSubject != "immutable-subject" ||
 		user.OIDCIdentityKey == "" || user.Role != store.ManagementRoleUser {
 		t.Fatalf("OIDC identity was not bound as least privilege: user=%+v err=%v", user, err)
 	}
 
-	// Refresh must use the current database authorization, not the stale role/tenant in the JWT.
+	// Refresh must use the current database authorization, not the stale role in the JWT.
 	user.Role = store.ManagementRoleAdmin
-	user.TenantID = "tenant-updated"
 	user.UpdatedAt = time.Now()
-	if err := db.DeleteManagementUser(context.Background(), user.Username); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.InsertManagementUser(context.Background(), *user); err != nil {
+	if err := db.UpdateManagementUser(context.Background(), *user); err != nil {
 		t.Fatal(err)
 	}
 	currentRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/api/admin/me", nil)
@@ -125,7 +121,7 @@ func TestOIDCCodeExchangeMintsLocalTokenAndBindsIdentity(t *testing.T) {
 	}
 	currentResponse.Body.Close()
 	if currentResponse.StatusCode != http.StatusOK || !currentMe.Admin ||
-		currentMe.Role != store.ManagementRoleAdmin || currentMe.TenantID != "tenant-updated" {
+		currentMe.Role != store.ManagementRoleAdmin || currentMe.TenantID != "default" {
 		t.Fatalf("request did not use current DB authorization: status=%d me=%+v",
 			currentResponse.StatusCode, currentMe)
 	}
@@ -142,19 +138,15 @@ func TestOIDCCodeExchangeMintsLocalTokenAndBindsIdentity(t *testing.T) {
 	}
 	refreshedClaims, ok := tokens.ValidateClaims(refreshed.AccessToken)
 	if refreshResponse.StatusCode != http.StatusOK || !ok || refreshedClaims.Role != store.ManagementRoleAdmin ||
-		refreshedClaims.TenantID != "tenant-updated" {
+		refreshedClaims.TenantID != "default" || refreshedClaims.Username != "certus-user" {
 		t.Fatalf("refresh did not use current DB authorization: status=%d claims=%+v ok=%t",
 			refreshResponse.StatusCode, refreshedClaims, ok)
 	}
 
-	// A token minted while the user was ADMIN must immediately observe demotion and tenant change.
+	// A token minted while the user was ADMIN must immediately observe demotion.
 	user.Role = store.ManagementRoleUser
-	user.TenantID = "tenant-demoted"
 	user.UpdatedAt = time.Now()
-	if err := db.DeleteManagementUser(context.Background(), user.Username); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.InsertManagementUser(context.Background(), *user); err != nil {
+	if err := db.UpdateManagementUser(context.Background(), *user); err != nil {
 		t.Fatal(err)
 	}
 	demotedRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/api/admin/me", nil)
@@ -170,9 +162,36 @@ func TestOIDCCodeExchangeMintsLocalTokenAndBindsIdentity(t *testing.T) {
 	}
 	demotedResponse.Body.Close()
 	if demotedResponse.StatusCode != http.StatusOK || demotedMe.Admin ||
-		demotedMe.Role != store.ManagementRoleUser || demotedMe.TenantID != "tenant-demoted" {
+		demotedMe.Role != store.ManagementRoleUser || demotedMe.TenantID != "default" {
 		t.Fatalf("stale ADMIN token ignored DB demotion: status=%d me=%+v",
 			demotedResponse.StatusCode, demotedMe)
+	}
+
+	// The token names a login name of its tenant: once the account lives in another tenant, the
+	// token resolves to no one rather than following the account there.
+	user.TenantID = "tenant-moved"
+	if err := db.DeleteManagementUser(context.Background(), *user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.InsertManagementUser(context.Background(), *user); err != nil {
+		t.Fatal(err)
+	}
+	movedRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/api/admin/me", nil)
+	movedRequest.Header.Set("Authorization", "Bearer "+refreshed.AccessToken)
+	movedResponse, err := http.DefaultClient.Do(movedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedResponse.Body.Close()
+	if movedResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a token of the old tenant followed the account: status=%d", movedResponse.StatusCode)
+	}
+	user.TenantID = "default"
+	if err := db.DeleteManagementUser(context.Background(), *user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.InsertManagementUser(context.Background(), *user); err != nil {
+		t.Fatal(err)
 	}
 
 	user.Enabled = false
@@ -256,7 +275,7 @@ func TestOIDCDirectBearerRequiresBoundEnabledUserAndUsesCurrentAuthorization(t *
 
 	now := time.Now()
 	identityKey := auth.DigestKey(idp.URL + "\x00" + "subject-admin")
-	if err := db.InsertManagementUser(context.Background(), store.ManagementUser{
+	if _, err := db.InsertManagementUser(context.Background(), store.ManagementUser{
 		Username: "local-user", TenantID: "tenant-db", PasswordHash: auth.HashPassword(auth.GeneratePassword()),
 		OIDCIssuer: idp.URL, OIDCSubject: "subject-admin", OIDCIdentityKey: identityKey,
 		Role: store.ManagementRoleUser, Enabled: true, CreatedAt: now, UpdatedAt: now,
@@ -287,7 +306,7 @@ func TestOIDCDirectBearerRequiresBoundEnabledUserAndUsesCurrentAuthorization(t *
 	if refreshResponse.StatusCode != http.StatusBadRequest {
 		t.Fatalf("OIDC refresh status = %d, want 400", refreshResponse.StatusCode)
 	}
-	bound, err := db.FindManagementUserByUsername(context.Background(), "local-user")
+	bound, err := db.FindManagementUserByLogin(context.Background(), "tenant-db", "local-user")
 	if err != nil || bound == nil {
 		t.Fatalf("find bound user: user=%+v err=%v", bound, err)
 	}

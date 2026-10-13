@@ -58,30 +58,33 @@ public sealed class HttpShareService
     internal sealed record SharePrincipal(string Username, string TenantId, bool Admin);
 
     /// <summary>
-    /// Re-reads a user. The configured built-in admin is not a row of the user table: it counts as
-    /// an enabled ADMIN of its configured tenant while the server would accept it as a principal,
-    /// i.e. while password login is enabled with a password set.
+    /// Re-reads a user by its identity: the tenant and the login name, as a share's creator or a
+    /// management context records them (Java <c>lookupActor</c>). The configured built-in admin is
+    /// not a row of the user table: it counts as an enabled ADMIN of its configured tenant while the
+    /// server would accept it as a principal, i.e. while password login is enabled with a password set.
     /// </summary>
-    internal async Task<SharePrincipal?> LoadPrincipalAsync(string? username,
+    internal async Task<SharePrincipal?> LoadPrincipalAsync(string? tenantId, string? username,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(username))
+        if (string.IsNullOrWhiteSpace(tenantId) || string.IsNullOrWhiteSpace(username))
         {
             return null;
         }
+        var tenant = ManagementContext.NormalizeTenant(tenantId);
         var normalized = username.Trim();
-        if (string.Equals(normalized, _auth.Username, StringComparison.OrdinalIgnoreCase))
+        var defaultTenant = ManagementContext.NormalizeTenant(_auth.TenantId);
+        if (string.Equals(normalized, _auth.Username, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(tenant, defaultTenant, StringComparison.Ordinal))
         {
             return _auth.PasswordLoginEnabled && !string.IsNullOrWhiteSpace(_auth.Password)
-                ? new SharePrincipal(_auth.Username, ManagementContext.NormalizeTenant(_auth.TenantId), true)
+                ? new SharePrincipal(_auth.Username, defaultTenant, true)
                 : null;
         }
-        var lowered = normalized.ToLowerInvariant();
-        var user = await _db.ManagementUsers.AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Username.ToLower() == lowered, cancellationToken)
+        var user = await ManagementUserService.FindByLoginNameAsync(_db.ManagementUsers.AsNoTracking(),
+                tenant, normalized, cancellationToken)
             .ConfigureAwait(false);
         return user is { Enabled: true }
-            ? new SharePrincipal(user.Username, ManagementContext.NormalizeTenant(user.TenantId),
+            ? new SharePrincipal(user.EffectiveLoginName(), ManagementContext.NormalizeTenant(user.TenantId),
                 user.Role == ManagementRole.Admin)
             : null;
     }
@@ -162,10 +165,14 @@ public sealed class HttpShareService
                 .ConfigureAwait(false);
             cache.Clients[route.ClientId] = client;
         }
-        if (!cache.Principals.TryGetValue(share.CreatedBy, out var creator))
+        // A creator is the login name in the share's tenant; the same name in another tenant is
+        // someone else.
+        var creatorKey = share.TenantId + "\0" + share.CreatedBy;
+        if (!cache.Principals.TryGetValue(creatorKey, out var creator))
         {
-            creator = await LoadPrincipalAsync(share.CreatedBy, cancellationToken).ConfigureAwait(false);
-            cache.Principals[share.CreatedBy] = creator;
+            creator = await LoadPrincipalAsync(share.TenantId, share.CreatedBy, cancellationToken)
+                .ConfigureAwait(false);
+            cache.Principals[creatorKey] = creator;
         }
         return new ShareContext(share, route, client, creator);
     }
@@ -646,7 +653,8 @@ public sealed class HttpShareService
         }
         try
         {
-            var caller = await LoadPrincipalAsync(context.Username, cancellationToken).ConfigureAwait(false);
+            var caller = await LoadPrincipalAsync(context.TenantId, context.Username, cancellationToken)
+                .ConfigureAwait(false);
             if (caller is not { Admin: true })
             {
                 return ShareResponse.Error(StatusCodes.Status403Forbidden, HttpShareCodes.Forbidden);
@@ -721,7 +729,8 @@ public sealed class HttpShareService
     private async Task<RouteView?> LoadRouteForCallerAsync(ManagementContext context, long routeId,
         CancellationToken cancellationToken)
     {
-        var caller = await LoadPrincipalAsync(context.Username, cancellationToken).ConfigureAwait(false);
+        var caller = await LoadPrincipalAsync(context.TenantId, context.Username, cancellationToken)
+            .ConfigureAwait(false);
         var route = await _db.HttpRouteMappings.AsNoTracking()
             .FirstOrDefaultAsync(r => r.Id == routeId, cancellationToken)
             .ConfigureAwait(false);

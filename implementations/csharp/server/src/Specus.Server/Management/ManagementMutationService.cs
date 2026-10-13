@@ -288,6 +288,7 @@ public sealed class ManagementMutationService
             CreatedAt = now,
             UpdatedAt = now,
         };
+        await _natControl.EnsureFitsAsync(account.Id, mapping, null, cancellationToken).ConfigureAwait(false);
         _db.SpecusMappings.Add(mapping);
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(account.Id, cancellationToken).ConfigureAwait(false);
@@ -313,6 +314,7 @@ public sealed class ManagementMutationService
         mapping.Enabled = request.Enabled ?? mapping.Enabled;
         mapping.DetailCaptureEnabled = request.DetailCaptureEnabled ?? mapping.DetailCaptureEnabled;
         mapping.UpdatedAt = DateTimeOffset.UtcNow;
+        await _natControl.EnsureFitsAsync(mapping.ClientId, mapping, null, cancellationToken).ConfigureAwait(false);
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(mapping.ClientId, cancellationToken).ConfigureAwait(false);
         return ToSpecusView(mapping);
@@ -393,6 +395,7 @@ public sealed class ManagementMutationService
             CreatedAt = now,
             UpdatedAt = now,
         };
+        await _natControl.EnsureFitsAsync(account.Id, null, row, cancellationToken).ConfigureAwait(false);
         _db.HttpRouteMappings.Add(row);
         await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
                          .ConfigureAwait(false))
@@ -438,6 +441,7 @@ public sealed class ManagementMutationService
         }
         ValidateAuthConfiguration(row.AuthEnabled, row.AuthUsername, row.AuthPasswordHash);
         row.UpdatedAt = DateTimeOffset.UtcNow;
+        await _natControl.EnsureFitsAsync(row.ClientId, null, row, cancellationToken).ConfigureAwait(false);
         // Audited when the Basic username changed or a new password was set while auth is on;
         // the shares never used those credentials, so they stay.
         var credentialsChanged = row.AuthEnabled

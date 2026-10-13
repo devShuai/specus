@@ -217,6 +217,20 @@ func (s *ProductMetricsStore) DeleteProgress(ctx context.Context, tenantID, user
 	return result.RowsAffected()
 }
 
+// DeleteProgressUnlessEnabled removes one account's progress row unless the tenant's switch is on
+// when the statement runs, and reports how many rows it removed. The retention sweep decides on
+// the switch here, not on the switches it read first, so a tenant switched back on in between
+// keeps the progress it started since.
+func (s *ProductMetricsStore) DeleteProgressUnlessEnabled(ctx context.Context, tenantID, username string) (int64, error) {
+	result, err := s.exec.ExecContext(ctx, s.db.rebind(`DELETE FROM product_metrics_onboarding_progress
+		WHERE tenant_id = ? AND username = ? AND NOT EXISTS (SELECT 1 FROM product_metrics_switch
+		WHERE tenant_id = ? AND enabled = ?)`), tenantID, username, tenantID, s.db.clientMessageCapabilityValue(true))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // DeleteTenantProgress removes every progress row of a tenant.
 func (s *ProductMetricsStore) DeleteTenantProgress(ctx context.Context, tenantID string) error {
 	_, err := s.exec.ExecContext(ctx, s.db.rebind(`DELETE FROM product_metrics_onboarding_progress
@@ -348,6 +362,23 @@ func (s *ProductMetricsStore) DeleteTenantCounts(ctx context.Context, tenantID s
 	for _, table := range []string{"product_metrics_onboarding_daily", "product_metrics_transfer_daily"} {
 		if _, err := s.exec.ExecContext(ctx, s.db.rebind(`DELETE FROM `+table+` WHERE tenant_id = ?`),
 			tenantID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeletePurgedTenantRows removes both daily tables' rows and the progress rows of a tenant, each
+// table only while the tenant's switch is off with a purge mark when that statement runs. The
+// retention sweep decides on the switch here, not on the switches it read first: switching on
+// clears the mark, so a tenant switched back on in between keeps what it collected since.
+func (s *ProductMetricsStore) DeletePurgedTenantRows(ctx context.Context, tenantID string) error {
+	off := s.db.clientMessageCapabilityValue(false)
+	for _, table := range []string{"product_metrics_onboarding_daily", "product_metrics_transfer_daily",
+		"product_metrics_onboarding_progress"} {
+		if _, err := s.exec.ExecContext(ctx, s.db.rebind(`DELETE FROM `+table+` WHERE tenant_id = ?
+			AND EXISTS (SELECT 1 FROM product_metrics_switch WHERE tenant_id = ? AND enabled = ?
+			AND purged_at IS NOT NULL)`), tenantID, tenantID, off); err != nil {
 			return err
 		}
 	}

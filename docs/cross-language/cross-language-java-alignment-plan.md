@@ -19,6 +19,7 @@ C server 已于 2026-08-27 解除轻量兼容子集冻结并进入 Java 全量�
 | [安全差异](alignment/security-differences.md) | 哪些安全机制必须一致、哪些故意不同、以及为什么那是对的 |
 | [环境验证](alignment/environment-verification.md) | 实际跑过什么？哪些结论必须在真实环境里才能得到，不能由源码自动化替代 |
 | [C server 测试对照](alignment/c-server-test-map.md) | 每个 Java server 测试类在 C server 有没有对应测试；没有的，原因是平台差异、能力缺失还是只缺测试 |
+| [C server API 盘点](alignment/c-server-api-inventory.md) | 每个 Java server HTTP/WebSocket 端点在 C server 有没有、行为是否一致；Elasticsearch 明细与 client-message 逐条对照 |
 
 ## 阅读顺序
 

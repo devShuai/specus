@@ -1,7 +1,9 @@
 package com.theshuai.specusclient.peer;
 
 import com.theshuai.common.peeregress.Ipv4Cidr;
+import com.theshuai.common.peeregress.Ipv6Cidr;
 import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.URI;
@@ -67,14 +69,24 @@ final class PeerEgressEndpoints {
         String candidate = stripPort(host);
         if (Ipv4Cidr.parseAddress(candidate) != null) {
             denied.add(candidate + "/32");
+            return;
+        }
+        long[] address = Ipv6Cidr.parseAddress(candidate);
+        if (address != null) {
+            // Written in RFC 5952 form, so the three clients derive the same list.
+            denied.add(Ipv6Cidr.formatAddress(address[0], address[1]) + "/128");
         }
     }
 
-    /** Removes a {@code :port} suffix, leaving an IPv6 literal in brackets alone. */
+    /** Removes a {@code :port} suffix, and the brackets around an IPv6 literal written with or without one. */
     private static String stripPort(String host) {
         String trimmed = host == null ? "" : host.trim();
-        if (trimmed.isEmpty() || trimmed.startsWith("[")) {
+        if (trimmed.isEmpty()) {
             return trimmed;
+        }
+        if (trimmed.startsWith("[")) {
+            int end = trimmed.indexOf(']');
+            return end > 0 ? trimmed.substring(1, end) : trimmed;
         }
         int colon = trimmed.indexOf(':');
         if (colon < 0 || trimmed.indexOf(':', colon + 1) >= 0) {
@@ -96,6 +108,15 @@ final class PeerEgressEndpoints {
         try {
             for (NetworkInterface device : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 for (InterfaceAddress address : device.getInterfaceAddresses()) {
+                    if (address.getAddress() instanceof Inet6Address) {
+                        // IPv6 networks too, now that IPv6 targets are dialled, written the way the
+                        // judgment reads them.
+                        int prefix = address.getNetworkPrefixLength();
+                        if (prefix >= 0 && prefix <= 128) {
+                            networks.add(ipv6NetworkOf(address.getAddress().getAddress(), prefix));
+                        }
+                        continue;
+                    }
                     if (!(address.getAddress() instanceof Inet4Address)) {
                         continue;
                     }
@@ -139,6 +160,19 @@ final class PeerEgressEndpoints {
     }
 
     /** Masks an address down to its network and renders it as a prefix. */
+    /** The IPv6 network of an interface address, host bits cleared, in RFC 5952 form. */
+    static String ipv6NetworkOf(byte[] address, int prefixLength) {
+        long high = 0;
+        long low = 0;
+        for (int index = 0; index < 8; index++) {
+            high = (high << 8) | (address[index] & 0xFFL);
+            low = (low << 8) | (address[index + 8] & 0xFFL);
+        }
+        long highMask = prefixLength <= 0 ? 0 : prefixLength >= 64 ? -1L : -1L << (64 - prefixLength);
+        long lowMask = prefixLength <= 64 ? 0 : prefixLength >= 128 ? -1L : -1L << (128 - prefixLength);
+        return Ipv6Cidr.formatAddress(high & highMask, low & lowMask) + "/" + prefixLength;
+    }
+
     static String networkOf(int address, int prefixLength) {
         int mask = prefixLength == 0 ? 0 : 0xFFFFFFFF << (32 - prefixLength);
         return Ipv4Cidr.format(address & mask) + "/" + prefixLength;

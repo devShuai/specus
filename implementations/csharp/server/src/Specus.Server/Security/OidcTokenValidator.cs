@@ -42,7 +42,11 @@ public sealed class AdminBearerTokenValidator
             {
                 return null;
             }
-            var current = await _users.ResolveRefreshUserAsync(subject, cancellationToken)
+            // sub is a login name of the token's tenant; a token without tenant_id predates
+            // tenant-scoped login names and its sub is an account key. uid pins the account row.
+            var current = await _users.ResolveLocalTokenUserAsync(subject,
+                    signedPrincipal.FindFirst("tenant_id")?.Value,
+                    signedPrincipal.FindFirst(LocalTokenService.AccountKeyClaim)?.Value, cancellationToken)
                 .ConfigureAwait(false);
             return current is null
                 ? null
@@ -85,6 +89,11 @@ public sealed class AdminBearerTokenValidator
         identity.AddClaim(new Claim(ClaimTypes.Name, user.Username));
         identity.AddClaim(new Claim("iss", issuer));
         identity.AddClaim(new Claim("tenant_id", user.TenantId));
+        // The account row it resolved to, so a refresh re-resolves that very row.
+        if (!string.IsNullOrEmpty(user.AccountKey))
+        {
+            identity.AddClaim(new Claim(LocalTokenService.AccountKeyClaim, user.AccountKey));
+        }
         identity.AddClaim(new Claim(ClaimTypes.Role, ManagementContext.RoleWire(user.Role)));
         identity.AddClaim(new Claim("role", ManagementContext.RoleWire(user.Role)));
         return new ClaimsPrincipal(identity);
