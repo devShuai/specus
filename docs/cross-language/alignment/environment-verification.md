@@ -67,7 +67,17 @@
     - 修复前（`39cab91`）跑两轮，每轮 3 份报告涉及 `apply_runtime_route_config`：两个闸门 control 场景（`/nat-control` 推送、新增映射）各一份 `record_login_success_event` 读 `client_id`，另有一份 `normalize_tenant_id` 读 `tenant_id`。
     - 修复后跑三轮，这类报告为 0，也没有 lock-order-inversion。剩下的只有 `close_conn_locked`、`session_shutdown` 的 fd 竞争，`main` 上同样存在，未改。
   - 合并 `main`（`3f5e620`，含已合并的 `fix/c-server-login-response-order` 和令牌登录按账号 id 绑定）后：重载会按 id 取到账号当前名字，推送因此对已改名账号的旧连接同样失败（`00e22c5`）。重新导出验证：0 warning，CTest `43/43` 通过（约 220 s）；TSan 跑一轮，route config 相关报告为 0。
-  - 未改：连接发布前的窗口。登录先在 `verify_login` 里从数据库加载 route，之后才发布连接；这段时间里的运行时推送找不到连接就直接返回，客户端会拿着加载时的旧 route，直到下一次变更。这不是数据竞争，另行跟进。
+  - 未改：连接发布前的窗口。登录先在 `verify_login` 里从数据库加载 route，之后才发布连接；这段时间里的运行时推送找不到连接就直接返回，客户端会拿着加载时的旧 route，直到下一次变更。这不是数据竞争，另行跟进。后由 `fix/c-server-login-route-push-window` 修复，见下条。
+- C server 连接发布前的运行时推送（2026-10-07，分支 `fix/c-server-login-route-push-window`，基于 `fix/c-server-post-login-config-race`）：
+  - 构建与 CTest：代码提交 `969ee40` 以 `git -c core.autocrlf=false archive` 导出到 `Ubuntu-24.04` WSL 全新目录，CMake Release 构建 0 warning，CTest `41/41` 通过（`-j 4` 约 126 s）；`make test` 0 warning 全部通过（约 4.5 min）。
+    - 第一轮 CTest 中 `tls_transport_tests` 被 SIGPIPE 杀掉一次，单独重跑 10/10 通过，第二轮 CTest 全部通过。该测试进程没有忽略 SIGPIPE，相关文件本分支未改，另行跟进。
+  - 回归测试：`SPECUS_LOGIN_TEST_GATE_DIR` 闸门新增 `loaded` 停点，位于 route 加载之后、连接发布之前。`session_lifecycle_tests` 新增两个场景：
+    - control 登录停在 `loaded` 时经管理接口新增 TCP 映射：断言心跳应答之前的最后一个 NAT_CONTROL 含新映射，之后登录的 data 能 REGISTER 该端口。
+    - data 登录停在 `loaded` 时新增映射：断言 data 能 REGISTER 新端口，control 的最后一个 NAT_CONTROL 含新映射。
+  - 反向验证：同一导出撤掉修复提交 `7b9659a`，保留测试与闸门，跑三轮。每轮都恰好是这两个场景失败，其余场景通过：
+    - control 场景心跳应答前只有登录自带的那条 NAT_CONTROL，`specusConfigList` 为空；
+    - data 场景 REGISTER 被拒，原因 `port mapping not configured`。
+  - TSan：`-fsanitize=thread`（RelWithDebInfo）构建、`setarch x86_64 -R` 跑三轮，场景全部通过。共 23 份报告，全是 `session_shutdown`、`close_conn_locked` 的 fd 竞争，`main` 上同样存在；没有涉及新代码或 route config 的报告，也没有 lock-order-inversion。
 - Android client × C server 的 Direct HTTP / WebSocket（2026-10-08，Issue #35 P0；分支 `test/android-c-direct-e2e`，PR #230）：
   - 方式：Android 没有命令行进程。`JvmClientMain`（`implementations/android/client` 的单测源集）以内存版 `Context`、不带 VPN 平台（`peerMeshDevice=noop` 路径）运行 `SpecusCore.Runtime`，参数与其它客户端相同；`:app:jvmClientLauncher` 用单测 classpath（Netty、org.json、mockable `android.jar`）生成启动脚本，`direct_route_e2e.sh` 经 `SPECUS_CLIENT_COMMAND` 运行它，断言与 Java/Go/.NET 完全相同。不覆盖前台服务、`VpnService`/TUN、UI 广播与真机网络。
   - E2E 暴露并已修复的 Android 缺陷：(1) Direct HTTP 上游响应一结束，转发线程就完成流、关闭发送窗口，丢弃排队中的响应尾部与 FIN；C server 对无长度的响应用 chunked 回给浏览器，每个响应都在正文之后挂住。(2) `StreamFlowScheduler` 中 RST 取代 `submitFinish` 排队的 FIN 时，FIN 的 release 回调先删掉了流，RST 永不发送、调用方永久阻塞（远端 RST 时是 data 连接的读线程；(1) 修复前 `completeHttpStream` 也走这条路径）；新增 `StreamFlowSubmitTest.resetOvertakingASubmittedFinStillGoesOut`，修复前超时。(3) peer service 快照的 UI 广播抛出的 RuntimeException 会让 control 连接断开重连（设备上 binder 失败会被重新抛出；JVM 上是 mockable `Intent` 的 not mocked）。

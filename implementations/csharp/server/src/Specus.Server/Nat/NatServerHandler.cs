@@ -38,7 +38,14 @@ public sealed class NatServerHandler
         return session.HandleAsync(packet);
     }
 
-    public void Attach(SpecusConnectionContext context) => GetOrAttach(context);
+    /// <summary>Runs at the end of <see cref="Attach"/>, so a test can hold a data login there.</summary>
+    internal Action<SpecusConnectionContext>? AttachedForTests { get; set; }
+
+    public void Attach(SpecusConnectionContext context)
+    {
+        GetOrAttach(context);
+        AttachedForTests?.Invoke(context);
+    }
 
     private NatClientSession GetOrAttach(SpecusConnectionContext context)
     {

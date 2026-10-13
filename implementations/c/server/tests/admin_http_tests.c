@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5696,6 +5697,8 @@ static int test_public_stun_config_endpoints(void)
 
 int main(void)
 {
+    /* The in-process admin server can still be writing to a socket the test has closed. */
+    (void)signal(SIGPIPE, SIG_IGN);
     /* The suite deliberately exercises demo credentials and seeding; production disables both. */
     setenv("SPECUS_ENV", "test", 1);
     setenv("SPECUS_CLIENT_PACKAGE_GITHUB_RELEASE_FALLBACK_ENABLED", "false", 1);

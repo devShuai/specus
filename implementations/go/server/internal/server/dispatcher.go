@@ -49,7 +49,9 @@ func (d *Dispatcher) SetNatHandler(handler func(conn *control.Conn, message prot
 // SetOnLoginSuccess installs a post-login hook, e.g. to push NAT_CONTROL (G3).
 func (d *Dispatcher) SetOnLoginSuccess(hook func(conn *control.Conn)) { d.onLoginSuccess = hook }
 
-// SetOnDataLoginSuccess installs the dedicated data-plane attachment hook.
+// SetOnDataLoginSuccess installs the dedicated data-plane attachment hook. It runs after the
+// data connection authenticates but before the registry lists it and before the success
+// response is written, with conn's write lock held, so it must not write to conn.
 func (d *Dispatcher) SetOnDataLoginSuccess(hook func(conn *control.Conn)) { d.onDataLogin = hook }
 
 // SetOnDisconnect installs a connection-teardown hook, e.g. to release NAT state (G3).
@@ -330,22 +332,33 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		response.Reason = &reason
 	}
 	var displaced session.Session
+	var publish func()
 	if result.Success {
 		// Commit authenticated connection state before publishing the success response.
-		// Once the client observes success it may immediately send heartbeat/NAT frames.
+		// Once the client observes success it may immediately send heartbeat/NAT frames, and a
+		// public request may at once open a stream on a new data connection.
 		if recordID > 0 {
 			conn.SetConnectionRecordID(recordID)
 		}
 		conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID,
 			time.Now().UnixMilli(), request.ConnectionRole)
 		conn.SetHTTPRouteCapability(result.Session.HTTPRouteCapability)
-		if dataConnection {
+		publish = func() {
+			if !dataConnection {
+				displaced = d.sessions.Replace(conn)
+				return
+			}
+			// Attach the stream namespace before the registry lists the data connection, so a
+			// request that finds the client online can open a stream on it.
+			if d.onDataLogin != nil {
+				d.onDataLogin(conn)
+			}
 			displaced = d.sessions.ReplaceData(conn)
-		} else {
-			displaced = d.sessions.Replace(conn)
 		}
 	}
-	if err := conn.Send(response); err != nil {
+	// The client reads the login response before any other frame, so whatever the published
+	// state lets other goroutines send on conn must queue behind it.
+	if err := conn.CommitAndSend(publish, response); err != nil {
 		conn.Close(store.ReasonIOError)
 		return
 	}
@@ -361,9 +374,6 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 			displaced.Close(store.ReasonReplacedByNewLogin)
 		}
 		d.logger.Info("client data connection logged in", "channel", conn.ChannelID(), "client", clientName)
-		if d.onDataLogin != nil {
-			d.onDataLogin(conn)
-		}
 		return
 	}
 	if displaced != nil {

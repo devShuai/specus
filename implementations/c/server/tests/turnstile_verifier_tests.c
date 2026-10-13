@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +153,8 @@ static void expect_verify(const char *name, const char *token, const char *actio
 
 int main(void)
 {
+    /* The fake endpoint can answer a client that has already closed its connection. */
+    (void)signal(SIGPIPE, SIG_IGN);
     /* The fake endpoint is on loopback; a proxy from the environment must not be asked for it. */
     setenv("NO_PROXY", "127.0.0.1,localhost", 1);
     setenv("no_proxy", "127.0.0.1,localhost", 1);

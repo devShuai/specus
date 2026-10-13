@@ -411,25 +411,30 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         };
 
         SpecusConnectionContext? displaced = null;
+        Action? publish = null;
         if (result.Success)
         {
             context.ConnectionRecordId = recordId;
             context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 packet.ClientSessionId, packet.ConnectionRole!, result.Account!.TenantId);
-            if (dataConnection)
-            {
-                displaced = _sessions.ReplaceData(packet.ClientName!, context);
-                _nat.Attach(context);
-            }
-            else
-            {
-                displaced = _sessions.Replace(packet.ClientName!, context);
-            }
+            publish = dataConnection
+                ? () =>
+                {
+                    // Attach the stream namespace before the registry lists the data connection,
+                    // so a request that finds the client online can open a stream on it.
+                    _nat.Attach(context);
+                    displaced = _sessions.ReplaceData(packet.ClientName!, context);
+                }
+                : () => displaced = _sessions.Replace(packet.ClientName!, context);
         }
 
         try
         {
-            await context.Writer.WriteAsync(response, context.Lifetime).ConfigureAwait(false);
+            // The client reads the login response before any other frame, so whatever the
+            // published state lets others send on this connection (a stream OPEN on data, a
+            // NAT_CONTROL push on control) must queue behind it.
+            await context.Writer.CommitAndWriteAsync(publish, response, context.Lifetime)
+                .ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -463,8 +468,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             // Go do: neither closes the connection nor stops the other. A NAT_CONTROL that does not fit
             // one MESSAGE, or a connection that cannot be written, is logged inside and does not throw;
             // a database error leaves a healthy connection, and closing it only had the client log in
-            // again. A connection that cannot be written is left to its own I/O handling. See
-            // "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+            // again. A connection that cannot be written closed itself on the failed write, and the
+            // pushes after it write nothing. See "NAT_CONTROL 写失败与数据库错误" and "帧写入失败" in
+            // protocol/spec/control-protocol.md.
             try
             {
                 var natControl = scope.ServiceProvider.GetRequiredService<NatControlService>();
