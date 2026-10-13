@@ -11,7 +11,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
-import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.Instant;
 
@@ -33,9 +32,6 @@ class JpaHttpTrafficExchangeStoreIntegrationTests {
 
     @Autowired
     private HttpTrafficExchangeStore store;
-
-    @Autowired
-    private JdbcTemplate jdbcTemplate;
 
     @BeforeEach
     void setUp() {
@@ -77,12 +73,6 @@ class JpaHttpTrafficExchangeStoreIntegrationTests {
         exchange.setResponseTruncated(false);
         exchange.setCapturedAt(Instant.now().toString());
         long id = repository.saveAndFlush(exchange).getId();
-        // SQLite's BIGINT identity column is not an alias for rowid. Hibernate obtains
-        // last_insert_rowid(), but the test table's physical id remains null.
-        jdbcTemplate.update(
-                "update specus_http_traffic_exchange set id = ? where rowid = ?",
-                id,
-                id);
 
         Page<HttpTrafficExchangeView> page = store.search(
                 TenantContext.defaultTenant(),
