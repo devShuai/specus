@@ -244,7 +244,8 @@ add_test(NAME object_storage_tests COMMAND specus_c_object_storage_tests)
 add_test(NAME object_storage_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/object_storage_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
-set_tests_properties(object_storage_e2e PROPERTIES TIMEOUT 45)
+set_tests_properties(object_storage_e2e PROPERTIES TIMEOUT 45
+    ENVIRONMENT "SPECUS_TEST_OSS_START_DELAY_SECONDS=0.5")
 
 add_executable(specus_c_media_capture_tests tests/media_capture_tests.c)
 target_link_libraries(specus_c_media_capture_tests PRIVATE specus_c_core)
