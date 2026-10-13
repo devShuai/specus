@@ -240,7 +240,7 @@ test: all
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)
-	bash scripts/object_storage_e2e.sh $(SERVER)
+	SPECUS_TEST_OSS_START_DELAY_SECONDS=0.5 bash scripts/object_storage_e2e.sh $(SERVER)
 	bash scripts/tls_deployment_e2e.sh $(SERVER)
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
 	bash scripts/elasticsearch_traffic_test.sh $(TRAFFIC_DETAIL_API_TESTS) $(SERVER)
