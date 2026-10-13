@@ -142,10 +142,23 @@ func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remo
 	return &ticket, nil
 }
 
+// revokeWebSocketTicketsOn deletes the unused management tickets of one identity in the caller's
+// transaction: the account was deleted, disabled or changed role (management-accounts.md 7.2).
+// Tenant and login name compare exactly, as the open connections do.
+func (db *DB) revokeWebSocketTicketsOn(ctx context.Context, runner sqlRunner, tenantID, username string) error {
+	if _, err := runner.ExecContext(ctx, db.rebind(`DELETE FROM specus_websocket_ticket
+		WHERE scope IN ('connections', 'client-messages') AND tenant_id = ? AND username = ?`),
+		tenantID, username); err != nil {
+		return fmt.Errorf("revoke websocket tickets: %w", err)
+	}
+	return nil
+}
+
 type webSocketTicketAttributes struct {
 	Username    string `json:"wsUser,omitempty"`
 	TenantID    string `json:"tenantId,omitempty"`
 	Admin       bool   `json:"admin"`
+	AccountKey  string `json:"uid,omitempty"`
 	RoomID      string `json:"roomId,omitempty"`
 	RoomKey     string `json:"roomKey,omitempty"`
 	RoomRole    string `json:"roomRole,omitempty"`
@@ -163,7 +176,7 @@ type webSocketTicketAttributes struct {
 func encodeWebSocketTicketAttributes(ticket WebSocketTicket) (string, error) {
 	discoverable := ticket.Discoverable
 	payload, err := json.Marshal(webSocketTicketAttributes{
-		Username: ticket.Username, TenantID: ticket.TenantID, Admin: ticket.Admin,
+		Username: ticket.Username, TenantID: ticket.TenantID, Admin: ticket.Admin, AccountKey: ticket.AccountKey,
 		RoomID: ticket.RoomID, RoomKey: ticket.RoomKey, RoomRole: ticket.RoomRole,
 		PeerID: ticket.PeerID, DisplayName: ticket.DisplayName, PublicAddress: ticket.PublicAddress,
 		SharedRoom: ticket.SharedRoom, Discoverable: &discoverable,
@@ -179,6 +192,7 @@ func decodeWebSocketTicketAttributes(payload string, ticket *WebSocketTicket) er
 	ticket.Username = attributes.Username
 	ticket.TenantID = attributes.TenantID
 	ticket.Admin = attributes.Admin
+	ticket.AccountKey = attributes.AccountKey
 	ticket.RoomID = attributes.RoomID
 	ticket.RoomKey = attributes.RoomKey
 	ticket.RoomRole = attributes.RoomRole

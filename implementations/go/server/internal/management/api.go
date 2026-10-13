@@ -17,8 +17,8 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
-	"github.com/devShuai/specus/implementations/go/server/internal/httpshare"
 	"github.com/devShuai/specus/implementations/go/server/internal/connectivity"
+	"github.com/devShuai/specus/implementations/go/server/internal/httpshare"
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
@@ -59,13 +59,22 @@ type API struct {
 	connectivity     *connectivity.Checker
 	productMetrics   *productmetrics.Service
 	clientTokens     *auth.SessionStore
-	accountDeleted   func(tenantID, username string)
+	accessRevoked    func(tenantID, username, reason string)
 	logger           *slog.Logger
 }
 
-// SetAccountDeleted registers what runs once a management account's deletion has committed: the
-// server ends the identity's open management WebSockets there (management-accounts.md 7.1).
-func (a *API) SetAccountDeleted(hook func(tenantID, username string)) { a.accountDeleted = hook }
+// Reasons an account's management WebSockets end (management-accounts.md 7.2); they are the reason of
+// the STCE kind 5 event (public-transfer-cluster.md 5.2).
+const (
+	AccessRevokedDeleted     = "deleted"
+	AccessRevokedDisabled    = "disabled"
+	AccessRevokedRoleChanged = "role-changed"
+)
+
+// SetAccessRevoked registers what runs once a change that deleted an account, disabled it or changed
+// its role has committed: the server ends the identity's open management WebSockets
+// (management-accounts.md 7.2). reason is one of the AccessRevoked constants.
+func (a *API) SetAccessRevoked(hook func(tenantID, username, reason string)) { a.accessRevoked = hook }
 
 // SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
 // long-standing NewAPI constructor used by integration tests.
@@ -285,10 +294,21 @@ func (a *API) ValidateConnectionWebSocketToken(token string) (wsevents.Access, b
 		return wsevents.Access{}, false
 	}
 	return wsevents.Access{
-		Username: principal.Username,
-		TenantID: principal.TenantID,
-		Admin:    principal.Admin,
+		Username:   principal.Username,
+		TenantID:   principal.TenantID,
+		Admin:      principal.Admin,
+		AccountKey: principal.AccountKey,
 	}, true
+}
+
+// WebSocketIdentityCurrent reports whether the identity a management WebSocket ticket recorded still
+// holds (management-accounts.md 7.2): it resolves as a local token of that login name, tenant and
+// account key would (section 6), with the same administrator rights. Tickets without a key resolve
+// like tokens without uid.
+func (a *API) WebSocketIdentityCurrent(ctx context.Context, access wsevents.Access) bool {
+	principal, ok := a.resolveLocalIdentity(ctx, access.Username, access.TenantID, true, access.AccountKey,
+		access.Admin)
+	return ok && principal.Admin == access.Admin
 }
 
 // ---- auth ----------------------------------------------------------------------------
@@ -722,6 +742,7 @@ func (a *API) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, store.ErrNotFound)
 		return
 	}
+	wasEnabled, previousRole := user.Enabled, normalizeRole(user.Role)
 	if strings.TrimSpace(req.Password) != "" {
 		password, err := requirePassword(req.Password)
 		if err != nil {
@@ -737,15 +758,27 @@ func (a *API) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		user.Enabled = *req.Enabled
 	}
 	user.UpdatedAt = time.Now()
-	// Disabling the user or changing its role ends the shares it may no longer manage, in the same
-	// transaction.
+	// Disabling the account or changing its role ends its management WebSockets: they carry the rights
+	// they were opened with (management-accounts.md 7.2). A new password does not, as it does not end
+	// the account's tokens either.
+	accessRevoked := ""
+	if wasEnabled && !user.Enabled {
+		accessRevoked = AccessRevokedDisabled
+	} else if wasEnabled && normalizeRole(user.Role) != previousRole {
+		accessRevoked = AccessRevokedRoleChanged
+	}
+	// Disabling the user or changing its role ends the shares it may no longer manage, and the unused
+	// WebSocket tickets, in the same transaction.
 	revoked, err := a.db.UpdateManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
-		a.shares.LapseReason)
+		a.shares.LapseReason, accessRevoked != "")
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	a.shares.CutStreams(revoked)
+	if accessRevoked != "" && a.accessRevoked != nil {
+		a.accessRevoked(normalizeTenant(user.TenantID), user.Username, accessRevoked)
+	}
 	writeJSON(w, http.StatusOK, managementUserView(*user))
 }
 
@@ -794,9 +827,9 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.shares.CutStreams(revoked)
-	// Committed: the identity's open management WebSockets end (management-accounts.md 7.1).
-	if a.accountDeleted != nil {
-		a.accountDeleted(normalizeTenant(user.TenantID), user.Username)
+	// Committed: the identity's open management WebSockets end (management-accounts.md 7.2).
+	if a.accessRevoked != nil {
+		a.accessRevoked(normalizeTenant(user.TenantID), user.Username, AccessRevokedDeleted)
 	}
 	a.productMetrics.UserDeleted(r.Context(), normalizeTenant(user.TenantID), user.Username)
 	w.WriteHeader(http.StatusNoContent)
@@ -2947,56 +2980,8 @@ func (a *API) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 // authenticate validates a bearer token: local HS256 first, then OIDC RS256 as a fallback.
 func (a *API) authenticate(ctx context.Context, token string) (managementPrincipal, bool) {
 	if claims, ok := a.tokens.ValidateClaims(token); ok {
-		// Java ManagementUserService.resolveLocalTokenUser: the subject is a login name of the
-		// token's tenant; a token without a tenant claim predates tenant-scoped login names and
-		// names its account by the exact account key.
-		tenant, valid := requestedTenant(claims.TenantID)
-		if !valid {
-			return managementPrincipal{}, false
-		}
-		if !claims.HasTenant {
-			tenant = ""
-		}
-		// A token with uid names an account row and is never the built-in admin's (section 6).
-		boundToAccount := claims.AccountKey != ""
-		if !boundToAccount && normalizeRole(claims.Role) == store.ManagementRoleAdmin &&
-			strings.EqualFold(strings.TrimSpace(claims.Username), a.adminUsername()) &&
-			(tenant == "" || tenant == a.defaultTenant()) {
-			if !a.tokens.PasswordLoginEnabled() {
-				return managementPrincipal{}, false
-			}
-			return managementPrincipal{
-				Username: a.adminUsername(), TenantID: a.defaultTenant(), Role: store.ManagementRoleAdmin,
-				Admin: true, BuiltIn: true, Issuer: security.Issuer,
-			}, true
-		}
-		var (
-			user *store.ManagementUser
-			err  error
-		)
-		if tenant != "" {
-			user, err = a.db.FindManagementUserByLogin(ctx, tenant, claims.Username)
-		} else {
-			user, err = a.db.FindManagementUserByAccountKey(ctx, strings.TrimSpace(claims.Username))
-		}
-		if err != nil {
-			a.logger.Warn("local bearer user lookup failed", "err", err)
-			return managementPrincipal{}, false
-		}
-		if user == nil || !user.Enabled {
-			return managementPrincipal{}, false
-		}
-		// Compared here rather than in SQL, so a case-insensitive collation cannot relax it: the token
-		// of a deleted account does not pass to a later account of the same login name.
-		if boundToAccount && user.AccountKey != claims.AccountKey {
-			return managementPrincipal{}, false
-		}
-		role := normalizeRole(user.Role)
-		return managementPrincipal{
-			Username: user.Username, TenantID: normalizeTenant(user.TenantID), Role: role,
-			Admin: role == store.ManagementRoleAdmin, BuiltIn: false, Issuer: security.Issuer,
-			AccountKey: user.AccountKey,
-		}, true
+		return a.resolveLocalIdentity(ctx, claims.Username, claims.TenantID, claims.HasTenant, claims.AccountKey,
+			normalizeRole(claims.Role) == store.ManagementRoleAdmin)
 	}
 	if a.oidcAuth != nil {
 		if identity, ok := a.oidcAuth.ValidateIdentity(ctx, token); ok {
@@ -3023,6 +3008,62 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 		}
 	}
 	return managementPrincipal{}, false
+}
+
+// resolveLocalIdentity resolves the identity of a local token, or of a management WebSocket ticket
+// (management-accounts.md 7.2), against the account as it is now. Java
+// ManagementUserService.resolveLocalTokenUser: the subject is a login name of the token's tenant; a
+// token without a tenant claim predates tenant-scoped login names and names its account by the exact
+// account key.
+func (a *API) resolveLocalIdentity(ctx context.Context, subject, tenantID string, hasTenant bool,
+	accountKey string, claimsAdmin bool) (managementPrincipal, bool) {
+	tenant, valid := requestedTenant(tenantID)
+	if !valid {
+		return managementPrincipal{}, false
+	}
+	if !hasTenant {
+		tenant = ""
+	}
+	// A token with uid names an account row and is never the built-in admin's (section 6).
+	boundToAccount := accountKey != ""
+	if !boundToAccount && claimsAdmin &&
+		strings.EqualFold(strings.TrimSpace(subject), a.adminUsername()) &&
+		(tenant == "" || tenant == a.defaultTenant()) {
+		if !a.tokens.PasswordLoginEnabled() {
+			return managementPrincipal{}, false
+		}
+		return managementPrincipal{
+			Username: a.adminUsername(), TenantID: a.defaultTenant(), Role: store.ManagementRoleAdmin,
+			Admin: true, BuiltIn: true, Issuer: security.Issuer,
+		}, true
+	}
+	var (
+		user *store.ManagementUser
+		err  error
+	)
+	if tenant != "" {
+		user, err = a.db.FindManagementUserByLogin(ctx, tenant, subject)
+	} else {
+		user, err = a.db.FindManagementUserByAccountKey(ctx, strings.TrimSpace(subject))
+	}
+	if err != nil {
+		a.logger.Warn("local bearer user lookup failed", "err", err)
+		return managementPrincipal{}, false
+	}
+	if user == nil || !user.Enabled {
+		return managementPrincipal{}, false
+	}
+	// Compared here rather than in SQL, so a case-insensitive collation cannot relax it: the token
+	// of a deleted account does not pass to a later account of the same login name.
+	if boundToAccount && user.AccountKey != accountKey {
+		return managementPrincipal{}, false
+	}
+	role := normalizeRole(user.Role)
+	return managementPrincipal{
+		Username: user.Username, TenantID: normalizeTenant(user.TenantID), Role: role,
+		Admin: role == store.ManagementRoleAdmin, BuiltIn: false, Issuer: security.Issuer,
+		AccountKey: user.AccountKey,
+	}, true
 }
 
 func principalFromContext(r *http.Request) (managementPrincipal, bool) {

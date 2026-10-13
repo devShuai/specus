@@ -37,8 +37,11 @@ type clientMessagesHub struct {
 	tickets         *security.WebSocketTicketService
 	addressResolver *security.ClientAddressResolver
 	logger          *slog.Logger
-	mu              sync.Mutex
-	sockets         map[string]map[*clientMessageSocket]struct{}
+	// identity checks a ticket's identity at the handshake and once the socket is registered
+	// (management-accounts.md 7.2); nil only in tests that build the hub alone.
+	identity wsevents.IdentityCheck
+	mu       sync.Mutex
+	sockets  map[string]map[*clientMessageSocket]struct{}
 }
 
 func newClientMessagesHub(db *store.DB, sessions *session.Registry, tickets *security.WebSocketTicketService,
@@ -66,7 +69,14 @@ func (h *clientMessagesHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	access := wsevents.Access{Username: claims.Username, TenantID: claims.TenantID, Admin: claims.Admin}
+	access := wsevents.Access{Username: claims.Username, TenantID: claims.TenantID, Admin: claims.Admin,
+		AccountKey: claims.AccountKey}
+	// The account may have been deleted, disabled or given another role since the ticket was issued.
+	if h.identity != nil && !h.identity(r.Context(), access) {
+		w.Header().Set("X-Auth-Reason", wsevents.RevokedIdentity)
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
@@ -87,6 +97,12 @@ func (h *clientMessagesHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.unregister(key, socket)
 		_ = conn.Close(websocket.StatusNormalClosure, "bye")
 	}()
+	// Registered first, checked second: a revocation that committed before this check is seen here,
+	// one that commits after it finds the socket.
+	if h.identity != nil && !h.identity(r.Context(), access) {
+		_ = conn.Close(websocket.StatusPolicyViolation, wsevents.RevokedIdentity)
+		return
+	}
 	_ = socket.write(map[string]any{
 		"type": "hello", "channel": "client-messages",
 		"username": access.Username, "tenantId": access.TenantID,
@@ -195,10 +211,11 @@ func (h *clientMessagesHub) deliverFromClient(source store.ClientAccount, target
 	return delivered
 }
 
-// closeIdentity ends the open subscriptions of one identity, whose account was deleted. A connection
-// keeps the identity it was opened with, so it would otherwise go on sending as the deleted account
-// and receive what clients send to a later account of the same name (management-accounts.md 7.1).
-func (h *clientMessagesHub) closeIdentity(tenantID, username string) {
+// closeIdentity ends the open subscriptions of one identity, whose account was deleted, disabled or
+// given another role (management-accounts.md 7.2). A connection keeps the identity and rights it was
+// opened with, so it would otherwise go on as the old account and receive what clients send to a
+// later account of the same name.
+func (h *clientMessagesHub) closeIdentity(tenantID, username, reason string) {
 	key := adminSocketKey(tenantID, username)
 	h.mu.Lock()
 	sockets := h.sockets[key]
@@ -206,7 +223,7 @@ func (h *clientMessagesHub) closeIdentity(tenantID, username string) {
 	h.mu.Unlock()
 	for socket := range sockets {
 		// The close handshake waits for the peer; the caller does not.
-		go socket.conn.Close(websocket.StatusPolicyViolation, "account deleted")
+		go socket.conn.Close(websocket.StatusPolicyViolation, reason)
 	}
 }
 

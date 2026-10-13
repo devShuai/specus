@@ -47,7 +47,8 @@ func (a *App) handleAdminWebSocketTicket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	issued, err := a.webSocketTickets.Issue(r.Context(), scope, security.WebSocketRequestAddress(a.addressResolver, r),
-		security.WebSocketTicketClaims{Username: access.Username, TenantID: access.TenantID, Admin: access.Admin})
+		security.WebSocketTicketClaims{Username: access.Username, TenantID: access.TenantID, Admin: access.Admin,
+			AccountKey: access.AccountKey})
 	if err != nil {
 		a.logger.Error("issue admin websocket ticket failed", "scope", scope, "err", err)
 		http.Error(w, "could not issue websocket ticket", http.StatusInternalServerError)
