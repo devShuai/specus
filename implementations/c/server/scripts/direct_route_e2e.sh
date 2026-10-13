@@ -535,9 +535,35 @@ ws.send(True, 0x8, app_close)
 ws.expect_eof()
 wait_event("close-reply 1001 app going away")
 
+# Both directions of a normal WebSocket close must leave the shared data connection usable.
+ws = Browser("/ws/chat?room=after-close")
+expect(ws.message(), (0x1, b"welcome /ws/chat?room=after-close", 1), "greeting after both closes")
+ws.send(True, 0x1, b"still connected")
+expect(ws.message(), (0x1, b"still connected", 1), "echo after both closes")
+ws.send(True, 0x8, close_payload)
+expect(ws.message(), (0x8, close_payload, 1), "final close handshake reply")
+ws.expect_eof()
+
 print(f"Direct WebSocket passed: greeting, UTF-8 text, binary, 1.5 MiB binary ({frames} frames back), "
-      "fragmented text with an interleaved ping, close from each side")
+      "fragmented text with an interleaved ping, close from each side, subsequent stream")
 PY
 then
   fail "WebSocket checks"
+fi
+
+# A quick reconnect must not disguise the transport-wide reset that #251 used to cause.
+if ! python3 - "$TMP_DIR/server.log" <<'PY'
+from pathlib import Path
+import sys
+log = Path(sys.argv[1]).read_text(encoding="utf-8")
+for role in ("control", "data"):
+    count = log.count(f"[{role}] login ok ")
+    if count != 1:
+        raise RuntimeError(f"expected the original {role} connection, observed {count} logins")
+if "[control] closed " in log:
+    raise RuntimeError("shared control/data transport closed before E2E cleanup")
+print("Original control and data connections survived all HTTP and WebSocket streams")
+PY
+then
+  fail "shared connection continuity"
 fi
