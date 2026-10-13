@@ -193,12 +193,13 @@ public sealed class TrafficUsageConcurrencyTests
 
     // Interception is after EF read the row and before its real SQLite write. Two independent
     // flush scopes therefore expose the old read/modify/save lost-update window deterministically.
-    private sealed class SaveGate(bool resource) : SaveChangesInterceptor
+    internal sealed class SaveGate(bool resource, TimeSpan? holdTimeout = null) : SaveChangesInterceptor
     {
         private int _mode;
         private int _writes;
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource SecondWriter { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public (long Upload, long Download)? HeldTotals { get; private set; }
         private TaskCompletionSource Resume { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void Hold() => Volatile.Write(ref _mode, 1);
@@ -222,8 +223,15 @@ public sealed class TrafficUsageConcurrencyTests
                 throw new InvalidOperationException("traffic save unavailable (test)");
             if (Interlocked.Increment(ref _writes) == 1)
             {
+                HeldTotals = resource
+                    ? eventData.Context!.ChangeTracker.Entries<ResourceTrafficUsage>()
+                        .Where(entry => entry.State is EntityState.Added or EntityState.Modified)
+                        .Select(entry => (entry.Entity.UploadBytes, entry.Entity.DownloadBytes)).Single()
+                    : eventData.Context!.ChangeTracker.Entries<TrafficUsage>()
+                        .Where(entry => entry.State is EntityState.Added or EntityState.Modified)
+                        .Select(entry => (entry.Entity.UploadBytes, entry.Entity.DownloadBytes)).Single();
                 Entered.TrySetResult();
-                await Resume.Task.WaitAsync(GateTimeout, cancellationToken);
+                await Resume.Task.WaitAsync(holdTimeout ?? GateTimeout, cancellationToken);
             }
             else
             {

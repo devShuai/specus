@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Specus.Server.Data;
+using Specus.Server.Data.Entities;
 using Specus.Server.Hosting;
 using Specus.Server.Nat;
 
@@ -36,11 +37,14 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
     private Process? _clientProcess;
     private string? _javaExecutable;
     private string? _javaHome;
+    private TrafficUsageConcurrencyTests.SaveGate? _trafficGate;
+    private Task? _heldFlush;
 
     public Task InitializeAsync() => Task.CompletedTask;
 
     public async Task DisposeAsync()
     {
+        _trafficGate?.Release();
         if (_clientProcess is { HasExited: false })
         {
             try { _clientProcess.Kill(entireProcessTree: true); } catch { /* already gone */ }
@@ -56,18 +60,24 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         {
             try { Directory.Delete(_clientWorkDir, recursive: true); } catch { /* ignore */ }
         }
-        if (_authStub is not null)
+        try
         {
-            await _authStub.DisposeAsync();
+            if (_heldFlush is not null) await _heldFlush.WaitAsync(TimeSpan.FromSeconds(5));
         }
-        if (_server is not null)
+        finally
         {
-            await _server.DisposeAsync();
+            if (_authStub is not null) await _authStub.DisposeAsync();
+            if (_server is not null) await _server.DisposeAsync();
         }
     }
 
     [Fact(Timeout = 180_000)]
-    public async Task ExternalClient_RoundTripsThroughJavaClientAndUpstreamEcho()
+    public Task ExternalClient_RoundTripsThroughJavaClientAndUpstreamEcho() => RoundTripAsync(holdFlush: false);
+
+    [Fact(Timeout = 180_000)]
+    public Task AFlushAlreadySavingTheFirstEchoCannotHideBytesFromTheNextEcho() => RoundTripAsync(holdFlush: true);
+
+    private async Task RoundTripAsync(bool holdFlush)
     {
         if (!File.Exists(ClientJar))
         {
@@ -83,7 +93,29 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
             return;
         }
 
-        _server = await TestServerFixture.StartAsync();
+        if (holdFlush)
+            _trafficGate = new TrafficUsageConcurrencyTests.SaveGate(resource: false,
+                holdTimeout: TimeSpan.FromSeconds(60));
+        _server = await TestServerFixture.StartAsync(
+            holdFlush ? new Dictionary<string, string?> { ["Specus:Traffic:FlushIntervalMs"] = "3600000" } : null,
+            _trafficGate is null ? null : services => services.ConfigureDbContext<SpecusDbContext>(
+                (_, options) => options.AddInterceptors(_trafficGate)));
+        if (holdFlush)
+        {
+            // An existing zero row makes the controlled overlap a read/modify/save case, not
+            // an insertion-key conflict. No synthetic traffic is added to the byte threshold.
+            await using var scope = _server.HostServices.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ClientAccounts.AsNoTracking().SingleAsync(
+                row => row.ClientName == DatabaseInitializer.DemoClientName);
+            db.TrafficUsages.Add(new TrafficUsage
+            {
+                TenantId = account.TenantId, ClientId = account.Id, ClientName = account.ClientName,
+                UsageDate = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                UpdatedAt = DateTimeOffset.UtcNow,
+            });
+            await db.SaveChangesAsync();
+        }
         _authStub = ClientAuthStub.Start(_server);
         _echo = new EchoUpstreamServer();
 
@@ -126,9 +158,10 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         var readBuf = new byte[4096];
         int totalRead = 0;
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        using var payloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         while (totalRead < payload.Length && DateTime.UtcNow < deadline)
         {
-            int got = await external.GetStream().ReadAsync(readBuf);
+            int got = await external.GetStream().ReadAsync(readBuf, payloadTimeout.Token);
             if (got == 0)
             {
                 break;
@@ -138,6 +171,14 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         }
         Assert.Equal(payload.Length, totalRead);
         Assert.Equal(payload, received.ToArray());
+        await FinishEchoAsync(external, payloadTimeout.Token);
+        if (_trafficGate is not null)
+        {
+            _trafficGate.Hold();
+            _heldFlush = _server.FlushTrafficAsync();
+            await _trafficGate.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(((long)payload.Length, (long)payload.Length), _trafficGate.HeldTotals!.Value);
+        }
 
         // Push enough sustained traffic to exercise the backpressure path. Send 1 MiB in
         // 16 KiB chunks and read each echo back; the control channel will periodically have to
@@ -156,9 +197,10 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         var burstRead = new byte[burstSize];
         var readIdx = 0;
         var burstDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+        using var burstTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         while (readIdx < burstSize && DateTime.UtcNow < burstDeadline)
         {
-            int got = await stream.ReadAsync(burstRead.AsMemory(readIdx, burstSize - readIdx));
+            int got = await stream.ReadAsync(burstRead.AsMemory(readIdx, burstSize - readIdx), burstTimeout.Token);
             if (got == 0)
             {
                 break;
@@ -167,9 +209,13 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         }
         Assert.Equal(burstSize, readIdx);
         Assert.Equal(burst, burstRead);
+        await FinishEchoAsync(burstSocket, burstTimeout.Token);
 
         // Flush traffic counters and assert both directions were accounted for.
-        await _server.FlushTrafficAsync();
+        if (_trafficGate is not null)
+            await VerifyPendingFlushAsync(payload.Length + burstSize);
+        else
+            await _server.FlushTrafficAsync();
         var (up, down) = await _server.ReadTrafficTotalsAsync(DatabaseInitializer.DemoClientName);
         Assert.True(up > 0, $"expected upload bytes > 0 (was {up})");
         Assert.True(down > 0, $"expected download bytes > 0 (was {down})");
@@ -179,6 +225,48 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
             $"upload bytes ({up}) should be >= payload + burst ({payload.Length + burstSize})");
         Assert.True(down >= payload.Length + burstSize,
             $"download bytes ({down}) should be >= payload + burst ({payload.Length + burstSize})");
+        await using var totalsScope = _server.HostServices.CreateAsyncScope();
+        var totalsDb = totalsScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var resource = await totalsDb.ResourceTrafficUsages.AsNoTracking().SingleAsync(
+            row => row.ClientName == DatabaseInitializer.DemoClientName && row.ResourceKey == $"tcp:{_remoteListenPort}");
+        Assert.True(resource.UploadBytes >= payload.Length + burstSize);
+        Assert.True(resource.DownloadBytes >= payload.Length + burstSize);
+        Console.WriteLine($"NAT accounting after both EOFs: heldFlush={holdFlush}, expected={payload.Length + burstSize}, "
+            + $"client={up}/{down}, resource={resource.UploadBytes}/{resource.DownloadBytes}");
+    }
+
+    private static async Task FinishEchoAsync(TcpClient socket, CancellationToken remainingReadBudget)
+    {
+        // FIN follows all DATA on the NAT stream. EOF is therefore a real completion boundary
+        // for its successful write/accounting callbacks, unlike merely receiving the last byte.
+        var stream = socket.GetStream();
+        socket.Client.Shutdown(SocketShutdown.Send);
+        Assert.Equal(0, await stream.ReadAsync(new byte[1], remainingReadBudget));
+    }
+
+    private async Task VerifyPendingFlushAsync(long expected)
+    {
+        var gate = _trafficGate!;
+        var manual = _server!.FlushTrafficAsync();
+        try
+        {
+            await Task.WhenAny(manual, gate.SecondWriter.Task, Task.Delay(250));
+            if (manual.IsCompletedSuccessfully)
+            {
+                var (up, down) = await _server.ReadTrafficTotalsAsync(DatabaseInitializer.DemoClientName);
+                Console.WriteLine($"premature flush while first echo is unsaved: expected={expected}, actual={up}/{down}");
+                Assert.True(up >= expected, $"premature upload ({up}) below complete echoes ({expected})");
+                Assert.True(down >= expected, $"premature download ({down}) below complete echoes ({expected})");
+            }
+            Assert.False(gate.SecondWriter.Task.IsCompleted, "manual flush bypassed the earlier unsaved echo snapshot");
+            Assert.False(manual.IsCompleted, "manual flush returned before its earlier snapshot became durable");
+        }
+        finally
+        {
+            gate.Release();
+            await _heldFlush!.WaitAsync(TimeSpan.FromSeconds(5));
+            await manual.WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     private static async Task WaitForRegisteredPortAsync(RemotePortServerManager manager,
