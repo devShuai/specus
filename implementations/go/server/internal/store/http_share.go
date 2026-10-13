@@ -591,8 +591,11 @@ func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, n
 
 // UpdateManagementUserAudited updates a user and, in the same transaction, revokes the user's own
 // active shares that the change leaves without a creator who may manage the route.
+//
+// accessRevoked says the change disabled the account or changed its role: its unused management
+// WebSocket tickets go in the same transaction (management-accounts.md 7.2).
 func (db *DB) UpdateManagementUserAudited(ctx context.Context, user ManagementUser, actor string, now int64,
-	lapse ShareLapseFunc) ([]string, error) {
+	lapse ShareLapseFunc, accessRevoked bool) ([]string, error) {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -600,6 +603,11 @@ func (db *DB) UpdateManagementUserAudited(ctx context.Context, user ManagementUs
 	defer tx.Rollback()
 	if err := db.updateManagementUserOn(ctx, tx, user); err != nil {
 		return nil, err
+	}
+	if accessRevoked {
+		if err := db.revokeWebSocketTicketsOn(ctx, tx, defaultTenant(user.TenantID), user.Username); err != nil {
+			return nil, err
+		}
 	}
 	revoked, err := db.revokeActiveShares(ctx, tx, `tenant_id = ? AND LOWER(created_by) = LOWER(?)`,
 		[]any{defaultTenant(user.TenantID), user.Username}, now, nullableActor(actor), "creator-lost-access", lapse)
@@ -626,6 +634,10 @@ func (db *DB) DeleteManagementUserAudited(ctx context.Context, user ManagementUs
 	}
 	// The account's workbench lists are personal history and go with it.
 	if err := db.deleteManagementUserOn(ctx, tx, user); err != nil {
+		return nil, err
+	}
+	// So do its unused management WebSocket tickets (management-accounts.md 7.2).
+	if err := db.revokeWebSocketTicketsOn(ctx, tx, defaultTenant(user.TenantID), user.Username); err != nil {
 		return nil, err
 	}
 	revoked, err := db.revokeActiveShares(ctx, tx, `tenant_id = ? AND LOWER(created_by) = LOWER(?)`,

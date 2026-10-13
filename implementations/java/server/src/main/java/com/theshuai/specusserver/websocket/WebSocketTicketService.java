@@ -15,6 +15,7 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -70,6 +71,36 @@ public class WebSocketTicketService {
             return Optional.empty();
         }
         return Optional.of(readAttributes(entity.getAttributesJson()));
+    }
+
+    /**
+     * Deletes the unused management tickets of one identity, in the caller's transaction: the
+     * account was deleted, disabled or changed role (management-accounts.md 7.2). Attributes are
+     * stored as JSON, so the few unexpired admin tickets are read and matched here; tenant and login
+     * name compare exactly, as the open connections do.
+     */
+    @Transactional
+    public int revokeIdentity(String tenantId, String username) {
+        List<String> revoked = repository.findByScopeIn(
+                        List.of(Scope.CONNECTIONS.wireName(), Scope.CLIENT_MESSAGES.wireName())).stream()
+                .filter(ticket -> belongsTo(ticket, tenantId, username))
+                .map(WebSocketTicket::getTokenHash)
+                .toList();
+        if (!revoked.isEmpty()) {
+            repository.deleteAllByIdInBatch(revoked);
+        }
+        return revoked.size();
+    }
+
+    private boolean belongsTo(WebSocketTicket ticket, String tenantId, String username) {
+        Map<String, Object> attributes;
+        try {
+            attributes = readAttributes(ticket.getAttributesJson());
+        } catch (IllegalStateException unreadable) {
+            return false;
+        }
+        return tenantId.equals(attributes.get(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID))
+                && username.equals(attributes.get(WebSocketTicketHandshakeInterceptor.ATTR_USER));
     }
 
     private String writeAttributes(Map<String, Object> attributes) {

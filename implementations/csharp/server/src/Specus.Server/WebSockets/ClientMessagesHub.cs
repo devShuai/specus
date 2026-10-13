@@ -34,17 +34,19 @@ public sealed class ClientMessagesHub
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly SessionRegistry _sessions;
     private readonly WebSocketTicketService _tickets;
+    private readonly ManagementWebSocketIdentity _identity;
     private readonly ClientAddressResolver _addressResolver;
     private readonly ILogger<ClientMessagesHub> _logger;
 
     public ClientMessagesHub(IServiceScopeFactory scopeFactory, SessionRegistry sessions,
         WebSocketTicketService tickets,
         ClientAddressResolver addressResolver,
-        ILogger<ClientMessagesHub> logger)
+        ILogger<ClientMessagesHub> logger, ManagementWebSocketIdentity identity)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
         _tickets = tickets;
+        _identity = identity;
         _addressResolver = addressResolver;
         _logger = logger;
     }
@@ -67,6 +69,12 @@ public sealed class ClientMessagesHub
             return;
         }
 
+        if (!await _identity.CurrentAsync(claims, context.RequestAborted).ConfigureAwait(false))
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            context.Response.Headers["X-Auth-Reason"] = ManagementWebSocketIdentity.Revoked;
+            return;
+        }
         var principal = claims.ToPrincipal();
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
@@ -74,6 +82,12 @@ public sealed class ClientMessagesHub
         _subscriptions[subscription.Id] = subscription;
         try
         {
+            if (!await _identity.CurrentAsync(claims, context.RequestAborted).ConfigureAwait(false))
+            {
+                await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
+                    ManagementWebSocketIdentity.Revoked, context.RequestAborted).ConfigureAwait(false);
+                return;
+            }
             await SendAsync(subscription, new
             {
                 type = "hello",
@@ -156,7 +170,7 @@ public sealed class ClientMessagesHub
     /// section 7.1). A connection keeps the identity it was opened with, so it would otherwise go on
     /// sending as the deleted account and receive what clients send to a later account of the same name.
     /// </summary>
-    public async Task CloseIdentityAsync(string tenantId, string username)
+    public async Task CloseIdentityAsync(string tenantId, string username, string reason = "account deleted")
     {
         foreach (var subscription in _subscriptions.Values)
         {
@@ -174,7 +188,7 @@ public sealed class ClientMessagesHub
                     if (subscription.Socket.State == WebSocketState.Open)
                     {
                         await subscription.Socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
-                            "account deleted", CancellationToken.None).ConfigureAwait(false);
+                            reason, CancellationToken.None).ConfigureAwait(false);
                     }
                 }
                 finally

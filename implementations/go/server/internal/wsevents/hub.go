@@ -35,7 +35,17 @@ type Access struct {
 	Username string
 	TenantID string
 	Admin    bool
+	// AccountKey is the key of the account row the ticket was issued for (its token's uid); empty for
+	// the built-in admin.
+	AccountKey string
 }
+
+// IdentityCheck reports whether the identity a ticket recorded still holds: the account exists, is
+// enabled, has the same key and the same administrator rights (management-accounts.md 7.2).
+type IdentityCheck func(ctx context.Context, access Access) bool
+
+// RevokedIdentity is the X-Auth-Reason of a refused handshake and the reason of the 1008 close.
+const RevokedIdentity = "identity revoked"
 
 // Event is a typed connection event ("created" | "updated").
 type Event struct {
@@ -58,11 +68,16 @@ type ClusterTransport struct {
 type Hub struct {
 	tickets         *security.WebSocketTicketService
 	addressResolver *security.ClientAddressResolver
-	authorize ReceiverAuthorizer
-	mu        sync.Mutex
-	sockets   map[*websocket.Conn]Access
-	cluster   *ClusterTransport
+	authorize       ReceiverAuthorizer
+	identity        IdentityCheck
+	mu              sync.Mutex
+	sockets         map[*websocket.Conn]Access
+	cluster         *ClusterTransport
 }
+
+// SetIdentityCheck makes the hub check a ticket's identity at the handshake and again once the socket
+// is registered (management-accounts.md 7.2).
+func (h *Hub) SetIdentityCheck(check IdentityCheck) { h.identity = check }
 
 // NewHub builds a hub that authorizes upgrades with validate.
 func NewHub(tickets *security.WebSocketTicketService, addressResolver *security.ClientAddressResolver,
@@ -113,7 +128,14 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	access := Access{Username: claims.Username, TenantID: claims.TenantID, Admin: claims.Admin}
+	access := Access{Username: claims.Username, TenantID: claims.TenantID, Admin: claims.Admin,
+		AccountKey: claims.AccountKey}
+	// The account may have been deleted, disabled or given another role since the ticket was issued.
+	if h.identity != nil && !h.identity(r.Context(), access) {
+		w.Header().Set("X-Auth-Reason", RevokedIdentity)
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 	conn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -127,6 +149,12 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 		conn.Close(websocket.StatusNormalClosure, "bye")
 	}()
+	// Registered first, checked second: a revocation that committed before this check is seen here,
+	// one that commits after it finds the socket.
+	if h.identity != nil && !h.identity(r.Context(), access) {
+		conn.Close(websocket.StatusPolicyViolation, RevokedIdentity)
+		return
+	}
 
 	// Drain client messages until it disconnects (the SPA only listens).
 	for {
@@ -136,10 +164,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// CloseIdentity ends the open connections of one identity, whose account was deleted. A connection
-// keeps the identity it was opened with, so it would otherwise receive the events of a later account
-// of the same name (management-accounts.md section 7.1).
-func (h *Hub) CloseIdentity(tenantID, username string) {
+// CloseIdentity ends the open connections of one identity, whose account was deleted, disabled or
+// given another role (management-accounts.md 7.2). A connection keeps the identity and rights it was
+// opened with, so it would otherwise go on filtering by the old role, or receive the events of a later
+// account of the same name.
+func (h *Hub) CloseIdentity(tenantID, username, reason string) {
 	h.mu.Lock()
 	var closing []*websocket.Conn
 	for socket, access := range h.sockets {
@@ -151,7 +180,7 @@ func (h *Hub) CloseIdentity(tenantID, username string) {
 	h.mu.Unlock()
 	for _, socket := range closing {
 		// The close handshake waits for the peer; the caller does not.
-		go socket.Close(websocket.StatusPolicyViolation, "account deleted")
+		go socket.Close(websocket.StatusPolicyViolation, reason)
 	}
 }
 

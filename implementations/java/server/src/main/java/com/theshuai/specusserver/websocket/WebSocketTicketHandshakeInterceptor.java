@@ -16,20 +16,33 @@ public final class WebSocketTicketHandshakeInterceptor implements HandshakeInter
     public static final String ATTR_USER = "wsUser";
     public static final String ATTR_TENANT_ID = "tenantId";
     public static final String ATTR_ADMIN = "admin";
+    /** The account key of a management ticket's identity, the {@code uid} of its token; absent for the built-in admin. */
+    public static final String ATTR_ACCOUNT_KEY = "uid";
 
     private final WebSocketTicketService ticketService;
     private final ClientAddressResolver addressResolver;
     private final WebSocketTicketService.Scope scope;
     private final boolean bindRemoteAddress;
+    /** Re-resolves a management ticket's identity; {@code null} for tickets that carry none. */
+    private final ManagementWebSocketIdentity identity;
 
     public WebSocketTicketHandshakeInterceptor(WebSocketTicketService ticketService,
                                                ClientAddressResolver addressResolver,
                                                WebSocketTicketService.Scope scope,
                                                boolean bindRemoteAddress) {
+        this(ticketService, addressResolver, scope, bindRemoteAddress, null);
+    }
+
+    public WebSocketTicketHandshakeInterceptor(WebSocketTicketService ticketService,
+                                               ClientAddressResolver addressResolver,
+                                               WebSocketTicketService.Scope scope,
+                                               boolean bindRemoteAddress,
+                                               ManagementWebSocketIdentity identity) {
         this.ticketService = ticketService;
         this.addressResolver = addressResolver;
         this.scope = scope;
         this.bindRemoteAddress = bindRemoteAddress;
+        this.identity = identity;
     }
 
     @Override
@@ -45,12 +58,18 @@ public final class WebSocketTicketHandshakeInterceptor implements HandshakeInter
         String remoteAddress = bindRemoteAddress
                 ? WebSocketRequestAddress.resolve(addressResolver, request)
                 : null;
-        return ticketService.consume(scope, values.getFirst(), remoteAddress)
-                .map(ticketAttributes -> {
-                    attributes.putAll(ticketAttributes);
-                    return true;
-                })
-                .orElseGet(() -> reject(response, "invalid or consumed ticket"));
+        Map<String, Object> ticketAttributes = ticketService.consume(scope, values.getFirst(), remoteAddress)
+                .orElse(null);
+        if (ticketAttributes == null) {
+            return reject(response, "invalid or consumed ticket");
+        }
+        // The account may have been deleted, disabled or given another role since the ticket was
+        // issued (management-accounts.md 7.2).
+        if (identity != null && !identity.current(ticketAttributes)) {
+            return reject(response, ManagementWebSocketIdentity.REVOKED);
+        }
+        attributes.putAll(ticketAttributes);
+        return true;
     }
 
     @Override

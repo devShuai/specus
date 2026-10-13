@@ -1,15 +1,28 @@
 package com.theshuai.specusserver.websocket;
 
 import com.theshuai.specusserver.config.PublicTransferProperties;
+import com.theshuai.specusserver.management.repository.ClientAccountRepository;
+import com.theshuai.specusserver.management.service.ManagementAccessRevoked;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.WebSocketSession;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class PublicTransferCoordinationRedisIT {
 
@@ -141,6 +154,59 @@ class PublicTransferCoordinationRedisIT {
             assertThat(second.unregister(delta)).isGreaterThan(0);
             assertThat(second.unregister(zeta)).isGreaterThan(0);
         }
+    }
+
+    /** management-accounts.md 7.2: a revocation on one instance closes the identity on another. */
+    @Test
+    void managementRevocationClosesTheIdentityOnAnotherInstance() throws Exception {
+        String redisUri = System.getenv("SPECUS_TEST_REDIS_URI");
+        Assumptions.assumeTrue(redisUri != null && !redisUri.isBlank(),
+                "SPECUS_TEST_REDIS_URI is not configured");
+        PublicTransferProperties properties = properties(redisUri);
+        try (PublicTransferCoordinationService first = new PublicTransferCoordinationService(properties);
+             PublicTransferCoordinationService second = new PublicTransferCoordinationService(properties)) {
+            first.start();
+            second.start();
+            ClientMessagesWebSocketHandler firstMessages = mock(ClientMessagesWebSocketHandler.class);
+            ClientMessagesWebSocketHandler secondMessages = mock(ClientMessagesWebSocketHandler.class);
+            ConnectionEventsWebSocketHandler firstEvents = mock(ConnectionEventsWebSocketHandler.class);
+            ConnectionEventsWebSocketHandler secondEvents = new ConnectionEventsWebSocketHandler(
+                    mock(ClientAccountRepository.class), second);
+            ManagementAccessRevocations revocations = new ManagementAccessRevocations(
+                    mock(WebSocketTicketService.class), firstMessages, firstEvents, first);
+            new ManagementAccessRevocations(mock(WebSocketTicketService.class), secondMessages, secondEvents, second);
+            WebSocketSession alice = session("tenant-a", "alice");
+            WebSocketSession bob = session("tenant-a", "bob");
+            WebSocketSession otherTenantAlice = session("tenant-b", "alice");
+            secondEvents.afterConnectionEstablished(alice);
+            secondEvents.afterConnectionEstablished(bob);
+            secondEvents.afterConnectionEstablished(otherTenantAlice);
+
+            revocations.closeConnections(new ManagementAccessRevoked("tenant-a", "alice",
+                    ManagementAccessRevoked.Reason.DISABLED));
+
+            // The publishing instance closes its own connections at once (and again when its own event
+            // comes back); the other one on the event.
+            verify(firstMessages, atLeastOnce()).closeIdentity("tenant-a", "alice", "account disabled");
+            verify(firstEvents, atLeastOnce()).closeIdentity("tenant-a", "alice", "account disabled");
+            verify(secondMessages, timeout(5_000)).closeIdentity("tenant-a", "alice", "account disabled");
+            verify(alice, timeout(5_000)).close(argThat(status ->
+                    status.getCode() == CloseStatus.POLICY_VIOLATION.getCode()
+                            && "account disabled".equals(status.getReason())));
+            verify(bob, never()).close(any());
+            verify(otherTenantAlice, never()).close(any());
+        }
+    }
+
+    private static WebSocketSession session(String tenantId, String username) {
+        WebSocketSession session = mock(WebSocketSession.class);
+        when(session.getId()).thenReturn(tenantId + "/" + username);
+        when(session.isOpen()).thenReturn(true);
+        when(session.getAttributes()).thenReturn(Map.of(
+                WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID, tenantId,
+                WebSocketTicketHandshakeInterceptor.ATTR_USER, username,
+                WebSocketTicketHandshakeInterceptor.ATTR_ADMIN, false));
+        return session;
     }
 
     private static PublicTransferProperties properties(String redisUri) {

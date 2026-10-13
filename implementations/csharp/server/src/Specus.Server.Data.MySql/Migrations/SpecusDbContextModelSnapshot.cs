@@ -3232,6 +3232,11 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasColumnType("varchar(64)")
                         .HasColumnName("token_hash");
 
+                    b.Property<string>("AccountKey")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("account_key");
+
                     b.Property<string>("CreatedAt")
                         .IsRequired()
                         .HasMaxLength(40)

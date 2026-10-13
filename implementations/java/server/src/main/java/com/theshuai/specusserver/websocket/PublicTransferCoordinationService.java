@@ -477,6 +477,18 @@ public class PublicTransferCoordinationService implements AutoCloseable {
                 payload));
     }
 
+    /** Every instance closes the identity's management WebSockets (management-accounts.md 7.2). */
+    public void publishManagementRevocation(String tenantId, byte[] payload) {
+        publish(new PublicTransferClusterFrame.Event(
+                PublicTransferClusterFrame.KIND_MANAGEMENT_REVOCATION,
+                false,
+                0,
+                managementGroupId(tenantId),
+                "",
+                "",
+                payload));
+    }
+
     public static String groupId(String roomId, String roomKey) {
         return digest((roomId == null ? "" : roomId) + "\u0000" + (roomKey == null ? "" : roomKey));
     }

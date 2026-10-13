@@ -77,6 +77,47 @@ class PublicTransferClusterFrameTests {
     }
 
     @Test
+    void managementRevocationMatchesCanonicalVectorAndTenantBinding() throws Exception {
+        JsonNode vector = new ObjectMapper().readTree(Files.readString(findVector()))
+                .path("canonicalManagementRevocation");
+        byte[] payload = vector.path("payloadUtf8").asText()
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        PublicTransferClusterFrame.Event event = new PublicTransferClusterFrame.Event(
+                (byte) vector.path("kind").asInt(),
+                vector.path("excludeSource").asBoolean(),
+                vector.path("revision").asLong(),
+                vector.path("groupId").asText(),
+                vector.path("targetPeerId").asText(),
+                vector.path("sourceLeaseId").asText(),
+                payload);
+
+        byte[] encoded = PublicTransferClusterFrame.encode(event);
+
+        assertThat(encoded).containsExactly(HexFormat.of().parseHex(vector.path("frameHex").asText()));
+        PublicTransferClusterFrame.Event decoded = PublicTransferClusterFrame.decode(encoded);
+        assertThat(decoded.kind()).isEqualTo(PublicTransferClusterFrame.KIND_MANAGEMENT_REVOCATION);
+        assertThat(decoded.groupId()).isEqualTo(event.groupId());
+        assertThat(decoded.payload()).containsExactly(payload);
+        assertThat(PublicTransferCoordinationService.managementGroupId(vector.path("tenantId").asText()))
+                .isEqualTo(vector.path("groupId").asText());
+        JsonNode body = new ObjectMapper().readTree(payload);
+        assertThat(body.path("tenantId").asText()).isEqualTo(vector.path("tenantId").asText());
+        assertThat(body.path("username").asText()).isEqualTo(vector.path("username").asText());
+        assertThat(body.path("reason").asText()).isEqualTo(vector.path("reason").asText());
+        assertThatThrownBy(() -> PublicTransferClusterFrame.encode(
+                new PublicTransferClusterFrame.Event(
+                        PublicTransferClusterFrame.KIND_MANAGEMENT_REVOCATION, false, 0,
+                        event.groupId(), "", "lease", payload)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("management event shape");
+        byte[] withRevision = encoded.clone();
+        withRevision[15] = 1;
+        assertThatThrownBy(() -> PublicTransferClusterFrame.decode(withRevision))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("management event shape");
+    }
+
+    @Test
     void decoderRejectsTrailingBytesAndBinaryWithoutTarget() {
         PublicTransferClusterFrame.Event event = new PublicTransferClusterFrame.Event(
                 PublicTransferClusterFrame.KIND_ROSTER,

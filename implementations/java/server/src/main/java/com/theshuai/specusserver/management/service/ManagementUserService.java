@@ -11,6 +11,7 @@ import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -42,10 +43,12 @@ public class ManagementUserService {
     private final ManagementUserEmailRepository userEmailRepository;
     /** Refuses or clears what a deleted account owns; absent only in isolated unit tests. */
     private final AccountOwnedData accountOwnedData;
+    /** Announces revoked access to the management WebSockets; absent only in isolated unit tests. */
+    private final ApplicationEventPublisher events;
 
     public ManagementUserService(ManagementUserRepository repository,
                                  AuthProperties authProperties) {
-        this(repository, authProperties, null, null, null, null);
+        this(repository, authProperties, null, null, null, null, null);
     }
 
     public ManagementUserService(ManagementUserRepository repository,
@@ -53,7 +56,7 @@ public class ManagementUserService {
                                  HttpShareService httpShareService,
                                  WorkbenchReferences workbenchReferences,
                                  ManagementUserEmailRepository userEmailRepository) {
-        this(repository, authProperties, httpShareService, workbenchReferences, userEmailRepository, null);
+        this(repository, authProperties, httpShareService, workbenchReferences, userEmailRepository, null, null);
     }
 
     @Autowired
@@ -62,13 +65,15 @@ public class ManagementUserService {
                                  HttpShareService httpShareService,
                                  WorkbenchReferences workbenchReferences,
                                  ManagementUserEmailRepository userEmailRepository,
-                                 AccountOwnedData accountOwnedData) {
+                                 AccountOwnedData accountOwnedData,
+                                 ApplicationEventPublisher events) {
         this.repository = repository;
         this.authProperties = authProperties;
         this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
         this.userEmailRepository = userEmailRepository;
         this.accountOwnedData = accountOwnedData;
+        this.events = events;
     }
 
     @Transactional(readOnly = true)
@@ -445,6 +450,8 @@ public class ManagementUserService {
             throw new IllegalArgumentException("内置 admin 用户只能通过配置文件修改");
         }
         ManagementUser user = requireMutableUserInTenant(context, normalized, "update");
+        boolean wasEnabled = user.isEnabled();
+        ManagementRole previousRole = user.getRole();
         if (StringUtils.hasText(request.password())) {
             user.setPasswordHash(PasswordService.hash(request.password().trim()));
         }
@@ -458,6 +465,14 @@ public class ManagementUserService {
         ManagementUserView view = toView(repository.save(user));
         if (request.role() != null || request.enabled() != null) {
             endSharesWithoutCreatorAccess(context, user);
+        }
+        // Disabling the account or changing its role ends its management WebSockets: they carry the
+        // rights they were opened with (management-accounts.md 7.2). A new password does not, as it
+        // does not end the account's tokens either.
+        if (wasEnabled && !user.isEnabled()) {
+            accessRevoked(user, ManagementAccessRevoked.Reason.DISABLED);
+        } else if (wasEnabled && previousRole != user.getRole()) {
+            accessRevoked(user, ManagementAccessRevoked.Reason.ROLE_CHANGED);
         }
         return view;
     }
@@ -497,7 +512,19 @@ public class ManagementUserService {
         }
         repository.delete(user);
         endSharesWithoutCreatorAccess(context, user);
+        accessRevoked(user, ManagementAccessRevoked.Reason.DELETED);
         return loginName(user);
+    }
+
+    /**
+     * In the transaction that changes the account: its unused WebSocket tickets go with this
+     * transaction, its open WebSockets close once it commits (management-accounts.md 7.2).
+     */
+    private void accessRevoked(ManagementUser user, ManagementAccessRevoked.Reason reason) {
+        if (events != null) {
+            events.publishEvent(new ManagementAccessRevoked(TenantContext.normalize(user.getTenantId()),
+                    loginName(user), reason));
+        }
     }
 
     /**

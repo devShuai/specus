@@ -90,11 +90,14 @@ type ClientCredential struct {
 
 // WebSocketTicket stores only a digest of a short-lived, single-use upgrade credential.
 type WebSocketTicket struct {
-	TokenHash         string
-	Scope             string
-	Username          string
-	TenantID          string
-	Admin             bool
+	TokenHash string
+	Scope     string
+	Username  string
+	TenantID  string
+	Admin     bool
+	// AccountKey is the key of the management account the ticket was issued to (the uid of its
+	// token); empty for the built-in admin and for public-transfer tickets.
+	AccountKey        string
 	RoomID            string
 	RoomKey           string
 	RoomRole          string

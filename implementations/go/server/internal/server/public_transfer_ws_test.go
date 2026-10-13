@@ -51,6 +51,15 @@ func TestPublicTransferClusterFrameMatchesCanonicalVector(t *testing.T) {
 			PayloadUTF8   string `json:"payloadUtf8"`
 			FrameHex      string `json:"frameHex"`
 		} `json:"canonicalManagement"`
+		CanonicalManagementRevocation struct {
+			Kind        byte   `json:"kind"`
+			TenantID    string `json:"tenantId"`
+			Username    string `json:"username"`
+			Reason      string `json:"reason"`
+			GroupID     string `json:"groupId"`
+			PayloadUTF8 string `json:"payloadUtf8"`
+			FrameHex    string `json:"frameHex"`
+		} `json:"canonicalManagementRevocation"`
 	}
 	contents, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "..", "protocol",
 		"test-vectors", "public-transfer-cluster-v2.json"))
@@ -117,6 +126,42 @@ func TestPublicTransferClusterFrameMatchesCanonicalVector(t *testing.T) {
 		targetPeerID: "unexpected-target", payload: []byte(management.PayloadUTF8),
 	}); err == nil {
 		t.Fatal("management STCE accepted a target identity")
+	}
+
+	// Kind 5 (management-accounts.md 7.2): the same shape as kind 4, the payload names the identity.
+	revocation := vectors.CanonicalManagementRevocation
+	revocationEncoded, err := encodePublicTransferClusterEvent(publicTransferClusterEvent{
+		kind: revocation.Kind, groupID: revocation.GroupID, payload: []byte(revocation.PayloadUTF8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(revocationEncoded) != revocation.FrameHex {
+		t.Fatalf("management revocation STCE frame = %x, want %s", revocationEncoded, revocation.FrameHex)
+	}
+	decoded, err = decodePublicTransferClusterEvent(revocationEncoded)
+	if err != nil || decoded.kind != clusterEventKindManagementRevocation || decoded.groupID != revocation.GroupID {
+		t.Fatalf("decoded management revocation = %+v, %v", decoded, err)
+	}
+	if managementGroupID(revocation.TenantID) != revocation.GroupID {
+		t.Fatalf("management revocation group id does not bind tenant %q", revocation.TenantID)
+	}
+	var payload managementRevocationEvent
+	if err := json.Unmarshal(decoded.payload, &payload); err != nil ||
+		payload != (managementRevocationEvent{TenantID: revocation.TenantID, Username: revocation.Username,
+			Reason: revocation.Reason}) {
+		t.Fatalf("management revocation payload = %+v, %v", payload, err)
+	}
+	if _, err := encodePublicTransferClusterEvent(publicTransferClusterEvent{
+		kind: clusterEventKindManagementRevocation, groupID: revocation.GroupID, sourceLeaseID: "lease",
+		payload: []byte(revocation.PayloadUTF8),
+	}); err == nil {
+		t.Fatal("management revocation STCE accepted a source lease")
+	}
+	withRevision := append([]byte(nil), revocationEncoded...)
+	withRevision[15] = 1
+	if _, err := decodePublicTransferClusterEvent(withRevision); err == nil {
+		t.Fatal("management revocation STCE with a revision was decoded")
 	}
 }
 

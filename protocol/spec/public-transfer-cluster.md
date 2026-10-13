@@ -1,7 +1,7 @@
 # 公共互传多实例协调协议
 
-本文定义 Java、Go 与 .NET 服务端在多实例部署时共享的 Redis 状态和内部 Pub/Sub 帧。它承载公共互传协调与
-管理连接事件，只用于服务端实例之间，不会替换浏览器可见的 STWR2、STAP2、JSON discovery 或管理 WebSocket 消息。
+本文定义 Java、Go 与 .NET 服务端在多实例部署时共享的 Redis 状态和内部 Pub/Sub 帧。它承载公共互传协调、
+管理连接事件与管理身份失效，只用于服务端实例之间，不会替换浏览器可见的 STWR2、STAP2、JSON discovery 或管理 WebSocket 消息。
 
 ## 1. 启用与故障边界
 
@@ -81,7 +81,7 @@ group 字段先后携带 groupId 与 netId 各发布一次，使房间与网络�
 offset  size  field
 0       4     ASCII "STCE"
 4       1     version = 2
-5       1     kind: 1=roster, 2=text, 3=binary, 4=management
+5       1     kind: 1=roster, 2=text, 3=binary, 4=management, 5=management-revocation
 6       1     flags: bit0=excludeSource，其余必须为 0
 7       1     reserved = 0
 8       8     rosterRevision, uint64
@@ -94,9 +94,11 @@ offset  size  field
 
 限制：group 必填且最多 128 字节；target/source lease 各最多 512 字节；payload 最多 256 KiB；字符串必须是严格 UTF-8；
 decoder 必须精确消费整帧。roster payload 必须为空，binary target 必填。text payload 是已序列化的浏览器 JSON envelope；
-binary payload 是原始 STWR2 relay envelope，禁止 Base64 化。management 必须满足 revision=0、flags=0、target/source
-为空且 payload 非空；group 必须等于 payload 中 `tenantId` 的 `managementGroupId`。频道允许发布实例收到自己的事件，
-以统一处理本地和远端连接。
+binary payload 是原始 STWR2 relay envelope，禁止 Base64 化。management 与 management-revocation 必须满足
+revision=0、flags=0、target/source 为空且 payload 非空；group 必须等于 payload 中 `tenantId` 的
+`managementGroupId`。频道允许发布实例收到自己的事件，以统一处理本地和远端连接。
+
+kind 5 是后加的：不认识它的旧版本实例按未知 kind 丢弃整帧（记日志），不会把它当成连接事件推给浏览器。
 
 事件的 group 字段按 kind 取义：roster 事件携带变化来源的 groupId 或 netId（各发布一次）；定向 text/binary 事件携带
 目标的 groupId——发布方先在来源的合并可见域内解析目标 peer（跨 Token 房间、跨 `roomId` 的同网目标同样可达），解析不到
@@ -106,7 +108,9 @@ binary payload 是原始 STWR2 relay envelope，禁止 Base64 化。management �
 中央确定性向量见
 [`protocol/test-vectors/public-transfer-cluster-v2.json`](../test-vectors/public-transfer-cluster-v2.json)。
 
-## 5. 管理事件恢复
+## 5. 管理事件
+
+### 5.1 连接事件与恢复
 
 管理连接事件使用 kind 4，payload 为对外 `/ws/connections` 使用的 camelCase `ConnectionEvent` JSON。接收实例必须先
 反序列化并校验 tenant 与 management group 的摘要绑定，再执行本实例原有的 tenant/owner 过滤；不得因为事件来自 Redis
@@ -115,6 +119,26 @@ binary payload 是原始 STWR2 relay envelope，禁止 Base64 化。management �
 Redis Pub/Sub 只负责低延迟通知，不充当持久事件日志。管理前端在每次 WebSocket 建立后先读取 REST 权威快照，同步期间
 将实时事件放入最多 4096 条的缓冲区，快照安装完成后再顺序回放。缓冲溢出时丢弃增量并重读快照；连接保持期间每 60 秒
 静默重读一次，以修复 Redis 短时故障、实例切换或浏览器挂起造成的事件空洞。因此管理面不依赖易失的 resume cursor。
+
+### 5.2 管理身份失效
+
+账号被删除、停用或改变角色时（[management-accounts.md](management-accounts.md) 7.2 节），处理该请求的实例在事务
+提交后关闭本地连接，并发布 kind 5，payload 为 UTF-8 JSON：
+
+```json
+{"tenantId":"tenant-a","username":"alice","reason":"disabled"}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `tenantId` | 账号的租户，非空；frame 的 group 必须等于它的 `managementGroupId` |
+| `username` | 账号的登录名，非空，逐字比较 |
+| `reason` | `deleted`、`disabled` 或 `role-changed`；决定关闭原因文本。不认识的值照样关闭，原因文本用 `account revoked` |
+
+接收实例（含发布者自己）校验 tenant 绑定与非空字段后，以 `1008` 关闭本地租户与登录名逐字相等的
+`/ws/client-messages` 与 `/ws/connections`；校验失败的帧丢弃并记日志。重复关闭没有副作用。与连接事件一样，
+Pub/Sub 只是低延迟通知：发布失败只记日志，账号修改照常成功；漏收的实例上已打开的连接要等断开才结束，新的握手由
+management-accounts.md 7.2 节的握手检查拒绝。
 
 ## 6. 共享固定窗口
 

@@ -27,9 +27,12 @@ type WebSocketTicketService struct {
 }
 
 type WebSocketTicketClaims struct {
-	Username    string
-	TenantID    string
-	Admin       bool
+	Username string
+	TenantID string
+	Admin    bool
+	// AccountKey pins a management ticket to the account row it was issued for, like a token's uid;
+	// empty for the built-in admin (management-accounts.md 7.2).
+	AccountKey  string
 	RoomID      string
 	RoomKey     string
 	RoomRole    string
@@ -88,6 +91,7 @@ func (s *WebSocketTicketService) Issue(ctx context.Context, scope, remoteAddress
 		Username:          strings.TrimSpace(claims.Username),
 		TenantID:          strings.TrimSpace(claims.TenantID),
 		Admin:             claims.Admin,
+		AccountKey:        strings.TrimSpace(claims.AccountKey),
 		RoomID:            strings.TrimSpace(claims.RoomID),
 		RoomKey:           strings.TrimSpace(claims.RoomKey),
 		RoomRole:          strings.TrimSpace(claims.RoomRole),
@@ -115,7 +119,7 @@ func (s *WebSocketTicketService) Consume(ctx context.Context, ticket, scope, rem
 		return nil, err
 	}
 	return &WebSocketTicketClaims{
-		Username: record.Username, TenantID: record.TenantID, Admin: record.Admin,
+		Username: record.Username, TenantID: record.TenantID, Admin: record.Admin, AccountKey: record.AccountKey,
 		RoomID: record.RoomID, RoomKey: record.RoomKey, RoomRole: record.RoomRole, PeerID: record.PeerID,
 		DisplayName: record.DisplayName, PublicAddress: record.PublicAddress,
 		SharedRoom: record.SharedRoom, Discoverable: record.Discoverable,

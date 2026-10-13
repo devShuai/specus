@@ -39,7 +39,8 @@ public class ManagementContextResolver {
         boolean builtIn = user.builtInAdmin()
                 && user.username().equalsIgnoreCase(authProperties.getUsername());
         boolean admin = builtIn || user.role() == ManagementRole.ADMIN;
-        return new ManagementContext(new TenantContext(user.tenantId()), user.username(), admin);
+        return new ManagementContext(new TenantContext(user.tenantId()), user.username(), admin,
+                user.tokenAccountKey());
     }
 
     private static String claimAsString(Jwt jwt, String claimName) {

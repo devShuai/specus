@@ -314,10 +314,16 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		})
 	}
 	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, addressResolver, logger)
-	api.SetAccountDeleted(func(tenantID, username string) {
-		wsHub.CloseIdentity(tenantID, username)
-		clientMessages.closeIdentity(tenantID, username)
-	})
+	// management-accounts.md 7.2: a ticket's identity is checked again at the handshake, and an account
+	// whose access changed loses its sockets here and, through STCE kind 5, on every other instance.
+	wsHub.SetIdentityCheck(api.WebSocketIdentityCurrent)
+	clientMessages.identity = api.WebSocketIdentityCurrent
+	revocations := managementRevocations{hub: wsHub, clientMessages: clientMessages, logger: logger}
+	if coordination := publicTransferDiscovery.coordination; coordination.enabled() {
+		revocations.coordination = coordination
+		coordination.addListener(revocations.handleClusterEvent)
+	}
+	api.SetAccessRevoked(revocations.revoked)
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
 		_ = publicTransferDiscovery.Close()

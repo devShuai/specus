@@ -191,7 +191,7 @@ $(CONNECTION_ARCHIVE_TESTS): $(CORE_OBJS) tests/connection_archive_tests.c tests
 $(TRAFFIC_DETAIL_API_TESTS): $(CORE_OBJS) tests/traffic_detail_api_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/traffic_detail_api_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(CLIENT_MESSAGES_TESTS): $(CORE_OBJS) tests/client_messages_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+$(CLIENT_MESSAGES_TESTS): $(CORE_OBJS) tests/client_messages_tests.c tests/client_messages_revocation_tests.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_messages_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(MANAGEMENT_LISTS_TESTS): $(CORE_OBJS) tests/management_lists_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)

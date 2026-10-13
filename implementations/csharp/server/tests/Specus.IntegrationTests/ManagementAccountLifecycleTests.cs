@@ -22,7 +22,7 @@ namespace Specus.IntegrationTests;
 /// protocol/test-vectors/management-accounts-v1.json through the real routes and walks the
 /// delete-then-recreate path with tokens <c>/auth/login</c> really issued.
 /// </summary>
-public sealed class ManagementAccountLifecycleTests
+public sealed partial class ManagementAccountLifecycleTests
 {
     private const string JwtSecret = "integration-test-secret";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);

@@ -33,6 +33,10 @@ const (
 	clusterRevisionTTL               = 7 * 24 * time.Hour
 )
 
+// clusterEventKindManagementRevocation ends an account's management WebSockets on every instance
+// (management-accounts.md 7.2, public-transfer-cluster.md 5.2).
+const clusterEventKindManagementRevocation byte = 5
+
 // Cluster visibility is net-scoped ("merged LAN visibility"): participants behind the
 // same public egress address see each other across rooms and token rooms, while
 // same-roomKey members stay visible across nets. Presence/members stay keyed by
@@ -529,6 +533,18 @@ func (c *publicTransferCoordination) publishManagement(ctx context.Context, tena
 		groupID: managementGroupID(tenantID), payload: payload})
 }
 
+// publishManagementRevocation asks every instance to close one identity's management WebSockets.
+func (c *publicTransferCoordination) publishManagementRevocation(ctx context.Context, tenantID string,
+	payload []byte) error {
+	return c.publish(ctx, publicTransferClusterEvent{kind: clusterEventKindManagementRevocation,
+		groupID: managementGroupID(tenantID), payload: payload})
+}
+
+// isManagementClusterEvent: both management kinds carry only a group (the tenant's) and a payload.
+func isManagementClusterEvent(kind byte) bool {
+	return kind == clusterEventKindManagement || kind == clusterEventKindManagementRevocation
+}
+
 func managementGroupID(tenantID string) string {
 	return digestString(strings.TrimSpace(tenantID))
 }
@@ -718,7 +734,7 @@ func encodePublicTransferClusterEvent(event publicTransferClusterEvent) ([]byte,
 	group := []byte(event.groupID)
 	target := []byte(event.targetPeerID)
 	sourceLease := []byte(event.sourceLeaseID)
-	if event.kind < clusterEventKindRoster || event.kind > clusterEventKindManagement {
+	if event.kind < clusterEventKindRoster || event.kind > clusterEventKindManagementRevocation {
 		return nil, errors.New("unsupported cluster event kind")
 	}
 	if len(group) == 0 || len(group) > clusterEventMaxGroupBytes || !utf8.Valid(group) {
@@ -737,7 +753,7 @@ func encodePublicTransferClusterEvent(event publicTransferClusterEvent) ([]byte,
 	if event.kind == clusterEventKindBinary && len(target) == 0 {
 		return nil, errors.New("binary event target is required")
 	}
-	if event.kind == clusterEventKindManagement && (len(event.payload) == 0 || len(target) != 0 ||
+	if isManagementClusterEvent(event.kind) && (len(event.payload) == 0 || len(target) != 0 ||
 		len(sourceLease) != 0 || event.revision != 0 || event.excludeSource) {
 		return nil, errors.New("management event shape is invalid")
 	}
@@ -767,7 +783,7 @@ func decodePublicTransferClusterEvent(encoded []byte) (publicTransferClusterEven
 	}
 	kind := encoded[5]
 	flags := encoded[6]
-	if kind < clusterEventKindRoster || kind > clusterEventKindManagement ||
+	if kind < clusterEventKindRoster || kind > clusterEventKindManagementRevocation ||
 		flags&^clusterEventFlagExclude != 0 || encoded[7] != 0 {
 		return publicTransferClusterEvent{}, errors.New("invalid cluster event header")
 	}
@@ -799,7 +815,7 @@ func decodePublicTransferClusterEvent(encoded []byte) (publicTransferClusterEven
 		return publicTransferClusterEvent{}, errors.New("binary event target is required")
 	}
 	revision := binary.BigEndian.Uint64(encoded[8:16])
-	if kind == clusterEventKindManagement && (len(payload) == 0 || len(target) != 0 ||
+	if isManagementClusterEvent(kind) && (len(payload) == 0 || len(target) != 0 ||
 		len(source) != 0 || revision != 0 || flags&clusterEventFlagExclude != 0) {
 		return publicTransferClusterEvent{}, errors.New("management event shape is invalid")
 	}

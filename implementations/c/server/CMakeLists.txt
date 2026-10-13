@@ -177,6 +177,8 @@ set_tests_properties(traffic_detail_api_tests PROPERTIES TIMEOUT 180)
 add_executable(specus_c_client_messages_tests tests/client_messages_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_client_messages_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_messages_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_client_messages_tests PRIVATE
+    ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/management-accounts-v1.json")
 add_test(NAME client_messages_tests
     COMMAND specus_c_client_messages_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(client_messages_tests PROPERTIES TIMEOUT 120)

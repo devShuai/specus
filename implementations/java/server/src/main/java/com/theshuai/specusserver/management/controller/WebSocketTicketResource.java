@@ -48,11 +48,16 @@ public class WebSocketTicketResource {
         WebSocketTicketService.Scope scope = WebSocketTicketService.Scope.adminEndpoint(
                 request == null ? null : request.endpoint());
         String remoteAddress = WebSocketRequestAddress.resolve(addressResolver, servletRequest);
-        return ticketService.issue(scope, Map.of(
-                WebSocketTicketHandshakeInterceptor.ATTR_USER, context.username(),
-                WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID, context.tenant().tenantId(),
-                WebSocketTicketHandshakeInterceptor.ATTR_ADMIN, context.isAdmin()
-        ), remoteAddress);
+        Map<String, Object> attributes = new LinkedHashMap<>();
+        attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_USER, context.username());
+        attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID, context.tenant().tenantId());
+        attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN, context.isAdmin());
+        // The handshake resolves the identity again, pinned to this account row like a token's uid
+        // (management-accounts.md 7.2). The built-in administrator has no row and no key.
+        if (StringUtils.hasText(context.accountKey())) {
+            attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_ACCOUNT_KEY, context.accountKey());
+        }
+        return ticketService.issue(scope, attributes, remoteAddress);
     }
 
     @PostMapping("/api/public/transfer/ws-tickets")

@@ -33,24 +33,28 @@ public class WebSocketConfig implements WebSocketConfigurer {
     private final ClientMessagesWebSocketHandler clientMessagesHandler;
     private final WebSocketTicketService ticketService;
     private final com.theshuai.specusserver.security.ClientAddressResolver addressResolver;
+    private final ManagementWebSocketIdentity managementIdentity;
 
     public WebSocketConfig(ConnectionEventsWebSocketHandler connectionEventsHandler,
                            PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler,
                            ClientMessagesWebSocketHandler clientMessagesHandler,
                            WebSocketTicketService ticketService,
-                           com.theshuai.specusserver.security.ClientAddressResolver addressResolver) {
+                           com.theshuai.specusserver.security.ClientAddressResolver addressResolver,
+                           ManagementWebSocketIdentity managementIdentity) {
         this.connectionEventsHandler = connectionEventsHandler;
         this.publicTransferDiscoveryHandler = publicTransferDiscoveryHandler;
         this.clientMessagesHandler = clientMessagesHandler;
         this.ticketService = ticketService;
         this.addressResolver = addressResolver;
+        this.managementIdentity = managementIdentity;
     }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(connectionEventsHandler, "/ws/connections")
                 .addInterceptors(new WebSocketTicketHandshakeInterceptor(
-                        ticketService, addressResolver, WebSocketTicketService.Scope.CONNECTIONS, true))
+                        ticketService, addressResolver, WebSocketTicketService.Scope.CONNECTIONS, true,
+                        managementIdentity))
                 // 默认 '*' 同源；显式写出来以示意，不引入 CORS 漏洞
                 .setAllowedOriginPatterns("*");
         registry.addHandler(publicTransferDiscoveryHandler, "/ws/public-transfer/discovery")
@@ -59,7 +63,8 @@ public class WebSocketConfig implements WebSocketConfigurer {
                 .setAllowedOriginPatterns("*");
         registry.addHandler(clientMessagesHandler, "/ws/client-messages")
                 .addInterceptors(new WebSocketTicketHandshakeInterceptor(
-                        ticketService, addressResolver, WebSocketTicketService.Scope.CLIENT_MESSAGES, true))
+                        ticketService, addressResolver, WebSocketTicketService.Scope.CLIENT_MESSAGES, true,
+                        managementIdentity))
                 .setAllowedOriginPatterns("*");
     }
 }

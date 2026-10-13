@@ -30,7 +30,8 @@ public static class WebSocketTicketEndpoints
             return Results.Ok(await tickets.IssueAsync(scope,
                 WebSocketTicketService.RequestAddress(addressResolver, context),
                 new WebSocketTicketClaims(username, tenantId,
-                    string.Equals(role, "ADMIN", StringComparison.OrdinalIgnoreCase)),
+                    string.Equals(role, "ADMIN", StringComparison.OrdinalIgnoreCase),
+                    AccountKey: context.User.FindFirstValue(LocalTokenService.AccountKeyClaim)),
                 cancellationToken).ConfigureAwait(false));
         });
 

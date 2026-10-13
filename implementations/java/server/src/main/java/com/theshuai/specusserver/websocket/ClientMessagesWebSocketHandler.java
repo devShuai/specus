@@ -12,6 +12,7 @@ import com.theshuai.specusserver.management.service.ClientAuthService;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -35,11 +36,21 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
     private final ClientAccountService clientAccountService;
     private final ClientSessionRepository clientSessionRepository;
     private final Map<String, Set<WebSocketSession>> adminSessions = new ConcurrentHashMap<>();
+    /** Checks the identity again once the session is registered; absent only in isolated unit tests. */
+    private final ManagementWebSocketIdentity identity;
 
     public ClientMessagesWebSocketHandler(ClientAccountService clientAccountService,
                                           ClientSessionRepository clientSessionRepository) {
+        this(clientAccountService, clientSessionRepository, null);
+    }
+
+    @Autowired
+    public ClientMessagesWebSocketHandler(ClientAccountService clientAccountService,
+                                          ClientSessionRepository clientSessionRepository,
+                                          ManagementWebSocketIdentity identity) {
         this.clientAccountService = clientAccountService;
         this.clientSessionRepository = clientSessionRepository;
+        this.identity = identity;
     }
 
     @Override
@@ -49,6 +60,13 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
         session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         adminSessions.computeIfAbsent(adminSessionKey(session), ignored -> ConcurrentHashMap.newKeySet()).add(session);
+        // Registered first, checked second: a revocation that committed before this check is seen
+        // here, one that commits after it finds the session (management-accounts.md 7.2).
+        if (identity != null && !identity.current(session.getAttributes())) {
+            unregister(session);
+            session.close(CloseStatus.POLICY_VIOLATION.withReason(ManagementWebSocketIdentity.REVOKED));
+            return;
+        }
         send(session, Map.of(
                 "type", "hello",
                 "channel", "client-messages",
@@ -168,18 +186,19 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
     }
 
     /**
-     * The account of this identity was deleted: its open subscriptions end. A connection keeps the
-     * identity it was opened with, so it would otherwise go on sending as the deleted account and
-     * receive what clients send to a later account of the same name.
+     * The account of this identity was deleted, disabled or given another role: its open
+     * subscriptions end (management-accounts.md 7.2). A connection keeps the identity and rights it
+     * was opened with, so it would otherwise go on as the old account and receive what clients send
+     * to a later account of the same name.
      */
-    public void closeIdentity(String tenantId, String username) {
+    public void closeIdentity(String tenantId, String username, String reason) {
         Set<WebSocketSession> sessions = adminSessions.remove(adminSessionKey(tenantId, username));
         if (sessions == null) {
             return;
         }
         for (WebSocketSession session : sessions) {
             try {
-                session.close(CloseStatus.POLICY_VIOLATION.withReason("account deleted"));
+                session.close(CloseStatus.POLICY_VIOLATION.withReason(reason));
             } catch (Exception e) {
                 log.debug("client-message websocket close failed: {}", e.getMessage());
             }

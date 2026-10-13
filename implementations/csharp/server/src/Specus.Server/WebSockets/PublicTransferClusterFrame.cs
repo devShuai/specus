@@ -10,6 +10,7 @@ internal static class PublicTransferClusterFrame
     internal const byte KindText = 2;
     internal const byte KindBinary = 3;
     internal const byte KindManagement = 4;
+    internal const byte KindManagementRevocation = 5;
     private const byte FlagExcludeSource = 1;
     private const int HeaderBytes = 26;
     private const int MaxGroupBytes = 128;
@@ -41,7 +42,7 @@ internal static class PublicTransferClusterFrame
         {
             throw new ArgumentException("binary event target is required");
         }
-        if (clusterEvent.Kind == KindManagement && (payload.Length == 0 || target.Length != 0
+        if (clusterEvent.Kind is KindManagement or KindManagementRevocation && (payload.Length == 0 || target.Length != 0
             || sourceLease.Length != 0 || clusterEvent.Revision != 0 || clusterEvent.ExcludeSource))
         {
             throw new ArgumentException("management event shape is invalid");
@@ -123,7 +124,7 @@ internal static class PublicTransferClusterFrame
             throw new ArgumentException("binary event target is required");
         }
         var revision = BinaryPrimitives.ReadUInt64BigEndian(encoded[8..16]);
-        if (kind == KindManagement && (payload.Length == 0 || targetPeerId.Length != 0
+        if (kind is KindManagement or KindManagementRevocation && (payload.Length == 0 || targetPeerId.Length != 0
             || sourceLeaseId.Length != 0 || revision != 0 || (flags & FlagExcludeSource) != 0))
         {
             throw new ArgumentException("management event shape is invalid");
@@ -146,7 +147,7 @@ internal static class PublicTransferClusterFrame
 
     private static void ValidateKind(byte kind)
     {
-        if (kind is not (KindRoster or KindText or KindBinary or KindManagement))
+        if (kind is not (KindRoster or KindText or KindBinary or KindManagement or KindManagementRevocation))
         {
             throw new ArgumentException("unsupported cluster event kind");
         }
