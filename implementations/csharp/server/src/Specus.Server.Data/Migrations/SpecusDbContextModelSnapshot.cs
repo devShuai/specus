@@ -1402,6 +1402,16 @@ namespace Specus.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("enabled");
 
+                    b.Property<string>("LoginName")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("login_name");
+
+                    b.Property<string>("LoginNameNormalized")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("login_name_normalized");
+
                     b.Property<string>("OidcIdentityKey")
                         .HasMaxLength(64)
                         .HasColumnType("TEXT")
@@ -1452,6 +1462,10 @@ namespace Specus.Server.Data.Migrations
 
                     b.HasIndex("TenantId")
                         .HasDatabaseName("idx_management_user_tenant");
+
+                    b.HasIndex("TenantId", "LoginNameNormalized")
+                        .IsUnique()
+                        .HasDatabaseName("uq_management_user_tenant_login_name");
 
                     b.ToTable("specus_management_user", (string)null);
                 });

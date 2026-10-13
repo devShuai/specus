@@ -60,15 +60,27 @@ internal static class PeerEgressEndpoints
         {
             denied.Add(candidate + "/32");
         }
+        else if (Ipv6Cidr.TryParseAddress(candidate, out var address))
+        {
+            // Written in RFC 5952 form, so the three clients derive the same list.
+            denied.Add(Ipv6Cidr.FormatAddress(address) + "/128");
+        }
     }
 
-    /// <summary>Removes a <c>:port</c> suffix, leaving an IPv6 literal in brackets alone.</summary>
+    /// <summary>
+    /// Removes a <c>:port</c> suffix, and the brackets around an IPv6 literal written with or without one.
+    /// </summary>
     private static string StripPort(string? host)
     {
         var trimmed = host?.Trim() ?? string.Empty;
-        if (trimmed.Length == 0 || trimmed[0] == '[')
+        if (trimmed.Length == 0)
         {
             return trimmed;
+        }
+        if (trimmed[0] == '[')
+        {
+            var end = trimmed.IndexOf(']', StringComparison.Ordinal);
+            return end > 0 ? trimmed[1..end] : trimmed;
         }
         var colon = trimmed.IndexOf(':', StringComparison.Ordinal);
         if (colon < 0 || trimmed.IndexOf(':', colon + 1) >= 0)
@@ -96,6 +108,16 @@ internal static class PeerEgressEndpoints
             {
                 foreach (var address in device.GetIPProperties().UnicastAddresses)
                 {
+                    if (address.Address.AddressFamily == AddressFamily.InterNetworkV6)
+                    {
+                        // IPv6 networks too, now that IPv6 targets are dialled, written the way the
+                        // judgment reads them.
+                        if (address.PrefixLength is >= 0 and <= 128 && !address.Address.IsIPv4MappedToIPv6)
+                        {
+                            networks.Add(Ipv6NetworkOf(address.Address, address.PrefixLength));
+                        }
+                        continue;
+                    }
                     if (address.Address.AddressFamily != AddressFamily.InterNetwork)
                     {
                         continue;
@@ -152,5 +174,17 @@ internal static class PeerEgressEndpoints
     {
         var mask = prefixLength == 0 ? 0u : 0xFFFFFFFFu << (32 - prefixLength);
         return Ipv4Cidr.FormatAddress(address & mask) + "/" + prefixLength;
+    }
+
+    /// <summary>The IPv6 network of an interface address, host bits cleared, in RFC 5952 form.</summary>
+    public static string Ipv6NetworkOf(IPAddress address, int prefixLength)
+    {
+        var value = UInt128.Zero;
+        foreach (var part in address.GetAddressBytes())
+        {
+            value = (value << 8) | part;
+        }
+        var mask = prefixLength == 0 ? UInt128.Zero : UInt128.MaxValue << (128 - prefixLength);
+        return Ipv6Cidr.FormatAddress(value & mask) + "/" + prefixLength.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 }

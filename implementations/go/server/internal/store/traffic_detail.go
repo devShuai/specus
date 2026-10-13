@@ -7,7 +7,6 @@ import (
 	"compress/zlib"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -260,8 +259,10 @@ func (db *DB) persistHTTPExchange(ctx context.Context, record HTTPExchangeRecord
 	resourceID, resourceName := db.httpResource(ctx, account, route)
 	requestContentType := headerValue(record.RequestHeaders, "content-type")
 	responseContentType := headerValue(record.ResponseHeaders, "content-type")
-	requestPreview := bodyPreview(record.RequestBody, requestContentType, headerValue(record.RequestHeaders, "content-encoding"), decodeMaxBytes(record.Options))
-	responsePreview := bodyPreview(record.ResponseBody, responseContentType, headerValue(record.ResponseHeaders, "content-encoding"), decodeMaxBytes(record.Options))
+	requestCapture := captureHTTPBody(record.RequestBody, requestContentType,
+		headerValue(record.RequestHeaders, "content-encoding"), record.Options)
+	responseCapture := captureHTTPBody(record.ResponseBody, responseContentType,
+		headerValue(record.ResponseHeaders, "content-encoding"), record.Options)
 	startedAt := record.StartedAt
 	if startedAt.IsZero() {
 		startedAt = time.Now()
@@ -288,10 +289,12 @@ func (db *DB) persistHTTPExchange(ctx context.Context, record HTTPExchangeRecord
 		ResponseBodyType:    classifyHTTPBody(responseContentType, len(record.ResponseBody)),
 		RequestHeaders:      capString(joinHeaders(record.RequestHeaders), headerChars(record.Options)),
 		ResponseHeaders:     capString(joinHeaders(record.ResponseHeaders), headerChars(record.Options)),
-		RequestPreviewText:  requestPreview.text,
-		ResponsePreviewText: responsePreview.text,
-		RequestTruncated:    requestPreview.truncated,
-		ResponseTruncated:   responsePreview.truncated,
+		RequestPreviewHex:   requestCapture.previewHex,
+		RequestPreviewText:  requestCapture.searchText,
+		RequestBodyData:     requestCapture.bodyData,
+		ResponsePreviewHex:  responseCapture.previewHex,
+		ResponsePreviewText: responseCapture.searchText,
+		ResponseBodyData:    responseCapture.bodyData,
 		CapturedAt:          time.Now(),
 	}
 	return db.InsertHTTPExchange(ctx, exchange)
@@ -444,14 +447,16 @@ func (db *DB) insertHTTPExchangeDB(ctx context.Context, e HTTPTrafficExchange) e
 		 relative_path, raw_query, status_code, success, error, remote_address, request_bytes,
 		 response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
 		 request_headers, response_headers, request_preview_hex, request_preview_text,
-		 response_preview_hex, response_preview_text, request_truncated, response_truncated, captured_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		 response_preview_hex, response_preview_text, request_body_data, response_body_data,
+		 request_truncated, response_truncated, captured_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query,
 		e.TenantID, e.ClientID, e.ClientName, e.Route, e.ResourceID, e.ResourceName, e.Method,
 		e.RelativePath, e.RawQuery, e.StatusCode, boolToInt(e.Success), e.Error, e.RemoteAddress,
 		e.RequestBytes, e.ResponseBytes, e.ElapsedMs, e.RequestContentType, e.ResponseContentType,
 		e.ResponseBodyType, e.RequestHeaders, e.ResponseHeaders, e.RequestPreviewHex, e.RequestPreviewText,
-		e.ResponsePreviewHex, e.ResponsePreviewText, boolToInt(e.RequestTruncated),
+		e.ResponsePreviewHex, e.ResponsePreviewText, nullableBytes(e.RequestBodyData),
+		nullableBytes(e.ResponseBodyData), boolToInt(e.RequestTruncated),
 		boolToInt(e.ResponseTruncated), formatTime(e.CapturedAt))
 	return err
 }
@@ -528,13 +533,18 @@ func (db *DB) GetHTTPExchange(
 		method, relative_path, raw_query, status_code, success, error, remote_address, request_bytes,
 		response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
 		request_headers, response_headers, request_preview_hex, request_preview_text, response_preview_hex,
-		response_preview_text, request_truncated, response_truncated, captured_at
+		response_preview_text, request_body_data, response_body_data, request_truncated, response_truncated,
+		captured_at
 		FROM specus_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT 1`)
 	exchange, err := scanHTTPExchange(db.sql.QueryRowContext(ctx, query, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	return &exchange, err
+	if err != nil {
+		return nil, err
+	}
+	showHTTPBodies(&exchange)
+	return &exchange, nil
 }
 
 func (db *DB) ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTrafficFrame, int, error) {
@@ -680,8 +690,8 @@ func scanHTTPExchange(scanner rowScanner) (HTTPTrafficExchange, error) {
 		&item.StatusCode, &success, &errText, &remote, &item.RequestBytes, &item.ResponseBytes,
 		&item.ElapsedMs, &requestCT, &responseCT, &item.ResponseBodyType, &item.RequestHeaders,
 		&item.ResponseHeaders, &item.RequestPreviewHex, &item.RequestPreviewText,
-		&item.ResponsePreviewHex, &item.ResponsePreviewText, &requestTruncated, &responseTrunc,
-		&capturedAt)
+		&item.ResponsePreviewHex, &item.ResponsePreviewText, &item.RequestBodyData, &item.ResponseBodyData,
+		&requestTruncated, &responseTrunc, &capturedAt)
 	if err != nil {
 		return HTTPTrafficExchange{}, err
 	}
@@ -1010,26 +1020,6 @@ func normalizeTrafficPage(size, page int) (int, int) {
 		page = 0
 	}
 	return size, page
-}
-
-type bodyPreviewResult struct {
-	text      string
-	truncated bool
-}
-
-func bodyPreview(data []byte, contentType, contentEncoding string, maxBytes int) bodyPreviewResult {
-	if len(data) == 0 {
-		return bodyPreviewResult{}
-	}
-	displayData, truncated := decodeBody(data, contentEncoding, maxBytes)
-	if !isTextBody(contentType) && !looksLikeText(displayData) {
-		mediaType := contentMediaType(contentType)
-		return bodyPreviewResult{
-			text:      "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(displayData),
-			truncated: truncated,
-		}
-	}
-	return bodyPreviewResult{text: sanitizeText(string(displayData)), truncated: truncated}
 }
 
 func decodeBody(data []byte, contentEncoding string, maxBytes int) ([]byte, bool) {

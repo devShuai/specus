@@ -255,6 +255,15 @@ public sealed class ServiceWorkbenchApiTests : IAsyncLifetime
             Assert.Equal(3, restored.RootElement.GetProperty("favorites").GetArrayLength());
         }
 
+        // An account that still owns a client is not deleted (management-accounts.md 7.1): carol's
+        // client goes to admin first, by data as no endpoint changes an owner.
+        Assert.Equal(HttpStatusCode.Conflict, (await admin.DeleteAsync("/api/admin/users/carol")).StatusCode);
+        await using (var scope = _server!.HostServices.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            await db.ClientAccounts.Where(client => client.ClientName == "carol-client")
+                .ExecuteUpdateAsync(setters => setters.SetProperty(client => client.OwnerUsername, "admin"));
+        }
         Assert.Equal(HttpStatusCode.NoContent, (await admin.DeleteAsync("/api/admin/users/carol")).StatusCode);
         var rows = await RowsAsync();
         Assert.Equal(6, rows.Count);

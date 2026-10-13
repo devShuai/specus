@@ -295,8 +295,11 @@ func Seed(t testing.TB, db *store.DB, world World, changes []WorldChange, shares
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for _, key := range sortedKeys(world.Users) {
 		user := world.Users[key]
-		if err := db.InsertManagementUser(ctx, store.ManagementUser{Username: user.Username, TenantID: user.TenantID,
-			PasswordHash: "unused", Role: user.Role, Enabled: user.Enabled, CreatedAt: now, UpdatedAt: now}); err != nil {
+		// The account key is the name, as for an account that predates tenant-scoped login names, so
+		// the world changes below can address the row by username.
+		if _, err := db.InsertManagementUser(ctx, store.ManagementUser{Username: user.Username,
+			AccountKey: user.Username, TenantID: user.TenantID, PasswordHash: "unused", Role: user.Role,
+			Enabled: user.Enabled, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatal(err)
 		}
 	}

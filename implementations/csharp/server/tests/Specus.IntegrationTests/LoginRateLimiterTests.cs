@@ -62,6 +62,29 @@ public sealed class LoginRateLimiterTests
     }
 
     [Fact]
+    public void SameLoginNameInDifferentTenantsHasSeparateBudgets()
+    {
+        // The account dimension is the tenant-qualified login name (Java AuthController.loginIdentity).
+        Assert.Equal("tenant-a\0alice", LoginRateLimiter.LoginIdentity(" Tenant-A ", " ALICE "));
+        Assert.Equal("\0alice", LoginRateLimiter.LoginIdentity(null, "alice"));
+        var limiter = Limiter(perIp: 100, perAccount: 2);
+        var tenantA = LoginRateLimiter.LoginIdentity("tenant-a", "alice");
+        var tenantB = LoginRateLimiter.LoginIdentity("tenant-b", "alice");
+        limiter.TryAcquire("203.0.113.1", tenantA, out _);
+        limiter.TryAcquire("203.0.113.2", tenantA, out _);
+
+        Assert.False(limiter.TryAcquire("203.0.113.3", LoginRateLimiter.LoginIdentity("TENANT-A", "Alice"), out _));
+        Assert.True(limiter.TryAcquire("203.0.113.4", tenantB, out _));
+        Assert.True(limiter.TryAcquire("203.0.113.5", LoginRateLimiter.LoginIdentity(null, "alice"), out _));
+
+        // A success clears only its own tenant's budget.
+        limiter.TryAcquire("203.0.113.6", tenantB, out _);
+        limiter.RecordSuccess(tenantA);
+        Assert.True(limiter.TryAcquire("203.0.113.7", tenantA, out _));
+        Assert.False(limiter.TryAcquire("203.0.113.8", tenantB, out _));
+    }
+
+    [Fact]
     public void DisabledConfigurationSkipsThrottling()
     {
         var limiter = Limiter(perIp: 1, perAccount: 1, enabled: false);

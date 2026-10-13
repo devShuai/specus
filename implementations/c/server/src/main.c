@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,7 +40,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define ST_MAX_TCP_MAPPINGS 64U
 #define ST_CHANNEL_ID_SIZE 64U
 #define ST_IO_BUFFER_SIZE 16384U
 #define ST_STREAM_INITIAL_WINDOW (1024U * 1024U)
@@ -95,12 +95,20 @@ typedef struct {
     int admin_port;
     char static_root[512];
     char database_path[512];
-    tcp_mapping mappings[ST_MAX_TCP_MAPPINGS];
+    /*
+     * The route set: mappings, http_routes and the nat_control_json built from them, heap arrays
+     * of any length (Java has no per-client limit either). The config frees them when owns_routes
+     * is set; a copy that shares another config's set, such as a connection's arguments before
+     * its login loads the account's own, leaves it clear.
+     */
+    tcp_mapping *mappings;
     size_t mapping_count;
-    http_route_mapping http_routes[ST_MAX_TCP_MAPPINGS];
+    size_t mapping_capacity;
+    http_route_mapping *http_routes;
     size_t http_route_count;
+    size_t http_route_capacity;
     char *nat_control_json;
-    int owns_nat_control_json;
+    int owns_routes;
     int client_session_db_backed;
     st_tls_server_context *tls_context;
 } server_config;
@@ -210,6 +218,12 @@ struct specus_session {
      */
     server_config config;
     pthread_mutex_t send_lock;
+    /*
+     * Set under send_lock once a write on the connection failed. The write may have stopped partway
+     * through a frame, the socket having a write timeout, and anything written after it would be read
+     * out of step, so nothing is written again (see session_send_packet_locked).
+     */
+    int write_failed;
     pthread_mutex_t map_lock;
     pthread_mutex_t direct_lock;
     pthread_cond_t reference_cond;
@@ -478,6 +492,85 @@ static int parse_port_text(const char *value, int *out)
     return 0;
 }
 
+/* Frees the route set if the config owns it, leaving an empty set of its own to load into. */
+static void config_release_routes(server_config *config)
+{
+    if (config->owns_routes) {
+        free(config->mappings);
+        free(config->http_routes);
+        free(config->nat_control_json);
+    }
+    config->mappings = NULL;
+    config->mapping_count = 0U;
+    config->mapping_capacity = 0U;
+    config->http_routes = NULL;
+    config->http_route_count = 0U;
+    config->http_route_capacity = 0U;
+    config->nat_control_json = NULL;
+    config->owns_routes = 1;
+}
+
+/* Moves the route set of from, ownership included, into to; from is left with an empty set. */
+static void config_move_routes(server_config *to, server_config *from)
+{
+    to->mappings = from->mappings;
+    to->mapping_count = from->mapping_count;
+    to->mapping_capacity = from->mapping_capacity;
+    to->http_routes = from->http_routes;
+    to->http_route_count = from->http_route_count;
+    to->http_route_capacity = from->http_route_capacity;
+    to->nat_control_json = from->nat_control_json;
+    to->owns_routes = from->owns_routes;
+    from->owns_routes = 0;
+    config_release_routes(from);
+}
+
+/* Grows *items, of item_size bytes each, so that it holds one more than count. */
+static int grow_route_array(void **items, size_t *capacity, size_t count, size_t item_size)
+{
+    if (count < *capacity) {
+        return 0;
+    }
+    size_t next = *capacity == 0U ? 16U : *capacity * 2U;
+    void *grown = next < *capacity || next > SIZE_MAX / item_size ? NULL : realloc(*items, next * item_size);
+    if (grown == NULL) {
+        fprintf(stderr, "out of memory for the client's routes\n");
+        return -1;
+    }
+    *items = grown;
+    *capacity = next;
+    return 0;
+}
+
+/* Appends a zeroed mapping to a route set the config owns; NULL when memory runs out. */
+static tcp_mapping *config_add_mapping(server_config *config)
+{
+    void *items = config->mappings;
+    if (!config->owns_routes
+        || grow_route_array(&items, &config->mapping_capacity, config->mapping_count, sizeof(tcp_mapping)) != 0) {
+        return NULL;
+    }
+    config->mappings = (tcp_mapping *)items;
+    tcp_mapping *mapping = &config->mappings[config->mapping_count++];
+    memset(mapping, 0, sizeof(*mapping));
+    return mapping;
+}
+
+/* Appends a zeroed HTTP route to a route set the config owns; NULL when memory runs out. */
+static http_route_mapping *config_add_http_route(server_config *config)
+{
+    void *items = config->http_routes;
+    if (!config->owns_routes
+        || grow_route_array(&items, &config->http_route_capacity, config->http_route_count,
+                            sizeof(http_route_mapping)) != 0) {
+        return NULL;
+    }
+    config->http_routes = (http_route_mapping *)items;
+    http_route_mapping *route = &config->http_routes[config->http_route_count++];
+    memset(route, 0, sizeof(*route));
+    return route;
+}
+
 static int parse_tcp_mappings(server_config *config)
 {
     const char *raw = getenv("SPECUS_TCP_MAPPINGS");
@@ -492,11 +585,6 @@ static int parse_tcp_mappings(server_config *config)
     char *cursor = copy;
     char *token = next_csv_token(&cursor);
     while (token != NULL) {
-        if (config->mapping_count >= ST_MAX_TCP_MAPPINGS) {
-            fprintf(stderr, "too many SPECUS_TCP_MAPPINGS entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
-            free(copy);
-            return -1;
-        }
         char *entry = trim(token);
         char *equals = strchr(entry, '=');
         if (equals == NULL) {
@@ -527,16 +615,22 @@ static int parse_tcp_mappings(server_config *config)
             return -1;
         }
 
-        tcp_mapping *mapping = &config->mappings[config->mapping_count];
-        if (parse_port_text(public_port_text, &mapping->port) != 0
-            || parse_port_text(target_port_text, &mapping->specus_port) != 0) {
+        tcp_mapping parsed;
+        memset(&parsed, 0, sizeof(parsed));
+        if (parse_port_text(public_port_text, &parsed.port) != 0
+            || parse_port_text(target_port_text, &parsed.specus_port) != 0) {
             fprintf(stderr, "invalid mapping port in \"%s=%s:%s\"\n",
                     public_port_text, target_host, target_port_text);
             free(copy);
             return -1;
         }
-        strcpy(mapping->specus_address, target_host);
-        ++config->mapping_count;
+        strcpy(parsed.specus_address, target_host);
+        tcp_mapping *mapping = config_add_mapping(config);
+        if (mapping == NULL) {
+            free(copy);
+            return -1;
+        }
+        *mapping = parsed;
         token = next_csv_token(&cursor);
     }
     free(copy);
@@ -557,11 +651,6 @@ static int parse_http_routes(server_config *config)
     char *cursor = copy;
     char *token = next_csv_token(&cursor);
     while (token != NULL) {
-        if (config->http_route_count >= ST_MAX_TCP_MAPPINGS) {
-            fprintf(stderr, "too many SPECUS_HTTP_ROUTES entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
-            free(copy);
-            return -1;
-        }
         char *entry = trim(token);
         char *equals = strchr(entry, '=');
         if (equals == NULL) {
@@ -583,7 +672,11 @@ static int parse_http_routes(server_config *config)
             free(copy);
             return -1;
         }
-        http_route_mapping *mapping = &config->http_routes[config->http_route_count++];
+        http_route_mapping *mapping = config_add_http_route(config);
+        if (mapping == NULL) {
+            free(copy);
+            return -1;
+        }
         strcpy(mapping->route, route);
         strcpy(mapping->target_base_url, target);
         token = next_csv_token(&cursor);
@@ -624,40 +717,37 @@ static int load_database_config(server_config *config, const char *database_path
         return -1;
     }
 
-    st_storage_mapping mappings[ST_MAX_TCP_MAPPINGS];
+    st_storage_mapping *mappings = NULL;
     size_t mapping_count = 0;
-    if (st_storage_load_mappings(database_path,
-                                 config->client_name,
-                                 mappings,
-                                 ST_MAX_TCP_MAPPINGS,
-                                 &mapping_count) != 0) {
+    if (st_storage_load_mappings(database_path, config->client_name, &mappings, &mapping_count) != 0) {
         fprintf(stderr, "failed to load specus mappings from database\n");
         return -1;
     }
     for (size_t i = 0; i < mapping_count; ++i) {
-        tcp_mapping *mapping = &config->mappings[config->mapping_count++];
+        tcp_mapping *mapping = config_add_mapping(config);
+        if (mapping == NULL) {
+            free(mappings);
+            return -1;
+        }
         mapping->id = mappings[i].id;
         mapping->port = mappings[i].listen_port;
         strcpy(mapping->specus_address, mappings[i].target_address);
         mapping->specus_port = mappings[i].target_port;
         mapping->detail_capture_enabled = mappings[i].detail_capture_enabled;
     }
-    st_storage_http_route routes[ST_MAX_TCP_MAPPINGS];
+    free(mappings);
+    st_storage_http_route *routes = NULL;
     size_t route_count = 0;
-    if (st_storage_load_http_routes(database_path,
-                                    config->client_name,
-                                    routes,
-                                    ST_MAX_TCP_MAPPINGS,
-                                    &route_count) != 0) {
+    if (st_storage_load_http_routes(database_path, config->client_name, &routes, &route_count) != 0) {
         fprintf(stderr, "failed to load HTTP routes from database\n");
         return -1;
     }
     for (size_t i = 0; i < route_count; ++i) {
-        if (config->http_route_count >= ST_MAX_TCP_MAPPINGS) {
-            fprintf(stderr, "too many database HTTP route entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
+        http_route_mapping *route = config_add_http_route(config);
+        if (route == NULL) {
+            free(routes);
             return -1;
         }
-        http_route_mapping *route = &config->http_routes[config->http_route_count++];
         route->id = routes[i].id;
         strcpy(route->route, routes[i].route);
         strcpy(route->target_base_url, routes[i].target_base_url);
@@ -665,6 +755,7 @@ static int load_database_config(server_config *config, const char *database_path
         route->path_rewrite_enabled = routes[i].path_rewrite_enabled;
         route->insecure_skip_verify = routes[i].insecure_skip_verify;
     }
+    free(routes);
     return 0;
 }
 
@@ -759,6 +850,7 @@ static int load_config(server_config *config)
     }
 
     memset(config, 0, sizeof(*config));
+    config_release_routes(config);
     if (copy_config_string(config->client_name, sizeof(config->client_name),
                            "SPECUS_CLIENT_NAME",
                            (name != NULL && *name != '\0') ? name : "Demo client") != 0
@@ -837,7 +929,6 @@ static int load_config(server_config *config)
         fprintf(stderr, "failed to build NAT_CONTROL JSON\n");
         return -1;
     }
-    config->owns_nat_control_json = 1;
     return 0;
 }
 
@@ -1227,17 +1318,44 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
     return 0;
 }
 
-/* Writes a packet on a connection whose send_lock the caller already holds. */
+/*
+ * Writes a packet on a connection whose send_lock the caller already holds.
+ *
+ * A write that fails, because the peer is gone or because the write timeout ran out, may have put
+ * part of the frame on the wire; any frame after it would be read out of step. The connection is
+ * then never written again: write_failed turns every later write away, and the socket is shut down
+ * so the connection's own thread wakes from its read, records IO_ERROR and closes it ("帧写入失败"
+ * in protocol/spec/control-protocol.md). This may run on any thread that sends; only shutting the
+ * socket down here, under send_lock, is safe, since session_shutdown closes the descriptor under
+ * the same lock and its number cannot have been reused yet.
+ */
 static int session_send_packet_locked(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
-    if (packet->data != NULL && session->control_fd >= 0) {
+    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed) {
         rc = session->tls_connection == NULL
             ? send_all(session->control_fd, packet->data, packet->len)
             : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
+        if (rc != 0) {
+            int write_errno = errno;
+            session->write_failed = 1;
+            shutdown(session->control_fd, SHUT_RDWR);
+            fprintf(stderr, "[%s] write failed remote=%s client=%s errno=%d: closing the connection\n",
+                    session->is_data_connection ? "data" : "control", session->remote,
+                    session->config.client_name, write_errno);
+        }
     }
     st_buffer_free(packet);
     return rc;
+}
+
+/* Whether a write on the connection has failed, which shut it down (session_send_packet_locked). */
+static int session_write_failed(specus_session *session)
+{
+    pthread_mutex_lock(&session->send_lock);
+    int failed = session->write_failed;
+    pthread_mutex_unlock(&session->send_lock);
+    return failed;
 }
 
 static int session_send_packet(specus_session *session, st_buffer *packet)
@@ -2233,6 +2351,18 @@ static long long connectivity_now_ms(void *ctx)
 }
 
 /*
+ * Test hook, SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true: once a response head has come, the
+ * probe also waits, within the same deadline, for the stream to end (FIN, or a reset) before it
+ * decides whether to reset it. A test can then show that a response its FIN ended is not reset,
+ * which otherwise depends on whether the FIN was read before the probe woke up. Off by default.
+ */
+static int connectivity_probe_awaits_end(void)
+{
+    const char *value = getenv("SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END");
+    return value != NULL && strcmp(value, "true") == 0;
+}
+
+/*
  * One connectivity check probe (protocol/spec/service-connectivity-check.md section 5): the same
  * HTTP stream as a public request, minus the public entry -- no route Basic auth, no server-side
  * route lookup (the device answers for its own configuration), no traffic accounting or detail.
@@ -2306,6 +2436,14 @@ static void connectivity_probe(void *ctx,
         while (pending.events_head == NULL && pending.error == NULL) {
             if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
                 break;
+            }
+        }
+        if (connectivity_probe_awaits_end() && pending.events_head != NULL
+            && pending.events_head->type == ST_NAT_OPEN) {
+            while (!pending.done && pending.error == NULL) {
+                if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
+                    break;
+                }
             }
         }
         if (pending.events_head != NULL && pending.events_head->type == ST_NAT_OPEN) {
@@ -2523,13 +2661,7 @@ static int reload_config_for_client_session(server_config *config,
     }
     char database_path[sizeof(config->database_path)];
     snprintf(database_path, sizeof(database_path), "%s", config->database_path);
-    if (config->owns_nat_control_json) {
-        free(config->nat_control_json);
-    }
-    config->nat_control_json = NULL;
-    config->owns_nat_control_json = 0;
-    config->mapping_count = 0;
-    config->http_route_count = 0;
+    config_release_routes(config);
     if (copy_config_string(config->client_name,
                            sizeof(config->client_name),
                            "client_account.client_name",
@@ -2545,13 +2677,13 @@ static int reload_config_for_client_session(server_config *config,
     config->peer_service_discovery_version = client_session->peer_service_discovery_version;
     config->client_http_route_version = client_session->client_http_route_version;
     config->client_session_db_backed = 1;
+    /* A partial set is the config's own and goes with it. */
     if (load_database_config(config, database_path) != 0
         || parse_tcp_mappings(config) != 0
         || parse_http_routes(config) != 0
         || build_nat_control_json(config) != 0) {
         return -1;
     }
-    config->owns_nat_control_json = 1;
     return 0;
 }
 
@@ -2560,13 +2692,10 @@ static int prepare_runtime_route_config(const server_config *current, server_con
     if (current == NULL || refreshed == NULL || current->database_path[0] == '\0') {
         return -1;
     }
+    /* The copy takes current's account settings; the route set it shares is current's, not its own. */
     *refreshed = *current;
-    memset(refreshed->mappings, 0, sizeof(refreshed->mappings));
-    memset(refreshed->http_routes, 0, sizeof(refreshed->http_routes));
-    refreshed->mapping_count = 0U;
-    refreshed->http_route_count = 0U;
-    refreshed->nat_control_json = NULL;
-    refreshed->owns_nat_control_json = 0;
+    refreshed->owns_routes = 0;
+    config_release_routes(refreshed);
     /*
      * Reloading resolves the account again: by id for a token login, by name for the static
      * configuration, and under the account's current name either way. A published connection keeps
@@ -2580,35 +2709,44 @@ static int prepare_runtime_route_config(const server_config *current, server_con
         || parse_tcp_mappings(refreshed) != 0
         || parse_http_routes(refreshed) != 0
         || build_nat_control_json(refreshed) != 0) {
-        free(refreshed->nat_control_json);
-        refreshed->nat_control_json = NULL;
+        config_release_routes(refreshed);
         return -1;
     }
-    refreshed->owns_nat_control_json = 1;
     return 0;
 }
 
-/* Replaces a published connection's route set; its account stays as it logged in. */
+/*
+ * Replaces a published connection's route set with refreshed's, which is left empty; its account
+ * stays as it logged in. Readers hold map_lock while they use the set, so the replaced one is freed
+ * once the lock is released.
+ */
 static void apply_runtime_route_config(specus_session *session, server_config *refreshed)
 {
-    char *old_json = NULL;
+    server_config replaced;
+    memset(&replaced, 0, sizeof(replaced));
     pthread_mutex_lock(&session->map_lock);
-    if (session->config.owns_nat_control_json) {
-        old_json = session->config.nat_control_json;
-    }
-    memcpy(session->config.mappings, refreshed->mappings, sizeof(refreshed->mappings));
-    session->config.mapping_count = refreshed->mapping_count;
-    memcpy(session->config.http_routes, refreshed->http_routes, sizeof(refreshed->http_routes));
-    session->config.http_route_count = refreshed->http_route_count;
-    session->config.nat_control_json = refreshed->nat_control_json;
-    session->config.owns_nat_control_json = 1;
-    refreshed->nat_control_json = NULL;
-    refreshed->owns_nat_control_json = 0;
+    config_move_routes(&replaced, &session->config);
+    config_move_routes(&session->config, refreshed);
     pthread_mutex_unlock(&session->map_lock);
-    free(old_json);
+    config_release_routes(&replaced);
 }
 
 static pthread_mutex_t runtime_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * The error a NAT_CONTROL that does not fit one MESSAGE leaves: it was not sent, and the connection is
+ * kept, since a client that logged in again would only meet the same failure. See "NAT_CONTROL 的大小"
+ * in protocol/spec/control-protocol.md.
+ */
+static void log_nat_control_not_sent(const char *client_name, size_t tcp_routes, size_t http_routes,
+                                     size_t json_bytes)
+{
+    fprintf(stderr,
+            "[nat-control] not pushed to %s: its NAT_CONTROL of %zu tcp + %zu http route(s), %zu bytes of JSON, "
+            "does not fit the %u-byte MESSAGE body; the connection is kept, disable or delete entries to bring "
+            "it back within the limit\n",
+            client_name, tcp_routes, http_routes, json_bytes, (unsigned)ST_MAX_MESSAGE_BODY_SIZE);
+}
 
 /*
  * Reloads a client's routes into its published control and data connections, then sends the
@@ -2640,6 +2778,10 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
     }
     pthread_mutex_unlock(&active_session_lock);
 
+    /*
+     * Only the account settings of these copies are read; the route sets they point at stay the
+     * connections', which nothing else replaces while runtime_nat_control_lock is held.
+     */
     server_config control_current;
     server_config data_current;
     server_config refreshed_control;
@@ -2658,32 +2800,42 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
     int result = prepare_runtime_route_config(&control_current, &refreshed_control) == 0
         && (data == NULL || prepare_runtime_route_config(&data_current, &refreshed_data) == 0)
         ? 0 : -2;
-    st_buffer packet = {0};
     if (result == 0) {
-        packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
-        if (packet.data == NULL) {
-            result = -2;
-        }
-    }
-    if (result == 0) {
+        /*
+         * The reloaded routes take effect on the server whether or not the NAT_CONTROL can be sent:
+         * they are what it forwards and accepts registrations by. One that does not fit one MESSAGE
+         * is not sent, and the client goes on with the configuration it has.
+         */
+        st_buffer packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
+        size_t tcp_routes = refreshed_control.mapping_count;
+        size_t http_routes = refreshed_control.http_route_count;
+        size_t json_bytes = refreshed_control.nat_control_json == NULL ? 0U : strlen(refreshed_control.nat_control_json);
         apply_runtime_route_config(control, &refreshed_control);
         if (data != NULL) {
             apply_runtime_route_config(data, &refreshed_data);
         }
-        if (session_send_packet(control, &packet) != 0) {
-            result = -2;
+        if (packet.data == NULL) {
+            log_nat_control_not_sent(client_name, tcp_routes, http_routes, json_bytes);
+            result = ST_ADMIN_NAT_CONTROL_NOT_SENT;
+        } else if (session_send_packet(control, &packet) != 0) {
+            /*
+             * The connection is closed, reset or no longer writable, and a write that failed here has
+             * shut it down: the client is as good as offline, and the manual push answers it as one.
+             * See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+             */
+            fprintf(stderr, "[nat-control] runtime push to %s failed: its control connection cannot be written\n",
+                    client_name);
+            result = -1;
         } else {
             printf("[nat-control] runtime push client=%s tcp=%zu http=%zu\n",
                    client_name,
-                   refreshed_control.mapping_count,
-                   refreshed_control.http_route_count);
+                   tcp_routes,
+                   http_routes);
         }
     } else {
-        st_buffer_free(&packet);
-        free(refreshed_control.nat_control_json);
-        if (data != NULL) {
-            free(refreshed_data.nat_control_json);
-        }
+        /* An unprepared copy holds nothing and a prepared one only its own set: both can be released. */
+        config_release_routes(&refreshed_control);
+        config_release_routes(&refreshed_data);
     }
 
     session_reference_release(data);
@@ -2753,6 +2905,37 @@ static int message_body_has_text(const char *value)
         }
     }
     return 0;
+}
+
+/*
+ * Java MessageRequestHandler.clientToClient for an admin:<username> target: the sending account
+ * must still exist and be enabled, and the administrator sees its stored name, in its stored
+ * tenant. Without a database there is no account to check, so the session's own name and tenant
+ * stand in.
+ */
+static int deliver_runtime_client_message_to_admin(specus_session *source_session,
+                                                   const st_message_response *request)
+{
+    if (source_session == NULL || request == NULL) {
+        return -1;
+    }
+    if (source_session->config.database_path[0] == '\0') {
+        return st_admin_deliver_client_message_to_admin(source_session->config.tenant_id,
+                                                        source_session->config.client_name,
+                                                        request->to_client_name,
+                                                        request->message);
+    }
+    st_storage_client source;
+    if (st_storage_get_client_by_name(source_session->config.database_path,
+                                      source_session->config.client_name,
+                                      &source) != 0
+        || !source.enabled) {
+        return -1;
+    }
+    return st_admin_deliver_client_message_to_admin(source.tenant_id,
+                                                    source.client_name,
+                                                    request->to_client_name,
+                                                    request->message);
 }
 
 static int forward_runtime_client_message(specus_session *source_session,
@@ -2863,6 +3046,13 @@ static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *sessio
     runtime.publisher_session_id = session->config.client_session_id;
     runtime.peer_service_discovery_version = session->config.peer_service_discovery_version;
     return runtime;
+}
+
+/* The management API's PEER_CONTROL messages (a session it closed) go out like the runtime's own. */
+static int push_runtime_peer_control(void *ctx, const char *target_client_name, const char *message)
+{
+    (void)ctx;
+    return peer_mesh_runtime_send(NULL, target_client_name, "server", message);
 }
 
 static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
@@ -3846,6 +4036,58 @@ static int process_ws_closed(specus_session *session, const st_nat_message *mess
     return 1;
 }
 
+/*
+ * Java RemotePortServerManager's per-tenant counters, which the management overview reports: the
+ * public connections open now and the ones a connection limit refused. Guarded by
+ * global_external_lock; entries live as long as the process.
+ */
+typedef struct tenant_external_stats {
+    struct tenant_external_stats *next;
+    char tenant_id[128];
+    long long active;
+    long long rejected;
+} tenant_external_stats;
+
+static tenant_external_stats *tenant_external_stats_list = NULL;
+
+static tenant_external_stats *tenant_external_stats_locked(const char *tenant_id, int create)
+{
+    const char *key = tenant_id == NULL || *tenant_id == '\0' ? "default" : tenant_id;
+    for (tenant_external_stats *stats = tenant_external_stats_list; stats != NULL; stats = stats->next) {
+        if (strcmp(stats->tenant_id, key) == 0) {
+            return stats;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    tenant_external_stats *stats = (tenant_external_stats *)calloc(1, sizeof(*stats));
+    if (stats != NULL) {
+        snprintf(stats->tenant_id, sizeof(stats->tenant_id), "%s", key);
+        stats->next = tenant_external_stats_list;
+        tenant_external_stats_list = stats;
+    }
+    return stats;
+}
+
+static void record_rejected_external_locked(const char *tenant_id)
+{
+    tenant_external_stats *stats = tenant_external_stats_locked(tenant_id, 1);
+    if (stats != NULL) {
+        ++stats->rejected;
+    }
+}
+
+static void external_connection_stats(void *ctx, const char *tenant_id, long long *active, long long *rejected)
+{
+    (void)ctx;
+    pthread_mutex_lock(&global_external_lock);
+    tenant_external_stats *stats = tenant_external_stats_locked(tenant_id, 0);
+    *active = stats == NULL ? 0 : stats->active;
+    *rejected = stats == NULL ? 0 : stats->rejected;
+    pthread_mutex_unlock(&global_external_lock);
+}
+
 static void release_external_count(external_conn *conn)
 {
     if (!conn->counted) {
@@ -3854,6 +4096,10 @@ static void release_external_count(external_conn *conn)
     pthread_mutex_lock(&global_external_lock);
     if (global_external_connections > 0) {
         --global_external_connections;
+    }
+    tenant_external_stats *stats = tenant_external_stats_locked(conn->session->config.tenant_id, 0);
+    if (stats != NULL && stats->active > 0) {
+        --stats->active;
     }
     conn->counted = 0;
     pthread_mutex_unlock(&global_external_lock);
@@ -4018,17 +4264,26 @@ static int try_count_external_connection(external_conn *conn)
     int client_count = 0;
     int port_count = 0;
     count_external_locked(session, conn->port, &client_count, &port_count);
+    /* Java records every refusal by a connection limit against the client's tenant. */
     if (client_count >= session->config.max_client_external_connections
         || port_count >= session->config.max_port_external_connections) {
+        pthread_mutex_lock(&global_external_lock);
+        record_rejected_external_locked(session->config.tenant_id);
+        pthread_mutex_unlock(&global_external_lock);
         return -1;
     }
 
     pthread_mutex_lock(&global_external_lock);
     if (global_external_connections >= session->config.max_global_external_connections) {
+        record_rejected_external_locked(session->config.tenant_id);
         pthread_mutex_unlock(&global_external_lock);
         return -1;
     }
     ++global_external_connections;
+    tenant_external_stats *stats = tenant_external_stats_locked(session->config.tenant_id, 1);
+    if (stats != NULL) {
+        ++stats->active;
+    }
     conn->counted = 1;
     pthread_mutex_unlock(&global_external_lock);
     return 0;
@@ -4064,6 +4319,8 @@ static void *external_writer_thread(void *arg)
             conn->queued_write_bytes -= chunk->len;
             pthread_mutex_unlock(&conn->write_lock);
 
+            /* Captured before it is forwarded, as Java does, so capture order is relay order. */
+            record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
             int fd;
             pthread_mutex_lock(&session->map_lock);
             fd = conn->fd;
@@ -4088,7 +4345,6 @@ static void *external_writer_thread(void *arg)
                 break;
             }
             record_tcp_traffic(session, conn->port, 0, (long long)chunk->len);
-            record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", chunk->data, chunk->len);
             if (send_window_update(session, conn->stream_id, chunk->len) != 0) {
                 free(chunk->data);
                 free(chunk);
@@ -4141,11 +4397,12 @@ static void *external_conn_thread(void *arg)
             if (consume_send_credit(conn, (size_t)read_len) != 0) {
                 break;
             }
+            /* Captured before it is forwarded, as Java does, so capture order is relay order. */
+            record_tcp_frame(session, conn, "PUBLIC_TO_CLIENT", buffer, (size_t)read_len);
             if (send_data(session, conn->stream_id, buffer, (size_t)read_len) != 0) {
                 break;
             }
             record_tcp_traffic(session, conn->port, (long long)read_len, 0);
-            record_tcp_frame(session, conn, "PUBLIC_TO_CLIENT", buffer, (size_t)read_len);
             continue;
         }
         if (read_len < 0 && errno == EINTR) {
@@ -4661,11 +4918,8 @@ static void session_shutdown(specus_session *session)
         ws = next;
     }
     session->ws_conns = NULL;
-    if (session->config.owns_nat_control_json) {
-        free(session->config.nat_control_json);
-        session->config.nat_control_json = NULL;
-        session->config.owns_nat_control_json = 0;
-    }
+    /* Nothing else holds a reference any more (client_thread waited for that), so no lock. */
+    config_release_routes(&session->config);
 }
 
 /*
@@ -4781,6 +5035,13 @@ static void *client_thread(void *arg)
         uint8_t *body = NULL;
         size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
         int rc = read_frame(session, frame_limit, &header, &body);
+        if (rc != 1 && session_write_failed(session)) {
+            /* A failed write, on whichever thread sent it, shut the socket down and so ended the read. */
+            disconnect_reason = "IO_ERROR";
+            fprintf(stderr, "[%s] closed %s after a failed write\n",
+                    session->is_data_connection ? "data" : "control", session->remote);
+            break;
+        }
         if (rc == 0) {
             disconnect_reason = "CLIENT_CLOSED";
             printf("[control] closed %s\n", session->remote);
@@ -4839,6 +5100,8 @@ static void *client_thread(void *arg)
             int control_login = !session->is_data_connection;
             st_buffer nat_control = {0};
             size_t nat_control_tcp_routes = 0U;
+            size_t nat_control_http_routes = 0U;
+            size_t nat_control_json_bytes = 0U;
             if (control_login) {
                 pthread_mutex_lock(&control_admission_lock);
             }
@@ -4847,6 +5110,9 @@ static void *client_thread(void *arg)
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                              session->config.nat_control_json);
                 nat_control_tcp_routes = session->config.mapping_count;
+                nat_control_http_routes = session->config.http_route_count;
+                nat_control_json_bytes = session->config.nat_control_json == NULL
+                    ? 0U : strlen(session->config.nat_control_json);
             }
             pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
@@ -4868,7 +5134,9 @@ static void *client_thread(void *arg)
                 reason);
             int response_rc = session_send_packet_locked(session, &response);
             int nat_control_rc = 0;
-            if (response_rc == 0 && logged_in && control_login) {
+            /* A NAT_CONTROL that does not fit one MESSAGE could not be encoded; it is not sent. */
+            int nat_control_sent = nat_control.data != NULL;
+            if (response_rc == 0 && logged_in && control_login && nat_control_sent) {
                 nat_control_rc = session_send_packet_locked(session, &nat_control);
             } else {
                 st_buffer_free(&nat_control);
@@ -4898,12 +5166,31 @@ static void *client_thread(void *arg)
                 record_login_success_event(session);
                 record_client_online_milestone(session);
                 if (nat_control_rc != 0) {
+                    /*
+                     * The control socket has a write timeout, so a failed write may have left half a
+                     * frame on the wire: anything written after it, the Peer Mesh push included, would
+                     * be read out of step. The failed write has already shut the connection down and
+                     * nothing more is written to it; it is closed here rather than after a Peer Mesh
+                     * push that could not go out. The client logs in again and gets its configuration
+                     * then.
+                     */
+                    fprintf(stderr, "[nat-control] push to %s on login failed: its control connection cannot "
+                            "be written; closing it\n", session->config.client_name);
                     disconnect_reason = "IO_ERROR";
                     st_login_request_free(&request);
                     break;
                 }
-                printf("[nat-control] pushed %zu tcp route(s) to %s\n",
-                       nat_control_tcp_routes, session->config.client_name);
+                /*
+                 * One that was not sent is only logged: the login stands and the Peer Mesh push below
+                 * still runs. Closing the connection had the client log in again into the same failure.
+                 */
+                if (nat_control_sent) {
+                    printf("[nat-control] pushed %zu tcp route(s) to %s\n",
+                           nat_control_tcp_routes, session->config.client_name);
+                } else {
+                    log_nat_control_not_sent(session->config.client_name, nat_control_tcp_routes,
+                                             nat_control_http_routes, nat_control_json_bytes);
+                }
                 if (session->config.database_path[0] != '\0') {
                     st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
                     if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
@@ -4969,10 +5256,7 @@ static void *client_thread(void *arg)
                 && message_request.message != NULL) {
                 int admin_target = message_target_is_admin(message_request.to_client_name);
                 int delivery_rc = admin_target
-                    ? st_admin_deliver_client_message_to_admin(session->config.tenant_id,
-                                                               session->config.client_name,
-                                                               message_request.to_client_name,
-                                                               message_request.message)
+                    ? deliver_runtime_client_message_to_admin(session, &message_request)
                     : forward_runtime_client_message(session, &message_request);
                 printf("[message] client->%s %s source=%s target=%s\n",
                        admin_target ? "admin" : "client",
@@ -5217,6 +5501,7 @@ int main(void)
 
     server_config config;
     if (load_config(&config) != 0) {
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5224,7 +5509,7 @@ int main(void)
     if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
         if (st_stun_turn_server_start(&stun_turn_server) != 0) {
             fprintf(stderr, "Peer Mesh STUN/TURN listener failed to start\n");
-            free(config.nat_control_json);
+            config_release_routes(&config);
             st_public_discovery_shutdown();
             return 1;
         }
@@ -5246,7 +5531,7 @@ int main(void)
                                         sizeof(tls_error)) != 0) {
         fprintf(stderr, "TLS configuration rejected: %s\n", tls_error);
         st_stun_turn_server_stop(stun_turn_server);
-        free(config.nat_control_json);
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5256,7 +5541,7 @@ int main(void)
         perror("shutdown pipe");
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
-        free(config.nat_control_json);
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5265,7 +5550,7 @@ int main(void)
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
-        free(config.nat_control_json);
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5281,7 +5566,9 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    st_admin_set_peer_control_send_handler(push_runtime_peer_control, NULL);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
+    st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);
     const st_connectivity_device connectivity_device = {
         .presence = connectivity_presence,
         .probe = connectivity_probe,
@@ -5305,12 +5592,14 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
+        st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
-        free(config.nat_control_json);
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5320,12 +5609,14 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
+        st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
         shutdown_wake_close(shutdown_pipe);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
-        free(config.nat_control_json);
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5341,11 +5632,13 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
+        st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
         st_stun_turn_server_stop(stun_turn_server);
         st_tls_server_context_free(config.tls_context);
-        free(config.nat_control_json);
+        config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
     }
@@ -5396,7 +5689,8 @@ int main(void)
             (void)fcntl(args->fd, F_SETFL, accepted_flags & ~O_NONBLOCK);
         }
         args->config = config;
-        args->config.owns_nat_control_json = 0;
+        /* Shared until the login loads the account's own set; the listener's config keeps it. */
+        args->config.owns_routes = 0;
         int one = 1;
         setsockopt(args->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         configure_control_socket(args->fd, &config);
@@ -5438,16 +5732,21 @@ int main(void)
                    unfinished, swept);
         }
     }
+    /* What the channels captured last is written out before the process ends (Java's
+     * TrafficInspectionService flushBeforeShutdown). */
+    st_elasticsearch_traffic_shutdown();
     shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
     st_admin_set_nat_control_handler(NULL, NULL);
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+    st_admin_set_peer_control_send_handler(NULL, NULL);
     st_admin_set_client_disconnect_handler(NULL, NULL);
+    st_admin_set_external_connection_stats_handler(NULL, NULL);
     st_stun_turn_server_stop(stun_turn_server);
     st_tls_server_context_free(config.tls_context);
-    free(config.nat_control_json);
+    config_release_routes(&config);
     st_public_discovery_shutdown();
     return 0;
 }

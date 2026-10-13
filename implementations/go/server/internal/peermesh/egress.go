@@ -243,17 +243,18 @@ const MaxEgressPortRangesPerRule = 32
 //
 // An egress never matches a CIDR it cannot parse, a protocol other than tcp or udp, or a malformed
 // port range. Storing such a rule used to succeed, so a typo became a rule that silently did
-// nothing; now the whole request is refused. Only spelling is normalised: a CIDR is trimmed and
-// kept as written, protocols are trimmed, lowercased and de-duplicated, absent lists become empty.
+// nothing; now the whole request is refused. Only spelling is normalised: a CIDR is trimmed, an IPv4
+// one kept as written and an IPv6 one written in RFC 5952 form; protocols are trimmed, lowercased and
+// de-duplicated, absent lists become empty.
 func NormalizeEgressDestinationRules(rules []peeregress.DestinationRule) ([]peeregress.DestinationRule, error) {
 	if len(rules) > MaxEgressDestinationRules {
 		return nil, egressInvalid("too many destination rules: %d, at most %d", len(rules), MaxEgressDestinationRules)
 	}
 	stored := make([]peeregress.DestinationRule, 0, len(rules))
 	for index, rule := range rules {
-		cidr := strings.TrimSpace(rule.CIDR)
-		if _, ok := peeregress.ParseCIDR(cidr); !ok {
-			return nil, egressInvalid("destinationRules[%d].cidr %q is not an IPv4 address or CIDR with zero host bits", index, rule.CIDR)
+		cidr, ok := peeregress.StoredDestinationCIDR(strings.TrimSpace(rule.CIDR))
+		if !ok {
+			return nil, egressInvalid("destinationRules[%d].cidr %q is not an IPv4 or IPv6 address or CIDR with zero host bits", index, rule.CIDR)
 		}
 		field := fmt.Sprintf("destinationRules[%d]", index)
 		protocols, ranges, err := normalizeEgressRuleTraffic(field, rule.Protocols, rule.PortRanges)
@@ -598,7 +599,8 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 			Scope:               policy.Scope,
 			Protocols:           egressProtocols(DecodeEgressDestinationRules(policy.DestinationRules, s.logger)),
 			DomainTargetCapable: domainTargets,
-			// No client declares IPv6 targets yet; the data plane carries IPv4 only.
+			// Egresses declare IPv6 targets, but no consumer reads this yet: the consumer data plane
+			// carries IPv4 only. It is forwarded, as domainTargetCapable is, once that changes.
 			IPv6TargetCapable: false,
 			EgressVersion:     egressVersion,
 		})

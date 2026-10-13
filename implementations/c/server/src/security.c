@@ -276,43 +276,66 @@ int st_security_issue_local_token(const char *username,
                                   char *out,
                                   size_t out_len)
 {
+    return st_security_issue_local_token_for_account(username, tenant_id, role, NULL, jwt_secret, ttl_seconds,
+                                                     out, out_len);
+}
+
+int st_security_issue_local_token_for_account(const char *username,
+                                              const char *tenant_id,
+                                              const char *role,
+                                              const char *account_key,
+                                              const char *jwt_secret,
+                                              long long ttl_seconds,
+                                              char *out,
+                                              size_t out_len)
+{
     if (username == NULL || *username == '\0' || out == NULL || out_len == 0U) {
+        return -1;
+    }
+    if (account_key != NULL && strlen(account_key) > ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN) {
         return -1;
     }
     if (ttl_seconds < 60) {
         ttl_seconds = 60;
     }
     long long now = (long long)time(NULL);
+    int has_account_key = account_key != NULL && *account_key != '\0';
     char *escaped_user = st_json_escape(username);
     char *escaped_tenant = st_json_escape(tenant_id == NULL || *tenant_id == '\0' ? "default" : tenant_id);
-    if (escaped_user == NULL || escaped_tenant == NULL) {
+    char *escaped_account_key = st_json_escape(has_account_key ? account_key : "");
+    if (escaped_user == NULL || escaped_tenant == NULL || escaped_account_key == NULL) {
         free(escaped_user);
         free(escaped_tenant);
+        free(escaped_account_key);
         return -1;
     }
     char header_json[] = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-    char payload_json[512];
+    char payload_json[1024];
     int payload_len = snprintf(payload_json,
                                sizeof(payload_json),
-                               "{\"iss\":\"specus\",\"sub\":\"%s\",\"tenant_id\":\"%s\","
+                               "{\"iss\":\"specus\",\"sub\":\"%s\",\"tenant_id\":\"%s\",%s%s%s"
                                "\"role\":\"%s\",\"iat\":%lld,\"exp\":%lld}",
                                escaped_user,
                                escaped_tenant,
+                               has_account_key ? "\"uid\":\"" : "",
+                               has_account_key ? escaped_account_key : "",
+                               has_account_key ? "\"," : "",
                                normalize_role(role),
                                now,
                                now + ttl_seconds);
     free(escaped_user);
     free(escaped_tenant);
+    free(escaped_account_key);
     if (payload_len < 0 || (size_t)payload_len >= sizeof(payload_json)) {
         return -1;
     }
     char header_segment[128];
-    char payload_segment[768];
+    char payload_segment[1408];
     if (base64url_encode((const uint8_t *)header_json, strlen(header_json), header_segment, sizeof(header_segment)) != 0
         || base64url_encode((const uint8_t *)payload_json, (size_t)payload_len, payload_segment, sizeof(payload_segment)) != 0) {
         return -1;
     }
-    char signing_input[1024];
+    char signing_input[1600];
     int signing_len = snprintf(signing_input, sizeof(signing_input), "%s.%s", header_segment, payload_segment);
     if (signing_len < 0 || (size_t)signing_len >= sizeof(signing_input)) {
         return -1;
@@ -381,16 +404,21 @@ int st_security_validate_local_token(const char *token,
             char *iss = st_json_get_string(payload_text, "iss");
             char *sub = st_json_get_string(payload_text, "sub");
             char *tenant = st_json_get_string(payload_text, "tenant_id");
+            char *account_key = st_json_get_top_level_string(payload_text, "uid");
             char *role = st_json_get_string(payload_text, "role");
             int exp = 0;
+            /* A uid longer than any account key names no account: refused rather than truncated. */
             ok = alg != NULL && strcmp(alg, "HS256") == 0
                 && iss != NULL && strcmp(iss, "specus") == 0
                 && sub != NULL && *sub != '\0'
+                && (account_key == NULL || strlen(account_key) <= ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN)
                 && st_json_get_int(payload_text, "exp", &exp) == 0
                 && (long long)time(NULL) < (long long)exp;
             if (ok) {
                 copy_text(claims->username, sizeof(claims->username), sub, "");
                 copy_text(claims->tenant_id, sizeof(claims->tenant_id), tenant, default_tenant_id);
+                claims->has_tenant = tenant != NULL && *tenant != '\0';
+                copy_text(claims->account_key, sizeof(claims->account_key), account_key, "");
                 copy_text(claims->role, sizeof(claims->role), normalize_role(role), "USER");
                 if (admin_username != NULL && strcasecmp(claims->username, admin_username) == 0) {
                     copy_text(claims->role, sizeof(claims->role), "ADMIN", "ADMIN");
@@ -401,6 +429,7 @@ int st_security_validate_local_token(const char *token,
             free(iss);
             free(sub);
             free(tenant);
+            free(account_key);
             free(role);
         }
         free(header_text);

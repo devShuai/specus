@@ -21,7 +21,8 @@ spring:
       # Default 1 keeps the single-writer SQLite default safe. Raise it (e.g. 16-32) for MySQL/PostgreSQL.
       maximum-pool-size: ${SPECUS_DB_POOL_SIZE:1}
   jpa:
-    # SpecusSqliteDialect is the community SQLiteDialect plus constraint-violation translation.
+    # SpecusSqliteDialect is the community SQLiteDialect plus constraint-violation translation and
+    # BLOB columns read with getBytes (sqlite-jdbc has no getBlob).
     database-platform: ${SPECUS_DB_DIALECT:com.theshuai.specusserver.database.SpecusSqliteDialect}
     hibernate:
       ddl-auto: update

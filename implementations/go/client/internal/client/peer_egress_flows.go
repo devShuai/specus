@@ -1,6 +1,7 @@
 package client
 
 import (
+	"net/netip"
 	"sort"
 	"time"
 )
@@ -55,8 +56,9 @@ type egressFlow struct {
 	// Destination is the address the flow was authorized for and its socket dialled to. It differs
 	// from the key's remote address only for a flow opened for a name: the key keeps the consumer's
 	// fake address, so replies come back from it, while the socket goes to what the name resolved
-	// to. Zero, for an entry opened without one, stands for the key's address.
-	Destination uint32
+	// to, of either family: an IPv6 one when the name had no A record. The zero value, for an entry
+	// opened without one, stands for the key's address.
+	Destination netip.Addr
 
 	// Handle is whatever the caller attached: a tcpConn, a UDP socket, a cancel function. The
 	// table stores it so that everything needed to tear a flow down travels with the entry that
@@ -65,11 +67,16 @@ type egressFlow struct {
 }
 
 // dialled is the address the flow's socket goes to.
-func (f *egressFlow) dialled() uint32 {
-	if f.Destination != 0 {
+func (f *egressFlow) dialled() netip.Addr {
+	if f.Destination.IsValid() {
 		return f.Destination
 	}
-	return f.Key.remoteIP
+	return egressNetAddr(f.Key.remoteIP)
+}
+
+// egressNetAddr is an IPv4 address as the flow keys hold it, in the form a dialled address takes.
+func egressNetAddr(address uint32) netip.Addr {
+	return netip.AddrFrom4([4]byte{byte(address >> 24), byte(address >> 16), byte(address >> 8), byte(address)})
 }
 
 // egressFlowTable holds every flow this node is currently forwarding.
@@ -285,7 +292,7 @@ func (t *egressFlowTable) reauthorize(policy egressPolicy, peerACLAllows func(co
 		}
 		decision := authorizeEgressFlow(egressRequest{
 			ConsumerClientID:    flow.Consumer,
-			DestinationIP:       formatEgressAddress(flow.dialled()),
+			DestinationIP:       formatEgressNetAddr(flow.dialled()),
 			DestinationPort:     int(flow.Key.remotePort),
 			Protocol:            flow.Key.protocolName(),
 			Name:                flow.Name,

@@ -5,6 +5,10 @@
 #include <string.h>
 #include <zlib.h>
 
+#ifdef ST_HAVE_BROTLI_ENCODER
+#include <brotli/encode.h>
+#endif
+
 static int compress_payload(const uint8_t *input,
                             size_t input_len,
                             int window_bits,
@@ -134,8 +138,113 @@ static int expect_bomb_rejected(void)
     return 0;
 }
 
+/*
+ * RFC 7932 written out by hand, so the decoder is checked without an encoder: WBITS 16 (one 0
+ * bit), a meta-block that is not last with 4 nibbles of MLEN-1 = 11 and ISUNCOMPRESSED, padding,
+ * the 12 bytes as they are, and a last, empty meta-block (ISLAST, ISLASTEMPTY).
+ */
+static const uint8_t brotli_hello[] = {
+    0xB0U, 0x00U, 0x10U, 'h', 'e', 'l', 'l', 'o', ' ', 'b', 'r', 'o', 't', 'l', 'i', 0x03U
+};
+
+#ifdef ST_HAVE_BROTLI_ENCODER
+/* body brotli-compressed by libbrotlienc; NULL when it fails. */
+static uint8_t *brotli_compress(const uint8_t *body, size_t body_len, size_t *out_len)
+{
+    size_t capacity = BrotliEncoderMaxCompressedSize(body_len);
+    uint8_t *out = (uint8_t *)malloc(capacity == 0U ? 64U : capacity);
+    *out_len = capacity == 0U ? 64U : capacity;
+    if (out != NULL && BrotliEncoderCompress(5, BROTLI_DEFAULT_WINDOW, BROTLI_MODE_GENERIC, body_len, body,
+                                             out_len, out) != BROTLI_TRUE) {
+        free(out);
+        out = NULL;
+    }
+    return out;
+}
+#endif
+
+/*
+ * Content-Encoding br, which Java reads with org.brotli:dec under the same DecompressionLimits:
+ * decoded when the build has libbrotlidec, and never decoded (INVALID, so a body stays as stored)
+ * when it has not.
+ */
+static int expect_brotli(void)
+{
+    uint8_t *out = NULL;
+    size_t out_len = 0U;
+    st_decompression_result rc = st_decompress_bounded(brotli_hello, sizeof(brotli_hello), ST_DECOMPRESSION_BROTLI,
+                                                       &out, &out_len);
+#ifndef ST_HAVE_BROTLI
+    int ok = st_decompression_brotli_supported() == 0 && rc == ST_DECOMPRESSION_INVALID && out == NULL;
+    free(out);
+    out = NULL;
+    ok = ok && st_decompress_brotli_prefix(brotli_hello, sizeof(brotli_hello), 5U, &out, &out_len)
+        == ST_DECOMPRESSION_INVALID && out == NULL;
+    free(out);
+    if (!ok) {
+        fprintf(stderr, "br was decoded by a build without libbrotlidec\n");
+        return 1;
+    }
+    printf("br: built without libbrotlidec, left as stored\n");
+    return 0;
+#else
+    int ok = st_decompression_brotli_supported() == 1 && rc == ST_DECOMPRESSION_OK && out_len == 12U
+        && memcmp(out, "hello brotli", 12U) == 0;
+    free(out);
+    out = NULL;
+    /* A preview reads a prefix, as Java's readLimited. */
+    ok = ok && st_decompress_brotli_prefix(brotli_hello, sizeof(brotli_hello), 5U, &out, &out_len)
+        == ST_DECOMPRESSION_OK && out_len == 5U && memcmp(out, "hello", 5U) == 0;
+    free(out);
+    out = NULL;
+    /* Input that ends before the stream does is not decoded (Java's EOFException). */
+    ok = ok && st_decompress_bounded(brotli_hello, sizeof(brotli_hello) - 1U, ST_DECOMPRESSION_BROTLI, &out,
+                                     &out_len) == ST_DECOMPRESSION_INVALID && out == NULL;
+    if (!ok) {
+        fprintf(stderr, "br decoding mismatch\n");
+        return 1;
+    }
+#ifdef ST_HAVE_BROTLI_ENCODER
+    /* A bomb: 32 MiB of zeros in a few bytes stops at the ratio limit. */
+    size_t plain_len = 32U * 1024U * 1024U;
+    uint8_t *plain = (uint8_t *)calloc(plain_len, 1U);
+    size_t compressed_len = 0U;
+    uint8_t *compressed = plain == NULL ? NULL : brotli_compress(plain, plain_len, &compressed_len);
+    ok = compressed != NULL
+        && st_decompress_bounded(compressed, compressed_len, ST_DECOMPRESSION_BROTLI, &out, &out_len)
+        == ST_DECOMPRESSION_LIMIT_EXCEEDED && out == NULL && out_len == 0U;
+    free(compressed);
+    /* A body of 256 KiB that does not compress much round trips whole. */
+    size_t text_len = 256U * 1024U;
+    uint32_t state = 2463534242U;
+    for (size_t i = 0U; ok && i < text_len; ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        plain[i] = (uint8_t)('a' + state % 26U);
+    }
+    compressed = ok ? brotli_compress(plain, text_len, &compressed_len) : NULL;
+    ok = ok && compressed != NULL
+        && st_decompress_bounded(compressed, compressed_len, ST_DECOMPRESSION_BROTLI, &out, &out_len)
+        == ST_DECOMPRESSION_OK && out_len == text_len && memcmp(out, plain, text_len) == 0;
+    free(out);
+    free(compressed);
+    free(plain);
+    if (!ok) {
+        fprintf(stderr, "br bomb or round trip mismatch\n");
+        return 1;
+    }
+#endif
+    printf("br: decoded with libbrotlidec\n");
+    return 0;
+#endif
+}
+
 int main(void)
 {
+    if (expect_brotli() != 0) {
+        return 1;
+    }
     if (st_decompression_limit_for(0U) != ST_DECOMPRESSION_MIN_ALLOWANCE_BYTES
         || st_decompression_limit_for(256U * 1024U) != 256U * 1024U * ST_DECOMPRESSION_MAX_RATIO
         || st_decompression_limit_for(ST_DECOMPRESSION_MAX_BYTES / ST_DECOMPRESSION_MAX_RATIO)

@@ -18,6 +18,8 @@ import re
 import struct
 from pathlib import Path
 
+import peer_egress_ipv6 as ipv6
+
 VECTORS = Path("protocol/test-vectors")
 MESH_CIDR = "100.96.0.0/11"
 DEFAULT_POOL = "198.18.0.0/15"
@@ -66,9 +68,16 @@ def validate_rule(rule, takeover, pool=DEFAULT_POOL, mesh=MESH_CIDR):
     match = (rule.get("match") or "").strip()
     if not match:
         return "EGRESS_RULE_MALFORMED"
-    if ":" in match:
-        return "EGRESS_RULE_IPV6_UNSUPPORTED"
-    if looks_like_domain(match):
+    ipv6_rule = ":" in match
+    if ipv6_rule:
+        # IPv6: refused as malformed when it does not read or lies in the IPv4-mapped block, and
+        # otherwise last, since no consumer carries IPv6 yet. The pool and the mesh are IPv4.
+        parsed = ipv6.parse_prefix(match)
+        if parsed is None or ipv6.is_mapped(parsed[0]):
+            return "EGRESS_RULE_MALFORMED"
+        if parsed[1] == 0:
+            return "EGRESS_RULE_DEFAULT_ROUTE"
+    elif looks_like_domain(match):
         if not takeover:
             return "EGRESS_RULE_DOMAIN_UNSUPPORTED"
         if not valid_domain_match(match):
@@ -90,6 +99,8 @@ def validate_rule(rule, takeover, pool=DEFAULT_POOL, mesh=MESH_CIDR):
         return "EGRESS_RULE_MALFORMED"
     if rule["action"] == "egress" and int(rule.get("egressClientId") or 0) <= 0:
         return "EGRESS_RULE_MISSING_TARGET"
+    if ipv6_rule:
+        return "EGRESS_RULE_IPV6_UNSUPPORTED"
     return None
 
 

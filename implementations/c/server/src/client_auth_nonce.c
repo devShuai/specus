@@ -1,6 +1,7 @@
 #include "client_auth_nonce.h"
 
 #include "crypto.h"
+#include "storage.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -234,6 +235,28 @@ st_client_auth_nonce_result st_client_auth_nonce_consume(const char *api_key,
     ++nonce_used;
     pthread_mutex_unlock(&nonce_lock);
     return ST_CLIENT_AUTH_NONCE_ACCEPTED;
+}
+
+st_client_auth_nonce_result st_client_auth_nonce_consume_stored(const char *database_path,
+                                                                const char *api_key,
+                                                                const char *nonce,
+                                                                int64_t now_ms)
+{
+    uint8_t digest[ST_SHA256_LEN];
+    uint8_t api_key_digest[ST_SHA256_LEN];
+    char nonce_id[ST_SHA256_HEX_LEN + 1U];
+    char api_key_hash[ST_SHA256_HEX_LEN + 1U];
+    if (database_path == NULL || api_key == NULL || nonce == NULL || nonce_digest(api_key, nonce, digest) != 0) {
+        return ST_CLIENT_AUTH_NONCE_UNAVAILABLE;
+    }
+    st_sha256((const uint8_t *)api_key, strlen(api_key), api_key_digest);
+    st_hex_encode(digest, sizeof(digest), nonce_id);
+    st_hex_encode(api_key_digest, sizeof(api_key_digest), api_key_hash);
+    int rc = st_storage_consume_client_auth_nonce(database_path, nonce_id, api_key_hash, (long long)now_ms,
+                                                  ST_CLIENT_AUTH_NONCE_TTL_MS);
+    return rc == 0 ? ST_CLIENT_AUTH_NONCE_ACCEPTED
+        : rc == 1 ? ST_CLIENT_AUTH_NONCE_REPLAYED
+        : ST_CLIENT_AUTH_NONCE_UNAVAILABLE;
 }
 
 size_t st_client_auth_nonce_tracked(void)
