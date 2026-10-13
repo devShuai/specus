@@ -1,5 +1,5 @@
 {
-  "description": "Destination rules of an egress policy saved through the management API: what the server stores and what it refuses with 400. See protocol/spec/peer-egress.md.",
+  "description": "Destination rules of an egress policy saved through the management API: what the server stores and what it refuses with 400. An IPv4 CIDR is stored as written after trimming; an IPv6 one in RFC 5952 form, with the /length only when it was written (the spelling is pinned by ipv6Prefixes in peer-egress-rules-v1.json). See protocol/spec/peer-egress.md.",
   "limits": {
     "rules": 64,
     "portRangesPerRule": 32,
@@ -1136,6 +1136,187 @@
           ]
         }
       ]
+    },
+    {
+      "name": "ipv6-prefix",
+      "destinationRules": [
+        {
+          "cidr": "2001:db8::/32",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ],
+      "stored": [
+        {
+          "cidr": "2001:db8::/32",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-address",
+      "destinationRules": [
+        {
+          "cidr": "2001:db8::7",
+          "protocols": [
+            "udp"
+          ],
+          "portRanges": [
+            [
+              53,
+              53
+            ]
+          ]
+        }
+      ],
+      "stored": [
+        {
+          "cidr": "2001:db8::7",
+          "protocols": [
+            "udp"
+          ],
+          "portRanges": [
+            [
+              53,
+              53
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-spelling-normalised",
+      "destinationRules": [
+        {
+          "cidr": " 2001:0DB8:0000:0000::/48 ",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ],
+      "stored": [
+        {
+          "cidr": "2001:db8::/48",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-whole-internet",
+      "destinationRules": [
+        {
+          "cidr": "::/0",
+          "protocols": [
+            "tcp",
+            "udp"
+          ],
+          "portRanges": [
+            [
+              1,
+              65535
+            ]
+          ]
+        }
+      ],
+      "stored": [
+        {
+          "cidr": "::/0",
+          "protocols": [
+            "tcp",
+            "udp"
+          ],
+          "portRanges": [
+            [
+              1,
+              65535
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv4-and-ipv6",
+      "destinationRules": [
+        {
+          "cidr": "203.0.113.0/24",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        },
+        {
+          "cidr": "2001:db8:1::/48",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ],
+      "stored": [
+        {
+          "cidr": "203.0.113.0/24",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        },
+        {
+          "cidr": "2001:db8:1::/48",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
     }
   ],
   "reject": [
@@ -1208,10 +1389,129 @@
       ]
     },
     {
-      "name": "ipv6",
+      "name": "ipv6-host-bits-set",
       "destinationRules": [
         {
-          "cidr": "2001:db8::/32",
+          "cidr": "2001:db8::1/32",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-prefix-too-long",
+      "destinationRules": [
+        {
+          "cidr": "2001:db8::/129",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-prefix-leading-zero",
+      "destinationRules": [
+        {
+          "cidr": "2001:db8::/032",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-dotted-tail",
+      "destinationRules": [
+        {
+          "cidr": "::ffff:192.0.2.1",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-zone",
+      "destinationRules": [
+        {
+          "cidr": "fe80::1%eth0",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-brackets",
+      "destinationRules": [
+        {
+          "cidr": "[2001:db8::1]",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-two-compressions",
+      "destinationRules": [
+        {
+          "cidr": "2001::db8::1",
+          "protocols": [
+            "tcp"
+          ],
+          "portRanges": [
+            [
+              443,
+              443
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ipv6-group-too-long",
+      "destinationRules": [
+        {
+          "cidr": "2001:db8::12345",
           "protocols": [
             "tcp"
           ],

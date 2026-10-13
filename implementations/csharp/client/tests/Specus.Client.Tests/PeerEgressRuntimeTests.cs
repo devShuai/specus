@@ -792,8 +792,8 @@ public class PeerEgressRuntimeTests
         harness.Runtime.HandleFrame(consumer, PeerEgressFrame.Encode(PeerEgressFrame.TypeControl, false,
             PeerEgressFrame.EncodeControl(PeerEgressFrame.Control.NameBind(address, name))), Epoch);
 
-    private static Func<string, IReadOnlyList<uint>> ResolvingTo(params string[] addresses) =>
-        _ => addresses.Select(Address).ToList();
+    private static Func<string, IReadOnlyList<System.Net.IPAddress>> ResolvingTo(params string[] addresses) =>
+        _ => addresses.Select(System.Net.IPAddress.Parse).ToList();
 
     /// <summary>
     /// A flow to a bound address is dialled to what the name resolves to, and the flow keeps the
@@ -814,6 +814,50 @@ public class PeerEgressRuntimeTests
         Assert.True(segments.Count > 0 && segments[0].SourceIp == Address("198.18.0.5"),
             "the SYN-ACK did not come from the fake address");
     }
+
+    /// <summary>
+    /// A name with no A record is dialled over IPv6 (peer-egress-dns.md): the egress's own socket goes
+    /// to the first AAAA address the policy allows, while the consumer still sees the flow at its IPv4
+    /// fake address. The rebound loopback ahead of it is refused by the IPv6 forced-deny list.
+    /// </summary>
+    [Fact]
+    public void DialsAnIpv6OnlyName()
+    {
+        var harness = new Harness("::/0");
+        harness.Runtime.Resolve = ResolvingTo("::1", "2001:DB8::10");
+        BindName(harness, 7, "198.18.0.5", "v6only.example");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 40000, "198.18.0.5", 443))), Epoch);
+
+        Assert.Equal(["2001:db8::10:443"], harness.Dialed);
+        var segments = harness.Segments();
+        Assert.True(segments.Count > 0 && segments[0].SourceIp == Address("198.18.0.5"),
+            "the SYN-ACK did not come from the fake address");
+    }
+
+    /// <summary>A name rebound to nothing but IPv6 loopback is refused before anything is dialled.</summary>
+    [Fact]
+    public void RefusesANameThatResolvesToIpv6Loopback()
+    {
+        var harness = new Harness("::/0");
+        harness.Runtime.Resolve = ResolvingTo("::1");
+        BindName(harness, 7, "198.18.0.5", "rebind.example");
+
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(
+            Syn("100.96.0.1", 40000, "198.18.0.5", 443))), Epoch);
+
+        Assert.True(harness.DialCount == 0, "a name resolving to IPv6 loopback was dialled");
+        Assert.Equal([PeerEgressCodes.ForbiddenDestination], harness.RejectCodes());
+    }
+
+    /// <summary>Only an IPv6 target is dialled unbound; an IPv4-mapped one goes through the IPv4 choice.</summary>
+    [Theory]
+    [InlineData("2001:db8::10", true)]
+    [InlineData("203.0.113.10", false)]
+    [InlineData("::ffff:203.0.113.10", false)]
+    public void SocketsToIpv6TargetsAreLeftUnbound(string target, bool unbound) =>
+        Assert.Equal(unbound, PeerEgressSocketBinder.LeftUnbound(System.Net.IPAddress.Parse(target)));
 
     /// <summary>
     /// A name that resolves only to what the policy forbids is refused, which is where DNS rebinding

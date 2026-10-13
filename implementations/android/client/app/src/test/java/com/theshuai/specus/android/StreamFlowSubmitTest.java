@@ -6,8 +6,10 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
@@ -150,6 +152,38 @@ public class StreamFlowSubmitTest {
             assertTrue(scheduler.addCredit(24, 1024));
             completion.get(5, TimeUnit.SECONDS);
             assertTrue(finSent.await(2, TimeUnit.SECONDS));
+        }
+    }
+
+    /**
+     * A reset that overtakes a FIN from submitFinish still goes out, and whoever resets is not left
+     * waiting. Failing the superseded FIN runs submitFinish's own release, which used to drop the
+     * stream before the reset was queued behind it: the reset never ran, and the caller -- the data
+     * connection's reader, on a remote RST -- parked for good.
+     */
+    @Test
+    public void resetOvertakingASubmittedFinStillGoesOut() throws Exception {
+        try (StreamFlowScheduler scheduler = new StreamFlowScheduler()) {
+            assertTrue(scheduler.open(26));
+            exhaustCredit(scheduler, 26);
+            scheduler.submit(26, 1024, () -> { });
+            AtomicBoolean finSent = new AtomicBoolean();
+            CompletableFuture<Void> fin = scheduler.submitFinish(26, () -> finSent.set(true));
+
+            CountDownLatch resetSent = new CountDownLatch(1);
+            CompletableFuture<Void> reset = CompletableFuture.runAsync(() -> {
+                try {
+                    scheduler.reset(26, resetSent::countDown);
+                } catch (Exception error) {
+                    throw new CompletionException(error);
+                }
+            });
+
+            reset.get(5, TimeUnit.SECONDS);
+            assertTrue(resetSent.await(2, TimeUnit.SECONDS));
+            assertTrue("the FIN was superseded", fin.isCompletedExceptionally());
+            assertFalse("the FIN must not follow the reset", finSent.get());
+            assertFalse("the stream is released once the reset is out", scheduler.contains(26));
         }
     }
 

@@ -24,7 +24,8 @@ public class SqliteDialectConfiguration {
      * Puts {@link SpecusSqliteDialect} in place of the community dialect it extends, whether named by
      * {@code spring.jpa.database-platform} or by {@code hibernate.dialect}. The README told SQLite
      * deployments to set {@code SPECUS_DB_DIALECT} to the community class, and those would otherwise
-     * keep the untranslated violations; the subclass changes nothing else.
+     * keep the untranslated violations and BLOB columns they cannot read back; the subclass changes
+     * nothing else.
      */
     @Bean
     public HibernatePropertiesCustomizer sqliteDialectUpgrade(
@@ -60,7 +61,8 @@ public class SqliteDialectConfiguration {
         Object configured = properties.getOrDefault(AvailableSettings.DIALECT, databasePlatform);
         if (configured instanceof String name && name.trim().equals(SQLiteDialect.class.getName())) {
             properties.put(AvailableSettings.DIALECT, SpecusSqliteDialect.class.getName());
-            log.info("[schema] {} is configured; using {}, which also translates SQLite constraint violations",
+            log.info("[schema] {} is configured; using {}, which also translates SQLite constraint violations"
+                            + " and reads BLOB columns",
                     SQLiteDialect.class.getName(), SpecusSqliteDialect.class.getName());
         }
     }

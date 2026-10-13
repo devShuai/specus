@@ -147,6 +147,8 @@ func (s *elasticsearchTrafficStore) InsertHTTPExchange(ctx context.Context, e HT
 		RequestPreviewText:  e.RequestPreviewText,
 		ResponsePreviewHex:  e.ResponsePreviewHex,
 		ResponsePreviewText: e.ResponsePreviewText,
+		RequestBodyData:     e.RequestBodyData,
+		ResponseBodyData:    e.ResponseBodyData,
 		RequestTruncated:    e.RequestTruncated,
 		ResponseTruncated:   e.ResponseTruncated,
 		CapturedAt:          formatTime(e.CapturedAt),
@@ -220,6 +222,8 @@ func (s *elasticsearchTrafficStore) ListHTTPExchanges(ctx context.Context, filte
 			"requestPreviewText",
 			"responsePreviewHex",
 			"responsePreviewText",
+			"requestBodyData",
+			"responseBodyData",
 		}},
 	}
 	var response esSearchResponse[httpTrafficDocument]
@@ -264,6 +268,7 @@ func (s *elasticsearchTrafficStore) GetHTTPExchange(
 		return nil, ErrNotFound
 	}
 	item := response.Hits.Hits[0].Source.toEntity()
+	showHTTPBodies(&item)
 	return &item, nil
 }
 
@@ -344,15 +349,28 @@ func (s *elasticsearchTrafficStore) ListTCPStream(ctx context.Context, tenantID,
 
 func (s *elasticsearchTrafficStore) ensureHTTPIndex(ctx context.Context) error {
 	mapping := map[string]any{"mappings": map[string]any{"properties": httpESProperties()}}
-	return s.ensureIndex(ctx, s.httpIndex, mapping, &s.httpIndexReady)
+	// Java's putBinaryBodyMapping: an index made before bodies were stored gets them as binary.
+	bodies := map[string]any{"properties": map[string]any{
+		"requestBodyData":  esType("binary"),
+		"responseBodyData": esType("binary"),
+	}}
+	return s.ensureIndex(ctx, s.httpIndex, mapping, bodies, &s.httpIndexReady)
 }
 
 func (s *elasticsearchTrafficStore) ensureTCPIndex(ctx context.Context) error {
 	mapping := map[string]any{"mappings": map[string]any{"properties": tcpESProperties()}}
-	return s.ensureIndex(ctx, s.tcpIndex, mapping, &s.tcpIndexReady)
+	return s.ensureIndex(ctx, s.tcpIndex, mapping, nil, &s.tcpIndexReady)
 }
 
-func (s *elasticsearchTrafficStore) ensureIndex(ctx context.Context, index string, mapping map[string]any, ready *bool) error {
+// ensureIndex creates the index with mapping, or puts existingUpdate (when not nil) on the mapping
+// of an index that exists already.
+func (s *elasticsearchTrafficStore) ensureIndex(
+	ctx context.Context,
+	index string,
+	mapping map[string]any,
+	existingUpdate map[string]any,
+	ready *bool,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if *ready {
@@ -363,6 +381,11 @@ func (s *elasticsearchTrafficStore) ensureIndex(ctx context.Context, index strin
 		return err
 	}
 	if status == http.StatusOK {
+		if existingUpdate != nil {
+			// As in Java, a refused update (a field mapped otherwise already, say as text) leaves the
+			// index as it is; documents still go in.
+			_ = s.doJSON(ctx, http.MethodPut, "/"+url.PathEscape(index)+"/_mapping", existingUpdate, nil)
+		}
 		*ready = true
 		return nil
 	}
@@ -546,6 +569,8 @@ type httpTrafficDocument struct {
 	RequestPreviewText  string  `json:"requestPreviewText"`
 	ResponsePreviewHex  string  `json:"responsePreviewHex"`
 	ResponsePreviewText string  `json:"responsePreviewText"`
+	RequestBodyData     []byte  `json:"requestBodyData,omitempty"`
+	ResponseBodyData    []byte  `json:"responseBodyData,omitempty"`
 	RequestTruncated    bool    `json:"requestTruncated"`
 	ResponseTruncated   bool    `json:"responseTruncated"`
 	CapturedAt          string  `json:"capturedAt"`
@@ -606,6 +631,8 @@ func (d httpTrafficDocument) toEntity() HTTPTrafficExchange {
 		RequestPreviewText:  d.RequestPreviewText,
 		ResponsePreviewHex:  d.ResponsePreviewHex,
 		ResponsePreviewText: d.ResponsePreviewText,
+		RequestBodyData:     d.RequestBodyData,
+		ResponseBodyData:    d.ResponseBodyData,
 		RequestTruncated:    d.RequestTruncated,
 		ResponseTruncated:   d.ResponseTruncated,
 		CapturedAt:          parseTime(d.CapturedAt),
@@ -946,6 +973,8 @@ func httpESProperties() map[string]any {
 		"requestPreviewText":  esType("text"),
 		"responsePreviewHex":  esType("text"),
 		"responsePreviewText": esType("text"),
+		"requestBodyData":     esType("binary"),
+		"responseBodyData":    esType("binary"),
 		"requestTruncated":    esType("boolean"),
 		"responseTruncated":   esType("boolean"),
 		"capturedAt":          esType("keyword"),

@@ -33,10 +33,10 @@ public partial class MainWindow
     {
         [PeerEgressCodes.RuleDefaultRoute] = "一期不接管默认路由",
         [PeerEgressCodes.RuleMeshOverlap] = "与组网虚拟网段重叠",
-        [PeerEgressCodes.RuleMalformed] = "规则格式不正确（含主机位非零）",
+        [PeerEgressCodes.RuleMalformed] = "规则格式不正确（含主机位非零、IPv4 映射的 IPv6 地址）",
         [PeerEgressCodes.RuleMissingTarget] = "没有指定出口设备",
         [PeerEgressCodes.RuleDomainUnsupported] = "域名规则需要二期的 DNS 接管，目前不支持",
-        [PeerEgressCodes.RuleIpv6Unsupported] = "一期不支持 IPv6 规则",
+        [PeerEgressCodes.RuleIpv6Unsupported] = "本机还不能承载 IPv6 流量，IPv6 规则暂不生效",
         [PeerEgressCodes.RulePortUnsupported] = "消费端规则不支持端口字段",
         [PeerEgressCodes.RuleDisabled] = "规则已停用",
         [PeerEgressCodes.ConsumerDisabled] = "系统接管未开启",

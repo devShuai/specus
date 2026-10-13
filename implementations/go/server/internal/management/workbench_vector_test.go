@@ -181,7 +181,6 @@ type workbenchHarness struct {
 	nextClientID int64
 	nextPort     int
 	objectClient map[string]int64
-	identities   map[string]workbenchVectorIdentity
 	fixtures     map[string]string
 }
 
@@ -203,7 +202,7 @@ func newWorkbenchHarness(t *testing.T, base time.Time) *workbenchHarness {
 		config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, mesh, nil, nil, nil, nil)
 	h := &workbenchHarness{t: t, ctx: context.Background(), db: db, dbPath: dbPath, api: api, tokens: tokens,
 		base: base, nextClientID: 9000, nextPort: 41000, objectClient: map[string]int64{},
-		identities: map[string]workbenchVectorIdentity{}, fixtures: map[string]string{}}
+		fixtures: map[string]string{}}
 	api.workbench.now = func() time.Time { return h.base.Add(time.Duration(h.clockMs.Load()) * time.Millisecond) }
 	mux := http.NewServeMux()
 	api.Register(mux)
@@ -214,18 +213,8 @@ func newWorkbenchHarness(t *testing.T, base time.Time) *workbenchHarness {
 
 func (h *workbenchHarness) setClock(atMs int64) { h.clockMs.Store(atMs) }
 
-// realUsername maps a vector identity to an account name. Usernames are globally unique on this
-// server, so the vector's "alice" of tenant t2 cannot share the name of t1's alice; every tenant
-// but t1 gets a suffix, and rows are mapped back before they are compared.
-func (h *workbenchHarness) realUsername(tenantID, username string) string {
-	real := username
-	if tenantID != "t1" {
-		real = username + "-" + tenantID
-	}
-	h.identities[real] = workbenchVectorIdentity{TenantID: tenantID, Username: username}
-	return real
-}
-
+// insertUser creates an account named as in the vector: login names are unique per tenant, so the
+// vector's "alice" of tenant t2 is an account named alice next to t1's.
 func (h *workbenchHarness) insertUser(username, tenantID string, admin bool) {
 	h.t.Helper()
 	role := store.ManagementRoleUser
@@ -233,7 +222,7 @@ func (h *workbenchHarness) insertUser(username, tenantID string, admin bool) {
 		role = store.ManagementRoleAdmin
 	}
 	now := time.Now()
-	if err := h.db.InsertManagementUser(h.ctx, store.ManagementUser{Username: username, TenantID: tenantID,
+	if _, err := h.db.InsertManagementUser(h.ctx, store.ManagementUser{Username: username, TenantID: tenantID,
 		PasswordHash: "test-password-hash", Role: role, Enabled: true, CreatedAt: now, UpdatedAt: now}); err != nil {
 		h.t.Fatalf("insert user %s: %v", username, err)
 	}
@@ -246,11 +235,11 @@ func (h *workbenchHarness) addFixtureAdmin(tenantID string) {
 }
 
 func (h *workbenchHarness) addUser(user workbenchVectorIdentity) {
-	h.insertUser(h.realUsername(user.TenantID, user.Username), user.TenantID, user.Admin)
+	h.insertUser(user.Username, user.TenantID, user.Admin)
 }
 
 func (h *workbenchHarness) token(tenantID, username string) string {
-	return h.tokens.IssueForUser(h.realUsername(tenantID, username), tenantID, store.ManagementRoleUser)
+	return h.tokens.IssueForUser(username, tenantID, store.ManagementRoleUser)
 }
 
 func (h *workbenchHarness) fixtureToken(tenantID string) string {
@@ -272,7 +261,7 @@ func (h *workbenchHarness) addClient(tenantID, owner string) store.ClientAccount
 	h.nextClientID++
 	now := time.Now()
 	client := store.ClientAccount{ID: h.nextClientID, TenantID: tenantID,
-		OwnerUsername: h.realUsername(tenantID, owner),
+		OwnerUsername: owner,
 		ClientName:    fmt.Sprintf("wb-client-%d", h.nextClientID), PasswordHash: "unused", Enabled: true,
 		ConnectionRateLimitPerMinute: 60, CreatedAt: now, UpdatedAt: now}
 	if err := h.db.InsertClient(h.ctx, client); err != nil {
@@ -311,7 +300,7 @@ func (h *workbenchHarness) addService(object workbenchVectorObject, client store
 }
 
 func (h *workbenchHarness) storedRow(row workbenchVectorRow) store.WorkbenchItem {
-	return store.WorkbenchItem{TenantID: row.TenantID, Username: h.realUsername(row.TenantID, row.Username),
+	return store.WorkbenchItem{TenantID: row.TenantID, Username: row.Username,
 		List: row.List, Kind: row.Kind, ObjectID: row.ID, AtMs: h.base.UnixMilli() + row.AtMs}
 }
 
@@ -323,11 +312,7 @@ func (h *workbenchHarness) vectorRows() []workbenchVectorRow {
 	}
 	rows := make([]workbenchVectorRow, 0, len(items))
 	for _, item := range items {
-		identity, ok := h.identities[item.Username]
-		if !ok || identity.TenantID != item.TenantID {
-			h.t.Fatalf("row of an unknown identity: %+v", item)
-		}
-		rows = append(rows, workbenchVectorRow{TenantID: item.TenantID, Username: identity.Username, List: item.List,
+		rows = append(rows, workbenchVectorRow{TenantID: item.TenantID, Username: item.Username, List: item.List,
 			Kind: item.Kind, ID: item.ObjectID, AtMs: item.AtMs - h.base.UnixMilli()})
 	}
 	sortWorkbenchVectorRows(rows)
@@ -435,7 +420,7 @@ func (h *workbenchHarness) applyEvent(label string, step workbenchVectorStep) {
 		if err != nil {
 			h.t.Fatalf("%s: %v", label, err)
 		}
-		account.OwnerUsername = h.realUsername(account.TenantID, step.OwnerUsername)
+		account.OwnerUsername = step.OwnerUsername
 		if err := h.db.UpdateClient(h.ctx, *account); err != nil {
 			h.t.Fatalf("%s: %v", label, err)
 		}
@@ -444,7 +429,7 @@ func (h *workbenchHarness) applyEvent(label string, step workbenchVectorStep) {
 		if step.Admin {
 			role = store.ManagementRoleAdmin
 		}
-		h.expect2xx(label, http.MethodPut, "/api/admin/users/"+h.realUsername(step.TenantID, step.Username),
+		h.expect2xx(label, http.MethodPut, "/api/admin/users/"+step.Username,
 			h.fixtureToken(step.TenantID), map[string]any{"role": role})
 	case "create-user":
 		role := store.ManagementRoleUser
@@ -452,10 +437,10 @@ func (h *workbenchHarness) applyEvent(label string, step workbenchVectorStep) {
 			role = store.ManagementRoleAdmin
 		}
 		h.expect2xx(label, http.MethodPost, "/api/admin/users", h.fixtureToken(step.TenantID),
-			map[string]any{"username": h.realUsername(step.TenantID, step.Username),
+			map[string]any{"username": step.Username,
 				"password": "workbench-test-password", "role": role})
 	case "delete-user":
-		h.expect2xx(label, http.MethodDelete, "/api/admin/users/"+h.realUsername(step.TenantID, step.Username),
+		h.expect2xx(label, http.MethodDelete, "/api/admin/users/"+step.Username,
 			h.fixtureToken(step.TenantID), nil)
 	case "store-down":
 		h.setStoreDown(true)

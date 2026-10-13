@@ -50,14 +50,35 @@ int st_elasticsearch_get_tcp(const char *database_path,
                              const char *owner_username,
                              int include_all_clients,
                              st_storage_tcp_frame *frame);
+/* One page of a channel's frames in capture order (Java findStream sorts by id, ascending). */
 int st_elasticsearch_list_tcp_stream(const char *database_path,
                                      const char *channel_id,
                                      const char *tenant_id,
                                      const char *owner_username,
                                      int include_all_clients,
-                                     int limit,
+                                     int page,
+                                     int size,
                                      st_storage_tcp_frame *items,
                                      size_t max_items,
-                                     size_t *item_count);
+                                     size_t *item_count,
+                                     long long *total_count);
+
+/*
+ * The write queue (Java TrafficInspectionService): recorded documents wait in memory and a
+ * background writer sends them in _bulk batches. flush sends one batch of each kind now (Java
+ * flush(), the flush=true query parameter); shutdown stops the writer and sends what is left.
+ */
+typedef struct {
+    int pending_http;
+    int pending_tcp;
+    long long dropped_http;
+    long long dropped_tcp;
+    /* ISO-8601 UTC of the last flush, "" before the first. */
+    char last_flushed_at[40];
+} st_elasticsearch_traffic_snapshot;
+
+void st_elasticsearch_traffic_flush(void);
+void st_elasticsearch_traffic_shutdown(void);
+void st_elasticsearch_traffic_snapshot_current(st_elasticsearch_traffic_snapshot *snapshot);
 
 #endif

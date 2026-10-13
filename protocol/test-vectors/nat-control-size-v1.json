@@ -1,0 +1,73 @@
+{
+  "name": "nat-control-size-v1",
+  "version": 1,
+  "description": "The 1 MiB MESSAGE body a client's NAT_CONTROL travels in, as the management API enforces it: creating an enabled TCP mapping or HTTP route, or changing one so that it is enabled afterwards, is refused with 400 when the client's NAT_CONTROL, measured in the server's own encoding with the client name counted at the longest a rename allows, would no longer fit; and how a NAT_CONTROL that already does not fit, written before the check existed or straight to the database, is handled when it is due: not sent, logged, the connection kept, the manual push answered with 409; and a control connection that cannot be written, where the manual push answers the 409 of an offline client and changes answer as usual. See protocol/spec/control-protocol.md (NAT_CONTROL 的大小, NAT_CONTROL 写失败与数据库错误).",
+  "notes": [
+    "J 是该实现按当前配置生成的 NAT_CONTROL JSON 在 clientName 为空串时的 UTF-8 字节数。bodyBytes 是 clientName 按 120 个字符预留之后的 MESSAGE body 字节数：482 + 1 + 1 + varint(J + 721) + J + 720。fits 为 bodyBytes <= messageBodyLimitBytes。",
+    "sizing：每个 case 用该实现的 JSON 生成逻辑构造一个空串名字下 JSON 恰为 jsonBytesWithEmptyClientName 字节的配置（例如调整一条 route 的 targetBaseUrl 长度），断言实现的大小计算给出 bodyBytes 和 fits。15662/15663 跨过 JSON 长度前缀从 2 字节变成 3 字节的位置。",
+    "management：在一台全新的服务端上建一个客户端账户，先直接向数据库写入启用的 route，使 J 恰为 maxJsonBytesWithEmptyClientName - fillRemainingJsonBytes；再按顺序经管理 API 重放 steps。",
+    "createRoute 的 targetBaseUrl 为 exact 时，测试选择 http://127.0.0.1:8080/ 加若干 ASCII 字母，使这条 route 加入后 J 恰为 maxJsonBytesWithEmptyClientName，即 body 恰为上限；否则用给出的 URL。createMapping 的 listenPort 由测试选一个未用的端口，targetAddress 为 127.0.0.1，targetPort 为 8080。",
+    "updateRoute / updateMapping 只改给出的字段，其余字段按当前值原样提交；growTargetBaseUrlBy 表示在当前 targetBaseUrl 末尾追加这么多个 ASCII 字母。",
+    "expect 为期望的 HTTP 状态码。400 时响应的 error 必须包含 errorContains，并且该客户端的映射和 route（条目、字段和启用状态）与这一步之前完全相同。每一步之后，按 clientName 预留计算的 body 都不得超过 messageBodyLimitBytes。",
+    "existingOversize：在一台全新的服务端上建一个客户端账户，绕过管理接口直接向数据库写入启用的 route（每条 targetBaseUrl 不超过 fillTargetBaseUrlMaxBytes 字节，C 服务端的 route 目标最长 511 字节），使空串名字下的 J 不少于 jsonBytesWithEmptyClientName。它比上限多出不止一条 route，所以无论客户端叫什么、删掉其中任意一条之后，NAT_CONTROL 都放不进一条 MESSAGE。然后按顺序执行 steps。",
+    "connect 用该客户端登录 control 连接（也可以接着登录 data 连接），登录必须成功；开启了 Peer Mesh 的服务端还必须照常发来 Peer Mesh 的登录推送。pushNatControl 和 forceRefreshPortMapping 分别调用 POST /api/admin/clients/{id}/nat-control 和 POST /api/admin/clients/{id}/force-refresh-port-mapping。createRoute 经管理接口新建 route；deleteFillRoute 经管理接口删除任意一条直接写库的 route。expect 为期望的 HTTP 状态码，409 时响应的 error 必须包含 errorContains。shrinkInStore 直接在数据库里停用所有直接写库的 route，不经管理接口，也不触发推送。",
+    "整个场景里服务端不得关闭 control 连接。natControl 为 true 的那一步之前不得收到任何 NAT_CONTROL；那一步之后收到的第一条 NAT_CONTROL 不含任何直接写库的 route。",
+    "writeFailure：客户端在线（control 会话已经登录并绑定），但写它的 control 连接总是失败，见 control-protocol.md 的「NAT_CONTROL 写失败与数据库错误」。Java、Go、.NET 的测试把一个写入总是报错的 control 会话绑定到该客户端名下，然后按顺序执行 steps：createRoute、deleteRoute 经管理接口新建、删除 route，之后的自动推送写失败也不改变它们的状态码；pushNatControl、forceRefreshPortMapping 同上。C 服务端的测试让 control 登录停在测试闸门上（会话已经发布、登录响应还没写出），发出手动下发，再让客户端以 RST 断开并放行登录，手动下发因而写在已经断开的连接上；它只执行 pushNatControl 和 forceRefreshPortMapping，每一步各用一次这样的登录。expect 为期望的 HTTP 状态码，409 时响应的 error 必须包含 writeFailure.errorContains。"
+  ],
+  "messageBodyLimitBytes": 1048576,
+  "clientNameReserve": {
+    "maxCharacters": 120,
+    "fieldBytes": 480,
+    "jsonBytes": 720
+  },
+  "maxJsonBytesWithEmptyClientName": 1047369,
+  "errorContains": "NAT_CONTROL",
+  "sizing": [
+    { "jsonBytesWithEmptyClientName": 1000, "bodyBytes": 2206, "fits": true },
+    { "jsonBytesWithEmptyClientName": 15662, "bodyBytes": 16868, "fits": true },
+    { "jsonBytesWithEmptyClientName": 15663, "bodyBytes": 16870, "fits": true },
+    { "jsonBytesWithEmptyClientName": 1047369, "bodyBytes": 1048576, "fits": true },
+    { "jsonBytesWithEmptyClientName": 1047370, "bodyBytes": 1048577, "fits": false }
+  ],
+  "management": {
+    "fillRemainingJsonBytes": 400,
+    "steps": [
+      { "op": "createRoute", "route": "edge", "targetBaseUrl": "exact", "enabled": true, "expect": 201 },
+      { "op": "createRoute", "route": "one-more", "targetBaseUrl": "http://127.0.0.1:8080", "enabled": true, "expect": 400 },
+      { "op": "createMapping", "mapping": "tcp-more", "enabled": true, "expect": 400 },
+      { "op": "createRoute", "route": "idle", "targetBaseUrl": "http://127.0.0.1:8080", "enabled": false, "expect": 201 },
+      { "op": "createMapping", "mapping": "tcp-idle", "enabled": false, "expect": 201 },
+      { "op": "updateRoute", "route": "idle", "enabled": true, "expect": 400 },
+      { "op": "updateMapping", "mapping": "tcp-idle", "enabled": true, "expect": 400 },
+      { "op": "updateRoute", "route": "edge", "detailCaptureEnabled": true, "expect": 200 },
+      { "op": "updateRoute", "route": "edge", "growTargetBaseUrlBy": 1, "expect": 400 },
+      { "op": "updateRoute", "route": "edge", "enabled": false, "expect": 200 },
+      { "op": "updateRoute", "route": "idle", "enabled": true, "expect": 200 },
+      { "op": "updateMapping", "mapping": "tcp-idle", "enabled": true, "expect": 200 },
+      { "op": "updateRoute", "route": "edge", "enabled": true, "expect": 400 },
+      { "op": "deleteRoute", "route": "edge", "expect": 204 }
+    ]
+  },
+  "existingOversize": {
+    "jsonBytesWithEmptyClientName": 1050000,
+    "fillTargetBaseUrlMaxBytes": 500,
+    "steps": [
+      { "op": "connect" },
+      { "op": "pushNatControl", "expect": 409 },
+      { "op": "forceRefreshPortMapping", "expect": 409 },
+      { "op": "createRoute", "route": "idle", "targetBaseUrl": "http://127.0.0.1:8080", "enabled": false, "expect": 201 },
+      { "op": "deleteFillRoute", "expect": 204 },
+      { "op": "shrinkInStore" },
+      { "op": "pushNatControl", "expect": 200, "natControl": true }
+    ]
+  },
+  "writeFailure": {
+    "errorContains": "不在线",
+    "steps": [
+      { "op": "createRoute", "route": "write-failure", "targetBaseUrl": "http://127.0.0.1:8080", "enabled": true, "expect": 201 },
+      { "op": "pushNatControl", "expect": 409 },
+      { "op": "forceRefreshPortMapping", "expect": 409 },
+      { "op": "deleteRoute", "route": "write-failure", "expect": 204 }
+    ]
+  }
+}

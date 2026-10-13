@@ -458,9 +458,10 @@ public sealed class ClientEgressCapabilities
         Version = Specus.Protocol.PeerEgress.PeerEgressProtocol.ProtocolVersion,
         ConsumerCapable = Specus.Client.PeerMesh.PeerEgressRouteCommanders.TakeoverSupported(),
         EgressCapable = true,
-        // The egress resolves names consumers bind. IPv6 targets are not announced: the outbound
-        // socket binding that keeps forwarded traffic out of this device's own tunnel is IPv4 only.
+        // The egress resolves names consumers bind, and dials a name with no A record over its AAAA
+        // records (PeerEgressRuntime.ResolveName).
         DomainTargetCapable = true,
+        Ipv6TargetCapable = Specus.Client.PeerMesh.PeerEgressRuntime.Ipv6TargetCapable,
     };
 }
 

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLoadFromEnvMapsTLSKeystore(t *testing.T) {
 	t.Setenv("SPECUS_TLS_MODE", "file")
@@ -341,14 +344,21 @@ func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 	}
 }
 
-func TestLoadAllowsHeaderOnlyFrameLimitAndRejectsSmaller(t *testing.T) {
-	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "11")
+// The full-frame limit must hold a MESSAGE of the 1 MiB body limit: the server's own frames are held
+// to it, and a smaller one left a NAT_CONTROL within the protocol's limit unsendable, the manual push
+// answering 500.
+func TestLoadAllowsTheLargestMessageFrameLimitAndRejectsSmaller(t *testing.T) {
+	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "1048587")
 	t.Setenv("SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE", "11")
-	if cfg, err := Load(""); err != nil || cfg.Netty.MaxFrameSize != 11 {
-		t.Fatalf("11-byte full-frame limit rejected: cfg=%+v err=%v", cfg.Netty, err)
+	if cfg, err := Load(""); err != nil || cfg.Netty.MaxFrameSize != MinMaxFrameSize {
+		t.Fatalf("a full-frame limit of 11 + 1 MiB rejected: cfg=%+v err=%v", cfg.Netty, err)
 	}
-	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "10")
+	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "1048586")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "netty.maxFrameSize") {
+		t.Fatalf("a full-frame limit one byte short of 11 + 1 MiB should be rejected, got %v", err)
+	}
+	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "11")
 	if _, err := Load(""); err == nil {
-		t.Fatal("10-byte full-frame limit should be rejected")
+		t.Fatal("a header-only full-frame limit should be rejected")
 	}
 }

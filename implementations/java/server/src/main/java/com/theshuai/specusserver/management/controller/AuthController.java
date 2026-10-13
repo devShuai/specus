@@ -117,7 +117,8 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("error", "OIDC 令牌不能通过该端点续期"));
         }
-        return managementUserService.resolveLocalTokenUser(jwt.getSubject(), claimAsString(jwt, "tenant_id"))
+        return managementUserService.resolveLocalTokenUser(jwt.getSubject(), claimAsString(jwt, "tenant_id"),
+                        claimAsString(jwt, LocalTokenService.ACCOUNT_KEY_CLAIM))
                 .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                         .body(Map.of("error", "账号已禁用、不存在或不再允许本地登录")));
@@ -125,7 +126,8 @@ public class AuthController {
 
     private Map<String, Object> buildTokenBody(LoginUser user) {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("accessToken", localTokenService.issueToken(user.username(), user.tenantId(), user.role()));
+        body.put("accessToken", localTokenService.issueToken(
+                user.username(), user.tenantId(), user.role(), user.tokenAccountKey()));
         body.put("tokenType", "Bearer");
         body.put("expiresIn", localTokenService.getTtlSeconds());
         return body;

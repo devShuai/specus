@@ -7,6 +7,8 @@ import com.theshuai.specusserver.management.service.ManagementUserService;
 import com.theshuai.specusserver.management.service.ManagementUserService.UserMutation;
 import com.theshuai.specusserver.productmetrics.ProductMetricsModel;
 import com.theshuai.specusserver.productmetrics.ProductMetricsService;
+import com.theshuai.specusserver.websocket.ClientMessagesWebSocketHandler;
+import com.theshuai.specusserver.websocket.ConnectionEventsWebSocketHandler;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -28,13 +30,19 @@ public class UserResource {
     private final ManagementContextResolver contextResolver;
     private final ManagementUserService userService;
     private final ProductMetricsService productMetrics;
+    private final ClientMessagesWebSocketHandler clientMessages;
+    private final ConnectionEventsWebSocketHandler connectionEvents;
 
     public UserResource(ManagementContextResolver contextResolver,
                         ManagementUserService userService,
-                        ProductMetricsService productMetrics) {
+                        ProductMetricsService productMetrics,
+                        ClientMessagesWebSocketHandler clientMessages,
+                        ConnectionEventsWebSocketHandler connectionEvents) {
         this.contextResolver = contextResolver;
         this.userService = userService;
         this.productMetrics = productMetrics;
+        this.clientMessages = clientMessages;
+        this.connectionEvents = connectionEvents;
     }
 
     @GetMapping("/me")
@@ -67,6 +75,9 @@ public class UserResource {
     public ResponseEntity<Void> deleteUser(@AuthenticationPrincipal Jwt jwt, @PathVariable String username) {
         ManagementContext context = contextResolver.resolve(jwt);
         String deleted = userService.deleteUser(context, username);
+        // Committed: the identity's open management WebSockets end (management-accounts.md 7.1).
+        clientMessages.closeIdentity(context.tenant().tenantId(), deleted);
+        connectionEvents.closeIdentity(context.tenant().tenantId(), deleted);
         productMetrics.userDeleted(context.tenant().tenantId(), deleted);
         return ResponseEntity.noContent().build();
     }

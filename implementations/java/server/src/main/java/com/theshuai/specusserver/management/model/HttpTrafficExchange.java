@@ -6,7 +6,6 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
-import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
@@ -101,23 +100,22 @@ public class HttpTrafficExchange {
     @Column(name = "request_preview_hex", length = 4096)
     private String requestPreviewHex;
 
-    // A @Lob column keeps @Column's default length of 255, which MySQL turns into tinyblob/tinytext.
-    @Lob
+    // Not @Lob: on PostgreSQL a @Lob is an oid column bound through the large-object API, which
+    // refuses to run outside a transaction, and a LIKE on it binds the keyword as a new large object.
+    // Length.LONG32 makes these bytea and text there, longblob and longtext on MySQL, and SQLite keeps
+    // binding them as bytes and a string. HttpExchangeLargeObjectMigrator converts the oid columns.
     @Column(name = "request_body_data", length = Length.LONG32)
     private byte[] requestBodyData;
 
-    @Lob
     @Column(name = "request_preview_text", length = Length.LONG32)
     private String requestPreviewText;
 
     @Column(name = "response_preview_hex", length = 4096)
     private String responsePreviewHex;
 
-    @Lob
     @Column(name = "response_body_data", length = Length.LONG32)
     private byte[] responseBodyData;
 
-    @Lob
     @Column(name = "response_preview_text", length = Length.LONG32)
     private String responsePreviewText;
 

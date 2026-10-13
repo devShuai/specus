@@ -44,12 +44,19 @@ final class PeerEgressSocketDialer implements PeerEgressRuntime.Dialer {
         return new Stream(target, timeoutMs, binder);
     }
 
+    /** The socket family for a target: IPv6 for an IPv6 target, which the egress now dials. */
+    private static StandardProtocolFamily familyOf(InetSocketAddress target) {
+        return target.getAddress() instanceof java.net.Inet6Address
+                ? StandardProtocolFamily.INET6
+                : StandardProtocolFamily.INET;
+    }
+
     /** One TCP connection. */
     private static final class Stream implements PeerEgressRuntime.Socket {
         private final SocketChannel channel;
 
         Stream(InetSocketAddress target, long timeoutMs, PeerEgressSocketBinder binder) throws IOException {
-            channel = SocketChannel.open(StandardProtocolFamily.INET);
+            channel = SocketChannel.open(familyOf(target));
             try {
                 binder.bind(channel, target);
                 channel.socket().connect(target, (int) Math.min(timeoutMs, Integer.MAX_VALUE));
@@ -112,7 +119,7 @@ final class PeerEgressSocketDialer implements PeerEgressRuntime.Dialer {
         private final DatagramChannel channel;
 
         Datagram(InetSocketAddress target, PeerEgressSocketBinder binder) throws IOException {
-            channel = DatagramChannel.open(StandardProtocolFamily.INET);
+            channel = DatagramChannel.open(familyOf(target));
             try {
                 binder.bind(channel, target);
                 channel.connect(target);

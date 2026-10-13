@@ -758,6 +758,45 @@ int st_json_object_keys_unique(const char *json)
     return unique;
 }
 
+int st_json_object_has_only_scalar_fields(const char *json, const char *const *allowed, size_t allowed_count)
+{
+    if (json == NULL || !st_json_is_valid_object(json)) {
+        return 0;
+    }
+    const char *p = skip_ws(json);
+    p = skip_ws(p + 1);
+    while (*p != '}') {
+        size_t name_len = 0U;
+        char *name = parse_json_string_value_len(&p, &name_len);
+        if (name == NULL) {
+            return 0;
+        }
+        int known = 0;
+        for (size_t i = 0U; i < allowed_count && !known; ++i) {
+            known = strlen(allowed[i]) == name_len && memcmp(allowed[i], name, name_len) == 0;
+        }
+        free(name);
+        if (!known) {
+            return 0;
+        }
+        p = skip_ws(p);
+        /* The object was validated above, so a ':' and a value follow every name. */
+        p = skip_ws(p + 1);
+        if (*p == '{' || *p == '[') {
+            return 0;
+        }
+        const char *value_end = validate_json_value(p, 1U);
+        if (value_end == NULL) {
+            return 0;
+        }
+        p = skip_ws(value_end);
+        if (*p == ',') {
+            p = skip_ws(p + 1);
+        }
+    }
+    return 1;
+}
+
 void st_json_free_string_array(char **values, size_t values_len)
 {
     if (values == NULL) {

@@ -206,10 +206,18 @@ final class PeerMeshEngine implements Closeable {
             if (context == null) {
                 return;
             }
-            android.content.Intent intent = new android.content.Intent(PeerServiceEvents.ACTION_SERVICES);
-            intent.setPackage(context.getPackageName());
-            intent.putExtra(PeerServiceEvents.EXTRA_JSON, json);
-            context.sendBroadcast(intent);
+            // The snapshot only informs the UI, and it is published from control-connection work
+            // (login, catalog updates). A broadcast the platform refuses -- ContextImpl rethrows a
+            // binder failure such as TransactionTooLargeException as a RuntimeException -- must
+            // not fail that work and drop the connection. The UI still reads the latest snapshot
+            // from PeerServiceRuntime.lastSnapshotJson(), and every later one is complete.
+            try {
+                android.content.Intent intent = new android.content.Intent(PeerServiceEvents.ACTION_SERVICES);
+                intent.setPackage(context.getPackageName());
+                intent.putExtra(PeerServiceEvents.EXTRA_JSON, json);
+                context.sendBroadcast(intent);
+            } catch (RuntimeException ignored) {
+            }
         });
     }
 
@@ -384,6 +392,28 @@ final class PeerMeshEngine implements Closeable {
         String rejection = capabilities.rejectionReason(size);
         if (rejection != null) {
             throw new IllegalStateException(rejection);
+        }
+    }
+
+    /** The peers this device knows from the server's roster, by name, for status views. */
+    List<RosterEntry> rosterSnapshot() {
+        List<RosterEntry> roster = new ArrayList<>();
+        for (PeerInfo peer : peers.values()) {
+            roster.add(new RosterEntry(peer.clientName, peer.virtualIp, peer.online));
+        }
+        roster.sort(Comparator.comparing(entry -> entry.clientName));
+        return roster;
+    }
+
+    static final class RosterEntry {
+        final String clientName;
+        final String virtualIp;
+        final boolean online;
+
+        RosterEntry(String clientName, String virtualIp, boolean online) {
+            this.clientName = clientName == null ? "" : clientName;
+            this.virtualIp = virtualIp == null ? "" : virtualIp;
+            this.online = online;
         }
     }
 

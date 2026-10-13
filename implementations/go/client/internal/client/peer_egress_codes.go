@@ -87,3 +87,31 @@ var egressLANCIDRs = []string{
 	"192.168.0.0/16",
 	"100.64.0.0/10",
 }
+
+// The IPv6 counterparts of the forced-deny list (protocol/spec/peer-egress.md, 强制拒绝清单), held
+// apart from the IPv4 one only so each list reads as one family; a destination is checked against
+// both and only a prefix of its own family can contain it.
+var egressForcedDenyCIDRs6 = []string{
+	"::/128",
+	"::1/128",
+	// A socket connected to an IPv4-mapped address reaches the IPv4 address, past every IPv4 entry.
+	"::ffff:0:0/96",
+	// Prefixes that embed an IPv4 address a NAT64 gateway or a 6to4 relay forwards to, metadata
+	// and private ranges included.
+	"64:ff9b::/96",
+	"64:ff9b:1::/48",
+	"2002::/16",
+	"fe80::/10",
+	"fec0::/10",
+	"ff00::/8",
+}
+
+// The IPv6 instance metadata endpoint, in the unique local range a LAN-scoped policy can grant.
+var egressCloudMetadataCIDRs6 = []string{
+	"fd00:ec2::254/128",
+}
+
+// Unique local addresses, the IPv6 counterpart of the private ranges.
+var egressLANCIDRs6 = []string{
+	"fc00::/7",
+}

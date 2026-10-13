@@ -15,7 +15,7 @@ func TestResolveOrProvisionOIDCUserDoesNotOverwriteExistingBinding(t *testing.T)
 	}
 	defer db.Close()
 	now := time.Now()
-	if err := db.InsertManagementUser(context.Background(), ManagementUser{
+	if _, err := db.InsertManagementUser(context.Background(), ManagementUser{
 		Username: "local-user", TenantID: "default", PasswordHash: "password-hash",
 		Role: ManagementRoleUser, Enabled: true, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
@@ -30,7 +30,7 @@ func TestResolveOrProvisionOIDCUserDoesNotOverwriteExistingBinding(t *testing.T)
 		"identity-two", "local-user", "default", "unused", now.Add(2*time.Second)); !errors.Is(err, ErrOIDCIdentityConflict) {
 		t.Fatalf("second identity bind error = %v, want conflict", err)
 	}
-	stored, err := db.FindManagementUserByUsername(context.Background(), "local-user")
+	stored, err := db.FindManagementUserByLogin(context.Background(), "default", "local-user")
 	if err != nil || stored == nil {
 		t.Fatalf("read bound user: user=%+v err=%v", stored, err)
 	}
@@ -44,7 +44,7 @@ func TestResolveOrProvisionOIDCUserDoesNotOverwriteExistingBinding(t *testing.T)
 	}
 }
 
-func TestResolveExactOIDCUsernameBindingAcceptsOnlyCommittedExactIdentity(t *testing.T) {
+func TestResolveExactOIDCAccountBindingAcceptsOnlyCommittedExactIdentity(t *testing.T) {
 	db, err := Open("sqlite", filepath.Join(t.TempDir(), "oidc-cas-revalidation.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -56,10 +56,11 @@ func TestResolveExactOIDCUsernameBindingAcceptsOnlyCommittedExactIdentity(t *tes
 		OIDCIssuer: "https://issuer.example", OIDCSubject: "subject-one", OIDCIdentityKey: "identity-one",
 		Role: ManagementRoleUser, Enabled: true, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := db.InsertManagementUser(context.Background(), user); err != nil {
+	user, err = db.InsertManagementUser(context.Background(), user)
+	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := db.resolveExactOIDCUsernameBinding(context.Background(), user.Username,
+	resolved, err := db.resolveExactOIDCAccountBinding(context.Background(), user.AccountKey,
 		user.OIDCIssuer, user.OIDCSubject, user.OIDCIdentityKey)
 	if err != nil || resolved == nil || resolved.Username != user.Username {
 		t.Fatalf("resolve exact binding: user=%+v err=%v", resolved, err)
@@ -70,7 +71,7 @@ func TestResolveExactOIDCUsernameBindingAcceptsOnlyCommittedExactIdentity(t *tes
 		"key":     {user.OIDCIssuer, user.OIDCSubject, "other-key"},
 	} {
 		issuer, subject, identityKey := mismatch[0], mismatch[1], mismatch[2]
-		if _, err := db.resolveExactOIDCUsernameBinding(context.Background(), user.Username,
+		if _, err := db.resolveExactOIDCAccountBinding(context.Background(), user.AccountKey,
 			issuer, subject, identityKey); !errors.Is(err, ErrOIDCIdentityConflict) {
 			t.Errorf("%s mismatch error = %v, want identity conflict", name, err)
 		}
@@ -80,7 +81,7 @@ func TestResolveExactOIDCUsernameBindingAcceptsOnlyCommittedExactIdentity(t *tes
 	if err := db.UpdateManagementUser(context.Background(), user); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.resolveExactOIDCUsernameBinding(context.Background(), user.Username,
+	if _, err := db.resolveExactOIDCAccountBinding(context.Background(), user.AccountKey,
 		user.OIDCIssuer, user.OIDCSubject, user.OIDCIdentityKey); !errors.Is(err, ErrManagementUserDisabled) {
 		t.Fatalf("disabled exact binding error = %v, want disabled", err)
 	}
