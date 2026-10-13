@@ -19,17 +19,20 @@ cleanup() {
     [[ -f "$TMP_DIR/server.log" ]] && sed -n '1,160p' "$TMP_DIR/server.log" >&2
     [[ -f "$TMP_DIR/oss.log" ]] && sed -n '1,160p' "$TMP_DIR/oss.log" >&2
   fi
-  if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; fi
-  if [[ -n "${OSS_PID:-}" ]]; then kill "$OSS_PID" 2>/dev/null || true; fi
+  if [[ -n "${SERVER_PID:-}" ]]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi
+  if [[ -n "${OSS_PID:-}" ]]; then kill "$OSS_PID" 2>/dev/null || true; wait "$OSS_PID" 2>/dev/null || true; fi
   rm -rf "$TMP_DIR"
   return "$status"
 }
 trap cleanup EXIT
 
-python3 - "$OSS_PORT" <<'PY' >"$TMP_DIR/oss.log" 2>&1 &
+python3 - "$OSS_PORT" "$TMP_DIR/oss.ready" <<'PY' >"$TMP_DIR/oss.log" 2>&1 &
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+from pathlib import Path
 import sys
 import threading
+import time
 import urllib.parse
 
 objects = {}
@@ -103,9 +106,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+# The optional delay lets the regression exercise a slow mock independently of the C server.
+time.sleep(float(os.environ.get("SPECUS_TEST_OSS_START_DELAY_SECONDS", "0")))
+server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+Path(sys.argv[2]).touch()
+server.serve_forever()
 PY
 OSS_PID=$!
+
+# C can become ready before Python has even imported http.server. Wait for this mock's own
+# listener, not just the admin login, and do not send a probe counted as an OSS operation.
+for _ in $(seq 1 200); do
+  [[ -f "$TMP_DIR/oss.ready" ]] && break
+  if ! kill -0 "$OSS_PID" 2>/dev/null; then
+    echo "OSS mock exited before becoming ready" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+if [[ ! -f "$TMP_DIR/oss.ready" ]]; then
+  echo "OSS mock did not become ready within 10 seconds" >&2
+  exit 1
+fi
 
 SPECUS_ENV=dev \
 SPECUS_DATABASE_PATH="$TMP_DIR/specus.db" \

@@ -125,6 +125,183 @@ static void *tls_accept_run(void *arg)
     return NULL;
 }
 
+typedef struct {
+    st_tls_connection *connection;
+    size_t count;
+    size_t block_size;
+    int result;
+} duplex_worker;
+
+static void *duplex_reader(void *arg)
+{
+    duplex_worker *worker = arg;
+    worker->result = 1;
+    for (size_t i = 0; i < worker->count; ++i) {
+        uint8_t value;
+        ssize_t rc = st_tls_connection_read(worker->connection, &value, 1);
+        if (rc != 1
+            || value != (uint8_t)i) {
+            fprintf(stderr, "duplex reader failed at %zu: rc=%zd\n", i, rc);
+            return NULL;
+        }
+    }
+    worker->result = 0;
+    return NULL;
+}
+
+static void *duplex_writer(void *arg)
+{
+    duplex_worker *worker = arg;
+    worker->result = 1;
+    if (worker->block_size > 1) {
+        size_t len = worker->count * worker->block_size;
+        uint8_t *payload = malloc(len);
+        if (payload == NULL) return NULL;
+        for (size_t i = 0; i < worker->count; ++i) {
+            memset(payload + i * worker->block_size, (uint8_t)(i ^ 0xa5U), worker->block_size);
+        }
+        worker->result = st_tls_connection_write_all(worker->connection, payload, len) != 0;
+        free(payload);
+        return NULL;
+    }
+    for (size_t i = 0; i < worker->count; ++i) {
+        uint8_t value = (uint8_t)(i ^ 0xa5U);
+        if (st_tls_connection_write_all(worker->connection, &value, 1) != 0) {
+            fprintf(stderr, "duplex writer failed at %zu\n", i);
+            return NULL;
+        }
+    }
+    worker->result = 0;
+    return NULL;
+}
+
+static void *read_until_failed(void *arg)
+{
+    duplex_worker *worker = arg;
+    uint8_t value;
+    worker->result = st_tls_connection_read(worker->connection, &value, 1) == -1 ? 0 : 1;
+    return NULL;
+}
+
+/* Separate server read/push threads, but just one client SSL owner. A pending server read must
+ * not hold a blocking SSL lock and delay the first push. TLS 1.3 updates request a response, so
+ * the server read path also performs protocol writes while application pushes are active. */
+static int test_concurrent_push_and_key_update(int version, size_t block_size)
+{
+    st_tls_config config = {.mode = ST_TLS_SELF_SIGNED};
+    st_tls_server_context *context = NULL;
+    char error[512];
+    if (st_tls_server_context_create(&config, &context, error, sizeof(error)) != 0) {
+        return 1;
+    }
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+        st_tls_server_context_free(context);
+        return 1;
+    }
+    struct timeval timeout = {.tv_sec = 5};
+    for (int i = 0; i < 2; ++i) {
+        setsockopt(sockets[i], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sockets[i], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    }
+    tls_accept_fixture fixture = {.context = context, .fd = sockets[0]};
+    pthread_t accept_thread;
+    if (pthread_create(&accept_thread, NULL, tls_accept_run, &fixture) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        st_tls_server_context_free(context);
+        return 1;
+    }
+    SSL_CTX *client_context = SSL_CTX_new(TLS_client_method());
+    int configured = client_context != NULL
+        && SSL_CTX_set_min_proto_version(client_context, version) == 1
+        && SSL_CTX_set_max_proto_version(client_context, version) == 1;
+    SSL *client = configured ? SSL_new(client_context) : NULL;
+    int ok = client != NULL && SSL_set_fd(client, sockets[1]) == 1 && SSL_connect(client) == 1;
+    if (!ok) {
+        shutdown(sockets[1], SHUT_RDWR);
+    }
+    pthread_join(accept_thread, NULL);
+    ok = ok && fixture.connection != NULL;
+    duplex_worker reader = {.connection = fixture.connection, .count = 2048, .result = 1};
+    duplex_worker writer = reader;
+    writer.block_size = block_size;
+    pthread_t read_thread, write_thread;
+    int read_started = 0, write_started = 0;
+    if (ok) {
+        read_started = pthread_create(&read_thread, NULL, duplex_reader, &reader) == 0;
+        /* The client deliberately sends nothing until it receives the first server push. */
+        struct timespec pause = {.tv_nsec = 100000000};
+        nanosleep(&pause, NULL);
+        write_started = pthread_create(&write_thread, NULL, duplex_writer, &writer) == 0;
+        ok = read_started && write_started;
+    }
+    for (size_t i = 0; ok && i < reader.count; ++i) {
+        uint8_t value = 0;
+        uint8_t payload[4096];
+        size_t offset = 0;
+        int rc = 0;
+        while (ok && offset < block_size) {
+            rc = SSL_read(client, payload + offset, (int)(block_size - offset));
+            ok = rc > 0;
+            if (ok) offset += (size_t)rc;
+        }
+        if (!ok) fprintf(stderr, "duplex client read failed at %zu: rc=%d error=%d\n", i, rc, SSL_get_error(client, rc));
+        for (size_t j = 0; ok && j < block_size; ++j) ok = payload[j] == (uint8_t)(i ^ 0xa5U);
+        if (ok && version == TLS1_3_VERSION && i % 4U == 0) {
+            ok = SSL_key_update(client, SSL_KEY_UPDATE_REQUESTED) == 1
+                && SSL_do_handshake(client) == 1;
+        }
+        value = (uint8_t)i;
+        if (ok) {
+            rc = SSL_write(client, &value, 1);
+            ok = rc == 1;
+            if (!ok) fprintf(stderr, "duplex client write failed at %zu: rc=%d error=%d\n", i, rc, SSL_get_error(client, rc));
+        }
+    }
+    if (!ok) {
+        shutdown(sockets[0], SHUT_RDWR);
+        shutdown(sockets[1], SHUT_RDWR);
+    }
+    if (read_started) pthread_join(read_thread, NULL);
+    if (write_started) pthread_join(write_thread, NULL);
+    ok = ok && reader.result == 0 && writer.result == 0;
+
+    /* Short internal waits/wakeups must not escape as a false idle timeout. A genuine configured
+     * timeout remains -2 and does not poison the SSL connection: another message still arrives. */
+    if (ok) {
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 250000;
+        setsockopt(sockets[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        struct timespec before, after;
+        clock_gettime(CLOCK_MONOTONIC, &before);
+        uint8_t value;
+        ssize_t rc = st_tls_connection_read(fixture.connection, &value, 1);
+        clock_gettime(CLOCK_MONOTONIC, &after);
+        long elapsed_ms = (after.tv_sec - before.tv_sec) * 1000
+            + (after.tv_nsec - before.tv_nsec) / 1000000;
+        ok = rc == -2 && elapsed_ms >= 200 && elapsed_ms < 3000
+            && SSL_write(client, "x", 1) == 1
+            && st_tls_connection_read(fixture.connection, &value, 1) == 1 && value == 'x';
+    }
+    if (ok) {
+        SSL_shutdown(client);
+        uint8_t value;
+        ok = st_tls_connection_read(fixture.connection, &value, 1) == 0;
+    }
+    st_tls_connection_free(fixture.connection);
+    SSL_free(client);
+    SSL_CTX_free(client_context);
+    close(sockets[0]);
+    close(sockets[1]);
+    st_tls_server_context_free(context);
+    if (!ok) {
+        fprintf(stderr, "TLS %x concurrent push/KeyUpdate/idle timeout regression failed (reader=%d writer=%d)\n",
+                version, reader.result, writer.result);
+    }
+    return !ok;
+}
+
 /*
  * The client goes away right after the handshake and the server writes next, as a server does
  * whenever a client disconnects while a NAT_CONTROL or a stream frame is on its way. The write
@@ -230,10 +407,15 @@ static int test_write_times_out_when_peer_stops_reading(void)
     size_t len = 8U * 1024U * 1024U;
     uint8_t *buffer = (uint8_t *)calloc(1U, len);
     int write_rc = 0;
+    duplex_worker reader = {.connection = fixture.connection, .result = 1};
+    pthread_t reader_thread;
+    int reader_started = 0;
     time_t started = time(NULL);
     if (connected && accepted && timeout_set && buffer != NULL) {
         alarm(60);
+        reader_started = pthread_create(&reader_thread, NULL, read_until_failed, &reader) == 0;
         write_rc = st_tls_connection_write_all(fixture.connection, buffer, len);
+        if (reader_started) pthread_join(reader_thread, NULL);
         alarm(0);
     }
     long elapsed = (long)(time(NULL) - started);
@@ -245,7 +427,7 @@ static int test_write_times_out_when_peer_stops_reading(void)
     close(sockets[1]);
     close(sockets[0]);
     st_tls_server_context_free(context);
-    if (!connected || !accepted || !timeout_set || write_rc != -1) {
+    if (!connected || !accepted || !timeout_set || write_rc != -1 || !reader_started || reader.result != 0) {
         fprintf(stderr, "write to a peer that stopped reading: connected=%d accepted=%d timeout=%d write=%d, "
                 "expected a failed write\n", connected, accepted, timeout_set, write_rc);
         return 1;
@@ -747,6 +929,9 @@ int main(void)
         return 1;
     }
     return test_self_signed_handshake() != 0
+        || test_concurrent_push_and_key_update(TLS1_2_VERSION, 1) != 0
+        || test_concurrent_push_and_key_update(TLS1_3_VERSION, 1) != 0
+        || test_concurrent_push_and_key_update(TLS1_3_VERSION, 4096) != 0
         || test_write_after_peer_closed() != 0
         || test_write_times_out_when_peer_stops_reading() != 0
         || test_pkcs12_file_context() != 0

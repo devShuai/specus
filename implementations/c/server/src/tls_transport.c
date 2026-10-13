@@ -7,15 +7,23 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
 
 struct st_tls_server_context {
     SSL_CTX *ssl_ctx;
@@ -24,7 +32,27 @@ struct st_tls_server_context {
 
 struct st_tls_connection {
     SSL *ssl;
+    pthread_mutex_t io_lock;
+    pthread_mutex_t writer_lock;
+    pthread_cond_t changed;
+    pthread_t worker;
+    int worker_started;
+    int fd;
+    int wake[2];
+    int failed;
+    int stopping;
+    int read_eof;
+    uint8_t received[32768];
+    size_t received_len;
+    const uint8_t *write_buffer;
+    size_t write_len;
+    size_t write_offset;
+    int writing;
+    int64_t write_deadline;
 };
+
+static void *tls_io_run(void *arg);
+static void wake_tls(st_tls_connection *connection);
 
 static int env_bool(const char *name, int fallback)
 {
@@ -389,6 +417,41 @@ int st_tls_connection_accept(st_tls_server_context *context,
     if (connection == NULL) {
         return set_error(error, error_len, "out of memory creating TLS connection");
     }
+    connection->fd = fd;
+    connection->wake[0] = connection->wake[1] = -1;
+    connection->failed = 1;
+    if (pthread_mutex_init(&connection->io_lock, NULL) != 0) {
+        free(connection);
+        return set_error(error, error_len, "failed to create TLS I/O lock");
+    }
+    if (pthread_mutex_init(&connection->writer_lock, NULL) != 0) {
+        pthread_mutex_destroy(&connection->io_lock);
+        free(connection);
+        return set_error(error, error_len, "failed to create TLS writer lock");
+    }
+    pthread_condattr_t attr;
+    int attr_ok = pthread_condattr_init(&attr) == 0;
+    int cond_ok = attr_ok && pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&connection->changed, &attr) == 0;
+    if (attr_ok) pthread_condattr_destroy(&attr);
+    if (!cond_ok) {
+        pthread_mutex_destroy(&connection->writer_lock);
+        pthread_mutex_destroy(&connection->io_lock);
+        free(connection);
+        return set_error(error, error_len, "failed to create TLS condition variable");
+    }
+    if (pipe(connection->wake) != 0) {
+        st_tls_connection_free(connection);
+        return set_error(error, error_len, "failed to create TLS reader wakeup");
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (fcntl(connection->wake[i], F_SETFL, O_NONBLOCK) < 0
+            || fcntl(connection->wake[i], F_SETFD, FD_CLOEXEC) < 0) {
+            st_tls_connection_free(connection);
+            return set_error(error, error_len, "failed to configure TLS reader wakeup");
+        }
+    }
+    ERR_clear_error();
     connection->ssl = SSL_new(context->ssl_ctx);
     if (connection->ssl == NULL
         || SSL_set_fd(connection->ssl, fd) != 1
@@ -397,70 +460,270 @@ int st_tls_connection_accept(st_tls_server_context *context,
         st_tls_connection_free(connection);
         return -1;
     }
+    /* Handshake first, then transfer exclusive SSL ownership to the I/O worker. Memory BIOs
+     * separate TLS state transitions from socket backpressure: a pending ciphertext send must
+     * not block inbound TLS records (nor violate SSL_write WANT_WRITE retry ownership). */
+    BIO *input = BIO_new(BIO_s_mem());
+    BIO *output = BIO_new(BIO_s_mem());
+    if (input == NULL || output == NULL) {
+        BIO_free(input);
+        BIO_free(output);
+        st_tls_connection_free(connection);
+        return set_error(error, error_len, "failed to create TLS transport buffers");
+    }
+    BIO_set_mem_eof_return(input, -1);
+    SSL_set_bio(connection->ssl, input, output);
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        st_tls_connection_free(connection);
+        return set_error(error, error_len, "failed to configure nonblocking TLS socket");
+    }
+    connection->failed = 0;
+    if (pthread_create(&connection->worker, NULL, tls_io_run, connection) != 0) {
+        connection->failed = 1;
+        st_tls_connection_free(connection);
+        return set_error(error, error_len, "failed to start TLS I/O worker");
+    }
+    connection->worker_started = 1;
     *out = connection;
     return 0;
 }
 
-ssize_t st_tls_connection_read(st_tls_connection *connection, uint8_t *buffer, size_t len)
+static int64_t monotonic_millis(void)
 {
-    if (connection == NULL || connection->ssl == NULL || buffer == NULL || len == 0U) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int64_t socket_deadline(int fd, int option)
+{
+    struct timeval timeout = {0};
+    socklen_t len = sizeof(timeout);
+    if (getsockopt(fd, SOL_SOCKET, option, &timeout, &len) != 0) {
+        return monotonic_millis();
+    }
+    if (timeout.tv_sec == 0 && timeout.tv_usec == 0) {
         return -1;
     }
-    size_t read_len = 0U;
-    if (SSL_read_ex(connection->ssl, buffer, len, &read_len) == 1) {
-        return (ssize_t)read_len;
+    return monotonic_millis() + (int64_t)timeout.tv_sec * 1000 + (timeout.tv_usec + 999) / 1000;
+}
+
+static void wake_tls(st_tls_connection *connection)
+{
+    const uint8_t byte = 1;
+    ssize_t rc;
+    do { rc = write(connection->wake[1], &byte, 1); } while (rc < 0 && errno == EINTR);
+    /* EAGAIN means the worker already has a queued wakeup. */
+}
+
+static void fail_tls_locked(st_tls_connection *connection)
+{
+    connection->failed = 1;
+    shutdown(connection->fd, SHUT_RDWR);
+    pthread_cond_broadcast(&connection->changed);
+}
+
+/* Only the I/O worker touches SSL/BIO after accept. The mutex protects API queues, not a
+ * blocking SSL call. Ciphertext output is bounded to a few records even for very large writes. */
+static void *tls_io_run(void *arg)
+{
+    st_tls_connection *connection = arg;
+    BIO *input = SSL_get_rbio(connection->ssl), *output = SSL_get_wbio(connection->ssl);
+    uint8_t encrypted[32768], outgoing[32768];
+    size_t outgoing_len = 0, outgoing_offset = 0;
+    int transport_eof = 0;
+    for (;;) {
+        pthread_mutex_lock(&connection->io_lock);
+        uint8_t wake_bytes[128];
+        while (read(connection->wake[0], wake_bytes, sizeof(wake_bytes)) > 0) {}
+        if (connection->failed || connection->stopping) {
+            /* Best-effort nonblocking close_notify. Never perform TLS I/O after a fatal error. */
+            if (!connection->failed) {
+                ERR_clear_error();
+                SSL_shutdown(connection->ssl);
+                int n = BIO_read(output, encrypted, sizeof(encrypted));
+                if (n > 0) (void)send(connection->fd, encrypted, (size_t)n, 0);
+            }
+            pthread_mutex_unlock(&connection->io_lock);
+            break;
+        }
+        if (connection->writing && connection->write_deadline >= 0
+            && monotonic_millis() >= connection->write_deadline) {
+            fail_tls_locked(connection);
+            pthread_mutex_unlock(&connection->io_lock);
+            continue;
+        }
+        int progress = 0;
+        if (outgoing_offset == outgoing_len) {
+            int n = BIO_read(output, outgoing, sizeof(outgoing));
+            outgoing_offset = 0;
+            outgoing_len = n > 0 ? (size_t)n : 0;
+        }
+        if (outgoing_offset < outgoing_len) {
+            ssize_t n = send(connection->fd, outgoing + outgoing_offset,
+                             outgoing_len - outgoing_offset, 0);
+            if (n > 0) {
+                outgoing_offset += (size_t)n;
+                progress = 1;
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                fail_tls_locked(connection);
+            }
+        }
+        int can_read = !connection->read_eof && !transport_eof
+            && connection->received_len < sizeof(connection->received)
+            && BIO_ctrl_pending(output) < sizeof(outgoing);
+        if (!connection->failed && can_read && BIO_ctrl_pending(input) < sizeof(encrypted)) {
+            ssize_t n = recv(connection->fd, encrypted, sizeof(encrypted), 0);
+            if (n > 0) {
+                if (BIO_write(input, encrypted, (int)n) != n) fail_tls_locked(connection);
+                progress = 1;
+            } else if (n == 0) {
+                transport_eof = 1;
+                BIO_set_mem_eof_return(input, 0);
+                progress = 1;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                fail_tls_locked(connection);
+            }
+        }
+        if (!connection->failed && !connection->read_eof
+            && connection->received_len < sizeof(connection->received)
+            && BIO_ctrl_pending(output) < sizeof(outgoing)) {
+            size_t n = 0;
+            ERR_clear_error();
+            int rc = SSL_read_ex(connection->ssl, connection->received + connection->received_len,
+                                 sizeof(connection->received) - connection->received_len, &n);
+            int ssl_error = rc == 1 ? SSL_ERROR_NONE : SSL_get_error(connection->ssl, rc);
+            if (rc == 1) {
+                connection->received_len += n;
+                progress = 1;
+                pthread_cond_broadcast(&connection->changed);
+            } else if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                connection->read_eof = 1;
+                pthread_cond_broadcast(&connection->changed);
+            } else if (ssl_error != SSL_ERROR_WANT_READ) {
+                fail_tls_locked(connection);
+            }
+        }
+        if (!connection->failed && connection->writing && outgoing_offset == outgoing_len
+            && BIO_ctrl_pending(output) == 0) {
+            if (connection->write_offset == connection->write_len) {
+                connection->writing = 0;
+                pthread_cond_broadcast(&connection->changed);
+            } else {
+                size_t n = 0, chunk = connection->write_len - connection->write_offset;
+                if (chunk > 16384) chunk = 16384;
+                ERR_clear_error();
+                int rc = SSL_write_ex(connection->ssl, connection->write_buffer + connection->write_offset,
+                                      chunk, &n);
+                int ssl_error = rc == 1 ? SSL_ERROR_NONE : SSL_get_error(connection->ssl, rc);
+                if (rc == 1) {
+                    connection->write_offset += n;
+                    progress = 1;
+                } else if (ssl_error != SSL_ERROR_WANT_READ) {
+                    /* Memory BIO writes never WANT_WRITE. WANT_READ may be satisfied on the
+                     * next iteration; offset/chunk stay unchanged for the SSL_write retry. */
+                    fail_tls_locked(connection);
+                }
+            }
+        }
+        struct pollfd fds[2] = {{.fd = connection->fd}, {.fd = connection->wake[0], .events = POLLIN}};
+        if (can_read && !transport_eof) fds[0].events |= POLLIN;
+        if (outgoing_offset < outgoing_len || BIO_ctrl_pending(output) > 0) fds[0].events |= POLLOUT;
+        /* A full application queue must wait on its consumer, not spin on socket POLLHUP. */
+        if (fds[0].events == 0) fds[0].fd = -1;
+        int timed = connection->writing && connection->write_deadline >= 0;
+        int64_t remaining = timed ? connection->write_deadline - monotonic_millis() : -1;
+        int timeout = !timed ? -1 : remaining > INT_MAX ? INT_MAX : remaining <= 0 ? 0 : (int)remaining;
+        int failed = connection->failed;
+        pthread_mutex_unlock(&connection->io_lock);
+        if (!progress && !failed && poll(fds, 2, timeout) < 0 && errno != EINTR) {
+            pthread_mutex_lock(&connection->io_lock);
+            fail_tls_locked(connection);
+            pthread_mutex_unlock(&connection->io_lock);
+        }
     }
-    int ssl_error = SSL_get_error(connection->ssl, 0);
-    if (ssl_error == SSL_ERROR_ZERO_RETURN) {
-        return 0;
+    return NULL;
+}
+
+ssize_t st_tls_connection_read(st_tls_connection *connection, uint8_t *buffer, size_t len)
+{
+    if (connection == NULL || buffer == NULL || len == 0U) return -1;
+    int64_t deadline = socket_deadline(connection->fd, SO_RCVTIMEO);
+    struct timespec until = {.tv_sec = deadline / 1000, .tv_nsec = (deadline % 1000) * 1000000};
+    ssize_t result = -1;
+    pthread_mutex_lock(&connection->io_lock);
+    while (!connection->received_len && !connection->failed && !connection->read_eof) {
+        int rc = deadline < 0 ? pthread_cond_wait(&connection->changed, &connection->io_lock)
+            : pthread_cond_timedwait(&connection->changed, &connection->io_lock, &until);
+        if (rc == ETIMEDOUT) {
+            result = -2;
+            break;
+        }
+        if (rc != 0) break;
     }
-    if ((ssl_error == SSL_ERROR_SYSCALL || ssl_error == SSL_ERROR_WANT_READ)
-        && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        return -2;
+    if (connection->received_len > 0) {
+        size_t n = len < connection->received_len ? len : connection->received_len;
+        memcpy(buffer, connection->received, n);
+        connection->received_len -= n;
+        memmove(connection->received, connection->received + n, connection->received_len);
+        result = (ssize_t)n;
+        wake_tls(connection);
+    } else if (connection->failed) {
+        result = -1;
+    } else if (connection->read_eof) {
+        result = 0;
     }
-    if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-        return -2;
-    }
-    return -1;
+    pthread_mutex_unlock(&connection->io_lock);
+    return result;
 }
 
 int st_tls_connection_write_all(st_tls_connection *connection, const uint8_t *buffer, size_t len)
 {
-    if (connection == NULL || connection->ssl == NULL || (buffer == NULL && len != 0U)) {
-        return -1;
-    }
-    size_t offset = 0U;
-    while (offset < len) {
-        size_t written = 0U;
-        if (SSL_write_ex(connection->ssl, buffer + offset, len - offset, &written) == 1) {
-            offset += written;
-            continue;
-        }
-        int ssl_error = SSL_get_error(connection->ssl, 0);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            /*
-             * The socket is blocking, so a retry is asked for only when a call was interrupted or
-             * its timeout (SO_SNDTIMEO, SO_RCVTIMEO) ran out. A timeout fails the write, as it does
-             * on a plain socket; retrying it would keep a peer that stopped reading on the line for
-             * good, with the connection's send lock held.
-             */
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return -1;
+    if (connection == NULL || (buffer == NULL && len != 0U)) return -1;
+    pthread_mutex_lock(&connection->writer_lock);
+    pthread_mutex_lock(&connection->io_lock);
+    if (!connection->failed && len > 0) {
+        connection->write_buffer = buffer;
+        connection->write_len = len;
+        connection->write_offset = 0;
+        connection->write_deadline = socket_deadline(connection->fd, SO_SNDTIMEO);
+        connection->writing = 1;
+        wake_tls(connection);
+        while (connection->writing && !connection->failed) {
+            if (pthread_cond_wait(&connection->changed, &connection->io_lock) != 0) {
+                fail_tls_locked(connection);
             }
-            continue;
         }
-        return -1;
     }
-    return 0;
+    int result = connection->failed ? -1 : 0;
+    connection->write_buffer = NULL;
+    pthread_mutex_unlock(&connection->io_lock);
+    pthread_mutex_unlock(&connection->writer_lock);
+    return result;
 }
 
 void st_tls_connection_free(st_tls_connection *connection)
 {
     if (connection != NULL) {
+        if (connection->worker_started) {
+            pthread_mutex_lock(&connection->io_lock);
+            connection->stopping = 1;
+            wake_tls(connection);
+            pthread_mutex_unlock(&connection->io_lock);
+            pthread_join(connection->worker, NULL);
+        }
         if (connection->ssl != NULL) {
-            (void)SSL_shutdown(connection->ssl);
             SSL_free(connection->ssl);
         }
+        pthread_cond_destroy(&connection->changed);
+        pthread_mutex_destroy(&connection->writer_lock);
+        for (int i = 0; i < 2; ++i) {
+            if (connection->wake[i] >= 0) {
+                close(connection->wake[i]);
+            }
+        }
+        pthread_mutex_destroy(&connection->io_lock);
         free(connection);
     }
 }
