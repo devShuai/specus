@@ -133,6 +133,7 @@ builder.Services.AddSingleton<PeerMeshServiceState>();
 builder.Services.AddScoped<PeerMeshService>();
 builder.Services.AddHostedService<StunTurnServer>();
 builder.Services.AddHostedService<PeerMeshRelayTrafficFlushService>();
+builder.Services.AddHostedService<PeerClientDeletionDispatchService>();
 builder.Services.AddSingleton<ElasticsearchTrafficDetailClient>();
 builder.Services.AddSingleton<IObjectStorageService, AliyunOssObjectStorageService>();
 builder.Services.AddSingleton<IHttpMediaStorage, RustFsMediaStorage>();

@@ -11,6 +11,8 @@ namespace Specus.Server.PeerMesh;
 /// </summary>
 public sealed class PeerMeshServiceState
 {
+    internal ConcurrentQueue<PendingPeerClientDeletion> ClientDeletions { get; } = new();
+    internal SemaphoreSlim ClientDeletionDispatchGate { get; } = new(1, 1);
     internal ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), PeerMeshServiceCatalogSnapshot>
         ServiceCatalogs { get; } = new();
 

@@ -5,6 +5,7 @@ using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Nat;
+using Specus.Server.PeerMesh;
 using Specus.Server.Sessions;
 
 namespace Specus.Server.Management;
@@ -16,15 +17,18 @@ public sealed class ManagementMutationService
     private readonly NatControlService _natControl;
     private readonly ClientAuthOptions _clientAuth;
     private readonly HttpShareService _shares;
+    private readonly PeerMeshService _peerMesh;
 
     public ManagementMutationService(SpecusDbContext db, SessionRegistry sessions,
-        NatControlService natControl, IOptions<ClientAuthOptions> clientAuth, HttpShareService shares)
+        NatControlService natControl, IOptions<ClientAuthOptions> clientAuth, HttpShareService shares,
+        PeerMeshService peerMesh)
     {
         _db = db;
         _sessions = sessions;
         _natControl = natControl;
         _clientAuth = clientAuth.Value;
         _shares = shares;
+        _peerMesh = peerMesh;
     }
 
     public async Task<ClientResult> CreateClientAsync(ManagementContext context, ClientMutation request,
@@ -95,20 +99,22 @@ public sealed class ManagementMutationService
     public async Task DeleteClientAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
         var account = await FindClientAsync(context, id, cancellationToken).ConfigureAwait(false);
-        CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
         // The client's route rows go with it (no orphans), each audited as route.deleted, and the
         // shares of those routes end, all in one transaction.
         await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        // Its mapping and Peer service rows outlive it here, but no workbench reference to any of
-        // its objects may: they go with the client, for every identity.
+        // Remove workbench references while the client's service rows still exist.
         await WorkbenchService.DeleteClientReferencesAsync(_db, account.Id, cancellationToken)
             .ConfigureAwait(false);
         var revokedShares = await _shares.OnClientDeletedAsync(context.Username, account.Id, cancellationToken)
             .ConfigureAwait(false);
+        var peerDeletion = await _peerMesh.ForgetClientReferencesAsync(account, cancellationToken)
+            .ConfigureAwait(false);
         _db.ClientAccounts.Remove(account);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        _peerMesh.QueueClientDeletion(peerDeletion);
+        CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
         _shares.CutStreams(revokedShares);
     }
 
