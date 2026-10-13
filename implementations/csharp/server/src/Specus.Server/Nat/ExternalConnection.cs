@@ -120,11 +120,15 @@ internal sealed class ExternalConnection : IAsyncDisposable
                 var read = await _stream.ReadAsync(buffer, token).ConfigureAwait(false);
                 if (read == 0)
                 {
+                    // Publish EOF before FIN becomes visible to the peer. Its reply may arrive
+                    // before the writer's continuation runs. Still await that write before
+                    // completing the run, even when both directions have already finished.
+                    var bothFinished = MarkPublicFinished();
                     if (!await TrySendFinAsync(CancellationToken.None).ConfigureAwait(false))
                     {
                         return;
                     }
-                    if (MarkPublicFinished())
+                    if (bothFinished)
                     {
                         _completed.TrySetResult();
                     }
