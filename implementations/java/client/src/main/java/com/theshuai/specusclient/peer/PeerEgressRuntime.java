@@ -507,10 +507,9 @@ final class PeerEgressRuntime {
 
         try {
             PeerEgressTcpConnection.Output output = new PeerEgressTcpConnection.Output();
-            PeerEgressTcpConnection connection = PeerEgressTcpConnection.accept(
-                    syn, newInitialSendSequence(), mtu, flows.idleTimeoutMs(), nowMs, output);
+            java.util.function.Predicate<byte[]> transmit = null;
             if (trySend != null) {
-                connection.tryTransmit = packet -> {
+                transmit = packet -> {
                     boolean accepted = trySend.test(consumer,
                             PeerEgressFrame.encode(PeerEgressFrame.TYPE_IP_PACKET, false, packet));
                     if (!accepted) {
@@ -520,6 +519,8 @@ final class PeerEgressRuntime {
                     return accepted;
                 };
             }
+            PeerEgressTcpConnection connection = PeerEgressTcpConnection.accept(
+                    syn, newInitialSendSequence(), mtu, flows.idleTimeoutMs(), nowMs, output, transmit);
             TcpFlow handle = new TcpFlow(connection, socket, lock.newCondition());
             flow.handle = handle;
             totalFlows++;

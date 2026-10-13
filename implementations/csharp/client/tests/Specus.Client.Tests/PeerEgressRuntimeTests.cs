@@ -24,6 +24,53 @@ public class PeerEgressRuntimeTests
 
     private static readonly object EndOfStream = new();
 
+    [Fact]
+    public void InitialSynAckResumesWhenQueueDrains()
+    {
+        var harness = new Harness();
+        using var queue = new BlockingCollection<byte[]>(1);
+        queue.Add([]);
+        harness.Runtime.TrySend = (_, frame) => queue.TryAdd((byte[])frame.Clone());
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening)), Epoch);
+            Assert.Equal(1, harness.DialCount);
+            Assert.Empty(harness.Segments());
+            queue.Take();
+            harness.Runtime.SendReady(Epoch + 1);
+            Assert.True(queue.TryTake(out var admitted), "queue drain did not resume initial SYN-ACK");
+            var decoded = PeerEgressFrame.Parse(admitted!);
+            Assert.True(decoded.Accepted);
+            var response = PeerEgressSegment.Parse(decoded.Body);
+            Assert.NotNull(response);
+            Assert.Equal(PeerEgressSegment.FlagSyn | PeerEgressSegment.FlagAck, response!.Flags);
+            Assert.Equal(opening.Seq + 1, response.Ack);
+        }
+        finally { harness.Runtime.Shutdown(Epoch); }
+    }
+
+    [Fact]
+    public void PendingSynAckDoesNotSurviveRevocation()
+    {
+        var harness = new Harness();
+        harness.Runtime.TrySend = (_, _) => false;
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening)), Epoch);
+            harness.Runtime.RevokeConsumer(7, Epoch);
+            Assert.True(harness.Socket(0).IsClosed);
+            var admitted = 0;
+            harness.Runtime.TrySend = (_, _) => { admitted++; return true; };
+            harness.Runtime.SendReady(Epoch + 1);
+            harness.Runtime.OnTick(Epoch + 2000);
+            Assert.Equal(0, admitted);
+            Assert.Equal(1, harness.DialCount);
+        }
+        finally { harness.Runtime.Shutdown(Epoch); }
+    }
+
     /// <summary>
     /// One end of a socket the runtime believes in. A read blocks until a test supplies data, an end
     /// of stream, or an error, which is what lets each failure path be driven on purpose.

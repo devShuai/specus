@@ -391,10 +391,9 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		return
 	}
 
-	conn, output := acceptTCPSyn(syn, newEgressISS(), mtu, r.flows.idleTimeout, now)
-	conn.tryTransmit = func(packet []byte) bool {
+	conn, output := acceptTCPSynWithTransmit(syn, newEgressISS(), mtu, r.flows.idleTimeout, now, func(packet []byte) bool {
 		return r.send == nil || r.send(consumer, encodePeerEgressFrame(peerEgressTypeIPPacket, false, packet)) == nil
-	}
+	})
 	handle := &egressTCPFlow{conn: conn, socket: socket, wake: make(chan struct{}, 1)}
 	flow.Handle = handle
 	r.stats.TotalFlows++

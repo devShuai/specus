@@ -517,11 +517,10 @@ internal sealed class PeerEgressRuntime
         try
         {
             var output = new PeerEgressTcpConnection.Output();
-            var connection = PeerEgressTcpConnection.Accept(
-                syn, NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output);
+            Func<byte[], bool>? transmit = null;
             if (TrySend is not null)
             {
-                connection.TryTransmit = packet =>
+                transmit = packet =>
                 {
                     var accepted = TrySend(consumer,
                         PeerEgressFrame.Encode(PeerEgressFrame.TypeIpPacket, false, packet));
@@ -533,6 +532,8 @@ internal sealed class PeerEgressRuntime
                     return accepted;
                 };
             }
+            var connection = PeerEgressTcpConnection.Accept(
+                syn, NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output, transmit);
             var handle = new TcpFlow(connection, socket);
             flow.Handle = handle;
             _totalFlows++;

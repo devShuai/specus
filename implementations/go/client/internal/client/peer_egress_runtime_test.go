@@ -386,6 +386,40 @@ func TestEgressRuntimeQueueWritableRotatesWaitingFlows(t *testing.T) {
 	}
 }
 
+func TestEgressRuntimeInitialSynAckResumesWhenQueueDrains(t *testing.T) {
+	h := newEgressHarness(t)
+	t.Cleanup(func() { h.runtime.shutdown(flowEpoch) })
+	queue := make(chan []byte, 1)
+	queue <- []byte("occupied")
+	h.runtime.send = func(_ int64, frame []byte) error {
+		select {
+		case queue <- append([]byte(nil), frame...):
+			return nil
+		default:
+			return errEgressQueueFull
+		}
+	}
+	syn := egressSyn(t, "100.96.0.1", 40000, "203.0.113.10", 443)
+	h.runtime.handleFrame(7, egressFrameFor(buildTCPSegment(syn)), flowEpoch)
+	if h.dialCount() != 1 {
+		t.Fatal("expected exactly one upstream dial")
+	}
+	<-queue
+	// The queue becoming writable, not the application's one-second SYN RTO,
+	// must resume the first SYN-ACK. No second inbound SYN is supplied.
+	h.runtime.sendReady(flowEpoch.Add(time.Millisecond))
+	select {
+	case raw := <-queue:
+		frame, code := parsePeerEgressFrame(raw)
+		segment, ok := parseTCPSegment(frame.Body)
+		if code != "" || !ok || segment.Flags != tcpFlagSYN|tcpFlagACK || segment.Ack != syn.Seq+1 {
+			t.Fatalf("unexpected initial response: %+v code=%s", segment, code)
+		}
+	default:
+		t.Fatal("initial SYN-ACK was lost when the send queue was full; queue drain did not resume it")
+	}
+}
+
 func TestEgressRuntimeCloseWakesBackpressuredReader(t *testing.T) {
 	handle := &egressTCPFlow{wake: make(chan struct{}, 1), socket: newFakeEgressConn()}
 	closeEgressHandle(handle)
