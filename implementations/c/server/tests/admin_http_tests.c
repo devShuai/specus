@@ -2513,6 +2513,14 @@ static int endpoint_nat_push(void *ctx, long long client_id, const char *client_
     return 0;
 }
 
+static int endpoint_nat_not_sent(void *ctx, long long client_id, const char *client_name)
+{
+    (void)ctx;
+    (void)client_id;
+    (void)client_name;
+    return ST_ADMIN_NAT_CONTROL_NOT_SENT;
+}
+
 static long long endpoint_runtime_client_id = 0;
 
 static int endpoint_runtime_status(void *ctx, long long client_id, const char *client_name,
@@ -2682,6 +2690,13 @@ static int test_admin_endpoint_contracts(void)
         len = endpoint_call("POST", path, "root-b", "tenant-b", "ADMIN", response, sizeof(response));
         failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, "force refresh from another tenant") != 0
             || endpoint_push_calls != 2;
+    }
+    /* A NAT_CONTROL that does not fit one MESSAGE was not sent: 409, never a reported push. */
+    st_admin_set_nat_control_handler(endpoint_nat_not_sent, NULL);
+    if (!failed) {
+        len = endpoint_call("POST", path, "alice", "tenant-a", "USER", response, sizeof(response));
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "NAT_CONTROL",
+                                 "force refresh of a NAT_CONTROL past the limit") != 0;
     }
     st_admin_set_nat_control_handler(NULL, NULL);
 
@@ -3020,16 +3035,23 @@ static int test_tenant_scoped_admin_mutations(void)
         }
         if (failed) fprintf(stderr, "tenant scope resource fixture setup failed\n");
     }
+    /* Credentials and mappings answer as Java, 400 "<kind> not found: <id>"; routes and Peer services 404. */
     struct {
         const char *prefix;
         long long id;
         const char *body;
         const char *label;
+        const char *status;
+        const char *message;
     } resources[] = {
-        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential"},
-        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping"},
-        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route"},
-        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service"},
+        {"/api/admin/client-credentials/", 0, "{\"enabled\":false,\"secret\":\"taken-over\"}", "credential",
+         "HTTP/1.1 400 ", "credential not found: "},
+        {"/api/admin/specus-mappings/", 0, "{\"targetPort\":9999}", "TCP mapping",
+         "HTTP/1.1 400 ", "mapping not found: "},
+        {"/api/admin/http-routes/", 0, "{\"targetBaseUrl\":\"http://203.0.113.9\"}", "HTTP route",
+         "HTTP/1.1 404 ", NULL},
+        {"/api/admin/peer-mesh/services/", 0, "{\"name\":\"taken-over\",\"enabled\":false}", "peer service",
+         "HTTP/1.1 400 ", "service not found: "},
     };
     resources[0].id = credential.id;
     resources[1].id = mapping.id;
@@ -3041,11 +3063,11 @@ static int test_tenant_scoped_admin_mutations(void)
         snprintf(label, sizeof(label), "PUT of another tenant's %s", resources[i].label);
         len = tenant_scope_call("PUT", path, "root-a", "tenant-a", "ADMIN", resources[i].body,
                                 response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        failed = endpoint_expect(len, response, resources[i].status, resources[i].message, label) != 0;
         snprintf(label, sizeof(label), "DELETE of another tenant's %s", resources[i].label);
         len = failed ? -1 : tenant_scope_call("DELETE", path, "root-a", "tenant-a", "ADMIN", NULL,
                                               response, sizeof(response));
-        failed = failed || endpoint_expect(len, response, "HTTP/1.1 404 ", NULL, label) != 0;
+        failed = failed || endpoint_expect(len, response, resources[i].status, resources[i].message, label) != 0;
     }
     if (!failed) {
         st_storage_client_credential stored_credential;
@@ -3071,7 +3093,8 @@ static int test_tenant_scoped_admin_mutations(void)
         snprintf(path, sizeof(path), "%s%lld", resources[i].prefix, resources[i].id);
         snprintf(label, sizeof(label), "own tenant DELETE of the %s", resources[i].label);
         len = tenant_scope_call("DELETE", path, "root-b", "tenant-b", "ADMIN", NULL, response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, label) != 0;
+        /* Java's Peer service delete is a void handler: 200 with no body; the others answer 204. */
+        failed = endpoint_expect(len, response, i == 3 ? "HTTP/1.1 200 " : "HTTP/1.1 204 ", NULL, label) != 0;
     }
     unsetenv("SPECUS_DB_SEED_DEMO_CLIENT");
     unsetenv("SPECUS_DATABASE_PATH");
@@ -3618,9 +3641,15 @@ static int test_tenant_qualified_login_and_refresh(void)
         if (failed) fprintf(stderr, "%s's alice saw another tenant's client\n", owners[i][0]);
     }
     if (!failed) {
+        /* An account that still owns a client is not deleted (management-accounts.md 7.1). */
         int len = tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN", NULL,
                                     response, sizeof(response));
-        failed = endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "delete tenant-a's alice") != 0;
+        failed = endpoint_expect(len, response, "HTTP/1.1 409 ", "\"clients\":1",
+                                 "delete tenant-a's alice with a client") != 0
+            || test_exec_sql(db_path, "DELETE FROM client_account WHERE client_name = 'alice-a-client';") != 0;
+        len = failed ? -1 : tenant_scope_call("DELETE", "/api/admin/users/alice", "root-a", "tenant-a", "ADMIN",
+                                              NULL, response, sizeof(response));
+        failed = failed || endpoint_expect(len, response, "HTTP/1.1 204 ", NULL, "delete tenant-a's alice") != 0;
     }
     if (!failed) {
         int me_len = tenant_token_call("GET", "/api/admin/me", token_a, NULL, response, sizeof(response));
@@ -5101,20 +5130,31 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
         return 1;
     }
 
-    static const char *const refused_rules[] = {
-        "[{\"cidr\":\"203.0.113.07\"}]",
-        "[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"icmp\"]}]",
-        "[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[443,80]]}]",
-        "[{\"protocols\":[\"tcp\"]}]",
+    /* Refused whole, with Java PeerEgressService's message, or Spring's 400 when it does not bind. */
+    static const char *const refused_rules[][2] = {
+        {"[{\"cidr\":\"203.0.113.07\"}]",
+         "{\"error\":\"destinationRules[0].cidr is not an IPv4 or IPv6 address or CIDR: 203.0.113.07\"}"},
+        {"[{\"cidr\":\"10.0.0.0/8\",\"protocols\":[\"icmp\"]}]",
+         "{\"error\":\"destinationRules[0].protocols may contain only tcp and udp: icmp\"}"},
+        {"[{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[443,80]]}]",
+         "{\"error\":\"destinationRules[0].portRanges entries must be [low, high] integers with "
+         "0 <= low <= high <= 65535: [443, 80]\"}"},
+        {"[{\"cidr\":\"10.0.0.0/8\"},{\"cidr\":\"10.0.0.0/8\",\"portRanges\":[[\"443\",443.5]]}]",
+         "{\"error\":\"destinationRules[1].portRanges entries must be [low, high] integers with "
+         "0 <= low <= high <= 65535: [443, 443.5]\"}"},
+        {"[{\"protocols\":[\"tcp\"]}]",
+         "{\"error\":\"destinationRules[0].cidr is not an IPv4 or IPv6 address or CIDR: null\"}"},
+        {"[null]", "{\"error\":\"destinationRules[0] must be an object\"}"},
+        {"[\"10.0.0.0/8\"]", "{\"error\":\"Bad Request\"}"},
+        {"{\"cidr\":\"10.0.0.0/8\"}", "{\"error\":\"Bad Request\"}"},
     };
     for (size_t i = 0; i < sizeof(refused_rules) / sizeof(refused_rules[0]); ++i) {
         snprintf(body, sizeof(body),
                  "{\"egressClientId\":%d,\"maxConcurrentFlows\":20,\"destinationRules\":%s}",
-                 egress_client_id, refused_rules[i]);
+                 egress_client_id, refused_rules[i][0]);
         len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
-        if (len <= 0 || !contains(response, "400 Bad Request")
-            || !contains(response, "invalid destinationRules")) {
-            fprintf(stderr, "egress policy accepted %s: %s\n", refused_rules[i], response);
+        if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, refused_rules[i][1])) {
+            fprintf(stderr, "egress policy accepted %s: %s\n", refused_rules[i][0], response);
             return 1;
         }
     }
@@ -5152,21 +5192,24 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
         fprintf(stderr, "egress policy save did not store the normalised domain rules: %s\n", response);
         return 1;
     }
-    static const char *const refused_names[] = {
-        "[{\"match\":\"203.0.113.5\"}]",
-        "[{\"match\":\"*.com\"}]",
-        "[{\"match\":\"localhost\"}]",
-        "[{\"match\":\"example.com\",\"protocols\":[\"icmp\"]}]",
-        "{\"match\":\"example.com\"}",
+    static const char *const refused_names[][2] = {
+        {"[{\"match\":\"203.0.113.5\"}]",
+         "{\"error\":\"domainRules[0].match must be a name or *.name with at least two labels: 203.0.113.5\"}"},
+        {"[{\"match\":\"*.com\"}]",
+         "{\"error\":\"domainRules[0].match must be a name or *.name with at least two labels: *.com\"}"},
+        {"[{\"match\":\"localhost\"}]",
+         "{\"error\":\"domainRules[0].match must be a name or *.name with at least two labels: localhost\"}"},
+        {"[{\"match\":\"example.com\",\"protocols\":[\"icmp\"]}]",
+         "{\"error\":\"domainRules[0].protocols may contain only tcp and udp: icmp\"}"},
+        {"{\"match\":\"example.com\"}", "{\"error\":\"Bad Request\"}"},
     };
     for (size_t i = 0; i < sizeof(refused_names) / sizeof(refused_names[0]); ++i) {
         snprintf(body, sizeof(body),
                  "{\"egressClientId\":%d,\"maxConcurrentFlows\":50,\"domainRules\":%s}",
-                 egress_client_id, refused_names[i]);
+                 egress_client_id, refused_names[i][0]);
         len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
-        if (len <= 0 || !contains(response, "400 Bad Request")
-            || !contains(response, "invalid domainRules")) {
-            fprintf(stderr, "egress policy accepted domain rules %s: %s\n", refused_names[i], response);
+        if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, refused_names[i][1])) {
+            fprintf(stderr, "egress policy accepted domain rules %s: %s\n", refused_names[i][0], response);
             return 1;
         }
     }
@@ -5189,7 +5232,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     snprintf(body, sizeof(body), "{\"egressClientId\":%d,\"maxConcurrentFlows\":40,\"destinationRules\":[",
              egress_client_id);
     len = st_admin_build_response_with_body("POST", path, body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "invalid request body")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"Bad Request\"}")) {
         fprintf(stderr, "egress policy accepted an unparsable body: %s\n", response);
         return 1;
     }
@@ -5202,7 +5245,7 @@ static int test_peer_mesh_egress_policy_validation(int egress_client_id)
     }
     len = st_admin_build_response_with_body("PUT", "/api/admin/peer-mesh/egress/switch",
                                             "{\"enabled\":false", response, sizeof(response));
-    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "invalid request body")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"Bad Request\"}")) {
         fprintf(stderr, "egress switch accepted an unparsable body: %s\n", response);
         return 1;
     }
@@ -5414,14 +5457,29 @@ static int test_peer_service_definition_validation(int client_id)
         fprintf(stderr, "a refused peer service definition was stored: %s\n", response);
         return 1;
     }
+    /*
+     * Java's new entity starts with transport tcp, which applyDefinition keeps when the request
+     * names none: a udp application without a transport is refused.
+     */
+    snprintf(body, sizeof(body),
+             "{\"clientId\":%d,\"serviceId\":\"svc-normal00\",\"name\":\"Local DNS\",\"application\":\"udp\","
+             "\"targetHost\":\"127.0.0.1\",\"targetPort\":53,\"publishedPort\":28052}",
+             client_id);
+    len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "{\"error\":\"udp application requires udp transport\"}")) {
+        fprintf(stderr, "a udp service without a transport was not refused as Java: %s\n", response);
+        return 1;
+    }
     /* Accepted spellings are stored normalised, and a new service starts disabled. */
     snprintf(body, sizeof(body),
              "{\"clientId\":%d,\"serviceId\":\"svc-normal01\",\"name\":\" Local DNS \",\"application\":\"UDP\","
-             "\"targetHost\":\" LOCALHOST \",\"targetPort\":53,\"publishedPort\":28053,\"visibility\":\"acl\"}",
+             "\"transport\":\" Udp \",\"targetHost\":\" LOCALHOST \",\"targetPort\":53,\"publishedPort\":28053,"
+             "\"visibility\":\"acl\"}",
              client_id);
     len = st_admin_build_response_with_body("POST", services_path, body, response, sizeof(response));
     int service_id = 0;
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"name\":\"Local DNS\"")
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"name\":\"Local DNS\"")
         || !contains(response, "\"application\":\"udp\"") || !contains(response, "\"transport\":\"udp\"")
         || !contains(response, "\"targetHost\":\"127.0.0.1\"") || !contains(response, "\"visibility\":\"ACL\"")
         || !contains(response, "\"enabled\":false") || !contains(response, "\"path\":\"\"")
@@ -5438,7 +5496,7 @@ static int test_peer_service_definition_validation(int client_id)
         return 1;
     }
     len = st_admin_build_response("DELETE", path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "peer service fixture delete failed: %s\n", response);
         return 1;
     }
@@ -6201,13 +6259,24 @@ int main(void)
         fprintf(stderr, "client message capability management response mismatch: %s\n", response);
         return 1;
     }
+    /* Java PeerMeshDeviceView has no message capabilities, and nothing reported reads as null. */
+    {
+        st_storage_client device_client;
+        st_storage_peer_mesh_device device;
+        if (st_storage_get_client(auth_db_path, runtime_client_id, &device_client) != 0
+            || st_storage_ensure_peer_mesh_device(auth_db_path, &device_client, &device) != 0) {
+            fprintf(stderr, "peer mesh device seed failed\n");
+            return 1;
+        }
+    }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"messageAttachmentsCapable\":false")
-        || !contains(response, "\"messageMaxAttachmentBytes\":0")
+        || contains(response, "\"messageAttachmentsCapable\"")
+        || contains(response, "\"messageMaxAttachmentBytes\"")
         || !contains(response, "\"cidr\":\"100.96.0.0/11\"")
-        || !contains(response, "\"virtualDeviceMode\":\"AUTO\"")) {
-        fprintf(stderr, "peer mesh capability management response mismatch\n");
+        || !contains(response, "\"natType\":null")
+        || !contains(response, "\"virtualDeviceMode\":null")) {
+        fprintf(stderr, "peer mesh capability management response mismatch: %s\n", response);
         return 1;
     }
     if (test_client_messages_websocket() != 0) {
@@ -6265,13 +6334,18 @@ int main(void)
     setenv("SPECUS_AUTH_TENANT_ID", "tenant-admin", 1);
     setenv("SPECUS_AUTH_USERNAME", "admin-user", 1);
     len = st_admin_build_response("POST", "/api/admin/database/initialize", response, sizeof(response));
+    /* Java DatabaseInitializer: the demo client is seeded into the caller's tenant. */
+    st_storage_client initialized_demo;
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"initialized\":true")
         || !contains(response, "\"tenantId\":\"tenant-admin\"")
         || !contains(response, "\"orm\":\"sqlite3\"")
         || !contains(response, "\"dialect\":\"sqlite\"")
-        || !contains(response, "\"clients\":0")) {
-        fprintf(stderr, "database initialize response mismatch\n");
+        || !contains(response, "\"clients\":1")
+        || st_storage_get_client_by_name(db_path, "Demo client", &initialized_demo) != 0
+        || strcmp(initialized_demo.tenant_id, "tenant-admin") != 0
+        || strcmp(initialized_demo.owner_username, "admin-user") != 0) {
+        fprintf(stderr, "database initialize response mismatch: %s\n", response);
         return 1;
     }
     len = st_admin_build_response("GET", "/api/admin/me", response, sizeof(response));
@@ -6778,7 +6852,8 @@ int main(void)
                                             "{\"listenPort\":19001,\"targetAddress\":\"127.0.0.1\",\"targetPort\":9001}",
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found")) {
+    /* Java NatControlService.findClient: 400 client not found: <id>. */
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"client not found: 1\"}")) {
         fprintf(stderr, "database user foreign specus create response mismatch\n");
         free(alice_token);
         return 1;
@@ -6842,7 +6917,7 @@ int main(void)
                                             case_acl_body,
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "source client not found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "\"error\":\"client not found: ")) {
         fprintf(stderr, "peer mesh acl source-owner authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -6858,7 +6933,7 @@ int main(void)
                                             case_acl_body,
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "cross-user peer ACL")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "普通用户不能创建跨用户 peer ACL")) {
         fprintf(stderr, "peer mesh acl target-owner authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -6874,7 +6949,7 @@ int main(void)
                                             case_acl_body,
                                             response,
                                             sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "target client not found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "\"error\":\"client not found: ")) {
         fprintf(stderr, "peer mesh acl tenant authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -6905,7 +6980,7 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%lld", hidden_case_acl.id);
     len = st_admin_build_response_with_auth("DELETE", request_path, authorization, NULL, response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "peer ACL not found: ")) {
         fprintf(stderr, "peer mesh acl delete authorization must be case-sensitive\n");
         free(alice_token);
         return 1;
@@ -6947,9 +7022,10 @@ int main(void)
         fprintf(stderr, "management user delete response mismatch\n");
         return 1;
     }
+    /* The demo client was seeded into SPECUS_AUTH_TENANT_ID, the built-in administrator's tenant. */
     len = st_admin_build_response("GET", "/api/admin/clients", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || contains(response, "\"clientName\":\"Demo client\"")) {
+        || !contains(response, "\"clientName\":\"Demo client\"")) {
         fprintf(stderr, "clients list response mismatch\n");
         return 1;
     }
@@ -7012,7 +7088,7 @@ int main(void)
     st_admin_set_peer_mesh_refresh_handler(test_peer_mesh_refresh, NULL);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
     int created_acl_id = 0;
-    if (len <= 0 || !contains(response, "201 Created")
+    if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"sourceClientName\":\"C managed\"")
         || !contains(response, "\"targetClientName\":\"C peer target\"")
         || !contains(response, "\"allowed\":true")
@@ -7040,7 +7116,7 @@ int main(void)
              created_client_id,
              target_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"BOTH\"")) {
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"direction\":\"BOTH\"")) {
         fprintf(stderr, "peer mesh acl omitted direction should preserve existing value\n");
         return 1;
     }
@@ -7051,7 +7127,7 @@ int main(void)
              created_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
     int default_direction_acl_id = 0;
-    if (len <= 0 || !contains(response, "201 Created")
+    if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"direction\":\"OUTBOUND\"")
         || st_json_get_int(response, "id", &default_direction_acl_id) != 0
         || default_direction_acl_id <= 0) {
@@ -7064,7 +7140,7 @@ int main(void)
              target_client_id,
              created_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"INBOUND\"")) {
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"direction\":\"INBOUND\"")) {
         fprintf(stderr, "peer mesh acl inbound direction response mismatch\n");
         return 1;
     }
@@ -7074,7 +7150,7 @@ int main(void)
              target_client_id,
              created_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
-    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"INBOUND\"")) {
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"direction\":\"INBOUND\"")) {
         fprintf(stderr, "peer mesh acl omitted direction should preserve inbound value\n");
         return 1;
     }
@@ -7091,23 +7167,46 @@ int main(void)
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%d", default_direction_acl_id);
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "default direction peer mesh acl delete response mismatch\n");
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%d", created_acl_id);
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "peer mesh acl delete response mismatch\n");
         return 1;
+    }
+    /* Java lists the devices that exist: none until the client logs in with Peer Mesh on. */
+    len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || contains(response, "\"clientName\":\"C managed\"")) {
+        fprintf(stderr, "a client that never logged in has a peer mesh device: %s\n", response);
+        return 1;
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/devices/%d", created_client_id);
+    len = st_admin_build_response_with_body("PUT", request_path, "{\"enabled\":true}", response, sizeof(response));
+    char missing_device[96];
+    snprintf(missing_device, sizeof(missing_device), "{\"error\":\"peer device not found: %d\"}", created_client_id);
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, missing_device)) {
+        fprintf(stderr, "enabling a device that does not exist mismatch: %s\n", response);
+        return 1;
+    }
+    {
+        st_storage_client device_client;
+        st_storage_peer_mesh_device device;
+        if (st_storage_get_client(db_path, created_client_id, &device_client) != 0
+            || st_storage_ensure_peer_mesh_device(db_path, &device_client, &device) != 0) {
+            fprintf(stderr, "peer mesh device seed failed\n");
+            return 1;
+        }
     }
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed\"")
         || !contains(response, "\"enabled\":false")
         || !contains(response, "\"online\":false")
-        || !contains(response, "\"virtualDeviceStatus\":\"DOWN\"")) {
-        fprintf(stderr, "peer mesh devices from clients response mismatch\n");
+        || !contains(response, "\"virtualDeviceStatus\":null")) {
+        fprintf(stderr, "peer mesh devices response mismatch: %s\n", response);
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/devices/%d", created_client_id);
@@ -7119,7 +7218,7 @@ int main(void)
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientName\":\"C managed\"")
         || !contains(response, "\"enabled\":true")
-        || !contains(response, "\"virtualDeviceStatus\":\"DOWN\"")) {
+        || !contains(response, "\"virtualDeviceStatus\":null")) {
         fprintf(stderr, "peer mesh device update response mismatch\n");
         return 1;
     }
@@ -7130,6 +7229,7 @@ int main(void)
         fprintf(stderr, "peer mesh devices updated list response mismatch\n");
         return 1;
     }
+    /* Unexpired: listing sessions closes the expired ones first, as Java's expireIfStale. */
     char peer_session_sql[2048];
     snprintf(peer_session_sql,
              sizeof(peer_session_sql),
@@ -7138,10 +7238,10 @@ int main(void)
              "path_type, status, token_hash, started_at, updated_at, expires_at, rtt_millis, "
              "local_endpoint, remote_endpoint, direct_bytes, relay_bytes, last_traffic_at) VALUES "
              "(99001, 'tenant-admin', %d, 'C managed', %d, 'C peer target', 'DIRECT', 'ACTIVE', 'hash-a', "
-             "'2026-06-25T01:00:00Z', '2026-06-25T01:01:00Z', '2026-06-25T02:00:00Z', 12, "
+             "'2026-06-25T01:00:00Z', '2026-06-25T01:01:00Z', '2999-06-25T02:00:00Z', 12, "
              "'10.0.0.1:10000', '10.0.0.2:10001', 128, 0, '2026-06-25T01:01:00Z'),"
              "(99002, 'tenant-admin', %d, 'C managed', %d, 'C peer target', 'RELAY', 'NEGOTIATING', 'hash-b', "
-             "'2026-06-25T01:02:00Z', '2026-06-25T01:03:00Z', '2026-06-25T02:03:00Z', NULL, "
+             "'2026-06-25T01:02:00Z', '2026-06-25T01:03:00Z', '2999-06-25T02:03:00Z', NULL, "
              "NULL, 'relay.example:3478', 0, 64, NULL)",
              created_client_id,
              target_client_id,
@@ -7215,7 +7315,7 @@ int main(void)
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/services", body,
                                             response, sizeof(response));
     int created_service_id = 0;
-    if (len <= 0 || !contains(response, "201 Created")
+    if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"serviceId\":\"service-test\"")
         || !contains(response, "\"publishedPort\":18080")
         || st_json_get_int(response, "id", &created_service_id) != 0 || created_service_id <= 0) {
@@ -7240,7 +7340,7 @@ int main(void)
         return 1;
     }
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "200 OK")) {
         fprintf(stderr, "peer service delete mismatch\n");
         return 1;
     }
@@ -7301,14 +7401,14 @@ int main(void)
                                             response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"created\":1")
-        || !contains(response, "\"serviceId\":\"import-tcp-")
+        || !contains(response, "\"name\":\"tcp-19090\"")
         || !contains(response, "\"publishedPort\":19090")) {
         fprintf(stderr, "peer TCP service import mismatch: %s\n", response);
         return 1;
     }
     /* importCandidatesCreatesDisabledTcpMapping: the imported service is a disabled tcp one. */
     {
-        const char *imported = strstr(response, "\"serviceId\":\"import-tcp-");
+        const char *imported = strstr(response, "\"name\":\"tcp-19090\"");
         const char *end = imported == NULL ? NULL : strstr(imported, "\"createdAt\"");
         size_t span = end == NULL ? 0U : (size_t)(end - imported);
         char view[2048] = "";
@@ -8092,17 +8192,17 @@ int main(void)
         return 1;
     }
     len = st_admin_build_response("DELETE", "/api/admin/peer-mesh/sessions/123", response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "peer mesh session not found")) {
+    if (len <= 0 || !contains(response, "503 Service Unavailable")) {
         fprintf(stderr, "peer mesh close missing session response mismatch\n");
         return 1;
     }
     len = st_admin_build_response("PUT", "/api/admin/peer-mesh/devices/42", response, sizeof(response));
-    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "peer mesh device not found")) {
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "{\"error\":\"Bad Request\"}")) {
         fprintf(stderr, "peer mesh update missing device response mismatch\n");
         return 1;
     }
     len = st_admin_build_response("DELETE", "/api/admin/peer-mesh/acls/42", response, sizeof(response));
-    if (len <= 0 || !contains(response, "204 No Content")) {
+    if (len <= 0 || !contains(response, "503 Service Unavailable")) {
         fprintf(stderr, "peer mesh delete missing acl response mismatch\n");
         return 1;
     }

@@ -366,14 +366,17 @@ key is that name, ignoring case, provided exactly one does. The built-in admin s
 tenant or with the default one. A same-named account of another tenant is no conflict for
 `POST /api/admin/users`, and self-registration creates accounts in the default tenant.
 The login and refresh responses use the Java-shaped `accessToken/tokenType/expiresIn` fields. The
-token is a local HS256 JWT with `iss=specus`, `sub` (the login name), `tenant_id`, `role`, `iat`,
-and `exp`;
+token is a local HS256 JWT with `iss=specus`, `sub` (the login name), `tenant_id`, `uid` (the
+account key; the built-in admin's tokens have none), `role`, `iat`, and `exp`;
 real HTTP requests to `/api/admin/**` and `/auth/refresh` must include it as
 `Authorization: Bearer <token>`. As in Java's `ManagementContextResolver`, the token only names
 the account: every authenticated request and every refresh re-reads it (one read-only SQLite
 query, not cached). The built-in admin must still be allowed to sign in with its password; a stored
 user is the login name `sub` of the tenant `tenant_id` (a token without `tenant_id` names the
-exact account key) and must exist and be enabled; tenant, role and admin rights
+exact account key) and must exist and be enabled; a token with `uid` resolves only to the account
+whose key is exactly that, so it does not pass to a later account of the same name, and is never the
+built-in admin's (tokens without `uid` predate it and resolve as before until they expire). Deleting
+an account deletes its email record in the same transaction. Tenant, role and admin rights
 come from the record as it is now. Otherwise requests get `403 {"error":"账号未绑定、已禁用或权限已撤销"}`
 and refresh gets `401 {"error":"账号已禁用、不存在或不再允许本地登录"}`; an unreadable user store
 answers `500`. Refresh issues the new token from the current record, so a demoted admin is

@@ -4,6 +4,7 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -80,6 +81,39 @@ public class StreamFlowSchedulerTest {
             assertTrue("exact outstanding credit must be accepted",
                     scheduler.addCredit(12, 5));
             assertFalse(scheduler.addCredit(12, 1));
+        }
+    }
+
+    /**
+     * The peer returns credit for the last DATA while the FIN behind it goes out and releases the
+     * stream. A WINDOW_UPDATE that finds the stream gone is late, not invalid; taking it for a
+     * protocol error closed the whole data connection (seen with the C server, whose update for a
+     * small Direct HTTP response raced the response FIN).
+     */
+    @Test
+    public void aWindowUpdateForAReleasedStreamIsIgnoredNotInvalid() throws Exception {
+        try (StreamFlowScheduler scheduler = new StreamFlowScheduler()) {
+            assertTrue(scheduler.open(21));
+            scheduler.send(21, 8, () -> { });
+            assertEquals(StreamFlowScheduler.Credit.INVALID, scheduler.creditIfOpen(21, 9));
+            assertEquals(StreamFlowScheduler.Credit.ADDED, scheduler.creditIfOpen(21, 3));
+            scheduler.submitFinish(21, () -> { }).get(5, TimeUnit.SECONDS);
+            assertFalse(scheduler.contains(21));
+            assertEquals(StreamFlowScheduler.Credit.NOT_OPEN, scheduler.creditIfOpen(21, 5));
+        }
+
+        // The release and the update race for real: the update is either credited or ignored. (A
+        // contains() check followed by addCredit() took it for invalid about once in 800 rounds.)
+        try (StreamFlowScheduler scheduler = new StreamFlowScheduler()) {
+            for (int streamId = 100; streamId < 10_100; streamId++) {
+                assertTrue(scheduler.open(streamId));
+                scheduler.send(streamId, 16, () -> { });
+                CompletableFuture<Void> fin = scheduler.submitFinish(streamId, () -> { });
+                StreamFlowScheduler.Credit credit = scheduler.creditIfOpen(streamId, 16);
+                assertTrue("stream " + streamId + ": " + credit,
+                        credit != StreamFlowScheduler.Credit.INVALID);
+                fin.get(5, TimeUnit.SECONDS);
+            }
         }
     }
 

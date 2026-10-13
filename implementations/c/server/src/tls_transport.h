@@ -57,6 +57,10 @@ int st_tls_connection_accept(st_tls_server_context *context,
 
 /* Read result: positive bytes, 0 clean close, -2 socket timeout, -1 other failure. */
 ssize_t st_tls_connection_read(st_tls_connection *connection, uint8_t *buffer, size_t len);
+/*
+ * Writes all of buffer: 0, or -1 when the write failed or the socket's write timeout ran out, after
+ * which part of it may already be on the wire.
+ */
 int st_tls_connection_write_all(st_tls_connection *connection, const uint8_t *buffer, size_t len);
 void st_tls_connection_free(st_tls_connection *connection);
 

@@ -616,6 +616,183 @@ static int test_sqlite_stream_and_pages(void)
     return 0;
 }
 
+/* The id of the first item of GET path as the token sees it; NULL when there is none. */
+static char *first_item_id(const char *token, const char *path)
+{
+    char *body = NULL;
+    char *id = NULL;
+    if (api_get(listener_port, path, token, &body) == 200) {
+        char **items = NULL;
+        size_t count = 0U;
+        if (st_json_get_raw_array(body, "items", &items, &count) == 0 && count > 0U) {
+            id = st_json_get_top_level_string(items[0], "id");
+        }
+        st_json_free_string_array(items, count);
+    }
+    free(body);
+    return id;
+}
+
+static int record_frame_on(const char *tenant, long long client_id, const char *client_name, int listen_port,
+                           const char *channel)
+{
+    st_storage_tcp_frame_record record = {
+        .tenant_id = tenant,
+        .client_id = client_id,
+        .client_name = client_name,
+        .listen_port = listen_port,
+        .resource_id = 1,
+        .resource_name = "TCP route",
+        .channel_id = channel,
+        .direction = "PUBLIC_TO_CLIENT",
+        .remote_address = "192.0.2.30:40000",
+        .source_address = "192.0.2.30",
+        .source_port = 40000,
+        .destination_address = "127.0.0.1",
+        .destination_port = 9,
+        .payload_data = (const uint8_t *)"frame",
+        .payload_data_len = 5U,
+        .frame_time = "2026-10-08T02:03:04Z"
+    };
+    return st_storage_record_tcp_frame(db_path, &record);
+}
+
+/*
+ * 4. SQLite search as Java's JpaHttpTrafficExchangeStore: HttpTrafficSearchField codes and constant
+ *    names (an unknown code searches the summary), lower(column) LIKE with the search text's %, _ and
+ *    \ taken literally, numbers matched as id, client id, status code or resource id per field, every
+ *    token required and no bound on how many there are; an administrator sees the tenant's records
+ *    of deleted clients too, list and detail; clientId <= 0 and listenPort=0 filter as Java's.
+ */
+static int test_sqlite_search(void)
+{
+    char admin[1024];
+    char owner[1024];
+    char foreign[1024];
+    CHECK(create_user("sqls-admin", "t-sqls", "ADMIN") == 0 && create_user("sqls-owner", "t-sqls", "USER") == 0
+              && create_user("sqls-other", "t-sqls", "USER") == 0
+              && create_user("sqls-foreign", "t-sqls-foreign", "ADMIN") == 0,
+          "sqlite search users");
+    CHECK(issue_token("sqls-admin", "t-sqls", "ADMIN", admin, sizeof(admin)) == 0
+              && issue_token("sqls-owner", "t-sqls", "USER", owner, sizeof(owner)) == 0
+              && issue_token("sqls-foreign", "t-sqls-foreign", "ADMIN", foreign, sizeof(foreign)) == 0,
+          "sqlite search tokens");
+    long long owned = create_client("t-sqls", "sqls-owned", "sqls-owner");
+    long long other = create_client("t-sqls", "sqls-other-client", "sqls-other");
+    long long gone = create_client("t-sqls", "sqls-gone", "sqls-owner");
+    long long foreign_client = create_client("t-sqls-foreign", "sqls-foreign-client", "sqls-foreign");
+    CHECK(owned > 0 && other > 0 && gone > 0 && foreign_client > 0, "sqlite search clients");
+    exchange_spec specs[] = {
+        {"t-sqls", owned, "sqls-owned", "api", "GET", "/v1/items", 200, NULL, "192.0.2.10",
+         "application/json; charset=utf-8", "binary", NULL, "{\"a\":1}"},
+        {"t-sqls", owned, "sqls-owned", "files", "POST", "/upload/report", 404, "upstream timed out", "10.0.0.7",
+         "text/html", NULL, "X-Trace: Alpha-42", "<p>hello world</p>"},
+        {"t-sqls", other, "sqls-other-client", "api", "GET", "/v1/other", 500, NULL, "192.0.2.11",
+         "text/plain", NULL, NULL, "boom"},
+        {"t-sqls", gone, "sqls-gone", "legacy", "DELETE", "/old", 204, NULL, "192.0.2.12", NULL, NULL, NULL, NULL},
+        {"t-sqls-foreign", foreign_client, "sqls-foreign-client", "api", "GET", "/v1/foreign", 202, NULL,
+         "192.0.2.13", "application/json", NULL, NULL, "{}"},
+    };
+    for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); ++i) {
+        CHECK(record_exchange(&specs[i]) == 0, "sqlite exchange %zu", i);
+    }
+    CHECK(record_frame_on("t-sqls", owned, "sqls-owned", 18081, "sqls-ch-owned") == 0
+              && record_frame_on("t-sqls", gone, "sqls-gone", 18082, "sqls-ch-gone") == 0,
+          "sqlite search frames");
+    CHECK(sql_exec("DELETE FROM client_account WHERE client_name = 'sqls-gone'") == 0, "delete sqls-gone");
+
+    static const struct {
+        const char *query;
+        long long total;
+        const char *codes;
+        const char *why;
+    } admin_cases[] = {
+        {"", 4, "204,500,404,200", "the administrator's tenant-wide view, deleted client included"},
+        {"q=get", 2, "500,200", "summary string columns match a case-insensitive substring"},
+        {"q=OWNED", 2, "404,200", "q=OWNED matches the client name"},
+        {"q=post%20report", 1, "404", "each token may match another column, but all must match"},
+        {"q=upstream%20nothing", 0, "", "a token without a match"},
+        {"q=e%20e%20e%20e%20e%20e%20e%20e%20e%20e%20e%20e%20e%20e%20e%20e", 4, "204,500,404,200",
+         "sixteen tokens: no bound on the query's length"},
+        {"q=hello", 0, "", "the summary leaves the previews out"},
+        {"q=404", 1, "404", "a number matches the status code in the summary"},
+        {"field=method&q=post", 1, "404", "field=method is one whole value"},
+        {"field=METHOD&q=pos", 0, "", "the method is not a substring"},
+        {"field=status&q=abc", 0, "", "a word in the status field matches nothing"},
+        {"field=remote&q=0.0.7", 1, "404", "field=remote substring"},
+        {"field=remote&q=10.0.0.%25", 0, "", "% is not a wildcard"},
+        {"field=remote&q=10.0.0._", 0, "", "_ is not a wildcard"},
+        {"field=requestHeaders&q=x-trace", 1, "404", "field=requestHeaders"},
+        {"field=REQUEST_HEADERS&q=alpha", 1, "404", "the constant name works too"},
+        {"field=headers&q=alpha", 0, "", "an unknown field code is the summary, which leaves headers out"},
+        {"field=all&q=alpha", 1, "404", "field=all reads headers"},
+        {"field=responseBody&q=HELLO", 1, "404", "field=responseBody reads the preview, case-insensitively"},
+        {"field=body&q=hello", 0, "", "body is no field code: the summary"},
+        {"field=path&q=items", 1, "200", "field=path"},
+        {"field=contentType&q=HTML", 1, "404", "field=contentType"},
+        {"clientId=0", 0, "", "clientId=0 names no client"},
+    };
+    char path[512];
+    for (size_t i = 0; i < sizeof(admin_cases) / sizeof(admin_cases[0]); ++i) {
+        snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges%s%s",
+                 admin_cases[i].query[0] == '\0' ? "" : "?", admin_cases[i].query);
+        CHECK(expect_exchanges(admin, path, admin_cases[i].total, admin_cases[i].codes) == 0, "%s",
+              admin_cases[i].why);
+    }
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges?field=client&q=%lld", other);
+    CHECK(expect_exchanges(admin, path, 1, "500") == 0, "field=client with a client id");
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges?clientId=%lld", gone);
+    CHECK(expect_exchanges(admin, path, 1, "204") == 0, "an administrator filters by a deleted client");
+    CHECK(expect_exchanges(owner, "/api/admin/traffic/http-exchanges", 2, "404,200") == 0, "owner view");
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges?clientId=%lld", other);
+    CHECK(expect_exchanges(owner, path, 0, "") == 0, "an owner naming another's client");
+    CHECK(expect_exchanges(foreign, "/api/admin/traffic/http-exchanges", 1, "202") == 0, "another tenant");
+
+    /* Detail: the deleted client's exchange for the administrator; another owner's is 404. */
+    char *id = first_item_id(admin, "/api/admin/traffic/http-exchanges?q=204");
+    CHECK(id != NULL, "deleted client's exchange id");
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%s", id);
+    free(id);
+    char *body = NULL;
+    CHECK(api_get(listener_port, path, admin, &body) == 200 && json_number(body, "statusCode") == 204,
+          "the administrator reads a deleted client's exchange: %s", body == NULL ? "" : body);
+    free(body);
+    id = first_item_id(admin, "/api/admin/traffic/http-exchanges?q=500");
+    CHECK(id != NULL, "another owner's exchange id");
+    snprintf(path, sizeof(path), "/api/admin/traffic/http-exchanges/%s", id);
+    free(id);
+    CHECK(api_get(listener_port, path, owner, &body) == 404, "another owner's exchange must be 404");
+    free(body);
+
+    /* TCP frames: listenPort=0 and clientId=0 filter; a deleted client's frames stay listed. */
+    static const struct {
+        const char *query;
+        long long total;
+    } frame_cases[] = {
+        {"", 2}, {"listenPort=0", 0}, {"listenPort=18081", 1}, {"clientId=0", 0}, {"clientId=-3", 0},
+    };
+    for (size_t i = 0; i < sizeof(frame_cases) / sizeof(frame_cases[0]); ++i) {
+        snprintf(path, sizeof(path), "/api/admin/traffic/tcp-frames%s%s",
+                 frame_cases[i].query[0] == '\0' ? "" : "?", frame_cases[i].query);
+        CHECK(api_get(listener_port, path, admin, &body) == 200 && json_number(body, "total") == frame_cases[i].total,
+              "GET %s: %s", path, body == NULL ? "" : body);
+        free(body);
+    }
+    snprintf(path, sizeof(path), "/api/admin/traffic/tcp-frames?clientId=%lld", gone);
+    id = first_item_id(admin, path);
+    CHECK(id != NULL, "a deleted client's frame must stay listed for the administrator");
+    snprintf(path, sizeof(path), "/api/admin/traffic/tcp-frames/%s", id);
+    free(id);
+    CHECK(api_get(listener_port, path, admin, &body) == 200 && json_number(body, "listenPort") == 18082,
+          "the administrator reads a deleted client's frame: %s", body == NULL ? "" : body);
+    free(body);
+    CHECK(api_get(listener_port, "/api/admin/traffic/tcp-frames", owner, &body) == 200
+              && json_number(body, "total") == 1,
+          "an owner sees its existing client's frames only: %s", body == NULL ? "" : body);
+    free(body);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -657,6 +834,10 @@ int main(int argc, char **argv)
         setenv("SPECUS_DATABASE_PATH", db_path, 1);
         failed = st_storage_init(db_path, 0) != 0 || test_sqlite_stream_and_pages();
         printf("%s sqlite stream contract and large pages\n", failed ? "FAIL" : "ok  ");
+        if (!failed) {
+            failed = test_sqlite_search();
+            printf("%s sqlite search as Java's JPA store\n", failed ? "FAIL" : "ok  ");
+        }
         unlink(db_path);
         if (saved[0] != '\0') setenv("SPECUS_ELASTICSEARCH_URIS", saved, 1);
     }

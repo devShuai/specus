@@ -2445,7 +2445,13 @@ static void test_cascades_from_endpoints(void)
               && create_share("admin", 50, "{\"expiresInSeconds\":3600}", token, share_b) == 0
               && create_share("alice", 42, "{\"expiresInSeconds\":3600}", token, share_c) == 0,
           "endpoint cascades: setup failed");
-    /* Deleting bob ends bob's share and leaves the admin's share of the same route. */
+    /*
+     * Deleting bob ends bob's share and leaves the admin's share of the same route. An account that
+     * still owns a client is not deleted (management-accounts.md 7.1): client 8 goes to admin first.
+     */
+    CHECK(manage("DELETE", "/api/admin/users/bob", "carol", NULL, response, RESPONSE_CAP) == 409
+              && sql_exec("UPDATE client_account SET owner_username = 'admin' WHERE id = 8;") == 0,
+          "endpoint cascades: refused user delete");
     CHECK(manage("DELETE", "/api/admin/users/bob", "carol", NULL, response, RESPONSE_CAP) == 204,
           "endpoint cascades: user delete");
     share_state a = read_share(share_a);

@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.theshuai.common.peeregress.Ipv4Cidr;
 import com.theshuai.common.peeregress.PeerEgressCodes;
 import com.theshuai.common.peeregress.PeerEgressFrame;
 import com.theshuai.common.peeregress.PeerEgressNames;
@@ -61,29 +60,37 @@ class PeerEgressNamesTests {
      */
     @Test
     void addressChoiceMatchesTheSharedVector() throws IOException {
+        assertTrue(PeerEgressRuntime.IPV6_TARGET_CAPABLE, "the vector's AAAA cases depend on IPv6 targets");
         for (JsonNode testCase : vector().get("egressChoice")) {
             String name = testCase.get("name").asText();
-            List<Integer> a = new ArrayList<>();
+            List<String> a = new ArrayList<>();
             for (JsonNode item : testCase.get("a")) {
-                a.add(Ipv4Cidr.parseAddress(item.asText()));
+                a.add(item.asText());
+            }
+            List<String> aaaa = new ArrayList<>();
+            for (JsonNode item : testCase.get("aaaa")) {
+                aaaa.add(item.asText());
             }
             JsonNode decisions = testCase.get("decisions");
-            PeerEgressRuntime.Choice choice = PeerEgressRuntime.chooseAddress(a, address -> {
-                String code = decisions.get(Ipv4Cidr.format(address)).asText();
+            List<String> candidates = PeerEgressRuntime.dialCandidates(a, aaaa,
+                    testCase.get("ipv6TargetCapable").asBoolean());
+            PeerEgressRuntime.Choice choice = PeerEgressRuntime.chooseAddress(candidates, address -> {
+                String code = decisions.get(address).asText();
                 return PeerEgressCodes.ALLOWED.equals(code) ? null : code;
             });
-            if (a.isEmpty() && testCase.get("aaaa").size() > 0 && testCase.get("ipv6TargetCapable").asBoolean()) {
-                assertEquals(PeerEgressCodes.NAME_UNRESOLVED, choice.code(),
-                        name + ": an IPv4-only egress should find nothing to dial");
-                continue;
-            }
             assertEquals(testCase.get("code").asText(),
                     choice.code() == null ? PeerEgressCodes.ALLOWED : choice.code(), name + ": code");
             JsonNode expected = testCase.get("address");
-            if (expected.isTextual()) {
-                assertEquals(expected.asText(), Ipv4Cidr.format(choice.address()), name + ": address");
-            }
+            assertEquals(expected.isTextual() ? expected.asText() : null, choice.address(), name + ": address");
         }
+    }
+
+    /** What the resolver hands on is the form the judgment reads: RFC 5952 for IPv6, without a scope. */
+    @Test
+    void resolvedAddressesAreWrittenTheWayTheJudgmentReadsThem() throws IOException {
+        assertEquals("2001:db8::10", PeerEgressRuntime.formatTarget(java.net.InetAddress.getByName("2001:0DB8:0:0::10")));
+        assertEquals("203.0.113.10", PeerEgressRuntime.formatTarget(java.net.InetAddress.getByName("203.0.113.10")));
+        assertEquals("fe80::1", PeerEgressRuntime.formatTarget(java.net.InetAddress.getByName("fe80::1%1")));
     }
 
     @Test

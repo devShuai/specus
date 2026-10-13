@@ -38,6 +38,9 @@ func windowsInterfaceKey(name string) string {
 }
 
 func (binder *egressSocketBinder) control(_ string, address string, connection syscall.RawConn) error {
+	if egressLeftUnbound(address) {
+		return nil
+	}
 	chosen, err := binder.choose(address)
 	if err != nil {
 		return err

@@ -1817,6 +1817,30 @@ int main(void)
         return 1;
     }
 
+    /*
+     * The login config, rosters and catalogues read every client of the database, which used to be
+     * cut at 256 or 1024 rows: past that, a client's local services and every Peer Mesh push failed,
+     * whatever tenant the other clients were in. Their names sort before these clients'.
+     */
+    sqlite3 *bulk_db = NULL;
+    int bulk_ok = sqlite3_open(path, &bulk_db) == SQLITE_OK
+        && sqlite3_exec(bulk_db,
+                        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 1099) "
+                        "INSERT INTO client_account(tenant_id, client_name, owner_username) "
+                        "SELECT 'tenant-bulk', printf('bulk-client-%04d', i), 'bulk-owner' FROM n",
+                        NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(bulk_db);
+    char *bulk_config = bulk_ok ? st_peer_mesh_build_login_config(path, source.client_name, 2) : NULL;
+    int bulk_config_ok = contains(bulk_config, "\"serviceId\":\"service-http-1\"") && contains(bulk_config, allowed_ips);
+    free(bulk_config);
+    context.count = 0;
+    context.target_online = 1;
+    if (!bulk_ok || !bulk_config_ok || st_peer_mesh_push_on_login(&runtime, source.client_name) != 0
+        || context.count < 2 || !contains(context.signals[0].message, "\"type\":\"peer-config\"")) {
+        fprintf(stderr, "peer mesh login config or push failed with 1100 more clients in the database\n");
+        return 1;
+    }
+
     unlink(path);
     if (test_egress_catalog_domain_targets() != 0) return 1;
     if (test_egress_catalog_egress_version() != 0) return 1;

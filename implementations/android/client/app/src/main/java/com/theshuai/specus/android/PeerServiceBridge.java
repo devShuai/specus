@@ -131,6 +131,12 @@ final class PeerServiceBridge implements AutoCloseable {
         Socket outbound = new Socket();
         splices.put(inbound, outbound);
         try {
+            // A flow accepted just before close() can reach here after close() went through the
+            // registered flows. Registered first, checked second: it is closed either way, and a
+            // withdrawn service never forwards it to the target.
+            if (!open.get()) {
+                return;
+            }
             inbound.setTcpNoDelay(true);
             inbound.setSoTimeout(PeerServiceResourceLimiter.IDLE_TIMEOUT_MILLIS);
             outbound.setTcpNoDelay(true);

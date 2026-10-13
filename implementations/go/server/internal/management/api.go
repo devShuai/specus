@@ -59,8 +59,13 @@ type API struct {
 	connectivity     *connectivity.Checker
 	productMetrics   *productmetrics.Service
 	clientTokens     *auth.SessionStore
+	accountDeleted   func(tenantID, username string)
 	logger           *slog.Logger
 }
+
+// SetAccountDeleted registers what runs once a management account's deletion has committed: the
+// server ends the identity's open management WebSockets there (management-accounts.md 7.1).
+func (a *API) SetAccountDeleted(hook func(tenantID, username string)) { a.accountDeleted = hook }
 
 // SetMediaCapture attaches the optional RustFS-backed media subsystem without widening the
 // long-standing NewAPI constructor used by integration tests.
@@ -324,7 +329,8 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !principal.BuiltIn {
 		a.recordMilestone(r.Context(), principal.TenantID, principal.Username, productmetrics.StepSignedIn)
 	}
-	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
+	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForAccount(principal.Username, principal.TenantID, principal.Role,
+		principal.AccountKey))
 }
 
 // handleRegister starts email verification. No account is created before the code is verified.
@@ -364,7 +370,7 @@ func (a *API) handleVerifyRegistration(w http.ResponseWriter, r *http.Request) {
 	// The verified registration created the account and this answer signs it in.
 	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepAccountCreated)
 	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepSignedIn)
-	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(user.Username, user.TenantID, user.Role))
+	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForAccount(user.Username, user.TenantID, user.Role, user.AccountKey))
 }
 
 func (a *API) registrationEnabled() bool {
@@ -387,8 +393,10 @@ func (a *API) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "OIDC 令牌不能通过该端点续期")
 		return
 	}
-	// authenticate already resolved the signed username against current config/DB state.
-	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
+	// authenticate already resolved the signed username against current config/DB state; the new
+	// token names the account row it resolved to, whether or not the old one carried uid.
+	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForAccount(principal.Username, principal.TenantID, principal.Role,
+		principal.AccountKey))
 }
 
 // loginIdentity is the account dimension of the login rate limit: tenant and login name, so
@@ -465,12 +473,13 @@ func (a *API) authenticatePassword(ctx context.Context, username, password,
 	}
 	role := normalizeRole(user.Role)
 	return managementPrincipal{
-		Username: user.Username,
-		TenantID: normalizeTenant(user.TenantID),
-		Role:     role,
-		Admin:    role == store.ManagementRoleAdmin,
-		BuiltIn:  false,
-		Issuer:   security.Issuer,
+		Username:   user.Username,
+		TenantID:   normalizeTenant(user.TenantID),
+		Role:       role,
+		Admin:      role == store.ManagementRoleAdmin,
+		BuiltIn:    false,
+		Issuer:     security.Issuer,
+		AccountKey: user.AccountKey,
 	}, true, nil
 }
 
@@ -556,7 +565,7 @@ func (a *API) handleOidcToken(w http.ResponseWriter, r *http.Request) {
 	}
 	a.recordMilestone(r.Context(), user.TenantID, user.Username, productmetrics.StepSignedIn)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accessToken": a.tokens.IssueForUser(user.Username, user.TenantID, user.Role),
+		"accessToken": a.tokens.IssueForAccount(user.Username, user.TenantID, user.Role, user.AccountKey),
 		"idToken":     result.IDToken,
 		"tokenType":   result.TokenType,
 		"expiresIn":   a.tokens.TTLSeconds(),
@@ -589,17 +598,22 @@ func (a *API) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	now := time.Now().Format(time.RFC3339Nano)
-	views := []ManagementUserView{{
-		Username:  a.adminUsername(),
-		TenantID:  principal.TenantID,
-		Role:      store.ManagementRoleAdmin,
-		Admin:     true,
-		BuiltIn:   true,
-		Enabled:   true,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}}
+	views := []ManagementUserView{}
+	// The built-in admin belongs to the default tenant only: it signs in there and its tokens resolve
+	// there, so another tenant's list does not show it as one of its accounts.
+	if normalizeTenant(principal.TenantID) == a.defaultTenant() {
+		now := time.Now().Format(time.RFC3339Nano)
+		views = append(views, ManagementUserView{
+			Username:  a.adminUsername(),
+			TenantID:  a.defaultTenant(),
+			Role:      store.ManagementRoleAdmin,
+			Admin:     true,
+			BuiltIn:   true,
+			Enabled:   true,
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}
 	for _, user := range users {
 		views = append(views, managementUserView(user))
 	}
@@ -765,11 +779,25 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	revoked, err := a.db.DeleteManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
 		a.shares.LapseReason)
+	var owned *store.AccountStillOwnsError
+	if errors.As(err, &owned) {
+		a.logger.Warn("management user delete refused: the account still owns clients or credentials",
+			"actor", principal.Username, "tenant", principal.TenantID, "target", user.Username,
+			"clients", owned.Clients, "credentials", owned.Credentials)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": owned.Error(), "clients": owned.Clients, "credentials": owned.Credentials,
+		})
+		return
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	a.shares.CutStreams(revoked)
+	// Committed: the identity's open management WebSockets end (management-accounts.md 7.1).
+	if a.accountDeleted != nil {
+		a.accountDeleted(normalizeTenant(user.TenantID), user.Username)
+	}
 	a.productMetrics.UserDeleted(r.Context(), normalizeTenant(user.TenantID), user.Username)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1637,6 +1665,19 @@ func (a *API) handleNatControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, online, err := a.natControl.PushToID(r.Context(), account.ID, account.ClientName)
+	if errors.Is(err, nat.ErrNatControlNotSent) {
+		// Nothing was sent and the connection is kept; the caller must not take it as pushed.
+		a.logger.Error("NAT_CONTROL push failed", "client", account.ClientName, "err", err)
+		a.fail(w, conflict(nat.ErrNatControlNotSent.Error()))
+		return
+	}
+	if errors.Is(err, nat.ErrNatControlWriteFailed) {
+		// The connection cannot be written, so the client is as good as offline: the 409 of an
+		// offline client, never a push reported as done. Its next login push carries the
+		// configuration. See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+		a.logger.Warn("NAT_CONTROL push failed", "client", account.ClientName, "err", err)
+		online, err = false, nil
+	}
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -2722,10 +2763,15 @@ func (a *API) requireNatControlFits(ctx context.Context, clientID int64, mapping
 	return err
 }
 
+// pushNatControl sends the client its configuration after a change. A push that fails, such as a
+// NAT_CONTROL past the 1 MiB MESSAGE body that predates the size check, is logged and leaves the
+// change and its answer as they are. See "NAT_CONTROL 的大小" in protocol/spec/control-protocol.md.
 func (a *API) pushNatControl(ctx context.Context, clientID int64, clientName string) {
 	pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _, _ = a.natControl.PushToID(pushCtx, clientID, clientName)
+	if _, _, err := a.natControl.PushToID(pushCtx, clientID, clientName); err != nil {
+		a.logger.Error("NAT_CONTROL push failed", "client", clientName, "err", err)
+	}
 }
 
 // revokeClientTokens forgets the runtime tokens of a deleted account and closes their session rows.
@@ -2866,6 +2912,9 @@ type managementPrincipal struct {
 	Admin    bool
 	BuiltIn  bool
 	Issuer   string
+	// AccountKey is the key of the account row the principal resolved to; empty for the built-in
+	// admin. Tokens issued for the principal carry it as uid.
+	AccountKey string
 }
 
 func (p managementPrincipal) canAccessClient(account store.ClientAccount) bool {
@@ -2908,7 +2957,9 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 		if !claims.HasTenant {
 			tenant = ""
 		}
-		if normalizeRole(claims.Role) == store.ManagementRoleAdmin &&
+		// A token with uid names an account row and is never the built-in admin's (section 6).
+		boundToAccount := claims.AccountKey != ""
+		if !boundToAccount && normalizeRole(claims.Role) == store.ManagementRoleAdmin &&
 			strings.EqualFold(strings.TrimSpace(claims.Username), a.adminUsername()) &&
 			(tenant == "" || tenant == a.defaultTenant()) {
 			if !a.tokens.PasswordLoginEnabled() {
@@ -2935,10 +2986,16 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 		if user == nil || !user.Enabled {
 			return managementPrincipal{}, false
 		}
+		// Compared here rather than in SQL, so a case-insensitive collation cannot relax it: the token
+		// of a deleted account does not pass to a later account of the same login name.
+		if boundToAccount && user.AccountKey != claims.AccountKey {
+			return managementPrincipal{}, false
+		}
 		role := normalizeRole(user.Role)
 		return managementPrincipal{
 			Username: user.Username, TenantID: normalizeTenant(user.TenantID), Role: role,
 			Admin: role == store.ManagementRoleAdmin, BuiltIn: false, Issuer: security.Issuer,
+			AccountKey: user.AccountKey,
 		}, true
 	}
 	if a.oidcAuth != nil {
@@ -2955,12 +3012,13 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 			}
 			role := normalizeRole(user.Role)
 			return managementPrincipal{
-				Username: user.Username,
-				TenantID: normalizeTenant(user.TenantID),
-				Role:     role,
-				Admin:    role == store.ManagementRoleAdmin,
-				BuiltIn:  false,
-				Issuer:   identity.Issuer,
+				Username:   user.Username,
+				TenantID:   normalizeTenant(user.TenantID),
+				Role:       role,
+				Admin:      role == store.ManagementRoleAdmin,
+				BuiltIn:    false,
+				Issuer:     identity.Issuer,
+				AccountKey: user.AccountKey,
 			}, true
 		}
 	}

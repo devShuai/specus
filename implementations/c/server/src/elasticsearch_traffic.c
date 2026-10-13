@@ -489,11 +489,16 @@ static int es_store_bytes(const st_es_config *config, const char *index, long lo
     char *entry = indices == NULL ? NULL : st_json_get_top_level_raw(indices, index);
     char *total = entry == NULL ? NULL : st_json_get_top_level_raw(entry, "total");
     char *store = total == NULL ? NULL : st_json_get_top_level_raw(total, "store");
+    /*
+     * Java currentStoreBytes: total_data_set_size_in_bytes whenever the cluster reports it, also when
+     * it is 0 (nothing is trimmed then); size_in_bytes only when the field is absent.
+     */
     long long value = 0;
-    int rc = store != NULL && st_json_get_i64(store, "total_data_set_size_in_bytes", &value) == 0
-        && value > 0 ? 0 : store != NULL ? st_json_get_i64(store, "size_in_bytes", &value) : -1;
+    int rc = store == NULL ? -1
+        : st_json_get_i64(store, "total_data_set_size_in_bytes", &value) == 0 ? 0
+        : st_json_get_i64(store, "size_in_bytes", &value);
     free(store); free(total); free(entry); free(indices); free(response);
-    if (rc == 0) *bytes = value;
+    if (rc == 0) *bytes = value < 0 ? 0 : value;
     return rc;
 }
 
@@ -1425,7 +1430,7 @@ static int es_build_tcp_query(st_es_buffer *json,
     int rc = es_buffer_append(json, "{\"query\":{\"bool\":{\"filter\":[")
         || es_append_scope_filters(json, tenant_id, all_clients, visible_ids, visible_count, client_id);
     if (rc == 0 && document_id > 0) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "id", document_id);
-    if (rc == 0 && listen_port > 0) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "listenPort", listen_port);
+    if (rc == 0 && listen_port != ST_STORAGE_ANY_LISTEN_PORT) rc = es_buffer_append(json, ",") || es_append_term_i64(json, "listenPort", listen_port);
     if (rc == 0 && channel_id != NULL) rc = es_buffer_append(json, ",") || es_append_exact_text(json, "channelId", channel_id);
     if (rc == 0) rc = es_buffer_append(json, "]}}");
     if (rc == 0 && document_id > 0) return es_buffer_append(json, ",\"from\":0,\"size\":1}") ? -1 : 0;
@@ -1817,7 +1822,7 @@ int st_elasticsearch_get_tcp(const char *database_path,
     if (frame == NULL || id <= 0) return -1;
     size_t count = 0U;
     long long total = 0;
-    int rc = es_list_tcp_internal(database_path, 0, 0, NULL, id,
+    int rc = es_list_tcp_internal(database_path, 0, ST_STORAGE_ANY_LISTEN_PORT, NULL, id,
                                   tenant_id, owner_username, include_all_clients, 0, 1,
                                   1, frame, 1U, &count, &total);
     return rc == 0 && count == 1U ? 0 : -1;
@@ -1842,7 +1847,7 @@ int st_elasticsearch_list_tcp_stream(const char *database_path,
     if (channel_id == NULL || es_copy_trimmed(trimmed, sizeof(trimmed), channel_id) != 0 || trimmed[0] == '\0') {
         return 0;
     }
-    return es_list_tcp_internal(database_path, 0, 0, trimmed, 0,
+    return es_list_tcp_internal(database_path, 0, ST_STORAGE_ANY_LISTEN_PORT, trimmed, 0,
                                 tenant_id, owner_username, include_all_clients, page, size,
                                 1, items, max_items, item_count, total_count);
 }

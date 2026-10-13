@@ -313,6 +313,9 @@ static uint8_t *decode_content_encoding(const uint8_t *data,
         } else if (token_equals(items[i], lengths[i], "deflate") || token_equals(items[i], lengths[i], "x-deflate")) {
             failed = inflate_prefix(input, current_len, MAX_WBITS, limit, &next, &next_len) != 0
                 && inflate_prefix(input, current_len, -MAX_WBITS, limit, &next, &next_len) != 0;
+        } else if (token_equals(items[i], lengths[i], "br")) {
+            /* Java reads br with org.brotli:dec; without libbrotlidec in the build it is not decoded. */
+            failed = st_decompress_brotli_prefix(input, current_len, limit, &next, &next_len) != ST_DECOMPRESSION_OK;
         } else {
             failed = 1;
         }
@@ -435,7 +438,7 @@ static void display_media_type(const char *content_type, char *out, size_t out_l
 /*
  * HttpBodyDataCodec.decodeContentEncoding: every layer, last applied first, within the bounds of
  * DecompressionLimits. 1 when the encoding is only identity, 0 with *out decoded, -1 when a layer
- * is unknown (br included) or fails.
+ * is unknown or fails (br too when the build has no libbrotlidec).
  */
 static int display_decode(const uint8_t *data, size_t len, const char *encoding, uint8_t **out, size_t *out_len)
 {
@@ -480,6 +483,9 @@ static int display_decode(const uint8_t *data, size_t len, const char *encoding,
                     != ST_DECOMPRESSION_OK
                 && st_decompress_bounded(input, current_len, ST_DECOMPRESSION_RAW_DEFLATE, &next, &next_len)
                     != ST_DECOMPRESSION_OK;
+        } else if (token_equals(items[i], lengths[i], "br")) {
+            failed = st_decompress_bounded(input, current_len, ST_DECOMPRESSION_BROTLI, &next, &next_len)
+                != ST_DECOMPRESSION_OK;
         } else {
             failed = 1;
         }

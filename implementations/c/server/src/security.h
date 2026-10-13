@@ -6,6 +6,7 @@
 #define ST_SECURITY_TOKEN_USERNAME_LEN 80
 #define ST_SECURITY_TOKEN_TENANT_LEN 63
 #define ST_SECURITY_TOKEN_ROLE_LEN 19
+#define ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN 80
 
 typedef struct {
     char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
@@ -13,6 +14,11 @@ typedef struct {
     /* The token carried tenant_id; without it tenant_id holds the default tenant. Tokens issued since
      * tenant-scoped login names always carry it, so one without it names its account by account key. */
     int has_tenant;
+    /* The uid claim: the key of the account the token was issued for, empty when the token has none
+     * (the built-in admin's tokens, and tokens issued before the claim existed). A login name can be
+     * reused once its account is deleted; the key cannot, so the token never passes to a later
+     * account of the same name (protocol/spec/management-accounts.md sections 5 and 6). */
+    char account_key[ST_SECURITY_TOKEN_ACCOUNT_KEY_LEN + 1];
     char role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
     long long expires_at;
 } st_security_token_claims;
@@ -51,6 +57,16 @@ int st_security_issue_local_token(const char *username,
                                   long long ttl_seconds,
                                   char *out,
                                   size_t out_len);
+/* A token for an account: account_key becomes the uid claim; NULL or empty only for the built-in
+ * admin, who has no account row (the call is then st_security_issue_local_token). */
+int st_security_issue_local_token_for_account(const char *username,
+                                              const char *tenant_id,
+                                              const char *role,
+                                              const char *account_key,
+                                              const char *jwt_secret,
+                                              long long ttl_seconds,
+                                              char *out,
+                                              size_t out_len);
 int st_security_validate_local_token(const char *token,
                                      const char *jwt_secret,
                                      const char *default_tenant_id,

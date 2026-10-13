@@ -223,6 +223,31 @@ public sealed class ManagementLoginNameMigrationTests
         await DatabaseInitializer.EnsureManagementLoginNamesAsync(db, CancellationToken.None);
     }
 
+    /// <summary>Java <c>ManagementUserSchemaMigratorTests.removesEmailRecordsOfAccountsThatNoLongerExist</c>.</summary>
+    [Fact]
+    public async Task StartupStepRemovesEmailRecordsOfDeletedAccounts()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = CreateContext(connection);
+        await db.Database.MigrateAsync();
+        // An account deleted before the delete took its email along left its record behind.
+        await db.Database.ExecuteSqlRawAsync("""
+            INSERT INTO specus_management_user (username, login_name, login_name_normalized, tenant_id, password_hash, role, enabled, created_at, updated_at)
+            VALUES ('kept-key', 'kept', 'kept', 'default', 'x', 'User', 1, 'now', 'now');
+            INSERT INTO specus_management_user_email (username, email, verified_at, created_at, updated_at)
+            VALUES ('kept-key', 'kept@example.com', 'now', 'now', 'now');
+            INSERT INTO specus_management_user_email (username, email, verified_at, created_at, updated_at)
+            VALUES ('deleted-key', 'released@example.com', 'now', 'now', 'now');
+            """);
+
+        await DatabaseInitializer.EnsureManagementLoginNamesAsync(db, CancellationToken.None);
+        await DatabaseInitializer.EnsureManagementLoginNamesAsync(db, CancellationToken.None);
+
+        Assert.Equal(new[] { "kept@example.com" },
+            await db.ManagementUserEmails.AsNoTracking().Select(email => email.Email).ToListAsync());
+    }
+
     [Theory]
     [InlineData("CREATE INDEX uq_management_user_tenant_login_name ON specus_management_user (tenant_id, login_name_normalized)")]
     [InlineData("CREATE UNIQUE INDEX uq_management_user_tenant_login_name ON specus_management_user (login_name_normalized, tenant_id)")]

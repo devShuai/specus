@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"testing"
 	"time"
 
@@ -272,7 +273,19 @@ func TestTenantQualifiedLoginAndRefreshResolveOnlyTheMatchingTenant(t *testing.T
 	}
 
 	// A token for tenant-a's alice resolves to no one once that account is gone, even though an
-	// alice still exists in tenant-b.
+	// alice still exists in tenant-b. Her client goes first: an account that still owns one is not
+	// deleted (management-accounts.md 7.1).
+	if status, _ := h.do(http.MethodDelete, "/api/admin/users/alice", adminA, nil); status != http.StatusConflict {
+		t.Fatalf("delete tenant-a alice with a client: %d", status)
+	}
+	aliceAClient, err := h.db.FindClientByName(context.Background(), "alice-a-client")
+	if err != nil || aliceAClient == nil {
+		t.Fatalf("alice-a-client: %v", err)
+	}
+	if status, payload := h.do(http.MethodDelete, "/api/admin/clients/"+strconv.FormatInt(aliceAClient.ID, 10),
+		adminA, nil); status != http.StatusNoContent && status != http.StatusOK {
+		t.Fatalf("delete alice-a-client: status %d body %s", status, payload)
+	}
 	if status, _ := h.do(http.MethodDelete, "/api/admin/users/alice", adminA, nil); status != http.StatusNoContent {
 		t.Fatalf("delete tenant-a alice: %d", status)
 	}
@@ -382,8 +395,9 @@ func TestLegacyAccountsStillSignInAfterTheLoginNameMigration(t *testing.T) {
 		clients[0].ClientName != "erin-client" {
 		t.Fatalf("erin's clients: status %d body %s", status, payload)
 	}
+	// The built-in admin belongs to the default tenant and is not listed in tenant-e.
 	users := h.users(erin)
-	if len(users) != 2 || users[1].Username != "erin" || users[1].TenantID != "tenant-e" {
+	if len(users) != 1 || users[0].Username != "erin" || users[0].TenantID != "tenant-e" || users[0].BuiltIn {
 		t.Fatalf("tenant-e users: %+v", users)
 	}
 	stored, err := h.db.FindManagementUserByLogin(context.Background(), "tenant-e", "ERIN")

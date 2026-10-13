@@ -218,6 +218,12 @@ struct specus_session {
      */
     server_config config;
     pthread_mutex_t send_lock;
+    /*
+     * Set under send_lock once a write on the connection failed. The write may have stopped partway
+     * through a frame, the socket having a write timeout, and anything written after it would be read
+     * out of step, so nothing is written again (see session_send_packet_locked).
+     */
+    int write_failed;
     pthread_mutex_t map_lock;
     pthread_mutex_t direct_lock;
     pthread_cond_t reference_cond;
@@ -1312,17 +1318,44 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
     return 0;
 }
 
-/* Writes a packet on a connection whose send_lock the caller already holds. */
+/*
+ * Writes a packet on a connection whose send_lock the caller already holds.
+ *
+ * A write that fails, because the peer is gone or because the write timeout ran out, may have put
+ * part of the frame on the wire; any frame after it would be read out of step. The connection is
+ * then never written again: write_failed turns every later write away, and the socket is shut down
+ * so the connection's own thread wakes from its read, records IO_ERROR and closes it ("帧写入失败"
+ * in protocol/spec/control-protocol.md). This may run on any thread that sends; only shutting the
+ * socket down here, under send_lock, is safe, since session_shutdown closes the descriptor under
+ * the same lock and its number cannot have been reused yet.
+ */
 static int session_send_packet_locked(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
-    if (packet->data != NULL && session->control_fd >= 0) {
+    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed) {
         rc = session->tls_connection == NULL
             ? send_all(session->control_fd, packet->data, packet->len)
             : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
+        if (rc != 0) {
+            int write_errno = errno;
+            session->write_failed = 1;
+            shutdown(session->control_fd, SHUT_RDWR);
+            fprintf(stderr, "[%s] write failed remote=%s client=%s errno=%d: closing the connection\n",
+                    session->is_data_connection ? "data" : "control", session->remote,
+                    session->config.client_name, write_errno);
+        }
     }
     st_buffer_free(packet);
     return rc;
+}
+
+/* Whether a write on the connection has failed, which shut it down (session_send_packet_locked). */
+static int session_write_failed(specus_session *session)
+{
+    pthread_mutex_lock(&session->send_lock);
+    int failed = session->write_failed;
+    pthread_mutex_unlock(&session->send_lock);
+    return failed;
 }
 
 static int session_send_packet(specus_session *session, st_buffer *packet)
@@ -2701,6 +2734,21 @@ static void apply_runtime_route_config(specus_session *session, server_config *r
 static pthread_mutex_t runtime_nat_control_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
+ * The error a NAT_CONTROL that does not fit one MESSAGE leaves: it was not sent, and the connection is
+ * kept, since a client that logged in again would only meet the same failure. See "NAT_CONTROL 的大小"
+ * in protocol/spec/control-protocol.md.
+ */
+static void log_nat_control_not_sent(const char *client_name, size_t tcp_routes, size_t http_routes,
+                                     size_t json_bytes)
+{
+    fprintf(stderr,
+            "[nat-control] not pushed to %s: its NAT_CONTROL of %zu tcp + %zu http route(s), %zu bytes of JSON, "
+            "does not fit the %u-byte MESSAGE body; the connection is kept, disable or delete entries to bring "
+            "it back within the limit\n",
+            client_name, tcp_routes, http_routes, json_bytes, (unsigned)ST_MAX_MESSAGE_BODY_SIZE);
+}
+
+/*
  * Reloads a client's routes into its published control and data connections, then sends the
  * control the new NAT_CONTROL. The route set is replaced before the send waits for send_lock, so
  * on a control whose login is still writing its response and first NAT_CONTROL (client_thread)
@@ -2752,22 +2800,32 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
     int result = prepare_runtime_route_config(&control_current, &refreshed_control) == 0
         && (data == NULL || prepare_runtime_route_config(&data_current, &refreshed_data) == 0)
         ? 0 : -2;
-    st_buffer packet = {0};
     if (result == 0) {
-        packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
-        if (packet.data == NULL) {
-            result = -2;
-        }
-    }
-    if (result == 0) {
+        /*
+         * The reloaded routes take effect on the server whether or not the NAT_CONTROL can be sent:
+         * they are what it forwards and accepts registrations by. One that does not fit one MESSAGE
+         * is not sent, and the client goes on with the configuration it has.
+         */
+        st_buffer packet = st_protocol_encode_nat_control(client_name, refreshed_control.nat_control_json);
         size_t tcp_routes = refreshed_control.mapping_count;
         size_t http_routes = refreshed_control.http_route_count;
+        size_t json_bytes = refreshed_control.nat_control_json == NULL ? 0U : strlen(refreshed_control.nat_control_json);
         apply_runtime_route_config(control, &refreshed_control);
         if (data != NULL) {
             apply_runtime_route_config(data, &refreshed_data);
         }
-        if (session_send_packet(control, &packet) != 0) {
-            result = -2;
+        if (packet.data == NULL) {
+            log_nat_control_not_sent(client_name, tcp_routes, http_routes, json_bytes);
+            result = ST_ADMIN_NAT_CONTROL_NOT_SENT;
+        } else if (session_send_packet(control, &packet) != 0) {
+            /*
+             * The connection is closed, reset or no longer writable, and a write that failed here has
+             * shut it down: the client is as good as offline, and the manual push answers it as one.
+             * See "NAT_CONTROL 写失败与数据库错误" in protocol/spec/control-protocol.md.
+             */
+            fprintf(stderr, "[nat-control] runtime push to %s failed: its control connection cannot be written\n",
+                    client_name);
+            result = -1;
         } else {
             printf("[nat-control] runtime push client=%s tcp=%zu http=%zu\n",
                    client_name,
@@ -2775,7 +2833,6 @@ static int push_runtime_nat_control(void *ctx, long long client_id, const char *
                    http_routes);
         }
     } else {
-        st_buffer_free(&packet);
         /* An unprepared copy holds nothing and a prepared one only its own set: both can be released. */
         config_release_routes(&refreshed_control);
         config_release_routes(&refreshed_data);
@@ -2989,6 +3046,13 @@ static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *sessio
     runtime.publisher_session_id = session->config.client_session_id;
     runtime.peer_service_discovery_version = session->config.peer_service_discovery_version;
     return runtime;
+}
+
+/* The management API's PEER_CONTROL messages (a session it closed) go out like the runtime's own. */
+static int push_runtime_peer_control(void *ctx, const char *target_client_name, const char *message)
+{
+    (void)ctx;
+    return peer_mesh_runtime_send(NULL, target_client_name, "server", message);
 }
 
 static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
@@ -4971,6 +5035,13 @@ static void *client_thread(void *arg)
         uint8_t *body = NULL;
         size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
         int rc = read_frame(session, frame_limit, &header, &body);
+        if (rc != 1 && session_write_failed(session)) {
+            /* A failed write, on whichever thread sent it, shut the socket down and so ended the read. */
+            disconnect_reason = "IO_ERROR";
+            fprintf(stderr, "[%s] closed %s after a failed write\n",
+                    session->is_data_connection ? "data" : "control", session->remote);
+            break;
+        }
         if (rc == 0) {
             disconnect_reason = "CLIENT_CLOSED";
             printf("[control] closed %s\n", session->remote);
@@ -5029,6 +5100,8 @@ static void *client_thread(void *arg)
             int control_login = !session->is_data_connection;
             st_buffer nat_control = {0};
             size_t nat_control_tcp_routes = 0U;
+            size_t nat_control_http_routes = 0U;
+            size_t nat_control_json_bytes = 0U;
             if (control_login) {
                 pthread_mutex_lock(&control_admission_lock);
             }
@@ -5037,6 +5110,9 @@ static void *client_thread(void *arg)
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                              session->config.nat_control_json);
                 nat_control_tcp_routes = session->config.mapping_count;
+                nat_control_http_routes = session->config.http_route_count;
+                nat_control_json_bytes = session->config.nat_control_json == NULL
+                    ? 0U : strlen(session->config.nat_control_json);
             }
             pthread_mutex_lock(&session->send_lock);
             if (logged_in) {
@@ -5058,7 +5134,9 @@ static void *client_thread(void *arg)
                 reason);
             int response_rc = session_send_packet_locked(session, &response);
             int nat_control_rc = 0;
-            if (response_rc == 0 && logged_in && control_login) {
+            /* A NAT_CONTROL that does not fit one MESSAGE could not be encoded; it is not sent. */
+            int nat_control_sent = nat_control.data != NULL;
+            if (response_rc == 0 && logged_in && control_login && nat_control_sent) {
                 nat_control_rc = session_send_packet_locked(session, &nat_control);
             } else {
                 st_buffer_free(&nat_control);
@@ -5088,12 +5166,31 @@ static void *client_thread(void *arg)
                 record_login_success_event(session);
                 record_client_online_milestone(session);
                 if (nat_control_rc != 0) {
+                    /*
+                     * The control socket has a write timeout, so a failed write may have left half a
+                     * frame on the wire: anything written after it, the Peer Mesh push included, would
+                     * be read out of step. The failed write has already shut the connection down and
+                     * nothing more is written to it; it is closed here rather than after a Peer Mesh
+                     * push that could not go out. The client logs in again and gets its configuration
+                     * then.
+                     */
+                    fprintf(stderr, "[nat-control] push to %s on login failed: its control connection cannot "
+                            "be written; closing it\n", session->config.client_name);
                     disconnect_reason = "IO_ERROR";
                     st_login_request_free(&request);
                     break;
                 }
-                printf("[nat-control] pushed %zu tcp route(s) to %s\n",
-                       nat_control_tcp_routes, session->config.client_name);
+                /*
+                 * One that was not sent is only logged: the login stands and the Peer Mesh push below
+                 * still runs. Closing the connection had the client log in again into the same failure.
+                 */
+                if (nat_control_sent) {
+                    printf("[nat-control] pushed %zu tcp route(s) to %s\n",
+                           nat_control_tcp_routes, session->config.client_name);
+                } else {
+                    log_nat_control_not_sent(session->config.client_name, nat_control_tcp_routes,
+                                             nat_control_http_routes, nat_control_json_bytes);
+                }
                 if (session->config.database_path[0] != '\0') {
                     st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
                     if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
@@ -5469,6 +5566,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    st_admin_set_peer_control_send_handler(push_runtime_peer_control, NULL);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
     st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);
     const st_connectivity_device connectivity_device = {
@@ -5494,6 +5592,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
@@ -5510,6 +5609,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
@@ -5532,6 +5632,7 @@ int main(void)
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
         st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+        st_admin_set_peer_control_send_handler(NULL, NULL);
         st_admin_set_client_disconnect_handler(NULL, NULL);
         st_admin_set_external_connection_stats_handler(NULL, NULL);
         close(listener);
@@ -5640,6 +5741,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);
     st_admin_set_peer_mesh_refresh_handler(NULL, NULL);
+    st_admin_set_peer_control_send_handler(NULL, NULL);
     st_admin_set_client_disconnect_handler(NULL, NULL);
     st_admin_set_external_connection_stats_handler(NULL, NULL);
     st_stun_turn_server_stop(stun_turn_server);

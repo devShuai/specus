@@ -21,7 +21,6 @@
 #include <strings.h>
 #include <time.h>
 
-#define ST_PEER_MESH_MAX_CLIENTS 1024U
 #define ST_PEER_MESH_MAX_CATALOGS 4096U
 #define ST_PEER_MESH_MAX_CATALOG_SERVICES 32U
 #define ST_PEER_MESH_CATALOG_TTL_SECONDS 300
@@ -740,11 +739,12 @@ static int pm_append_allowed_peer_ips(pm_builder *builder,
 {
     if (pm_append(builder, "[") != 0) return -1;
     if (!service->enabled) return pm_append(builder, "]");
-    st_storage_client clients[256];
+    st_storage_client *clients = NULL;
     size_t count = 0U;
-    if (st_storage_list_clients(database_path, clients, 256U, &count) != 0) return -1;
+    if (st_storage_list_all_clients(database_path, &clients, &count) != 0) return -1;
     int first = 1;
-    for (size_t i = 0; i < count; ++i) {
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
         st_storage_client *recipient = &clients[i];
         int allowed = 0;
         if (recipient->id == publisher->id
@@ -761,10 +761,11 @@ static int pm_append_allowed_peer_ips(pm_builder *builder,
                                                        recipient->id, &device) != 0
             || !device.enabled || device.virtual_ip[0] == '\0') continue;
         if ((!first && pm_append(builder, ",") != 0)
-            || pm_append_json_string(builder, device.virtual_ip) != 0) return -1;
+            || pm_append_json_string(builder, device.virtual_ip) != 0) rc = -1;
         first = 0;
     }
-    return pm_append(builder, "]");
+    free(clients);
+    return rc == 0 ? pm_append(builder, "]") : -1;
 }
 
 static int pm_append_local_services(pm_builder *builder,
@@ -772,12 +773,13 @@ static int pm_append_local_services(pm_builder *builder,
                                     const st_storage_client *client)
 {
     if (pm_append(builder, "[") != 0) return -1;
-    st_storage_peer_mesh_service services[256];
+    st_storage_peer_mesh_service *services = NULL;
     size_t count = 0U;
     if (st_storage_list_peer_mesh_services_visible(database_path, client->tenant_id, "", 1,
-                                                    services, 256U, &count) != 0) return -1;
+                                                    &services, &count) != 0) return -1;
     int first = 1;
-    for (size_t i = 0; i < count; ++i) {
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
         const st_storage_peer_mesh_service *service = &services[i];
         if (service->client_id != client->id) continue;
         if ((!first && pm_append(builder, ",") != 0)
@@ -801,10 +803,11 @@ static int pm_append_local_services(pm_builder *builder,
             || pm_append_json_string(builder, service->visibility) != 0
             || pm_append(builder, ",\"allowedPeerVirtualIps\":") != 0
             || pm_append_allowed_peer_ips(builder, database_path, client, service) != 0
-            || pm_append(builder, "}") != 0) return -1;
+            || pm_append(builder, "}") != 0) rc = -1;
         first = 0;
     }
-    return pm_append(builder, "]");
+    free(services);
+    return rc == 0 ? pm_append(builder, "]") : -1;
 }
 
 static int pm_top_level_has(const char *json, const char *field)
@@ -957,44 +960,68 @@ static void pm_trim_lower(const char *value, char *out, size_t out_len)
     out[len] = '\0';
 }
 
-static int pm_normalize_local_host(const char *value, char out[256])
+/*
+ * Java PeerServiceDiscovery.requireTargetHost, step by step, with the message each refusal carries:
+ * a blank value, anything shaped like a URL, a name other than localhost, an address that is not
+ * written canonically (Java compares the text with InetAddress.getHostAddress), the wildcard and
+ * multicast addresses, and an address that is not loopback, link-local, site-local or unique-local.
+ */
+const char *st_peer_mesh_local_host_refusal(const char *value, char out[256])
 {
     char host[256];
     const char *start = value == NULL ? "" : value;
-    while (isspace((unsigned char)*start)) ++start;
+    while ((unsigned char)*start <= ' ' && *start != '\0') ++start;
     const char *end = start + strlen(start);
-    while (end > start && isspace((unsigned char)end[-1])) --end;
-    if (end == start || (size_t)(end - start) >= sizeof(host)) return -1;
+    while (end > start && (unsigned char)end[-1] <= ' ') --end;
+    if (end == start) return "targetHost is required";
+    if ((size_t)(end - start) >= sizeof(host)) return "targetHost must be a unicast IP or localhost";
     memcpy(host, start, (size_t)(end - start));
     host[end - start] = '\0';
-    if (host[0] == '[' && end - start > 2 && host[end - start - 1] == ']') {
-        memmove(host, host + 1, (size_t)(end - start - 2));
-        host[end - start - 2] = '\0';
+    if (strpbrk(host, "/\\@?#") != NULL) return "targetHost must be a local address, not a URL";
+    size_t len = strlen(host);
+    if (host[0] == '[' && len >= 2U && host[len - 1U] == ']') {
+        memmove(host, host + 1, len - 2U);
+        host[len - 2U] = '\0';
     }
     if (strcasecmp(host, "localhost") == 0) {
         snprintf(out, 256U, "127.0.0.1");
-        return 0;
+        return NULL;
     }
+    int numeric = strchr(host, ':') != NULL || (host[0] != '\0' && strspn(host, "0123456789.") == strlen(host));
+    if (!numeric) return "targetHost must be a numeric local address or localhost";
     struct in_addr ipv4;
-    if (inet_pton(AF_INET, host, &ipv4) == 1) {
+    if (strchr(host, ':') == NULL) {
+        if (inet_pton(AF_INET, host, &ipv4) != 1 || inet_ntop(AF_INET, &ipv4, out, 256U) == NULL
+            || strcmp(out, host) != 0) {
+            return "targetHost must be a unicast IP or localhost";
+        }
         uint32_t address = ntohl(ipv4.s_addr);
+        if (address == 0U || (address >> 28U) == 0xEU) return "targetHost cannot be wildcard or multicast";
         int local = (address >> 24U) == 127U || (address >> 24U) == 10U
             || (address >> 20U) == 0xAC1U || (address >> 16U) == 0xC0A8U
             || (address >> 16U) == 0xA9FEU;
-        if (!local || address == 0U || (address >> 28U) == 0xEU) return -1;
-        return inet_ntop(AF_INET, &ipv4, out, 256U) == NULL ? -1 : 0;
+        return local ? NULL : "targetHost must be loopback or a local interface address";
     }
     struct in6_addr ipv6;
-    if (inet_pton(AF_INET6, host, &ipv6) != 1) return -1;
+    if (inet_pton(AF_INET6, host, &ipv6) != 1) return "targetHost must be a unicast IP or localhost";
+    if (IN6_IS_ADDR_UNSPECIFIED(&ipv6) || IN6_IS_ADDR_MULTICAST(&ipv6)) {
+        return "targetHost cannot be wildcard or multicast";
+    }
     const unsigned char *bytes = ipv6.s6_addr;
     int loopback = IN6_IS_ADDR_LOOPBACK(&ipv6);
     int link_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0x80U;
     /* fec0::/10, which Java's isSiteLocalAddress still counts as local. */
     int site_local = bytes[0] == 0xfeU && (bytes[1] & 0xc0U) == 0xc0U;
     int unique_local = (bytes[0] & 0xfeU) == 0xfcU;
-    if ((!loopback && !link_local && !site_local && !unique_local) || IN6_IS_ADDR_UNSPECIFIED(&ipv6)
-        || IN6_IS_ADDR_MULTICAST(&ipv6)) return -1;
-    return inet_ntop(AF_INET6, &ipv6, out, 256U) == NULL ? -1 : 0;
+    if (!loopback && !link_local && !site_local && !unique_local) {
+        return "targetHost must be loopback or a local interface address";
+    }
+    return inet_ntop(AF_INET6, &ipv6, out, 256U) == NULL ? "targetHost must be a unicast IP or localhost" : NULL;
+}
+
+static int pm_normalize_local_host(const char *value, char out[256])
+{
+    return st_peer_mesh_local_host_refusal(value, out) == NULL ? 0 : -1;
 }
 
 int st_peer_mesh_normalize_local_host(const char *value, char out[256])
@@ -1075,21 +1102,22 @@ static int pm_catalog_has_service(const pm_catalog *catalog, const char *service
 static int pm_has_authorized_online_peer(const st_peer_mesh_runtime *runtime,
                                          const st_storage_client *publisher)
 {
-    st_storage_client clients[ST_PEER_MESH_MAX_CLIENTS];
+    st_storage_client *clients = NULL;
     size_t count = 0U;
-    if (st_storage_list_clients(runtime->database_path, clients,
-                                ST_PEER_MESH_MAX_CLIENTS, &count) != 0) return 0;
-    for (size_t i = 0; i < count; ++i) {
+    if (st_storage_list_all_clients(runtime->database_path, &clients, &count) != 0) return 0;
+    int found = 0;
+    for (size_t i = 0; !found && i < count; ++i) {
         int allowed = 0;
-        if (clients[i].id != publisher->id
+        found = clients[i].id != publisher->id
             && strcmp(clients[i].tenant_id, publisher->tenant_id) == 0
             && clients[i].enabled
             && st_storage_can_peer(runtime->database_path, publisher, &clients[i], &allowed) == 0
             && allowed
             && runtime->online != NULL
-            && runtime->online(runtime->ctx, clients[i].id, clients[i].client_name)) return 1;
+            && runtime->online(runtime->ctx, clients[i].id, clients[i].client_name);
     }
-    return 0;
+    free(clients);
+    return found;
 }
 
 static int pm_catalog_service_visible(const st_storage_client *publisher,
@@ -1136,6 +1164,8 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
     char expires_at[32];
     pm_format_instant(catalog->expires_at, expires_at);
     pm_builder builder = {0};
+    st_storage_peer_mesh_service *definitions = NULL;
+    size_t count = 0U;
     if (pm_appendf(&builder,
                    "{\"type\":\"service-catalog\",\"publisherClientId\":%lld,\"publisherClientName\":",
                    catalog->publisher_client_id) != 0
@@ -1144,11 +1174,9 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
                       catalog->publisher_session_id, catalog->catalog_revision) != 0
         || pm_append_json_string(&builder, expires_at) != 0
         || pm_append(&builder, ",\"services\":[") != 0) goto failed;
-    st_storage_peer_mesh_service definitions[256];
-    size_t count = 0U;
     if (authorized && catalog->active
         && st_storage_list_peer_mesh_services_visible(runtime->database_path, publisher->tenant_id,
-                                                       "", 1, definitions, 256U, &count) != 0) goto failed;
+                                                       "", 1, &definitions, &count) != 0) goto failed;
     int first = 1;
     for (size_t i = 0; authorized && catalog->active && i < count; ++i) {
         st_storage_peer_mesh_service *service = &definitions[i];
@@ -1161,8 +1189,10 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
     }
     if (pm_appendf(&builder, "],\"createdAtMillis\":%lld}",
                    (long long)time(NULL) * 1000LL) != 0) goto failed;
+    free(definitions);
     return builder.data;
 failed:
+    free(definitions);
     free(builder.data);
     return NULL;
 }
@@ -1171,10 +1201,9 @@ static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
                              const pm_catalog *catalog,
                              const st_storage_client *publisher)
 {
-    st_storage_client clients[ST_PEER_MESH_MAX_CLIENTS];
+    st_storage_client *clients = NULL;
     size_t count = 0U;
-    if (st_storage_list_clients(runtime->database_path, clients,
-                                ST_PEER_MESH_MAX_CLIENTS, &count) != 0) return -1;
+    if (st_storage_list_all_clients(runtime->database_path, &clients, &count) != 0) return -1;
     int rc = 0;
     for (size_t i = 0; i < count; ++i) {
         st_storage_client *recipient = &clients[i];
@@ -1192,6 +1221,7 @@ static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
             || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
         free(message);
     }
+    free(clients);
     return rc;
 }
 
@@ -1925,12 +1955,11 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
 {
     if (!pm_egress_supported(consumer)) return 0;
 
-    st_storage_peer_mesh_egress_policy policies[64];
+    st_storage_peer_mesh_egress_policy *policies = NULL;
     size_t policy_count = 0U;
-    if (!pm_tenant_egress_enabled(runtime->database_path, consumer->tenant_id)) {
-        policy_count = 0U;
-    } else if (st_storage_list_peer_mesh_egress_policies(runtime->database_path, consumer->tenant_id, 1,
-                                                         policies, 64U, &policy_count) != 0) return -1;
+    if (pm_tenant_egress_enabled(runtime->database_path, consumer->tenant_id)
+        && st_storage_list_peer_mesh_egress_policies(runtime->database_path, consumer->tenant_id, 1,
+                                                     &policies, &policy_count) != 0) return -1;
 
     pm_builder message = {0};
     int rc = pm_appendf(&message, "{\"type\":\"egress-catalog\",\"revision\":%lld,\"egresses\":[",
@@ -1996,7 +2025,8 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
         }
         if (rc == 0) {
             /*
-             * ipv6TargetCapable stays false: no client declares it yet. egressVersion is written
+             * ipv6TargetCapable stays false: egresses declare it, but no consumer reads it while
+             * the consumer data plane carries IPv4 only. egressVersion is written
              * even when 0, because a consumer reads 0 as an egress that cannot take a flow but an
              * absent field as an old server it cannot judge.
              */
@@ -2011,6 +2041,7 @@ static int pm_push_egress_catalog(const st_peer_mesh_runtime *runtime,
             ? runtime->send(runtime->ctx, consumer->client_name, "server", message.data) : -1;
     }
     free(message.data);
+    free(policies);
     return rc;
 }
 
@@ -2211,12 +2242,14 @@ int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
         || !pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)) return 0;
     (void)st_peer_mesh_expire_catalogs(runtime);
     st_storage_client source;
-    st_storage_client clients[ST_PEER_MESH_MAX_CLIENTS];
+    st_storage_client *clients = NULL;
     size_t client_count = 0U;
     if (st_storage_get_client_by_name(runtime->database_path, client_name, &source) != 0
-        || st_storage_list_clients(runtime->database_path, clients,
-                                   ST_PEER_MESH_MAX_CLIENTS, &client_count) != 0
-        || pm_push_config(runtime, &source) != 0) return -1;
+        || st_storage_list_all_clients(runtime->database_path, &clients, &client_count) != 0) return -1;
+    if (pm_push_config(runtime, &source) != 0) {
+        free(clients);
+        return -1;
+    }
     (void)pm_push_egress_config(runtime, &source, clients, client_count);
     for (size_t i = 0; i < client_count; ++i) {
         if (strcmp(clients[i].tenant_id, source.tenant_id) == 0
@@ -2228,6 +2261,7 @@ int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
             (void)pm_push_egress_catalog(runtime, &clients[i], clients, client_count);
         }
     }
+    free(clients);
     (void)pm_replay_catalogs(runtime, &source);
     return 0;
 }
@@ -2250,10 +2284,9 @@ int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
     st_storage_client departed;
     if (st_storage_get_client_by_name(runtime->database_path, client_name, &departed) != 0) return -1;
     if (runtime->online(runtime->ctx, departed.id, departed.client_name)) return 0;
-    st_storage_client clients[ST_PEER_MESH_MAX_CLIENTS];
+    st_storage_client *clients = NULL;
     size_t client_count = 0U;
-    if (st_storage_list_clients(runtime->database_path, clients,
-                                ST_PEER_MESH_MAX_CLIENTS, &client_count) != 0) return -1;
+    if (st_storage_list_all_clients(runtime->database_path, &clients, &client_count) != 0) return -1;
     for (size_t i = 0; i < client_count; ++i) {
         if (clients[i].id == departed.id
             || strcmp(clients[i].tenant_id, departed.tenant_id) != 0
@@ -2261,6 +2294,7 @@ int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
         (void)pm_push_roster(runtime, &clients[i], clients, client_count);
         (void)pm_push_egress_catalog(runtime, &clients[i], clients, client_count);
     }
+    free(clients);
     return 0;
 }
 
@@ -2272,10 +2306,9 @@ int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
         || !pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)) return 0;
 
     (void)st_peer_mesh_expire_catalogs(runtime);
-    st_storage_client clients[ST_PEER_MESH_MAX_CLIENTS];
+    st_storage_client *clients = NULL;
     size_t client_count = 0U;
-    if (st_storage_list_clients(runtime->database_path, clients,
-                                ST_PEER_MESH_MAX_CLIENTS, &client_count) != 0) return -1;
+    if (st_storage_list_all_clients(runtime->database_path, &clients, &client_count) != 0) return -1;
 
     int rc = 0;
     for (size_t i = 0; i < client_count; ++i) {
@@ -2287,6 +2320,7 @@ int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
         if (pm_push_egress_config(runtime, &clients[i], clients, client_count) != 0
             || pm_push_egress_catalog(runtime, &clients[i], clients, client_count) != 0) rc = -1;
     }
+    free(clients);
 
     pm_catalog *snapshots = (pm_catalog *)calloc(ST_PEER_MESH_MAX_CATALOGS,
                                                  sizeof(*snapshots));

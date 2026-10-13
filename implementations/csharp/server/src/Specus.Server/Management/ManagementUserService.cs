@@ -9,6 +9,17 @@ using Specus.Server.Data.Entities;
 
 namespace Specus.Server.Management;
 
+/// <summary>
+/// An account that still owns clients or access credentials is not deleted (management-accounts.md
+/// section 7.1): answered 409 with both counts, so the administrator knows what to delete or hand over.
+/// </summary>
+public sealed class AccountStillOwnsResourcesException(long clients, long credentials)
+    : Exception($"该账号仍拥有 {clients} 个客户端、{credentials} 个接入凭证，需先转移或删除")
+{
+    public long Clients { get; } = clients;
+    public long Credentials { get; } = credentials;
+}
+
 public sealed class ManagementUserService
 {
     private readonly SpecusDbContext _db;
@@ -279,8 +290,19 @@ public sealed class ManagementUserService
     /// without one the token predates tenant-scoped login names and its subject is an account key,
     /// looked up exactly. Tenant, role and enabled state always come from the account record.
     /// </summary>
+    public Task<LoginUser?> ResolveLocalTokenUserAsync(string? subject, string? tenantId,
+        CancellationToken cancellationToken) =>
+        ResolveLocalTokenUserAsync(subject, tenantId, accountKey: null, cancellationToken);
+
+    /// <summary>
+    /// <paramref name="accountKey"/> is the token's <c>uid</c> claim. With one, the token resolves
+    /// only to the account row whose key is exactly that value, never to the built-in administrator:
+    /// the token of a deleted account must not pass to a later account of the same login name.
+    /// Without one (tokens minted before the claim existed, and the built-in admin's) the subject and
+    /// tenant resolve as before, until the token expires.
+    /// </summary>
     public async Task<LoginUser?> ResolveLocalTokenUserAsync(string? subject, string? tenantId,
-        CancellationToken cancellationToken)
+        string? accountKey, CancellationToken cancellationToken)
     {
         string normalized;
         try
@@ -297,7 +319,9 @@ public sealed class ManagementUserService
             return null;
         }
 
-        if (IsBuiltInAdminName(normalized)
+        var boundToAccount = !string.IsNullOrEmpty(accountKey);
+        if (!boundToAccount
+            && IsBuiltInAdminName(normalized)
             && (requestedTenant is null || string.Equals(requestedTenant, DefaultTenant, StringComparison.Ordinal)))
         {
             if (!_auth.PasswordLoginEnabled || string.IsNullOrWhiteSpace(_auth.Password))
@@ -313,7 +337,14 @@ public sealed class ManagementUserService
             : await _db.ManagementUsers.AsNoTracking()
                 .FirstOrDefaultAsync(item => item.Username == normalized, cancellationToken)
                 .ConfigureAwait(false);
-        return user is { Enabled: true } ? ToLoginUser(user) : null;
+        if (user is not { Enabled: true })
+        {
+            return null;
+        }
+        // Compared here rather than in SQL, so a case-insensitive collation cannot relax it.
+        return !boundToAccount || string.Equals(user.Username, accountKey, StringComparison.Ordinal)
+            ? ToLoginUser(user)
+            : null;
     }
 
     public async Task<ManagementUserView> CurrentUserAsync(ManagementContext context,
@@ -340,12 +371,15 @@ public sealed class ManagementUserService
         CancellationToken cancellationToken)
     {
         RequireAdmin(context);
-        var now = DateTimeOffset.UtcNow.ToString("O");
-        var views = new List<ManagementUserView>
+        var views = new List<ManagementUserView>();
+        // The built-in admin belongs to the default tenant only: it signs in there and its tokens
+        // resolve there, so another tenant's list does not show it as one of its accounts.
+        if (string.Equals(context.TenantId, DefaultTenant, StringComparison.Ordinal))
         {
-            new(_auth.Username, context.TenantId, "ADMIN", Admin: true,
-                BuiltIn: true, Enabled: true, now, now),
-        };
+            var now = DateTimeOffset.UtcNow.ToString("O");
+            views.Add(new ManagementUserView(_auth.Username, DefaultTenant, "ADMIN", Admin: true,
+                BuiltIn: true, Enabled: true, now, now));
+        }
         var users = await _db.ManagementUsers.AsNoTracking()
             .Where(u => u.TenantId == context.TenantId)
             .OrderBy(u => u.LoginName)
@@ -465,9 +499,34 @@ public sealed class ManagementUserService
         // the same name must not inherit them.
         await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        // Unlike the account's other data, its workbench lists are personal history: they go with the
-        // account row, so an account created later under the same name starts empty.
+        // Clients and credentials carry tunnels in use: the administrator deletes or hands them over
+        // first, as a later account of the same name would own them (management-accounts.md 7.1).
+        var clients = await _db.ClientAccounts
+            .LongCountAsync(client => client.TenantId == tenantId && client.OwnerUsername == loginName,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var credentials = await _db.ClientCredentials
+            .LongCountAsync(credential => credential.TenantId == tenantId && credential.OwnerUsername == loginName,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (clients > 0 || credentials > 0)
+        {
+            _logger?.LogWarning(
+                "管理用户delete被拒绝: actor={Actor}, tenant={Tenant}, target={Target}, reason=仍拥有客户端{Clients}个、接入凭证{Credentials}个",
+                context.Username, tenantId, loginName, clients, credentials);
+            throw new AccountStillOwnsResourcesException(clients, credentials);
+        }
+        await ForgetOwnedDataAsync(tenantId, loginName, context.Username, cancellationToken).ConfigureAwait(false);
+        // The workbench lists are personal history: they go with the account row, so an account
+        // created later under the same name starts empty.
         await WorkbenchService.DeleteIdentityAsync(_db, tenantId, loginName, cancellationToken)
+            .ConfigureAwait(false);
+        // The registered email points at the account key and goes with the account, so the address
+        // can register again once the transaction commits.
+        var accountKey = user.Username;
+        await _db.ManagementUserEmails
+            .Where(email => email.Username == accountKey)
+            .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
         _db.ManagementUsers.Remove(user);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -476,6 +535,50 @@ public sealed class ManagementUserService
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
         return (tenantId, loginName);
+    }
+
+    /// <summary>
+    /// The rest of what a deleted account's identity owns, in the deletion's transaction
+    /// (management-accounts.md section 7.1). Diagram documents, download grants and download usage
+    /// go. Attachments expire now, so nothing can complete, download or count them any more and the
+    /// expiry scan deletes their objects (the row is the only record of the object). Peer device rows
+    /// of clients that no longer exist go. Peer ACLs and egress policies decide how other people's
+    /// clients connect: they stay, owned by <paramref name="actor"/> from now on.
+    /// </summary>
+    private async Task ForgetOwnedDataAsync(string tenantId, string loginName, string actor,
+        CancellationToken cancellationToken)
+    {
+        await _db.UserDiagramDocuments
+            .Where(document => document.TenantId == tenantId && document.OwnerUsername == loginName)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        await _db.TransferAttachments
+            .Where(attachment => attachment.TenantId == tenantId && attachment.OwnerUsername == loginName
+                && attachment.Status != TransferAttachmentService.StatusExpired && attachment.ExpiresAt > now)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(attachment => attachment.ExpiresAt, now)
+                .SetProperty(attachment => attachment.UploadExpiresAt, now)
+                .SetProperty(attachment => attachment.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+        await _db.TransferAttachmentDownloadGrants
+            .Where(grant => grant.TenantId == tenantId && grant.Username == loginName)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.TransferAttachmentDownloadUsages
+            .Where(usage => usage.TenantId == tenantId && usage.Username == loginName)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.PeerMeshDevices
+            .Where(device => device.TenantId == tenantId && device.OwnerUsername == loginName
+                && !_db.ClientAccounts.Any(client => client.Id == device.ClientId))
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.PeerMeshAcls
+            .Where(acl => acl.TenantId == tenantId && acl.OwnerUsername == loginName)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(acl => acl.OwnerUsername, actor), cancellationToken)
+            .ConfigureAwait(false);
+        await _db.PeerMeshEgressPolicies
+            .Where(policy => policy.TenantId == tenantId && policy.OwnerUsername == loginName)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(policy => policy.OwnerUsername, actor),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public static void RequireAdmin(ManagementContext context)
@@ -628,12 +731,16 @@ public sealed class ManagementUserService
         return Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
     }
 
-    /// <summary>The identity a principal carries: the login name, never the account key.</summary>
+    /// <summary>
+    /// The identity a principal carries is the login name, never the account key; the key only
+    /// travels in the token's <c>uid</c> claim.
+    /// </summary>
     internal static LoginUser ToLoginUser(ManagementUser user) => new(
         user.EffectiveLoginName(),
         ManagementContext.NormalizeTenant(user.TenantId),
         user.Role,
-        BuiltInAdmin: false);
+        BuiltInAdmin: false,
+        AccountKey: user.Username);
 
     private static bool IsExactEnabledOidcBinding(ManagementUser user, string issuer,
         string subject, string identityKey) =>
@@ -655,4 +762,6 @@ public sealed class ManagementUserService
 /// A resolved management principal. <see cref="Username"/> is the login name (the built-in
 /// administrator's configured name), never the opaque account key.
 /// </summary>
-public sealed record LoginUser(string Username, string TenantId, ManagementRole Role, bool BuiltInAdmin);
+/// <summary>A resolved principal; <see cref="AccountKey"/> is null only for the built-in admin.</summary>
+public sealed record LoginUser(string Username, string TenantId, ManagementRole Role, bool BuiltInAdmin,
+    string? AccountKey = null);

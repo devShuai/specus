@@ -24,6 +24,9 @@ public sealed partial class DatabaseInitializer
     private static readonly string[] ManagementLoginNameIndexColumns = ["tenant_id", "login_name_normalized"];
     private const string UpdateManagementLoginNameSql =
         "UPDATE specus_management_user SET login_name = {0}, login_name_normalized = {1} WHERE username = {2}";
+    internal const string ManagementUserEmailTable = "specus_management_user_email";
+    private const string RemoveOrphanedManagementEmailsSql =
+        "DELETE FROM specus_management_user_email WHERE username NOT IN (SELECT username FROM specus_management_user)";
 
     /// <summary>
     /// Runs before EF applies AddManagementLoginNames to an existing database. When two accounts of one
@@ -58,7 +61,9 @@ public sealed partial class DatabaseInitializer
     /// Idempotent, runs on every start after the migrations: adds the columns if a database lacks them,
     /// gives every row its login name (the stored one, else the account key) and the canonical form of
     /// it, refusing to start on a duplicate within a tenant before writing anything, then ensures and
-    /// verifies <c>uq_management_user_tenant_login_name</c>.
+    /// verifies <c>uq_management_user_tenant_login_name</c>. Last, it deletes the email records whose
+    /// account key no account has any more: accounts deleted before the delete took their email along
+    /// left them behind, and the address could never register again.
     /// </summary>
     internal static async Task EnsureManagementLoginNamesAsync(SpecusDbContext db,
         CancellationToken cancellationToken)
@@ -97,6 +102,11 @@ public sealed partial class DatabaseInitializer
         {
             throw new InvalidOperationException(
                 $"index {ManagementLoginNameIndex} must be unique on (tenant_id, login_name_normalized)");
+        }
+        if (await TableExistsAsync(db, ManagementUserEmailTable, cancellationToken).ConfigureAwait(false))
+        {
+            await db.Database.ExecuteSqlRawAsync(RemoveOrphanedManagementEmailsSql, cancellationToken)
+                .ConfigureAwait(false);
         }
     }
 

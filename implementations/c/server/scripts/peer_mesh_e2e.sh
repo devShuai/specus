@@ -356,7 +356,8 @@ JSON
 done
 
 # Starts one client, in the namespace of the holder process given, or in this one. Each client has
-# a HOME of its own, where its Peer Mesh key lives; the JVM reads its home from the password
+# a HOME of its own, where its Peer Mesh key lives (and, for the Android core on a JVM, the machine
+# id that keeps it the same device across restarts); the JVM reads its home from the password
 # database rather than HOME, so it is told. exec keeps the recorded pid the client itself.
 start_client() {
   local role="$1" phase="$2" holder="${3:-}"
@@ -389,6 +390,13 @@ wait_log() {
 # Server log lines from a given line on, so each phase is judged on its own signalling.
 server_log_since() {
   tail -n +"$(( $1 + 1 ))" "$TMP_DIR/server.log"
+}
+
+# Whether the server log from line $1 on has a line with the text $2. grep -q would stop at the
+# first match, and on a long log tail then dies of SIGPIPE, which pipefail turns into a failed
+# check although the line is there; grep -c reads everything.
+server_log_since_has() {
+  server_log_since "$1" | grep -cF -- "$2" >/dev/null
 }
 
 # --- Phase one: both clients beside the server, a DIRECT path over loopback --------------------
@@ -426,12 +434,13 @@ DIRECT_REMOTE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["rem
 [[ "$DIRECT_REMOTE" == "$SERVER_IP:"* || "$DIRECT_REMOTE" == 127.* ]] \
   || fail "the direct path should run over the loopback interface, not $DIRECT_REMOTE"
 
-server_log_since 0 | grep -q "signal accepted source=$CLIENT_A target=$CLIENT_B" \
+server_log_since_has 0 "signal accepted source=$CLIENT_A target=$CLIENT_B" \
   || fail "the server never accepted a signal from A to B"
-server_log_since 0 | grep -q "signal accepted source=$CLIENT_B target=$CLIENT_A" \
+server_log_since_has 0 "signal accepted source=$CLIENT_B target=$CLIENT_A" \
   || fail "the server never accepted a signal from B to A"
-if [[ "$CLIENT_LABEL" != Java ]]; then
-  # Java logs the path at debug level; Go and .NET log it at info.
+if [[ "$CLIENT_LABEL" != Java && "$CLIENT_LABEL" != Android ]]; then
+  # Go and .NET log the path at info. Java logs it at debug level, and the Android core reports it
+  # only to the server (the path report behind the session above) and to no log of its own.
   for role in a b; do
     wait_log "$TMP_DIR/client-$role-direct.log" "direct UDP path active" \
       || fail "client $role never logged an active direct path"
@@ -537,14 +546,14 @@ RELAY_SESSION="$(check session "$ADMIN_PORT" "$ADMIN_TOKEN" "$CLIENT_A" "$CLIENT
   || fail "no RELAY session between A and B"
 echo "relay session: $RELAY_SESSION"
 
-server_log_since "$PHASE_TWO_LOG_START" | grep -q "signal accepted source=$CLIENT_A target=$CLIENT_B" \
+server_log_since_has "$PHASE_TWO_LOG_START" "signal accepted source=$CLIENT_A target=$CLIENT_B" \
   || fail "the server accepted no signal from A to B in phase two"
-server_log_since "$PHASE_TWO_LOG_START" | grep -q "signal accepted source=$CLIENT_B target=$CLIENT_A" \
+server_log_since_has "$PHASE_TWO_LOG_START" "signal accepted source=$CLIENT_B target=$CLIENT_A" \
   || fail "the server accepted no signal from B to A in phase two"
 RELAY_SOCKETS="$(( $(check relay-sockets "$RELAY_MIN_PORT" "$RELAY_MAX_PORT") - RELAY_SOCKETS_BEFORE ))"
 (( RELAY_SOCKETS >= 2 )) \
   || fail "expected a new TURN allocation per client in phase two, found $RELAY_SOCKETS new relay sockets"
-if [[ "$CLIENT_LABEL" != Java ]]; then
+if [[ "$CLIENT_LABEL" != Java && "$CLIENT_LABEL" != Android ]]; then
   for role in a b; do
     wait_log "$TMP_DIR/client-$role-relay.log" "relay UDP path active" \
       || fail "client $role never logged an active relay path"

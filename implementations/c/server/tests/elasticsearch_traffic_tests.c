@@ -45,6 +45,32 @@ static int check_existing_http_index(const char *path, const st_storage_http_exc
     return ok ? 0 : -1;
 }
 
+/*
+ * Stores one exchange in a fresh HTTP index whose store size must be cut to 1 byte, then counts
+ * what is left. The fake cluster reports total_data_set_size_in_bytes as 0 for an index named
+ * *-zero-dataset and leaves it out for *-no-dataset; size_in_bytes is the documents' size.
+ */
+static int check_trim(const char *path, const st_storage_http_exchange_record *http, long long client_id,
+                      const char *index, long long expected_left)
+{
+    if (setenv("SPECUS_ELASTICSEARCH_HTTP_INDEX", index, 1) != 0
+        || setenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE", "1", 1) != 0) {
+        return -1;
+    }
+    st_elasticsearch_traffic_reset_for_tests();
+    if (st_storage_record_http_exchange(path, http) != 0) return -1;
+    st_elasticsearch_traffic_flush();
+    st_storage_http_exchange exchanges[2];
+    size_t exchange_count = 0;
+    long long total = -1;
+    int ok = st_storage_list_http_exchanges_visible(path, client_id, NULL, NULL, NULL, NULL, "default", "admin", 1,
+                                                    0, 10, exchanges, 2, &exchange_count, &total) == 0
+        && total == expected_left;
+    if (!ok) fprintf(stderr, "Elasticsearch trimming of %s left %lld exchanges, expected %lld\n", index, total,
+                     expected_left);
+    return unsetenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE") == 0 && ok ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2 || st_storage_init(argv[1], 1) != 0) return 1;
@@ -202,6 +228,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "Elasticsearch TCP traffic list mismatch\n");
         return 1;
     }
+    /* Java's Integer listenPort filters whenever it is given: 0 matches no frame. */
+    long long any_total = 0;
+    long long zero_total = -1;
+    size_t other_count = 0;
+    st_storage_tcp_frame other_frames[4];
+    if (st_storage_list_tcp_frames_visible(argv[1], client.id, ST_STORAGE_ANY_LISTEN_PORT, "default", "admin", 1,
+                                           0, 10, other_frames, 4, &other_count, &any_total) != 0
+        || st_storage_list_tcp_frames_visible(argv[1], client.id, 0, "default", "admin", 1,
+                                              0, 10, other_frames, 4, &other_count, &zero_total) != 0
+        || any_total != 1 || zero_total != 0) {
+        fprintf(stderr, "Elasticsearch TCP listenPort filter: any %lld, 0 %lld\n", any_total, zero_total);
+        return 1;
+    }
     long long frame_id = frames[0].id;
     st_storage_tcp_frame detail;
     if (st_storage_get_tcp_frame_visible(argv[1], frame_id, "default", "admin", 1, &detail) != 0
@@ -241,6 +280,13 @@ int main(int argc, char **argv)
     if (unsetenv("SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE") != 0
         || check_existing_http_index(argv[1], &http, client.id, "specus-http-legacy", "binary") != 0
         || check_existing_http_index(argv[1], &http, client.id, "specus-http-text-bodies", "text") != 0) {
+        return 1;
+    }
+
+    /* Java currentStoreBytes: total_data_set_size_in_bytes whenever it is there, also when 0;
+     * size_in_bytes only without it. */
+    if (check_trim(argv[1], &http, client.id, "specus-http-zero-dataset", 1) != 0
+        || check_trim(argv[1], &http, client.id, "specus-http-no-dataset", 0) != 0) {
         return 1;
     }
     puts("elasticsearch traffic tests passed");

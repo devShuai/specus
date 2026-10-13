@@ -117,6 +117,35 @@ void st_egress_format_address(uint32_t value, char *out, size_t out_len);
 int st_egress_cidr_contains(const st_egress_cidr *cidr, uint32_t address);
 int st_egress_cidr_overlaps(const st_egress_cidr *left, const st_egress_cidr *right);
 
+#define ST_EGRESS_MAX_PREFIX6 128
+
+/*
+ * An IPv6 prefix with its host bits clear, read with the spelling protocol/spec/peer-egress.md pins
+ * (IPv6 写法) for a consumer rule's match and an egress policy's destination rule alike: RFC 4291
+ * 2.2 forms 1 and 2 only, so no dotted IPv4 tail, no zone and no brackets. The ipv6Prefixes section
+ * of protocol/test-vectors/peer-egress-rules-v1.json pins every refusal.
+ */
+typedef struct {
+    uint8_t network[16];
+    int prefix_length;
+} st_egress_cidr6;
+
+/* Reads an IPv6 address: eight groups of one to four hex digits, at most one "::". Returns 0 on success. */
+int st_egress_parse_address6(const char *text, uint8_t out[16]);
+/*
+ * Reads an IPv6 address or address/length, the length 0-128 without a leading zero and the host bits
+ * clear; a bare address is a /128. had_length, when not NULL, says whether a length was written.
+ * The text is not trimmed. Returns 0 on success.
+ */
+int st_egress_parse_cidr6(const char *text, st_egress_cidr6 *out, int *had_length);
+/*
+ * Writes RFC 5952 section 4: lower case, no leading zeros, the longest run of two or more zero groups
+ * (the leftmost of equal runs) as "::", never dotted. out_len must be at least 40.
+ */
+void st_egress_format_address6(const uint8_t address[16], char *out, size_t out_len);
+/* Whether the prefix lies in ::ffff:0:0/96, where IPv4 destinations are spelled in IPv6 APIs. */
+int st_egress_cidr6_mapped(const st_egress_cidr6 *cidr);
+
 /*
  * Clamps a client-announced version to what this build understands. Returns 0 when the client
  * cannot take part, in which case the server must not push egress-config or egress-catalog to it.
@@ -287,6 +316,17 @@ extern const char *const ST_EGRESS_LAN_CIDRS[];
 extern const size_t ST_EGRESS_LAN_CIDRS_LEN;
 
 /*
+ * The IPv6 counterparts of the three lists above (protocol/spec/peer-egress.md, 强制拒绝清单). A
+ * destination is checked against both families' lists; only a prefix of its own family can contain it.
+ */
+extern const char *const ST_EGRESS_FORCED_DENY_CIDRS6[];
+extern const size_t ST_EGRESS_FORCED_DENY_CIDRS6_LEN;
+extern const char *const ST_EGRESS_CLOUD_METADATA_CIDRS6[];
+extern const size_t ST_EGRESS_CLOUD_METADATA_CIDRS6_LEN;
+extern const char *const ST_EGRESS_LAN_CIDRS6[];
+extern const size_t ST_EGRESS_LAN_CIDRS6_LEN;
+
+/*
  * Reads a stored allowlist. A row that cannot be parsed yields zero rules, which denies everything
  * rather than falling back to something permissive. Returns 0 when the input parsed cleanly.
  *
@@ -341,6 +381,18 @@ char *st_egress_encode_destination_rules(const st_egress_destination_rule *rules
  * itself.
  */
 int st_egress_normalize_domain_rules(const char *json, char **out_json);
+
+/*
+ * The two normalisers with Java PeerEgressService's verdict on a management request: 0 with
+ * *out_json; 1 when the list is refused, with Java's IllegalArgumentException message in error
+ * (destinationRules[0].cidr is not an IPv4 or IPv6 address or CIDR: ..., too many domain rules: ..., and so
+ * on; Spring answers 400 with it); 2 when the JSON does not bind into Java's rule records at all --
+ * a list that is not an array, an element that is neither an object nor null, a field of the wrong
+ * shape -- which Spring answers with its own 400 before the service runs. error may be NULL.
+ */
+int st_egress_normalize_destination_rules_explained(const char *json, char **out_json, char *error,
+                                                    size_t error_len);
+int st_egress_normalize_domain_rules_explained(const char *json, char **out_json, char *error, size_t error_len);
 
 /* Collects the distinct protocols an allowlist mentions, in first-seen order. */
 size_t st_egress_collect_protocols(const st_egress_destination_rule *rules,
