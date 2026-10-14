@@ -53,7 +53,7 @@ public class ClientOwnerTransferWriter {
         ManagementContext actor = actors.actor();
         long id = ClientOwnerTransferService.parseId(actor, textId);
         if (request == null || !request.isObject()) throw new ClientOwnerTransferException(400, "INVALID_TRANSFER_REQUEST");
-        Snapshot current = rows.lock(actor.tenant().tenantId(), scope, id);
+        Snapshot current = rows.lock(actor, scope, id);
         Prepared prepared = ClientOwnerTransferPlan.prepare(actor, scope, id, request, current);
         String normalized = prepared.requestedTargetUsername().toLowerCase(Locale.ROOT);
         String target;

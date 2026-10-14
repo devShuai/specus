@@ -221,6 +221,9 @@ public class ClientAuthService {
         String selectedTenant = session.getTenantId();
         ClientCredential credential = credentialRepository.lockCurrent(selectedCredential, selectedTenant)
                 .orElse(null);
+        if (credential == null) return AuthenticationResult.failure(null, "客户端身份不存在");
+        if (!hasUnambiguousCredential(selectedClient, credential))
+            return AuthenticationResult.failure(null, "客户端身份关联不一致");
         ClientAccount account = clientAccountRepository.lockCurrent(selectedClient, selectedTenant)
                 .orElse(null);
         if (credential == null || account == null) {
@@ -327,7 +330,20 @@ public class ClientAuthService {
                 credential.getId(),
                 environment.getMachineFingerprint(),
                 environment.getOsUser()
-        ).map(identity -> updateIdentityLastSeen(identity, environment)).orElseGet(() -> createIdentity(credential, environment));
+        ).map(identity -> {
+            if (!hasUnambiguousCredential(identity.getClientId(), credential))
+                throw new IllegalArgumentException("客户端身份关联不一致");
+            return updateIdentityLastSeen(identity, environment);
+        }).orElseGet(() -> createIdentity(credential, environment));
+    }
+
+    private boolean hasUnambiguousCredential(Long clientId, ClientCredential credential) {
+        // Check immutable membership BEFORE saving an identity or acquiring a different
+        // credential through the parent-client lock. Otherwise malformed legacy links can
+        // invert the global credential order (high credential -> identity -> low credential).
+        return identityRepository.findCredentialBindings(clientId).stream().allMatch(row ->
+                Objects.equals(credential.getId(), ((Number) row[0]).longValue())
+                        && Objects.equals(credential.getTenantId(), row[1]));
     }
 
     private ClientIdentity updateIdentityLastSeen(ClientIdentity identity, ClientEnvironmentInfo environment) {

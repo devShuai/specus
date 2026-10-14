@@ -4,6 +4,7 @@ import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientCredentialRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
+import com.theshuai.specusserver.management.security.ManagementContext;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import org.hibernate.Session;
@@ -27,13 +28,26 @@ class ClientOwnerTransferRows {
     private final ClientAccountRepository accounts;
     private final ClientCredentialRepository credentials;
     private final PeerMeshDeviceRepository devices;
+    private final ClientOwnerTransferService previews;
 
     ClientOwnerTransferRows(ClientAccountRepository accounts, ClientCredentialRepository credentials,
-                            PeerMeshDeviceRepository devices) {
+                            PeerMeshDeviceRepository devices, ClientOwnerTransferService previews) {
         this.accounts = accounts; this.credentials = credentials; this.devices = devices;
+        this.previews = previews;
     }
 
-    Snapshot lock(String tenant, PathScope scope, long id) {
+    Snapshot lock(ManagementContext actor, PathScope scope, long id) {
+        String tenant = actor.tenant().tenantId();
+        // Discovery chooses a lock superset ONLY; never authorize or build the final revision
+        // from this possibly older snapshot. Existing links are immutable. New devices get NEW
+        // client IDs under the selected credential, so they cannot introduce another credential
+        // after this discovery. Any future reassociation API needs a coordinated redesign.
+        Snapshot hints = previews.load(actor, scope, id);
+        TreeSet<Long> prerequisites = new TreeSet<>();
+        if (scope == PathScope.CREDENTIAL_GROUP) prerequisites.add(id);
+        hints.credentials().forEach(row -> prerequisites.add(row.id()));
+        hints.identities().forEach(row -> prerequisites.add(row.credentialId()));
+        for (long credential : prerequisites) credentials.lockCurrent(credential, tenant);
         ArrayList<ClientRow> clients = new ArrayList<>();
         ArrayList<CredentialRow> credentialRows = new ArrayList<>();
         LinkedHashMap<Long, IdentityRow> identities = new LinkedHashMap<>();
