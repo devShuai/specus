@@ -19,6 +19,8 @@ import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
 import io.netty.channel.local.LocalServerChannel;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -35,6 +37,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
@@ -94,6 +97,8 @@ class NatTcpBackpressureLoopbackTests {
                 long queued = fillUntilTheUpstreamStops(control, sent, stuck);
                 assertTrue(queued > 2L * FRAME,
                         "the stalled upstream must leave bytes queued in front of its socket, queued=" + queued);
+                assertTrue(handler.hasLocalTcpStream(stuck), "a sender honouring the full window must not be reset");
+                assertTrue(sent.resets(stuck).isEmpty(), () -> "valid credit-bound sender reset: " + sent.resets(stuck));
                 assertTrue(control.isActive(), "the shared data connection must remain active");
                 assertTrue(handler.hasLocalTcpStream(flowing), "the independent echo stream must remain active");
 
@@ -110,8 +115,9 @@ class NatTcpBackpressureLoopbackTests {
         }
     }
 
-    @Test
-    void dataPastTheReceiveWindowResetsTheStreamInsteadOfQueueingIt() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void dataPastTheReceiveWindowResetsTheStreamInsteadOfQueueingIt(boolean batchedControlReads) throws Exception {
         try (StalledUpstream stalled = new StalledUpstream(); EchoUpstream echo = new EchoUpstream()) {
             NatClientHandler handler = new NatClientHandler(
                     bean(stalled.port(), echo.port()), new TcpConnection());
@@ -119,21 +125,63 @@ class NatTcpBackpressureLoopbackTests {
             try (ControlFixture fixture = new ControlFixture(sent, handler)) {
                 Channel control = fixture.control;
                 int streamId = 53;
+                int flowing = 54;
+                inbound(control, open(flowing, ECHO_PORT));
+                await(() -> handler.hasLocalTcpStream(flowing));
                 inbound(control, open(streamId, STALLED_PORT));
-                await(() -> handler.hasLocalTcpStream(streamId));
+                await(() -> handler.localTcpStream(streamId) != null
+                        && handler.localTcpStream(streamId).getCtx() != null
+                        && handler.localTcpStream(streamId).getCtx().channel().isActive());
+                Channel local = handler.localTcpStream(streamId).getCtx().channel();
 
-                // Far more than any socket buffer takes from a peer that is not reading, sent without
-                // waiting for credit, which a server honouring the window never does.
+                // Fix the reservation state, not the kernel's socket buffer size: the real local
+                // NIO loop cannot complete writes or return credit until every offered frame has
+                // been accounted for. One legal-size frame past the initial window is the only
+                // violation. Flooding after reset mixes an unrelated unknown-stream RST into
+                // the observation and can let that RST overtake the queued overflow response.
                 byte[] chunk = new byte[FRAME];
-                for (long offered = 0; offered < 32 * WINDOW; offered += FRAME) {
-                    inbound(control, data(streamId, chunk));
+                assertTrue(chunk.length <= StreamFlowController.MAX_DATA_FRAME_BYTES);
+                try (LocalLoopGate gate = new LocalLoopGate(local)) {
+                    if (batchedControlReads) {
+                        fixture.control.eventLoop().submit(() -> {
+                            for (long offered = 0; offered < WINDOW + FRAME; offered += FRAME) {
+                                fixture.control.pipeline().fireChannelRead(data(streamId, chunk));
+                            }
+                            fixture.control.pipeline().fireChannelReadComplete();
+                        }).sync();
+                    } else {
+                        for (long offered = 0; offered < WINDOW + FRAME; offered += FRAME) {
+                            inbound(control, data(streamId, chunk));
+                        }
+                    }
+                    assertTrue(sent.resets(streamId).isEmpty(), "overflow runs only after the owned loop is released");
+                    assertTrue(sent.history.stream().noneMatch(p -> p.getStreamId() == streamId
+                            && p.getNatMessageType() == NatMessageType.WINDOW_UPDATE),
+                            "the gated local socket must not return receive credit");
                 }
 
                 NatMessagePacket reset = awaitReset(control, sent, streamId);
                 assertNotNull(reset, "the stream must be reset once the server overruns the window");
-                assertEquals(8, reset.getValue());
+                assertEquals(8, reset.getValue(), () -> "first reset reason=" + reset.getMetaData()
+                        + ", complete reset sequence=" + sent.resets(streamId));
                 assertEquals("pending local TCP data exceeds receive window", reset.getMetaData().get("reason"));
                 await(() -> !handler.hasLocalTcpStream(streamId));
+                control.eventLoop().submit(() -> {}).sync();
+                assertEquals(1, sent.resets(streamId).size(), "one overflow stimulus must yield one reset");
+                // Keep the original 32-window adversarial load, but make its second phase explicit:
+                // these frames address an already-reset stream and cannot identify the overflow RST.
+                // They still must neither reopen the target nor disrupt the existing echo stream.
+                for (long offered = WINDOW + FRAME; offered < 32 * WINDOW; offered += FRAME) {
+                    inbound(control, data(streamId, chunk));
+                }
+                control.eventLoop().submit(() -> {}).sync();
+                assertFalse(handler.hasLocalTcpStream(streamId), "late DATA must not reopen a reset stream");
+                assertTrue(handler.hasLocalTcpStream(flowing), "late DATA must not reset an independent stream");
+                assertTrue(control.isActive(), "overflow must not close the shared data connection");
+                assertTrue(control.config().isAutoRead(), "overflow must not pause the shared data connection");
+                byte[] ping = "after-overflow".getBytes(StandardCharsets.UTF_8);
+                inbound(control, data(flowing, ping));
+                assertArrayEquals(ping, awaitData(control, sent, flowing, ping.length));
                 assertNull(sent.threadViolation, "outbound callbacks must share the data event loop");
             }
         }
@@ -221,8 +269,14 @@ class NatTcpBackpressureLoopbackTests {
      */
     private static final class SentFrames extends ChannelOutboundHandlerAdapter {
         private final Queue<NatMessagePacket> frames = new ConcurrentLinkedQueue<>();
+        private final Queue<NatMessagePacket> history = new ConcurrentLinkedQueue<>();
         private volatile Thread owner;
         private volatile Throwable threadViolation;
+
+        List<String> resets(int streamId) {
+            return history.stream().filter(p -> p.getStreamId() == streamId && p.getNatMessageType() == NatMessageType.RST)
+                    .map(p -> p.getValue() + ":" + p.getMetaData()).toList();
+        }
 
         @Override
         public void handlerAdded(ChannelHandlerContext ctx) {
@@ -237,6 +291,7 @@ class NatTcpBackpressureLoopbackTests {
                 return;
             }
             if (msg instanceof NatMessagePacket packet) {
+                history.add(packet);
                 frames.add(packet);
             }
             promise.trySuccess();
@@ -248,6 +303,43 @@ class NatTcpBackpressureLoopbackTests {
             channel.pipeline().fireChannelRead(packet);
             channel.pipeline().fireChannelReadComplete();
         }).sync();
+    }
+
+    private static void awaitLatch(CountDownLatch latch, String reason) {
+        try {
+            assertTrue(latch.await(5, TimeUnit.SECONDS), reason);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(reason, interrupted);
+        }
+    }
+
+    /** Owns one finite local-loop pause; every exit releases it and observes its completion. */
+    private static final class LocalLoopGate implements AutoCloseable {
+        private final CountDownLatch released = new CountDownLatch(1);
+        private final io.netty.util.concurrent.Future<?> task;
+
+        LocalLoopGate(Channel local) {
+            CountDownLatch entered = new CountDownLatch(1);
+            task = local.eventLoop().submit(() -> {
+                entered.countDown();
+                awaitLatch(released, "local loop gate must be released");
+            });
+            try {
+                awaitLatch(entered, "local loop gate must start");
+            } catch (Throwable failure) {
+                released.countDown();
+                throw failure;
+            }
+        }
+
+        void release() { released.countDown(); }
+
+        @Override public void close() {
+            release();
+            assertTrue(task.awaitUninterruptibly(5, TimeUnit.SECONDS), "local gate task must terminate");
+            if (!task.isSuccess()) throw new AssertionError("local gate task failed", task.cause());
+        }
     }
 
     /**
