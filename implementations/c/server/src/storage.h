@@ -1628,6 +1628,12 @@ enum {
     ST_STORAGE_CLIENT_NOT_VISIBLE = 4,
     ST_STORAGE_CLIENT_NAME_EXISTS = 5
 };
+/* Plain INSERT, authorized and validated inside one write transaction. Current USER
+ * accounts may create; no stale tenant/owner or output is accepted before COMMIT. */
+int st_storage_create_client_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *client_name, int enabled, int connection_rate_limit_per_minute,
+    st_storage_client *out_client);
 /* BEGIN IMMEDIATE encloses current actor, current credential visibility and the entire write.
  * No tenant/owner replacement from a stale caller object; output only after successful commit.
  * 0 success, positive refusal above, -1 store/integrity/argument failure. */

@@ -751,6 +751,108 @@ done:
     return failed;
 }
 
+/* Pause after the real authenticated account lookup closes its SQLite connection.
+ * No read lock is held while the fixture commits the intervening account change. */
+static int native_client_create_race(int scenario)
+{
+    test_server server;
+    if(server_prepare(&server)!=0) return 1;
+    char ready[400],resume[400],preload[1024],ready_env[450],resume_env[450],account_env[200],token[2048];
+    snprintf(ready,sizeof(ready),"%s/auth-ready",server.dir);snprintf(resume,sizeof(resume),"%s/auth-resume",server.dir);
+    int failed=1,ready_fd=-1,resume_fd=-1,started=0,thread_started=0;
+    sqlite3 *db=NULL;pthread_t thread;
+    credential_http_worker w={.server=&server,.method="POST",.path="/api/admin/clients",.token=token,
+        .request="{\"clientName\":\"  create-race-client  \",\"enabled\":false,\"connectionRateLimitPerMinute\":9}"};
+    st_storage_management_user actor,replacement;
+    st_storage_client client={0},duplicate={0},demo={0};
+    int admin=scenario==6;
+    if(st_storage_get_client_by_name(server.db_path,"Demo client",&demo)!=0
+        || st_storage_init(server.db_path,0)!=0
+        || st_storage_create_management_user(server.db_path,"alice","default","fixture-only-hash",admin?"ADMIN":"USER",1,&actor)!=0
+        || st_security_issue_local_token_for_account("alice","default",admin?"ADMIN":"USER",actor.account_key,
+            ADMIN_JWT_SECRET,600,token,sizeof(token))!=0) goto done;
+    if(scenario==11) w.request="{\"clientName\":\"create-race-client\"}";
+    if(scenario==15) w.request="{\"clientName\":\"create-race-client\",\"connectionRateLimitPerMinute\":0}";
+    if(scenario==16) w.request="{}";
+    if(mkfifo(ready,0600)!=0 || mkfifo(resume,0600)!=0) goto done;
+    ready_fd=open(ready,O_RDWR|O_NONBLOCK|O_CLOEXEC);resume_fd=open(resume,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+    if(ready_fd<0 || resume_fd<0) goto done;
+    Dl_info sanitizer={0};void *asan=dlsym(RTLD_DEFAULT,"__asan_init");
+    if(asan!=NULL&&dladdr(asan,&sanitizer)!=0&&sanitizer.dli_fname!=NULL)
+        snprintf(preload,sizeof(preload),"LD_PRELOAD=%s:%s",sanitizer.dli_fname,barrier_library);
+    else snprintf(preload,sizeof(preload),"LD_PRELOAD=%s",barrier_library);
+    snprintf(ready_env,sizeof(ready_env),"SPECUS_TEST_AUTH_BARRIER_READY=%s",ready);
+    snprintf(resume_env,sizeof(resume_env),"SPECUS_TEST_AUTH_BARRIER_RESUME=%s",resume);
+    snprintf(account_env,sizeof(account_env),"SPECUS_TEST_AUTH_BARRIER_ACCOUNT=%s",actor.account_key);
+    server.extra_env[0]=preload;server.extra_env[1]=ready_env;server.extra_env[2]=resume_env;server.extra_env[3]=account_env;
+    if(server_start(&server)!=0) goto done;
+    started=1;
+    if(sqlite3_open(server.db_path,&db)!=SQLITE_OK) goto done;
+    sqlite3_busy_timeout(db,5000);
+    if(pthread_create(&thread,NULL,mutate_credential,&w)!=0) goto done;
+    thread_started=1;
+    struct pollfd event={.fd=ready_fd,.events=POLLIN};int polled;
+    do { polled=poll(&event,1,5000); } while(polled<0&&errno==EINTR);
+    char signal=0;
+    if(polled!=1 || read(ready_fd,&signal,1)!=1 || signal!='R') { fprintf(stderr,"client create missed closed account-read barrier\n");goto done; }
+    const char *change=NULL;
+    switch(scenario) {
+        case 0: case 7: case 11: case 15: case 16: break;
+        case 1: change="UPDATE specus_management_user SET enabled=0 WHERE login_name='alice'";break;
+        case 2: case 3: case 12: change="DELETE FROM specus_management_user WHERE login_name='alice'";break;
+        case 4: change="UPDATE specus_management_user SET tenant_id='foreign' WHERE login_name='alice'";break;
+        case 5: change="UPDATE specus_management_user SET login_name='renamed',login_name_normalized='renamed' WHERE login_name='alice'";break;
+        case 6: change="UPDATE specus_management_user SET role='USER' WHERE login_name='alice'";break;
+        case 8: change="CREATE TRIGGER malformed_created_client AFTER INSERT ON client_account BEGIN UPDATE client_account SET owner_username=printf('%0300d',0) WHERE rowid=NEW.rowid; END";break;
+        case 9: change="CREATE TRIGGER wrong_created_client_owner AFTER INSERT ON client_account BEGIN UPDATE client_account SET owner_username='bob' WHERE rowid=NEW.rowid; END";break;
+        case 10: change="CREATE TRIGGER fail_client_insert BEFORE INSERT ON client_account BEGIN SELECT RAISE(ABORT,'injected insert failure'); END";break;
+        case 13: change="UPDATE specus_management_user SET role='ADMIN' WHERE login_name='alice'";break;
+        case 14: change="CREATE TRIGGER wrong_created_client_tenant AFTER INSERT ON client_account BEGIN UPDATE client_account SET tenant_id='foreign' WHERE rowid=NEW.rowid; END";break;
+        default: goto done;
+    }
+    if(change!=NULL && execute(db,change)!=0) goto done;
+    if((scenario==3 || scenario==12)
+        && st_storage_create_management_user(server.db_path,"alice",scenario==12?"foreign":"default","replacement-fixture-hash","ADMIN",1,&replacement)!=0) goto done;
+    if(scenario==7 && st_storage_upsert_client(server.db_path,0,"default","create-race-client","bob",1,7,&duplicate)!=0) goto done;
+    int expected_status=201;
+    if((scenario>=1 && scenario<=5) || scenario==12) expected_status=403;
+    if(scenario==7 || scenario==16) expected_status=400;
+    if((scenario>=8 && scenario<=10) || scenario==14) expected_status=409;
+    if(write(resume_fd,"C",1)!=1) goto done;
+    pthread_join(thread,NULL);thread_started=0;
+    if(w.rc!=0 || w.status!=expected_status) { fprintf(stderr,"client create scenario=%d status=%d expected=%d\n",scenario,w.status,expected_status);goto done; }
+    long long count=scalar(db,"SELECT COUNT(*) FROM client_account");
+    if(expected_status==201) {
+        char *name=st_json_get_string(w.body,"clientName");
+        long long response_id=0;
+        int valid=st_json_get_i64(w.body,"id",&response_id)==0;
+        valid=valid && name!=NULL && strcmp(name,"create-race-client")==0
+            && st_storage_get_client_by_name(server.db_path,name,&client)==0 && count==2 && response_id==client.id
+            && strcmp(client.tenant_id,"default")==0 && strcmp(client.owner_username,"alice")==0
+            && client.enabled==(scenario==11 || scenario==15)
+            && client.connection_rate_limit_per_minute==((scenario==11 || scenario==15)?30:9);
+        free(name);
+        if(!valid) { fprintf(stderr,"client create inconsistent result scenario=%d count=%lld\n",scenario,count);goto done; }
+    } else if(scenario==7) {
+        if(count!=2 || st_storage_get_client(server.db_path,duplicate.id,&client)!=0 || !same_client_state(&duplicate,&client,1)) goto done;
+    } else if(count!=1) { fprintf(stderr,"client create left rows after refusal scenario=%d count=%lld\n",scenario,count);goto done; }
+    /* The common native harness intentionally seeds the unrelated Demo client. */
+    if(st_storage_get_client(server.db_path,demo.id,&client)!=0 || !same_client_state(&demo,&client,1)) goto done;
+    if(scalar(db,"SELECT COUNT(*) FROM specus_client_identity")!=0 || scalar(db,"SELECT COUNT(*) FROM peer_mesh_device")!=0) goto done;
+    failed=0;
+done:
+    if(thread_started) { ssize_t sent=write(resume_fd,"C",1);if(sent!=1)fprintf(stderr,"client create resume failed\n");pthread_join(thread,NULL); }
+    free(w.body);sqlite3_close(db);
+    if(ready_fd>=0)close(ready_fd);
+    if(resume_fd>=0)close(resume_fd);
+    unlink(ready);unlink(resume);
+    if(started&&server_stop(&server,10000)!=0)failed=1;
+    if(failed)dump_server_log(&server);
+    server_cleanup(&server,failed);
+    printf("%s native client create coordination: scenario=%d\n",failed?"FAIL":"PASS",scenario);
+    return failed;
+}
+
 static int direct_client_mutation(int scenario)
 {
     fixture f;
@@ -842,6 +944,87 @@ done:
     return failed;
 }
 
+static int direct_client_create(int scenario)
+{
+    fixture f;
+    int failed=fresh(&f);
+    st_storage_management_user user,other;
+    st_storage_client output,created={0},duplicate={0};
+    st_storage_share_builtin_admin builtin={"builtin","default",1};
+    st_storage_client_credential credential;
+    if(failed) goto done;
+    if(st_storage_create_management_user(f.path,"alice","default","fixture-only-hash","USER",1,&user)!=0
+        || st_storage_create_management_user(f.path,"bob","default","fixture-only-hash","ADMIN",1,&other)!=0) { failed=1;goto done; }
+    st_storage_management_actor actor={"alice","default",user.account_key};
+    const st_storage_management_actor *resolved=&actor;
+    st_storage_client *published=&output;
+    const char *name="direct-created-client",*owner="alice",*change=NULL;
+    int expected=0,rate=9,enabled=scenario==1?7:0;
+    char oversized[257];memset(oversized,'n',sizeof(oversized)-1);oversized[sizeof(oversized)-1]='\0';
+    switch(scenario) {
+        case 0: break;
+        case 1: actor=(st_storage_management_actor){"BuIlTiN","default",""};owner="builtin";break;
+        case 2: actor.account_key=other.account_key;expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 3: actor.account_key="";expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 4: resolved=NULL;expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 5: actor=(st_storage_management_actor){"builtin","DEFAULT",""};expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 6: name="";expected=-1;break;
+        case 7: name=oversized;expected=-1;break;
+        case 8:
+            if(st_storage_upsert_client(f.path,0,"foreign",name,"bob",1,7,&duplicate)!=0) { failed=1;goto done; }
+            expected=ST_STORAGE_CLIENT_NAME_EXISTS;break;
+        case 9:
+            change="CREATE TRIGGER malformed_client_create AFTER INSERT ON client_account BEGIN UPDATE client_account SET owner_username=printf('%0300d',0) WHERE rowid=NEW.rowid; END";
+            expected=-1;break;
+        case 10:
+            change="CREATE TRIGGER wrong_client_create_owner AFTER INSERT ON client_account BEGIN UPDATE client_account SET owner_username='bob' WHERE rowid=NEW.rowid; END";
+            expected=-1;published=NULL;break;
+        case 11: published=NULL;break;
+        case 12:
+            change="CREATE TRIGGER wrong_client_create_tenant AFTER INSERT ON client_account BEGIN UPDATE client_account SET tenant_id='foreign' WHERE rowid=NEW.rowid; END";
+            expected=-1;break;
+        case 13:
+            change="CREATE TRIGGER fail_client_create BEFORE INSERT ON client_account BEGIN SELECT RAISE(ABORT,'injected create failure'); END";
+            expected=-1;break;
+        case 14: rate=-5;break;
+        case 15:
+            change="CREATE TRIGGER empty_client_create_time AFTER INSERT ON client_account BEGIN UPDATE client_account SET created_at='' WHERE rowid=NEW.rowid; END";
+            expected=-1;break;
+        case 16:
+            change="UPDATE specus_management_user SET enabled=0 WHERE login_name='alice'";
+            expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 17:
+            actor=(st_storage_management_actor){"builtin","default",""};builtin.accepted=0;
+            expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        default: failed=1;goto done;
+    }
+    if(change!=NULL && execute(f.db,change)!=0) { failed=1;goto done; }
+    memset(&output,0x7f,sizeof(output));
+    int rc=st_storage_create_client_current_actor(f.path,resolved,&builtin,name,enabled,rate,published);
+    if(rc!=expected || scalar(f.db,"SELECT COUNT(*) FROM client_account")!=((rc==0 || scenario==8)?1:0)
+        || scalar(f.db,"SELECT COUNT(*) FROM specus_client_identity")!=0
+        || scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_device")!=0
+        || st_storage_get_client_credential(f.path,f.credential.id,&credential)!=0 || !same_credential(&f.credential,&credential,1)) {
+        fprintf(stderr,"direct client create scenario=%d rc=%d expected=%d\n",scenario,rc,expected);failed=1;goto done;
+    }
+    if(rc==0) {
+        if(st_storage_get_client_by_name(f.path,name,&created)!=0 || created.id<=0
+            || strcmp(created.tenant_id,"default")!=0 || strcmp(created.owner_username,owner)!=0
+            || created.enabled!=(enabled!=0) || created.connection_rate_limit_per_minute!=(rate<=0?30:rate)
+            || created.created_at[0]=='\0' || created.updated_at[0]=='\0'
+            || (published!=NULL && !same_client_state(&created,published,1))) failed=1;
+    } else if(scenario==8 && (st_storage_get_client(f.path,duplicate.id,&created)!=0 || !same_client_state(&duplicate,&created,1))) failed=1;
+    if(rc!=0 || published==NULL) {
+        const unsigned char *bytes=(const unsigned char *)&output;
+        unsigned char wanted=published==NULL?0x7f:0;
+        for(size_t i=0;i<sizeof(output);++i) if(bytes[i]!=wanted) failed=1;
+    }
+done:
+    finish(&f);
+    printf("%s direct client create coordination: scenario=%d\n",failed?"FAIL":"PASS",scenario);
+    return failed;
+}
+
 int main(int argc,char **argv)
 {
     if(argc!=3)return 2;
@@ -875,5 +1058,7 @@ int main(int argc,char **argv)
     for(int scenario=0;scenario<15;++scenario)
         for(int deleting=0;deleting<2;++deleting) if(!(scenario==12 && deleting)) failed+=native_client_mutation_race(deleting,scenario);
     for(int scenario=0;scenario<17;++scenario) failed+=direct_client_mutation(scenario);
+    for(int scenario=0;scenario<17;++scenario) failed+=native_client_create_race(scenario);
+    for(int scenario=0;scenario<18;++scenario) failed+=direct_client_create(scenario);
     return failed?1:0;
 }

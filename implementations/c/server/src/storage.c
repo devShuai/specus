@@ -3720,6 +3720,65 @@ static int load_visible_client(sqlite3 *db, long long id,
     return 0;
 }
 
+int st_storage_create_client_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *client_name, int enabled, int connection_rate_limit_per_minute,
+    st_storage_client *out_client)
+{
+    if (out_client != NULL) memset(out_client, 0, sizeof(*out_client));
+    if (client_name == NULL || *client_name == '\0'
+        || strlen(client_name) >= sizeof(((st_storage_client *)0)->client_name)) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = -1, transaction = 0;
+    int rate = connection_rate_limit_per_minute <= 0 ? 30 : connection_rate_limit_per_minute;
+    st_storage_management_user current_actor;
+    st_storage_client staged = {0};
+    sqlite3_stmt *stmt = NULL;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    result = load_management_actor(db, actor, builtin, &current_actor);
+    if (result != 0) goto done;
+    result = -1;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE client_name = ?", -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (step == SQLITE_ROW) { result = ST_STORAGE_CLIENT_NAME_EXISTS; goto done; }
+    if (step != SQLITE_DONE) goto done;
+    /* Names are globally unique. Never reuse or overwrite another account's row. */
+    if (sqlite3_prepare_v2(db,
+        "INSERT INTO client_account(tenant_id, client_name, owner_username, enabled, connection_limit_per_minute) VALUES(?,?,?,?,?)",
+        -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, current_actor.tenant_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, client_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, current_actor.username, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, enabled != 0);
+    sqlite3_bind_int(stmt, 5, rate);
+    step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (step != SQLITE_DONE) goto done;
+    long long id = sqlite3_last_insert_rowid(db);
+    /* Validate even without an output pointer: a malformed trigger result must roll back. */
+    if (id <= 0 || load_client(db, id, &staged) != 0 || staged.id != id
+        || strcmp(staged.tenant_id, current_actor.tenant_id) != 0
+        || strcmp(staged.owner_username, current_actor.username) != 0
+        || strcmp(staged.client_name, client_name) != 0 || staged.enabled != (enabled != 0)
+        || staged.connection_rate_limit_per_minute != rate
+        || staged.created_at[0] == '\0' || staged.updated_at[0] == '\0') goto done;
+    result = 0;
+done:
+    sqlite3_finalize(stmt);
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (result == 0 && out_client != NULL) *out_client = staged;
+    return result;
+}
+
 int st_storage_create_client_credential_current_actor(const char *path,
     const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
     const char *api_key, const char *secret_hash, int enabled, int max_online_instances,

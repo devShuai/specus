@@ -8662,16 +8662,18 @@ static int handle_client_create(const st_admin_context *context, const char *bod
         free(client_name);
         return len;
     }
-    int rc = st_storage_upsert_client(database_path,
-                                      0,
-                                      context->tenant_id,
-                                      client_name,
-                                      context->username,
-                                      enabled,
-                                      rate_limit,
-                                      &client);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_create_client_current_actor(database_path, &actor, &builtin, client_name,
+                                                    enabled, rate_limit, &client);
+    int refusal = 0;
+    if (rc == ST_STORAGE_CLIENT_NAME_EXISTS) refusal = write_client_name_exists(client_name, out, out_len);
+    else if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+        refusal = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
     free(client_name);
     if (rc != 0) {
+        if (refusal != 0) return refusal;
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client create failed\"}");
     }
     admin_notify_peer_mesh_refresh(client.tenant_id);
