@@ -171,6 +171,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
+      postgres:
+        image: postgres:17.11@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_PASSWORD: specus-ci-postgres-281
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=20
       mysql:
         image: mysql:8.4.11@sha256:24989179f58856db763f418010c1169fecc944e3ec1ea7e921572d83eb070f70
         env:
@@ -221,6 +231,31 @@ jobs:
         run: >-
           dotnet test implementations/csharp/server/Specus.slnx
           -p:SpecusServerWebSkip=true
+
+      - name: Test real PostgreSQL native bootstrap, compatibility and catalogue data
+        env:
+          SPECUS_TEST_POSTGRES_CONNECTION: "Host=127.0.0.1;Port=${{ job.services.postgres.ports[5432] }};Username=postgres;Password=specus-ci-postgres-281;Pooling=false"
+        run: |
+          dotnet test implementations/csharp/server/tests/Specus.PostgresTests/Specus.PostgresTests.csproj \
+            -c Release -p:SpecusServerWebSkip=true \
+            --logger 'trx;LogFileName=postgres-bootstrap.trx' --results-directory "$RUNNER_TEMP/postgres-results"
+          python3 - <<'PY'
+          import os, pathlib, xml.etree.ElementTree as ET
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'postgres-results/postgres-bootstrap.trx'
+          counters = ET.parse(path).getroot().find('.//{*}Counters')
+          assert counters is not None, 'missing actual PostgreSQL test counters'
+          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+              assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
+          print('Verified all twelve real PostgreSQL cases executed and passed; zero skipped.')
+          PY
+
+      - name: Keep real PostgreSQL bootstrap results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-postgres-bootstrap
+          path: ${{ runner.temp }}/postgres-results
+          if-no-files-found: error
 
       - name: Test real MySQL bootstrap, upgrades and maximum traffic rows
         env:

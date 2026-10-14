@@ -285,11 +285,14 @@ public sealed partial class DatabaseInitializer
             "postgresql" => "BIGINT PRIMARY KEY",
             _ => "INTEGER PRIMARY KEY",
         };
-        var boolType = BooleanColumnType(db.Database.ProviderName).Replace(" DEFAULT 0", " DEFAULT 1");
+        var boolType = dialect == "postgresql" ? "BOOLEAN NOT NULL DEFAULT TRUE"
+            : BooleanColumnType(db.Database.ProviderName).Replace(" DEFAULT 0", " DEFAULT 1");
+        // EF keeps this particular key as PascalCase; PostgreSQL requires exact quoting.
+        var idColumn = dialect == "postgresql" ? "\"Id\"" : "id";
 
         await ExecuteSchemaSqlAsync(db, $"""
             CREATE TABLE IF NOT EXISTS client_download_link (
-              id {idType},
+              {idColumn} {idType},
               implementation VARCHAR(32) NOT NULL,
               platform VARCHAR(32) NOT NULL,
               arch VARCHAR(32) NOT NULL,
@@ -302,6 +305,9 @@ public sealed partial class DatabaseInitializer
               updated_at VARCHAR(40) NOT NULL
             )
             """, cancellationToken).ConfigureAwait(false);
+
+        if (dialect == "postgresql")
+            await EnsurePostgresClientDownloadShapeAsync(db, cancellationToken).ConfigureAwait(false);
 
         await EnsureIndexAsync(db, "idx_client_download_impl", "client_download_link",
             "implementation", cancellationToken).ConfigureAwait(false);
@@ -338,9 +344,9 @@ public sealed partial class DatabaseInitializer
             UPDATE client_download_link
             SET is_latest = {notLatestValue}, latest_slot = NULL
             WHERE is_latest = {latestValue}
-              AND id NOT IN (
+              AND {idColumn} NOT IN (
                 SELECT keep_id FROM (
-                  SELECT MAX(id) AS keep_id
+                  SELECT MAX({idColumn}) AS keep_id
                   FROM client_download_link
                   WHERE is_latest = {latestValue}
                   GROUP BY implementation, platform, arch
@@ -1144,6 +1150,13 @@ public sealed partial class DatabaseInitializer
         {
             command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = @table";
         }
+        else if (DatabaseDialect(db.Database.ProviderName) == "postgresql")
+        {
+            command.CommandText = """
+                SELECT COUNT(*) FROM pg_catalog.pg_class
+                WHERE oid = pg_catalog.to_regclass(@table) AND relkind IN ('r', 'p')
+                """;
+        }
         else
         {
             command.CommandText = """
@@ -1183,7 +1196,11 @@ public sealed partial class DatabaseInitializer
             return false;
         }
 
-        command.CommandText = """
+        command.CommandText = DatabaseDialect(db.Database.ProviderName) == "postgresql" ? """
+            SELECT COUNT(*) FROM pg_catalog.pg_attribute
+            WHERE attrelid = pg_catalog.to_regclass(@table) AND attname = @column
+              AND attnum > 0 AND NOT attisdropped
+            """ : """
             SELECT COUNT(*) FROM information_schema.columns
             WHERE table_name = @table AND column_name = @column
             """;
@@ -1225,7 +1242,11 @@ public sealed partial class DatabaseInitializer
                     return false;
                 }
             case "postgresql":
-                command.CommandText = "SELECT COUNT(*) FROM pg_indexes WHERE tablename = @table AND indexname = @index";
+                command.CommandText = """
+                    SELECT COUNT(*) FROM pg_catalog.pg_index i
+                    JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+                    WHERE i.indrelid = pg_catalog.to_regclass(@table) AND c.relname = @index
+                    """;
                 break;
             case "mysql":
                 command.CommandText = """
