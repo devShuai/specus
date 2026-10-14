@@ -170,6 +170,38 @@ jobs:
     name: .NET server
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.11@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_PASSWORD: specus-ci-postgres-281
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      mysql:
+        image: mysql:8.4.11@sha256:24989179f58856db763f418010c1169fecc944e3ec1ea7e921572d83eb070f70
+        env:
+          MYSQL_ROOT_PASSWORD: specus-ci-mysql-276
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3306/tcp
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pspecus-ci-mysql-276 --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      mariadb:
+        # Pinned historical regression fixture for #277, not a production version recommendation.
+        image: mariadb:11.4.5@sha256:49117dcc565cf51aa57ac5fca59ab31213402ff0eae6ffc13c46a37b938f7e4b
+        env:
+          MARIADB_ROOT_PASSWORD: specus-ci-maria-277
+          MARIADB_ROOT_HOST: "%"
+        ports:
+          - 3306/tcp
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -199,6 +231,82 @@ jobs:
         run: >-
           dotnet test implementations/csharp/server/Specus.slnx
           -p:SpecusServerWebSkip=true
+
+      - name: Test real PostgreSQL native bootstrap, compatibility and catalogue data
+        env:
+          SPECUS_TEST_POSTGRES_CONNECTION: "Host=127.0.0.1;Port=${{ job.services.postgres.ports[5432] }};Username=postgres;Password=specus-ci-postgres-281;Pooling=false"
+        run: |
+          dotnet test implementations/csharp/server/tests/Specus.PostgresTests/Specus.PostgresTests.csproj \
+            -c Release -p:SpecusServerWebSkip=true \
+            --logger 'trx;LogFileName=postgres-bootstrap.trx' --results-directory "$RUNNER_TEMP/postgres-results"
+          python3 - <<'PY'
+          import os, pathlib, xml.etree.ElementTree as ET
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'postgres-results/postgres-bootstrap.trx'
+          counters = ET.parse(path).getroot().find('.//{*}Counters')
+          assert counters is not None, 'missing actual PostgreSQL test counters'
+          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+              assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
+          print('Verified all twelve real PostgreSQL cases executed and passed; zero skipped.')
+          PY
+
+      - name: Keep real PostgreSQL bootstrap results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-postgres-bootstrap
+          path: ${{ runner.temp }}/postgres-results
+          if-no-files-found: error
+
+      - name: Test real MySQL bootstrap, upgrades and maximum traffic rows
+        env:
+          SPECUS_TEST_MYSQL_CONNECTION: "server=127.0.0.1;port=${{ job.services.mysql.ports[3306] }};user=root;password=specus-ci-mysql-276;Pooling=false"
+        run: |
+          dotnet test implementations/csharp/server/tests/Specus.DatabaseTests/Specus.DatabaseTests.csproj \
+            -c Release -p:SpecusServerWebSkip=true \
+            --logger 'trx;LogFileName=mysql-schema.trx' --results-directory "$RUNNER_TEMP/mysql-schema-results"
+          python3 - <<'PY'
+          import os, pathlib, xml.etree.ElementTree as ET
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mysql-schema-results/mysql-schema.trx'
+          root = ET.parse(path).getroot()
+          counters = root.find('.//{*}Counters')
+          assert counters is not None, 'missing actual MySQL test counters'
+          for key, expected in [('total', 7), ('executed', 7), ('passed', 7), ('failed', 0), ('notExecuted', 0)]:
+              assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
+          print('Verified all seven real MySQL schema cases executed and passed; zero skipped.')
+          PY
+
+      - name: Keep real MySQL schema results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-mysql-schema
+          path: ${{ runner.temp }}/mysql-schema-results
+          if-no-files-found: error
+
+      - name: Test real MariaDB bootstrap, upgrades, Unicode and migration lock safety
+        env:
+          SPECUS_TEST_MARIADB_CONNECTION: "server=127.0.0.1;port=${{ job.services.mariadb.ports[3306] }};user=root;password=specus-ci-maria-277;Pooling=false"
+        run: |
+          dotnet test implementations/csharp/server/tests/Specus.MariaDbTests/Specus.MariaDbTests.csproj \
+            -c Release -p:SpecusServerWebSkip=true \
+            --logger 'trx;LogFileName=mariadb-compatibility.trx' --results-directory "$RUNNER_TEMP/mariadb-results"
+          python3 - <<'PY'
+          import os, pathlib, xml.etree.ElementTree as ET
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mariadb-results/mariadb-compatibility.trx'
+          counters = ET.parse(path).getroot().find('.//{*}Counters')
+          assert counters is not None, 'missing actual MariaDB test counters'
+          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+              assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
+          print('Verified all twelve real MariaDB cases executed and passed; zero skipped.')
+          PY
+
+      - name: Keep real MariaDB results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-mariadb-compatibility
+          path: ${{ runner.temp }}/mariadb-results
+          if-no-files-found: error
 
   c-linux:
     name: C server (Linux)

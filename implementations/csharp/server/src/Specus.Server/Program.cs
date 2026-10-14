@@ -5,6 +5,7 @@ using Specus.Server.Configuration;
 using Specus.Server.Connectivity;
 using Specus.Server.ControlChannel;
 using Specus.Server.Data;
+using Specus.Server.Data.MySql;
 using Specus.Server.Hosting;
 using Specus.Server.Http;
 using Specus.Server.Management;
@@ -88,11 +89,7 @@ builder.Services.AddDbContext<SpecusDbContext>(options =>
             });
             break;
         case "mysql":
-            options.UseMySQL(database.ConnectionString, o =>
-            {
-                o.MigrationsAssembly("Specus.Server.Data.MySql");
-                o.MaxBatchSize(database.BatchSize);
-            });
+            MySqlDatabaseCompatibility.Configure(options, database.ConnectionString, database.BatchSize);
             break;
         case "sqlite":
             // Migrations for SQLite live in the Data project itself.

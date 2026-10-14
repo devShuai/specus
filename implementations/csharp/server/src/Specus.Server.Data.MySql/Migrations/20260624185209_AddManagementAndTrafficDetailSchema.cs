@@ -57,11 +57,13 @@ namespace Specus.Server.Data.MySql.Migrations
                     request_content_type = table.Column<string>(type: "varchar(255)", maxLength: 255, nullable: true),
                     response_content_type = table.Column<string>(type: "varchar(255)", maxLength: 255, nullable: true),
                     response_body_type = table.Column<string>(type: "varchar(32)", maxLength: 32, nullable: false),
-                    request_headers = table.Column<string>(type: "varchar(8192)", maxLength: 8192, nullable: true),
-                    response_headers = table.Column<string>(type: "varchar(8192)", maxLength: 8192, nullable: true),
-                    request_preview_hex = table.Column<string>(type: "varchar(4096)", maxLength: 4096, nullable: true),
+                    // New databases must survive this historical step before the forward repair
+                    // can run. Existing databases get the separate WidenHttpTrafficText migration.
+                    request_headers = table.Column<string>(type: "longtext", maxLength: 8192, nullable: true),
+                    response_headers = table.Column<string>(type: "longtext", maxLength: 8192, nullable: true),
+                    request_preview_hex = table.Column<string>(type: "longtext", maxLength: 4096, nullable: true),
                     request_preview_text = table.Column<string>(type: "longtext", nullable: true),
-                    response_preview_hex = table.Column<string>(type: "varchar(4096)", maxLength: 4096, nullable: true),
+                    response_preview_hex = table.Column<string>(type: "longtext", maxLength: 4096, nullable: true),
                     response_preview_text = table.Column<string>(type: "longtext", nullable: true),
                     request_truncated = table.Column<bool>(type: "tinyint(1)", nullable: false),
                     response_truncated = table.Column<bool>(type: "tinyint(1)", nullable: false),

@@ -1210,12 +1210,12 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.Property<string>("RequestHeaders")
                         .HasMaxLength(8192)
-                        .HasColumnType("varchar(8192)")
+                        .HasColumnType("longtext")
                         .HasColumnName("request_headers");
 
                     b.Property<string>("RequestPreviewHex")
                         .HasMaxLength(4096)
-                        .HasColumnType("varchar(4096)")
+                        .HasColumnType("longtext")
                         .HasColumnName("request_preview_hex");
 
                     b.Property<string>("RequestPreviewText")
@@ -1256,12 +1256,12 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.Property<string>("ResponseHeaders")
                         .HasMaxLength(8192)
-                        .HasColumnType("varchar(8192)")
+                        .HasColumnType("longtext")
                         .HasColumnName("response_headers");
 
                     b.Property<string>("ResponsePreviewHex")
                         .HasMaxLength(4096)
-                        .HasColumnType("varchar(4096)")
+                        .HasColumnType("longtext")
                         .HasColumnName("response_preview_hex");
 
                     b.Property<string>("ResponsePreviewText")
