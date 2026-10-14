@@ -3457,14 +3457,9 @@ int st_storage_get_client_credential_by_api_key(const char *path,
     return ok ? 0 : -1;
 }
 
-int st_storage_get_client_credential(const char *path,
-                                     long long id,
-                                     st_storage_client_credential *credential)
+/* 0 found, 1 absent, -1 store/shape failure. Also used inside the identity write transaction. */
+static int load_client_credential(sqlite3 *db, long long id, st_storage_client_credential *credential)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, owner_username, api_key, secret_hash, enabled, "
@@ -3474,15 +3469,25 @@ int st_storage_get_client_credential(const char *path,
         &stmt,
         NULL);
     if (rc != SQLITE_OK) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_bind_int64(stmt, 1, id);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_client_credential(stmt, credential) == 0;
+    int result = rc == SQLITE_DONE ? 1
+        : rc == SQLITE_ROW && scan_client_credential(stmt, credential) == 0 ? 0 : -1;
     sqlite3_finalize(stmt);
+    return result;
+}
+
+int st_storage_get_client_credential(const char *path,
+                                     long long id,
+                                     st_storage_client_credential *credential)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = load_client_credential(db, id, credential);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return result == 0 ? 0 : -1;
 }
 
 int st_storage_list_client_credentials(const char *path,
@@ -4190,23 +4195,77 @@ static int load_identity_by_machine(sqlite3 *db,
     sqlite3_bind_text(stmt, 2, machine_fingerprint, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, os_user, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_client_identity(stmt, identity) == 0;
+    int result = rc == SQLITE_DONE ? 1
+        : rc == SQLITE_ROW && scan_client_identity(stmt, identity) == 0 ? 0 : -1;
     sqlite3_finalize(stmt);
-    return ok ? 0 : -1;
+    return result;
 }
 
-int st_storage_find_or_create_client_identity(const char *path,
+/* The caller's HMAC check ran before the write boundary. Preserve that exact key/tenant/hash
+ * identity, but take ownership and current policy from the locked credential row. */
+static int credential_snapshot_matches(const st_storage_client_credential *authenticated,
+                                        const st_storage_client_credential *current)
+{
+    size_t a_len = strlen(authenticated->secret_hash), c_len = strlen(current->secret_hash);
+    return authenticated->id == current->id
+        && strcmp(normalize_tenant_id(authenticated->tenant_id), normalize_tenant_id(current->tenant_id)) == 0
+        && strcmp(authenticated->api_key, current->api_key) == 0
+        && a_len == c_len
+        && st_constant_time_eq((const uint8_t *)authenticated->secret_hash,
+                               (const uint8_t *)current->secret_hash, a_len);
+}
+
+static int identity_account_matches(sqlite3 *db, const st_storage_client_identity *identity,
+                                    const st_storage_client_credential *credential)
+{
+    if (identity->id <= 0 || identity->client_id <= 0
+        || strcmp(normalize_tenant_id(identity->tenant_id), normalize_tenant_id(credential->tenant_id)) != 0) return 0;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT tenant_id FROM client_account WHERE rowid = ?", -1, &stmt, NULL);
+    int matches = 0;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, identity->client_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *tenant = (const char *)sqlite3_column_text(stmt, 0);
+            matches = tenant != NULL && strcmp(normalize_tenant_id(tenant), normalize_tenant_id(credential->tenant_id)) == 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return matches;
+}
+
+int st_storage_find_or_create_client_identity_current(const char *path,
                                               const st_storage_client_credential *credential,
                                               const char *machine_fingerprint,
                                               const char *os_user,
                                               const char *hostname,
-                                              st_storage_client_identity *identity)
+                                              st_storage_client_identity *identity,
+                                              st_storage_client_credential *effective_credential)
 {
+    if (identity == NULL) return -1;
+    if (effective_credential != NULL && effective_credential == credential) return -1;
+    memset(identity, 0, sizeof(*identity));
+    if (effective_credential != NULL) memset(effective_credential, 0, sizeof(*effective_credential));
+    if (credential == NULL || credential->id <= 0 || machine_fingerprint == NULL || os_user == NULL) return -1;
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
+    if (open_db(path, &db) != 0) return -1;
+    /* SQLite's database write lock coordinates independent connections and server processes,
+     * not just this process. No old credential read can cross it and create an old-owner row. */
+    int result = -1, transaction = 0;
+    st_storage_client_credential current = {0};
+    st_storage_client_identity staged = {0};
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    int found = load_client_credential(db, credential->id, &current);
+    if (found < 0) goto done;
+    if (found > 0 || !credential_snapshot_matches(credential, &current)) {
+        result = ST_STORAGE_IDENTITY_AUTH_CHANGED; goto done;
     }
-    if (load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity) == 0) {
+    if (!current.enabled) { result = ST_STORAGE_IDENTITY_AUTH_DISABLED; goto done; }
+    found = load_identity_by_machine(db, current.id, machine_fingerprint, os_user, &staged);
+    if (found < 0) goto done;
+    if (found == 0) {
+        if (!identity_account_matches(db, &staged, &current)) goto done;
         sqlite3_stmt *update = NULL;
         int rc = sqlite3_prepare_v2(db,
             "UPDATE specus_client_identity SET hostname = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -4215,24 +4274,20 @@ int st_storage_find_or_create_client_identity(const char *path,
             NULL);
         if (rc == SQLITE_OK) {
             sqlite3_bind_text(update, 1, hostname == NULL ? "" : hostname, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(update, 2, identity->id);
-            rc = sqlite3_step(update) == SQLITE_DONE ? 0 : -1;
+            sqlite3_bind_int64(update, 2, staged.id);
+            rc = sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
         } else {
             rc = -1;
         }
         sqlite3_finalize(update);
-        if (rc == 0) {
-            rc = load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity);
-        }
-        sqlite3_close(db);
-        return rc == 0 ? 0 : -1;
+        if (rc != 0 || load_identity_by_machine(db, current.id, machine_fingerprint, os_user, &staged) != 0
+            || !identity_account_matches(db, &staged, &current)) goto done;
+        result = 0;
+        goto done;
     }
 
     char client_name[121];
-    if (build_client_name(db, credential, machine_fingerprint, os_user, hostname, client_name, sizeof(client_name)) != 0) {
-        sqlite3_close(db);
-        return -1;
-    }
+    if (build_client_name(db, &current, machine_fingerprint, os_user, hostname, client_name, sizeof(client_name)) != 0) goto done;
     sqlite3_stmt *client_stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO client_account(tenant_id, client_name, owner_username, enabled, connection_limit_per_minute, created_at, updated_at) "
@@ -4241,9 +4296,9 @@ int st_storage_find_or_create_client_identity(const char *path,
         &client_stmt,
         NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(client_stmt, 1, credential->tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(client_stmt, 1, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(client_stmt, 2, client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(client_stmt, 3, credential->owner_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(client_stmt, 3, current.owner_username, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(client_stmt, 4, 1);
         rc = sqlite3_step(client_stmt) == SQLITE_DONE ? 0 : -1;
     } else {
@@ -4251,10 +4306,7 @@ int st_storage_find_or_create_client_identity(const char *path,
     }
     sqlite3_finalize(client_stmt);
     long long client_id = sqlite3_last_insert_rowid(db);
-    if (rc != 0 || client_id <= 0) {
-        sqlite3_close(db);
-        return -1;
-    }
+    if (rc != 0 || client_id <= 0) goto done;
 
     sqlite3_stmt *identity_stmt = NULL;
     rc = sqlite3_prepare_v2(db,
@@ -4264,8 +4316,8 @@ int st_storage_find_or_create_client_identity(const char *path,
         &identity_stmt,
         NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(identity_stmt, 1, credential->tenant_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(identity_stmt, 2, credential->id);
+        sqlite3_bind_text(identity_stmt, 1, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(identity_stmt, 2, current.id);
         sqlite3_bind_int64(identity_stmt, 3, client_id);
         sqlite3_bind_text(identity_stmt, 4, client_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(identity_stmt, 5, machine_fingerprint, -1, SQLITE_TRANSIENT);
@@ -4276,11 +4328,32 @@ int st_storage_find_or_create_client_identity(const char *path,
         rc = -1;
     }
     sqlite3_finalize(identity_stmt);
-    if (rc == 0) {
-        rc = load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity);
+    if (rc == 0 && load_identity_by_machine(db, current.id, machine_fingerprint, os_user, &staged) == 0
+        && identity_account_matches(db, &staged, &current)) result = 0;
+done:
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
     }
+    if (transaction) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    /* Nothing, including allocated ids, is published to callers before successful commit. */
+    if (result == 0) {
+        *identity = staged;
+        if (effective_credential != NULL) *effective_credential = current;
+    }
+    return result;
+}
+
+int st_storage_find_or_create_client_identity(const char *path,
+                                              const st_storage_client_credential *credential,
+                                              const char *machine_fingerprint,
+                                              const char *os_user,
+                                              const char *hostname,
+                                              st_storage_client_identity *identity)
+{
+    return st_storage_find_or_create_client_identity_current(path, credential, machine_fingerprint,
+                                                            os_user, hostname, identity, NULL);
 }
 
 int st_storage_close_http_authenticated_sessions(const char *path,

@@ -807,6 +807,17 @@ int st_storage_delete_user_diagram(const char *path,
                                    const char *owner_username);
 void st_storage_user_diagram_free(st_storage_user_diagram *diagram);
 int st_storage_delete_client_download_link(const char *path, long long id);
+enum { ST_STORAGE_IDENTITY_AUTH_CHANGED = 1, ST_STORAGE_IDENTITY_AUTH_DISABLED = 2 };
+/* Authenticated snapshot is immutable. Under BEGIN IMMEDIATE, re-read current credential,
+ * reject changed key/hash/tenant or disabled state, then atomically provision/touch identity.
+ * 0 success, positive AUTH_* refusal, -1 store/integrity failure; outputs only after commit. */
+int st_storage_find_or_create_client_identity_current(const char *path,
+                                                      const st_storage_client_credential *credential,
+                                                      const char *machine_fingerprint,
+                                                      const char *os_user,
+                                                      const char *hostname,
+                                                      st_storage_client_identity *identity,
+                                                      st_storage_client_credential *effective_credential);
 int st_storage_find_or_create_client_identity(const char *path,
                                               const st_storage_client_credential *credential,
                                               const char *machine_fingerprint,

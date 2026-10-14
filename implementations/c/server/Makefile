@@ -21,6 +21,8 @@ CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR
 SERVER := $(BUILD_DIR)/specus-server-c
 CORE_OBJS += $(BUILD_DIR)/owner_transfer.o
 OWNER_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_tests
+IDENTITY_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_client_identity_coordination_tests
+AUTH_READ_BARRIER := $(BUILD_DIR)/libspecus_c_auth_read_barrier.so
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
 DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
@@ -75,6 +77,7 @@ TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIE
 ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
 ALL_TESTS += $(OWNER_TRANSFER_TESTS)
+ALL_TESTS += $(IDENTITY_COORDINATION_TESTS) $(AUTH_READ_BARRIER)
 
 .PHONY: all test release clean
 
@@ -247,6 +250,12 @@ $(OWNER_TRANSFER_TESTS): $(CORE_OBJS) tests/owner_transfer_tests.c tests/server_
 	  -DST_OWNER_TRANSFER_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/client-owner-transfer-plan-v1.json)"' \
 	  tests/owner_transfer_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(AUTH_READ_BARRIER): tests/auth_read_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lsqlite3 -ldl -lpthread -o $@
+
+$(IDENTITY_COORDINATION_TESTS): $(CORE_OBJS) tests/client_identity_coordination_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_identity_coordination_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
 test: all
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
@@ -272,6 +281,7 @@ test: all
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)
 	$(OWNER_TRANSFER_TESTS) $(SERVER)
+	$(IDENTITY_COORDINATION_TESTS) $(abspath $(SERVER)) $(abspath $(AUTH_READ_BARRIER))
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
 release: clean $(SERVER)

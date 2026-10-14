@@ -448,6 +448,16 @@ target_compile_definitions(specus_c_owner_transfer_tests PRIVATE
 add_test(NAME owner_transfer_tests COMMAND specus_c_owner_transfer_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(owner_transfer_tests PROPERTIES TIMEOUT 120)
 
+add_library(specus_c_auth_read_barrier SHARED tests/auth_read_barrier.c)
+target_link_libraries(specus_c_auth_read_barrier PRIVATE SQLite::SQLite3 ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_auth_read_barrier PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specus_c_client_identity_coordination_tests tests/client_identity_coordination_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_client_identity_coordination_tests PRIVATE specus_c_core ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_client_identity_coordination_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_identity_coordination_tests COMMAND specus_c_client_identity_coordination_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_auth_read_barrier>)
+set_tests_properties(client_identity_coordination_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_tls_transport_tests PRIVATE -Wall -Wextra -Wpedantic)

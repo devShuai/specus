@@ -3243,12 +3243,14 @@ static int build_database_client_auth_login_response(const char *database_path,
     }
 
     st_storage_client_identity identity;
-    int rc = st_storage_find_or_create_client_identity(database_path,
+    st_storage_client_credential effective_credential;
+    int rc = st_storage_find_or_create_client_identity_current(database_path,
                                                        &credential,
                                                        machine_fingerprint,
                                                        os_user,
                                                        hostname == NULL ? "unknown-host" : hostname,
-                                                       &identity);
+                                                       &identity,
+                                                       &effective_credential);
     if (rc != 0) {
         free(api_key);
         free(timestamp);
@@ -3262,8 +3264,13 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(os_arch);
         free(client_version);
         free(java_version);
+        if (rc == ST_STORAGE_IDENTITY_AUTH_CHANGED)
+            return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client credential changed\"}");
+        if (rc == ST_STORAGE_IDENTITY_AUTH_DISABLED)
+            return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"客户端凭证已停用\"}");
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client identity build failed\"}");
     }
+    credential = effective_credential;
     /*
      * The identity names its account by id; the name it recorded may since belong to another
      * account. As Java and Go do, the account is loaded by id within the credential's tenant, and its
