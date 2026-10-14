@@ -54,7 +54,11 @@ public sealed class CliStateSnapshotTests
 
     private static void Write(string path, string content)
     {
-        File.WriteAllText(path, content); CliState.ProtectNewFile(path);
+        var options = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+        if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        using (var file = new FileStream(path, options))
+        using (var writer = new StreamWriter(file)) writer.Write(content);
+        CliState.ProtectNewFile(path);
     }
 
     [Fact]
