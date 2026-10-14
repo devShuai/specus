@@ -3661,6 +3661,131 @@ int st_storage_delete_client_credential(const char *path, long long id)
     return rc == 0 ? 0 : -1;
 }
 
+static int management_actor_is_admin(const char *role)
+{
+    while (*role != '\0' && isspace((unsigned char)*role)) ++role;
+    size_t length = strlen(role);
+    while (length > 0 && isspace((unsigned char)role[length - 1])) --length;
+    return length == 5 && sqlite3_strnicmp(role, "ADMIN", 5) == 0;
+}
+
+static int load_management_actor(sqlite3 *db, const st_storage_management_actor *actor,
+    const st_storage_share_builtin_admin *builtin, st_storage_management_user *current)
+{
+    memset(current, 0, sizeof(*current));
+    if (actor == NULL || actor->username == NULL || actor->tenant_id == NULL
+        || *actor->username == '\0' || *actor->tenant_id == '\0') return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+    if (actor->account_key == NULL || *actor->account_key == '\0') {
+        if (builtin == NULL || !builtin->accepted || builtin->username == NULL || builtin->tenant_id == NULL
+            || sqlite3_stricmp(actor->username, builtin->username) != 0
+            || strcmp(actor->tenant_id, builtin->tenant_id) != 0
+            || strlen(builtin->username) >= sizeof(current->username)
+            || strlen(builtin->tenant_id) >= sizeof(current->tenant_id)) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+        strcpy(current->username, builtin->username);
+        strcpy(current->tenant_id, builtin->tenant_id);
+        strcpy(current->role, "ADMIN");
+        current->enabled = 1;
+        return 0;
+    }
+    int found = management_user_lookup(db, 0, 0, NULL, actor->account_key, current);
+    if (found < 0) return -1;
+    if (found != 0 || !current->enabled || strcmp(current->tenant_id, actor->tenant_id) != 0
+        || strcmp(current->username, actor->username) != 0) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+    return 0;
+}
+
+static int mutate_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_credential_patch *patch, int deleting, st_storage_client_credential *out_credential)
+{
+    if (out_credential != NULL) memset(out_credential, 0, sizeof(*out_credential));
+    if (id <= 0 || (!deleting && (patch == NULL
+        || (patch->api_key != NULL && (*patch->api_key == '\0' || strlen(patch->api_key) >= sizeof(((st_storage_client_credential *)0)->api_key)))
+        || (patch->secret_hash != NULL && strlen(patch->secret_hash) != ST_SHA256_HEX_LEN)
+        || (patch->max_online_provided && (patch->max_online_instances < 1 || patch->max_online_instances > 10000))))) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = -1, transaction = 0;
+    st_storage_management_user current_actor;
+    st_storage_client_credential current = {0}, staged = {0};
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    result = load_management_actor(db, actor, builtin, &current_actor);
+    if (result != 0) goto done;
+    result = -1;
+    int found = load_client_credential(db, id, &current);
+    if (found < 0) goto done;
+    if (found > 0 || strcmp(current.tenant_id, current_actor.tenant_id) != 0
+        || (!management_actor_is_admin(current_actor.role) && strcmp(current.owner_username, current_actor.username) != 0)) {
+        result = ST_STORAGE_CREDENTIAL_NOT_VISIBLE;
+        goto done;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (!deleting && patch->api_key != NULL && strcmp(patch->api_key, current.api_key) != 0) {
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM specus_client_credential WHERE api_key = ? AND id <> ?", -1, &stmt, NULL) != SQLITE_OK) goto done;
+        sqlite3_bind_text(stmt, 1, patch->api_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, id);
+        int step = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+        if (step == SQLITE_ROW) { result = ST_STORAGE_CREDENTIAL_KEY_EXISTS; goto done; }
+        if (step != SQLITE_DONE) goto done;
+    }
+    const char *sql = deleting ? "DELETE FROM specus_client_credential WHERE id = ?"
+        : "UPDATE specus_client_credential SET api_key=COALESCE(?,api_key),secret_hash=COALESCE(?,secret_hash),"
+          "enabled=CASE WHEN ? THEN ? ELSE enabled END,"
+          "max_online_instances=CASE WHEN ? THEN ? ELSE max_online_instances END,updated_at=CURRENT_TIMESTAMP WHERE id=?";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) goto done;
+    if (deleting) sqlite3_bind_int64(stmt, 1, id);
+    else {
+        if (patch->api_key != NULL) sqlite3_bind_text(stmt, 1, patch->api_key, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(stmt, 1);
+        if (patch->secret_hash != NULL) sqlite3_bind_text(stmt, 2, patch->secret_hash, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(stmt, 2);
+        sqlite3_bind_int(stmt, 3, patch->enabled_provided != 0);
+        sqlite3_bind_int(stmt, 4, patch->enabled != 0);
+        sqlite3_bind_int(stmt, 5, patch->max_online_provided != 0);
+        sqlite3_bind_int(stmt, 6, patch->max_online_instances);
+        sqlite3_bind_int64(stmt, 7, id);
+    }
+    int written = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(stmt);
+    if (!written) goto done;
+    found = load_client_credential(db, id, &staged);
+    if (deleting) {
+        if (found != 1) goto done;
+    } else if (found != 0 || strcmp(staged.tenant_id, current.tenant_id) != 0
+        || strcmp(staged.owner_username, current.owner_username) != 0
+        || strcmp(staged.created_at, current.created_at) != 0
+        || strcmp(staged.api_key, patch->api_key == NULL ? current.api_key : patch->api_key) != 0
+        || strcmp(staged.secret_hash, patch->secret_hash == NULL ? current.secret_hash : patch->secret_hash) != 0
+        || staged.enabled != (patch->enabled_provided ? patch->enabled != 0 : current.enabled)
+        || staged.max_online_instances != (patch->max_online_provided ? patch->max_online_instances : current.max_online_instances)) goto done;
+    result = 0;
+done:
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (result == 0 && out_credential != NULL) *out_credential = staged;
+    return result;
+}
+
+int st_storage_patch_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_credential_patch *patch, st_storage_client_credential *out_credential)
+{
+    return mutate_client_credential_visible(path, id, actor, builtin, patch, 0, out_credential);
+}
+
+int st_storage_delete_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin)
+{
+    return mutate_client_credential_visible(path, id, actor, builtin, NULL, 1, NULL);
+}
+
 int st_storage_list_client_download_links(const char *path,
                                           int enabled_only,
                                           st_storage_client_download_link *links,

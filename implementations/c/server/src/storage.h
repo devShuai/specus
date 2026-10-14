@@ -52,6 +52,15 @@ typedef struct {
     char updated_at[64];
 } st_storage_management_user;
 
+/* The resolved identity, not a cached role. Mutations re-read this exact account key and
+ * verify its current login name, tenant, enabled state and role under the database write lock.
+ * Only the built-in administrator has an empty account_key. */
+typedef struct {
+    const char *username;
+    const char *tenant_id;
+    const char *account_key;
+} st_storage_management_actor;
+
 typedef struct {
     char registration_id[65];
     char username[81];
@@ -77,6 +86,17 @@ typedef struct {
     char created_at[64];
     char updated_at[64];
 } st_storage_client_credential;
+
+/* API key/hash are already validated and normalized by the HTTP binder; NULL preserves
+ * the current value. Explicit flags distinguish omitted/null policy fields from false/zero. */
+typedef struct {
+    const char *api_key;
+    const char *secret_hash;
+    int enabled_provided;
+    int enabled;
+    int max_online_provided;
+    int max_online_instances;
+} st_storage_credential_patch;
 
 typedef struct {
     long long id;
@@ -1592,6 +1612,20 @@ typedef struct {
     const char *tenant_id;
     int accepted;
 } st_storage_share_builtin_admin;
+
+enum {
+    ST_STORAGE_MANAGEMENT_ACTOR_CHANGED = 1,
+    ST_STORAGE_CREDENTIAL_NOT_VISIBLE = 2,
+    ST_STORAGE_CREDENTIAL_KEY_EXISTS = 3
+};
+/* BEGIN IMMEDIATE encloses current actor, current credential visibility and the entire write.
+ * No tenant/owner replacement from a stale caller object; output only after successful commit.
+ * 0 success, positive refusal above, -1 store/integrity/argument failure. */
+int st_storage_patch_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_credential_patch *patch, st_storage_client_credential *out_credential);
+int st_storage_delete_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin);
 
 /* Share ids a call revoked, so the caller can cut this instance's streams of them. */
 typedef struct {

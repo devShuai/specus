@@ -10716,7 +10716,7 @@ static int handle_credential_update(const st_admin_context *context,
     /* Java updateCredential: only what the request carries changes, in this order. */
     char *api_key = st_json_get_string(body, "apiKey");
     char *secret = st_json_get_string(body, "secret");
-    const char *next_api_key = existing.api_key;
+    const char *next_api_key = NULL;
     int answer = 0;
     if (admin_java_has_text(api_key)) {
         st_storage_client_credential duplicate;
@@ -10729,7 +10729,7 @@ static int handle_credential_update(const st_admin_context *context,
         next_api_key = api_key;
     }
     char secret_hash[ST_SHA256_HEX_LEN + 1];
-    const char *secret_hash_ptr = existing.secret_hash;
+    const char *secret_hash_ptr = NULL;
     const char *revealed_secret = NULL;
     if (answer == 0 && admin_java_has_text(secret)) {
         if (password_hash_hex(admin_java_trim(secret), secret_hash) != 0) {
@@ -10743,7 +10743,7 @@ static int handle_credential_update(const st_admin_context *context,
     int max_online_instances = existing.max_online_instances <= 0
         ? client_auth_default_max_online_instances()
         : existing.max_online_instances;
-    (void)admin_jackson_boolean(body, "enabled", &enabled);
+    int enabled_provided = admin_jackson_boolean(body, "enabled", &enabled) == 1;
     int max_online = answer == 0 ? admin_credential_max_online(body, &max_online_instances) : 0;
     if (answer == 0 && max_online == -2) {
         answer = write_spring_bad_request(out, out_len);
@@ -10756,17 +10756,22 @@ static int handle_credential_update(const st_admin_context *context,
         return answer;
     }
     st_storage_client_credential credential;
-    int rc = st_storage_upsert_client_credential(database_path,
-                                                 existing.id,
-                                                 existing.tenant_id,
-                                                 existing.owner_username,
-                                                 next_api_key,
-                                                 secret_hash_ptr,
-                                                 enabled,
-                                                 max_online_instances,
-                                                 &credential);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    /* An account-less authenticated context also covers the existing trusted default-admin
+     * embedding mode. Database identities always have a bound key and cannot take this branch. */
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    st_storage_credential_patch patch = {next_api_key, secret_hash_ptr, enabled_provided, enabled,
+                                        max_online == 1, max_online_instances};
+    int rc = st_storage_patch_client_credential_visible(database_path, existing.id, &actor, &builtin, &patch, &credential);
     int response_len;
-    if (rc != 0) {
+    if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED) {
+        response_len = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+    } else if (rc == ST_STORAGE_CREDENTIAL_NOT_VISIBLE) {
+        response_len = write_credential_not_found(id, out, out_len);
+    } else if (rc == ST_STORAGE_CREDENTIAL_KEY_EXISTS) {
+        response_len = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_EXISTS_BODY);
+    } else if (rc != 0) {
         response_len = write_response(out, out_len, 409, "Conflict", "{\"error\":\"credential update failed\"}");
     } else {
         response_len = build_credential_result_response(&credential, revealed_secret, 200, "OK", out, out_len);
@@ -10785,10 +10790,16 @@ static int handle_credential_delete(const st_admin_context *context, long long i
     }
     st_storage_client_credential existing;
     if (st_storage_get_client_credential(database_path, id, &existing) != 0
-        || !admin_can_access_credential(context, &existing)
-        || st_storage_delete_client_credential(database_path, id) != 0) {
+        || !admin_can_access_credential(context, &existing)) {
         return write_credential_not_found(id, out, out_len);
     }
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_delete_client_credential_visible(database_path, id, &actor, &builtin);
+    if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+        return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+    if (rc != 0) return write_credential_not_found(id, out, out_len);
     return write_response(out, out_len, 204, "No Content", "");
 }
 
