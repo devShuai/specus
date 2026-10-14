@@ -235,7 +235,7 @@ class MariaDbSchemaTests {
 
     private static ConfigurableApplicationContext boot(String database, boolean zeroAffectedRows) {
         // Command-line arguments, because builder properties are defaults that application.yml overrides.
-        return new SpringApplicationBuilder(SpecusServerApplication.class)
+        return new SpringApplicationBuilder(SpecusServerApplication.class, ManagementLoginAssertions.ProofConfiguration.class)
                 .web(WebApplicationType.NONE)
                 .run(
                         "--spring.datasource.url=" + url(database) + (zeroAffectedRows ? "&useAffectedRows=true" : ""),

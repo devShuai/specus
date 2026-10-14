@@ -43,6 +43,7 @@ class ManagementUserServiceTests {
         properties.setTenantId("default");
         ManagementWriteAuthority authority = mock(ManagementWriteAuthority.class);
         when(authority.current(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(authority.lockCurrentAccount(anyString(), anyString())).thenAnswer(invocation -> repository.findById(invocation.getArgument(0)));
         when(authority.currentAndTarget(any(), anyString())).thenAnswer(invocation -> {
             ManagementContext actor = invocation.getArgument(0);
             String target = invocation.getArgument(1);
@@ -50,7 +51,8 @@ class ManagementUserServiceTests {
                     actor.tenant().tenantId(), target.trim().toLowerCase(java.util.Locale.ROOT)));
         });
         service = new ManagementUserService(repository, properties, null, mock(WorkbenchReferences.class),
-                emailRepository, null, null, authority);
+                emailRepository, null, null, authority, new ManagementPasswordVerifier(),
+                new ManagementAuthenticationWriter(repository, authority));
         when(repository.save(any(ManagementUser.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
         when(repository.saveAndFlush(any(ManagementUser.class)))
@@ -75,7 +77,7 @@ class ManagementUserServiceTests {
         assertThat(login.builtInAdmin()).isFalse();
 
         ArgumentCaptor<ManagementUser> captor = ArgumentCaptor.forClass(ManagementUser.class);
-        verify(repository).save(captor.capture());
+        verify(repository).saveAndFlush(captor.capture());
         ManagementUser saved = captor.getValue();
         assertThat(saved.getOidcIssuer()).isEqualTo(ISSUER);
         assertThat(saved.getUsername()).isNotEqualTo("new-user");
@@ -99,6 +101,7 @@ class ManagementUserServiceTests {
         mapped.setOidcIdentityKey(identityKey(ISSUER, "subject-alice"));
         when(repository.findByOidcIdentityKey(mapped.getOidcIdentityKey()))
                 .thenReturn(Optional.of(mapped));
+        when(repository.findById("alice")).thenReturn(Optional.of(mapped));
 
         ManagementUserService.LoginUser login = service.resolveOrProvisionOidcUser(
                 ISSUER,
@@ -148,6 +151,7 @@ class ManagementUserServiceTests {
         disabled.setOidcIdentityKey(identityKey(ISSUER, "subject-disabled"));
         when(repository.findByOidcIdentityKey(disabled.getOidcIdentityKey()))
                 .thenReturn(Optional.of(disabled));
+        when(repository.findById("disabled")).thenReturn(Optional.of(disabled));
         assertThat(service.resolveOrProvisionOidcUser(
                 ISSUER,
                 "subject-disabled",
@@ -161,6 +165,7 @@ class ManagementUserServiceTests {
                 .thenReturn(Optional.empty());
         when(repository.findByTenantIdAndLoginNameNormalized("default", "alice"))
                 .thenReturn(Optional.of(conflicting));
+        when(repository.findById("alice")).thenReturn(Optional.of(conflicting));
         assertThat(service.resolveOrProvisionOidcUser(
                 ISSUER,
                 "subject-alice",

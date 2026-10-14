@@ -41,7 +41,7 @@ class MySqlCredentialAuthProof {
     }
 
     private static ConfigurableApplicationContext boot(String url, Path expected, String database) {
-        return new SpringApplicationBuilder(SpecusServerApplication.class).web(WebApplicationType.NONE).run(
+        return new SpringApplicationBuilder(SpecusServerApplication.class, ManagementLoginAssertions.ProofConfiguration.class).web(WebApplicationType.NONE).run(
                 "--spring.datasource.url=" + url,
                 "--spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver", "--spring.datasource.username=root",
                 "--spring.datasource.hikari.maximum-pool-size=4",

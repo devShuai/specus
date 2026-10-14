@@ -376,7 +376,7 @@ class PostgresSchemaMigrationTests {
     private ConfigurableApplicationContext start(String database) {
         // Command-line arguments, because builder properties are defaults that application.yml
         // overrides: the datasource would silently fall back to ./specus.db.
-        return new SpringApplicationBuilder(SpecusServerApplication.class)
+        return new SpringApplicationBuilder(SpecusServerApplication.class, ManagementLoginAssertions.ProofConfiguration.class)
                 .web(WebApplicationType.NONE)
                 .run(
                         "--spring.datasource.url=" + postgres.getJdbcUrl("postgres", database),

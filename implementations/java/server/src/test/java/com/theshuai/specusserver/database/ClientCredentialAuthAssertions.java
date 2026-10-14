@@ -148,6 +148,7 @@ final class ClientCredentialAuthAssertions {
         assertEquals("after-commit", jdbc.queryForObject("select owner_username from specus_client_credential where id=910501", String.class));
         verifyManagementWrites(context, independent, zeroAffectedRows);
         ManagementResourceWriteAssertions.verify(context, independent, zeroAffectedRows);
+        ManagementLoginAssertions.verify(context, independent, zeroAffectedRows);
     }
 
     private static void verifyManagementWrites(ConfigurableApplicationContext context, DataSource independent,

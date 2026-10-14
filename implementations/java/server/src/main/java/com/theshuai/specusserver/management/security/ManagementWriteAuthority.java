@@ -41,6 +41,14 @@ public class ManagementWriteAuthority {
                 : lockUser(resolved.accountKey(), resolved.tenant().tenantId()).orElse(null));
     }
 
+    /** Internal authentication writer entry; this does not authorize privileged management CRUD.
+     * Callers must validate the password/immutable OIDC proof against the locked current row. */
+    public Optional<ManagementUser> lockCurrentAccount(String accountKey, String tenantId) {
+        reserveWriter();
+        if (accountKey == null || tenantId == null) return Optional.empty();
+        return lockUser(accountKey, tenantId);
+    }
+
     /** Acquire actor and target together in key order. Locking the actor first and only later
      * discovering the target deadlocks when two administrators edit one another. */
     public UserWrite currentAndTarget(ManagementContext resolved, String requestedLogin) {

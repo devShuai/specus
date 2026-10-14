@@ -17,6 +17,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.util.StringUtils;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -47,6 +48,8 @@ public class ManagementUserService {
     /** Announces revoked access to the management WebSockets; absent only in isolated unit tests. */
     private final ApplicationEventPublisher events;
     private final ManagementWriteAuthority authority;
+    private final ManagementPasswordVerifier passwordVerifier;
+    private final ManagementAuthenticationWriter authenticationWriter;
 
     @Autowired
     public ManagementUserService(ManagementUserRepository repository,
@@ -56,7 +59,9 @@ public class ManagementUserService {
                                  ManagementUserEmailRepository userEmailRepository,
                                  AccountOwnedData accountOwnedData,
                                  ApplicationEventPublisher events,
-                                 ManagementWriteAuthority authority) {
+                                 ManagementWriteAuthority authority,
+                                 ManagementPasswordVerifier passwordVerifier,
+                                 ManagementAuthenticationWriter authenticationWriter) {
         this.repository = repository;
         this.authProperties = authProperties;
         this.httpShareService = httpShareService;
@@ -65,14 +70,16 @@ public class ManagementUserService {
         this.accountOwnedData = accountOwnedData;
         this.events = events;
         this.authority = authority;
+        this.passwordVerifier = passwordVerifier;
+        this.authenticationWriter = authenticationWriter;
     }
 
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public Optional<LoginUser> authenticate(String username, String password) {
         return authenticate(username, password, null);
     }
 
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public Optional<LoginUser> authenticate(String username, String password, String tenantId) {
         if (!StringUtils.hasText(username) || password == null) {
             return Optional.empty();
@@ -100,46 +107,32 @@ public class ManagementUserService {
                     true,
                     authProperties.getUsername()));
         }
-        Optional<ManagementUser> candidate;
-        if (requestedTenant != null) {
-            candidate = repository.findByTenantIdAndLoginNameNormalized(requestedTenant, loginNameKey(normalized));
-        } else {
-            // Keep the default-tenant login flow unchanged for existing clients. Only fall back to
-            // the legacy global account key when no default-tenant alias exists; non-default
-            // tenants must be selected explicitly, so a tenant cannot probe another tenant here.
-            candidate = repository.findByTenantIdAndLoginNameNormalized(
-                            defaultTenant, loginNameKey(normalized))
-                    .or(() -> uniqueLegacyAccountCandidate(normalized));
-        }
-        return candidate
-                .filter(ManagementUser::isEnabled)
-                .filter(user -> verifyAndUpgrade(user, password))
-                .map(this::toLoginUser);
-    }
-
-    /**
-     * Verifies the password and, on success, retires a legacy or under-cost hash.
-     *
-     * <p>A successful login is the only moment the plaintext exists, so it is the only chance to
-     * rewrite the stored hash. A failure to persist must not fail the login: the user is
-     * authenticated either way and the old hash still works next time.
-     */
-    private boolean verifyAndUpgrade(ManagementUser user, String password) {
-        PasswordService.Verification verification =
-                PasswordService.verify(password, user.getPasswordHash());
-        if (!verification.matches()) {
-            return false;
-        }
-        if (verification.needsUpgrade() && verification.upgradedHash() != null) {
+        Optional<ManagementUser> candidate = authenticationWriter.passwordCandidate(normalized, requestedTenant, defaultTenant);
+        ManagementUser selected = candidate.filter(ManagementUser::isEnabled).orElse(null);
+        // One bounded re-verification handles another legitimate login upgrading the same hash.
+        // It never repeats a lookup by reusable login name, and CPU work holds no account lock.
+        for (int attempt = 0; attempt < 2 && selected != null; attempt++) {
+            String key = selected.getUsername(), tenant = selected.getTenantId();
+            String login = loginName(selected), expectedHash = selected.getPasswordHash();
+            var proof = passwordVerifier.verify(password, expectedHash);
+            if (!proof.matches()) return Optional.empty();
+            ManagementAuthenticationWriter.PasswordResult result;
             try {
-                user.setPasswordHash(verification.upgradedHash());
-                repository.save(user);
+                result = authenticationWriter.acceptPassword(key, tenant, login, expectedHash, proof.upgradedHash());
             } catch (RuntimeException error) {
-                log.warn("管理用户口令哈希升级失败: user={}, reason={}",
-                        user.getUsername(), error.getMessage());
+                if (proof.upgradedHash() == null) throw error;
+                // The failed fresh transaction has already rolled back. Recheck the SAME
+                // immutable account/proof in another transaction, omitting the optional write.
+                // Never swallow a rollback-only transaction or accept a stale user snapshot.
+                log.warn("管理用户口令哈希升级失败: accountKey={}, failure={}", key, error.getClass().getSimpleName());
+                result = authenticationWriter.acceptPassword(key, tenant, login, expectedHash, null);
             }
+            if (result.state() == ManagementAuthenticationWriter.PasswordState.ACCEPTED)
+                return Optional.of(toLoginUser(result.account()));
+            if (result.state() == ManagementAuthenticationWriter.PasswordState.DENIED) return Optional.empty();
+            selected = result.account();
         }
-        return true;
+        return Optional.empty();
     }
 
     /**
@@ -148,7 +141,7 @@ public class ManagementUserService {
      * USER is provisioned in the default tenant. Email and display-name claims are profile data and
      * never participate in account linking.
      */
-    @Transactional
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public Optional<LoginUser> resolveOrProvisionOidcUser(
             String issuer,
             String subject,
@@ -175,54 +168,17 @@ public class ManagementUserService {
             // the configured built-in administrator, which has no persistent OIDC binding row.
             return Optional.empty();
         }
-        Optional<ManagementUser> bound = repository.findByOidcIdentityKey(identityKey);
-        if (bound.isPresent()) {
-            return bound.filter(ManagementUser::isEnabled).map(this::toLoginUser);
-        }
-
         String tenantId = TenantContext.normalize(authProperties.getTenantId());
-        Optional<ManagementUser> existing = repository.findByTenantIdAndLoginNameNormalized(
-                tenantId, loginNameKey(normalized));
-        if (existing.isPresent()) {
-            ManagementUser user = existing.get();
-            if (!user.isEnabled()) {
-                return Optional.empty();
-            }
-            if (StringUtils.hasText(user.getOidcIssuer())
-                    || StringUtils.hasText(user.getOidcSubject())) {
-                return sameOidcIdentity(user, normalizedIssuer, normalizedSubject)
-                        ? Optional.of(toLoginUser(user))
-                        : Optional.empty();
-            }
-            repository.bindOidcIdentityIfUnbound(
-                    user.getUsername(),
-                    normalizedIssuer,
-                    normalizedSubject,
-                    identityKey,
-                    Instant.now().toString());
-            // Whether this request won the conditional update or another request got there first,
-            // re-read the committed binding and accept only the exact immutable identity.
-            return repository.findById(user.getUsername())
-                    .filter(ManagementUser::isEnabled)
-                    .filter(current -> sameOidcIdentity(current, normalizedIssuer, normalizedSubject))
-                    .map(this::toLoginUser);
+        try {
+            return authenticationWriter.resolveOidc(normalizedIssuer, normalizedSubject, identityKey, normalized, tenantId, true)
+                    .account().map(this::toLoginUser);
+        } catch (DataIntegrityViolationException conflict) {
+            // A unique alias/issuer-subject race can be resolved only after the failed insert
+            // transaction rolls back. Never provision again or relink a missing selected UID.
+            var winner = authenticationWriter.resolveOidc(normalizedIssuer, normalizedSubject, identityKey, normalized, tenantId, false);
+            if (!winner.existingAccount()) throw conflict;
+            return winner.account().map(this::toLoginUser);
         }
-
-        String now = Instant.now().toString();
-        ManagementUser user = new ManagementUser();
-        user.setUsername(newAccountKey());
-        user.setLoginName(normalized);
-        user.setLoginNameNormalized(loginNameKey(normalized));
-        user.setTenantId(tenantId);
-        user.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
-        user.setOidcIssuer(normalizedIssuer);
-        user.setOidcSubject(normalizedSubject);
-        user.setOidcIdentityKey(identityKey);
-        user.setRole(ManagementRole.USER);
-        user.setEnabled(true);
-        user.setCreatedAt(now);
-        user.setUpdatedAt(now);
-        return Optional.of(toLoginUser(repository.save(user)));
     }
 
     /** Resolves an already-bound external identity for direct OIDC bearer authentication. */
@@ -582,11 +538,6 @@ public class ManagementUserService {
         return new LoginUser(loginName(user), user.getTenantId(), user.getRole(), false, user.getUsername());
     }
 
-    private Optional<ManagementUser> uniqueLegacyAccountCandidate(String username) {
-        List<ManagementUser> matches = repository.findAllByUsernameIgnoreCase(username);
-        return matches.size() == 1 ? Optional.of(matches.getFirst()) : Optional.empty();
-    }
-
     private String loginName(ManagementUser user) {
         return StringUtils.hasText(user.getLoginName()) ? user.getLoginName() : user.getUsername();
     }
@@ -600,7 +551,8 @@ public class ManagementUserService {
     }
 
     private boolean sameOidcIdentity(ManagementUser user, String issuer, String subject) {
-        return oidcIdentityKey(issuer, subject).equals(user.getOidcIdentityKey());
+        return oidcIdentityKey(issuer, subject).equals(user.getOidcIdentityKey())
+                && issuer.equals(user.getOidcIssuer()) && subject.equals(user.getOidcSubject());
     }
 
     private String oidcIdentityKey(String issuer, String subject) {
