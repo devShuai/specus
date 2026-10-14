@@ -135,6 +135,28 @@ flows arrived at once, and a flow failed for want of a target any real service w
 CI runs every consumer language against every egress language, Go, Java and .NET, nine jobs in
 all, each with the full acceptance list and the gate. The server is Go in every one.
 
+### New-flow evidence
+
+CI also supplies `--trace-new-flows` (requires `--performance-gate`). It archives
+`new-flow-trace-*/` next to the existing report: the original 20 requests in `samples.jsonl`,
+metadata streams for the consumer, egress and target, and `summary.json`. TCP tuples,
+sequence/ACK, flags/window and clear SPM2 session/sequence headers are kept; request bodies,
+headers, probe tokens and encrypted payloads are not serialized. This is for the lab's synthetic
+addresses, not production browsing traffic. The collector refuses the host network namespace.
+
+The timestamps are userspace monotonic arrivals, not kernel wire timestamps. A clear SPM2 header
+alone does not identify the encrypted inner packet. Correlate it with the TCP tuples, request
+windows and existing client logs; do not infer a root cause from a sequence gap alone. Counter
+polling remains as before: before each request and after slow requests, with no extra requests or
+retries. Fast requests therefore have a null `countersAfter`, not a fabricated zero.
+
+Each collector stops after 240 seconds or 20,000 recorded events. Missing journals, failed or
+killed collectors, capture-socket drops, timeouts and truncation make the separate diagnostic
+check fail. The original 50 ms p95 gate still runs and fails independently. Success and failure
+artifacts are retained by the same workflow upload; do not discard slow samples or replace a
+failed run with a later success. Relative log times, duration measurements and timeout budgets
+use a monotonic clock; the report's UTC date remains wall-clock time.
+
 ## Running it
 
 CI runs it in `.github/workflows/peer-egress-lab.yml`. By hand, with both binaries built:

@@ -196,7 +196,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 
 1. 删除该身份尚未使用的管理 ticket：scope 为 `connections` 或 `client-messages`，租户与登录名都与账号逐字相等。Java、Go、.NET 的 ticket 存在共享数据库的 `specus_websocket_ticket` 里，与账号的修改或删除在**同一事务**里删除，对所有实例都生效。C 的 ticket 在进程内存里，在 SQLite 提交成功后、关闭连接前删除；数据库操作回滚时不动 ticket 和连接。提交与内存失效之间的握手仍由下面的当前身份检查保护。
 2. 提交之后，以 `1008` 关闭本实例上该身份（租户与登录名逐字相等）的 `/ws/client-messages` 与 `/ws/connections`，原因文本为 `account deleted`、`account disabled` 或 `account role changed`。其他身份的连接不受影响，另一租户的同名身份也不受影响。
-3. 集群模式（Java、Go、.NET 的 `cluster-enabled=true`）：经公共互传协调的 Redis 事件频道发布 STCE kind 5（[public-transfer-cluster.md](public-transfer-cluster.md) 第 4 节与 5.2 节），各实例（含发布者自己）按第 2 步关闭本地连接。发布失败只记日志，账号的修改照常成功。
+3. 集群模式（Java、Go、.NET、C 的 `cluster-enabled=true`）：经公共互传协调的 Redis 事件频道发布 STCE kind 5（[public-transfer-cluster.md](public-transfer-cluster.md) 第 4 节与 5.2 节），各实例（含发布者自己）按第 2 步关闭本地连接。发布失败只记日志，账号的修改照常成功。 C 收到有效 kind 5 后还删除本实例的内存 ticket；Pub/Sub 漏收时远端 ticket 仍受当前数据库身份检查保护，但不能承诺远端内存 ticket 一定收到撤销。
 
 **握手时再校验。** 消费 ticket 之后、升级之前，按第 6 节解析 ticket 记下的身份，等于解析一个 `sub` 为 ticket 的登录名、`tenant_id` 为 ticket 的租户、`uid` 为 ticket 的账号键（没有时不带）的 token。解析不到（账号不存在、已停用、账号键不符；内置管理员已关闭密码登录），或解析出的是否管理员与 ticket 记下的不同，都答复 `403`，`X-Auth-Reason: identity revoked`，ticket 照样算已消费。账号键不符覆盖「删除后又在同一租户建了同名账号」。本版本之前签发、不带账号键的 ticket（升级时至多 45 秒）按不带 `uid` 解析，与 token 相同。
 
@@ -250,7 +250,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 | Java | 参考实现 |
 | Go | 规范登录名用 `strings.ToLower`（Unicode 简单大小写映射），与 Java 的 `Locale.ROOT` 在少数字符上可能不同 |
 | .NET | 规范登录名用 `ToLowerInvariant()`，同上 |
-| C | 只用 SQLite。规范登录名只折叠 ASCII 字母（与既有的 SQLite `lower()` 一致），非 ASCII 字母区分大小写；token 的租户声明最长 63 字节；限流键的分隔符是 `\x1f` 而不是 `\0`（C 字符串不能含 `\0`），效果相同。管理面按单实例部署：管理 WebSocket 的 ticket 在进程内存里，身份失效（7.2 节）只关闭本进程的连接，不发布也不处理 STCE kind 5（[c-server-api-inventory.md](../../docs/cross-language/alignment/c-server-api-inventory.md) 第 8 节） |
+| C | 只用 SQLite。规范登录名只折叠 ASCII 字母（与既有的 SQLite `lower()` 一致），非 ASCII 字母区分大小写；token 的租户声明最长 63 字节；限流键的分隔符是 `\x1f` 而不是 `\0`（C 字符串不能含 `\0`），效果相同。管理 WebSocket 的 ticket 在进程内存里；提交后删除本地 ticket 并关闭连接，启用公共互传集群时发布及接收 STCE kind 4/5，远端收到撤销后同样删除本地 ticket、关闭两类连接。仍只用 SQLite，事件协调不提供数据库 HA（[c-server-api-inventory.md](../../docs/cross-language/alignment/c-server-api-inventory.md) 第 8 节） |
 
 MySQL 上（Java、Go、.NET）：库的默认排序规则（如 `utf8mb4_0900_ai_ci`）不区分大小写和重音，`tenant_id = ?` 与唯一索引在这种库上也就不区分，`Tenant-A` 与 `tenant-a`、`élise` 与 `elise` 会被当成同一个。这与第 1 节「租户区分大小写」不符，属于已知差异；需要严格语义的部署应为这两列使用二进制或区分大小写的排序规则。
 

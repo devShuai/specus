@@ -20,8 +20,8 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 126 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`） |
-| 有差异 | 15 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址） |
+| 一致 | 127 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`） |
+| 有差异 | 14 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址） |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
 | 未逐项对照 | 0 | 最后 27 个（Peer Mesh / Egress）已由 `fix/c-server-parity-peer-api` 逐项对照 |
 
@@ -152,7 +152,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | 方法 | 路径 | 鉴权 | 要点 | C 状态 | C 证据 / 说明 |
 | --- | --- | --- | --- | --- | --- |
 | POST | `/api/admin/ws-tickets` | Bearer | `{"endpoint":"connections"\|"client-messages"}` → 45 s 单次 ticket，`no-store` | 一致 | `WebSocketTicketServiceTests` 覆盖 |
-| WS | `/ws/connections` | ticket | 推送 `{tenantId,type:created\|updated,connection}`，管理员收本租户全部，其他人只收自己客户端的 | 有差异 | 差异仅为 Redis 集群扇出（第 8 节平台差异）。**本分支**：二进制帧 1003、未掩码帧 1002（`client_messages_tests`）。`fix/c-server-parity-edges`：文本消息按 Tomcat 默认缓冲 8192 个字符（UTF-16 code unit）计，超过 1009、非 UTF-8 1007（原先上限 1 MiB、不校验 UTF-8），`client_messages_tests` |
+| WS | `/ws/connections` | ticket | 推送 `{tenantId,type:created\|updated,connection}`，管理员收本租户全部，其他人只收自己客户端的 | 一致 | #261：STCE kind 4 经 Redis 扇出，接收时校验 tenant/group 绑定并按当前客户端 owner 过滤；发布失败回退本地。真实双 C 与 C↔Java 测试见 `management_cluster_e2e.py`。**本分支**：二进制帧 1003、未掩码帧 1002（`client_messages_tests`）。`fix/c-server-parity-edges`：文本消息按 Tomcat 默认缓冲 8192 个字符（UTF-16 code unit）计，超过 1009、非 UTF-8 1007（原先上限 1 MiB、不校验 UTF-8），`client_messages_tests` |
 | WS | `/ws/client-messages` | ticket | 见下表 | 一致 | `fix/c-server-parity-edges`：原先 `messageId` 为数字时回显空串；现与 Jackson 相同，四个成员为数字或布尔值时读作其字面文本 |
 | WS | `/ws/public-transfer/discovery` | 公共 ticket | 互传发现 | 一致 | `PublicTransferDiscoveryWebSocketHandlerTests` 覆盖 |
 | WS | `/http/**`（Upgrade） | 路由认证 | Direct WebSocket（SWS2） | 一致 | `WebSocketSpecusHandlerTests`、`WebSocketSpecusHandshakeInterceptorAuthenticationTests` 覆盖 |
@@ -234,7 +234,7 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 
 | 差异 | 原因 |
 | --- | --- |
-| `/ws/connections` 与公共互传的管理事件不经 Redis 跨实例扇出 | C 管理面按单实例部署；跨实例事件归 Issue #35 的「HA/跨实例事件语义」一项，不在本文三项内 |
+| 管理事件协调不等于数据库 HA | #261 已实现 kind 4 连接事件与 kind 5 身份撤销的 Redis 扇出、租户绑定和本地授权过滤；Pub/Sub 漏收限制与 Java 相同。C 仍只用 SQLite，这不提供分布式管理数据库、跨节点数据复制或 HA 接管 |
 | SQLite 明细同步写入，没有待写队列；`inspection-status` 在 SQLite 下 pending/dropped 恒为 0 | 本地写库不阻塞网络；Java 的队列为保护转发线程，C 只对 Elasticsearch（网络写入）使用 |
 | Elasticsearch 待写队列另有 256 MiB 总量上限 | C 服务常跑在小内存设备上；Java 只按条数（每类 20000）限制 |
 | 关停时写出全部待写文档，Java 只写一批 | 只会少丢数据 |

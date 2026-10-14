@@ -183,6 +183,10 @@ static int test_canonical_frames(const char *root)
     CHECK(check_canonical(root, "canonicalManagement", &decoded) == 0, "canonical management frame");
     CHECK(decoded.kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT, "decoded management kind");
     free(decoded.payload);
+    CHECK(check_canonical(root, "canonicalManagementRevocation", &decoded) == 0,
+          "canonical management revocation frame");
+    CHECK(decoded.kind == 5U, "decoded management revocation kind");
+    free(decoded.payload);
 
     /* The management shape: group and payload only, on encode and on decode. */
     uint8_t *encoded = NULL;
@@ -204,6 +208,24 @@ static int test_canonical_frames(const char *root)
     encoded[15] = 0U;
     encoded[6] = 1U; /* excludeSource */
     CHECK(!decodes(encoded, encoded_len), "a management frame with excludeSource was decoded");
+    free(encoded);
+    CHECK(encode_event(5, 0, 0, "tenant-group", "unexpected-target", "", "{}", &encoded, &encoded_len) != 0,
+          "a revocation with a target was encoded");
+    CHECK(encode_event(5, 0, 0, "tenant-group", "", "lease", "{}", &encoded, &encoded_len) != 0,
+          "a revocation with a source lease was encoded");
+    CHECK(encode_event(5, 0, 3, "tenant-group", "", "", "{}", &encoded, &encoded_len) != 0,
+          "a revocation with a revision was encoded");
+    CHECK(encode_event(5, 1, 0, "tenant-group", "", "", "{}", &encoded, &encoded_len) != 0,
+          "a revocation with excludeSource was encoded");
+    CHECK(encode_event(5, 0, 0, "tenant-group", "", "", "", &encoded, &encoded_len) != 0,
+          "a revocation without payload was encoded");
+    CHECK(encode_event(5, 0, 0, "tenant-group", "", "", "{}", &encoded, &encoded_len) == 0
+              && decodes(encoded, encoded_len), "a valid revocation did not round-trip");
+    encoded[15] = 1U;
+    CHECK(!decodes(encoded, encoded_len), "a revocation with a revision was decoded");
+    encoded[15] = 0U;
+    encoded[6] = 1U;
+    CHECK(!decodes(encoded, encoded_len), "a revocation with excludeSource was decoded");
     free(encoded);
     return 0;
 }
@@ -293,6 +315,20 @@ static int participant_ids(const char *room_id, const char *room_key, const char
  */
 static int test_identifiers(const char *root)
 {
+    char management_group[65];
+    char *management = st_json_get_top_level_raw(root, "canonicalManagement");
+    char *tenant = management == NULL ? NULL : st_json_get_top_level_string(management, "tenantId");
+    char *expected_group = management == NULL ? NULL : st_json_get_top_level_string(management, "groupId");
+    st_public_coordination_management_group(tenant, management_group);
+    int bound = tenant != NULL && expected_group != NULL && strcmp(management_group, expected_group) == 0;
+    free(tenant); free(expected_group); free(management);
+    CHECK(bound, "management group is not derived from the shared tenant vector");
+    st_public_coordination_management_group(" \tdefault\r\n", management_group);
+    CHECK(strcmp(management_group, "37a8eec1ce19687d132fe29051dca629d164e2c4958ba141d5f4133a33f0688f") == 0,
+          "management group does not use Java trim");
+    st_public_coordination_management_group(NULL, management_group);
+    CHECK(strcmp(management_group, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == 0,
+          "management group null/empty digest mismatch");
     char *derivation = st_json_get_top_level_raw(root, "groupIdDerivation");
     char room_id[64], room_key[64], group_id[80];
     st_public_cluster_participant participant;

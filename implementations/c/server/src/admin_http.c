@@ -16826,7 +16826,7 @@ static void admin_ws_close_revoked_locked(st_admin_ws_client *client, const char
     shutdown(client->fd, SHUT_RDWR);
 }
 
-static void admin_ws_revoke_identity(const char *tenant_id, const char *username, const char *reason)
+static void admin_ws_revoke_identity_local(const char *tenant_id, const char *username, const char *reason)
 {
     if (tenant_id == NULL || username == NULL) {
         return;
@@ -16851,6 +16851,28 @@ static void admin_ws_revoke_identity(const char *tenant_id, const char *username
         }
     }
     pthread_mutex_unlock(&admin_ws_lock);
+}
+
+/* Called only by successful account mutations after their database transaction commits. */
+static void admin_ws_revoke_identity(const char *tenant_id, const char *username, const char *reason)
+{
+    admin_ws_revoke_identity_local(tenant_id, username, reason);
+    if (!st_public_coordination_enabled()) return;
+    const char *code = strcmp(reason, "account disabled") == 0 ? "disabled"
+        : strcmp(reason, "account role changed") == 0 ? "role-changed"
+        : strcmp(reason, "account deleted") == 0 ? "deleted" : "unknown";
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_append(&builder, "{\"tenantId\":")
+        || admin_sb_append_json_string(&builder, tenant_id)
+        || admin_sb_append(&builder, ",\"username\":")
+        || admin_sb_append_json_string(&builder, username)
+        || admin_sb_append(&builder, ",\"reason\":")
+        || admin_sb_append_json_string(&builder, code)
+        || admin_sb_append(&builder, "}");
+    if (rc != 0 || st_public_coordination_publish_management(ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION,
+                                                            tenant_id, (uint8_t *)builder.data, builder.len) != 0)
+        fprintf(stderr, "[admin] management revocation publish failed; remote connections may remain open\n");
+    free(builder.data);
 }
 
 static int admin_ws_reserve_client_message_write(st_admin_ws_client *client)
@@ -17626,6 +17648,78 @@ int st_admin_deliver_client_message_to_admin(const char *tenant_id,
     return delivered ? 0 : -1;
 }
 
+static void admin_ws_broadcast_connection_local(const char *event_tenant, long long client_id,
+                                                const uint8_t *payload, size_t payload_len)
+{
+    st_storage_client owner;
+    int owner_loaded = 0;
+    const char *database_path = admin_database_path();
+    if (client_id > 0 && database_path != NULL
+        && st_storage_get_client(database_path, client_id, &owner) == 0
+        && strcmp(owner.tenant_id, event_tenant) == 0) owner_loaded = 1;
+    pthread_mutex_lock(&admin_ws_lock);
+    for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
+        if (client->closing || strcmp(client->endpoint, "connections") != 0
+            || strcmp(client->tenant_id, event_tenant) != 0) continue;
+        if (!client->admin && (!owner_loaded || strcmp(client->username, owner.owner_username) != 0)) continue;
+        if (admin_ws_send_frame(client, 0x1U, payload, payload_len) != 0) shutdown(client->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&admin_ws_lock);
+}
+
+/* Decode identity strings without accepting escaped NUL or nested lookalike fields. */
+static char *admin_cluster_string(const char *json, const char *name)
+{
+    char *raw = st_json_get_top_level_raw(json, name);
+    size_t len = 0U;
+    char *value = raw == NULL ? NULL : st_json_decode_string(raw, &len);
+    free(raw);
+    if (value != NULL && strlen(value) != len) { free(value); value = NULL; }
+    return value;
+}
+
+void st_admin_handle_cluster_event(const st_public_cluster_event *event)
+{
+    if (event == NULL || (event->kind != ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT
+        && event->kind != ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION)) return;
+    if (event->exclude_source || event->revision != 0U || event->target_peer_id[0] != '\0'
+        || event->source_lease_id[0] != '\0' || event->payload == NULL
+        || event->payload_len == 0U || event->payload_len > 256U * 1024U
+        || admin_utf8_complete(event->payload, event->payload_len) != 0
+        || memchr(event->payload, '\0', event->payload_len) != NULL) return;
+    char *json = malloc(event->payload_len + 1U);
+    if (json == NULL) return;
+    memcpy(json, event->payload, event->payload_len);
+    json[event->payload_len] = '\0';
+    char *tenant = NULL, *username = NULL, *reason = NULL, *type = NULL, *connection = NULL;
+    int valid = st_json_object_keys_unique(json);
+    if (valid) tenant = admin_cluster_string(json, "tenantId");
+    char group[65];
+    st_public_coordination_management_group(tenant, group);
+    valid = valid && tenant != NULL && tenant[0] != '\0' && strcmp(group, event->group_id) == 0;
+    if (valid && event->kind == ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT_REVOCATION) {
+        username = admin_cluster_string(json, "username");
+        reason = admin_cluster_string(json, "reason");
+        valid = username != NULL && username[0] != '\0';
+        if (valid) {
+            const char *close_reason = reason != NULL && strcmp(reason, "deleted") == 0 ? "account deleted"
+                : reason != NULL && strcmp(reason, "disabled") == 0 ? "account disabled"
+                : reason != NULL && strcmp(reason, "role-changed") == 0 ? "account role changed" : "account revoked";
+            admin_ws_revoke_identity_local(tenant, username, close_reason);
+        }
+    } else if (valid) {
+        type = admin_cluster_string(json, "type");
+        connection = st_json_get_top_level_raw(json, "connection");
+        long long client_id = 0;
+        valid = type != NULL && type[0] != '\0' && connection != NULL
+            && st_json_object_keys_unique(connection)
+            && admin_jackson_long(connection, "clientId", LLONG_MIN, LLONG_MAX, &client_id) != -2;
+        if (valid) admin_ws_broadcast_connection_local(tenant, client_id, event->payload, event->payload_len);
+    }
+    if (!valid) fprintf(stderr, "[admin] discarded invalid management cluster event or tenant binding\n");
+    free(connection); free(type); free(reason); free(username); free(tenant); free(json);
+}
+
 void st_admin_broadcast_connection_event(const char *tenant_id,
                                          const char *type,
                                          const st_storage_connection *connection)
@@ -17657,31 +17751,14 @@ void st_admin_broadcast_connection_event(const char *tenant_id,
         free(builder.data);
         return;
     }
-    st_storage_client owner;
-    int owner_loaded = 0;
     const char *event_tenant = tenant_id == NULL ? "" : tenant_id;
-    const char *database_path = admin_database_path();
-    if (connection->client_id > 0
-        && database_path != NULL
-        && st_storage_get_client(database_path, connection->client_id, &owner) == 0
-        && strcmp(owner.tenant_id, event_tenant) == 0) {
-        owner_loaded = 1;
+    if (!st_public_coordination_enabled()
+        || st_public_coordination_publish_management(ST_PUBLIC_CLUSTER_EVENT_MANAGEMENT, event_tenant,
+                                                     (uint8_t *)builder.data, builder.len) != 0) {
+        if (st_public_coordination_enabled())
+            fprintf(stderr, "[admin] management connection publish failed; using local delivery\n");
+        admin_ws_broadcast_connection_local(event_tenant, connection->client_id, (uint8_t *)builder.data, builder.len);
     }
-    pthread_mutex_lock(&admin_ws_lock);
-    for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
-        if (strcmp(client->endpoint, "connections") != 0
-            || strcmp(client->tenant_id, event_tenant) != 0) {
-            continue;
-        }
-        if (!client->admin
-            && (!owner_loaded || strcmp(client->username, owner.owner_username) != 0)) {
-            continue;
-        }
-        if (admin_ws_send_frame(client, 0x1U, (const uint8_t *)builder.data, builder.len) != 0) {
-            shutdown(client->fd, SHUT_RDWR);
-        }
-    }
-    pthread_mutex_unlock(&admin_ws_lock);
     free(builder.data);
 }
 

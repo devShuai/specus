@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -48,6 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from target import SLOW_TICK, blob_chunks, blob_sha256  # noqa: E402
+from new_flow_trace import NewFlowTrace  # noqa: E402
 
 SERVER_IP = "203.0.113.2"
 TARGET_IP = "203.0.113.10"  # under the consumer's rule
@@ -333,14 +335,14 @@ class Lab:
         self.consumer_id = None
         self.password = "lab-" + secrets.token_hex(12)
         self.secrets = {"egress": secrets.token_hex(16), "consumer": secrets.token_hex(16)}
-        self.started = time.time()
+        self.started = time.monotonic()
         self.netem = None
         self.last_refused = None
 
     # -- plumbing ---------------------------------------------------------------------------------
 
     def say(self, text):
-        stamp = f"[{time.time() - self.started:7.1f}s]"
+        stamp = f"[{time.monotonic() - self.started:7.1f}s]"
         print(stamp, text, flush=True)
         with self.trace_lock:
             self.trace.write(f"{stamp} {text}\n")
@@ -373,15 +375,15 @@ class Lab:
         self.say(f"measured {name} = {value} {unit}".rstrip())
 
     def wait_for(self, what, predicate, timeout, interval=0.5):
-        deadline = time.time() + timeout
-        start = time.time()
+        deadline = time.monotonic() + timeout
+        start = time.monotonic()
         while True:
             value = predicate()
             if value:
-                return value, time.time() - start
-            if time.time() >= deadline:
+                return value, time.monotonic() - start
+            if time.monotonic() >= deadline:
                 self.say(f"timed out after {timeout}s waiting for {what}")
-                return None, time.time() - start
+                return None, time.monotonic() - start
             time.sleep(interval)
 
     # -- topology ---------------------------------------------------------------------------------
@@ -792,7 +794,7 @@ class Lab:
         self.admin.call("PUT", f"/api/admin/peer-mesh/devices/{self.egress_id}", {"enabled": True})
 
         rules = [{"match": RULE_CIDR, "action": "egress", "egressClientId": self.egress_id}]
-        consumer_started = time.time()
+        consumer_started = time.monotonic()
         consumer = self.start_client("consumer", self.client_config("consumer", rules))
         found, _ = self.wait_for("the consumer device", lambda: len(self.devices()) >= 2, 60, 1.0)
         if not found:
@@ -820,7 +822,7 @@ class Lab:
                          consumer.log_since() + egress.log_since(), re.IGNORECASE)
         self.measure("peer path type", path.group(1).lower() if path else "unreported")
         self.measure("bring-up, consumer start to first request through the egress",
-                     round(time.time() - consumer_started, 1), "s")
+                     round(time.monotonic() - consumer_started, 1), "s")
 
     def wait_ready(self, timeout=90):
         """After a restart: the rule route is back and a request goes through the egress."""
@@ -1157,8 +1159,46 @@ class Lab:
                     values[f"{name}.{parts[0]}"] = int(parts[1])
         return values
 
-    def performance_gate(self):
-        """Issue #50's thresholds, agreed before any of these numbers were taken; each is a check."""
+    @contextlib.contextmanager
+    def new_flow_evidence(self):
+        if not getattr(getattr(self, "args", None), "trace_new_flows", False):
+            yield None
+            return
+        trace = None
+        try:
+            try:
+                trace = NewFlowTrace(self.work, GATE_FIRST_BYTE_SAMPLES)
+                trace.start()
+            except (OSError, RuntimeError, ValueError) as error:
+                if trace is not None:
+                    trace.errors.append(f"collector startup failed: {type(error).__name__}")
+                self.note(f"new-flow metadata collection could not start ({type(error).__name__}); "
+                          "all performance samples and their gate still run")
+            yield trace
+        finally:
+            summary = {"complete": False}
+            copied = False
+            if trace is not None:
+                try:
+                    summary = trace.close()
+                except (OSError, ValueError) as error:
+                    self.note(f"new-flow metadata finalization failed ({type(error).__name__})")
+                try:
+                    archived = self.report_dir / trace.directory.name
+                    shutil.copytree(trace.directory, archived)
+                    # copytree preserves mkdtemp's private 0700 source mode. The
+                    # sudo lab's archive must be as readable as the existing
+                    # report for the non-root artifact uploader, but no more.
+                    archived.chmod(stat.S_IMODE(self.report_dir.stat().st_mode))
+                    copied = True
+                except OSError as error:
+                    self.note(f"new-flow metadata archive failed ({type(error).__name__})")
+            self.check("new-flow diagnostics: complete metadata evidence",
+                       summary["complete"] and copied,
+                       json.dumps(summary, separators=(",", ":")))
+
+    def first_byte_gate(self, trace=None):
+        """The original 20 samples and 50ms gate, without retries or discarded slow samples."""
         samples, slow = [], []
         for _ in range(GATE_FIRST_BYTE_SAMPLES):
             # A new flow that takes a second waited out one SYN retransmission somewhere. Which kernel
@@ -1166,7 +1206,10 @@ class Lab:
             # the egress answered late), the egress's (its connect to the target waited) or the target's
             # listen queue. Taken around every sample because a slow one is only known afterwards.
             before = self.tcp_counters()
+            started_ns = time.monotonic_ns()
             got = self.whoami(TARGET_URL)
+            ended_ns = time.monotonic_ns()
+            after = None
             if got["code"] == CURL_OK and got["src"] == EGRESS_IP:
                 samples.append(got["firstByte"] * 1000)
             if got.get("firstByte", 0) * 1000 > GATE_FIRST_BYTE_P95_MS and before is not None:
@@ -1174,6 +1217,11 @@ class Lab:
                 moved = {key: after[key] - before.get(key, 0) for key in after if after[key] != before.get(key, 0)}
                 slow.append(f"{got['firstByte'] * 1000:.0f} ms (connect {got.get('connect', 0) * 1000:.0f} ms) "
                             + (", ".join(f"{key}+{delta}" for key, delta in sorted(moved.items())) or "no counter moved"))
+            if trace is not None:
+                try:
+                    trace.sample(started_ns, ended_ns, got, before, after)
+                except (OSError, ValueError, TypeError) as error:
+                    trace.errors.append(f"sample evidence write failed: {type(error).__name__}")
         title = f"performance gate: first byte of a new flow, p95 <= {GATE_FIRST_BYTE_P95_MS:g} ms"
         if len(samples) < GATE_FIRST_BYTE_SAMPLES:
             self.check(title, False, f"only {len(samples)}/{GATE_FIRST_BYTE_SAMPLES} new flows went through the egress")
@@ -1184,6 +1232,10 @@ class Lab:
         if slow:
             self.note("slow new flows in the first-byte gate: " + "; ".join(slow))
 
+    def performance_gate(self):
+        """Issue #50's thresholds, agreed before any of these numbers were taken; each is a check."""
+        with self.new_flow_evidence() as trace:
+            self.first_byte_gate(trace)
         size = GATE_SINGLE_FLOW_BYTES
         for name, transfer in (("single-flow download of 8 MiB", self.verified_download),
                                ("single-flow upload of 8 MiB", self.verified_upload)):
@@ -1328,11 +1380,11 @@ class Lab:
             self.check("switch off: an established flow is cut instead of running to its end", False,
                        "the slow download never started")
             return
-        cut_at = time.time()
+        cut_at = time.monotonic()
         self.switch(False)
         try:
             _, stderr = slow.communicate(timeout=35)
-            elapsed = time.time() - cut_at
+            elapsed = time.monotonic() - cut_at
             cut = slow.returncode != CURL_OK and elapsed < 30
             self.check("switch off: an established flow is cut instead of running to its end", cut,
                        f"curl exit {slow.returncode} after {elapsed:.1f}s of a 40s stream ({stderr.strip()[:100]})")
@@ -1359,12 +1411,12 @@ class Lab:
         mark = self.target_mark()
         egress = self.procs["egress"]
         egress.stop()
-        stopped_at = time.time()
+        stopped_at = time.monotonic()
         outcomes = []
 
         def probe():
             got = self.whoami(TARGET_URL)
-            outcomes.append((round(time.time() - stopped_at, 1), got["code"], got.get("src")))
+            outcomes.append((round(time.monotonic() - stopped_at, 1), got["code"], got.get("src")))
             if got["code"] == CURL_OK:
                 # A request that succeeds with the egress gone went somewhere it should not have.
                 # The table at this instant is the evidence for where, so take it before anything
@@ -1389,7 +1441,7 @@ class Lab:
                 self.snapshots["consumer status after offline refusal timed out"] = json.dumps(
                     status.get("data", status), indent=2)
 
-        restarted_at = time.time()
+        restarted_at = time.monotonic()
         egress = self.start_client("egress", self.work / "egress.jsonc")
         if not egress.wait_log(r"policy applied enabled=true", 30):
             self.note("the restarted egress did not receive the policy on login; the lab re-sent it")
@@ -1398,7 +1450,7 @@ class Lab:
         got, _ = self.wait_for("recovery after the egress restart", self.through_egress, 90, 1.0)
         self.check("egress restarted: flows go through the egress again", bool(got))
         if got:
-            self.measure("egress restart to first flow through it again", round(time.time() - restarted_at, 1), "s")
+            self.measure("egress restart to first flow through it again", round(time.monotonic() - restarted_at, 1), "s")
 
     def fault_server_restart(self):
         """The control connection going away must not hand the claimed destinations back to the
@@ -1867,12 +1919,12 @@ class Lab:
                    + (f" ({got['stderr'][:120]})" if got["stderr"] else ""))
         self.leak_check("phase two: nothing reached the target from the consumer's own address", mark)
 
-        started = time.time()
+        started = time.monotonic()
         body = self.work / f"curl-{next(self.counter)}.out"
         refused = self.sh(ns("con", "curl", "-sS", "--max-time", "5", "-o", str(body), f"http://{UNMAPPED_FAKE_IP}/"),
                           check=False, timeout=40)
         body.unlink(missing_ok=True)
-        took = time.time() - started
+        took = time.monotonic() - started
         self.check("phase two: a fake IP nothing maps is refused at once, not sent anywhere",
                    refused.returncode == CURL_CONNECT_FAILED and took < 3,
                    f"curl exit {refused.returncode} after {took:.1f}s ({refused.stderr.strip()[:120]})")
@@ -2101,7 +2153,12 @@ def main():
                         help="repeat established-flow revocation (1-20 rounds)")
     parser.add_argument("--performance-gate", action="store_true",
                         help="check issue #50's agreed throughput, latency, loss and memory thresholds")
+    parser.add_argument("--trace-new-flows", action="store_true",
+                        help="archive bounded metadata of the 20 first-byte samples in private lab namespaces; "
+                             "no payloads; incomplete diagnostics fail a separate check, not replace the gate")
     args = parser.parse_args()
+    if args.trace_new_flows and not args.performance_gate:
+        parser.error("--trace-new-flows requires --performance-gate")
     if not args.client and not (args.consumer_client and args.egress_client):
         parser.error("provide --client or both --consumer-client and --egress-client")
     return Lab(args).run()
