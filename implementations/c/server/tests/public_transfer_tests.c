@@ -3,7 +3,8 @@
  * PublicTransferRelayFrameTests, WebSocketTicketServiceTests, PublicTransferRoomResourceTests and
  * PublicTransferRoomServiceTests.
  *
- * The admin server runs in this process and the checks speak real HTTP and WebSocket over loopback.
+ * Every case runs in a fresh exec process with its environment fixed before startup. The admin
+ * server runs inside that child and the checks speak real HTTP and WebSocket over loopback.
  * SPECUS_TRUSTED_PROXIES trusts loopback, so X-Real-IP chooses each participant's public address.
  * Only the participants whose resolved address must be "unknown" or blank, which no loopback
  * request resolves to, drive the discovery handler over a socketpair with that address.
@@ -18,10 +19,12 @@
 #include "storage.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +32,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -52,6 +56,37 @@
 
 static int admin_port = -1;
 static char db_path[128];
+static int environment_frozen;
+static int environment_violations;
+static st_admin_server fixture_server;
+extern char **environ;
+
+/* Never mutate libc's shared environ after any server handler can call getenv. Keep
+ * this guard enabled until process exit: closing clients does not join detached handlers. */
+static int fixture_setenv(const char *name, const char *value, int replace)
+{
+    if (environment_frozen) {
+        fprintf(stderr, "unsafe fixture environment mutation after server start: setenv(%s)\n", name);
+        ++environment_violations;
+        errno = EPERM;
+        return -1;
+    }
+    return setenv(name, value, replace);
+}
+
+static int fixture_unsetenv(const char *name)
+{
+    if (environment_frozen) {
+        fprintf(stderr, "unsafe fixture environment mutation after server start: unsetenv(%s)\n", name);
+        ++environment_violations;
+        errno = EPERM;
+        return -1;
+    }
+    return unsetenv(name);
+}
+
+#define setenv fixture_setenv
+#define unsetenv fixture_unsetenv
 
 static int contains(const char *haystack, const char *needle)
 {
@@ -719,13 +754,11 @@ static int test_room_capacity_per_group(void)
     const participant same_group = {"198.51.100.28", "cap-room", "cap-token", "cap-peer-2", "Cap Beta", 0};
     const participant same_net = {"203.0.113.28", "cap-room", NULL, "cap-peer-3", "Cap Gamma", 0};
     drained state;
-    setenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", "1", 1);
     int first_fd = discovery_join(&first);
     int full = discovery_open(&same_group);
     int full_refused = full >= 0 && expect_error_and_close(full, "room is full") == 0;
     if (full >= 0) close(full);
     int other_fd = discovery_join(&same_net);
-    unsetenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM");
     CHECK(first_fd >= 0 && full_refused, "the second member of a one-peer room was not refused");
     CHECK(other_fd >= 0 && drain(other_fd, &state) == 0 && ROSTER_IS(state.roster, "cap-peer-1=0", "cap-peer-3=1"),
           "a same-net member of another group was counted against the full room: %s", state.roster);
@@ -966,11 +999,10 @@ static int redeem_status(const char *headers, const char *code)
  * redeemIgnoresForwardedHeadersFromUntrustedPeers: the redemption limit (one attempt per source in
  * this test) shows which address the server keyed it by.
  */
-static int test_redeem_client_address(void)
+static int test_redeem_client_address_trusted(void)
 {
     static char response[8192];
     char body[512];
-    setenv("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP", "1", 1);
 
     /* Behind the trusted loopback proxy the last untrusted X-Forwarded-For hop wins over X-Real-IP. */
     st_public_room_reset_for_tests();
@@ -989,13 +1021,15 @@ static int test_redeem_client_address(void)
     CHECK(redeem_status("X-Real-IP: 203.0.113.5\r\n", "00000000") == 400,
           "X-Real-IP was used although X-Forwarded-For named the client");
 
+    return 0;
+}
+
+static int test_redeem_client_address_untrusted(void)
+{
     /* Without trusted proxies a direct client cannot choose its own source address. */
-    unsetenv("SPECUS_TRUSTED_PROXIES");
     st_public_room_reset_for_tests();
     int first = redeem_status("X-Forwarded-For: 1.2.3.4\r\nX-Real-IP: 5.6.7.8\r\n", "00000000");
     int second = redeem_status("X-Forwarded-For: 9.9.9.9\r\nX-Real-IP: 8.8.8.8\r\n", "00000000");
-    setenv("SPECUS_TRUSTED_PROXIES", "127.0.0.1/32", 1);
-    unsetenv("SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP");
     st_public_room_reset_for_tests();
     CHECK(first == 400 && second == 429,
           "forwarded headers from an untrusted peer changed the redemption source (%d, %d)", first, second);
@@ -1209,50 +1243,268 @@ static int test_room_credentials(void)
     return 0;
 }
 
-int main(void)
+typedef enum {
+    PROFILE_DEFAULT, PROFILE_ROOM_CAPACITY, PROFILE_REDEEM_TRUSTED, PROFILE_REDEEM_UNTRUSTED
+} fixture_profile;
+
+typedef struct {
+    const char *name;
+    int (*run)(void);
+    fixture_profile profile;
+} isolated_case;
+
+/* All thirteen original cases remain; only the two proxy configurations are split. */
+static const isolated_case cases[] = {
+    {"duplicate-peer-ids", test_duplicate_peer_ids, PROFILE_DEFAULT},
+    {"client-name-uniqueness", test_client_name_uniqueness, PROFILE_DEFAULT},
+    {"merged-rosters", test_merged_rosters, PROFILE_DEFAULT},
+    {"signal-to-invisible-peer", test_signal_to_invisible_peer, PROFILE_DEFAULT},
+    {"unidentifiable-addresses", test_unidentifiable_addresses, PROFILE_DEFAULT},
+    {"broadcast-stays-in-group", test_broadcast_stays_in_group, PROFILE_DEFAULT},
+    {"hidden-peer", test_hidden_peer, PROFILE_DEFAULT},
+    {"room-capacity-per-group", test_room_capacity_per_group, PROFILE_ROOM_CAPACITY},
+    {"viewer-text-messages", test_viewer_text_messages, PROFILE_DEFAULT},
+    {"relay-frames", test_relay_frames, PROFILE_DEFAULT},
+    {"ticket-scope-and-address", test_ticket_scope_and_address, PROFILE_DEFAULT},
+    {"redeem-client-address-trusted", test_redeem_client_address_trusted, PROFILE_REDEEM_TRUSTED},
+    {"redeem-client-address-untrusted", test_redeem_client_address_untrusted, PROFILE_REDEEM_UNTRUSTED},
+    {"room-credentials", test_room_credentials, PROFILE_DEFAULT}
+};
+
+static void case_database_path(char *out, size_t out_len, pid_t launcher_pid, size_t index)
 {
-    signal(SIGPIPE, SIG_IGN);
-    setenv("SPECUS_ENV", "test", 1);
-    setenv("SPECUS_AUTH_JWT_SECRET", JWT_SECRET, 1);
-    setenv("SPECUS_TRUSTED_PROXIES", "127.0.0.1/32", 1);
-    snprintf(db_path, sizeof(db_path), "/tmp/specus_c_public_transfer_%ld.db", (long)getpid());
+    snprintf(out, out_len, "/tmp/specus_c_public_transfer_%ld_case_%zu.db", (long)launcher_pid, index);
+}
+
+static void cleanup_case_database(size_t index)
+{
+    /* Called only by the launcher after waitpid reaps its child: no detached handler
+     * can reopen the database or leave fresh WAL/SHM files after this cleanup. */
+    char path[sizeof(db_path)], sidecar[sizeof(db_path) + 5U];
+    case_database_path(path, sizeof(path), getpid(), index);
+    (void)unlink(path);
+    snprintf(sidecar, sizeof(sidecar), "%s-wal", path);
+    (void)unlink(sidecar);
+    snprintf(sidecar, sizeof(sidecar), "%s-shm", path);
+    (void)unlink(sidecar);
+}
+
+static int owned_environment_entry(const char *entry)
+{
+    static const char *const names[] = {
+        "SPECUS_ENV", "SPECUS_AUTH_JWT_SECRET", "SPECUS_TRUSTED_PROXIES", "SPECUS_DATABASE_PATH",
+        "SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM",
+        "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP"
+    };
+    for (size_t i = 0U; i < sizeof(names) / sizeof(names[0]); ++i) {
+        size_t len = strlen(names[i]);
+        if (strncmp(entry, names[i], len) == 0 && entry[len] == '=') return 1;
+    }
+    return 0;
+}
+
+static void free_environment(char **values)
+{
+    if (values == NULL) return;
+    for (size_t i = 0U; values[i] != NULL; ++i) free(values[i]);
+    free(values);
+}
+
+static int append_environment(char **values, size_t *used, const char *name, const char *value)
+{
+    if (value == NULL) return 0;
+    size_t len = strlen(name) + strlen(value) + 2U;
+    char *entry = (char *)malloc(len);
+    if (entry == NULL) return -1;
+    snprintf(entry, len, "%s=%s", name, value);
+    values[(*used)++] = entry;
+    return 0;
+}
+
+/* Construct a private envp for exec, rather than call setenv even in the launcher. The
+ * child therefore starts with immutable configuration before libc/sanitizer constructors. */
+static char **case_environment(size_t index)
+{
+    size_t count = 0U, used = 0U;
+    while (environ[count] != NULL) ++count;
+    char **values = (char **)calloc(count + 7U, sizeof(*values));
+    if (values == NULL) return NULL;
+    for (size_t i = 0U; i < count; ++i) {
+        if (owned_environment_entry(environ[i])) continue;
+        char *copy = strdup(environ[i]);
+        if (copy == NULL) { free_environment(values); return NULL; }
+        values[used++] = copy;
+    }
+    char path[sizeof(db_path)];
+    case_database_path(path, sizeof(path), getpid(), index);
+    fixture_profile profile = cases[index].profile;
+    int failed = append_environment(values, &used, "SPECUS_ENV", "test")
+        || append_environment(values, &used, "SPECUS_AUTH_JWT_SECRET", JWT_SECRET)
+        || append_environment(values, &used, "SPECUS_DATABASE_PATH", path)
+        || append_environment(values, &used, "SPECUS_TRUSTED_PROXIES",
+                              profile == PROFILE_REDEEM_UNTRUSTED ? NULL : "127.0.0.1/32")
+        || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM",
+                              profile == PROFILE_ROOM_CAPACITY ? "1" : NULL)
+        || append_environment(values, &used, "SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP",
+                              profile == PROFILE_REDEEM_TRUSTED || profile == PROFILE_REDEEM_UNTRUSTED ? "1" : NULL);
+    if (failed) { free_environment(values); return NULL; }
+    return values;
+}
+
+static int check_environment_guard(void)
+{
+    const char *name = "SPECUS_FIXTURE_ENV_GUARD_PROBE";
+    const char *before = getenv(name);
+    environment_frozen = 1;
+    environment_violations = 0;
+    int refused_set = setenv(name, "must-not-change", 1) == -1 && errno == EPERM;
+    int refused_unset = unsetenv(name) == -1 && errno == EPERM;
+    CHECK(refused_set && refused_unset && environment_violations == 2 && before == getenv(name),
+          "environment mutation guard did not fail closed");
+    puts("fixture environment guard check passed (two expected refusals)");
+    return 0;
+}
+
+static int run_case(size_t index)
+{
+    /* No environment writes are legal anywhere in an executing case, including startup. */
+    environment_frozen = 1;
+    char expected[sizeof(db_path)];
+    case_database_path(expected, sizeof(expected), getppid(), index);
+    const char *configured_path = getenv("SPECUS_DATABASE_PATH");
+    CHECK(configured_path != NULL && strcmp(configured_path, expected) == 0,
+          "case must be launched with its private environment; use --only %s", cases[index].name);
+    snprintf(db_path, sizeof(db_path), "%s", configured_path);
     unlink(db_path);
-    setenv("SPECUS_DATABASE_PATH", db_path, 1);
     if (st_storage_init(db_path, 0) != 0) {
         fprintf(stderr, "storage init failed\n");
         return 1;
     }
     st_public_discovery_reset_for_tests();
-    st_admin_server server;
-    memset(&server, 0, sizeof(server));
-    server.fd = -1;
+    /* Detached handlers may outlive the listener. Its identity must remain alive until
+     * process exit, not belong to a helper's returned stack frame. */
+    memset(&fixture_server, 0, sizeof(fixture_server));
+    fixture_server.fd = -1;
     struct sockaddr_in address;
     socklen_t address_len = sizeof(address);
-    if (st_admin_server_start(&server, 0, "") != 0
-        || getsockname(server.fd, (struct sockaddr *)&address, &address_len) != 0) {
+    if (st_admin_server_start(&fixture_server, 0, "") != 0
+        || getsockname(fixture_server.fd, (struct sockaddr *)&address, &address_len) != 0) {
         fprintf(stderr, "admin server start failed\n");
         return 1;
     }
     admin_port = ntohs(address.sin_port);
+    int failed = cases[index].run();
+    (void)shutdown(fixture_server.fd, SHUT_RDWR);
+    close(fixture_server.fd);
+    /* Do not write the published server identity while its detached acceptor may
+     * still be reading it. The static storage remains alive until process exit. */
+    if (failed || environment_violations != 0) return 1;
+    printf("public transfer case passed: %s profile=%d pid=%ld environment_writes=0\n",
+           cases[index].name, (int)cases[index].profile, (long)getpid());
+    return 0;
+}
 
-    int failed = test_duplicate_peer_ids()
-        || test_client_name_uniqueness()
-        || test_merged_rosters()
-        || test_signal_to_invisible_peer()
-        || test_unidentifiable_addresses()
-        || test_broadcast_stays_in_group()
-        || test_hidden_peer()
-        || test_room_capacity_per_group()
-        || test_viewer_text_messages()
-        || test_relay_frames()
-        || test_ticket_scope_and_address()
-        || test_redeem_client_address()
-        || test_room_credentials();
+static int run_case_process(char *program, size_t index, int *interrupted)
+{
+    char **environment = case_environment(index);
+    if (environment == NULL) { fprintf(stderr, "case environment allocation failed\n"); return 1; }
+    sigset_t waits, original_mask;
+    sigemptyset(&waits);
+    sigaddset(&waits, SIGCHLD);
+    sigaddset(&waits, SIGINT);
+    sigaddset(&waits, SIGTERM);
+    sigaddset(&waits, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, &waits, &original_mask) != 0) {
+        perror("block child lifecycle signals"); free_environment(environment); return 1;
+    }
+    posix_spawnattr_t attributes;
+    int rc = posix_spawnattr_init(&attributes);
+    if (rc != 0) {
+        (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        free_environment(environment); return 1;
+    }
+    sigset_t child_mask = original_mask;
+    sigdelset(&child_mask, SIGCHLD);
+    sigdelset(&child_mask, SIGINT);
+    sigdelset(&child_mask, SIGTERM);
+    sigdelset(&child_mask, SIGHUP);
+    rc = posix_spawnattr_setsigmask(&attributes, &child_mask);
+    if (rc == 0) rc = posix_spawnattr_setsigdefault(&attributes, &waits);
+    if (rc == 0) rc = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t child = -1;
+    char *arguments[] = {program, "--case", (char *)cases[index].name, NULL};
+    if (rc == 0) rc = posix_spawnp(&child, program, NULL, &attributes, arguments, environment);
+    posix_spawnattr_destroy(&attributes);
+    free_environment(environment);
+    if (rc != 0) {
+        fprintf(stderr, "spawn %s: %s\n", cases[index].name, strerror(rc));
+        (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        return 1;
+    }
+    fprintf(stderr, "public transfer case start: %s child=%ld\n", cases[index].name, (long)child);
+    int status = 0, failed = 0;
+    /* Signals stay blocked through reap: never signal a pid after it can be reused. */
+    while (1) {
+        pid_t got = waitpid(child, &status, WNOHANG);
+        if (got == child) break;
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            perror("wait for case child"); failed = 1; break;
+        }
+        int received = 0;
+        rc = sigwait(&waits, &received);
+        if (rc != 0) {
+            fprintf(stderr, "wait for case signal: %s\n", strerror(rc));
+            /* Still our unreaped child; terminate and reap rather than leave a fixture behind. */
+            (void)kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
+            failed = 1; break;
+        }
+        if (received != SIGCHLD) {
+            *interrupted = received;
+            (void)kill(child, received);
+        }
+    }
+    (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    if (*interrupted != 0) { if (!failed) cleanup_case_database(index); return 1; }
+    if (failed || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "public transfer case failed: %s exit=%d signal=%d\n", cases[index].name,
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        return 1;
+    }
+    cleanup_case_database(index);
+    return 0;
+}
 
-    (void)shutdown(server.fd, SHUT_RDWR);
-    close(server.fd);
-    unlink(db_path);
+int main(int argc, char **argv)
+{
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_DFL);
+    environment_frozen = 1;
+    size_t count = sizeof(cases) / sizeof(cases[0]);
+    if (argc == 2 && strcmp(argv[1], "--check-environment-guard") == 0) return check_environment_guard();
+    if (argc == 3 && (strcmp(argv[1], "--case") == 0 || strcmp(argv[1], "--only") == 0)) {
+        for (size_t i = 0U; i < count; ++i) {
+            if (strcmp(argv[2], cases[i].name) != 0) continue;
+            if (strcmp(argv[1], "--case") == 0) return run_case(i);
+            int interrupted = 0;
+            int result = run_case_process(argv[0], i, &interrupted);
+            return interrupted == 0 ? result : 128 + interrupted;
+        }
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--only CASE | --check-environment-guard]\n", argv[0]);
+        return 2;
+    }
+    if (check_environment_guard() != 0) return 1;
+    int failed = 0, interrupted = 0;
+    for (size_t i = 0U; i < count; ++i) {
+        failed |= run_case_process(argv[0], i, &interrupted);
+        if (interrupted != 0) return 128 + interrupted;
+    }
     if (failed) return 1;
+    printf("public transfer isolated cases passed: %zu/%zu\n", count, count);
     puts("public transfer tests passed");
     return 0;
 }

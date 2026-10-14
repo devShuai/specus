@@ -137,6 +137,12 @@ jobs:
           size="$(stat -c%s specus-server)"
           built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go_version="$(go version)"
+          go version -m specus-server > "$stage/go-build-info.txt"
+          binary_go_version="$(sed -n '1s/^.*: //p' "$stage/go-build-info.txt")"
+          [ "$binary_go_version" = "$(go env GOVERSION)" ] || {
+            echo "binary compiler differs from selected Go toolchain" >&2
+            exit 1
+          }
 
           cat > "$stage/manifest.json" <<EOF
           {
@@ -146,6 +152,7 @@ jobs:
             "dirty": $dirty,
             "builtAtUtc": "$built_at",
             "goVersion": "$go_version",
+            "binaryGoVersion": "$binary_go_version",
             "cgoEnabled": false,
             "binary": "specus-server",
             "sizeBytes": $size,
