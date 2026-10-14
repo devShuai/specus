@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Specus.Server.Data;
+using Specus.Server.Data.Entities;
 
 namespace Specus.IntegrationTests;
 
@@ -59,6 +60,22 @@ public sealed class MultiProviderModelTests
         // i.e. someone changed the model but forgot to add a migration.
         Assert.False(context.Database.HasPendingModelChanges(),
             $"model differs from the committed migrations for provider '{provider}'");
+    }
+
+    [Theory]
+    [InlineData(nameof(HttpTrafficExchange.RequestHeaders), 8192)]
+    [InlineData(nameof(HttpTrafficExchange.ResponseHeaders), 8192)]
+    [InlineData(nameof(HttpTrafficExchange.RequestPreviewHex), 4096)]
+    [InlineData(nameof(HttpTrafficExchange.ResponsePreviewHex), 4096)]
+    public void MySqlWideTrafficFieldsAreOffRowWithoutReducingCaptureLimits(string field, int limit)
+    {
+        foreach (var provider in new[] { "sqlite", "postgres", "mysql" })
+        {
+            using var context = CreateContext(provider);
+            var property = context.Model.FindEntityType(typeof(HttpTrafficExchange))!.FindProperty(field)!;
+            Assert.Equal(limit, property.GetMaxLength());
+            if (provider == "mysql") Assert.Equal("longtext", property.GetColumnType());
+        }
     }
 
     private static SpecusDbContext CreateContext(string provider)
