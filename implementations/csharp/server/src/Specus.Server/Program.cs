@@ -111,6 +111,7 @@ builder.Services.AddScoped<ClientAccountService>();
 builder.Services.AddScoped<ConnectionRecordService>();
 builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
+builder.Services.AddScoped<ClientOwnerTransferService>();
 builder.Services.AddScoped<ManagementMutationService>();
 builder.Services.AddScoped<ClientPackageService>();
 builder.Services.AddScoped<ManagementUserService>();
