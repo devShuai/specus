@@ -44,7 +44,6 @@ final class PeerServiceRuntime implements AutoCloseable {
     private final Map<CatalogKey, CatalogSnapshot> catalogs = new ConcurrentHashMap<>();
     private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
     private final Map<String, AutoCloseable> bridges = new ConcurrentHashMap<>();
-    private final Map<String, SpecusCore.LocalPeerService> bridgeLocals = new ConcurrentHashMap<>();
     private final Object lock = new Object();
     private volatile SpecusCore.PeerMeshConfig config = new SpecusCore.PeerMeshConfig();
     private volatile Map<Long, RosterHint> roster = Map.of();
@@ -291,10 +290,17 @@ final class PeerServiceRuntime implements AutoCloseable {
         }
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(target, port), Math.max(50, timeoutMillis));
-            return socket.isConnected();
+            return connectedToOtherEndpoint(socket);
         } catch (Exception ignored) {
             return false;
         }
+    }
+
+    static boolean connectedToOtherEndpoint(Socket socket) {
+        // Linux can complete a reflexive TCP handshake with no listener when the
+        // automatically chosen source endpoint equals the local destination.
+        return socket.isConnected() && !socket.isClosed()
+                && !socket.getLocalSocketAddress().equals(socket.getRemoteSocketAddress());
     }
 
     static boolean probeUdp(String host, int port, int timeoutMillis) {
@@ -364,12 +370,11 @@ final class PeerServiceRuntime implements AutoCloseable {
         for (String id : new ArrayList<>(bridges.keySet())) {
             if (!desired.containsKey(id)) {
                 closeQuietly(bridges.remove(id));
-                bridgeLocals.remove(id);
             }
         }
         for (SpecusCore.LocalPeerService local : desired.values()) {
-            SpecusCore.LocalPeerService bound = bridgeLocals.get(local.serviceId);
-            if (bound != null && matches(config.virtualIp, bound, local)) {
+            AutoCloseable bound = bridges.get(local.serviceId);
+            if (matches(bound, config.virtualIp, local)) {
                 continue;
             }
             closeQuietly(bridges.remove(local.serviceId));
@@ -378,7 +383,6 @@ final class PeerServiceRuntime implements AutoCloseable {
                         ? PeerServiceUdpBridge.bind(config.virtualIp, local)
                         : PeerServiceBridge.bind(config.virtualIp, local);
                 bridges.put(local.serviceId, forwarder);
-                bridgeLocals.put(local.serviceId, local);
             } catch (Exception ignored) {
             }
         }
@@ -388,14 +392,11 @@ final class PeerServiceRuntime implements AutoCloseable {
         return "udp".equalsIgnoreCase(local.transport) || "udp".equalsIgnoreCase(local.application);
     }
 
-    private boolean matches(String virtualIp, SpecusCore.LocalPeerService current, SpecusCore.LocalPeerService next) {
-        return Objects.equals(current.serviceId, next.serviceId)
-                && current.publishedPort == next.publishedPort
-                && Objects.equals(current.targetHost, next.targetHost)
-                && current.targetPort == next.targetPort
-                && PeerServiceBridge.allowedPeerAddresses(current)
-                .equals(PeerServiceBridge.allowedPeerAddresses(next))
-                && Objects.equals(config.virtualIp, virtualIp);
+    private static boolean matches(AutoCloseable current, String virtualIp, SpecusCore.LocalPeerService next) {
+        if (isUdp(next)) {
+            return current instanceof PeerServiceUdpBridge udp && udp.matches(virtualIp, next);
+        }
+        return current instanceof PeerServiceBridge tcp && tcp.matches(virtualIp, next);
     }
 
     private static void closeQuietly(AutoCloseable closeable) {
@@ -467,7 +468,6 @@ final class PeerServiceRuntime implements AutoCloseable {
             closeQuietly(bridge);
         }
         bridges.clear();
-        bridgeLocals.clear();
     }
 
     private void publishSnapshot() {

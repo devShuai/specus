@@ -41,6 +41,7 @@ final class PeerServiceUdpBridge implements AutoCloseable {
     }
 
     static PeerServiceUdpBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws Exception {
+        service = PeerServiceBridge.snapshotService(service);
         InetAddress target = PeerServiceRuntime.resolveLocalServiceTarget(service.targetHost);
         if (target == null) {
             throw new IllegalArgumentException("targetHost is not assigned to this device");
@@ -155,16 +156,19 @@ final class PeerServiceUdpBridge implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!open.compareAndSet(true, false)) {
-            return;
+        if (open.compareAndSet(true, false)) {
+            LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
+                    + " activePeers=" + peers.size()
+                    + " reason=config-withdrawn-or-shutdown");
+            inbound.close();
+            peers.values().forEach(UdpPeer::close);
+            peers.clear();
+            executor.shutdownNow();
         }
-        LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
-                + " activePeers=" + peers.size()
-                + " reason=config-withdrawn-or-shutdown");
-        inbound.close();
-        peers.values().forEach(UdpPeer::close);
-        peers.clear();
-        executor.shutdownNow();
+        // DatagramSocket.close may pre-close a descriptor and defer its final release
+        // until blocking receive/send returns. Await owned I/O before reusing the port;
+        // a timeout/interruption is a failed close, not permission to continue silently.
+        PeerServiceBridge.awaitClosedIo(executor, "UDP", service.serviceId);
     }
 
     private static final class UdpPeer implements AutoCloseable {
