@@ -1,0 +1,18 @@
+{
+  "description": "Close is scoped by sessionId, not optional endpoint hints. Each case starts with peer 7/session 200 and peer 9/session 300, both owning an active egress TCP socket. A replacement is installed after the close and must survive replay.",
+  "cases": [
+    {"name":"missing-id","messages":[{"type":"close","sourceClientId":1,"targetClientId":7}],"closedPeerId":0},
+    {"name":"null-id","messages":[{"type":"close","sessionId":null,"sourceClientId":1,"targetClientId":7}],"closedPeerId":0},
+    {"name":"zero-id","messages":[{"type":"close","sessionId":0,"sourceClientId":1,"targetClientId":7}],"closedPeerId":0},
+    {"name":"negative-id","messages":[{"type":"close","sessionId":-1,"sourceClientId":1,"targetClientId":7}],"closedPeerId":0},
+    {"name":"old-id","messages":[{"type":"close","sessionId":100,"sourceClientId":1,"targetClientId":7}],"closedPeerId":0},
+    {"name":"unknown-id","messages":[{"type":"close","sessionId":999,"sourceClientId":1,"targetClientId":7}],"closedPeerId":0},
+    {"name":"id-only","messages":[{"type":"close","sessionId":200}],"closedPeerId":7},
+    {"name":"current-id","messages":[{"type":"close","sessionId":200,"sourceClientId":1,"targetClientId":7}],"closedPeerId":7},
+    {"name":"reverse-endpoints","messages":[{"type":"close","sessionId":200,"sourceClientId":7,"targetClientId":1}],"closedPeerId":7},
+    {"name":"misleading-endpoints","messages":[{"type":"close","sessionId":200,"sourceClientId":1,"targetClientId":9}],"closedPeerId":7},
+    {"name":"other-session","messages":[{"type":"close","sessionId":300,"sourceClientId":1,"targetClientId":7}],"closedPeerId":9},
+    {"name":"duplicate-close","messages":[{"type":"close","sessionId":200},{"type":"close","sessionId":200,"sourceClientId":1,"targetClientId":7}],"closedPeerId":7},
+    {"name":"replay-after-replacement","messages":[{"type":"close","sessionId":200,"sourceClientId":1,"targetClientId":7}],"closedPeerId":7,"replacementSessionId":201}
+  ]
+}

@@ -345,6 +345,11 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
 
 服务端标记 session 为 `CLOSED`，并向双方在线客户端转发 close 信令。
 
+客户端按 `sessionId` 匹配当前会话，并仅释放该会话对应的出口连接；不依赖可选的
+`sourceClientId` / `targetClientId` 来选择关闭对象。缺失、非正数或不匹配当前会话的 ID
+不产生清理副作用。重复或延迟到达的 close 不得关闭同一对端后来建立的新会话及其连接。
+跨语言控制消息与出口连接生命周期回归见 `protocol/test-vectors/peer-session-close-v1.json`。
+
 ## 本地服务发现（默认关闭）
 
 Peer Mesh 设备互联不等于本机服务目录。一期发布用户在控制页显式配置、且实际可探测到的 TCP/UDP 服务，
