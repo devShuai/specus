@@ -21,6 +21,9 @@
 
   <ItemGroup>
     <PackageReference Include="MailKit" Version="4.17.0" />
+    <!-- MailKit -> MimeKit permits Pkcs 10.0.0. Pin the CVE-2026-84008 patched
+         runtime asset instead of suppressing NU1903 (GHSA-846f-f764-76mx). -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
     <PackageReference Include="StackExchange.Redis" Version="3.1.13" />
     <ProjectReference Include="..\..\..\protocol\src\Specus.Protocol\Specus.Protocol.csproj" />
     <ProjectReference Include="..\Specus.Server.Data\Specus.Server.Data.csproj" />
