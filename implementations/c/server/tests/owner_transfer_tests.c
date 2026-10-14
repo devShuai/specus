@@ -206,6 +206,7 @@ static int http_scenario(test_server *server)
     printf("16 real HTTP vectors, auth priority, 1050 unbounded UTF8 rows and restart revision passed\n");return 0;
 }
 #include "owner_transfer_write_tests.h"
+#include "owner_transfer_http_write_tests.h"
 
 int main(int argc,char **argv)
 {
@@ -215,5 +216,6 @@ int main(int argc,char **argv)
     base=st_json_get_top_level_raw(vector,"base");snapshots=st_json_get_top_level_raw(vector,"snapshots");CHECK(base!=NULL&&snapshots!=NULL&&st_json_get_raw_array(vector,"cases",&cases,&case_count)==0,"vector decode");
     int failed=shared_vectors()|revisions();if(!failed)failed=ownership_writer_tests();
     if(!failed)failed=run_on_fresh_server("owner-transfer-preview",http_scenario,NULL);
+    if(!failed)failed=run_on_fresh_server("owner-transfer-http-write",http_write_scenario,NULL);
     st_json_free_string_array(cases,case_count);free(snapshots);free(base);free(vector);return failed?1:0;
 }

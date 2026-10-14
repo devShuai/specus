@@ -327,7 +327,26 @@ static int expect_owner_close(int fd,long long session_id)
     }
     return -1;
 }
-static int native_two_instances(void)
+static int native_http_transfer(test_server *preview_server,test_server *write_server,long long id)
+{
+    int status=0;char *body=NULL,*token=NULL,*revision=NULL;char path[160],request[400];int failed=1;
+    snprintf(request,sizeof(request),"{\"username\":\"%s\",\"password\":\"%s\"}",ADMIN_USERNAME,ADMIN_PASSWORD);
+    if(http_request(preview_server->admin_port,"POST","/auth/login",request,NULL,&status,&body)!=0 || status!=200)goto done;
+    token=st_json_get_top_level_string(body,"accessToken");free(body);body=NULL;if(token==NULL)goto done;
+    snprintf(path,sizeof(path),"/api/admin/clients/%lld/owner-transfer",id);
+    if(http_request(preview_server->admin_port,"GET",path,NULL,token,&status,&body)!=0 || status!=200)goto done;
+    revision=st_json_get_top_level_string(body,"revision");free(body);body=NULL;if(revision==NULL)goto done;
+    snprintf(request,sizeof(request),"{\"scope\":\"single\",\"targetUsername\":\"bob\",\"expectedRevision\":\"%s\"}",revision);
+    if(http_request(write_server->admin_port,"POST",path,request,token,&status,&body)!=0 || status!=200) {
+        fprintf(stderr,"cross-instance real ownership POST status%d\n",status);goto done;
+    }
+    int changed=0,retained=0;
+    if(st_json_get_bool(body,"changed",&changed)!=0 || !changed || st_json_get_bool(body,"accessRetained",&retained)!=0 || !retained)goto done;
+    failed=0;
+done:
+    free(body);free(token);free(revision);return failed;
+}
+static int native_two_instances(int via_http)
 {
     test_server first={.pid=-1},second={.pid=-1};runtime_session source={0},target={0};int source_fd=-1,target_fd=-1,data_fd=-1,failed=1;
     st_storage_owner_transfer_result result={0};int first_prepared=0,second_prepared=0;
@@ -354,8 +373,9 @@ static int native_two_instances(void)
     if(channel_login(first.control_port,&source,"control",&source_fd,reason,sizeof(reason))!=1
         || channel_login(second.control_port,&target,"control",&target_fd,reason,sizeof(reason))!=1) goto done;
     st_storage_peer_mesh_session session={0};
-    if(st_storage_create_peer_mesh_session(first.db_path,&source_client,&target_client,"DIRECT","native-session-token",60,&session)!=0
-        || transfer(first.db_path,source.client_id,ADMIN_USERNAME,&result)!=200) goto done;
+    if(st_storage_create_peer_mesh_session(first.db_path,&source_client,&target_client,"DIRECT","native-session-token",60,&session)!=0)goto done;
+    if(via_http ? native_http_transfer(&first,&second,source.client_id)!=0
+                : transfer(first.db_path,source.client_id,ADMIN_USERNAME,&result)!=200)goto done;
     if(expect_owner_close(source_fd,session.id)!=0 || expect_owner_close(target_fd,session.id)!=0
         || expect_channel_alive(source_fd)!=0 || expect_channel_alive(target_fd)!=0) goto done;
     if(channel_login(first.control_port,&source,"data",&data_fd,reason,sizeof(reason))!=1 || expect_channel_alive(data_fd)!=0) goto done;
@@ -369,7 +389,7 @@ done:
     if(second.pid>0 && server_stop(&second,10000)!=0) failed=1;
     if(second_prepared) server_cleanup(&second,failed);
     if(first_prepared) server_cleanup(&first,failed);
-    printf("%s actual two-process durable transfer notifications retain control connections\n",failed?"FAIL":"PASS");return failed;
+    printf("%s actual two-process %s transfer notifications retain control connections\n",failed?"FAIL":"PASS",via_http?"HTTP GET A/POST B":"internal writer");return failed;
 }
 int main(int argc,char **argv)
 {
@@ -378,6 +398,7 @@ int main(int argc,char **argv)
     setenv("SPECUS_PEER_MESH_ENABLED","true",1);
     int failed=0;for(int mode=0;mode<4;++mode) failed+=committed_delivery(mode);
     failed+=rollback_and_independent_cursors();failed+=malformed_event();failed+=egress_and_live_catalogue();
-    failed+=journal_visibility_and_large_event();failed+=journal_batch();failed+=snapshot_ordering();failed+=native_two_instances();
+    failed+=journal_visibility_and_large_event();failed+=journal_batch();failed+=snapshot_ordering();
+    failed+=native_two_instances(0);failed+=native_two_instances(1);
     return failed?1:0;
 }

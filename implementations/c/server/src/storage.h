@@ -1911,11 +1911,11 @@ typedef struct {
     size_t closed_count;
 } st_storage_owner_transfer_result;
 
-/* Internal transfer writer, NOT an exposed POST. Contract HTTP status/stable code;
+/* Authenticated transfer writer used by the dedicated single/group HTTP POSTs. HTTP status/stable code;
  * fresh actor/target/group/revision, ownership, selective session closure and one audit
  * are atomic. Outputs only after commit; NULL output still validates everything.
  * Caller supplies an empty output and frees successful outputs with the matching helper.
- * Runtime notification/outbox consumption must be integrated before exposing a route. */
+ * Runtime instances independently consume the committed audit journal after this returns. */
 int st_storage_transfer_owner(const char *path, const st_storage_management_actor *actor,
     const st_storage_share_builtin_admin *builtin, int group, long long id,
     const char *request, long long now_ms, st_storage_owner_transfer_result *out, const char **code);

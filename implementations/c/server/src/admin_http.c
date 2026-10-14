@@ -12512,8 +12512,7 @@ static int write_auth_refusal(char *out,
         : write_response(out, out_len, status, reason, body);
 }
 
-/* GET only: no ownership writer until login/edit/delete/Peer/target mutations share a database
- * coordination boundary. Use the unbounded response path, never silently truncate a large group. */
+/* Use the unbounded response path, never silently truncate a large group. */
 static int handle_owner_transfer_preview(const st_admin_context *context, int group, long long id,
                                          int id_valid, char *out, size_t out_len)
 {
@@ -12530,6 +12529,28 @@ static int handle_owner_transfer_preview(const st_admin_context *context, int gr
     if (status != 200) return write_workbench_error(out, out_len, status, code, code, 0);
     int result = write_unbounded_response(out, out_len, 200, "OK", json);
     free(json);
+    return result;
+}
+
+static int handle_owner_transfer_write(const st_admin_context *context, int group, long long id,
+                                       int id_valid, const char *body, char *out, size_t out_len)
+{
+    if (!context->admin) return write_workbench_error(out, out_len, 403, "FORBIDDEN", "FORBIDDEN", 0);
+    if (!id_valid) return write_workbench_error(out, out_len, 400, "INVALID_TRANSFER_REQUEST", "INVALID_TRANSFER_REQUEST", 0);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    st_storage_owner_transfer_result transfer = {0};
+    const char *code = NULL;
+    int status = st_storage_transfer_owner(admin_database_path(), &actor, &builtin, group, id,
+                                           body, st_workbench_now_ms(), &transfer, &code);
+    if (status != 200) return write_workbench_error(out, out_len, status, code, code, 0);
+    /* The transaction committed its durable event before publishing this result. Every instance's
+     * maintenance worker independently consumes that journal and retries failures. Do not drain
+     * its cursor here, race maintenance, notify before commit, or turn a delivery failure into a
+     * rollback-looking HTTP error after a successful transfer. No-op writes publish no event. */
+    int result = write_unbounded_response(out, out_len, 200, "OK", transfer.json);
+    st_storage_owner_transfer_result_free(&transfer);
     return result;
 }
 
@@ -13148,6 +13169,8 @@ static int st_admin_build_response_internal(const char *method,
     long long owner_id = 0;
     if (strcmp(method, "GET") == 0 && st_owner_transfer_match(path, &owner_group, &owner_id, &owner_id_valid))
         return handle_owner_transfer_preview(&context, owner_group, owner_id, owner_id_valid, out, out_len);
+    if (strcmp(method, "POST") == 0 && st_owner_transfer_match(path, &owner_group, &owner_id, &owner_id_valid))
+        return handle_owner_transfer_write(&context, owner_group, owner_id, owner_id_valid, body, out, out_len);
     st_workbench_request workbench_request;
     if (st_workbench_match(method, path, &workbench_request)) {
         return handle_workbench_request(&context, &workbench_request, out, out_len);
