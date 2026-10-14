@@ -234,6 +234,9 @@ class MariaDbSchemaTests {
                         "--spring.datasource.url=" + url(database) + (zeroAffectedRows ? "&useAffectedRows=true" : ""),
                         "--spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver",
                         "--spring.datasource.username=root",
+                        // Concurrent caller transactions need separate connections, not SQLite's
+                        // default single-connection pool. Leave the other schema fixtures unchanged.
+                        "--spring.datasource.hikari.maximum-pool-size=" + (zeroAffectedRows ? 4 : 1),
                         "--spring.jpa.database-platform=org.hibernate.dialect.MySQLDialect",
                         "--spring.jpa.hibernate.ddl-auto=update",
                         // A create table that fails would otherwise only be logged.

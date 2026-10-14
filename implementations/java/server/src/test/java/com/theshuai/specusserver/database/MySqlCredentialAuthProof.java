@@ -32,6 +32,7 @@ class MySqlCredentialAuthProof {
         try (var context = new SpringApplicationBuilder(SpecusServerApplication.class).web(WebApplicationType.NONE).run(
                 "--spring.datasource.url=" + url,
                 "--spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver", "--spring.datasource.username=root",
+                "--spring.datasource.hikari.maximum-pool-size=4",
                 "--spring.jpa.database-platform=org.hibernate.dialect.MySQLDialect", "--spring.jpa.hibernate.ddl-auto=update",
                 "--spring.jpa.properties.hibernate.hbm2ddl.halt_on_error=true", "--specus.elasticsearch.uris=",
                 "--specus.netty.port=0", "--specus.database.seed-demo-client=false",

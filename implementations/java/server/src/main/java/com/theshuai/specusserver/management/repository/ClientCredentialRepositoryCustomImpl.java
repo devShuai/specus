@@ -2,7 +2,6 @@ package com.theshuai.specusserver.management.repository;
 
 import com.theshuai.specusserver.management.model.ClientCredential;
 import jakarta.persistence.EntityManager;
-import jakarta.persistence.EntityNotFoundException;
 import jakarta.persistence.PersistenceContext;
 import org.hibernate.Session;
 import org.springframework.transaction.annotation.Propagation;
@@ -25,19 +24,26 @@ public class ClientCredentialRepositoryCustomImpl implements ClientCredentialRep
         // clause because the first write already holds its writer reservation.
         String rowLock = entities.unwrap(Session.class).doReturningWork(connection ->
                 connection.getMetaData().supportsSelectForUpdate() ? " for update" : "");
-        if (entities.createNativeQuery("select id from specus_client_credential where id=?1 and tenant_id=?2" + rowLock)
-                .setParameter(1, id).setParameter(2, tenantId).getResultList().isEmpty()) {
-            return Optional.empty();
-        }
-        ClientCredential current = entities.find(ClientCredential.class, id);
-        if (current == null) return Optional.empty();
-        try {
-            // Querying again alone can return a stale first-level-cache entity. Refresh it
-            // explicitly. The native row lock also covers newly inserted rows on row-locking DBs.
-            entities.refresh(current);
-        } catch (EntityNotFoundException disappeared) {
-            return Optional.empty();
-        }
-        return tenantId.equals(current.getTenantId()) ? Optional.of(current) : Optional.empty();
+        var rows = entities.createNativeQuery("""
+                select id, tenant_id, owner_username, api_key, secret_hash, enabled,
+                       max_online_instances, created_at, updated_at
+                  from specus_client_credential where id=?1 and tenant_id=?2
+                """ + rowLock).setParameter(1, id).setParameter(2, tenantId).getResultList();
+        if (rows.isEmpty()) return Optional.empty();
+        // Do not map a native entity or refresh an existing managed instance. Both can return
+        // cached fields, and a plain refresh can read an older MySQL REPEATABLE READ snapshot
+        // even after obtaining the row lock. These scalar fields come from the locking read.
+        Object[] row = (Object[]) rows.getFirst();
+        ClientCredential current = new ClientCredential();
+        current.setId(((Number) row[0]).longValue());
+        current.setTenantId((String) row[1]);
+        current.setOwnerUsername((String) row[2]);
+        current.setApiKey((String) row[3]);
+        current.setSecretHash((String) row[4]);
+        current.setEnabled(row[5] instanceof Boolean value ? value : ((Number) row[5]).intValue() != 0);
+        current.setMaxOnlineInstances(((Number) row[6]).intValue());
+        current.setCreatedAt((String) row[7]);
+        current.setUpdatedAt((String) row[8]);
+        return Optional.of(current);
     }
 }
