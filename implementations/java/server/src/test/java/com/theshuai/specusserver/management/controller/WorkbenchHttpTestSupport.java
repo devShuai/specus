@@ -126,8 +126,9 @@ abstract class WorkbenchHttpTestSupport {
 
     // -- accounts ---------------------------------------------------------------------------------
 
-    static ManagementContext tenantAdmin(String tenantId) {
-        return new ManagementContext(new TenantContext(tenantId), "workbench-fixture-admin", true);
+    ManagementContext tenantAdmin(String tenantId) {
+        return com.theshuai.specusserver.management.ManagementActorFixtures.admin(
+                managementUserRepository, tenantId, "workbench-fixture-admin");
     }
 
     /** Creates the account through the existing account management and returns a bearer token for it. */

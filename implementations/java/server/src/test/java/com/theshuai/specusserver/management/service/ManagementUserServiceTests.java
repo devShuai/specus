@@ -7,6 +7,7 @@ import com.theshuai.specusserver.management.model.ManagementUserView;
 import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import org.junit.jupiter.api.BeforeEach;
@@ -40,8 +41,16 @@ class ManagementUserServiceTests {
         properties.setUsername("dungouji");
         properties.setPassword("built-in-password");
         properties.setTenantId("default");
+        ManagementWriteAuthority authority = mock(ManagementWriteAuthority.class);
+        when(authority.current(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(authority.currentAndTarget(any(), anyString())).thenAnswer(invocation -> {
+            ManagementContext actor = invocation.getArgument(0);
+            String target = invocation.getArgument(1);
+            return new ManagementWriteAuthority.UserWrite(actor, repository.findByTenantIdAndLoginNameNormalized(
+                    actor.tenant().tenantId(), target.trim().toLowerCase(java.util.Locale.ROOT)));
+        });
         service = new ManagementUserService(repository, properties, null, mock(WorkbenchReferences.class),
-                emailRepository);
+                emailRepository, null, null, authority);
         when(repository.save(any(ManagementUser.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
         when(repository.saveAndFlush(any(ManagementUser.class)))

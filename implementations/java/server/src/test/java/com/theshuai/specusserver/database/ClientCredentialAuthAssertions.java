@@ -147,6 +147,7 @@ final class ClientCredentialAuthAssertions {
         assertEquals(1, writer.update("update specus_client_credential set owner_username='after-commit' where id=910501"));
         assertEquals("after-commit", jdbc.queryForObject("select owner_username from specus_client_credential where id=910501", String.class));
         verifyManagementWrites(context, independent, zeroAffectedRows);
+        ManagementResourceWriteAssertions.verify(context, independent, zeroAffectedRows);
     }
 
     private static void verifyManagementWrites(ConfigurableApplicationContext context, DataSource independent,

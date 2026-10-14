@@ -79,6 +79,13 @@ class PostgresSchemaMigrationTests {
     }
 
     @Test
+    void humanPasswordHashesSurviveLegacyColumnUpgrade() throws Exception {
+        String database = createDatabase();
+        try (var legacy = start(database)) { ManagementResourceWriteAssertions.prepareLegacyPasswordSchema(legacy, false); }
+        try (var upgraded = start(database)) { ManagementResourceWriteAssertions.verifyPasswordSchemaUpgrade(upgraded); }
+    }
+
+    @Test
     void serverStartsRestartsAndReinitializesOnPostgres() {
         String database = createDatabase();
         List<Map<String, Object>> indexes;

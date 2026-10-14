@@ -6,6 +6,7 @@ import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.context.ConfigurableApplicationContext;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
@@ -29,7 +30,18 @@ class MySqlCredentialAuthProof {
         String database = "specus_owner_auth_test_" + UUID.randomUUID().toString().replace("-", "");
         admin.execute("create database " + database + " character set utf8mb4 collate utf8mb4_unicode_ci");
         String url = prefix + database + options;
-        try (var context = new SpringApplicationBuilder(SpecusServerApplication.class).web(WebApplicationType.NONE).run(
+        try (var context = boot(url, expected, database)) {
+            ClientCredentialAuthAssertions.verify(context, new DriverManagerDataSource(url, "root", ""), true);
+        }
+        String legacyDatabase = database + "_legacy";
+        admin.execute("create database " + legacyDatabase + " character set utf8mb4 collate utf8mb4_unicode_ci");
+        String legacyUrl = prefix + legacyDatabase + options;
+        try (var legacy = boot(legacyUrl, expected, legacyDatabase)) { ManagementResourceWriteAssertions.prepareLegacyPasswordSchema(legacy, true); }
+        try (var upgraded = boot(legacyUrl, expected, legacyDatabase)) { ManagementResourceWriteAssertions.verifyPasswordSchemaUpgrade(upgraded); }
+    }
+
+    private static ConfigurableApplicationContext boot(String url, Path expected, String database) {
+        return new SpringApplicationBuilder(SpecusServerApplication.class).web(WebApplicationType.NONE).run(
                 "--spring.datasource.url=" + url,
                 "--spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver", "--spring.datasource.username=root",
                 "--spring.datasource.hikari.maximum-pool-size=4",
@@ -37,8 +49,6 @@ class MySqlCredentialAuthProof {
                 "--spring.jpa.properties.hibernate.hbm2ddl.halt_on_error=true", "--specus.elasticsearch.uris=",
                 "--specus.netty.port=0", "--specus.database.seed-demo-client=false",
                 "--specus.client-packages.github-release-fallback-enabled=false",
-                "--specus.client-packages.data-directory=" + expected.getParent().resolve(database + "-packages"))) {
-            ClientCredentialAuthAssertions.verify(context, new DriverManagerDataSource(url, "root", ""), true);
-        }
+                "--specus.client-packages.data-directory=" + expected.getParent().resolve(database + "-packages"));
     }
 }

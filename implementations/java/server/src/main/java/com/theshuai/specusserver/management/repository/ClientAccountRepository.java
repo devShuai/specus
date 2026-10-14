@@ -6,7 +6,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import java.util.List;
 import java.util.Optional;
 
-public interface ClientAccountRepository extends JpaRepository<ClientAccount, Long> {
+public interface ClientAccountRepository extends JpaRepository<ClientAccount, Long>, ClientAccountRepositoryCustom {
     Optional<ClientAccount> findByClientName(String clientName);
 
     Optional<ClientAccount> findByTenantIdAndClientName(String tenantId, String clientName);

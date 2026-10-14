@@ -7,6 +7,7 @@ import com.theshuai.specusserver.management.model.ManagementUserView;
 import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import lombok.extern.slf4j.Slf4j;
@@ -45,19 +46,7 @@ public class ManagementUserService {
     private final AccountOwnedData accountOwnedData;
     /** Announces revoked access to the management WebSockets; absent only in isolated unit tests. */
     private final ApplicationEventPublisher events;
-
-    public ManagementUserService(ManagementUserRepository repository,
-                                 AuthProperties authProperties) {
-        this(repository, authProperties, null, null, null, null, null);
-    }
-
-    public ManagementUserService(ManagementUserRepository repository,
-                                 AuthProperties authProperties,
-                                 HttpShareService httpShareService,
-                                 WorkbenchReferences workbenchReferences,
-                                 ManagementUserEmailRepository userEmailRepository) {
-        this(repository, authProperties, httpShareService, workbenchReferences, userEmailRepository, null, null);
-    }
+    private final ManagementWriteAuthority authority;
 
     @Autowired
     public ManagementUserService(ManagementUserRepository repository,
@@ -66,7 +55,8 @@ public class ManagementUserService {
                                  WorkbenchReferences workbenchReferences,
                                  ManagementUserEmailRepository userEmailRepository,
                                  AccountOwnedData accountOwnedData,
-                                 ApplicationEventPublisher events) {
+                                 ApplicationEventPublisher events,
+                                 ManagementWriteAuthority authority) {
         this.repository = repository;
         this.authProperties = authProperties;
         this.httpShareService = httpShareService;
@@ -74,6 +64,7 @@ public class ManagementUserService {
         this.userEmailRepository = userEmailRepository;
         this.accountOwnedData = accountOwnedData;
         this.events = events;
+        this.authority = authority;
     }
 
     @Transactional(readOnly = true)
@@ -411,6 +402,7 @@ public class ManagementUserService {
 
     @Transactional
     public ManagementUserView createUser(ManagementContext context, UserMutation request) {
+        context = authority.current(context);
         requireAdmin(context);
         String username = normalizeUsername(request.username());
         if (username.equalsIgnoreCase(authProperties.getUsername())) {
@@ -444,12 +436,14 @@ public class ManagementUserService {
 
     @Transactional
     public ManagementUserView updateUser(ManagementContext context, String username, UserMutation request) {
+        var write = authority.currentAndTarget(context, username);
+        context = write.actor();
         requireAdmin(context);
         String normalized = normalizeUsername(username);
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户只能通过配置文件修改");
         }
-        ManagementUser user = requireMutableUserInTenant(context, normalized, "update");
+        ManagementUser user = requireMutableUserInTenant(context, normalized, "update", write.target());
         boolean wasEnabled = user.isEnabled();
         ManagementRole previousRole = user.getRole();
         if (StringUtils.hasText(request.password())) {
@@ -480,12 +474,14 @@ public class ManagementUserService {
     /** Deletes an account of the caller's tenant and returns its login name. */
     @Transactional
     public String deleteUser(ManagementContext context, String username) {
+        var write = authority.currentAndTarget(context, username);
+        context = write.actor();
         requireAdmin(context);
         String normalized = normalizeUsername(username);
         if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
             throw new IllegalArgumentException("内置 admin 用户不能删除");
         }
-        ManagementUser user = requireMutableUserInTenant(context, normalized, "delete");
+        ManagementUser user = requireMutableUserInTenant(context, normalized, "delete", write.target());
         String tenantId = TenantContext.normalize(user.getTenantId());
         // Clients and credentials carry tunnels in use: the administrator deletes or hands them over
         // first, as a later account of the same name would own them (management-accounts.md 7.1).
@@ -544,9 +540,9 @@ public class ManagementUserService {
      * that only exist in another tenant are indistinguishable to the caller so a tenant-A admin
      * cannot probe tenant-B usernames; the rejected attempt is still recorded for auditing.
      */
-    private ManagementUser requireMutableUserInTenant(ManagementContext context, String normalized, String action) {
-        return repository.findByTenantIdAndLoginNameNormalized(
-                        context.tenant().tenantId(), loginNameKey(normalized))
+    private ManagementUser requireMutableUserInTenant(ManagementContext context, String normalized, String action,
+                                                      Optional<ManagementUser> currentTarget) {
+        return currentTarget
                 .orElseThrow(() -> {
                     log.warn("管理用户{}被拒绝: actor={}, tenant={}, target={}, reason=目标不在当前租户或不存在",
                             action, context.username(), context.tenant().tenantId(), normalized);

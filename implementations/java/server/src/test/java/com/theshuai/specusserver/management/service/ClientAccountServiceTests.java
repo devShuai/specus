@@ -70,6 +70,7 @@ class ClientAccountServiceTests {
     @Autowired private PeerMeshSharedServiceRepository sharedServiceRepository;
     @Autowired private PeerMeshSessionRepository peerSessionRepository;
     @Autowired private PlatformTransactionManager transactionManager;
+    @Autowired private com.theshuai.specusserver.management.repository.ManagementUserRepository managementUsers;
 
     @AfterEach
     void tearDown() {
@@ -84,6 +85,7 @@ class ClientAccountServiceTests {
         specusMappingRepository.deleteAll();
         clientIdentityRepository.deleteAll();
         clientAccountRepository.deleteAll();
+        managementUsers.deleteAll();
     }
 
     @Test
@@ -269,8 +271,8 @@ class ClientAccountServiceTests {
         });
         try {
             Runnable deletion = () -> clientAccountService.deleteClient(
-                    new ManagementContext(new TenantContext(vector.path("tenantId").asText()),
-                            vector.path("actor").asText(), true), vector.path("clientId").asLong());
+                    com.theshuai.specusserver.management.ManagementActorFixtures.admin(managementUsers,
+                            vector.path("tenantId").asText(), vector.path("actor").asText()), vector.path("clientId").asLong());
             if (rollback) assertThatThrownBy(deletion::run).isInstanceOf(RuntimeException.class);
             else deletion.run();
             transaction.executeWithoutResult(status -> {

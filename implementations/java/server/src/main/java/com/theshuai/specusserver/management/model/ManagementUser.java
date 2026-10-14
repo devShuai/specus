@@ -45,7 +45,9 @@ public class ManagementUser {
     @Column(name = "tenant_id", nullable = false, length = 80)
     private String tenantId;
 
-    @Column(name = "password_hash", nullable = false, length = 64)
+    // Human passwords use a versioned, salted PBKDF2 encoding, not the 64-char token digest.
+    // Hibernate update must also widen legacy varchar(64) schemas on row-typed providers.
+    @Column(name = "password_hash", nullable = false, length = 255)
     private String passwordHash;
 
     @Column(name = "oidc_issuer", length = 255)

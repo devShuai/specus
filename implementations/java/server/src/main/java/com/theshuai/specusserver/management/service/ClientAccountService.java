@@ -13,6 +13,7 @@ import com.theshuai.specusserver.management.repository.HttpRouteMappingRepositor
 import com.theshuai.specusserver.management.repository.TrafficTotal;
 import com.theshuai.specusserver.management.repository.TrafficUsageRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.session.SessionUtil;
@@ -56,6 +57,7 @@ public class ClientAccountService {
     private final HttpShareService httpShareService;
     private final WorkbenchReferences workbenchReferences;
     private final ClientPeerReferences clientPeerReferences;
+    private final ManagementWriteAuthority authority;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
@@ -64,7 +66,8 @@ public class ClientAccountService {
                                 HttpRouteMappingRepository httpRouteMappingRepository,
                                 HttpShareService httpShareService,
                                 WorkbenchReferences workbenchReferences,
-                                ClientPeerReferences clientPeerReferences) {
+                                ClientPeerReferences clientPeerReferences,
+                                ManagementWriteAuthority authority) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
@@ -73,6 +76,7 @@ public class ClientAccountService {
         this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
         this.clientPeerReferences = clientPeerReferences;
+        this.authority = authority;
     }
 
     @Transactional(readOnly = true)
@@ -110,6 +114,7 @@ public class ClientAccountService {
 
     @Transactional
     public ClientResult createClient(TenantContext tenant, ClientMutation request) {
+        authority.reserveWriter();
         String clientName = requireClientName(request.clientName());
         clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
             throw new IllegalArgumentException("clientName " + clientName + " 已存在");
@@ -126,11 +131,14 @@ public class ClientAccountService {
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
         invalidateNameCache(account.getClientName());
-        return new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        ClientResult result = new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        afterCommit(account.getClientName(), account.getClientName(), null);
+        return result;
     }
 
     @Transactional
     public ClientResult createClient(ManagementContext context, ClientMutation request) {
+        context = authority.current(context);
         String clientName = requireClientName(request.clientName());
         clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
             throw new IllegalArgumentException("clientName " + clientName + " 已存在");
@@ -148,7 +156,9 @@ public class ClientAccountService {
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
         invalidateNameCache(account.getClientName());
-        return new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        ClientResult result = new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        afterCommit(account.getClientName(), account.getClientName(), null);
+        return result;
     }
 
     @Transactional
@@ -158,13 +168,14 @@ public class ClientAccountService {
 
     @Transactional
     public ClientResult updateClient(TenantContext tenant, long id, ClientMutation request) {
-        ClientAccount account = findClientById(tenant, id);
+        ClientAccount account = lockClient(tenant, id);
         return updateClient(tenant, account, request, null);
     }
 
     @Transactional
     public ClientResult updateClient(ManagementContext context, long id, ClientMutation request) {
-        ClientAccount account = findClientById(context, id);
+        context = authority.current(context);
+        ClientAccount account = lockClient(context, id);
         return updateClient(context.tenant(), account, request, context.username());
     }
 
@@ -219,7 +230,9 @@ public class ClientAccountService {
             DisconnectReason reason = !account.isEnabled()
                     ? DisconnectReason.ADMIN_DISABLED
                     : DisconnectReason.ADMIN_RENAMED;
-            closeOnlineChannel(originalClientName, reason);
+            afterCommit(originalClientName, account.getClientName(), reason);
+        } else {
+            afterCommit(originalClientName, account.getClientName(), null);
         }
         TrafficTotal total = trafficUsageRepository
                 .sumBytesByTenantIdAndClientId(tenant.tenantId(), account.getId())
@@ -234,13 +247,14 @@ public class ClientAccountService {
 
     @Transactional
     public void deleteClient(TenantContext tenant, long id) {
-        ClientAccount account = findClientById(tenant, id);
+        ClientAccount account = lockClient(tenant, id);
         deleteClient(account, null);
     }
 
     @Transactional
     public void deleteClient(ManagementContext context, long id) {
-        ClientAccount account = findClientById(context, id);
+        context = authority.current(context);
+        ClientAccount account = lockClient(context, id);
         deleteClient(account, context.username());
     }
 
@@ -259,11 +273,27 @@ public class ClientAccountService {
         httpRouteMappingRepository.flush();
         clientAccountRepository.delete(account);
         // A failed delete must not disconnect a client that still exists after rollback.
-        String clientName = account.getClientName();
+        afterCommit(account.getClientName(), account.getClientName(), DisconnectReason.ADMIN_DELETED);
+    }
+
+    private ClientAccount lockClient(TenantContext tenant, long id) {
+        return clientAccountRepository.lockCurrent(id, tenant.tenantId())
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
+    }
+
+    private ClientAccount lockClient(ManagementContext context, long id) {
+        ClientAccount account = lockClient(context.tenant(), id);
+        if (!context.isAdmin() && !context.username().equals(account.getOwnerUsername()))
+            throw new IllegalArgumentException("client not found: " + id);
+        return account;
+    }
+
+    private void afterCommit(String oldName, String newName, DisconnectReason reason) {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override public void afterCommit() {
-                invalidateNameCache(clientName);
-                closeOnlineChannel(clientName, DisconnectReason.ADMIN_DELETED);
+                invalidateNameCache(oldName);
+                invalidateNameCache(newName);
+                if (reason != null) closeOnlineChannel(oldName, reason);
             }
         });
     }

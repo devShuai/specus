@@ -107,6 +107,13 @@ class MariaDbSchemaTests {
     }
 
     @Test
+    void humanPasswordHashesSurviveLegacyColumnUpgrade() throws Exception {
+        String database = createDatabase("specus_password_storage");
+        try (var legacy = boot(database)) { ManagementResourceWriteAssertions.prepareLegacyPasswordSchema(legacy, true); }
+        try (var upgraded = boot(database)) { ManagementResourceWriteAssertions.verifyPasswordSchemaUpgrade(upgraded); }
+    }
+
+    @Test
     void noLargeObjectColumnStopsAt64KiB() {
         // The binary and text columns of this schema hold bodies, payloads and snapshots.
         assertThat(jdbc().queryForList("""

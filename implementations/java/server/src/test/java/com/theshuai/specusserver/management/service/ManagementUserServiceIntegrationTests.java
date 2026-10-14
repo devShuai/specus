@@ -69,7 +69,7 @@ class ManagementUserServiceIntegrationTests {
     void adminCannotReadResetOrDeleteUsersFromAnotherTenant() {
         seedUser("bob", "tenant-b");
         ManagementContext tenantAAdmin =
-                new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+                com.theshuai.specusserver.management.ManagementActorFixtures.admin(repository, "tenant-a", "admin-a");
         var mutation = new ManagementUserService.UserMutation(
                 "bob", "reset-password", ManagementRole.ADMIN, false);
 
@@ -96,7 +96,7 @@ class ManagementUserServiceIntegrationTests {
     void adminManagesUsersInsideOwnTenant() {
         seedUser("bob", "tenant-b");
         ManagementContext tenantBAdmin =
-                new ManagementContext(new TenantContext("tenant-b"), "admin-b", true);
+                com.theshuai.specusserver.management.ManagementActorFixtures.admin(repository, "tenant-b", "admin-b");
 
         var updated = service.updateUser(tenantBAdmin, "bob",
                 new ManagementUserService.UserMutation("bob", "new-password", ManagementRole.ADMIN, false));
@@ -112,9 +112,9 @@ class ManagementUserServiceIntegrationTests {
     @Test
     void tenantsCanCreateTheSameLoginNameWithoutEnumeration() {
         ManagementContext tenantAAdmin =
-                new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+                com.theshuai.specusserver.management.ManagementActorFixtures.admin(repository, "tenant-a", "admin-a");
         ManagementContext tenantBAdmin =
-                new ManagementContext(new TenantContext("tenant-b"), "admin-b", true);
+                com.theshuai.specusserver.management.ManagementActorFixtures.admin(repository, "tenant-b", "admin-b");
         var request = new ManagementUserService.UserMutation(
                 "Shared", "secret-password", ManagementRole.USER, true);
 
@@ -133,7 +133,7 @@ class ManagementUserServiceIntegrationTests {
     @Test
     void tenantQualifiedLoginAndRefreshResolveOnlyTheMatchingTenant() {
         ManagementContext tenantAAdmin =
-                new ManagementContext(new TenantContext("tenant-a"), "admin-a", true);
+                com.theshuai.specusserver.management.ManagementActorFixtures.admin(repository, "tenant-a", "admin-a");
         service.createUser(tenantAAdmin, new ManagementUserService.UserMutation(
                 "alice", "secret-password", ManagementRole.USER, true));
 

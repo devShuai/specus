@@ -93,8 +93,9 @@ abstract class ProductMetricsHttpTestSupport {
 
     // -- accounts -----------------------------------------------------------------------------------
 
-    static ManagementContext tenantAdmin(String tenantId) {
-        return new ManagementContext(new TenantContext(tenantId), "product-metrics-fixture-admin", true);
+    ManagementContext tenantAdmin(String tenantId) {
+        return com.theshuai.specusserver.management.ManagementActorFixtures.admin(
+                managementUserRepository, tenantId, "product-metrics-fixture-admin");
     }
 
     void createUser(String tenantId, String username, boolean admin) {

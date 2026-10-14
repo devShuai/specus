@@ -130,7 +130,9 @@ class ClientOwnerTransferPreviewTests {
     @Test
     void actualIdentityResolverRechecksCurrentRoleAndEnabledStateForEveryPreview() throws Exception {
         seed(snapshot(vector(), "shared"));
-        users.createUser(ADMIN, new ManagementUserService.UserMutation(
+        ManagementContext admin = com.theshuai.specusserver.management.ManagementActorFixtures.admin(
+                managementUsers, ADMIN.tenant().tenantId(), ADMIN.username());
+        users.createUser(admin, new ManagementUserService.UserMutation(
                 "preview-admin", "preview-test-password", ManagementRole.ADMIN, true));
         String accountKey = managementUsers.findByTenantIdAndLoginNameNormalized("tenant-a", "preview-admin")
                 .orElseThrow().getUsername();
@@ -145,16 +147,16 @@ class ClientOwnerTransferPreviewTests {
             realIdentityMvc.perform(get(route("single", "1001"))).andExpect(status().isUnauthorized());
             SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(jwt));
             realIdentityMvc.perform(get(route("single", "1001"))).andExpect(status().isOk());
-            users.updateUser(ADMIN, "preview-admin", new ManagementUserService.UserMutation(
+            users.updateUser(admin, "preview-admin", new ManagementUserService.UserMutation(
                     null, null, ManagementRole.USER, null));
             realIdentityMvc.perform(get(route("single", "not-a-number"))).andExpect(status().isForbidden())
                     .andExpect(jsonPath("$.code").value("FORBIDDEN"));
-            users.updateUser(ADMIN, "preview-admin", new ManagementUserService.UserMutation(
+            users.updateUser(admin, "preview-admin", new ManagementUserService.UserMutation(
                     null, null, ManagementRole.ADMIN, false));
             realIdentityMvc.perform(get(route("single", "1001"))).andExpect(status().isForbidden());
         } finally {
             SecurityContextHolder.clearContext();
-            users.deleteUser(ADMIN, "preview-admin");
+            users.deleteUser(admin, "preview-admin");
         }
         // Token signature verification belongs to the existing security filter chain; this
         // test covers the production resolver/current database authorization after that stage.
