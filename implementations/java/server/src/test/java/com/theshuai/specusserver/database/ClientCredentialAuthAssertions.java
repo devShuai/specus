@@ -150,6 +150,7 @@ final class ClientCredentialAuthAssertions {
         ManagementResourceWriteAssertions.verify(context, independent, zeroAffectedRows);
         ManagementLoginAssertions.verify(context, independent, zeroAffectedRows);
         ClientRuntimeCoordinationAssertions.verify(context, independent);
+        ClientOwnerTransferWriteAssertions.verify(context, independent);
     }
 
     private static void verifyManagementWrites(ConfigurableApplicationContext context, DataSource independent,
