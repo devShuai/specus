@@ -91,6 +91,13 @@ class MariaDbSchemaTests {
     }
 
     @Test
+    void ownershipPreviewUsesCompleteGroupsOnActualMySqlDialectSchema() throws ManagedProcessException {
+        try (ConfigurableApplicationContext preview = boot(createDatabase("specus_owner_preview"))) {
+            OwnerTransferPreviewAssertions.verify(preview);
+        }
+    }
+
+    @Test
     void noLargeObjectColumnStopsAt64KiB() {
         // The binary and text columns of this schema hold bodies, payloads and snapshots.
         assertThat(jdbc().queryForList("""

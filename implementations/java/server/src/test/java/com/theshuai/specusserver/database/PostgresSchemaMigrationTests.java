@@ -90,6 +90,13 @@ class PostgresSchemaMigrationTests {
         }
     }
 
+    @Test
+    void ownershipPreviewUsesCompleteGroupsOnActualPostgresSchema() {
+        try (ConfigurableApplicationContext context = start(createDatabase())) {
+            OwnerTransferPreviewAssertions.verify(context);
+        }
+    }
+
     /** Update never changes a column's type, so a database the old varchar(8192) headers created keeps them. */
     @Test
     void httpHeaderColumnsTheOldMappingCreatedKeepWorking() {

@@ -1,6 +1,8 @@
 package com.theshuai.specusserver.management.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.theshuai.specusserver.management.model.ClientOwnerTransferPreview;
+import com.theshuai.specusserver.management.model.ClientOwnerTransferPreview.AffectedClient;
 import com.theshuai.specusserver.management.security.ManagementContext;
 
 import java.io.ByteArrayOutputStream;
@@ -49,24 +51,9 @@ final class ClientOwnerTransferPlan {
         }
     }
 
-    record AffectedClient(long id, String clientName, String ownerUsername, boolean enabled) {}
-    record Preview(String scope, Long clientId, Long credentialId, String credentialOwnerUsername,
-                   Boolean credentialEnabled, List<AffectedClient> affectedClients,
-                   int affectedClientCount, boolean canTransfer, String conflictCode,
-                   String revision, boolean accessRetained) {
-        Preview { affectedClients = List.copyOf(affectedClients); }
-    }
-    record Prepared(Preview preview, String requestedTargetUsername) {}
+    record Prepared(ClientOwnerTransferPreview preview, String requestedTargetUsername) {}
 
-    static final class Failure extends RuntimeException {
-        private final int status;
-        private final String code;
-        Failure(int status, String code) { super(code); this.status = status; this.code = code; }
-        int status() { return status; }
-        String code() { return code; }
-    }
-
-    static Preview preview(ManagementContext context, PathScope scope, long pathId, Snapshot snapshot) {
+    static ClientOwnerTransferPreview preview(ManagementContext context, PathScope scope, long pathId, Snapshot snapshot) {
         authorizeAndValidateId(context, pathId);
         requireResource(context, scope, pathId, snapshot);
         return build(context.tenant().tenantId(), scope, pathId, snapshot);
@@ -85,18 +72,18 @@ final class ClientOwnerTransferPlan {
             JsonNode value = request.get(field);
             if (value != null && !value.isTextual()) throw invalid();
         }
-        Preview preview = build(context.tenant().tenantId(), scope, pathId, current);
-        if (!preview.canTransfer()) throw new Failure(409, "CREDENTIAL_SHARED");
+        ClientOwnerTransferPreview preview = build(context.tenant().tenantId(), scope, pathId, current);
+        if (!preview.canTransfer()) throw new ClientOwnerTransferException(409, "CREDENTIAL_SHARED");
         String target = requiredText(request, "targetUsername");
         String revision = requiredText(request, "expectedRevision");
         // Revisions are opaque: don't normalize them (unlike the requested target lookup text).
-        if (!preview.revision().equals(revision)) throw new Failure(409, "TRANSFER_PREVIEW_CHANGED");
+        if (!preview.revision().equals(revision)) throw new ClientOwnerTransferException(409, "TRANSFER_PREVIEW_CHANGED");
         return new Prepared(preview, target.trim());
     }
 
-    private static void authorizeAndValidateId(ManagementContext context, long id) {
+    static void authorizeAndValidateId(ManagementContext context, long id) {
         Objects.requireNonNull(context, "management identity must already be resolved");
-        if (!context.isAdmin()) throw new Failure(403, "FORBIDDEN");
+        if (!context.isAdmin()) throw new ClientOwnerTransferException(403, "FORBIDDEN");
         if (id <= 0 || id > MAX_SAFE_ID) throw invalid();
     }
 
@@ -105,10 +92,10 @@ final class ClientOwnerTransferPlan {
         boolean exists = scope == PathScope.SINGLE
                 ? data.clients().stream().anyMatch(c -> c.id() == id && tenant.equals(c.tenantId()))
                 : data.credentials().stream().anyMatch(c -> c.id() == id && tenant.equals(c.tenantId()));
-        if (!exists) throw new Failure(404, "RESOURCE_NOT_FOUND");
+        if (!exists) throw new ClientOwnerTransferException(404, "RESOURCE_NOT_FOUND");
     }
 
-    private static Preview build(String tenant, PathScope scope, long pathId, Snapshot data) {
+    private static ClientOwnerTransferPreview build(String tenant, PathScope scope, long pathId, Snapshot data) {
         Long credentialId = scope == PathScope.CREDENTIAL_GROUP ? pathId : null;
         if (scope == PathScope.SINGLE) {
             List<IdentityRow> direct = data.identities().stream().filter(i -> i.clientId() == pathId).toList();
@@ -164,7 +151,7 @@ final class ClientOwnerTransferPlan {
         boolean shared = scope == PathScope.SINGLE && clientIds.size() > 1;
         List<AffectedClient> affected = clients.stream().map(c ->
                 new AffectedClient(c.id(), c.clientName(), c.ownerUsername(), c.enabled())).toList();
-        return new Preview(scope.wireName, scope == PathScope.SINGLE ? pathId : null,
+        return new ClientOwnerTransferPreview(scope.wireName, scope == PathScope.SINGLE ? pathId : null,
                 credentialId, credential == null ? null : credential.ownerUsername(),
                 credential == null ? null : credential.enabled(), affected, affected.size(),
                 !shared, shared ? "CREDENTIAL_SHARED" : null,
@@ -226,6 +213,6 @@ final class ClientOwnerTransferPlan {
         if (value == null || value.textValue().isBlank()) throw invalid();
         return value.textValue();
     }
-    private static Failure invalid() { return new Failure(400, "INVALID_TRANSFER_REQUEST"); }
-    private static Failure inconsistent() { return new Failure(409, "INCONSISTENT_CREDENTIAL_GROUP"); }
+    private static ClientOwnerTransferException invalid() { return new ClientOwnerTransferException(400, "INVALID_TRANSFER_REQUEST"); }
+    private static ClientOwnerTransferException inconsistent() { return new ClientOwnerTransferException(409, "INCONSISTENT_CREDENTIAL_GROUP"); }
 }

@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.model.ClientOwnerTransferPreview;
+import com.theshuai.specusserver.management.model.ClientOwnerTransferPreview.AffectedClient;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
@@ -52,7 +54,7 @@ class ClientOwnerTransferPlanTests {
                     assertThatThrownBy(() -> {
                         if (scenario.has("request")) prepare(context, scope, id, finalRequest, snapshot);
                         else preview(context, scope, id, snapshot);
-                    }).isInstanceOfSatisfying(Failure.class, error -> {
+                    }).isInstanceOfSatisfying(ClientOwnerTransferException.class, error -> {
                         assertThat(error.status()).isEqualTo(scenario.path("error").path("status").intValue());
                         assertThat(error.code()).isEqualTo(scenario.path("error").path("code").textValue());
                         assertThat(error.getMessage()).isEqualTo(error.code());
@@ -62,7 +64,7 @@ class ClientOwnerTransferPlanTests {
                     assertThat(prepared.requestedTargetUsername()).isEqualTo(scenario.path("preparedTarget").textValue());
                     assertThat(prepared.preview().accessRetained()).isTrue();
                 } else {
-                    Preview actual = preview(context, scope, id, snapshot);
+                    ClientOwnerTransferPreview actual = preview(context, scope, id, snapshot);
                     JsonNode expected = scenario.path("preview");
                     JsonNode encoded = mapper.valueToTree(actual);
                     for (String field : List.of("clientId", "credentialId")) {
@@ -164,7 +166,7 @@ class ClientOwnerTransferPlanTests {
     @Test
     void revisionIsStatelessOrderIndependentAndBoundToTenantScopeAndPath() throws Exception {
         Snapshot snapshot = mapper.treeToValue(vector().path("base"), Snapshot.class);
-        Preview original = preview(admin, PathScope.CREDENTIAL_GROUP, 501, snapshot);
+        ClientOwnerTransferPreview original = preview(admin, PathScope.CREDENTIAL_GROUP, 501, snapshot);
         Snapshot reordered = new Snapshot(reverse(snapshot.clients()), reverse(snapshot.credentials()),
                 reverse(snapshot.identities()), reverse(snapshot.peers()));
         assertThat(preview(admin, PathScope.CREDENTIAL_GROUP, 501, reordered)).isEqualTo(original);
@@ -196,7 +198,7 @@ class ClientOwnerTransferPlanTests {
         Snapshot snapshot = new Snapshot(clients, List.of(new CredentialRow(501, "tenant-a", "alice", false)), identities, List.of());
         clients.clear();
         identities.clear();
-        Preview result = preview(admin, PathScope.CREDENTIAL_GROUP, 501, snapshot);
+        ClientOwnerTransferPreview result = preview(admin, PathScope.CREDENTIAL_GROUP, 501, snapshot);
         assertThat(result.affectedClients()).hasSize(1050);
         assertThat(result.affectedClients().getLast().id()).isEqualTo(2050);
         assertThatThrownBy(() -> result.affectedClients().clear()).isInstanceOf(UnsupportedOperationException.class);
@@ -211,7 +213,7 @@ class ClientOwnerTransferPlanTests {
         ObjectNode request = mapper.createObjectNode().put("scope", "credential-group")
                 .put("targetUsername", "bob").put("expectedRevision", " " + revision);
         assertThatThrownBy(() -> prepare(admin, PathScope.CREDENTIAL_GROUP, 501, request, original))
-                .isInstanceOfSatisfying(Failure.class, error -> assertThat(error.code()).isEqualTo("TRANSFER_PREVIEW_CHANGED"));
+                .isInstanceOfSatisfying(ClientOwnerTransferException.class, error -> assertThat(error.code()).isEqualTo("TRANSFER_PREVIEW_CHANGED"));
         ((ObjectNode) base.path("clients").get(0)).put("clientName", "one\ntwo").put("ownerUsername", "three");
         String first = preview(admin, PathScope.CREDENTIAL_GROUP, 501, mapper.treeToValue(base, Snapshot.class)).revision();
         ((ObjectNode) base.path("clients").get(0)).put("clientName", "one").put("ownerUsername", "two\nthree");
@@ -225,7 +227,7 @@ class ClientOwnerTransferPlanTests {
         ObjectNode request = mapper.createObjectNode().put("scope", "credential-group")
                 .put("targetUsername", "bob").put("expectedRevision", old);
         assertThatThrownBy(() -> prepare(admin, PathScope.CREDENTIAL_GROUP, 501, request, current))
-                .isInstanceOfSatisfying(Failure.class, error -> {
+                .isInstanceOfSatisfying(ClientOwnerTransferException.class, error -> {
                     assertThat(error.status()).isEqualTo(409);
                     assertThat(error.code()).isEqualTo("TRANSFER_PREVIEW_CHANGED");
                 });
