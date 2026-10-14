@@ -8,7 +8,8 @@
 #
 # 产物: out/release/<version>/specus-client-go-<version>-<platform>-<arch>.{tar.gz|zip}
 #   - 二进制为静态交叉编译（CGO_ENABLED=0），wintun.dll 已 go:embed 进 Windows 二进制，
-#     无需随包携带；包内附 client.example.jsonc，Windows 包附 Wintun LICENSE。
+#     无需随包携带；包内附 client.example.jsonc、二进制编译器证据 go-build-info.txt，
+#     Windows 包附 Wintun LICENSE。最低 Go 版本由 go.mod 强制约束。
 #   - platform/arch 命名与管理台「客户端下载」的 platform(windows|linux|macos) /
 #     arch(x64|arm64) 枚举一致，可直接登记为下载链接。
 #   - 同目录生成 SHA256SUMS-go.txt（名称全局唯一，避免 Release 合并产物时被覆盖）。
@@ -99,6 +100,20 @@ for target in "${TARGETS[@]}"; do
     go build -trimpath -ldflags "-s -w -X main.version=${BUILD_VERSION#v}" \
     -o "${stage}/${bin}" ./cmd/specus-client
 
+  build_info="$(go version -m "${stage}/${bin}")"
+  binary_go_version="$(printf '%s\n' "${build_info}" | sed -n '1s/^.*: //p')"
+  selected_go_version="$(go env GOVERSION)"
+  if [ "${binary_go_version}" != "${selected_go_version}" ]; then
+    echo "error: binary compiler ${binary_go_version} differs from selected ${selected_go_version}" >&2
+    exit 1
+  fi
+  # Keep binary-backed compiler evidence, not the bootstrap executable's version.
+  # Replace the first path-bearing line so archives disclose no local build path.
+  {
+    printf '%s: %s\n' "${bin}" "${binary_go_version}"
+    printf '%s\n' "${build_info}" | tail -n +2
+  } > "${stage}/go-build-info.txt"
+
   cp client.example.jsonc "${stage}/"
   if [ "${goos}" = "windows" ]; then
     # wintun.dll 已嵌入二进制，但其许可证要求随分发附带
@@ -117,7 +132,7 @@ for target in "${TARGETS[@]}"; do
     tar -cf "${plain_tar}" -C "${stage}" \
       --owner=0 --group=0 --numeric-owner --mode=0755 "${bin}"
     tar -rf "${plain_tar}" -C "${stage}" \
-      --owner=0 --group=0 --numeric-owner --mode=0644 client.example.jsonc
+      --owner=0 --group=0 --numeric-owner --mode=0644 client.example.jsonc go-build-info.txt
     gzip -9 -f "${plain_tar}"
   fi
   echo "    -> ${artifact}"

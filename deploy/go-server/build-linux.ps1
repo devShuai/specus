@@ -252,6 +252,22 @@ try {
         "-o", $BinaryPath,
         "./cmd/specus-server"
     )
+    # Resolve the selected compiler while still inside this module. Outside it, an
+    # auto-switching bootstrap go command may report its older bundled version.
+    $goVersion = (& $go version).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Unable to record selected Go compiler" }
+    $selectedGoVersion = (& $go env GOVERSION).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Unable to resolve selected GOVERSION" }
+    $goBuildInfo = @(& $go version -m $BinaryPath)
+    if ($LASTEXITCODE -ne 0 -or $goBuildInfo.Count -eq 0) {
+        throw "Unable to read Go binary build information"
+    }
+    $compilerMatch = [regex]::Match($goBuildInfo[0], ':\s+(go\S+)$')
+    if (-not $compilerMatch.Success -or $compilerMatch.Groups[1].Value -ne $selectedGoVersion) {
+        throw "Binary compiler does not match selected Go toolchain: $BinaryPath"
+    }
+    $binaryGoVersion = $compilerMatch.Groups[1].Value
+    $goBuildInfo[0] = "specus-server: $binaryGoVersion"
 } finally {
     Pop-Location
     Restore-EnvironmentValue "GOCACHE" $hadGoCache $originalGoCache
@@ -277,7 +293,6 @@ $dirty = $dirtyOutput.Count -gt 0
 $hash = (Get-FileHash -LiteralPath $BinaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $binarySize = (Get-Item -LiteralPath $BinaryPath).Length
 $builtAt = [DateTimeOffset]::UtcNow.ToString("o")
-$goVersion = (& $go version).Trim()
 
 $manifest = [ordered]@{
     name         = "specus-server"
@@ -286,6 +301,7 @@ $manifest = [ordered]@{
     dirty        = $dirty
     builtAtUtc   = $builtAt
     goVersion    = $goVersion
+    binaryGoVersion = $binaryGoVersion
     cgoEnabled   = $false
     binary       = "specus-server"
     sizeBytes    = $binarySize
@@ -295,6 +311,7 @@ $manifest = [ordered]@{
 }
 Write-Utf8NoBom (Join-Path $PackageRoot "manifest.json") (($manifest | ConvertTo-Json -Depth 4) + "`n")
 Write-Utf8NoBom (Join-Path $PackageRoot "SHA256SUMS") "$hash  specus-server`n"
+Write-Utf8NoBom (Join-Path $PackageRoot "go-build-info.txt") (($goBuildInfo -join "`n") + "`n")
 
 $tar = Get-Command "tar" -ErrorAction SilentlyContinue
 if ($null -ne $tar) {
