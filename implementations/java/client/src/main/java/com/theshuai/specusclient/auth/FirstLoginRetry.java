@@ -12,7 +12,38 @@ public final class FirstLoginRetry {
     @FunctionalInterface interface Sleeper { void sleep(long millis) throws InterruptedException; }
 
     public static <T> T login(Duration budget, Function<Duration, T> attempt, Consumer<String> diagnostic) {
-        return login(budget, attempt, diagnostic, System::nanoTime, Thread::sleep);
+        if (budget.isZero() || budget.isNegative()) throw new IllegalArgumentException("Login budget must be positive");
+        if (Thread.currentThread().isInterrupted()) throw interrupted();
+        // HttpClient.build() can synchronously load the platform TLS trust store before
+        // sendAsync even exists. HttpRequest.timeout / future.get cannot bound that work.
+        // Keep ALL initial-login preparation, attempts and backoff under one caller deadline.
+        // TLS validation stays untouched. A provider/native initializer may ignore interrupt,
+        // so it must not hold startup or process exit hostage on a non-daemon worker.
+        var executor = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+            Thread worker = new Thread(task, "specus-initial-login");
+            worker.setDaemon(true);
+            return worker;
+        });
+        long started = System.nanoTime();
+        var pending = executor.submit(() -> login(budget, attempt, diagnostic, System::nanoTime, Thread::sleep));
+        try {
+            long remaining = budget.toNanos() - (System.nanoTime() - started);
+            if (remaining <= 0) throw exhausted();
+            return pending.get(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
+        } catch (java.util.concurrent.TimeoutException timeout) {
+            throw exhausted();
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            throw interrupted();
+        } catch (java.util.concurrent.ExecutionException failed) {
+            if (failed.getCause() instanceof RuntimeException error) throw error;
+            if (failed.getCause() instanceof Error error) throw error;
+            throw new IllegalStateException("Unexpected initial HTTP login failure", failed.getCause());
+        } finally {
+            pending.cancel(true);
+            // ExecutorService.close() waits for uncooperative preparation, undoing the bound.
+            executor.shutdownNow();
+        }
     }
 
     static <T> T login(Duration budget, Function<Duration, T> attempt, Consumer<String> diagnostic,

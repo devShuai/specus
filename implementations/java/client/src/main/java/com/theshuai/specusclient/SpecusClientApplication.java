@@ -200,6 +200,8 @@ public class SpecusClientApplication {
         ));
 
         Duration remaining = timeout.minusNanos(System.nanoTime() - attemptStarted);
+        if (Thread.currentThread().isInterrupted())
+            throw new HttpLoginFailure("HTTP login cancelled.", false);
         if (remaining.isNegative() || remaining.isZero())
             throw new HttpLoginFailure("HTTP login preparation exceeded the request budget.", true);
         ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest, remaining);
@@ -235,21 +237,34 @@ public class SpecusClientApplication {
     }
 
     static ClientAuthLoginResponse postLogin(ClientStartupConfig startupConfig, ClientAuthLoginRequest loginRequest, Duration timeout) {
+        return postLogin(startupConfig, loginRequest, timeout, () -> HttpClient.newBuilder()
+                .connectTimeout(timeout.compareTo(Duration.ofSeconds(10)) < 0 ? timeout : Duration.ofSeconds(10))
+                .build());
+    }
+
+    static ClientAuthLoginResponse postLogin(ClientStartupConfig startupConfig, ClientAuthLoginRequest loginRequest,
+                                             Duration timeout, java.util.function.Supplier<HttpClient> clientFactory) {
         long requestStarted = System.nanoTime();
         String url = trimTrailingSlash(startupConfig.getServerBaseUrl()) + "/api/client/auth/login";
         String body = JsonUtil.objectToString(loginRequest);
-        HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(timeout.compareTo(Duration.ofSeconds(10)) < 0 ? timeout : Duration.ofSeconds(10))
-                .build();
+        HttpClient httpClient = clientFactory.get();
+        // A cold TLS trust-store load in build() can outlive the caller's login deadline.
+        // Do not let that abandoned preparation issue a late authentication request.
+        Duration preparedRemaining = timeout.minusNanos(System.nanoTime() - requestStarted);
+        if (Thread.currentThread().isInterrupted() || preparedRemaining.isNegative() || preparedRemaining.isZero()) {
+            httpClient.shutdownNow();
+            throw new HttpLoginFailure("HTTP login preparation exceeded the request budget.", true);
+        }
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                .timeout(timeout.compareTo(Duration.ofSeconds(20)) < 0 ? timeout : Duration.ofSeconds(20))
+                .timeout(preparedRemaining.compareTo(Duration.ofSeconds(20)) < 0 ? preparedRemaining : Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
         var pending = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         try {
             // HttpRequest.timeout alone does not bound a stalled response body on JDK 21.
-            long remainingNanos = request.timeout().orElseThrow().toNanos() - (System.nanoTime() - requestStarted);
+            long remainingNanos = Math.min(timeout.toNanos(), Duration.ofSeconds(20).toNanos())
+                    - (System.nanoTime() - requestStarted);
             if (remainingNanos <= 0) throw new java.util.concurrent.TimeoutException();
             HttpResponse<String> response = pending.get(remainingNanos, TimeUnit.NANOSECONDS);
             if (response.statusCode() < 200 || response.statusCode() >= 300) {

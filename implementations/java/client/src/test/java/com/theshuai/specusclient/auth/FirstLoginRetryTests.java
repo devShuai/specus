@@ -8,6 +8,81 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.assertj.core.api.Assertions.*;
 
 class FirstLoginRetryTests {
+    @Test void publicDeadlinePreservesPermanentFailureIdentityAndExitCode() {
+        var failure = HttpLoginFailure.forStatus(401);
+        Throwable actual = catchThrowable(() -> FirstLoginRetry.login(Duration.ofSeconds(5), remaining -> {
+            throw failure;
+        }, ignored -> { }));
+        assertThat(actual).isSameAs(failure).hasNoCause();
+        assertThat(failure.exitCode()).isEqualTo(3);
+    }
+
+    @Test void publicDeadlinePreservesCallerInterruptionAndStopsItsWorker() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var stopped = new java.util.concurrent.CountDownLatch(1);
+        var outcome = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var interrupted = new java.util.concurrent.atomic.AtomicBoolean();
+        Thread caller = new Thread(() -> {
+            outcome.set(catchThrowable(() -> FirstLoginRetry.login(Duration.ofSeconds(30), remaining -> {
+                entered.countDown();
+                try { release.await(); }
+                catch (InterruptedException cancelled) { Thread.currentThread().interrupt(); }
+                finally { stopped.countDown(); }
+                return "cancelled attempt must not succeed";
+            }, ignored -> { })));
+            interrupted.set(Thread.currentThread().isInterrupted());
+        }, "owned-login-caller-test");
+        caller.start();
+        try {
+            assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            caller.interrupt();
+            caller.join(5_000);
+            assertThat(caller.isAlive()).isFalse();
+            assertThat(outcome.get()).isInstanceOf(HttpLoginFailure.class).hasMessage("HTTP login cancelled.");
+            assertThat(interrupted.get()).isTrue();
+        } finally {
+            release.countDown();
+            caller.interrupt();
+            caller.join(5_000);
+            assertThat(caller.isAlive()).isFalse();
+            assertThat(stopped.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test void publicBudgetBoundsPreparationEvenWhenTheAttemptIgnoresInterrupts() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var stopped = new java.util.concurrent.CountDownLatch(1);
+        var caller = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try {
+            var result = caller.submit(() -> FirstLoginRetry.login(Duration.ofMillis(500), remaining -> {
+                entered.countDown();
+                // Models the observed default TLS trust-store initialization: it can keep
+                // doing CPU/native/file work after a deadline, rather than an HTTP exchange
+                // whose future can be cancelled. The test always releases its own attempt.
+                try {
+                    while (true) {
+                        try { release.await(); break; }
+                        catch (InterruptedException ignored) { /* deliberately uncooperative */ }
+                    }
+                    return "must not authenticate after the deadline";
+                } finally { stopped.countDown(); }
+            }, ignored -> { }));
+            assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> result.get(2, java.util.concurrent.TimeUnit.SECONDS))
+                    .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                    .hasCauseInstanceOf(HttpLoginFailure.class)
+                    .hasRootCauseMessage("Initial HTTP login timeout. Check network/server availability or increase --login-timeout (seconds).");
+            assertThat(stopped.getCount()).as("caller must time out before blocked preparation returns").isEqualTo(1);
+        } finally {
+            release.countDown();
+            caller.shutdownNow();
+            assertThat(caller.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(stopped.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
     @Test void respectsRetryAfterWithoutExtendingTheLoginBudget() {
         var clock = new AtomicLong();
         var attempts = new AtomicInteger();

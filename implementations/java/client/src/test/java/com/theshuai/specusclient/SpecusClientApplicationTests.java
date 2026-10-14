@@ -16,6 +16,51 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 //@SpringBootTest
 class SpecusClientApplicationTests {
+    @Test void abandonedTlsPreparationCannotIssueALateAuthenticationRequest() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var stopped = new java.util.concurrent.CountDownLatch(1);
+        var lateFailure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var client = org.mockito.Mockito.mock(java.net.http.HttpClient.class);
+        var caller = java.util.concurrent.Executors.newSingleThreadExecutor();
+        var config = new ClientStartupConfig();
+        config.setServerBaseUrl("http://127.0.0.1:1");
+        try {
+            var result = caller.submit(() -> FirstLoginRetry.login(Duration.ofMillis(500), remaining -> {
+                try {
+                    return SpecusClientApplication.postLogin(config, new ClientAuthLoginRequest(), remaining, () -> {
+                        entered.countDown();
+                        while (true) {
+                            try { release.await(); break; }
+                            catch (InterruptedException ignored) { /* TLS initialization may ignore cancellation */ }
+                        }
+                        return client;
+                    });
+                } catch (RuntimeException failure) {
+                    lateFailure.set(failure);
+                    throw failure;
+                } finally { stopped.countDown(); }
+            }, ignored -> { }));
+            assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> result.get(2, java.util.concurrent.TimeUnit.SECONDS))
+                    .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                    .hasCauseInstanceOf(HttpLoginFailure.class);
+            assertThat(stopped.getCount()).isEqualTo(1);
+            release.countDown();
+            assertThat(stopped.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(lateFailure.get()).isInstanceOf(HttpLoginFailure.class)
+                    .hasMessage("HTTP login preparation exceeded the request budget.");
+            org.mockito.Mockito.verify(client).shutdownNow();
+            // This includes sendAsync: no credentials may leave an abandoned preparation.
+            org.mockito.Mockito.verifyNoMoreInteractions(client);
+        } finally {
+            release.countDown();
+            caller.shutdownNow();
+            assertThat(caller.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(stopped.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
     @Test void loginBudgetAlsoBoundsAStalledResponseBody() throws Exception {
         var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         var bodyStarted = new java.util.concurrent.atomic.AtomicBoolean();
