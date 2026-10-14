@@ -14,11 +14,8 @@ public sealed class MySqlDesignTimeDbContextFactory : IDesignTimeDbContextFactor
 {
     public SpecusDbContext CreateDbContext(string[] args)
     {
-        var options = new DbContextOptionsBuilder<SpecusDbContext>()
-            .UseMySQL(
-                "server=localhost;database=design_time",
-                mysql => mysql.MigrationsAssembly(typeof(MySqlDesignTimeDbContextFactory).Assembly.GetName().Name))
-            .Options;
-        return new SpecusDbContext(options);
+        var options = new DbContextOptionsBuilder<SpecusDbContext>();
+        MySqlDatabaseCompatibility.Configure(options, "server=localhost;database=design_time");
+        return new SpecusDbContext(options.Options);
     }
 }
