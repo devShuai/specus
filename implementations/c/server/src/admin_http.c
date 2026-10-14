@@ -10670,18 +10670,17 @@ static int handle_credential_create(const st_admin_context *context, const char 
     /* A plain insert: a create that races another one for the api key never replaces it; Java's
      * unique column refuses it and GlobalExceptionHandler answers 400. */
     st_storage_client_credential credential;
-    int rc = st_storage_insert_client_credential(database_path,
-                                                 context->tenant_id,
-                                                 context->username,
-                                                 api_key,
-                                                 secret_hash,
-                                                 enabled,
-                                                 max_online_instances,
-                                                 &credential);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_create_client_credential_current_actor(database_path, &actor, &builtin,
+        api_key, secret_hash, enabled, max_online_instances, &credential);
     free(api_key);
     if (rc != 0) {
         free(secret);
-        return rc > 0
+        if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+            return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+        return rc == ST_STORAGE_CREDENTIAL_KEY_EXISTS
             ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
             : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential create failed\"}");
     }

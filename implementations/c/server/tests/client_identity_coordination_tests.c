@@ -402,6 +402,117 @@ done:
     return failed;
 }
 
+/* The real account resolver has returned a row and released its read lock, but HTTP has
+ * not resumed. Fixture writes below commit before POST is allowed to continue. */
+static int native_credential_create_race(int scenario)
+{
+    test_server server;
+    if(server_prepare(&server)!=0) return 1;
+    char ready[400],resume[400],preload[1024],ready_env[450],resume_env[450],account_env[200],token[2048];
+    snprintf(ready,sizeof(ready),"%s/auth-ready",server.dir);
+    snprintf(resume,sizeof(resume),"%s/auth-resume",server.dir);
+    int failed=1,ready_fd=-1,resume_fd=-1,started=0,thread_started=0;
+    sqlite3 *db=NULL;
+    pthread_t thread;
+    credential_http_worker w={.server=&server,.method="POST",.path="/api/admin/client-credentials",.token=token,
+        .request="{\"apiKey\":\"create-race-key\",\"secret\":\"  create-race-secret  \",\"enabled\":false,\"maxOnlineInstances\":9}"};
+    st_storage_management_user actor,replacement;
+    st_storage_client_credential credential={0},duplicate={0};
+    int admin=scenario==6;
+    if(st_storage_init(server.db_path,0)!=0
+        || st_storage_create_management_user(server.db_path,"alice","default","fixture-only-hash",admin?"ADMIN":"USER",1,&actor)!=0
+        || st_security_issue_local_token_for_account("alice","default",admin?"ADMIN":"USER",actor.account_key,
+            ADMIN_JWT_SECRET,600,token,sizeof(token))!=0) goto done;
+    if(scenario==11) w.request="{}";
+    if(mkfifo(ready,0600)!=0 || mkfifo(resume,0600)!=0) goto done;
+    ready_fd=open(ready,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+    resume_fd=open(resume,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+    if(ready_fd<0 || resume_fd<0) goto done;
+    Dl_info sanitizer={0};void *asan=dlsym(RTLD_DEFAULT,"__asan_init");
+    if(asan!=NULL&&dladdr(asan,&sanitizer)!=0&&sanitizer.dli_fname!=NULL)
+        snprintf(preload,sizeof(preload),"LD_PRELOAD=%s:%s",sanitizer.dli_fname,barrier_library);
+    else snprintf(preload,sizeof(preload),"LD_PRELOAD=%s",barrier_library);
+    snprintf(ready_env,sizeof(ready_env),"SPECUS_TEST_AUTH_BARRIER_READY=%s",ready);
+    snprintf(resume_env,sizeof(resume_env),"SPECUS_TEST_AUTH_BARRIER_RESUME=%s",resume);
+    snprintf(account_env,sizeof(account_env),"SPECUS_TEST_AUTH_BARRIER_ACCOUNT=%s",actor.account_key);
+    server.extra_env[0]=preload;server.extra_env[1]=ready_env;server.extra_env[2]=resume_env;server.extra_env[3]=account_env;
+    if(server_start(&server)!=0) goto done;
+    started=1;
+    if(sqlite3_open(server.db_path,&db)!=SQLITE_OK) goto done;
+    sqlite3_busy_timeout(db,5000);
+    if(pthread_create(&thread,NULL,mutate_credential,&w)!=0) goto done;
+    thread_started=1;
+    struct pollfd event={.fd=ready_fd,.events=POLLIN};int polled;
+    do { polled=poll(&event,1,5000); } while(polled<0&&errno==EINTR);
+    char signal=0;
+    if(polled!=1 || read(ready_fd,&signal,1)!=1 || signal!='R') {
+        fprintf(stderr,"credential create did not reach closed account-read barrier\n");goto done;
+    }
+    const char *change=NULL;
+    switch(scenario) {
+        case 0: case 11: break;
+        case 1: change="UPDATE specus_management_user SET enabled=0 WHERE login_name='alice'";break;
+        case 2: case 3: case 12: change="DELETE FROM specus_management_user WHERE login_name='alice'";break;
+        case 4: change="UPDATE specus_management_user SET tenant_id='foreign' WHERE login_name='alice'";break;
+        case 5: change="UPDATE specus_management_user SET login_name='renamed',login_name_normalized='renamed' WHERE login_name='alice'";break;
+        case 6: change="UPDATE specus_management_user SET role='USER' WHERE login_name='alice'";break;
+        case 7: break;
+        case 8: change="CREATE TRIGGER malformed_created_owner AFTER INSERT ON specus_client_credential BEGIN UPDATE specus_client_credential SET owner_username=printf('%0300d',0) WHERE id=NEW.id; END";break;
+        case 9: change="CREATE TRIGGER wrong_created_owner AFTER INSERT ON specus_client_credential BEGIN UPDATE specus_client_credential SET owner_username='bob' WHERE id=NEW.id; END";break;
+        case 10: change="CREATE TRIGGER fail_credential_insert BEFORE INSERT ON specus_client_credential BEGIN SELECT RAISE(ABORT,'injected insert failure'); END";break;
+        case 13: change="UPDATE specus_management_user SET role='ADMIN' WHERE login_name='alice'";break;
+        default: goto done;
+    }
+    if(change!=NULL && execute(db,change)!=0) goto done;
+    if((scenario==3 || scenario==12)
+        && st_storage_create_management_user(server.db_path,"alice",scenario==12?"foreign":"default","replacement-fixture-hash","ADMIN",1,&replacement)!=0) goto done;
+    if(scenario==7) {
+        uint8_t digest[ST_SHA256_LEN];char hash[65];
+        st_sha256((const uint8_t *)"concurrent-secret",strlen("concurrent-secret"),digest);st_hex_encode(digest,sizeof(digest),hash);
+        if(st_storage_insert_client_credential(server.db_path,"default","bob","create-race-key",hash,1,2,&duplicate)!=0) goto done;
+    }
+    int expected_status=201;
+    if((scenario>=1 && scenario<=5) || scenario==12) expected_status=403;
+    if(scenario==7) expected_status=400;
+    if(scenario>=8 && scenario<=10) expected_status=500;
+    if(write(resume_fd,"C",1)!=1) goto done;
+    pthread_join(thread,NULL);thread_started=0;
+    if(w.rc!=0 || w.status!=expected_status) {
+        fprintf(stderr,"credential create scenario=%d status=%d expected=%d\n",scenario,w.status,expected_status);goto done;
+    }
+    long long count=scalar(db,"SELECT COUNT(*) FROM specus_client_credential");
+    if(expected_status==201) {
+        char *key=st_json_get_string(w.body,"apiKey"),*secret=st_json_get_string(w.body,"secret");
+        uint8_t digest[ST_SHA256_LEN];char hash[65];
+        int valid=key!=NULL && secret!=NULL && *key!='\0' && *secret!='\0';
+        if(valid) {
+            st_sha256((const uint8_t *)secret,strlen(secret),digest);st_hex_encode(digest,sizeof(digest),hash);
+            valid=st_storage_get_client_credential_by_api_key(server.db_path,key,&credential)==0
+                && count==1 && strcmp(credential.tenant_id,"default")==0 && strcmp(credential.owner_username,"alice")==0
+                && strcmp(credential.secret_hash,hash)==0 && credential.enabled==(scenario==11)
+                && (scenario==11?credential.max_online_instances>0:credential.max_online_instances==9)
+                && (scenario==11 || (strcmp(key,"create-race-key")==0 && strcmp(secret,"create-race-secret")==0));
+        }
+        free(key);free(secret);
+        if(!valid) { fprintf(stderr,"credential create returned inconsistent result scenario=%d count=%lld\n",scenario,count);goto done; }
+    } else if(scenario==7) {
+        if(count!=1 || st_storage_get_client_credential(server.db_path,duplicate.id,&credential)!=0
+            || !same_credential(&duplicate,&credential,1)) goto done;
+    } else if(count!=0) { fprintf(stderr,"credential create left rows after refusal scenario=%d count=%lld\n",scenario,count);goto done; }
+    failed=0;
+done:
+    if(thread_started) { ssize_t sent=write(resume_fd,"C",1);if(sent!=1)fprintf(stderr,"credential create resume failed\n");pthread_join(thread,NULL); }
+    free(w.body);sqlite3_close(db);
+    if(ready_fd>=0)close(ready_fd);
+    if(resume_fd>=0)close(resume_fd);
+    unlink(ready);unlink(resume);
+    if(started&&server_stop(&server,10000)!=0)failed=1;
+    if(failed)dump_server_log(&server);
+    server_cleanup(&server,failed);
+    printf("%s native credential create coordination: scenario=%d\n",failed?"FAIL":"PASS",scenario);
+    return failed;
+}
+
 static int direct_credential_coordination(int scenario)
 {
     fixture f;
@@ -454,6 +565,71 @@ done:
     return failed;
 }
 
+static int direct_credential_create_coordination(int scenario)
+{
+    fixture f;
+    int failed=fresh(&f);
+    st_storage_management_user user,other;
+    st_storage_client_credential original={0},output,created={0};
+    st_storage_share_builtin_admin builtin={"builtin","default",1};
+    if(failed) goto done;
+    if(st_storage_create_management_user(f.path,"alice","default","fixture-only-hash","USER",1,&user)!=0
+        || st_storage_create_management_user(f.path,"bob","default","fixture-only-hash","ADMIN",1,&other)!=0
+        || st_storage_get_client_credential(f.path,f.credential.id,&original)!=0) { failed=1;goto done; }
+    st_storage_management_actor actor={"alice","default",user.account_key};
+    st_storage_client_credential *published=&output;
+    const char *key="direct-create-key",*hash=f.credential.secret_hash,*expected_owner="alice";
+    int expected=0,maximum=9;
+    char oversized[362];memset(oversized,'k',sizeof(oversized)-1);oversized[sizeof(oversized)-1]='\0';
+    switch(scenario) {
+        case 0: break;
+        case 1: actor=(st_storage_management_actor){"BuIlTiN","default",""};expected_owner="builtin";break;
+        case 2: actor.account_key="";expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 3: actor.account_key=other.account_key;expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 4: actor=(st_storage_management_actor){"builtin","DEFAULT",""};expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 5: actor=(st_storage_management_actor){"builtin","default",""};builtin.accepted=0;expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 6:
+            if(execute(f.db,"UPDATE specus_management_user SET enabled=0 WHERE login_name='alice'")!=0) { failed=1;goto done; }
+            expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 7: published=NULL;break;
+        case 8: case 9:
+            if(execute(f.db,scenario==8
+                ? "CREATE TRIGGER wrong_create_owner AFTER INSERT ON specus_client_credential BEGIN UPDATE specus_client_credential SET owner_username='bob' WHERE id=NEW.id; END"
+                : "CREATE TRIGGER malformed_create_owner AFTER INSERT ON specus_client_credential BEGIN UPDATE specus_client_credential SET owner_username=printf('%0300d',0) WHERE id=NEW.id; END")!=0) { failed=1;goto done; }
+            expected=-1;if(scenario==8) published=NULL;break;
+        case 10: key=TEST_KEY;expected=ST_STORAGE_CREDENTIAL_KEY_EXISTS;break;
+        case 11: maximum=0;expected=-1;break;
+        case 12: hash="short";expected=-1;break;
+        case 13: key="";expected=-1;break;
+        case 14: key=oversized;expected=-1;break;
+        case 15: actor.username="ALICE";expected=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        default: failed=1;goto done;
+    }
+    memset(&output,0x7f,sizeof(output));
+    int rc=st_storage_create_client_credential_current_actor(f.path,&actor,&builtin,key,hash,0,maximum,published);
+    if(rc!=expected || scalar(f.db,"SELECT COUNT(*) FROM specus_client_credential")!=(rc==0?2:1)
+        || st_storage_get_client_credential(f.path,f.credential.id,&created)!=0 || !same_credential(&original,&created,1)) {
+        fprintf(stderr,"direct credential create scenario=%d rc=%d expected=%d\n",scenario,rc,expected);failed=1;goto done;
+    }
+    if(rc==0) {
+        if(st_storage_get_client_credential_by_api_key(f.path,key,&created)!=0
+            || strcmp(created.owner_username,expected_owner)!=0 || strcmp(created.tenant_id,"default")!=0
+            || strcmp(created.secret_hash,hash)!=0 || created.enabled!=0 || created.max_online_instances!=9
+            || (published!=NULL && !same_credential(&created,published,1))) failed=1;
+    } else if(published!=NULL) {
+        const unsigned char *zeroed=(const unsigned char *)&output;
+        for(size_t i=0;i<sizeof(output);++i) if(zeroed[i]!=0) failed=1;
+    }
+    if(published==NULL) {
+        const unsigned char *untouched=(const unsigned char *)&output;
+        for(size_t i=0;i<sizeof(output);++i) if(untouched[i]!=0x7f) failed=1;
+    }
+done:
+    finish(&f);
+    printf("%s direct credential create coordination: scenario=%d\n",failed?"FAIL":"PASS",scenario);
+    return failed;
+}
+
 int main(int argc,char **argv)
 {
     if(argc!=3)return 2;
@@ -482,5 +658,7 @@ int main(int argc,char **argv)
     failed+=native_credential_race(0,14);
     failed+=native_credential_race(1,14);
     for(int scenario=0;scenario<10;++scenario) failed+=direct_credential_coordination(scenario);
+    for(int scenario=0;scenario<14;++scenario) failed+=native_credential_create_race(scenario);
+    for(int scenario=0;scenario<16;++scenario) failed+=direct_credential_create_coordination(scenario);
     return failed?1:0;
 }

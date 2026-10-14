@@ -1621,6 +1621,12 @@ enum {
 /* BEGIN IMMEDIATE encloses current actor, current credential visibility and the entire write.
  * No tenant/owner replacement from a stale caller object; output only after successful commit.
  * 0 success, positive refusal above, -1 store/integrity/argument failure. */
+/* Create uses the freshly resolved actor's canonical tenant/login as owner; never upserts
+ * an existing key. USER accounts may create, and no stale cached role grants extra rights. */
+int st_storage_create_client_credential_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *api_key, const char *secret_hash, int enabled, int max_online_instances,
+    st_storage_client_credential *out_credential);
 int st_storage_patch_client_credential_visible(const char *path, long long id,
     const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
     const st_storage_credential_patch *patch, st_storage_client_credential *out_credential);

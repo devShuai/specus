@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-/* Test-only LD_PRELOAD probe. Pauses AFTER the real API-key/by-id credential connection closes,
+/* Test-only LD_PRELOAD probe. Pauses AFTER the real credential/management account connection closes,
  * hence holds no SQLite read lock. The native HTTP thread really retains its old struct.
  * No production callback, fake SQLite result, timer race or application bypass is installed. */
 #include <dlfcn.h>
@@ -36,6 +36,12 @@ int sqlite3_step(sqlite3_stmt *stmt)
             || strstr(sql, "FROM specus_client_credential WHERE id = ?") != NULL)) {
         const char *actual = (const char *)sqlite3_column_text(stmt, 3);
         if (actual != NULL && strcmp(actual, key) == 0) selected_db = sqlite3_db_handle(stmt);
+    }
+    const char *account = getenv("SPECUS_TEST_AUTH_BARRIER_ACCOUNT");
+    if (rc == SQLITE_ROW && account != NULL && sql != NULL
+        && strstr(sql, "FROM specus_management_user ") != NULL && sqlite3_column_count(stmt) == 8) {
+        const char *actual = (const char *)sqlite3_column_text(stmt, 7);
+        if (actual != NULL && strcmp(actual, account) == 0) selected_db = sqlite3_db_handle(stmt);
     }
     return rc;
 }

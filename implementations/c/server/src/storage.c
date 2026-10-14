@@ -3596,19 +3596,16 @@ int st_storage_upsert_client_credential(const char *path,
     return out_credential == NULL ? 0 : st_storage_get_client_credential_by_api_key(path, api_key, out_credential);
 }
 
-int st_storage_insert_client_credential(const char *path,
+/* Plain insert shared by bootstrap callers and the current-actor transaction below. */
+static int insert_client_credential_on_db(sqlite3 *db,
                                         const char *tenant_id,
                                         const char *owner_username,
                                         const char *api_key,
                                         const char *secret_hash,
                                         int enabled,
                                         int max_online_instances,
-                                        st_storage_client_credential *out_credential)
+                                        long long *inserted_id)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO specus_client_credential(tenant_id, owner_username, api_key, secret_hash, enabled, "
@@ -3630,6 +3627,23 @@ int st_storage_insert_client_credential(const char *path,
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    if (rc == 0 && inserted_id != NULL) *inserted_id = sqlite3_last_insert_rowid(db);
+    return rc;
+}
+
+int st_storage_insert_client_credential(const char *path,
+                                        const char *tenant_id,
+                                        const char *owner_username,
+                                        const char *api_key,
+                                        const char *secret_hash,
+                                        int enabled,
+                                        int max_online_instances,
+                                        st_storage_client_credential *out_credential)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = insert_client_credential_on_db(db, tenant_id, owner_username, api_key,
+                                          secret_hash, enabled, max_online_instances, NULL);
     sqlite3_close(db);
     if (rc != 0) {
         return rc;
@@ -3692,6 +3706,50 @@ static int load_management_actor(sqlite3 *db, const st_storage_management_actor 
     if (found != 0 || !current->enabled || strcmp(current->tenant_id, actor->tenant_id) != 0
         || strcmp(current->username, actor->username) != 0) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
     return 0;
+}
+
+int st_storage_create_client_credential_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *api_key, const char *secret_hash, int enabled, int max_online_instances,
+    st_storage_client_credential *out_credential)
+{
+    if (out_credential != NULL) memset(out_credential, 0, sizeof(*out_credential));
+    if (api_key == NULL || *api_key == '\0' || strlen(api_key) >= sizeof(((st_storage_client_credential *)0)->api_key)
+        || secret_hash == NULL || strlen(secret_hash) != ST_SHA256_HEX_LEN
+        || max_online_instances < 1 || max_online_instances > 10000) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = -1, transaction = 0;
+    st_storage_management_user current_actor;
+    st_storage_client_credential staged = {0};
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    result = load_management_actor(db, actor, builtin, &current_actor);
+    if (result != 0) goto done;
+    long long inserted_id = 0;
+    result = insert_client_credential_on_db(db, current_actor.tenant_id, current_actor.username,
+                                          api_key, secret_hash, enabled, max_online_instances, &inserted_id);
+    if (result == 1) { result = ST_STORAGE_CREDENTIAL_KEY_EXISTS; goto done; }
+    if (result != 0) goto done;
+    result = -1;
+    /* Validate on the same connection before COMMIT, even when no output was requested.
+     * A malformed row/trigger failure must not commit an orphan or report a partial success. */
+    if (load_client_credential(db, inserted_id, &staged) != 0
+        || staged.id <= 0 || strcmp(staged.tenant_id, current_actor.tenant_id) != 0
+        || strcmp(staged.owner_username, current_actor.username) != 0
+        || strcmp(staged.api_key, api_key) != 0 || strcmp(staged.secret_hash, secret_hash) != 0
+        || staged.enabled != (enabled != 0) || staged.max_online_instances != max_online_instances
+        || staged.created_at[0] == '\0' || staged.updated_at[0] == '\0') goto done;
+    result = 0;
+done:
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (result == 0 && out_credential != NULL) *out_credential = staged;
+    return result;
 }
 
 static int mutate_client_credential_visible(const char *path, long long id,
