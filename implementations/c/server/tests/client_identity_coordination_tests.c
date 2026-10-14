@@ -1236,6 +1236,8 @@ done:
     finish(&f);printf("%s direct runtime snapshot: scenario=%d\n",failed?"FAIL":"PASS",scenario);return failed;
 }
 
+#include "management_ws_coordination_tests.h"
+
 int main(int argc,char **argv)
 {
     if(argc==6 && strcmp(argv[1],"--peer-config")==0) {
@@ -1282,5 +1284,8 @@ int main(int argc,char **argv)
     for(int scenario=0;scenario<12;++scenario) failed+=current_peer_permission(scenario);
     for(int scenario=0;scenario<9;++scenario) failed+=runtime_config_race(scenario);
     for(int scenario=0;scenario<13;++scenario) failed+=direct_runtime_snapshot(scenario);
+    for(int messages=0;messages<2;++messages)
+        for(int scenario=0;scenario<6;++scenario) failed+=management_post_registration(messages,scenario);
+    for(int admin=0;admin<2;++admin) failed+=management_owner_visibility(admin);
     return failed?1:0;
 }

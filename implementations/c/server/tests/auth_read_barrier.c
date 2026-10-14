@@ -16,6 +16,7 @@ static int (*real_step)(sqlite3_stmt *);
 static int (*real_close)(sqlite3 *);
 static pthread_once_t symbols_once = PTHREAD_ONCE_INIT;
 static _Atomic int fired;
+static _Atomic int ws_account_reads;
 static _Thread_local sqlite3 *selected_db;
 
 static void pause_once(void)
@@ -53,10 +54,14 @@ int sqlite3_step(sqlite3_stmt *stmt)
         if (actual != NULL && strcmp(actual, key) == 0) selected_db = sqlite3_db_handle(stmt);
     }
     const char *account = getenv("SPECUS_TEST_AUTH_BARRIER_ACCOUNT");
-    if (rc == SQLITE_ROW && account != NULL && sql != NULL
+    const char *ws_account = getenv("SPECUS_TEST_AUTH_BARRIER_WS_ACCOUNT");
+    if (rc == SQLITE_ROW && (account != NULL || ws_account != NULL) && sql != NULL
         && strstr(sql, "FROM specus_management_user ") != NULL && sqlite3_column_count(stmt) == 8) {
         const char *actual = (const char *)sqlite3_column_text(stmt, 7);
-        if (actual != NULL && strcmp(actual, account) == 0) selected_db = sqlite3_db_handle(stmt);
+        if (actual != NULL && account != NULL && strcmp(actual, account) == 0) selected_db = sqlite3_db_handle(stmt);
+        /* Ticket issuance resolves once; pause only the next, pre-upgrade identity read. */
+        if (actual != NULL && ws_account != NULL && strcmp(actual, ws_account) == 0
+            && atomic_fetch_add(&ws_account_reads, 1) == 1) selected_db = sqlite3_db_handle(stmt);
     }
     const char *client = getenv("SPECUS_TEST_AUTH_BARRIER_CLIENT_ID");
     if (rc == SQLITE_ROW && client != NULL && sql != NULL

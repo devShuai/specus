@@ -253,7 +253,7 @@ $(OWNER_TRANSFER_TESTS): $(CORE_OBJS) tests/owner_transfer_tests.c tests/server_
 $(AUTH_READ_BARRIER): tests/auth_read_barrier.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lsqlite3 -ldl -lpthread -o $@
 
-$(IDENTITY_COORDINATION_TESTS): $(CORE_OBJS) tests/client_identity_coordination_tests.c tests/server_harness.c | $(BUILD_DIR)
+$(IDENTITY_COORDINATION_TESTS): $(CORE_OBJS) tests/client_identity_coordination_tests.c tests/management_ws_coordination_tests.h tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_identity_coordination_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
 
 test: all
