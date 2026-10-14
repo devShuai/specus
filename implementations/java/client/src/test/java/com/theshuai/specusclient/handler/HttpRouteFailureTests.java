@@ -147,21 +147,21 @@ class HttpRouteFailureTests {
 
     @Test
     void aRouteTheDeviceHasNotLoadedIsRouteNotLoaded() throws Exception {
-        NatMessagePacket reset = resetFor(List.of(), null);
+        NatMessagePacket reset = resetForRejectedOpen(List.of(), null, httpOpen());
         assertFailure(HttpRouteFailure.ROUTE_NOT_LOADED, reset);
         assertEquals("未配置 HTTP route", reset.getMetaData().get("reason"));
     }
 
     @Test
     void aRouteWithoutATargetIsRouteNotLoaded() throws Exception {
-        assertFailure(HttpRouteFailure.ROUTE_NOT_LOADED, resetFor(List.of(route("")), null));
+        assertFailure(HttpRouteFailure.ROUTE_NOT_LOADED, resetForRejectedOpen(List.of(route("")), null, httpOpen()));
     }
 
     // --- target-reachable ---
 
     @Test
     void aTargetTheRouteCannotUseIsTargetInvalid() throws Exception {
-        assertFailure(HttpRouteFailure.TARGET_INVALID, resetFor(List.of(route("ftp://127.0.0.1/")), null));
+        assertFailure(HttpRouteFailure.TARGET_INVALID, resetForRejectedOpen(List.of(route("ftp://127.0.0.1/")), null, httpOpen()));
     }
 
     @Test
@@ -275,7 +275,7 @@ class HttpRouteFailureTests {
     void aMalformedRequestCarriesNoFailure() throws Exception {
         Map<String, Object> open = new HashMap<>(httpOpen());
         open.remove("method");
-        NatMessagePacket reset = resetFor(List.of(route("http://127.0.0.1:" + closedLoopbackPort())), null, open);
+        NatMessagePacket reset = resetFor(List.of(route("http://127.0.0.1:" + closedLoopbackPort())), null, open, new Frames(), false);
         assertNoFailure(reset);
     }
 
@@ -283,7 +283,7 @@ class HttpRouteFailureTests {
     void aLocalLimitCarriesNoFailure() throws Exception {
         Map<String, Object> open = new HashMap<>(httpOpen());
         open.put("contentLength", 64L * 1024 * 1024);
-        NatMessagePacket reset = resetFor(List.of(route("http://127.0.0.1:" + closedLoopbackPort())), null, open);
+        NatMessagePacket reset = resetFor(List.of(route("http://127.0.0.1:" + closedLoopbackPort())), null, open, new Frames(), false);
         assertNoFailure(reset);
     }
 
@@ -362,7 +362,7 @@ class HttpRouteFailureTests {
     }
 
     private static void assertNoFailure(NatMessagePacket reset) {
-        assertEquals(8, reset.getValue());
+        assertEquals(8, reset.getValue(), () -> "first reset metadata=" + reset.getMetaData());
         assertNotNull(reset.getMetaData().get("reason"));
         assertFalse(reset.getMetaData().containsKey(HttpRouteFailure.METADATA_KEY),
                 "metadata " + reset.getMetaData());
@@ -377,9 +377,24 @@ class HttpRouteFailureTests {
         return resetFor(routes, dial, openMetadata, new Frames());
     }
 
-    /** Opens one GET on the route, ends its request, and returns the RST the client writes for it. */
+    private static NatMessagePacket resetForRejectedOpen(List<HttpSpecusConfig> routes, HttpUpstreamDial dial,
+                                                         Map<String, Object> openMetadata) throws Exception {
+        return resetFor(routes, dial, openMetadata, new Frames(), false);
+    }
+
     private static NatMessagePacket resetFor(List<HttpSpecusConfig> routes, HttpUpstreamDial dial,
                                              Map<String, Object> openMetadata, Frames frames) throws Exception {
+        return resetFor(routes, dial, openMetadata, frames, true);
+    }
+
+    /**
+     * A real exchange receives FIN, as before. Tests of OPEN validation send only that invalid
+     * OPEN: an unrelated FIN after its asynchronous rejection may generate an unknown-stream RST
+     * before the queued validation RST and is not an observation of the failure under test.
+     */
+    private static NatMessagePacket resetFor(List<HttpSpecusConfig> routes, HttpUpstreamDial dial,
+                                             Map<String, Object> openMetadata, Frames frames,
+                                             boolean finishRequest) throws Exception {
         NatClientHandler handler = new NatClientHandler(bean(routes));
         if (dial != null) {
             handler.useHttpUpstreamDial(dial);
@@ -387,7 +402,7 @@ class HttpRouteFailureTests {
         EmbeddedChannel control = new EmbeddedChannel(frames, handler);
         try {
             control.writeInbound(open(STREAM, openMetadata));
-            control.writeInbound(fin(STREAM));
+            if (finishRequest) control.writeInbound(fin(STREAM));
             NatMessagePacket reset = frames.await(control, NatMessageType.RST);
             assertNotNull(reset, "the stream must be reset");
             assertNotNull(reset.getMetaData(), "the RST carries metadata");
