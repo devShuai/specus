@@ -9,10 +9,10 @@ import org.springframework.context.support.GenericApplicationContext;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -37,24 +37,19 @@ class ClientCliTests {
                     "-cp", System.getProperty("java.class.path"),
                     "com.theshuai.specusclient.SpecusClientApplication"));
             command.addAll(args);
-            Path stdout = temporary.resolve("stdout-" + index);
-            Path stderr = temporary.resolve("stderr-" + index++);
-            var process = new ProcessBuilder(command).directory(temporary.toFile())
-                    .redirectOutput(stdout.toFile()).redirectError(stderr.toFile()).start();
-            try {
-                assertThat(process.waitFor(10, TimeUnit.SECONDS)).as("CLI must not connect/hang: %s", args).isTrue();
-                String output = Files.readString(stdout);
-                String errors = Files.readString(stderr);
-                assertThat(process.exitValue()).as("stdout=%s stderr=%s", output, errors).isEqualTo(expected);
-                assertThat(output + errors).doesNotContain("DO_NOT_PRINT_SECRET");
-                if (args.contains(diagnosticConfig.toString())) {
-                    assertThat(errors).contains("Warning:", "peerMeshMtu normalized to 1280");
-                    assertThat(output).doesNotContain("Warning:");
-                } else assertThat(expected == 0 ? errors : output).isEmpty();
-                if (args.contains("validate")) assertThat(output).contains("offline");
-            } finally {
-                if (process.isAlive()) { process.destroyForcibly(); process.waitFor(); }
-            }
+            var result = CliProcessProbe.run(command, temporary, "cli-case-" + index++, Duration.ofSeconds(10));
+            assertThat(result.reaped()).as("Owned child must terminate; %s", result.diagnostic()).isTrue();
+            assertThat(result.secretFound()).as("Child emitted a secret marker; raw output withheld").isFalse();
+            assertThat(result.outputTooLarge()).as("Unexpected excessive child output").isFalse();
+            assertThat(result.finishedInBudget()).as("CLI process exceeded original 10s budget; %s", result.diagnostic()).isTrue();
+            assertThat(result.exitCode()).as("%s", result.diagnostic()).isEqualTo(expected);
+            String output = result.stdout();
+            String errors = result.stderr();
+            if (args.contains(diagnosticConfig.toString())) {
+                assertThat(errors).contains("Warning:", "peerMeshMtu normalized to 1280");
+                assertThat(output).doesNotContain("Warning:");
+            } else assertThat(expected == 0 ? errors : output).isEmpty();
+            if (args.contains("validate")) assertThat(output).contains("offline");
         }
     }
 

@@ -98,6 +98,13 @@ jobs:
           python scripts/test-cli-ui.py --name dotnet -- dotnet $dll
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/test-cli-matrix.py --name dotnet -- dotnet $dll
+      - name: Keep sanitized Java CLI process diagnostics, including timeouts
+        if: always() && matrix.runtime == 'java'
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-cli-process-${{ matrix.os }}
+          path: implementations/java/client/target/cli-process-diagnostics/*.txt
+          if-no-files-found: warn
       - name: Test the Windows desktop window
         if: matrix.runtime == 'dotnet' && runner.os == 'Windows'
         # Lays the real window out in both themes and two sizes, including the egress page with rules
