@@ -1138,6 +1138,8 @@ int st_storage_list_peer_mesh_acls_visible(const char *path,
                                            int include_all_clients,
                                            st_storage_peer_mesh_acl **acls,
                                            size_t *acl_count);
+/* Cached client identifies id+tenant only. Each ensure/enable/report re-reads current client
+ * under one database write transaction, rolls back creation on later failure, publishes after commit. */
 int st_storage_ensure_peer_mesh_device(const char *path,
                                        const st_storage_client *client,
                                        st_storage_peer_mesh_device *out_device);

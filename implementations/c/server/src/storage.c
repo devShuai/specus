@@ -2351,12 +2351,8 @@ int st_storage_list_all_clients(const char *path, st_storage_client **clients, s
     return 0;
 }
 
-int st_storage_get_client(const char *path, long long id, st_storage_client *client)
+static int load_client(sqlite3 *db, long long id, st_storage_client *client)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
@@ -2378,15 +2374,22 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
         &stmt,
         NULL);
     if (rc != SQLITE_OK) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_bind_int64(stmt, 1, id);
     rc = sqlite3_step(stmt);
     int ok = rc == SQLITE_ROW && scan_client(stmt, client) == 0;
     sqlite3_finalize(stmt);
-    sqlite3_close(db);
     return ok ? 0 : -1;
+}
+
+int st_storage_get_client(const char *path, long long id, st_storage_client *client)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = load_client(db, id, client);
+    sqlite3_close(db);
+    return rc;
 }
 
 int st_storage_get_client_by_name(const char *path, const char *client_name, st_storage_client *client)
@@ -7199,17 +7202,9 @@ static int peer_mesh_allocate_virtual_ip(sqlite3 *db,
     return -1;
 }
 
-int st_storage_ensure_peer_mesh_device(const char *path,
-                                       const st_storage_client *client,
-                                       st_storage_peer_mesh_device *out_device)
+/* Called only with the current client row under the caller's database write transaction. */
+static int ensure_peer_mesh_device_on_db(sqlite3 *db, const st_storage_client *client)
 {
-    if (client == NULL || client->id <= 0) {
-        return -1;
-    }
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     const char *cidr = getenv("SPECUS_PEER_MESH_CIDR");
     if (cidr == NULL || *cidr == '\0') cidr = "100.96.0.0/11";
     char virtual_ip[64];
@@ -7218,7 +7213,6 @@ int st_storage_ensure_peer_mesh_device(const char *path,
         && existing.virtual_ip[0] != '\0') {
         snprintf(virtual_ip, sizeof(virtual_ip), "%s", existing.virtual_ip);
     } else if (peer_mesh_allocate_virtual_ip(db, client, cidr, virtual_ip) != 0) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
@@ -7248,18 +7242,59 @@ int st_storage_ensure_peer_mesh_device(const char *path,
         rc = -1;
     }
     sqlite3_finalize(stmt);
-    if (rc == 0 && out_device != NULL) {
-        rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
-        if (rc == 0) {
-            out_device->message_send_capable = client->message_send_capable;
-            out_device->message_receive_capable = client->message_receive_capable;
-            out_device->message_attachments_capable = client->message_attachments_capable;
-            out_device->message_media_preview_capable = client->message_media_preview_capable;
-            out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
-        }
+    return rc;
+}
+
+static int peer_client_write_begin(const char *path, const st_storage_client *cached,
+                                  sqlite3 **db, st_storage_client *current,
+                                  st_storage_peer_mesh_device *out_device)
+{
+    if (out_device != NULL) memset(out_device, 0, sizeof(*out_device));
+    *db = NULL;
+    if (cached == NULL || cached->id <= 0 || open_db(path, db) != 0) return -1;
+    /* A cached owner/name/capability is not authority. The SQLite writer lock also fences
+     * independent connections/processes, including future ownership transfer transactions. */
+    if (exec_sql(*db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
     }
+    if (load_client(*db, cached->id, current) != 0
+        || strcmp(normalize_tenant_id(current->tenant_id), normalize_tenant_id(cached->tenant_id)) != 0) {
+        (void)exec_sql(*db, "ROLLBACK");
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int peer_client_write_end(sqlite3 *db, const st_storage_client *current, int rc,
+                                st_storage_peer_mesh_device *out_device)
+{
+    st_storage_peer_mesh_device staged = {0};
+    if (rc == 0) rc = read_peer_mesh_device(db, current->tenant_id, current->id, &staged);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
+    if (rc == 0 && out_device != NULL) {
+        staged.message_send_capable = current->message_send_capable;
+        staged.message_receive_capable = current->message_receive_capable;
+        staged.message_attachments_capable = current->message_attachments_capable;
+        staged.message_media_preview_capable = current->message_media_preview_capable;
+        staged.message_max_attachment_bytes = current->message_max_attachment_bytes;
+        *out_device = staged;
+    }
     return rc == 0 ? 0 : -1;
+}
+
+int st_storage_ensure_peer_mesh_device(const char *path, const st_storage_client *client,
+                                     st_storage_peer_mesh_device *out_device)
+{
+    sqlite3 *db = NULL;
+    st_storage_client current;
+    if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    return peer_client_write_end(db, &current, ensure_peer_mesh_device_on_db(db, &current), out_device);
 }
 
 int st_storage_update_peer_mesh_device_enabled(const char *path,
@@ -7267,16 +7302,11 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                int enabled,
                                                st_storage_peer_mesh_device *out_device)
 {
-    if (client == NULL || client->id <= 0) {
-        return -1;
-    }
-    if (st_storage_ensure_peer_mesh_device(path, client, NULL) != 0) {
-        return -1;
-    }
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
+    st_storage_client current;
+    if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    if (ensure_peer_mesh_device_on_db(db, &current) != 0)
+        return peer_client_write_end(db, &current, -1, out_device);
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
                                 "UPDATE peer_mesh_device SET enabled = ?, owner_username = ?, "
@@ -7287,27 +7317,16 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                 NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int(stmt, 1, enabled ? 1 : 0);
-        sqlite3_bind_text(stmt, 2, normalize_owner_username(client->owner_username), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, client->client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, normalize_tenant_id(client->tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 5, client->id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(current.owner_username), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, current.client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 5, current.id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;
     }
     sqlite3_finalize(stmt);
-    if (rc == 0 && out_device != NULL) {
-        rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
-        if (rc == 0) {
-            out_device->message_send_capable = client->message_send_capable;
-            out_device->message_receive_capable = client->message_receive_capable;
-            out_device->message_attachments_capable = client->message_attachments_capable;
-            out_device->message_media_preview_capable = client->message_media_preview_capable;
-            out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
-        }
-    }
-    sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    return peer_client_write_end(db, &current, rc, out_device);
 }
 
 int st_storage_get_peer_mesh_device_by_client(const char *path,
@@ -7480,9 +7499,11 @@ int st_storage_update_peer_mesh_device_report(const char *path,
                                               const char *virtual_device_error,
                                               st_storage_peer_mesh_device *out_device)
 {
-    if (client == NULL || st_storage_ensure_peer_mesh_device(path, client, NULL) != 0) return -1;
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
+    st_storage_client current;
+    if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    if (ensure_peer_mesh_device_on_db(db, &current) != 0)
+        return peer_client_write_end(db, &current, -1, out_device);
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE peer_mesh_device SET public_key=COALESCE(?,public_key),nat_type=COALESCE(?,nat_type),"
@@ -7509,14 +7530,12 @@ int st_storage_update_peer_mesh_device_report(const char *path,
         bind_nullable_text_limit(stmt, 12, virtual_device_name, 127);
         bind_nullable_text_limit(stmt, 13, virtual_device_status, 31);
         bind_nullable_text_limit(stmt, 14, virtual_device_error, 255);
-        sqlite3_bind_text(stmt, 15, normalize_tenant_id(client->tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 16, client->id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        sqlite3_bind_text(stmt, 15, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 16, current.id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
-    if (rc == 0 && out_device != NULL) rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
-    sqlite3_close(db);
-    return rc;
+    return peer_client_write_end(db, &current, rc, out_device);
 }
 
 int st_storage_can_peer(const char *path,

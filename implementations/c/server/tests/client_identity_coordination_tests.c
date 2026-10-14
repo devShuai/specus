@@ -183,6 +183,88 @@ done:
     printf("%s native auth coordination: %s\n",failed?"FAIL":"PASS",label);return failed;
 }
 
+static int peer_update(fixture *f, const st_storage_client *client, int operation,
+                       st_storage_peer_mesh_device *device)
+{
+    if (operation == 0) return st_storage_ensure_peer_mesh_device(f->path, client, device);
+    if (operation == 1) return st_storage_update_peer_mesh_device_enabled(f->path, client, 1, device);
+    return st_storage_update_peer_mesh_device_report(f->path, client, "new-public-key", "NAT",
+        NULL, NULL, NULL, NULL, "tun", "peer-test", "ready", NULL, device);
+}
+
+/* The real caller retains a client struct between reading it and reporting/enabling Peer.
+ * SQL changes below are fixtures, not a substitute for the still-unimplemented transfer API. */
+static int peer_coordination_case(int operation, int scenario)
+{
+    fixture f;
+    int failed = fresh(&f);
+    st_storage_client cached;
+    st_storage_client_identity identity;
+    st_storage_peer_mesh_device before = {0}, after = {0};
+    if (failed) goto done;
+    if (st_storage_find_or_create_client_identity(f.path, &f.credential, "peer-device", "user", "host", &identity) != 0
+        || st_storage_get_client(f.path, identity.client_id, &cached) != 0) { failed = 1; goto done; }
+    if (scenario == 1 || scenario == 5) {
+        if (st_storage_ensure_peer_mesh_device(f.path, &cached, &before) != 0
+            || execute(f.db, "UPDATE peer_mesh_device SET enabled=1,public_key='original-key'") != 0) { failed = 1; goto done; }
+    }
+    if (scenario == 0 || scenario == 1 || scenario == 5) {
+        if (execute(f.db, "UPDATE client_account SET owner_username='bob',client_name='renamed-current'") != 0) { failed = 1; goto done; }
+        cached.message_send_capable = 1; /* A stale capability must not escape in the result. */
+    } else if (scenario == 2) {
+        if (execute(f.db, "DELETE FROM client_account") != 0) { failed = 1; goto done; }
+    } else if (scenario == 3) {
+        if (execute(f.db, "UPDATE client_account SET tenant_id='foreign'") != 0) { failed = 1; goto done; }
+    }
+    if (scenario >= 4) {
+        const char *fault = operation == 1
+            ? "CREATE TRIGGER fail_peer BEFORE UPDATE OF enabled ON peer_mesh_device BEGIN SELECT RAISE(ABORT,'injected enable failure'); END"
+            : "CREATE TRIGGER fail_peer BEFORE UPDATE OF public_key ON peer_mesh_device BEGIN SELECT RAISE(ABORT,'injected report failure'); END";
+        if (execute(f.db, fault) != 0) { failed = 1; goto done; }
+    }
+    int rc = peer_update(&f, &cached, operation, &after);
+    if (scenario <= 1) {
+        if (rc != 0 || strcmp(after.owner_username, "bob") != 0
+            || strcmp(after.client_name, "renamed-current") != 0 || after.message_send_capable != 0
+            || strcmp(cached.owner_username, "alice") != 0) failed = 1;
+        if (scenario == 1 && (strcmp(after.virtual_ip, before.virtual_ip) != 0 || !after.enabled)) failed = 1;
+        if (operation == 2 && strcmp(after.public_key, "new-public-key") != 0) failed = 1;
+    } else if (scenario <= 4) {
+        if (rc >= 0 || scalar(f.db, "SELECT COUNT(*) FROM peer_mesh_device") != 0 || after.id != 0) failed = 1;
+    } else {
+        if (rc >= 0 || after.id != 0
+            || scalar(f.db, "SELECT COUNT(*) FROM peer_mesh_device WHERE owner_username='alice' AND client_name<>'renamed-current' AND public_key='original-key' AND enabled=1") != 1) failed = 1;
+    }
+done:
+    finish(&f);
+    printf("%s Peer owner coordination: operation=%d scenario=%d\n", failed ? "FAIL" : "PASS", operation, scenario);
+    return failed;
+}
+
+static int peer_current_capabilities(int operation)
+{
+    fixture f;
+    int failed = fresh(&f);
+    st_storage_client cached;
+    st_storage_client_identity identity;
+    st_storage_peer_mesh_device device;
+    if (failed) goto done;
+    if (st_storage_find_or_create_client_identity(f.path, &f.credential, "peer-device", "user", "host", &identity) != 0
+        || st_storage_get_client(f.path, identity.client_id, &cached) != 0) { failed = 1; goto done; }
+    if (execute(f.db, "INSERT INTO specus_client_session(tenant_id,credential_id,identity_id,client_id,client_name,token_hash,status,machine_fingerprint,os_user,expires_at,message_send_capable,message_receive_capable,message_attachments_capable,message_media_preview_capable,message_max_attachment_bytes) SELECT tenant_id,credential_id,id,client_id,client_name,'fixture-token-hash','NETTY_ONLINE',machine_fingerprint,os_user,'2099-01-01',1,1,1,1,12345 FROM specus_client_identity") != 0) { failed = 1; goto done; }
+    if (peer_update(&f, &cached, operation, &device) != 0 || !device.message_send_capable
+        || !device.message_receive_capable || !device.message_attachments_capable
+        || !device.message_media_preview_capable || device.message_max_attachment_bytes != 12345) failed = 1;
+    if (execute(f.db, "UPDATE specus_client_session SET status='DISCONNECTED'") != 0
+        || peer_update(&f, &cached, operation, &device) != 0 || device.message_send_capable
+        || device.message_receive_capable || device.message_attachments_capable
+        || device.message_media_preview_capable || device.message_max_attachment_bytes != 0) failed = 1;
+done:
+    finish(&f);
+    printf("%s Peer current capabilities: operation=%d\n", failed ? "FAIL" : "PASS", operation);
+    return failed;
+}
+
 int main(int argc,char **argv)
 {
     if(argc!=3)return 2;
@@ -197,5 +279,12 @@ int main(int argc,char **argv)
     failed+=native_race("key-rotated","UPDATE specus_client_credential SET api_key='rotated-key'",401);
     failed+=native_race("secret-rotated","UPDATE specus_client_credential SET secret_hash=printf('%064d',0)",401);
     failed+=native_race("deleted","DELETE FROM specus_client_credential",401);
+    for (int operation = 0; operation < 3; ++operation)
+        for (int scenario = 0; scenario < 4; ++scenario)
+            failed += peer_coordination_case(operation, scenario);
+    failed += peer_coordination_case(1, 4);
+    failed += peer_coordination_case(2, 4);
+    failed += peer_coordination_case(2, 5);
+    for (int operation = 0; operation < 3; ++operation) failed += peer_current_capabilities(operation);
     return failed?1:0;
 }
