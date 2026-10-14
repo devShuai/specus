@@ -71,6 +71,14 @@ class PostgresSchemaMigrationTests {
     }
 
     @Test
+    void credentialAuthenticationUsesCurrentMaterialAndDatabaseLocks() throws Exception {
+        String database = createDatabase();
+        try (ConfigurableApplicationContext auth = start(database)) {
+            ClientCredentialAuthAssertions.verify(auth, postgres.getDatabase("postgres", database), false);
+        }
+    }
+
+    @Test
     void serverStartsRestartsAndReinitializesOnPostgres() {
         String database = createDatabase();
         List<Map<String, Object>> indexes;

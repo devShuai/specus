@@ -123,8 +123,20 @@ public class ClientAuthService {
         if (!credential.isEnabled()) {
             throw new IllegalArgumentException("客户端凭证已停用");
         }
-        return transactionTemplate.execute(status ->
-                completeLogin(credential, environment, requestServerName));
+        // Capture authenticated material before a refresh can mutate any managed entity.
+        Long credentialId = credential.getId();
+        String tenantId = credential.getTenantId(), apiKey = credential.getApiKey(), secretHash = credential.getSecretHash();
+        return transactionTemplate.execute(status -> {
+            ClientCredential current = credentialRepository.lockCurrent(credentialId, tenantId)
+                    .orElseThrow(() -> new IllegalArgumentException("客户端凭证不存在或已变更"));
+            if (!Objects.equals(apiKey, current.getApiKey()) || !Objects.equals(secretHash, current.getSecretHash())) {
+                throw new IllegalArgumentException("客户端签名无效或已过期");
+            }
+            if (!current.isEnabled()) throw new IllegalArgumentException("客户端凭证已停用");
+            // The nonce was consumed exactly once above. Current owner and policy, identity/account
+            // creation and session insertion now share the credential's database write lock.
+            return completeLogin(current, environment, requestServerName);
+        });
     }
 
     private ClientAuthLoginResponse completeLogin(ClientCredential credential,

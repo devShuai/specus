@@ -98,6 +98,15 @@ class MariaDbSchemaTests {
     }
 
     @Test
+    void credentialAuthenticationUsesCurrentMaterialAndDatabaseLocks() throws Exception {
+        String database = createDatabase("specus_owner_auth");
+        try (ConfigurableApplicationContext auth = boot(database, true)) {
+            ClientCredentialAuthAssertions.verify(auth,
+                    new DriverManagerDataSource(url(database) + "&useAffectedRows=true", "root", ""), true);
+        }
+    }
+
+    @Test
     void noLargeObjectColumnStopsAt64KiB() {
         // The binary and text columns of this schema hold bodies, payloads and snapshots.
         assertThat(jdbc().queryForList("""
@@ -214,11 +223,15 @@ class MariaDbSchemaTests {
     }
 
     private static ConfigurableApplicationContext boot(String database) {
+        return boot(database, false);
+    }
+
+    private static ConfigurableApplicationContext boot(String database, boolean zeroAffectedRows) {
         // Command-line arguments, because builder properties are defaults that application.yml overrides.
         return new SpringApplicationBuilder(SpecusServerApplication.class)
                 .web(WebApplicationType.NONE)
                 .run(
-                        "--spring.datasource.url=" + url(database),
+                        "--spring.datasource.url=" + url(database) + (zeroAffectedRows ? "&useAffectedRows=true" : ""),
                         "--spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver",
                         "--spring.datasource.username=root",
                         "--spring.jpa.database-platform=org.hibernate.dialect.MySQLDialect",
