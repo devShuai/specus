@@ -318,6 +318,8 @@ target_link_libraries(specus_c_public_transfer_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_public_transfer_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME public_transfer_tests COMMAND specus_c_public_transfer_tests)
 set_tests_properties(public_transfer_tests PROPERTIES TIMEOUT 120)
+add_test(NAME public_transfer_environment_guard_tests
+    COMMAND specus_c_public_transfer_tests --check-environment-guard)
 
 # The shared product metrics vector through the real request handling, the write-path hooks, and a
 # real server process (client_online on a control login, the HTTP layer's body hand-over).
