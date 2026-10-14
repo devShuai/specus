@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -46,14 +47,40 @@ final class PeerServiceBridge implements AutoCloseable {
     }
 
     static PeerServiceBridge bind(String virtualIp, SpecusCore.LocalPeerService service) throws IOException {
+        service = snapshotService(service);
         InetAddress target = PeerServiceRuntime.resolveLocalServiceTarget(service.targetHost);
         if (target == null) {
             throw new IOException("targetHost is not assigned to this device");
         }
         ServerSocket server = new ServerSocket();
-        server.setReuseAddress(true);
-        server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.publishedPort));
-        return new PeerServiceBridge(virtualIp, service, target, server);
+        try {
+            server.setReuseAddress(true);
+            server.bind(new InetSocketAddress(InetAddress.getByName(virtualIp), service.publishedPort));
+            return new PeerServiceBridge(virtualIp, service, target, server);
+        } catch (IOException | RuntimeException failure) {
+            server.close();
+            throw failure;
+        }
+    }
+
+    // A bridge owns one binding generation. Reusing a mutable config object must not
+    // rewrite the identity used for reconciliation or retarget an existing connection.
+    static SpecusCore.LocalPeerService snapshotService(SpecusCore.LocalPeerService source) {
+        SpecusCore.LocalPeerService copy = new SpecusCore.LocalPeerService();
+        copy.serviceId = source.serviceId;
+        copy.name = source.name;
+        copy.description = source.description;
+        copy.transport = source.transport;
+        copy.application = source.application;
+        copy.targetHost = source.targetHost;
+        copy.targetPort = source.targetPort;
+        copy.publishedPort = source.publishedPort;
+        copy.path = source.path;
+        copy.enabled = source.enabled;
+        copy.visibility = source.visibility;
+        copy.allowedPeerVirtualIps = source.allowedPeerVirtualIps == null ? java.util.List.of()
+                : java.util.Collections.unmodifiableList(new java.util.ArrayList<>(source.allowedPeerVirtualIps));
+        return copy;
     }
 
     boolean matches(String virtualIp, SpecusCore.LocalPeerService service) {
@@ -183,21 +210,34 @@ final class PeerServiceBridge implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!open.compareAndSet(true, false)) {
-            return;
+        if (open.compareAndSet(true, false)) {
+            LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
+                    + " activeConnections=" + splices.size()
+                    + " reason=config-withdrawn-or-shutdown");
+            try {
+                serverSocket.close();
+            } catch (IOException ignored) {
+            }
+            splices.forEach((inbound, outbound) -> {
+                closeQuietly(inbound);
+                closeQuietly(outbound);
+            });
+            splices.clear();
+            executor.shutdownNow();
         }
-        LOG.info("[peer-service-access-audit] action=revoke serviceId=" + service.serviceId
-                + " activeConnections=" + splices.size()
-                + " reason=config-withdrawn-or-shutdown");
+        awaitClosedIo(executor, "TCP", service.serviceId);
+    }
+
+    static void awaitClosedIo(ExecutorService executor, String transport, String serviceId) {
+        // JDK socket close can defer final descriptor release until native I/O unwinds.
+        // All callers share the same executor completion boundary, including repeat close.
         try {
-            serverSocket.close();
-        } catch (IOException ignored) {
+            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                throw new IllegalStateException(transport + " bridge I/O did not terminate for " + serviceId);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted closing " + transport + " bridge " + serviceId, interrupted);
         }
-        splices.forEach((inbound, outbound) -> {
-            closeQuietly(inbound);
-            closeQuietly(outbound);
-        });
-        splices.clear();
-        executor.shutdownNow();
     }
 }

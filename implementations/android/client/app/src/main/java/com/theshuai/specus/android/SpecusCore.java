@@ -2171,17 +2171,13 @@ public final class SpecusCore {
             streamLifecycle.markOpened(streamId);
         }
 
-        /**
-         * Schedules a watchdog on the heartbeat scheduler. Returns null when the scheduler is gone,
-         * which callers treat as "no watchdog" rather than as a failure.
-         */
+        /** A local write must not run without its deadline, including during connection close. */
         @Override
         public ScheduledFuture<?> scheduleWatchdog(Runnable task, long delayMillis) {
-            try {
-                return heartbeat.schedule(task, delayMillis, TimeUnit.MILLISECONDS);
-            } catch (RuntimeException ignored) {
-                return null;
+            if (closed.get()) {
+                throw new RejectedExecutionException("control connection is closed");
             }
+            return heartbeat.schedule(task, delayMillis, TimeUnit.MILLISECONDS);
         }
 
         private void sendStreamData(int streamId, byte[] data) throws Exception {
@@ -2429,6 +2425,7 @@ public final class SpecusCore {
 
         void resetTcpStream(int streamId, LocalSpecus specus, long errorCode, String reason);
 
+        /** Return an active deadline or throw; null must never permit an unprotected write. */
         ScheduledFuture<?> scheduleWatchdog(Runnable task, long delayMillis);
     }
 
@@ -2623,6 +2620,7 @@ public final class SpecusCore {
             synchronized (outputLock) {
                 inbound.clear();
                 inboundBytes = 0;
+                inboundFin = false;
                 draining = false;
             }
         }
@@ -2664,9 +2662,13 @@ public final class SpecusCore {
             if (data.length == 0 || closeState.isReset()) {
                 return true;
             }
-            ScheduledFuture<?> watchdog = control.scheduleWatchdog(
-                    () -> failLocalIo("local TCP write timed out"), writeTimeoutMillis);
+            ScheduledFuture<?> watchdog = null;
             try {
+                watchdog = control.scheduleWatchdog(
+                        () -> failLocalIo("local TCP write timed out"), writeTimeoutMillis);
+                if (watchdog == null) {
+                    throw new RejectedExecutionException("local TCP write watchdog unavailable");
+                }
                 OutputStream out = local.getOutputStream();
                 out.write(data);
                 out.flush();
@@ -2713,8 +2715,12 @@ public final class SpecusCore {
             if (!closeState.reset()) {
                 return;
             }
-            control.resetTcpStream(streamId, this, 9, reason);
-            closeQuietly(socket);
+            try {
+                control.resetTcpStream(streamId, this, 9, reason);
+            } finally {
+                closeQuietly(socket);
+                discardInbound();
+            }
         }
 
         private void failRemoteProtocol(String reason) {
@@ -2738,6 +2744,7 @@ public final class SpecusCore {
         public void close() {
             closeState.reset();
             closeQuietly(socket);
+            discardInbound();
         }
     }
 
