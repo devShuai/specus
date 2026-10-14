@@ -7,6 +7,11 @@ import org.hibernate.Session;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import java.util.Optional;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.TreeSet;
 
 public class ClientAccountRepositoryCustomImpl implements ClientAccountRepositoryCustom {
     @PersistenceContext private EntityManager entities;
@@ -17,6 +22,13 @@ public class ClientAccountRepositoryCustomImpl implements ClientAccountRepositor
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
     public Optional<ClientAccount> lockCurrent(Long id, String tenantId) {
+        if (id == null) return Optional.empty();
+        return Optional.ofNullable(lockCurrentAll(Collections.singleton(id), tenantId).get(id));
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Map<Long, ClientAccount> lockCurrentAll(Collection<Long> ids, String tenantId) {
         entities.createNativeQuery("update specus_client_account set enabled=enabled where 1=0").executeUpdate();
         // Runtime credential/client links are immutable: authentication allocates a NEW client ID
         // for every new identity. Read the stable links without taking identity locks first, then
@@ -24,12 +36,20 @@ public class ClientAccountRepositoryCustomImpl implements ClientAccountRepositor
         // order and avoiding a rename(identity update) versus login deadlock. Deleted credentials
         // do not prevent management of the remaining client. No ownership/integrity validation for
         // a transfer is implied by this ordinary resource writer; the transfer planner does that.
-        for (Object credential : entities.createNativeQuery("""
+        TreeSet<Long> clients = new TreeSet<>(ids), linked = new TreeSet<>();
+        for (long id : clients) for (Object credential : entities.createNativeQuery("""
                 select distinct credential_id from specus_client_identity
                  where client_id=?1 order by credential_id
                 """).setParameter(1, id).getResultList()) {
-            if (credential != null) credentials.lockCurrent(((Number) credential).longValue(), tenantId);
+            if (credential != null) linked.add(((Number) credential).longValue());
         }
+        for (long credential : linked) credentials.lockCurrent(credential, tenantId);
+        Map<Long, ClientAccount> result = new LinkedHashMap<>();
+        for (long id : clients) lockClientRow(id, tenantId).ifPresent(account -> result.put(id, account));
+        return Collections.unmodifiableMap(result);
+    }
+
+    private Optional<ClientAccount> lockClientRow(Long id, String tenantId) {
         entities.createNativeQuery("update specus_client_account set enabled=enabled where id=?1 and tenant_id=?2")
                 .setParameter(1, id).setParameter(2, tenantId).executeUpdate();
         String lock = entities.unwrap(Session.class).doReturningWork(connection ->

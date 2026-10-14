@@ -73,6 +73,14 @@ class PeerMeshServiceTests {
         when(authority.current(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(deviceRepository.lockCurrent(any(), any())).thenAnswer(invocation ->
                 deviceRepository.findByTenantIdAndClientId(invocation.getArgument(0), invocation.getArgument(1)));
+        when(clientAccountRepository.lockCurrentAll(any(), any())).thenAnswer(invocation -> {
+            java.util.Map<Long, ClientAccount> current = new java.util.HashMap<>();
+            for (Long id : invocation.<java.util.Collection<Long>>getArgument(0))
+                clientAccountRepository.lockCurrent(id, invocation.getArgument(1)).ifPresent(account -> current.put(id, account));
+            return current;
+        });
+        when(aclRepository.lockPair(any(), any(), any())).thenAnswer(invocation ->
+                aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2)));
         when(sharingRepository.findById(any())).thenReturn(Optional.empty());
         when(sharedServiceRepository.findByTenantIdAndClientIdOrderByNameAsc(any(), any())).thenReturn(List.of());
     }

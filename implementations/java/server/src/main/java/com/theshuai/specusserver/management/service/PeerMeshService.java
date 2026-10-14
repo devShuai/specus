@@ -313,21 +313,22 @@ public class PeerMeshService {
 
     @Transactional
     public PeerMeshAclView createAcl(ManagementContext context, AclMutation mutation) {
-        ClientAccount source = findAccessibleClient(context, requireId(mutation.sourceClientId(), "sourceClientId"));
-        ClientAccount target = findTenantClient(context, requireId(mutation.targetClientId(), "targetClientId"));
+        context = authority.current(context);
+        long sourceId = requireId(mutation.sourceClientId(), "sourceClientId"), targetId = requireId(mutation.targetClientId(), "targetClientId");
+        Map<Long, ClientAccount> current = clientAccountRepository.lockCurrentAll(List.of(sourceId, targetId), context.tenant().tenantId());
+        ClientAccount source = current.get(sourceId), target = current.get(targetId);
+        if (source == null || target == null || !context.isAdmin() && !context.username().equals(normalizeOwner(source.getOwnerUsername())))
+            throw new IllegalArgumentException("client not found");
         if (source.getId().equals(target.getId())) {
             throw new IllegalArgumentException("source and target cannot be the same client");
         }
         if (!context.isAdmin() && !normalizeOwner(target.getOwnerUsername()).equals(context.username())) {
             throw new IllegalArgumentException("普通用户不能创建跨用户 peer ACL");
         }
-        PeerMeshAcl acl = aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(
-                context.tenant().tenantId(), source.getId(), target.getId()).orElseGet(PeerMeshAcl::new);
-        if (acl.getId() == null) {
-            acl.setId(ClientIdGenerator.newId());
-            acl.setTenantId(context.tenant().tenantId());
-            acl.setCreatedAt(Instant.now().toString());
-        }
+        PeerMeshAcl acl = new PeerMeshAcl();
+        acl.setId(ClientIdGenerator.newId());
+        acl.setTenantId(context.tenant().tenantId());
+        acl.setCreatedAt(Instant.now().toString());
         acl.setOwnerUsername(context.username());
         acl.setSourceClientId(source.getId());
         acl.setSourceClientName(source.getClientName());
@@ -335,23 +336,27 @@ public class PeerMeshService {
         acl.setTargetClientName(target.getClientName());
         acl.setAllowed(mutation.allowed() == null || mutation.allowed());
         if (mutation.direction() != null) {
-            String dir = mutation.direction().toUpperCase();
+            String dir = mutation.direction().toUpperCase(java.util.Locale.ROOT);
             if (!"OUTBOUND".equals(dir) && !"INBOUND".equals(dir) && !"BOTH".equals(dir)) {
                 throw new IllegalArgumentException("invalid direction: " + mutation.direction());
             }
             acl.setDirection(dir);
         }
         acl.setUpdatedAt(Instant.now().toString());
-        return toAclView(aclRepository.save(acl));
+        return toAclView(aclRepository.upsertCurrent(acl, mutation.direction() != null));
     }
 
     @Transactional
     public void deleteAcl(ManagementContext context, long id) {
-        PeerMeshAcl acl = aclRepository.findById(id)
-                .filter(row -> row.getTenantId().equals(context.tenant().tenantId()))
-                .filter(row -> context.isAdmin() || row.getOwnerUsername().equals(context.username()))
+        ManagementContext actor = authority.current(context);
+        PeerMeshAcl hint = aclRepository.findById(id).filter(row -> row.getTenantId().equals(actor.tenant().tenantId()))
                 .orElseThrow(() -> new IllegalArgumentException("peer ACL not found: " + id));
-        aclRepository.delete(acl);
+        clientAccountRepository.lockCurrentAll(List.of(hint.getSourceClientId(), hint.getTargetClientId()), actor.tenant().tenantId());
+        PeerMeshAcl acl = aclRepository.lockCurrent(id, actor.tenant().tenantId())
+                .filter(row -> Objects.equals(row.getSourceClientId(), hint.getSourceClientId()) && Objects.equals(row.getTargetClientId(), hint.getTargetClientId()))
+                .filter(row -> actor.isAdmin() || row.getOwnerUsername().equals(actor.username()))
+                .orElseThrow(() -> new IllegalArgumentException("peer ACL not found: " + id));
+        aclRepository.deleteCurrent(acl.getId(), actor.tenant().tenantId());
     }
 
     @Transactional(readOnly = true)
@@ -399,7 +404,11 @@ public class PeerMeshService {
 
     @Transactional
     public PeerSessionGrant createSession(ClientAccount source, ClientAccount target, String pathType) {
-        if (!canPeer(source, target)) {
+        if (source == null || target == null || source.getTenantId() == null || !source.getTenantId().equals(target.getTenantId()))
+            throw new IllegalArgumentException("peer access denied");
+        Map<Long, ClientAccount> current = clientAccountRepository.lockCurrentAll(List.of(source.getId(), target.getId()), source.getTenantId());
+        source = current.get(source.getId()); target = current.get(target.getId());
+        if (!canPeerLocked(source, target)) {
             throw new IllegalArgumentException("peer access denied");
         }
         Instant now = Instant.now();
@@ -424,6 +433,17 @@ public class PeerMeshService {
         PeerMeshSession saved = sessionRepository.save(session);
         sessionTokenCache.put(saved.getId(), token);
         return new PeerSessionGrant(toSessionView(saved), token);
+    }
+
+    private boolean canPeerLocked(ClientAccount source, ClientAccount target) {
+        if (source == null || target == null || !source.isEnabled() || !target.isEnabled()) return false;
+        if (!deviceRepository.lockCurrent(source.getTenantId(), source.getId()).map(PeerMeshDevice::isEnabled).orElse(false)
+                || !deviceRepository.lockCurrent(target.getTenantId(), target.getId()).map(PeerMeshDevice::isEnabled).orElse(false)) return false;
+        if (normalizeOwner(source.getOwnerUsername()).equals(normalizeOwner(target.getOwnerUsername()))) return true;
+        return aclRepository.lockPair(source.getTenantId(), source.getId(), target.getId()).filter(PeerMeshAcl::isAllowed)
+                .filter(acl -> "OUTBOUND".equals(acl.getDirection()) || "BOTH".equals(acl.getDirection())).isPresent()
+                || aclRepository.lockPair(source.getTenantId(), target.getId(), source.getId()).filter(PeerMeshAcl::isAllowed)
+                .filter(acl -> "INBOUND".equals(acl.getDirection()) || "BOTH".equals(acl.getDirection())).isPresent();
     }
 
     private Optional<PeerSessionGrant> reusableSessionGrant(ClientAccount source, ClientAccount target, Instant now) {
