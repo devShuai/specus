@@ -1921,4 +1921,18 @@ int st_storage_transfer_owner(const char *path, const st_storage_management_acto
     const char *request, long long now_ms, st_storage_owner_transfer_result *out, const char **code);
 void st_storage_owner_transfer_result_free(st_storage_owner_transfer_result *result);
 
+/* Committed audit rows are the durable, ordered ownership-change journal. Each
+ * runtime instance has its own cursor; reading never acknowledges for other instances. */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    st_storage_peer_close *closed;
+    size_t closed_count;
+} st_storage_owner_transfer_event;
+int st_storage_owner_transfer_last_id(const char *path, long long *id);
+/* 1 = next committed event, 0 = none, -1 = unreadable/malformed (do not advance). */
+int st_storage_owner_transfer_next(const char *path, long long after,
+                                   st_storage_owner_transfer_event *event);
+void st_storage_owner_transfer_event_free(st_storage_owner_transfer_event *event);
+
 #endif

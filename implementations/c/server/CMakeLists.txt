@@ -451,6 +451,12 @@ target_compile_definitions(specus_c_owner_transfer_tests PRIVATE
 add_test(NAME owner_transfer_tests COMMAND specus_c_owner_transfer_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(owner_transfer_tests PROPERTIES TIMEOUT 120)
 
+add_executable(specus_c_owner_transfer_runtime_tests tests/owner_transfer_runtime_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_owner_transfer_runtime_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_owner_transfer_runtime_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME owner_transfer_runtime_tests COMMAND specus_c_owner_transfer_runtime_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(owner_transfer_runtime_tests PROPERTIES TIMEOUT 60)
+
 add_library(specus_c_auth_read_barrier SHARED tests/auth_read_barrier.c)
 target_link_libraries(specus_c_auth_read_barrier PRIVATE SQLite::SQLite3 ${CMAKE_DL_LIBS})
 target_compile_options(specus_c_auth_read_barrier PRIVATE -Wall -Wextra -Wpedantic)

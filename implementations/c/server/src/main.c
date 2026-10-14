@@ -3129,6 +3129,7 @@ static peer_mesh_maintenance_state peer_mesh_maintenance = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .condition = PTHREAD_COND_INITIALIZER
 };
+static st_peer_mesh_owner_cursor peer_owner_cursor;
 
 static time_t maintenance_interval_seconds(const char *name, long long fallback_ms)
 {
@@ -3190,6 +3191,8 @@ static void *peer_mesh_maintenance_thread(void *unused)
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
         if (st_peer_mesh_drain_client_deletions(&runtime) != 0)
             fprintf(stderr, "[peer-mesh] deleted client notification failed; retrying\n");
+        if (peer_owner_cursor.initialized && st_peer_mesh_owner_changes_drain(&runtime, &peer_owner_cursor) != 0)
+            fprintf(stderr, "[peer-mesh] ownership-change notification failed; cursor retained for retry\n");
         st_admin_http_share_tick();
         time_t now = time(NULL);
         if (now >= peer_mesh_maintenance.next_catalog_expiry) {
@@ -5550,6 +5553,15 @@ int main(void)
         config_release_routes(&config);
         st_public_discovery_shutdown();
         return 1;
+    }
+    /* Bookmark before any listener can accept a local client: every later committed
+     * event is consumed independently by this instance, even if another instance wrote it. */
+    /* DB-less Redis discovery/TLS and disabled Peer Mesh must not acquire a new
+     * storage dependency just because ownership transfers now have a journal. */
+    if (config.database_path[0] != '\0' && env_bool("SPECUS_PEER_MESH_ENABLED", 0)
+        && st_peer_mesh_owner_changes_init(config.database_path, &peer_owner_cursor) != 0) {
+        fprintf(stderr, "ownership-change journal initialization failed\n");
+        config_release_routes(&config); st_public_discovery_shutdown(); return 1;
     }
     st_stun_turn_server *stun_turn_server = NULL;
     if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {

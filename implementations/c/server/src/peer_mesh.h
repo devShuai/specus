@@ -13,6 +13,8 @@ typedef int (*st_peer_mesh_online_fn)(void *ctx,
                                       const char *client_name);
 
 typedef struct {
+    /* send/online are invoked under the snapshot delivery fence. They must not
+     * re-enter control/login/logout/refresh or ownership-drain dispatch. */
     const char *database_path;
     st_peer_mesh_send_fn send;
     st_peer_mesh_online_fn online;
@@ -59,6 +61,17 @@ int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
 int st_peer_mesh_queue_client_deleted(const st_storage_client *client,
                                       const st_storage_peer_close *closed, size_t closed_count);
 int st_peer_mesh_drain_client_deletions(const st_peer_mesh_runtime *runtime);
+typedef struct {
+    char database_path[512];
+    long long after_id;
+    int initialized;
+} st_peer_mesh_owner_cursor;
+/* Initialize BEFORE accepting any local clients. Historical events are already
+ * reflected in their fresh login snapshots. Caller serializes each instance's cursor. */
+int st_peer_mesh_owner_changes_init(const char *database_path, st_peer_mesh_owner_cursor *cursor);
+/* At-least-once delivery; advance only after all local close/config/catalog sends
+ * succeed. No deletion or withdrawal of the transferred publisher's live catalogue. */
+int st_peer_mesh_owner_changes_drain(const st_peer_mesh_runtime *runtime, st_peer_mesh_owner_cursor *cursor);
 int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
                                    const char *client_name);
 int st_peer_mesh_expire_catalogs(const st_peer_mesh_runtime *runtime);

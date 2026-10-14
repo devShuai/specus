@@ -90,6 +90,10 @@ typedef struct {
 
 static pm_catalog peer_catalogs[ST_PEER_MESH_MAX_CATALOGS];
 static pthread_mutex_t peer_catalog_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Serialize snapshot construction AND delivery, not just database reads. Otherwise
+ * an older peer-config/roster may arrive after the committed ownership refresh.
+ * Runtime send/online callbacks must not re-enter these dispatch operations. */
+static pthread_mutex_t peer_snapshot_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct pm_client_deletion {
     st_storage_client client;
@@ -528,7 +532,7 @@ static int pm_handle_report(const st_peer_mesh_runtime *runtime,
     return rc;
 }
 
-int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
+static int pm_handle_control_impl(const st_peer_mesh_runtime *runtime,
                                 const char *authenticated_client_name,
                                 const char *target_client_name,
                                 const char *message)
@@ -1558,7 +1562,7 @@ static int pm_prepare_deleted_catalogs(pm_client_deletion *item)
     return 0;
 }
 
-static char *pm_deleted_close_message(const st_storage_peer_close *closed)
+static char *pm_closed_session_message(const st_storage_peer_close *closed, const char *reason)
 {
     pm_builder builder = {0};
     if (pm_appendf(&builder, "{\"type\":\"close\",\"sessionId\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":",
@@ -1566,7 +1570,9 @@ static char *pm_deleted_close_message(const st_storage_peer_close *closed)
         || pm_append_json_string(&builder, closed->source_client_name) != 0
         || pm_appendf(&builder, ",\"targetClientId\":%lld,\"targetClientName\":", closed->target_client_id) != 0
         || pm_append_json_string(&builder, closed->target_client_name) != 0
-        || pm_appendf(&builder, ",\"status\":\"CLOSED\",\"reason\":\"client-deleted\",\"createdAtMillis\":%lld}",
+        || pm_append(&builder, ",\"status\":\"CLOSED\",\"reason\":") != 0
+        || pm_append_json_string(&builder, reason) != 0
+        || pm_appendf(&builder, ",\"createdAtMillis\":%lld}",
                       (long long)time(NULL) * 1000LL) != 0) {
         free(builder.data);
         return NULL;
@@ -1589,7 +1595,7 @@ static int pm_dispatch_deleted_client(const st_peer_mesh_runtime *runtime, pm_cl
             const st_storage_peer_close *closed = &item->closed[j];
             if (strcmp(closed->tenant_id, recipient->tenant_id) != 0
                 || (closed->source_client_id != recipient->id && closed->target_client_id != recipient->id)) continue;
-            char *message = pm_deleted_close_message(closed);
+            char *message = pm_closed_session_message(closed, "client-deleted");
             if (message == NULL || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
             free(message);
         }
@@ -2363,7 +2369,7 @@ static int pm_handle_egress_report(const st_peer_mesh_runtime *runtime,
     return st_storage_upsert_peer_mesh_egress_activity(runtime->database_path, &row);
 }
 
-int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
+static int pm_push_on_login_impl(const st_peer_mesh_runtime *runtime,
                                const char *client_name)
 {
     if (runtime == NULL || runtime->database_path == NULL || runtime->send == NULL
@@ -2403,7 +2409,7 @@ int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
  * Called after the session has been removed from the active list, so the rosters built here count
  * the client as offline. A client already back on a newer session was announced by that login and
  * is left alone. */
-int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
+static int pm_push_on_logout_impl(const st_peer_mesh_runtime *runtime,
                                 const char *client_name)
 {
     if (runtime == NULL || runtime->database_path == NULL || runtime->send == NULL
@@ -2426,7 +2432,7 @@ int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
     return 0;
 }
 
-int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
+static int pm_refresh_tenant_impl(const st_peer_mesh_runtime *runtime,
                                 const char *tenant_id)
 {
     if (runtime == NULL || runtime->database_path == NULL || runtime->send == NULL
@@ -2473,4 +2479,85 @@ int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime,
     }
     free(snapshots);
     return rc;
+}
+
+int st_peer_mesh_owner_changes_init(const char *database_path, st_peer_mesh_owner_cursor *cursor)
+{
+    if (cursor == NULL) return -1;
+    memset(cursor, 0, sizeof(*cursor));
+    if (database_path == NULL || *database_path == '\0' || strlen(database_path) >= sizeof(cursor->database_path)
+        || st_storage_owner_transfer_last_id(database_path, &cursor->after_id) != 0) return -1;
+    strcpy(cursor->database_path, database_path); cursor->initialized = 1; return 0;
+}
+
+static int pm_dispatch_owner_change(const st_peer_mesh_runtime *runtime, const st_storage_owner_transfer_event *event)
+{
+    /* Maintenance must not block behind an in-flight network send. Retain this
+     * event and retry after the previous snapshot finishes; never acknowledge it. */
+    if (pthread_mutex_trylock(&peer_snapshot_dispatch_lock) != 0) return -1;
+    st_storage_client *clients = NULL; size_t count = 0;
+    if (st_storage_list_all_clients(runtime->database_path, &clients, &count) != 0) {
+        pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return -1;
+    }
+    int rc = 0;
+    for (size_t i = 0; i < event->closed_count; ++i) {
+        const st_storage_peer_close *closed = &event->closed[i];
+        long long endpoints[] = {closed->source_client_id, closed->target_client_id};
+        char *message = pm_closed_session_message(closed, "owner-transferred");
+        if (message == NULL) { rc = -1; break; }
+        for (size_t n = 0; n < 2; ++n) {
+            const st_storage_client *recipient = pm_find_client_by_id(clients, count, endpoints[n]);
+            if (recipient == NULL || strcmp(recipient->tenant_id, event->tenant_id) != 0
+                || !runtime->online(runtime->ctx, recipient->id, recipient->client_name)) continue;
+            if (runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
+        }
+        free(message);
+    }
+    free(clients);
+    if (pm_refresh_tenant_impl(runtime, event->tenant_id) != 0) rc = -1;
+    pthread_mutex_unlock(&peer_snapshot_dispatch_lock);
+    return rc;
+}
+
+int st_peer_mesh_owner_changes_drain(const st_peer_mesh_runtime *runtime, st_peer_mesh_owner_cursor *cursor)
+{
+    if (runtime == NULL || runtime->database_path == NULL || runtime->send == NULL || runtime->online == NULL
+        || cursor == NULL || !cursor->initialized || strcmp(runtime->database_path, cursor->database_path) != 0) return -1;
+    if (!pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)) return 0;
+    for (size_t n = 0; n < 64; ++n) {
+        st_storage_owner_transfer_event event = {0};
+        int found = st_storage_owner_transfer_next(runtime->database_path, cursor->after_id, &event);
+        if (found <= 0) return found;
+        int rc = pm_dispatch_owner_change(runtime, &event);
+        if (rc == 0) cursor->after_id = event.id;
+        st_storage_owner_transfer_event_free(&event);
+        if (rc != 0) return -1;
+    }
+    return 0;
+}
+
+int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime, const char *authenticated_client_name,
+                                const char *target_client_name, const char *message)
+{
+    pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    int rc = pm_handle_control_impl(runtime, authenticated_client_name, target_client_name, message);
+    pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return rc;
+}
+int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime, const char *client_name)
+{
+    pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    int rc = pm_push_on_login_impl(runtime, client_name);
+    pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return rc;
+}
+int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime, const char *client_name)
+{
+    pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    int rc = pm_push_on_logout_impl(runtime, client_name);
+    pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return rc;
+}
+int st_peer_mesh_refresh_tenant(const st_peer_mesh_runtime *runtime, const char *tenant_id)
+{
+    pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    int rc = pm_refresh_tenant_impl(runtime, tenant_id);
+    pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return rc;
 }

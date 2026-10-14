@@ -13006,6 +13006,81 @@ void st_storage_owner_transfer_result_free(st_storage_owner_transfer_result *res
     memset(result, 0, sizeof(*result));
 }
 
+void st_storage_owner_transfer_event_free(st_storage_owner_transfer_event *event)
+{
+    if (event == NULL) return;
+    free(event->closed); memset(event, 0, sizeof(*event));
+}
+
+int st_storage_owner_transfer_last_id(const char *path, long long *id)
+{
+    if (id == NULL) return -1;
+    *id = 0; sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(id),0) FROM client_owner_transfer_audit", -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_INTEGER ? 0 : -1;
+    long long staged = rc == 0 ? sqlite3_column_int64(stmt, 0) : -1;
+    sqlite3_finalize(stmt); sqlite3_close(db);
+    if (rc == 0 && staged >= 0) *id = staged;
+    else rc = -1;
+    return rc;
+}
+
+static int owner_transfer_event_text(const char *json, const char *field, char *out, size_t capacity)
+{
+    char *raw = st_json_get_top_level_raw(json, field); size_t length = 0;
+    char *decoded = raw == NULL ? NULL : st_json_decode_string(raw, &length);
+    int rc = decoded != NULL && length < capacity && memchr(decoded, '\0', length) == NULL ? 0 : -1;
+    if (rc == 0) memcpy(out, decoded, length + 1U);
+    free(raw); free(decoded); return rc;
+}
+
+int st_storage_owner_transfer_next(const char *path, long long after, st_storage_owner_transfer_event *event)
+{
+    if (event == NULL || event->closed != NULL || event->closed_count != 0) return -1;
+    memset(event, 0, sizeof(*event));
+    if (after < 0) return -1;
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    st_storage_owner_transfer_event staged = {0}; char **rows = NULL; size_t count = 0;
+    int rc = sqlite3_prepare_v2(db, "SELECT id,tenant_id,payload_json FROM client_owner_transfer_audit WHERE id>? ORDER BY id LIMIT 1", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc != 0) goto done;
+    sqlite3_bind_int64(stmt, 1, after);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_DONE) goto done;
+    rc = -1;
+    if (step != SQLITE_ROW || sqlite3_column_type(stmt, 0) != SQLITE_INTEGER) goto done;
+    staged.id = sqlite3_column_int64(stmt, 0);
+    if (staged.id <= after || copy_text_column(stmt, 1, staged.tenant_id, sizeof(staged.tenant_id)) != 0
+        || staged.tenant_id[0] == '\0') goto done;
+    const char *payload = (const char *)sqlite3_column_text(stmt, 2);
+    int payload_length = sqlite3_column_bytes(stmt, 2); char tenant[64];
+    if (payload == NULL || payload_length <= 0 || memchr(payload, '\0', (size_t)payload_length) != NULL
+        || !st_json_is_valid_object(payload)
+        || owner_transfer_event_text(payload, "tenantId", tenant, sizeof(tenant)) != 0
+        || strcmp(tenant, staged.tenant_id) != 0
+        || st_json_get_raw_array(payload, "closedPeerSessions", &rows, &count) != 0
+        || count > SIZE_MAX / sizeof(*staged.closed)) goto done;
+    if (count != 0 && (staged.closed = calloc(count, sizeof(*staged.closed))) == NULL) goto done;
+    staged.closed_count = count;
+    for (size_t i = 0; i < count; ++i) {
+        st_storage_peer_close *closed = &staged.closed[i];
+        if (!st_json_is_valid_object(rows[i]) || st_json_get_i64(rows[i], "id", &closed->id) != 0
+            || st_json_get_i64(rows[i], "sourceClientId", &closed->source_client_id) != 0
+            || st_json_get_i64(rows[i], "targetClientId", &closed->target_client_id) != 0
+            || closed->id <= 0 || (i != 0 && closed->id <= staged.closed[i-1].id)
+            || closed->source_client_id <= 0 || closed->target_client_id <= 0
+            || closed->source_client_id == closed->target_client_id
+            || owner_transfer_event_text(rows[i], "sourceClientName", closed->source_client_name, sizeof(closed->source_client_name)) != 0
+            || owner_transfer_event_text(rows[i], "targetClientName", closed->target_client_name, sizeof(closed->target_client_name)) != 0) goto done;
+        strcpy(closed->tenant_id, staged.tenant_id);
+    }
+    *event = staged; memset(&staged, 0, sizeof(staged)); rc = 1;
+done:
+    st_json_free_string_array(rows, count); st_storage_owner_transfer_event_free(&staged);
+    sqlite3_finalize(stmt); sqlite3_close(db); return rc;
+}
+
 static int owner_transfer_scalar(sqlite3 *db, const char *sql, long long *value)
 {
     sqlite3_stmt *stmt = NULL;
