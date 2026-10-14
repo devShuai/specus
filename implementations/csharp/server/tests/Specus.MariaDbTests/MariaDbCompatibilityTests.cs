@@ -22,13 +22,18 @@ public sealed class MariaDbCompatibilityTests
     public async Task OriginalDriverFailureAndBootstrapOnlyMetadataAdaptationAreReal()
     {
         await using var database = await OwnedDatabase.CreateAsync();
-        // The pinned regression fixture has generic UCA rows with NULL IDs. This is
-        // the original provider failure, not a mocked or swallowed application error.
-        var original = new MySqlConnectionStringBuilder(database.ConnectionString) { CommandInterceptors = "" };
+        // Some MariaDB builds automatically mask NULL IDs for Connector/NET. Expose
+        // the real underlying metadata on ONLY these test connections, without
+        // mocking reader results or relying on an OS-specific handshake heuristic.
+        var testHook = typeof(UnmaskedMariaDbMetadataInterceptor);
+        var original = new MySqlConnectionStringBuilder(database.ConnectionString)
+        {
+            CommandInterceptors = $"{testHook.FullName}, {testHook.Assembly.GetName().Name}",
+        };
         await using (var raw = new MySqlConnection(original.ConnectionString))
             await Assert.ThrowsAsync<InvalidCastException>(() => raw.OpenAsync());
 
-        await using var connection = new MySqlConnection(database.ConnectionString);
+        await using var connection = new MySqlConnection(MySqlDatabaseCompatibility.PrepareConnectionString(original.ConnectionString));
         await connection.OpenAsync();
         Assert.True(await NullCollationsAsync(connection) > 0, "Ordinary SHOW COLLATION must retain MariaDB's NULL mappings after Open.");
         await using var command = connection.CreateCommand();
@@ -62,6 +67,13 @@ public sealed class MariaDbCompatibilityTests
             for (int iteration = 0; iteration < 5; iteration++)
             {
                 if (iteration % 2 == 0) connection.Open(); else await connection.OpenAsync();
+                // Real user SQL after Open: the production hook must not re-mask
+                // or filter subsequent ordinary metadata queries on either OS.
+                using (var unmask = connection.CreateCommand())
+                {
+                    unmask.CommandText = "SET SESSION old_mode=''";
+                    unmask.ExecuteNonQuery();
+                }
                 int nulls = await NullCollationsAsync(connection);
                 Assert.True(nulls > 0);
                 expectedNulls ??= nulls;
@@ -104,6 +116,24 @@ public sealed class MariaDbCompatibilityTests
             Assert.Equal(before, await ReadAsync(db, id));
             Assert.False(db.Database.HasPendingModelChanges());
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProductionStartupCreatesAMissingDatabaseAndPreservesUnicode(bool quotedName)
+    {
+        await using var database = await OwnedDatabase.CreateAsync(create: false, quotedName: quotedName);
+        string serverCharset = await database.ServerCharsetAsync();
+        await using var server = await StartAsync(database);
+        using var client = server.CreateClient();
+        using var health = await client.GetAsync("/health");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        await using var scope = server.HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        Assert.Contains(Repair, await db.Database.GetAppliedMigrationsAsync());
+        await InsertMaximumAsync(db);
+        Assert.Equal(serverCharset, await database.ServerCharsetAsync());
     }
 
     [Fact]
@@ -304,6 +334,15 @@ public sealed class MariaDbCompatibilityTests
     {
         public string ConnectionString { get; } = connectionString;
 
+        public async Task<string> ServerCharsetAsync()
+        {
+            await using var connection = new MySqlConnection(adminConnection);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT @@character_set_server";
+            return Convert.ToString(await command.ExecuteScalarAsync())!;
+        }
+
         public SpecusDbContext Context()
         {
             var options = new DbContextOptionsBuilder<SpecusDbContext>();
@@ -311,7 +350,7 @@ public sealed class MariaDbCompatibilityTests
             return new SpecusDbContext(options.Options);
         }
 
-        public static async Task<OwnedDatabase> CreateAsync()
+        public static async Task<OwnedDatabase> CreateAsync(bool create = true, bool quotedName = false)
         {
             var configured = Environment.GetEnvironmentVariable("SPECUS_TEST_MARIADB_CONNECTION");
             Assert.False(string.IsNullOrWhiteSpace(configured), "SPECUS_TEST_MARIADB_CONNECTION must point to an owned loopback test MariaDB; these tests never skip.");
@@ -328,20 +367,29 @@ public sealed class MariaDbCompatibilityTests
                 var actual = Convert.ToString(await command.ExecuteScalarAsync())!;
                 Assert.Equal(Path.GetFullPath(expected).TrimEnd('/', '\\'), Path.GetFullPath(actual).TrimEnd('/', '\\'), ignoreCase: OperatingSystem.IsWindows());
             }
-            string name = "specus_277_" + Guid.NewGuid().ToString("N");
-            command.CommandText = $"CREATE DATABASE `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
-            await command.ExecuteNonQueryAsync();
+            string name = "specus_277_" + Guid.NewGuid().ToString("N") + (quotedName ? "`quoted" : "");
+            if (create)
+            {
+                command.CommandText = $"CREATE DATABASE `{name.Replace("`", "``", StringComparison.Ordinal)}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
+                await command.ExecuteNonQueryAsync();
+            }
+            else
+            {
+                command.CommandText = "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name=@name";
+                command.Parameters.AddWithValue("@name", name);
+                Assert.Equal(0, Convert.ToInt64(await command.ExecuteScalarAsync()));
+            }
             settings.Database = name;
             return new OwnedDatabase(admin, name, MySqlDatabaseCompatibility.PrepareConnectionString(settings.ConnectionString));
         }
 
         public async ValueTask DisposeAsync()
         {
-            if (!Regex.IsMatch(name, "^specus_277_[0-9a-f]{32}$", RegexOptions.CultureInvariant)) throw new InvalidOperationException("Refuse to drop an unowned database.");
+            if (!Regex.IsMatch(name, "^specus_277_[0-9a-f]{32}(?:`quoted)?$", RegexOptions.CultureInvariant)) throw new InvalidOperationException("Refuse to drop an unowned database.");
             await using var connection = new MySqlConnection(adminConnection);
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
-            command.CommandText = $"DROP DATABASE `{name}`";
+            command.CommandText = $"DROP DATABASE IF EXISTS `{name.Replace("`", "``", StringComparison.Ordinal)}`";
             await command.ExecuteNonQueryAsync();
         }
     }

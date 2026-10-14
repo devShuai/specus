@@ -260,9 +260,9 @@ jobs:
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mariadb-results/mariadb-compatibility.trx'
           counters = ET.parse(path).getroot().find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 10), ('executed', 10), ('passed', 10), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all ten real MariaDB cases executed and passed; zero skipped.')
+          print('Verified all twelve real MariaDB cases executed and passed; zero skipped.')
           PY
 
       - name: Keep real MariaDB results

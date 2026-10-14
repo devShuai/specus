@@ -42,7 +42,21 @@ public sealed class MySqlDatabaseCompatibilityTests
         MySqlDatabaseCompatibility.Configure(builder, "server=localhost;database=proof");
         var interceptors = builder.Options.FindExtension<CoreOptionsExtension>()!.Interceptors!;
         Assert.Single(interceptors.OfType<MariaDbMigrationLockInterceptor>());
+        Assert.Single(interceptors.OfType<MariaDbDatabaseCreationInterceptor>());
         using var db = new SpecusDbContext(builder.Options);
+        Assert.False(db.Database.HasPendingModelChanges());
+    }
+
+    [Fact]
+    public void QuotedDatabaseNamesUseOneCreationHookWithoutModelDrift()
+    {
+        var settings = new MySqlConnectionStringBuilder { Server = "localhost", Database = "fresh`database" };
+        var builder = new DbContextOptionsBuilder<SpecusDbContext>();
+        MySqlDatabaseCompatibility.Configure(builder, settings.ConnectionString);
+        MySqlDatabaseCompatibility.Configure(builder, settings.ConnectionString);
+        Assert.Single(builder.Options.FindExtension<CoreOptionsExtension>()!.Interceptors!.OfType<MariaDbDatabaseCreationInterceptor>());
+        using var db = new SpecusDbContext(builder.Options);
+        Assert.Equal(settings.Database, db.Database.GetDbConnection().Database);
         Assert.False(db.Database.HasPendingModelChanges());
     }
 

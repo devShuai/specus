@@ -32,5 +32,9 @@ public static class MySqlDatabaseCompatibility
         var existing = options.Options.FindExtension<CoreOptionsExtension>()?.Interceptors;
         if (existing?.Contains(MariaDbMigrationLockInterceptor.Instance) != true)
             options.AddInterceptors(MariaDbMigrationLockInterceptor.Instance);
+        string databaseName = new MySqlConnectionStringBuilder(connectionString).Database;
+        if (!string.IsNullOrWhiteSpace(databaseName)
+            && existing?.OfType<MariaDbDatabaseCreationInterceptor>().Any(value => value.DatabaseName == databaseName) != true)
+            options.AddInterceptors(new MariaDbDatabaseCreationInterceptor(databaseName));
     }
 }
