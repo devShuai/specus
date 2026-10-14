@@ -12,6 +12,13 @@ public final class FirstLoginRetry {
     @FunctionalInterface interface Sleeper { void sleep(long millis) throws InterruptedException; }
 
     public static <T> T login(Duration budget, Function<Duration, T> attempt, Consumer<String> diagnostic) {
+        return login(budget, (remaining, cancelled) -> attempt.apply(remaining), diagnostic);
+    }
+
+    /** A cancellation predicate also survives preparation that swallows Thread.interrupt(). */
+    public static <T> T login(Duration budget,
+                             java.util.function.BiFunction<Duration, java.util.function.BooleanSupplier, T> attempt,
+                             Consumer<String> diagnostic) {
         if (budget.isZero() || budget.isNegative()) throw new IllegalArgumentException("Login budget must be positive");
         if (Thread.currentThread().isInterrupted()) throw interrupted();
         // HttpClient.build() can synchronously load the platform TLS trust store before
@@ -25,14 +32,18 @@ public final class FirstLoginRetry {
             return worker;
         });
         long started = System.nanoTime();
-        var pending = executor.submit(() -> login(budget, attempt, diagnostic, System::nanoTime, Thread::sleep));
+        var cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.function.BooleanSupplier expired = () -> cancelled.get()
+                || System.nanoTime() - started >= budget.toNanos();
+        var pending = executor.submit(() -> login(budget, remaining -> attempt.apply(remaining, expired),
+                diagnostic, System::nanoTime, Thread::sleep));
         try {
             long remaining = budget.toNanos() - (System.nanoTime() - started);
             if (remaining <= 0) throw exhausted();
             return pending.get(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
         } catch (java.util.concurrent.TimeoutException timeout) {
             throw exhausted();
-        } catch (InterruptedException cancelled) {
+        } catch (InterruptedException interruptedWait) {
             Thread.currentThread().interrupt();
             throw interrupted();
         } catch (java.util.concurrent.ExecutionException failed) {
@@ -40,6 +51,7 @@ public final class FirstLoginRetry {
             if (failed.getCause() instanceof Error error) throw error;
             throw new IllegalStateException("Unexpected initial HTTP login failure", failed.getCause());
         } finally {
+            cancelled.set(true);
             pending.cancel(true);
             // ExecutorService.close() waits for uncooperative preparation, undoing the bound.
             executor.shutdownNow();

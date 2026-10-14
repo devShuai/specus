@@ -136,7 +136,8 @@ public class SpecusClientApplication {
     public SpecusBean specusBean(ClientStartupConfig startupConfig,
             @Value("${specus.cli.login-timeout:60}") int loginTimeoutSeconds, CliState cliState) {
         return FirstLoginRetry.login(Duration.ofSeconds(loginTimeoutSeconds),
-                remaining -> loginAndBuildSpecus(startupConfig, remaining), message -> log.warn("{}", message));
+                (remaining, cancelled) -> loginAndBuildSpecus(startupConfig, remaining, cancelled),
+                message -> log.warn("{}", message));
     }
 
     @Bean(destroyMethod = "close")
@@ -177,6 +178,11 @@ public class SpecusClientApplication {
     }
 
     public static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig, Duration timeout) {
+        return loginAndBuildSpecus(startupConfig, timeout, () -> false);
+    }
+
+    private static SpecusBean loginAndBuildSpecus(ClientStartupConfig startupConfig, Duration timeout,
+                                                 java.util.function.BooleanSupplier cancelled) {
         long attemptStarted = System.nanoTime();
         ClientEnvironmentInfo environment = collectEnvironment();
         ClientAuthLoginRequest loginRequest = new ClientAuthLoginRequest();
@@ -200,11 +206,12 @@ public class SpecusClientApplication {
         ));
 
         Duration remaining = timeout.minusNanos(System.nanoTime() - attemptStarted);
-        if (Thread.currentThread().isInterrupted())
+        if (cancelled.getAsBoolean() || Thread.currentThread().isInterrupted())
             throw new HttpLoginFailure("HTTP login cancelled.", false);
         if (remaining.isNegative() || remaining.isZero())
             throw new HttpLoginFailure("HTTP login preparation exceeded the request budget.", true);
-        ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest, remaining);
+        ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest, remaining,
+                loginClientFactory(remaining), cancelled);
         SpecusBean specusBean = new SpecusBean();
         specusBean.setClientName(response.getClientName());
         specusBean.setClientSessionId(response.getClientSessionId());
@@ -237,13 +244,18 @@ public class SpecusClientApplication {
     }
 
     static ClientAuthLoginResponse postLogin(ClientStartupConfig startupConfig, ClientAuthLoginRequest loginRequest, Duration timeout) {
-        return postLogin(startupConfig, loginRequest, timeout, () -> HttpClient.newBuilder()
+        return postLogin(startupConfig, loginRequest, timeout, loginClientFactory(timeout), () -> false);
+    }
+
+    private static java.util.function.Supplier<HttpClient> loginClientFactory(Duration timeout) {
+        return () -> HttpClient.newBuilder()
                 .connectTimeout(timeout.compareTo(Duration.ofSeconds(10)) < 0 ? timeout : Duration.ofSeconds(10))
-                .build());
+                .build();
     }
 
     static ClientAuthLoginResponse postLogin(ClientStartupConfig startupConfig, ClientAuthLoginRequest loginRequest,
-                                             Duration timeout, java.util.function.Supplier<HttpClient> clientFactory) {
+                                             Duration timeout, java.util.function.Supplier<HttpClient> clientFactory,
+                                             java.util.function.BooleanSupplier cancelled) {
         long requestStarted = System.nanoTime();
         String url = trimTrailingSlash(startupConfig.getServerBaseUrl()) + "/api/client/auth/login";
         String body = JsonUtil.objectToString(loginRequest);
@@ -251,7 +263,8 @@ public class SpecusClientApplication {
         // A cold TLS trust-store load in build() can outlive the caller's login deadline.
         // Do not let that abandoned preparation issue a late authentication request.
         Duration preparedRemaining = timeout.minusNanos(System.nanoTime() - requestStarted);
-        if (Thread.currentThread().isInterrupted() || preparedRemaining.isNegative() || preparedRemaining.isZero()) {
+        if (cancelled.getAsBoolean() || Thread.currentThread().isInterrupted()
+                || preparedRemaining.isNegative() || preparedRemaining.isZero()) {
             httpClient.shutdownNow();
             throw new HttpLoginFailure("HTTP login preparation exceeded the request budget.", true);
         }

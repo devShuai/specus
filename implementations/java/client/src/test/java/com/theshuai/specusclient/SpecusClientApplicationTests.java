@@ -16,6 +16,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 //@SpringBootTest
 class SpecusClientApplicationTests {
+    @Test void explicitCancellationWinsOverAnOtherwiseLiveRequestBudget() {
+        var client = org.mockito.Mockito.mock(java.net.http.HttpClient.class);
+        var config = new ClientStartupConfig();
+        config.setServerBaseUrl("http://127.0.0.1:1");
+        assertThatThrownBy(() -> SpecusClientApplication.postLogin(config, new ClientAuthLoginRequest(),
+                Duration.ofSeconds(30), () -> client, () -> true))
+                .isInstanceOf(HttpLoginFailure.class)
+                .hasMessage("HTTP login preparation exceeded the request budget.");
+        org.mockito.Mockito.verify(client).shutdownNow();
+        org.mockito.Mockito.verifyNoMoreInteractions(client);
+    }
+
     @Test void abandonedTlsPreparationCannotIssueALateAuthenticationRequest() throws Exception {
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
@@ -26,7 +38,7 @@ class SpecusClientApplicationTests {
         var config = new ClientStartupConfig();
         config.setServerBaseUrl("http://127.0.0.1:1");
         try {
-            var result = caller.submit(() -> FirstLoginRetry.login(Duration.ofMillis(500), remaining -> {
+            var result = caller.submit(() -> FirstLoginRetry.login(Duration.ofMillis(500), (remaining, cancelled) -> {
                 try {
                     return SpecusClientApplication.postLogin(config, new ClientAuthLoginRequest(), remaining, () -> {
                         entered.countDown();
@@ -35,7 +47,7 @@ class SpecusClientApplicationTests {
                             catch (InterruptedException ignored) { /* TLS initialization may ignore cancellation */ }
                         }
                         return client;
-                    });
+                    }, cancelled);
                 } catch (RuntimeException failure) {
                     lateFailure.set(failure);
                     throw failure;
