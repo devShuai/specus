@@ -1346,6 +1346,9 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
                                                      int include_all_clients,
                                                      st_storage_peer_mesh_session **sessions,
                                                      size_t *session_count);
+/* Fresh endpoint binding/authorization, insert and validation share one write
+ * transaction with ownership transfer. No cached names/owners are authority;
+ * publish only after commit, clear failure output and validate even with NULL output. */
 int st_storage_create_peer_mesh_session(const char *path,
                                         const st_storage_client *source,
                                         const st_storage_client *target,

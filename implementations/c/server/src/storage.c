@@ -8707,35 +8707,85 @@ int st_storage_create_peer_mesh_session(const char *path,
                                         long long ttl_seconds,
                                         st_storage_peer_mesh_session *out_session)
 {
-    if (source == NULL || target == NULL || token_hash == NULL || ttl_seconds <= 0) return -1;
-    int allowed = 0;
-    if (st_storage_can_peer(path, source, target, &allowed) != 0 || !allowed) return -1;
+    if (source == NULL || target == NULL || source->id <= 0 || target->id <= 0
+        || source->id == target->id || token_hash == NULL || ttl_seconds <= 0) {
+        if (out_session != NULL) memset(out_session, 0, sizeof(*out_session));
+        return -1;
+    }
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
+    if (open_db(path, &db) != 0) {
+        if (out_session != NULL) memset(out_session, 0, sizeof(*out_session));
+        return -1;
+    }
+    /* Transfer and session creation must share the database writer fence: a
+     * separate permission read followed by an insert can resurrect a lost grant. */
+    st_storage_client current_source = {0}, current_target = {0};
+    st_storage_client checked_source = {0}, checked_target = {0};
+    st_storage_peer_mesh_session staged = {0};
+    int allowed = 0, rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0 && (load_client(db, source->id, &current_source) != 0
+        || load_client(db, target->id, &current_target) != 0
+        || strcmp(current_source.tenant_id, source->tenant_id) != 0
+        || strcmp(current_target.tenant_id, target->tenant_id) != 0)) rc = -1;
+    if (rc == 0 && (can_peer_on_db(db, &current_source, &current_target, &allowed) != 0 || !allowed)) rc = -1;
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
+    const char *selected_path = path_type == NULL || *path_type == '\0' ? "DIRECT" : path_type;
+    if (rc == 0) rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_session(tenant_id,source_client_id,source_client_name,target_client_id,"
         "target_client_name,path_type,status,token_hash,started_at,updated_at,expires_at) "
         "VALUES(?,?,?,?,?,?, 'NEGOTIATING',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,datetime('now',?))",
-        -1, &stmt, NULL);
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
     char ttl[64];
     snprintf(ttl, sizeof(ttl), "+%lld seconds", ttl_seconds);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, source->tenant_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 2, source->id);
-        sqlite3_bind_text(stmt, 3, source->client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 4, target->id);
-        sqlite3_bind_text(stmt, 5, target->client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 6, path_type == NULL || *path_type == '\0' ? "DIRECT" : path_type, -1, SQLITE_TRANSIENT);
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, current_source.tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, current_source.id);
+        sqlite3_bind_text(stmt, 3, current_source.client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, current_target.id);
+        sqlite3_bind_text(stmt, 5, current_target.client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, selected_path, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 7, token_hash, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 8, ttl, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-    } else rc = -1;
-    sqlite3_finalize(stmt);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    }
+    sqlite3_finalize(stmt); stmt = NULL;
     long long id = rc == 0 ? sqlite3_last_insert_rowid(db) : 0;
-    if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, source->tenant_id, id, out_session);
+    /* Even callers that discard the result must reject malformed/deleted rows or
+     * an insert trigger changing the grant, token or initial session state. */
+    if (rc == 0 && (id <= 0 || read_peer_mesh_session(db, current_source.tenant_id, id, &staged) != 0
+        || staged.source_client_id != current_source.id || staged.target_client_id != current_target.id
+        || strcmp(staged.source_client_name, current_source.client_name) != 0
+        || strcmp(staged.target_client_name, current_target.client_name) != 0
+        || strcmp(staged.path_type, selected_path) != 0 || strcmp(staged.status, "NEGOTIATING") != 0)) rc = -1;
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db,
+            "SELECT 1 FROM peer_mesh_session WHERE id=? AND token_hash=? AND closed_at IS NULL "
+            "AND started_at=updated_at AND expires_at=datetime(started_at,?) "
+            "AND rtt_millis IS NULL AND local_endpoint IS NULL AND remote_endpoint IS NULL "
+            "AND direct_bytes=0 AND relay_bytes=0 AND last_traffic_at IS NULL AND last_keepalive_at IS NULL",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, id); sqlite3_bind_text(stmt, 2, token_hash, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, ttl, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_ROW ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0 && (load_client(db, current_source.id, &checked_source) != 0
+        || load_client(db, current_target.id, &checked_target) != 0
+        || strcmp(checked_source.tenant_id, current_source.tenant_id) != 0
+        || strcmp(checked_target.tenant_id, current_target.tenant_id) != 0
+        || strcmp(checked_source.client_name, current_source.client_name) != 0
+        || strcmp(checked_target.client_name, current_target.client_name) != 0
+        || can_peer_on_db(db, &checked_source, &checked_target, &allowed) != 0 || !allowed)) rc = -1;
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     sqlite3_close(db);
-    return rc;
+    if (out_session != NULL) {
+        if (rc == 0) *out_session = staged;
+        else memset(out_session, 0, sizeof(*out_session));
+    }
+    return rc == 0 ? 0 : -1;
 }
 
 int st_storage_get_peer_mesh_session(const char *path,

@@ -1237,9 +1237,11 @@ done:
 }
 
 #include "management_ws_coordination_tests.h"
+#include "peer_session_coordination_tests.h"
 
 int main(int argc,char **argv)
 {
+    if(argc>=2 && strcmp(argv[1],"--peer-session-create")==0) return peer_session_create_child(argc,argv);
     if(argc==6 && strcmp(argv[1],"--peer-config")==0) {
         char *config=st_peer_mesh_build_login_config(argv[2],argv[3],atoi(argv[5]));
         FILE *output=fopen(argv[4],"wb");
@@ -1250,7 +1252,7 @@ int main(int argc,char **argv)
     }
     if(argc!=3)return 2;
     server_binary=argv[1];barrier_library=argv[2];signal(SIGPIPE,SIG_IGN);setvbuf(stdout,NULL,_IOLBF,0);
-    int failed=0;struct {const char *name;int(*run)(fixture *);} tests[]={
+    int failed=peer_session_port_pair_fixture();struct {const char *name;int(*run)(fixture *);} tests[]={
         {"fresh-owner",stale_owner},{"rollback-new",rollback_new},{"disabled",disabled},{"key-rotated",changed_key},{"secret-rotated",changed_secret},{"tenant-moved",changed_tenant},{"deleted",deleted},{"corrupt-existing",corrupt_existing},{"concurrent",concurrent},
         {"no-implicit-transfer",existing_owner_is_not_implicitly_transferred},{"rollback-existing",rollback_existing},{"missing-existing-client",missing_existing_client}};
     for(size_t i=0;i<sizeof(tests)/sizeof(tests[0]);++i){fixture f;int result=fresh(&f);if(!result)result=tests[i].run(&f);finish(&f);failed+=result;printf("%s storage auth coordination: %s\n",result?"FAIL":"PASS",tests[i].name);}
@@ -1287,5 +1289,9 @@ int main(int argc,char **argv)
     for(int messages=0;messages<2;++messages)
         for(int scenario=0;scenario<6;++scenario) failed+=management_post_registration(messages,scenario);
     for(int admin=0;admin<2;++admin) failed+=management_owner_visibility(admin);
+    for(int scenario=0;scenario<17;++scenario)
+        for(int null_output=0;null_output<2;++null_output) failed+=direct_peer_session_creation(scenario,null_output);
+    for(int scenario=0;scenario<3;++scenario)
+        for(int null_output=0;null_output<2;++null_output) failed+=peer_session_transfer_interleaving(scenario,null_output);
     return failed?1:0;
 }

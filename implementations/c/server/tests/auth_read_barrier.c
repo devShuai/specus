@@ -69,6 +69,8 @@ int sqlite3_step(sqlite3_stmt *stmt)
             || strstr(sql, "FROM client_account WHERE client_name = ?") != NULL)
         && sqlite3_column_int64(stmt, 0) == strtoll(client, NULL, 10)) selected_db = sqlite3_db_handle(stmt);
     /* Snapshot-fence test: pause in the real read while its transaction is held. */
+    if (rc == SQLITE_ROW && getenv("SPECUS_TEST_AUTH_BARRIER_PEER_SESSION") != NULL && sql != NULL
+        && strstr(sql, "SELECT COUNT(*) FROM peer_mesh_device ") != NULL) selected_db = sqlite3_db_handle(stmt);
     if (rc == SQLITE_ROW && getenv("SPECUS_TEST_AUTH_BARRIER_CONFIG_SNAPSHOT") != NULL && sql != NULL
         && strstr(sql, "SELECT enabled,mdns_import_enabled,updated_by,updated_at FROM peer_mesh_service_sharing") != NULL) pause_once();
     return rc;

@@ -56,6 +56,9 @@ void sleep_ms(int ms);
 
 /* Sockets */
 int pick_free_port(void);
+/* Bind both candidates simultaneously so the OS cannot hand out the first twice.
+ * Releases them before return; this is not a reservation against another process. */
+int pick_free_port_pair(int *first, int *second);
 int connect_local(int port);
 int send_all(int fd, const uint8_t *data, size_t len);
 /* 1 = filled, 0 = orderly EOF or reset, -1 = error, -2 = timed out. */

@@ -48,8 +48,10 @@ void sleep_ms(int ms)
 /* ------------------------------------------------------------------------------------------- */
 /* Sockets                                                                                       */
 
-int pick_free_port(void)
+/* Keep the socket bound until the caller has selected all of its endpoints. */
+static int reserve_free_port(int *reserved_fd)
 {
+    *reserved_fd = -1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -65,8 +67,28 @@ int pick_free_port(void)
         && getsockname(fd, (struct sockaddr *)&address, &length) == 0) {
         port = ntohs(address.sin_port);
     }
-    close(fd);
+    if (port > 0) *reserved_fd = fd;
+    else close(fd);
     return port;
+}
+
+int pick_free_port(void)
+{
+    int reserved_fd = -1;
+    int port = reserve_free_port(&reserved_fd);
+    if (reserved_fd >= 0) close(reserved_fd);
+    return port;
+}
+
+int pick_free_port_pair(int *first, int *second)
+{
+    if (first == NULL || second == NULL || first == second) return -1;
+    int first_fd = -1, second_fd = -1;
+    *first = reserve_free_port(&first_fd);
+    *second = *first > 0 ? reserve_free_port(&second_fd) : -1;
+    if (first_fd >= 0) close(first_fd);
+    if (second_fd >= 0) close(second_fd);
+    return *first > 0 && *second > 0 && *first != *second ? 0 : -1;
 }
 
 int connect_local(int port)
@@ -710,9 +732,7 @@ int server_prepare(test_server *server)
 
 int server_start(test_server *server)
 {
-    server->control_port = pick_free_port();
-    server->admin_port = pick_free_port();
-    if (server->control_port <= 0 || server->admin_port <= 0 || server->control_port == server->admin_port) {
+    if (pick_free_port_pair(&server->control_port, &server->admin_port) != 0) {
         fprintf(stderr, "server startup refused before fork: control_port=%d admin_port=%d reason=%s\n",
                 server->control_port, server->admin_port,
                 server->control_port == server->admin_port ? "ports-not-distinct" : "port-selection-failed");
