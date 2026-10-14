@@ -381,6 +381,28 @@ typedef struct {
 } st_storage_peer_mesh_service;
 
 typedef struct {
+    st_storage_peer_mesh_service service;
+    char (*allowed_peer_ips)[64];
+    size_t allowed_peer_count;
+} st_storage_peer_mesh_config_service;
+
+typedef struct {
+    st_storage_client client;
+    int has_device;
+    st_storage_peer_mesh_device device;
+    st_storage_peer_mesh_service_sharing sharing;
+    st_storage_peer_mesh_config_service *services;
+    size_t service_count;
+} st_storage_peer_mesh_config;
+
+/* Current client, optional device ensure, sharing, services and effective IP grants
+ * form one database transaction. No output or device write survives a failed snapshot.
+ * Output must be empty; release successful snapshots with the matching free function. */
+int st_storage_load_peer_mesh_config(const char *path, const st_storage_client *client,
+    int ensure_device, int include_services, st_storage_peer_mesh_config *out);
+void st_storage_peer_mesh_config_free(st_storage_peer_mesh_config *config);
+
+typedef struct {
     char at[64];
     char action[64];
     char tenant_id[64];

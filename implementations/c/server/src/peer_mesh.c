@@ -748,55 +748,24 @@ static int pm_service_allows_client(const st_storage_peer_mesh_service *service,
 }
 
 static int pm_append_allowed_peer_ips(pm_builder *builder,
-                                      const char *database_path,
-                                      const st_storage_client *publisher,
-                                      const st_storage_peer_mesh_service *service)
+                                      const st_storage_peer_mesh_config_service *service)
 {
     if (pm_append(builder, "[") != 0) return -1;
-    if (!service->enabled) return pm_append(builder, "]");
-    st_storage_client *clients = NULL;
-    size_t count = 0U;
-    if (st_storage_list_all_clients(database_path, &clients, &count) != 0) return -1;
-    int first = 1;
-    int rc = 0;
-    for (size_t i = 0; rc == 0 && i < count; ++i) {
-        st_storage_client *recipient = &clients[i];
-        int allowed = 0;
-        if (recipient->id == publisher->id
-            || strcmp(recipient->tenant_id, publisher->tenant_id) != 0
-            || !recipient->enabled
-            || st_storage_can_peer(database_path, publisher, recipient, &allowed) != 0
-            || !allowed
-            || (strcmp(service->visibility, "OWNER") == 0
-                && strcmp(recipient->owner_username, publisher->owner_username) != 0)
-            || (strcmp(service->visibility, "OWNER") != 0
-                && !pm_service_allows_client(service, recipient->id))) continue;
-        st_storage_peer_mesh_device device;
-        if (st_storage_get_peer_mesh_device_by_client(database_path, publisher->tenant_id,
-                                                       recipient->id, &device) != 0
-            || !device.enabled || device.virtual_ip[0] == '\0') continue;
-        if ((!first && pm_append(builder, ",") != 0)
-            || pm_append_json_string(builder, device.virtual_ip) != 0) rc = -1;
-        first = 0;
+    for (size_t i = 0; i < service->allowed_peer_count; ++i) {
+        if ((i > 0 && pm_append(builder, ",") != 0)
+            || pm_append_json_string(builder, service->allowed_peer_ips[i]) != 0) return -1;
     }
-    free(clients);
-    return rc == 0 ? pm_append(builder, "]") : -1;
+    return pm_append(builder, "]");
 }
 
 static int pm_append_local_services(pm_builder *builder,
-                                    const char *database_path,
-                                    const st_storage_client *client)
+                                    const st_storage_peer_mesh_config *config)
 {
     if (pm_append(builder, "[") != 0) return -1;
-    st_storage_peer_mesh_service *services = NULL;
-    size_t count = 0U;
-    if (st_storage_list_peer_mesh_services_visible(database_path, client->tenant_id, "", 1,
-                                                    &services, &count) != 0) return -1;
     int first = 1;
     int rc = 0;
-    for (size_t i = 0; rc == 0 && i < count; ++i) {
-        const st_storage_peer_mesh_service *service = &services[i];
-        if (service->client_id != client->id) continue;
+    for (size_t i = 0; rc == 0 && i < config->service_count; ++i) {
+        const st_storage_peer_mesh_service *service = &config->services[i].service;
         if ((!first && pm_append(builder, ",") != 0)
             || pm_append(builder, "{\"serviceId\":") != 0
             || pm_append_json_string(builder, service->service_id) != 0
@@ -817,11 +786,10 @@ static int pm_append_local_services(pm_builder *builder,
                           service->enabled ? "true" : "false") != 0
             || pm_append_json_string(builder, service->visibility) != 0
             || pm_append(builder, ",\"allowedPeerVirtualIps\":") != 0
-            || pm_append_allowed_peer_ips(builder, database_path, client, service) != 0
+            || pm_append_allowed_peer_ips(builder, &config->services[i]) != 0
             || pm_append(builder, "}") != 0) rc = -1;
         first = 0;
     }
-    free(services);
     return rc == 0 ? pm_append(builder, "]") : -1;
 }
 
@@ -1726,11 +1694,11 @@ int st_peer_mesh_list_service_instances(const char *tenant_id,
     return 0;
 }
 
-static char *pm_runtime_config(const char *database_path,
-                               const st_storage_client *client,
-                               const st_storage_peer_mesh_device *device,
+static char *pm_runtime_config(const st_storage_peer_mesh_config *config,
                                int client_peer_service_version)
 {
+    const st_storage_client *client = &config->client;
+    const st_storage_peer_mesh_device *device = config->has_device ? &config->device : NULL;
     int deployment_enabled = pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0);
     int enabled = deployment_enabled && device != NULL && device->enabled;
     /*
@@ -1754,8 +1722,7 @@ static char *pm_runtime_config(const char *database_path,
     char ice_username[192] = "";
     char ice_credential[64] = "";
     char subject[64];
-    st_storage_peer_mesh_service_sharing sharing = {0};
-    (void)st_storage_get_peer_mesh_service_sharing(database_path, client->tenant_id, &sharing);
+    st_storage_peer_mesh_service_sharing sharing = config->sharing;
     int effective_sharing = deployment_enabled && sharing.enabled && enabled;
     snprintf(subject, sizeof(subject), "pm-%lld", client->id);
     if (endpoints) (void)st_turn_auth_issue(subject, ice_username, sizeof(ice_username),
@@ -1793,7 +1760,7 @@ static char *pm_runtime_config(const char *database_path,
                       sharing.enabled ? "true" : "false", effective_sharing ? "true" : "false",
                       effective_sharing && sharing.mdns_import_enabled ? "true" : "false") != 0
         || (client_peer_service_version >= 2
-            ? pm_append_local_services(&builder, database_path, client)
+            ? pm_append_local_services(&builder, config)
             : pm_append(&builder, "[]")) != 0
         || pm_append(&builder, "}") != 0) {
         free(builder.data);
@@ -1807,23 +1774,25 @@ char *st_peer_mesh_build_login_config(const char *database_path,
                                       int client_peer_service_version)
 {
     st_storage_client client;
-    st_storage_peer_mesh_device device;
-    st_storage_peer_mesh_device *device_ptr = NULL;
+    st_storage_peer_mesh_config snapshot = {0};
     if (database_path == NULL || client_name == NULL
         || st_storage_get_client_by_name(database_path, client_name, &client) != 0) return NULL;
-    if (pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)
-        && st_storage_ensure_peer_mesh_device(database_path, &client, &device) == 0) device_ptr = &device;
-    return pm_runtime_config(database_path, &client, device_ptr, client_peer_service_version);
+    if (st_storage_load_peer_mesh_config(database_path, &client, pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0),
+                                         client_peer_service_version >= 2, &snapshot) != 0) return NULL;
+    char *config = pm_runtime_config(&snapshot, client_peer_service_version);
+    st_storage_peer_mesh_config_free(&snapshot);
+    return config;
 }
 
 static int pm_push_config(const st_peer_mesh_runtime *runtime,
                           const st_storage_client *client)
 {
-    st_storage_peer_mesh_device device;
-    if (st_storage_ensure_peer_mesh_device(runtime->database_path, client, &device) != 0) return -1;
-    char *config = pm_runtime_config(runtime->database_path, client, &device,
-                                     runtime->peer_service_discovery_version);
-    if (config == NULL) return -1;
+    st_storage_peer_mesh_config snapshot = {0};
+    if (st_storage_load_peer_mesh_config(runtime->database_path, client, 1,
+                                         runtime->peer_service_discovery_version >= 2, &snapshot) != 0) return -1;
+    client = &snapshot.client;
+    char *config = pm_runtime_config(&snapshot, runtime->peer_service_discovery_version);
+    if (config == NULL) { st_storage_peer_mesh_config_free(&snapshot); return -1; }
     pm_builder message = {0};
     int rc = pm_appendf(&message,
                         "{\"type\":\"peer-config\",\"sourceClientId\":%lld,\"sourceClientName\":",
@@ -1837,6 +1806,7 @@ static int pm_push_config(const st_peer_mesh_runtime *runtime,
         ? runtime->send(runtime->ctx, client->client_name, "server", message.data) : -1;
     free(config);
     free(message.data);
+    st_storage_peer_mesh_config_free(&snapshot);
     return rc;
 }
 

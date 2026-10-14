@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
-/* Test-only LD_PRELOAD probe. Pauses AFTER the real credential/management account connection closes,
- * hence holds no SQLite read lock. The native HTTP thread really retains its old struct.
- * No production callback, fake SQLite result, timer race or application bypass is installed. */
+/* Test-only LD_PRELOAD probe. Normal interleavings pause AFTER the real lookup closes,
+ * holding no read lock. The separate config-fence mode pauses IN a real sharing-row read
+ * to verify an independent writer is refused. No fake result or production hook. */
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -17,6 +17,21 @@ static int (*real_close)(sqlite3 *);
 static pthread_once_t symbols_once = PTHREAD_ONCE_INIT;
 static _Atomic int fired;
 static _Thread_local sqlite3 *selected_db;
+
+static void pause_once(void)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&fired, &expected, 1)) return;
+    const char *ready = getenv("SPECUS_TEST_AUTH_BARRIER_READY"), *resume = getenv("SPECUS_TEST_AUTH_BARRIER_RESUME");
+    if (ready == NULL || resume == NULL) _exit(92);
+    int output = open(ready, O_WRONLY | O_CLOEXEC);
+    if (output < 0 || write(output, "R", 1) != 1) _exit(93);
+    close(output);
+    int input = open(resume, O_RDONLY | O_CLOEXEC);
+    char signal = 0;
+    if (input < 0 || read(input, &signal, 1) != 1 || signal != 'C') _exit(94);
+    close(input);
+}
 
 static void symbols(void)
 {
@@ -45,8 +60,12 @@ int sqlite3_step(sqlite3_stmt *stmt)
     }
     const char *client = getenv("SPECUS_TEST_AUTH_BARRIER_CLIENT_ID");
     if (rc == SQLITE_ROW && client != NULL && sql != NULL
-        && strstr(sql, "FROM client_account WHERE rowid = ?") != NULL
+        && (strstr(sql, "FROM client_account WHERE rowid = ?") != NULL
+            || strstr(sql, "FROM client_account WHERE client_name = ?") != NULL)
         && sqlite3_column_int64(stmt, 0) == strtoll(client, NULL, 10)) selected_db = sqlite3_db_handle(stmt);
+    /* Snapshot-fence test: pause in the real read while its transaction is held. */
+    if (rc == SQLITE_ROW && getenv("SPECUS_TEST_AUTH_BARRIER_CONFIG_SNAPSHOT") != NULL && sql != NULL
+        && strstr(sql, "SELECT enabled,mdns_import_enabled,updated_by,updated_at FROM peer_mesh_service_sharing") != NULL) pause_once();
     return rc;
 }
 int sqlite3_close(sqlite3 *db)
@@ -55,17 +74,6 @@ int sqlite3_close(sqlite3 *db)
     int selected = db != NULL && db == selected_db;
     if (selected) selected_db = NULL;
     int rc = real_close(db);
-    int expected = 0;
-    if (selected && rc == SQLITE_OK && atomic_compare_exchange_strong(&fired, &expected, 1)) {
-        const char *ready = getenv("SPECUS_TEST_AUTH_BARRIER_READY"), *resume = getenv("SPECUS_TEST_AUTH_BARRIER_RESUME");
-        if (ready == NULL || resume == NULL) _exit(92);
-        int output = open(ready, O_WRONLY | O_CLOEXEC);
-        if (output < 0 || write(output, "R", 1) != 1) _exit(93);
-        close(output);
-        int input = open(resume, O_RDONLY | O_CLOEXEC);
-        char signal = 0;
-        if (input < 0 || read(input, &signal, 1) != 1 || signal != 'C') _exit(94);
-        close(input);
-    }
+    if (selected && rc == SQLITE_OK) pause_once();
     return rc;
 }

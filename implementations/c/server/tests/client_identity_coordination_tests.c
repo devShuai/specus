@@ -4,6 +4,7 @@
 #include "json.h"
 #include "server_harness.h"
 #include "security.h"
+#include "peer_mesh.h"
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define TEST_KEY "coordination-client-key"
@@ -1025,8 +1027,225 @@ done:
     return failed;
 }
 
+static int current_peer_permission(int scenario)
+{
+    fixture f;int failed=fresh(&f);
+    st_storage_client source={0},target={0};
+    st_storage_peer_mesh_device device;
+    if(failed) goto done;
+    if(st_storage_upsert_client(f.path,0,"default","current-source","alice",1,30,&source)!=0
+        || st_storage_upsert_client(f.path,0,"default","current-target","alice",1,30,&target)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&source,1,&device)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&target,1,&device)!=0) { failed=1;goto done; }
+    char change[800];change[0]='\0';int expected=0,rejected=0;
+    switch(scenario) {
+        case 0: expected=1;break;
+        case 1: case 3: case 8: case 11:
+            snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld",source.id);break;
+        case 2: snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld",target.id);break;
+        case 4: snprintf(change,sizeof(change),"UPDATE client_account SET enabled=0 WHERE rowid=%lld",target.id);break;
+        case 5: snprintf(change,sizeof(change),"DELETE FROM client_account WHERE rowid=%lld",source.id);rejected=1;break;
+        case 6: case 7:
+            snprintf(change,sizeof(change),"UPDATE client_account SET tenant_id='foreign' WHERE rowid=%lld",scenario==6?target.id:source.id);rejected=1;break;
+        case 9: source.enabled=0;expected=1;break;
+        case 10: strcpy(target.owner_username,"bob");expected=1;break;
+        default: failed=1;goto done;
+    }
+    if(change[0]!='\0' && execute(f.db,change)!=0) { failed=1;goto done; }
+    if(scenario==3 || scenario==11) {
+        if(st_storage_upsert_peer_mesh_acl(f.path,"default","policy-admin",scenario==3?&source:&target,
+            scenario==3?&target:&source,1,scenario==3?"OUTBOUND":"INBOUND",NULL)!=0) { failed=1;goto done; }
+        expected=1;
+    }
+    if(scenario==8) { strcpy(source.owner_username,"forged");strcpy(target.owner_username,"forged"); }
+    int allowed=77;
+    int rc=st_storage_can_peer(f.path,&source,&target,&allowed);
+    if((rejected?rc>=0:rc!=0) || allowed!=expected) {
+        fprintf(stderr,"current Peer permission scenario=%d rc=%d allowed=%d expected=%d\n",scenario,rc,allowed,expected);failed=1;
+    }
+done:
+    finish(&f);printf("%s current Peer permission: scenario=%d\n",failed?"FAIL":"PASS",scenario);return failed;
+}
+
+/* Real library entry point in another process, paused after its first real client read
+ * closes. Fixture changes are committed before resume, with no application test hook. */
+static int runtime_config_race(int scenario)
+{
+    fixture f;int failed=fresh(&f),ready_fd=-1,resume_fd=-1;
+    pid_t child=-1;
+    char ready[256],resume[256],output[256],client_id[40],preload[1024],change[800];
+    snprintf(ready,sizeof(ready),"%s/config-ready",f.dir);snprintf(resume,sizeof(resume),"%s/config-resume",f.dir);
+    snprintf(output,sizeof(output),"%s/config.json",f.dir);
+    st_storage_client source={0},old_peer={0},new_peer={0};
+    st_storage_peer_mesh_device source_device,old_device,new_device;
+    if(failed) goto done;
+    if(st_storage_upsert_client(f.path,0,"default","runtime-source","alice",1,30,&source)!=0
+        || st_storage_upsert_client(f.path,0,"default","runtime-old-peer","alice",1,30,&old_peer)!=0
+        || st_storage_upsert_client(f.path,0,"default","runtime-new-peer","bob",1,30,&new_peer)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&source,1,&source_device)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&old_peer,1,&old_device)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&new_peer,1,&new_device)!=0) { failed=1;goto done; }
+    st_storage_peer_mesh_service service={.tenant_id="default",.client_id=source.id,.client_name="runtime-source",
+        .service_id="runtime-service-1",.name="runtime service",.transport="tcp",.application="http",
+        .target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="OWNER"};
+    if(st_storage_upsert_peer_mesh_service(f.path,&service,NULL)!=0
+        || st_storage_upsert_peer_mesh_service_sharing(f.path,"default",1,1,"fixture",NULL)!=0
+        || mkfifo(ready,0600)!=0 || mkfifo(resume,0600)!=0) { failed=1;goto done; }
+    ready_fd=open(ready,O_RDWR|O_NONBLOCK|O_CLOEXEC);resume_fd=open(resume,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+    if(ready_fd<0 || resume_fd<0) { failed=1;goto done; }
+    Dl_info sanitizer={0};void *asan=dlsym(RTLD_DEFAULT,"__asan_init");
+    if(asan!=NULL&&dladdr(asan,&sanitizer)!=0&&sanitizer.dli_fname!=NULL)
+        snprintf(preload,sizeof(preload),"%s:%s",sanitizer.dli_fname,barrier_library);
+    else snprintf(preload,sizeof(preload),"%s",barrier_library);
+    snprintf(client_id,sizeof(client_id),"%lld",source.id);
+    child=fork();
+    if(child==0) {
+        setenv("LD_PRELOAD",preload,1);setenv("SPECUS_TEST_AUTH_BARRIER_READY",ready,1);
+        setenv("SPECUS_TEST_AUTH_BARRIER_RESUME",resume,1);setenv("SPECUS_TEST_AUTH_BARRIER_CLIENT_ID",client_id,1);
+        unsetenv("SPECUS_TEST_AUTH_BARRIER_ACCOUNT");unsetenv("SPECUS_TEST_AUTH_BARRIER_KEY");
+        if(scenario==8) { unsetenv("SPECUS_TEST_AUTH_BARRIER_CLIENT_ID");setenv("SPECUS_TEST_AUTH_BARRIER_CONFIG_SNAPSHOT","1",1); }
+        else unsetenv("SPECUS_TEST_AUTH_BARRIER_CONFIG_SNAPSHOT");
+        setenv("SPECUS_PEER_MESH_ENABLED",scenario==6?"false":"true",1);
+        execl("/proc/self/exe","peer-config-test","--peer-config",f.path,source.client_name,output,scenario==7?"1":"2",(char *)NULL);
+        _exit(95);
+    }
+    if(child<0) { failed=1;goto done; }
+    struct pollfd event={.fd=ready_fd,.events=POLLIN};int polled;
+    do { polled=poll(&event,1,5000); } while(polled<0&&errno==EINTR);
+    char signal=0;
+    if(polled!=1 || read(ready_fd,&signal,1)!=1 || signal!='R') { fprintf(stderr,"runtime config missed closed-read barrier\n");failed=1;goto done; }
+    switch(scenario) {
+        case 0: snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld",source.id);break;
+        case 1: snprintf(change,sizeof(change),"UPDATE client_account SET client_name='current-runtime-name',owner_username='bob' WHERE rowid=%lld",source.id);break;
+        case 2: case 6: snprintf(change,sizeof(change),"DELETE FROM client_account WHERE rowid=%lld",source.id);break;
+        case 3: snprintf(change,sizeof(change),"UPDATE client_account SET tenant_id='foreign' WHERE rowid=%lld",source.id);break;
+        case 4: snprintf(change,sizeof(change),"UPDATE client_account SET enabled=0 WHERE rowid=%lld",source.id);break;
+        case 5: strcpy(change,"CREATE TRIGGER fail_config_ensure BEFORE UPDATE ON peer_mesh_device BEGIN SELECT RAISE(ABORT,'injected config failure'); END");break;
+        case 7: change[0]='\0';break;
+        case 8: {
+            /* No timer race: an actual independent writer must be refused while the
+             * snapshot is paused inside its real sharing-row read. */
+            sqlite3_busy_timeout(f.db,0);
+            int attempt=sqlite3_exec(f.db,"BEGIN IMMEDIATE",NULL,NULL,NULL);
+            if(attempt==SQLITE_OK) (void)sqlite3_exec(f.db,"ROLLBACK",NULL,NULL,NULL);
+            sqlite3_busy_timeout(f.db,5000);
+            if(attempt!=SQLITE_BUSY) { fprintf(stderr,"runtime snapshot did not hold the writer fence: rc=%d\n",attempt);failed=1;goto done; }
+            change[0]='\0';break;
+        }
+        default: failed=1;goto done;
+    }
+    if(change[0]!='\0' && execute(f.db,change)!=0) { failed=1;goto done; }
+    if(write(resume_fd,"C",1)!=1) { failed=1;goto done; }
+    int status=0;
+    if(waitpid(child,&status,0)!=child || !WIFEXITED(status) || WEXITSTATUS(status)!=0) { child=-1;failed=1;goto done; }
+    child=-1;
+    FILE *input=fopen(output,"rb");char config[16384];
+    if(input==NULL) { failed=1;goto done; }
+    size_t length=fread(config,1,sizeof(config)-1,input);config[length]='\0';
+    int io_failed=ferror(input) || length==sizeof(config)-1;fclose(input);
+    if(io_failed) { failed=1;goto done; }
+    if(scenario>=2 && scenario<=6) failed=strcmp(config,"null")!=0;
+    else if(scenario==7) failed=strstr(config,"\"localServices\":[]")==NULL;
+    else {
+        char allowed[160];snprintf(allowed,sizeof(allowed),"\"allowedPeerVirtualIps\":[\"%s\"]",scenario==8?old_device.virtual_ip:new_device.virtual_ip);
+        failed=strstr(config,allowed)==NULL || strstr(config,scenario==8?new_device.virtual_ip:old_device.virtual_ip)!=NULL;
+        if(scenario==1 && strstr(config,"\"clientName\":\"current-runtime-name\"")==NULL) failed=1;
+    }
+    if(failed) fprintf(stderr,"runtime config scenario=%d inconsistent metadata/grants (credential fields omitted)\n",scenario);
+    if(scenario==8 && (execute(f.db,"BEGIN IMMEDIATE")!=0 || execute(f.db,"ROLLBACK")!=0)) failed=1;
+done:
+    if(child>0) { if(write(resume_fd,"C",1)!=1)fprintf(stderr,"config resume failed\n");int status=0;waitpid(child,&status,0); }
+    if(ready_fd>=0)close(ready_fd);
+    if(resume_fd>=0)close(resume_fd);
+    unlink(ready);unlink(resume);unlink(output);finish(&f);
+    printf("%s current runtime config: scenario=%d\n",failed?"FAIL":"PASS",scenario);return failed;
+}
+
+static int direct_runtime_snapshot(int scenario)
+{
+    fixture f;int failed=fresh(&f);
+    st_storage_client source={0},old_peer={0},new_peer={0},current={0};
+    st_storage_peer_mesh_device source_device,old_device,new_device;
+    st_storage_peer_mesh_config snapshot={0};
+    if(failed) goto done;
+    if(st_storage_upsert_client(f.path,0,"default","snapshot-source","alice",1,30,&source)!=0
+        || st_storage_upsert_client(f.path,0,"default","snapshot-old-peer","alice",1,30,&old_peer)!=0
+        || st_storage_upsert_client(f.path,0,"default","snapshot-new-peer","bob",1,30,&new_peer)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&source,1,&source_device)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&old_peer,1,&old_device)!=0
+        || st_storage_update_peer_mesh_device_enabled(f.path,&new_peer,1,&new_device)!=0) { failed=1;goto done; }
+    st_storage_peer_mesh_service service={.tenant_id="default",.client_id=source.id,.client_name="snapshot-source",
+        .service_id="snapshot-service-1",.name="snapshot service",.transport="tcp",.application="http",
+        .target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="OWNER"};
+    st_storage_peer_mesh_service created_service;
+    if(st_storage_upsert_peer_mesh_service(f.path,&service,&created_service)!=0
+        || st_storage_upsert_peer_mesh_service_sharing(f.path,"default",1,1,"fixture",NULL)!=0) { failed=1;goto done; }
+    service.id=created_service.id;
+    const st_storage_client *cached=&source;
+    int expected=0,ensure=1,services=1;
+    char change[1400];change[0]='\0';
+    switch(scenario) {
+        case 0: snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld",source.id);break;
+        case 1: snprintf(change,sizeof(change),"DELETE FROM peer_mesh_device WHERE client_id=%lld",source.id);ensure=0;break;
+        case 2: snprintf(change,sizeof(change),"DELETE FROM client_account WHERE rowid=%lld",source.id);expected=-1;break;
+        case 3: snprintf(change,sizeof(change),"UPDATE client_account SET tenant_id='foreign' WHERE rowid=%lld",source.id);expected=-1;break;
+        case 4: snprintf(change,sizeof(change),"UPDATE client_account SET enabled=0 WHERE rowid=%lld",source.id);expected=-1;break;
+        case 5:
+            snprintf(change,sizeof(change),"DELETE FROM peer_mesh_device WHERE client_id=%lld; UPDATE peer_mesh_service_sharing SET updated_by=printf('%%0300d',0)",source.id);expected=-1;break;
+        case 6:
+            strcpy(change,"CREATE TRIGGER bad_snapshot_device AFTER UPDATE ON peer_mesh_device BEGIN UPDATE peer_mesh_device SET owner_username='wrong' WHERE id=NEW.id; END");expected=-1;break;
+        case 7:
+            snprintf(change,sizeof(change),"DELETE FROM peer_mesh_device WHERE client_id=%lld; UPDATE peer_mesh_shared_service SET description=printf('%%0400d',0)",source.id);expected=-1;break;
+        case 8: cached=NULL;expected=-1;break;
+        case 9: strcpy(change,"UPDATE peer_mesh_shared_service SET description=printf('%0400d',0)");services=0;break;
+        case 10:
+            strcpy(service.visibility,"TENANT");snprintf(service.allowed_client_ids,sizeof(service.allowed_client_ids),"%lld",new_peer.id);
+            if(st_storage_upsert_peer_mesh_service(f.path,&service,NULL)!=0
+                || st_storage_upsert_peer_mesh_acl(f.path,"default","policy-admin",&source,&new_peer,1,"OUTBOUND",NULL)!=0) { failed=1;goto done; }
+            break;
+        case 11: strcpy(change,"UPDATE peer_mesh_shared_service SET enabled=0");break;
+        case 12:
+            strcpy(change,"WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<300) INSERT INTO client_account(tenant_id,client_name,owner_username) SELECT 'default',printf('bulk-%03d',x),'alice' FROM n; INSERT INTO peer_mesh_device(tenant_id,owner_username,client_id,client_name,enabled,virtual_ip,cidr) SELECT tenant_id,owner_username,rowid,client_name,1,printf('100.120.%d.%d',rowid/250,rowid%250+1),'100.96.0.0/11' FROM client_account WHERE client_name LIKE 'bulk-%'");break;
+        default: failed=1;goto done;
+    }
+    if(change[0]!='\0' && execute(f.db,change)!=0) { failed=1;goto done; }
+    long long peer_count=scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_device");
+    snapshot.client.id=-77;
+    int rc=st_storage_load_peer_mesh_config(f.path,cached,ensure,services,&snapshot);
+    if(rc!=expected || scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_device")!=peer_count) { fprintf(stderr,"snapshot scenario=%d rc=%d expected=%d\n",scenario,rc,expected);failed=1;goto done; }
+    if(rc!=0) {
+        const unsigned char *bytes=(const unsigned char *)&snapshot;
+        for(size_t i=0;i<sizeof(snapshot);++i) if(bytes[i]!=0) failed=1;
+        if(scenario==6 && (st_storage_get_peer_mesh_device_by_client(f.path,"default",source.id,&source_device)!=0
+            || strcmp(source_device.owner_username,"alice")!=0)) failed=1;
+    } else {
+        if(st_storage_get_client(f.path,source.id,&current)!=0 || !same_client_state(&snapshot.client,&current,1)
+            || snapshot.has_device!=ensure || !snapshot.sharing.enabled || !snapshot.sharing.mdns_import_enabled
+            || snapshot.service_count!=(size_t)services) { failed=1;goto done; }
+        if(ensure && (snapshot.device.client_id!=current.id || strcmp(snapshot.device.owner_username,current.owner_username)!=0)) failed=1;
+        if(services) {
+            size_t wanted=(scenario==1 || scenario==11)?0:scenario==12?301:1;
+            if(snapshot.services[0].allowed_peer_count!=wanted) failed=1;
+            if(wanted==1 && strcmp(snapshot.services[0].allowed_peer_ips[0],(scenario==0 || scenario==10)?new_device.virtual_ip:old_device.virtual_ip)!=0) failed=1;
+        }
+    }
+done:
+    st_storage_peer_mesh_config_free(&snapshot);
+    const unsigned char *bytes=(const unsigned char *)&snapshot;
+    for(size_t i=0;i<sizeof(snapshot);++i) if(bytes[i]!=0) failed=1;
+    finish(&f);printf("%s direct runtime snapshot: scenario=%d\n",failed?"FAIL":"PASS",scenario);return failed;
+}
+
 int main(int argc,char **argv)
 {
+    if(argc==6 && strcmp(argv[1],"--peer-config")==0) {
+        char *config=st_peer_mesh_build_login_config(argv[2],argv[3],atoi(argv[5]));
+        FILE *output=fopen(argv[4],"wb");
+        if(output==NULL) { free(config);return 96; }
+        int failed=fputs(config==NULL?"null":config,output)==EOF;
+        if(fclose(output)!=0) failed=1;
+        free(config);return failed?97:0;
+    }
     if(argc!=3)return 2;
     server_binary=argv[1];barrier_library=argv[2];signal(SIGPIPE,SIG_IGN);setvbuf(stdout,NULL,_IOLBF,0);
     int failed=0;struct {const char *name;int(*run)(fixture *);} tests[]={
@@ -1060,5 +1279,8 @@ int main(int argc,char **argv)
     for(int scenario=0;scenario<17;++scenario) failed+=direct_client_mutation(scenario);
     for(int scenario=0;scenario<17;++scenario) failed+=native_client_create_race(scenario);
     for(int scenario=0;scenario<18;++scenario) failed+=direct_client_create(scenario);
+    for(int scenario=0;scenario<12;++scenario) failed+=current_peer_permission(scenario);
+    for(int scenario=0;scenario<9;++scenario) failed+=runtime_config_race(scenario);
+    for(int scenario=0;scenario<13;++scenario) failed+=direct_runtime_snapshot(scenario);
     return failed?1:0;
 }
