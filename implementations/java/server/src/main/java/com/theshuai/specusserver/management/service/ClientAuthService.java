@@ -21,6 +21,7 @@ import com.theshuai.specusserver.management.repository.ClientAccountRepository;
 import com.theshuai.specusserver.management.repository.ClientCredentialRepository;
 import com.theshuai.specusserver.management.repository.ClientIdentityRepository;
 import com.theshuai.specusserver.management.repository.ClientSessionRepository;
+import com.theshuai.specusserver.management.repository.ClientSessionRepositoryCustom.SessionSnapshot;
 import com.theshuai.specusserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.specusserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.specusserver.management.repository.SpecusMappingRepository;
@@ -191,81 +192,85 @@ public class ClientAuthService {
         return response;
     }
 
-    @Transactional
     public AuthenticationResult authenticateNetty(LoginRequestPacket packet, String channelId, String remoteAddress) {
         return authenticateNetty(packet, channelId, remoteAddress, false);
     }
 
-    @Transactional
     public AuthenticationResult authenticateNetty(LoginRequestPacket packet, String channelId,
                                                    String remoteAddress, boolean dataConnection) {
         if (packet == null || !StringUtils.hasText(packet.getAccessToken())) {
             return AuthenticationResult.failure(null, "缺少客户端访问令牌");
         }
-        ClientSession session = sessionRepository.findByTokenHash(tokenHash(packet.getAccessToken())).orElse(null);
+        String expectedToken = tokenHash(packet.getAccessToken());
+        ClientSession session = sessionRepository.findByTokenHash(expectedToken).orElse(null);
         if (session == null) {
             return AuthenticationResult.failure(null, "客户端访问令牌无效");
         }
-        if (Instant.parse(session.getExpiresAt()).isBefore(Instant.now())) {
-            session.setStatus(STATUS_DISCONNECTED);
-            session.setDisconnectedAt(Instant.now().toString());
-            sessionRepository.save(session);
-            return AuthenticationResult.failure(null, "客户端访问令牌已过期");
-        }
+        // Like signed HTTP login, the initial lookup is not the admission decision. Start a
+        // short writer only for a known token; its FIRST statement locks the credential and
+        // reserves SQLite's writer before any snapshot read. Invalid tokens take no write lock.
+        return transactionTemplate.execute(status -> authenticateCurrentNetty(
+                packet, channelId, remoteAddress, dataConnection, session, expectedToken));
+    }
 
-        ClientCredential credential = credentialRepository.findByIdAndTenantId(session.getCredentialId(), session.getTenantId())
+    private AuthenticationResult authenticateCurrentNetty(LoginRequestPacket packet, String channelId,
+                                                          String remoteAddress, boolean dataConnection,
+                                                          ClientSession session, String expectedToken) {
+        Long selectedId = session.getId(), selectedCredential = session.getCredentialId();
+        Long selectedClient = session.getClientId(), selectedIdentity = session.getIdentityId();
+        String selectedTenant = session.getTenantId();
+        ClientCredential credential = credentialRepository.lockCurrent(selectedCredential, selectedTenant)
                 .orElse(null);
-        ClientAccount account = clientAccountRepository.findByIdAndTenantId(session.getClientId(), session.getTenantId())
+        ClientAccount account = clientAccountRepository.lockCurrent(selectedClient, selectedTenant)
                 .orElse(null);
         if (credential == null || account == null) {
             return AuthenticationResult.failure(null, "客户端身份不存在");
         }
+        SessionSnapshot current = sessionRepository.lockCurrent(selectedId, selectedTenant).orElse(null);
+        if (current == null || !Objects.equals(expectedToken, current.tokenHash())
+                || !Objects.equals(selectedCredential, current.credentialId()) || !Objects.equals(selectedClient, current.clientId())
+                || !Objects.equals(selectedIdentity, current.identityId()))
+            return AuthenticationResult.failure(null, "客户端访问令牌或身份已变更");
+        if (Instant.parse(current.expiresAt()).isBefore(Instant.now())) {
+            sessionRepository.markDisconnected(current, Instant.now().toString());
+            return AuthenticationResult.failure(null, "客户端访问令牌已过期");
+        }
         if (!credential.isEnabled() || !account.isEnabled()) {
             return AuthenticationResult.failure(account, "客户端已停用");
         }
-        if (dataConnection && !STATUS_NETTY_ONLINE.equals(session.getStatus())) {
+        if (dataConnection && !STATUS_NETTY_ONLINE.equals(current.status())) {
             return AuthenticationResult.failure(account, "数据连接要求控制连接先登录");
         }
         if (dataConnection) {
             packet.setClientName(account.getClientName());
-            packet.setClientSessionId(session.getId());
-            return AuthenticationResult.success(account, session.getId());
+            packet.setClientSessionId(current.id());
+            return AuthenticationResult.success(account, current.id());
         }
         if (hasExceededRateLimit(account)) {
             return AuthenticationResult.failure(account, "连接频率超过限制");
         }
-        closeStaleOnlineSessions(session);
-        if (isAnotherOnlineSessionForMachine(session)) {
+        List<SessionSnapshot> online = closeStaleOnlineSessions(sessionRepository.lockOnline(credential.getId(), selectedTenant));
+        if (online.stream().filter(row -> Objects.equals(row.machineFingerprint(), current.machineFingerprint())
+                && Objects.equals(row.osUser(), current.osUser())).count() >= properties.getPerMachineUserMaxInstances()) {
             return AuthenticationResult.failure(account, "同一台机器和用户已经有在线实例");
         }
-        if (isOnlineLimitExceeded(session, credential)) {
+        if (online.size() >= credential.getMaxOnlineInstances()) {
             return AuthenticationResult.failure(account, "在线实例数已达上限");
         }
 
         String now = Instant.now().toString();
-        session.setStatus(STATUS_NETTY_ONLINE);
-        session.setNettyConnectedAt(now);
-        session.setDisconnectedAt(null);
-        session.setChannelId(channelId);
-        session.setRemoteAddress(remoteAddress);
-        sessionRepository.save(session);
+        sessionRepository.markOnline(current, account.getClientName(), channelId, remoteAddress, now);
         packet.setClientName(account.getClientName());
-        packet.setClientSessionId(session.getId());
-        return AuthenticationResult.success(account, session.getId());
+        packet.setClientSessionId(current.id());
+        return AuthenticationResult.success(account, current.id());
     }
 
     @Transactional
-    public void markNettyDisconnected(Long sessionId) {
-        if (sessionId == null || sessionId <= 0) {
-            return;
+    public boolean markNettyDisconnected(Long sessionId, String channelId) {
+        if (sessionId == null || sessionId <= 0 || !StringUtils.hasText(channelId)) {
+            return false;
         }
-        sessionRepository.findById(sessionId).ifPresent(session -> {
-            if (STATUS_NETTY_ONLINE.equals(session.getStatus())) {
-                session.setStatus(STATUS_DISCONNECTED);
-                session.setDisconnectedAt(Instant.now().toString());
-                sessionRepository.save(session);
-            }
-        });
+        return sessionRepository.disconnectChannel(sessionId, channelId, Instant.now().toString()) == 1;
     }
 
     private ClientCredential authenticateCredential(ClientAuthLoginRequest request) {
@@ -375,55 +380,24 @@ public class ClientAuthService {
         return candidate;
     }
 
-    private boolean isAnotherOnlineSessionForMachine(ClientSession session) {
-        long online = sessionRepository.countByCredentialIdAndMachineFingerprintAndOsUserAndStatus(
-                session.getCredentialId(),
-                session.getMachineFingerprint(),
-                session.getOsUser(),
-                STATUS_NETTY_ONLINE
-        );
-        return online >= properties.getPerMachineUserMaxInstances();
-    }
-
-    private boolean isOnlineLimitExceeded(ClientSession session, ClientCredential credential) {
-        long online = sessionRepository.countByCredentialIdAndStatus(
-                credential.getId(),
-                STATUS_NETTY_ONLINE
-        );
-        return online >= credential.getMaxOnlineInstances();
-    }
-
-    private void closeStaleOnlineSessions(ClientSession currentSession) {
-        closeStaleOnlineSessions(sessionRepository.findByCredentialIdAndMachineFingerprintAndOsUserAndStatus(
-                currentSession.getCredentialId(),
-                currentSession.getMachineFingerprint(),
-                currentSession.getOsUser(),
-                STATUS_NETTY_ONLINE
-        ));
-        closeStaleOnlineSessions(sessionRepository.findByCredentialIdAndStatus(
-                currentSession.getCredentialId(),
-                STATUS_NETTY_ONLINE
-        ));
-    }
-
-    private void closeStaleOnlineSessions(List<ClientSession> sessions) {
-        if (sessions == null || sessions.isEmpty()) {
-            return;
-        }
+    private List<SessionSnapshot> closeStaleOnlineSessions(List<SessionSnapshot> sessions) {
+        if (sessions.isEmpty()) return sessions;
+        java.util.ArrayList<SessionSnapshot> live = new java.util.ArrayList<>();
         String now = Instant.now().toString();
         int closed = 0;
-        for (ClientSession onlineSession : sessions) {
-            Channel channel = SessionUtil.getChannel(onlineSession.getClientName());
+        for (SessionSnapshot onlineSession : sessions) {
+            Channel channel = SessionUtil.getChannel(onlineSession.clientName());
             if (channel != null && channel.isActive() && SessionUtil.hasLogin(channel)) {
+                live.add(onlineSession);
                 continue;
             }
-            onlineSession.setStatus(STATUS_DISCONNECTED);
-            onlineSession.setDisconnectedAt(now);
+            sessionRepository.markDisconnected(onlineSession, now);
             closed++;
         }
         if (closed > 0) {
             log.info("closed {} stale online client session(s) before netty authentication", closed);
         }
+        return live;
     }
 
     private void closeStaleHttpAuthenticatedSessions(ClientCredential credential, ClientEnvironmentInfo environment) {
@@ -442,7 +416,7 @@ public class ClientAuthService {
 
     private boolean hasExceededRateLimit(ClientAccount account) {
         return account.getConnectionRateLimitPerMinute() > 0
-                && connectionRecordRepository.countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(
+                && connectionRecordRepository.countCurrentConnections(
                 account.getTenantId(),
                 account.getId(),
                 SortableInstant.format(Instant.now().minus(1, ChronoUnit.MINUTES))

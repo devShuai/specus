@@ -177,8 +177,9 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         if (clientSessionId != null && !dataConnection) {
             long sessionId = clientSessionId;
             submit(() -> {
-                clientAuthService.markNettyDisconnected(sessionId);
-                peerSignalService.onClientDisconnected(sessionId);
+                if (clientAuthService.markNettyDisconnected(sessionId, ctx.channel().id().asLongText())) {
+                    peerSignalService.onClientDisconnected(sessionId);
+                }
             });
         }
         // The close-future listener has normally unbound the session already, closing the data

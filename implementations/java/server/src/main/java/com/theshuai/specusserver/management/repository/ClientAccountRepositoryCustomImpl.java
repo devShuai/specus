@@ -48,6 +48,6 @@ public class ClientAccountRepositoryCustomImpl implements ClientAccountRepositor
         account.setEnabled(row[5] instanceof Boolean value ? value : ((Number) row[5]).intValue() != 0);
         account.setConnectionRateLimitPerMinute(((Number) row[6]).intValue());
         account.setCreatedAt((String) row[7]); account.setUpdatedAt((String) row[8]);
-        return Optional.of(account);
+        return tenantId.equals(account.getTenantId()) ? Optional.of(account) : Optional.empty();
     }
 }

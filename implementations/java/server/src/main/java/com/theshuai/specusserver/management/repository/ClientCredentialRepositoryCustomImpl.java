@@ -44,6 +44,6 @@ public class ClientCredentialRepositoryCustomImpl implements ClientCredentialRep
         current.setMaxOnlineInstances(((Number) row[6]).intValue());
         current.setCreatedAt((String) row[7]);
         current.setUpdatedAt((String) row[8]);
-        return Optional.of(current);
+        return tenantId.equals(current.getTenantId()) ? Optional.of(current) : Optional.empty();
     }
 }

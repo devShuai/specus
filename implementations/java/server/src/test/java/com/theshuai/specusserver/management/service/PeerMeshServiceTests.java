@@ -19,6 +19,7 @@ import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRep
 import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.peer.TurnCredentialService;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -53,6 +54,7 @@ class PeerMeshServiceTests {
     private final PeerMeshSharedServiceRepository sharedServiceRepository = mock(PeerMeshSharedServiceRepository.class);
     private final PeerMeshProperties properties = new PeerMeshProperties();
     private final PlatformTransactionManager transactionManager = transactionManager();
+    private final ManagementWriteAuthority authority = mock(ManagementWriteAuthority.class);
     private final PeerMeshService service = new PeerMeshService(
             properties,
             deviceRepository,
@@ -64,10 +66,13 @@ class PeerMeshServiceTests {
             sharingRepository,
             sharedServiceRepository,
             transactionManager,
-            new SimpleMeterRegistry()
+            new SimpleMeterRegistry(), authority
     );
 
     {
+        when(authority.current(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        when(deviceRepository.lockCurrent(any(), any())).thenAnswer(invocation ->
+                deviceRepository.findByTenantIdAndClientId(invocation.getArgument(0), invocation.getArgument(1)));
         when(sharingRepository.findById(any())).thenReturn(Optional.empty());
         when(sharedServiceRepository.findByTenantIdAndClientIdOrderByNameAsc(any(), any())).thenReturn(List.of());
     }
@@ -498,7 +503,7 @@ class PeerMeshServiceTests {
                 sharingRepository,
                 sharedServiceRepository,
                 transactionManager(),
-                meterRegistry);
+                meterRegistry, authority);
 
         assertThat(retryingService.authorizeRelayFrameForRelay(
                 new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512)).isTrue();
@@ -593,6 +598,7 @@ class PeerMeshServiceTests {
         account.setOwnerUsername(owner);
         account.setClientName(name);
         account.setEnabled(true);
+        when(clientAccountRepository.lockCurrent(id, "tenant-a")).thenReturn(Optional.of(account));
         return account;
     }
 

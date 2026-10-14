@@ -41,6 +41,7 @@ import static org.mockito.Mockito.when;
 class ManagedLoginLogoutPushTests {
     private final String clientName = "logout-push-" + UUID.randomUUID();
     private final PeerSignalService peerSignal = mock(PeerSignalService.class);
+    private final ClientAuthService auth = mock(ClientAuthService.class);
     private final List<EmbeddedChannel> channels = new ArrayList<>();
     private final ManagedLoginRequestHandler handler;
 
@@ -49,9 +50,9 @@ class ManagedLoginLogoutPushTests {
         account.setId(42L);
         account.setTenantId("t1");
         account.setClientName(clientName);
-        ClientAuthService auth = mock(ClientAuthService.class);
         when(auth.authenticateNetty(any(), anyString(), anyString(), anyBoolean()))
                 .thenReturn(AuthenticationResult.success(account, 7L));
+        when(auth.markNettyDisconnected(any(), anyString())).thenReturn(true);
         handler = new ManagedLoginRequestHandler(auth, mock(ConnectionRecordService.class),
                 mock(NatControlService.class), peerSignal, new NettyServerProperties(), new CallerRunsExecutor(),
                 mock(ProductMetricsService.class));
@@ -74,7 +75,19 @@ class ManagedLoginLogoutPushTests {
         control.close();
 
         verify(peerSignal).pushOnLogout(clientName);
+        verify(peerSignal).onClientDisconnected(7L);
         assertThat(boundWhenPushed).as("the roster would still count the client as online").isFalse();
+    }
+
+    @Test
+    void obsoleteChannelDoesNotWithdrawTheCurrentDiscoveryCatalog() {
+        EmbeddedChannel control = login(ConnectionRole.CONTROL);
+        when(auth.markNettyDisconnected(7L, control.id().asLongText())).thenReturn(false);
+
+        control.close();
+
+        verify(auth).markNettyDisconnected(7L, control.id().asLongText());
+        verify(peerSignal, never()).onClientDisconnected(7L);
     }
 
     // The client is still online on the newer connection, whose login already told its peers.

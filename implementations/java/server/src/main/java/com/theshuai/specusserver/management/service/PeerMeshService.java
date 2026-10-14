@@ -30,6 +30,7 @@ import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRep
 import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.peer.TurnCredentialService;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.session.SessionUtil;
@@ -83,6 +84,7 @@ public class PeerMeshService {
     private final ClientSessionRepository clientSessionRepository;
     private final PeerMeshServiceSharingRepository sharingRepository;
     private final PeerMeshSharedServiceRepository sharedServiceRepository;
+    private final ManagementWriteAuthority authority;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, AtomicLong> pendingRelayBytes = new ConcurrentHashMap<>();
     private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
@@ -101,7 +103,8 @@ public class PeerMeshService {
                            PeerMeshServiceSharingRepository sharingRepository,
                            PeerMeshSharedServiceRepository sharedServiceRepository,
                            PlatformTransactionManager transactionManager,
-                           MeterRegistry meterRegistry) {
+                           MeterRegistry meterRegistry,
+                           ManagementWriteAuthority authority) {
         this.properties = properties;
         this.deviceRepository = deviceRepository;
         this.aclRepository = aclRepository;
@@ -111,6 +114,7 @@ public class PeerMeshService {
         this.clientSessionRepository = clientSessionRepository;
         this.sharingRepository = sharingRepository;
         this.sharedServiceRepository = sharedServiceRepository;
+        this.authority = authority;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.relayTrafficFlushFailures = Counter.builder("specus.peer_mesh.relay.traffic.flush.failures")
                 .description("Relay traffic batches restored after a persistence failure")
@@ -184,6 +188,7 @@ public class PeerMeshService {
     public ClientAuthLoginResponse.PeerMeshConfig buildLoginConfig(ClientAccount account,
                                                                   ClientEnvironmentInfo environment,
                                                                   String requestServerName) {
+        account = lockRuntimeClient(account);
         PeerMeshDevice device = null;
         if (properties.isEnabled()) {
             device = ensureDevice(account, environment);
@@ -196,10 +201,10 @@ public class PeerMeshService {
 
     @Transactional
     public ClientAuthLoginResponse.PeerMeshConfig buildRuntimeConfig(ClientAccount account) {
+        account = lockRuntimeClient(account);
         PeerMeshDevice device = null;
         if (properties.isEnabled()) {
-            device = deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId())
-                    .orElseGet(() -> deviceRepository.save(createDevice(account)));
+            device = currentDevice(account);
         }
         return buildConfig(account, device, null, currentPeerServiceProtocolVersion(account));
     }
@@ -260,8 +265,8 @@ public class PeerMeshService {
 
     @Transactional
     public PeerMeshDevice ensureDevice(ClientAccount account, ClientEnvironmentInfo environment) {
-        PeerMeshDevice device = deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId())
-                .orElseGet(() -> createDevice(account));
+        account = lockRuntimeClient(account);
+        PeerMeshDevice device = currentDevice(account);
         device.setClientName(account.getClientName());
         device.setOwnerUsername(normalizeOwner(account.getOwnerUsername()));
         if (environment != null && StringUtils.hasText(environment.getPeerPublicKey())) {
@@ -283,7 +288,14 @@ public class PeerMeshService {
 
     @Transactional
     public PeerMeshDeviceView updateDevice(ManagementContext context, long clientId, DeviceMutation mutation) {
-        PeerMeshDevice device = findAccessibleDevice(context, clientId);
+        ManagementContext currentActor = authority.current(context);
+        ClientAccount current = clientAccountRepository.lockCurrent(clientId, currentActor.tenant().tenantId())
+                .filter(account -> currentActor.isAdmin() || currentActor.username().equals(account.getOwnerUsername()))
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
+        PeerMeshDevice device = deviceRepository.lockCurrent(currentActor.tenant().tenantId(), clientId)
+                .orElseThrow(() -> new IllegalArgumentException("peer device not found: " + clientId));
+        device.setOwnerUsername(normalizeOwner(current.getOwnerUsername()));
+        device.setClientName(current.getClientName());
         if (mutation.enabled() != null) {
             device.setEnabled(mutation.enabled());
         }
@@ -478,8 +490,8 @@ public class PeerMeshService {
 
     @Transactional
     public PeerMeshDeviceView reportDevice(ClientAccount reporter, PeerControlMessage report) {
-        PeerMeshDevice device = deviceRepository.findByTenantIdAndClientId(reporter.getTenantId(), reporter.getId())
-                .orElseGet(() -> createDevice(reporter));
+        reporter = lockRuntimeClient(reporter);
+        PeerMeshDevice device = currentDevice(reporter);
         Instant now = Instant.now();
         device.setClientName(reporter.getClientName());
         device.setOwnerUsername(normalizeOwner(reporter.getOwnerUsername()));
@@ -1170,6 +1182,21 @@ public class PeerMeshService {
             return List.of();
         }
         return clientAccountRepository.findByTenantIdOrderByIdDesc(account.getTenantId());
+    }
+
+    private ClientAccount lockRuntimeClient(ClientAccount reference) {
+        if (reference == null || reference.getId() == null || reference.getTenantId() == null)
+            throw new IllegalArgumentException("client identity is required");
+        return clientAccountRepository.lockCurrent(reference.getId(), reference.getTenantId())
+                .filter(ClientAccount::isEnabled)
+                .orElseThrow(() -> new IllegalArgumentException("client unavailable: " + reference.getId()));
+    }
+
+    private PeerMeshDevice currentDevice(ClientAccount account) {
+        // A current client row serializes device creation and metadata writers for that client.
+        // Never return a JPA cached device that can restore an old enabled/IP/owner state.
+        return deviceRepository.lockCurrent(account.getTenantId(), account.getId())
+                .orElseGet(() -> deviceRepository.save(createDevice(account)));
     }
 
     private PeerMeshDevice createDevice(ClientAccount account) {

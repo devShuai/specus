@@ -7,7 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import java.util.List;
 import java.util.Optional;
 
-public interface PeerMeshDeviceRepository extends JpaRepository<PeerMeshDevice, Long> {
+public interface PeerMeshDeviceRepository extends JpaRepository<PeerMeshDevice, Long>, PeerMeshDeviceRepositoryCustom {
     Optional<PeerMeshDevice> findByTenantIdAndClientId(String tenantId, Long clientId);
 
     Optional<PeerMeshDevice> findByTenantIdAndVirtualIp(String tenantId, String virtualIp);
