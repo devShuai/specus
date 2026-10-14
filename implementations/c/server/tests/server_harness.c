@@ -713,12 +713,17 @@ int server_start(test_server *server)
     server->control_port = pick_free_port();
     server->admin_port = pick_free_port();
     if (server->control_port <= 0 || server->admin_port <= 0 || server->control_port == server->admin_port) {
+        fprintf(stderr, "server startup refused before fork: control_port=%d admin_port=%d reason=%s\n",
+                server->control_port, server->admin_port,
+                server->control_port == server->admin_port ? "ports-not-distinct" : "port-selection-failed");
         return -1;
     }
     fflush(stdout);
     fflush(stderr);
     pid_t pid = fork();
     if (pid < 0) {
+        fprintf(stderr, "server startup fork failed: %s (control_port=%d admin_port=%d)\n",
+                strerror(errno), server->control_port, server->admin_port);
         return -1;
     }
     if (pid == 0) {
@@ -826,7 +831,12 @@ int run_on_fresh_server(const char *name, server_scenario scenario, const char *
     for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL && i < MAX_EXTRA_ENV; ++i) {
         server.extra_env[i] = extra_env[i];
     }
-    int failed = server_start(&server) != 0;
+    int started = server_start(&server);
+    int failed = started != 0;
+    if (failed) {
+        fprintf(stderr, "%s: server_start=%d control_port=%d admin_port=%d pid=%ld; scenario not executed\n",
+                name, started, server.control_port, server.admin_port, (long)server.pid);
+    }
     if (!failed) {
         failed = scenario(&server) != 0;
     }
