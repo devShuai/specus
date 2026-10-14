@@ -117,7 +117,9 @@ jobs:
       # protocol workflow where the point is to test protocol behaviour rather than dependencies.
       - name: Fail on a high or critical advisory
         working-directory: implementations/csharp/server
-        run: dotnet restore
+        run: |
+          dotnet restore
+          dotnet restore tests/Specus.PostgresTests/Specus.PostgresTests.csproj
 
       - name: Upload the report
         if: always()
