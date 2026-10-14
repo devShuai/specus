@@ -16,6 +16,7 @@
 #include "login_rate_limiter.h"
 #include "media_capture.h"
 #include "object_storage.h"
+#include "owner_transfer.h"
 #include "oidc.h"
 #include "password_hash.h"
 #include "peer_mesh.h"
@@ -12481,6 +12482,27 @@ static int write_auth_refusal(char *out,
         : write_response(out, out_len, status, reason, body);
 }
 
+/* GET only: no ownership writer until login/edit/delete/Peer/target mutations share a database
+ * coordination boundary. Use the unbounded response path, never silently truncate a large group. */
+static int handle_owner_transfer_preview(const st_admin_context *context, int group, long long id,
+                                         int id_valid, char *out, size_t out_len)
+{
+    if (!context->admin) return write_workbench_error(out, out_len, 403, "FORBIDDEN", "FORBIDDEN", 0);
+    if (!id_valid) return write_workbench_error(out, out_len, 400, "INVALID_TRANSFER_REQUEST", "INVALID_TRANSFER_REQUEST", 0);
+    st_owner_snapshot snapshot;
+    if (st_owner_snapshot_load(admin_database_path(), context->tenant_id, group, id, &snapshot) != 0)
+        return write_workbench_error(out, out_len, 500, "INTERNAL_SERVER_ERROR", "INTERNAL_SERVER_ERROR", 0);
+    char *json = NULL;
+    char revision[65];
+    const char *code = NULL;
+    int status = st_owner_transfer_preview(context->tenant_id, context->admin, group, id, &snapshot, &json, revision, &code);
+    st_owner_snapshot_free(&snapshot);
+    if (status != 200) return write_workbench_error(out, out_len, status, code, code, 0);
+    int result = write_unbounded_response(out, out_len, 200, "OK", json);
+    free(json);
+    return result;
+}
+
 /* Only failures of the store are logged, and never with the reference: no access log can form. */
 static void admin_workbench_log_unavailable(const st_admin_context *context, st_workbench_op op)
 {
@@ -13092,6 +13114,10 @@ static int st_admin_build_response_internal(const char *method,
     if (product_metrics_path) {
         return handle_product_metrics_request(&context, method, path, body, body_len, out, out_len);
     }
+    int owner_group = 0, owner_id_valid = 0;
+    long long owner_id = 0;
+    if (strcmp(method, "GET") == 0 && st_owner_transfer_match(path, &owner_group, &owner_id, &owner_id_valid))
+        return handle_owner_transfer_preview(&context, owner_group, owner_id, owner_id_valid, out, out_len);
     st_workbench_request workbench_request;
     if (st_workbench_match(method, path, &workbench_request)) {
         return handle_workbench_request(&context, &workbench_request, out, out_len);

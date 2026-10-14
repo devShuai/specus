@@ -30,6 +30,7 @@ add_library(specus_c_core
     src/login_rate_limiter.c
     src/media_capture.c
     src/object_storage.c
+    src/owner_transfer.c
     src/oidc.c
     src/password_hash.c
     src/peer_egress.c
@@ -438,6 +439,14 @@ target_compile_definitions(specus_c_management_accounts_tests PRIVATE
     ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/management-accounts-v1.json"
     ST_CLIENT_PEER_DELETION_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/client-peer-deletion-v1.json")
 add_test(NAME management_accounts_tests COMMAND specus_c_management_accounts_tests)
+
+add_executable(specus_c_owner_transfer_tests tests/owner_transfer_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_owner_transfer_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_owner_transfer_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_owner_transfer_tests PRIVATE
+    ST_OWNER_TRANSFER_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/client-owner-transfer-plan-v1.json")
+add_test(NAME owner_transfer_tests COMMAND specus_c_owner_transfer_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(owner_transfer_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)
