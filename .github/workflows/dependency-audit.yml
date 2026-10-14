@@ -120,6 +120,8 @@ jobs:
         run: |
           dotnet restore
           dotnet restore tests/Specus.PostgresTests/Specus.PostgresTests.csproj
+          dotnet restore tests/Specus.DatabaseTests/Specus.DatabaseTests.csproj
+          dotnet restore tests/Specus.MariaDbTests/Specus.MariaDbTests.csproj
 
       - name: Upload the report
         if: always()

@@ -600,6 +600,15 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.ResponsePreviewHex).HasColumnName("response_preview_hex").HasMaxLength(4096);
             b.Property(x => x.ResponseBodyData).HasColumnName("response_body_data");
             b.Property(x => x.ResponsePreviewText).HasColumnName("response_preview_text");
+            if (Database.ProviderName == "MySql.EntityFrameworkCore")
+            {
+                // Four bounded VARCHARs alone exceed MySQL's 65,535-byte logical row limit
+                // under utf8mb4. Keep capture/length metadata, but store these fields off-row.
+                b.Property(x => x.RequestHeaders).HasColumnType("longtext");
+                b.Property(x => x.ResponseHeaders).HasColumnType("longtext");
+                b.Property(x => x.RequestPreviewHex).HasColumnType("longtext");
+                b.Property(x => x.ResponsePreviewHex).HasColumnType("longtext");
+            }
             b.Property(x => x.RequestTruncated).HasColumnName("request_truncated").IsRequired();
             b.Property(x => x.ResponseTruncated).HasColumnName("response_truncated").IsRequired();
             b.Property(x => x.CapturedAt).HasColumnName("captured_at").HasMaxLength(40).IsRequired()
