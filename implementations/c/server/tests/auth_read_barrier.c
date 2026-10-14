@@ -43,6 +43,10 @@ int sqlite3_step(sqlite3_stmt *stmt)
         const char *actual = (const char *)sqlite3_column_text(stmt, 7);
         if (actual != NULL && strcmp(actual, account) == 0) selected_db = sqlite3_db_handle(stmt);
     }
+    const char *client = getenv("SPECUS_TEST_AUTH_BARRIER_CLIENT_ID");
+    if (rc == SQLITE_ROW && client != NULL && sql != NULL
+        && strstr(sql, "FROM client_account WHERE rowid = ?") != NULL
+        && sqlite3_column_int64(stmt, 0) == strtoll(client, NULL, 10)) selected_db = sqlite3_db_handle(stmt);
     return rc;
 }
 int sqlite3_close(sqlite3 *db)

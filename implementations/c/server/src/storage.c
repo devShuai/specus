@@ -3708,6 +3708,18 @@ static int load_management_actor(sqlite3 *db, const st_storage_management_actor 
     return 0;
 }
 
+static int load_visible_client(sqlite3 *db, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    st_storage_management_user *current_actor, st_storage_client *client)
+{
+    int rc = load_management_actor(db, actor, builtin, current_actor);
+    if (rc != 0) return rc;
+    if (load_client(db, id, client) != 0 || strcmp(client->tenant_id, current_actor->tenant_id) != 0
+        || (!management_actor_is_admin(current_actor->role) && strcmp(client->owner_username, current_actor->username) != 0))
+        return ST_STORAGE_CLIENT_NOT_VISIBLE;
+    return 0;
+}
+
 int st_storage_create_client_credential_current_actor(const char *path,
     const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
     const char *api_key, const char *secret_hash, int enabled, int max_online_instances,
@@ -12393,6 +12405,63 @@ int st_storage_update_client_audited(const char *path,
     return out_client == NULL ? 0 : st_storage_get_client(path, id, out_client);
 }
 
+int st_storage_patch_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_client_patch *patch, long long now_ms, st_storage_client *out_before,
+    st_storage_client *out_client, st_storage_share_ids *revoked)
+{
+    if (out_before != NULL) memset(out_before, 0, sizeof(*out_before));
+    if (out_client != NULL) memset(out_client, 0, sizeof(*out_client));
+    if (id <= 0 || patch == NULL
+        || (patch->client_name != NULL && (*patch->client_name == '\0' || strlen(patch->client_name) >= sizeof(((st_storage_client *)0)->client_name)))
+        || (revoked != NULL && (revoked->ids != NULL || revoked->len != 0 || revoked->cap != 0))) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    st_storage_management_user current_actor;
+    st_storage_client before = {0}, staged = {0};
+    st_storage_share_ids pending_revoked = {0};
+    int rc = share_begin(db);
+    if (rc == 0) rc = load_visible_client(db, id, actor, builtin, &current_actor, &before);
+    const char *name = patch->client_name == NULL ? before.client_name : patch->client_name;
+    int enabled = patch->enabled_provided ? patch->enabled != 0 : before.enabled;
+    int rate = patch->rate_limit_provided
+        ? (patch->connection_rate_limit_per_minute <= 0 ? 30 : patch->connection_rate_limit_per_minute)
+        : before.connection_rate_limit_per_minute;
+    if (rc == 0 && strcmp(name, before.client_name) != 0) {
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE client_name = ? AND rowid <> ?", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, id);
+            int step = sqlite3_step(stmt);
+            rc = step == SQLITE_ROW ? ST_STORAGE_CLIENT_NAME_EXISTS : step == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) rc = update_client_on_db(db, id, before.client_name, before.tenant_id, name,
+                                         before.owner_username, enabled, rate);
+    if (rc == 0 && before.enabled && !enabled) {
+        st_storage_http_share *shares = NULL;
+        size_t count = 0U;
+        rc = share_active_of_client(db, name, now_ms, &shares, &count);
+        if (rc == 0) rc = share_revoke_each(db, shares, count, current_actor.username, "client-disabled", now_ms, &pending_revoked);
+        free(shares);
+    }
+    if (rc == 0 && (load_client(db, id, &staged) != 0 || staged.id != before.id
+        || strcmp(staged.tenant_id, before.tenant_id) != 0 || strcmp(staged.owner_username, before.owner_username) != 0
+        || strcmp(staged.created_at, before.created_at) != 0 || strcmp(staged.client_name, name) != 0
+        || staged.enabled != enabled || staged.connection_rate_limit_per_minute != rate)) rc = -1;
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc == 0) {
+        if (out_before != NULL) *out_before = before;
+        if (out_client != NULL) *out_client = staged;
+        if (revoked != NULL) { *revoked = pending_revoked; memset(&pending_revoked, 0, sizeof(pending_revoked)); }
+    }
+    st_storage_share_ids_free(&pending_revoked);
+    return rc;
+}
+
 int st_storage_delete_client_audited(const char *path,
                                      long long id,
                                      const char *actor,
@@ -12402,11 +12471,15 @@ int st_storage_delete_client_audited(const char *path,
     return st_storage_delete_client_audited_with_peers(path, id, actor, now_ms, revoked, NULL, NULL);
 }
 
-int st_storage_delete_client_audited_with_peers(const char *path, long long id,
+static int delete_client_audited_with_peers(const char *path, long long id,
                                                const char *actor, long long now_ms,
                                                st_storage_share_ids *revoked,
-                                               st_storage_peer_close **closed, size_t *closed_count)
+                                               st_storage_peer_close **closed, size_t *closed_count,
+                                               const st_storage_management_actor *management_actor,
+                                               const st_storage_share_builtin_admin *builtin,
+                                               st_storage_client *out_before)
 {
+    if (out_before != NULL) memset(out_before, 0, sizeof(*out_before));
     if ((closed == NULL) != (closed_count == NULL)) return -1;
     if (closed != NULL) { *closed = NULL; *closed_count = 0U; }
     st_storage_peer_close *pending_closed = NULL;
@@ -12421,7 +12494,13 @@ int st_storage_delete_client_audited_with_peers(const char *path, long long id,
     size_t route_count = 0U;
     st_storage_http_share *shares = NULL;
     size_t share_count = 0U;
+    st_storage_client before = {0};
+    st_storage_management_user current_actor;
     int rc = share_begin(db);
+    if (rc == 0 && management_actor != NULL) {
+        rc = load_visible_client(db, id, management_actor, builtin, &current_actor, &before);
+        if (rc == 0) actor = current_actor.username;
+    }
     if (rc == 0) {
         rc = share_load_client_state(db, id, &client);
     }
@@ -12476,6 +12555,15 @@ int st_storage_delete_client_audited_with_peers(const char *path, long long id,
     if (rc == 0) {
         rc = share_revoke_each(db, shares, share_count, actor, "client-deleted", now_ms, revoked);
     }
+    if (rc == 0 && management_actor != NULL) {
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE rowid = ?", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, id);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
     free(route_ids);
     free(exposures);
     free(shares);
@@ -12488,7 +12576,42 @@ int st_storage_delete_client_audited_with_peers(const char *path, long long id,
         free(pending_closed);
         if (rc != 0) st_storage_share_ids_free(revoked);
     }
-    return rc == 0 ? 0 : -1;
+    if (rc == 0 && out_before != NULL) *out_before = before;
+    return rc;
+}
+
+int st_storage_delete_client_audited_with_peers(const char *path, long long id,
+    const char *actor, long long now_ms, st_storage_share_ids *revoked,
+    st_storage_peer_close **closed, size_t *closed_count)
+{
+    return delete_client_audited_with_peers(path, id, actor, now_ms, revoked, closed, closed_count, NULL, NULL, NULL) == 0 ? 0 : -1;
+}
+
+int st_storage_delete_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    long long now_ms, st_storage_client *out_before, st_storage_share_ids *revoked,
+    st_storage_peer_close **closed, size_t *closed_count)
+{
+    if (out_before != NULL) memset(out_before, 0, sizeof(*out_before));
+    if ((closed == NULL) != (closed_count == NULL)
+        || (revoked != NULL && (revoked->ids != NULL || revoked->len != 0 || revoked->cap != 0))) return -1;
+    if (closed != NULL) { *closed = NULL; *closed_count = 0U; }
+    if (id <= 0) return -1;
+    if (actor == NULL) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+    st_storage_client before = {0};
+    st_storage_share_ids pending_revoked = {0};
+    st_storage_peer_close *pending_closed = NULL;
+    size_t pending_count = 0U;
+    int rc = delete_client_audited_with_peers(path, id, NULL, now_ms, &pending_revoked, &pending_closed,
+                                             &pending_count, actor, builtin, &before);
+    if (rc == 0) {
+        if (out_before != NULL) *out_before = before;
+        if (revoked != NULL) { *revoked = pending_revoked; memset(&pending_revoked, 0, sizeof(pending_revoked)); }
+        if (closed != NULL) { *closed = pending_closed; *closed_count = pending_count; pending_closed = NULL; }
+    }
+    st_storage_share_ids_free(&pending_revoked);
+    free(pending_closed);
+    return rc;
 }
 
 typedef struct {

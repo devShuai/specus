@@ -8713,27 +8713,33 @@ static int handle_client_update(const st_admin_context *context, long long id, c
         return len;
     }
     int enabled = existing.enabled;
-    (void)admin_jackson_boolean(body, "enabled", &enabled);
+    int enabled_provided = admin_jackson_boolean(body, "enabled", &enabled) == 1;
     int rate_limit = existing.connection_rate_limit_per_minute;
-    (void)admin_jackson_int(body, "connectionRateLimitPerMinute", &rate_limit);
+    int rate_provided = admin_jackson_int(body, "connectionRateLimitPerMinute", &rate_limit) == 1;
     st_storage_client updated;
     st_storage_share_ids revoked = {0};
     /* Disabling the client ends the shares of all its routes in the same transaction. */
-    int rc = st_storage_update_client_audited(database_path,
-                                              id,
-                                              next_client_name,
-                                              enabled,
-                                              rate_limit,
-                                              context->username,
-                                              st_http_share_now_ms(),
-                                              &updated,
-                                              &revoked);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    st_storage_client_patch patch = {name_given ? client_name : NULL, enabled_provided, enabled, rate_provided, rate_limit};
+    /* Replace the earlier read with the actual transactional before-state for notifications. */
+    int rc = st_storage_patch_client_visible_audited(database_path, id, &actor, &builtin, &patch,
+                                                    st_http_share_now_ms(), &existing, &updated, &revoked);
+    int refusal = 0;
+    if (rc == ST_STORAGE_CLIENT_NAME_EXISTS) refusal = write_client_name_exists(client_name, out, out_len);
+    else if (rc == ST_STORAGE_CLIENT_NOT_VISIBLE)
+        refusal = write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    else if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+        refusal = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
     free(client_name);
-    admin_share_cut_revoked(&revoked);
-    st_storage_share_ids_free(&revoked);
     if (rc != 0) {
+        st_storage_share_ids_free(&revoked);
+        if (refusal != 0) return refusal;
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
     }
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     /*
      * As Go's management API: the online connections of a disabled or renamed client are closed,
      * so none keeps serving under a name or route set the server no longer has.
@@ -8763,11 +8769,16 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     st_storage_share_ids revoked = {0};
     st_storage_peer_close *closed = NULL;
     size_t closed_count = 0U;
-    int rc = st_storage_delete_client_audited_with_peers(database_path, id, context->username, st_http_share_now_ms(),
-                                                        &revoked, &closed, &closed_count);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_delete_client_visible_audited(database_path, id, &actor, &builtin, st_http_share_now_ms(),
+                                                     &existing, &revoked, &closed, &closed_count);
     if (rc != 0) {
         st_storage_share_ids_free(&revoked);
         free(closed);
+        if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+            return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
     admin_share_cut_revoked(&revoked);

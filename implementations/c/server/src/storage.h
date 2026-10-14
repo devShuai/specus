@@ -99,6 +99,14 @@ typedef struct {
 } st_storage_credential_patch;
 
 typedef struct {
+    const char *client_name; /* NULL preserves the current name. */
+    int enabled_provided;
+    int enabled;
+    int rate_limit_provided;
+    int connection_rate_limit_per_minute;
+} st_storage_client_patch;
+
+typedef struct {
     long long id;
     char implementation[33];
     char platform[33];
@@ -1616,7 +1624,9 @@ typedef struct {
 enum {
     ST_STORAGE_MANAGEMENT_ACTOR_CHANGED = 1,
     ST_STORAGE_CREDENTIAL_NOT_VISIBLE = 2,
-    ST_STORAGE_CREDENTIAL_KEY_EXISTS = 3
+    ST_STORAGE_CREDENTIAL_KEY_EXISTS = 3,
+    ST_STORAGE_CLIENT_NOT_VISIBLE = 4,
+    ST_STORAGE_CLIENT_NAME_EXISTS = 5
 };
 /* BEGIN IMMEDIATE encloses current actor, current credential visibility and the entire write.
  * No tenant/owner replacement from a stale caller object; output only after successful commit.
@@ -1822,6 +1832,17 @@ int st_storage_delete_client_audited_with_peers(const char *path, long long id,
                                                const char *actor, long long now_ms,
                                                st_storage_share_ids *revoked,
                                                st_storage_peer_close **closed, size_t *closed_count);
+/* Current exact actor and resource visibility are checked inside the same write transaction.
+ * Omitted fields preserve current values, never a caller snapshot. Outputs publish only after
+ * commit; revoked/closed outputs must be empty and closed/count must be provided together. */
+int st_storage_patch_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_client_patch *patch, long long now_ms, st_storage_client *out_before,
+    st_storage_client *out_client, st_storage_share_ids *revoked);
+int st_storage_delete_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    long long now_ms, st_storage_client *out_before, st_storage_share_ids *revoked,
+    st_storage_peer_close **closed, size_t *closed_count);
 int st_storage_update_management_user_audited(const char *path,
                                               const st_storage_share_builtin_admin *builtin,
                                               const char *tenant_id,

@@ -630,6 +630,218 @@ done:
     return failed;
 }
 
+static int same_client_state(const st_storage_client *a, const st_storage_client *b, int timestamps)
+{
+    return a->id==b->id && strcmp(a->tenant_id,b->tenant_id)==0 && strcmp(a->client_name,b->client_name)==0
+        && strcmp(a->owner_username,b->owner_username)==0 && a->enabled==b->enabled
+        && a->connection_rate_limit_per_minute==b->connection_rate_limit_per_minute
+        && strcmp(a->created_at,b->created_at)==0 && (!timestamps || strcmp(a->updated_at,b->updated_at)==0);
+}
+
+static int native_client_mutation_race(int deleting, int scenario)
+{
+    test_server server;
+    if(server_prepare(&server)!=0) return 1;
+    char ready[400],resume[400],preload[1024],ready_env[450],resume_env[450],client_env[200],token[2048],path[160],change[800];
+    snprintf(ready,sizeof(ready),"%s/auth-ready",server.dir);snprintf(resume,sizeof(resume),"%s/auth-resume",server.dir);
+    int failed=1,ready_fd=-1,resume_fd=-1,started=0,thread_started=0;
+    sqlite3 *db=NULL;pthread_t thread;
+    credential_http_worker w={.server=&server,.method=deleting?"DELETE":"PUT",.path=path,.token=token,
+        .request=scenario==2?"{}":"{\"connectionRateLimitPerMinute\":99}"};
+    st_storage_management_user actor,replacement;
+    st_storage_client_credential credential;
+    st_storage_client_identity identity;
+    st_storage_client initial={0},expected={0},after={0};
+    st_storage_peer_mesh_device peer={0};
+    int admin=scenario==1 || scenario==3 || scenario==12;
+    if(insert_credential(server.db_path,&credential)!=0
+        || st_storage_find_or_create_client_identity(server.db_path,&credential,"client-mutation-device","user","host",&identity)!=0
+        || st_storage_get_client(server.db_path,identity.client_id,&initial)!=0
+        || st_storage_ensure_peer_mesh_device(server.db_path,&initial,&peer)!=0
+        || st_storage_create_management_user(server.db_path,"alice","default","fixture-only-hash",admin?"ADMIN":"USER",1,&actor)!=0
+        || st_security_issue_local_token_for_account("alice","default",admin?"ADMIN":"USER",actor.account_key,
+             ADMIN_JWT_SECRET,600,token,sizeof(token))!=0) goto done;
+    snprintf(path,sizeof(path),"/api/admin/clients/%lld",initial.id);
+    if(scenario==12) w.request="{\"clientName\":\"explicit-client-name\",\"enabled\":false,\"connectionRateLimitPerMinute\":100}";
+    if(mkfifo(ready,0600)!=0 || mkfifo(resume,0600)!=0) goto done;
+    ready_fd=open(ready,O_RDWR|O_NONBLOCK|O_CLOEXEC);resume_fd=open(resume,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+    if(ready_fd<0 || resume_fd<0) goto done;
+    Dl_info sanitizer={0};void *asan=dlsym(RTLD_DEFAULT,"__asan_init");
+    if(asan!=NULL&&dladdr(asan,&sanitizer)!=0&&sanitizer.dli_fname!=NULL)
+        snprintf(preload,sizeof(preload),"LD_PRELOAD=%s:%s",sanitizer.dli_fname,barrier_library);
+    else snprintf(preload,sizeof(preload),"LD_PRELOAD=%s",barrier_library);
+    snprintf(ready_env,sizeof(ready_env),"SPECUS_TEST_AUTH_BARRIER_READY=%s",ready);
+    snprintf(resume_env,sizeof(resume_env),"SPECUS_TEST_AUTH_BARRIER_RESUME=%s",resume);
+    snprintf(client_env,sizeof(client_env),"SPECUS_TEST_AUTH_BARRIER_CLIENT_ID=%lld",initial.id);
+    server.extra_env[0]=preload;server.extra_env[1]=ready_env;server.extra_env[2]=resume_env;server.extra_env[3]=client_env;
+    if(server_start(&server)!=0) goto done;
+    started=1;
+    if(sqlite3_open(server.db_path,&db)!=SQLITE_OK) goto done;
+    sqlite3_busy_timeout(db,5000);
+    if(pthread_create(&thread,NULL,mutate_credential,&w)!=0) goto done;
+    thread_started=1;
+    struct pollfd event={.fd=ready_fd,.events=POLLIN};int polled;
+    do { polled=poll(&event,1,5000); } while(polled<0&&errno==EINTR);
+    char signal=0;
+    if(polled!=1 || read(ready_fd,&signal,1)!=1 || signal!='R') { fprintf(stderr,"client mutation missed closed-read barrier\n");goto done; }
+    change[0]='\0';
+    switch(scenario) {
+        case 0: case 1: case 12:
+            snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld",initial.id);break;
+        case 2:
+            if(st_storage_update_client_audited(server.db_path,initial.id,"concurrently-renamed",0,7,"fixture",1,&expected,NULL)!=0) goto done;
+            break;
+        case 3:
+            snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld; UPDATE specus_management_user SET role='USER' WHERE login_name='alice'",initial.id);break;
+        case 4: strcpy(change,"UPDATE specus_management_user SET enabled=0 WHERE login_name='alice'");break;
+        case 5: case 6: strcpy(change,"DELETE FROM specus_management_user WHERE login_name='alice'");break;
+        case 7: strcpy(change,"UPDATE specus_management_user SET tenant_id='foreign' WHERE login_name='alice'");break;
+        case 8: snprintf(change,sizeof(change),"UPDATE client_account SET tenant_id='foreign' WHERE rowid=%lld",initial.id);break;
+        case 9: snprintf(change,sizeof(change),"DELETE FROM client_account WHERE rowid=%lld",initial.id);break;
+        case 10: case 11:
+            snprintf(change,sizeof(change),deleting
+                ? (scenario==10?"CREATE TRIGGER fail_client_delete BEFORE DELETE ON client_account WHEN OLD.rowid=%lld BEGIN SELECT RAISE(ABORT,'injected delete failure'); END"
+                    : "CREATE TRIGGER fail_peer_delete BEFORE DELETE ON peer_mesh_device WHEN OLD.client_id=%lld BEGIN SELECT RAISE(ABORT,'injected peer delete failure'); END")
+                : (scenario==10?"CREATE TRIGGER malformed_client AFTER UPDATE ON client_account WHEN NEW.rowid=%lld BEGIN UPDATE client_account SET owner_username=printf('%%0300d',0) WHERE rowid=NEW.rowid; END"
+                    : "CREATE TRIGGER changed_client_owner AFTER UPDATE ON client_account WHEN NEW.rowid=%lld BEGIN UPDATE client_account SET owner_username='bob' WHERE rowid=NEW.rowid; END"),initial.id);break;
+        case 13:
+            snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld; UPDATE specus_management_user SET role='ADMIN' WHERE login_name='alice'",initial.id);break;
+        case 14: strcpy(change,"UPDATE specus_management_user SET login_name='renamed',login_name_normalized='renamed' WHERE login_name='alice'");break;
+        default: goto done;
+    }
+    if(change[0]!='\0' && execute(db,change)!=0) goto done;
+    if(scenario==6 && st_storage_create_management_user(server.db_path,"alice","default","replacement-fixture-hash","ADMIN",1,&replacement)!=0) goto done;
+    if(scenario!=9 && st_storage_get_client(server.db_path,initial.id,&expected)!=0) goto done;
+    int expected_status=deleting?204:200;
+    if(scenario==0 || scenario==3 || scenario==8 || scenario==9) expected_status=404;
+    if((scenario>=4 && scenario<=7) || scenario==14) expected_status=403;
+    if(scenario==10 || scenario==11) expected_status=deleting?404:409;
+    if(write(resume_fd,"C",1)!=1) goto done;
+    pthread_join(thread,NULL);thread_started=0;
+    if(w.rc!=0 || w.status!=expected_status) { fprintf(stderr,"client mutation op=%d scenario=%d status=%d expected=%d\n",deleting,scenario,w.status,expected_status);goto done; }
+    int found=st_storage_get_client(server.db_path,initial.id,&after)==0;
+    if(expected_status==204 || scenario==9) {
+        if(found) goto done;
+    } else if(expected_status!=200) {
+        if(!found || !same_client_state(&after,&expected,1)) { fprintf(stderr,"refused client mutation changed row\n");goto done; }
+    } else {
+        if(scenario!=2) expected.connection_rate_limit_per_minute=scenario==12?100:99;
+        if(scenario==12) { strcpy(expected.client_name,"explicit-client-name");expected.enabled=0; }
+        if(!found || !same_client_state(&after,&expected,0)) { fprintf(stderr,"client mutation overwrote concurrent state\n");goto done; }
+        char *name=st_json_get_string(w.body,"clientName");
+        int matches=name!=NULL && strcmp(name,expected.client_name)==0;
+        free(name);if(!matches) goto done;
+    }
+    long long refs=expected_status==204?0:1;
+    /* The original identity intentionally remains bound to the deleted, never-reused account ID
+     * (client-auth contract); it must not silently provision a replacement on a later login. */
+    if(scalar(db,"SELECT COUNT(*) FROM specus_client_identity")!=1 || scalar(db,"SELECT COUNT(*) FROM peer_mesh_device")!=refs
+        || scalar(db,"SELECT COUNT(*) FROM specus_client_credential")!=1) { fprintf(stderr,"client mutation reference cleanup/rollback mismatch\n");goto done; }
+    failed=0;
+done:
+    if(thread_started) { ssize_t sent=write(resume_fd,"C",1);if(sent!=1)fprintf(stderr,"client resume failed\n");pthread_join(thread,NULL); }
+    free(w.body);sqlite3_close(db);
+    if(ready_fd>=0)close(ready_fd);
+    if(resume_fd>=0)close(resume_fd);
+    unlink(ready);unlink(resume);
+    if(started&&server_stop(&server,10000)!=0)failed=1;
+    if(failed)dump_server_log(&server);
+    server_cleanup(&server,failed);
+    printf("%s native client mutation coordination: operation=%d scenario=%d\n",failed?"FAIL":"PASS",deleting,scenario);
+    return failed;
+}
+
+static int direct_client_mutation(int scenario)
+{
+    fixture f;
+    int failed=fresh(&f);
+    st_storage_management_user user,other;
+    st_storage_client_identity identity;
+    st_storage_client initial={0},expected={0},actual={0},before,updated;
+    st_storage_peer_mesh_device device={0};
+    st_storage_share_builtin_admin builtin={"builtin","default",1};
+    st_storage_share_ids revoked={0};
+    st_storage_peer_close *closed=NULL;
+    size_t closed_count=77;
+    if(failed) goto done;
+    if(st_storage_find_or_create_client_identity(f.path,&f.credential,"direct-client-device","user","host",&identity)!=0
+        || st_storage_get_client(f.path,identity.client_id,&initial)!=0
+        || st_storage_ensure_peer_mesh_device(f.path,&initial,&device)!=0
+        || st_storage_create_management_user(f.path,"alice","default","fixture-only-hash","USER",1,&user)!=0
+        || st_storage_create_management_user(f.path,"bob","default","fixture-only-hash","ADMIN",1,&other)!=0) { failed=1;goto done; }
+    st_storage_management_actor actor={"alice","default",user.account_key};
+    const st_storage_management_actor *resolved=&actor;
+    st_storage_client_patch patch={.rate_limit_provided=1,.connection_rate_limit_per_minute=9};
+    int deleting=scenario>=10 && scenario!=15,expected_rc=0;
+    st_storage_client *published_before=&before,*published_after=deleting?NULL:&updated;
+    char change[1000];change[0]='\0';
+    switch(scenario) {
+        case 0: patch.enabled_provided=1;patch.enabled=0;break;
+        case 1: actor=(st_storage_management_actor){"BuIlTiN","default",""};patch.connection_rate_limit_per_minute=-5;break;
+        case 2: actor.account_key=other.account_key;expected_rc=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 3: actor.account_key="";expected_rc=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 4: case 5:
+            snprintf(change,sizeof(change),scenario==4
+                ? "CREATE TRIGGER malformed_patch AFTER UPDATE ON client_account WHEN NEW.rowid=%lld BEGIN UPDATE client_account SET owner_username=printf('%%0300d',0) WHERE rowid=NEW.rowid; END"
+                : "CREATE TRIGGER wrong_patch_owner AFTER UPDATE ON client_account WHEN NEW.rowid=%lld BEGIN UPDATE client_account SET owner_username='bob' WHERE rowid=NEW.rowid; END",initial.id);
+            expected_rc=-1;if(scenario==5) { published_before=NULL;published_after=NULL; }break;
+        case 6:
+            if(st_storage_upsert_client(f.path,0,"default","duplicate-client-name","bob",1,30,&actual)!=0) { failed=1;goto done; }
+            patch.client_name="duplicate-client-name";expected_rc=ST_STORAGE_CLIENT_NAME_EXISTS;break;
+        case 7: actor=(st_storage_management_actor){"builtin","DEFAULT",""};expected_rc=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 8:
+            snprintf(change,sizeof(change),"UPDATE client_account SET owner_username='bob' WHERE rowid=%lld",initial.id);
+            expected_rc=ST_STORAGE_CLIENT_NOT_VISIBLE;break;
+        case 9: patch.client_name="";expected_rc=-1;break;
+        case 10:
+            actor=(st_storage_management_actor){"bob","default",other.account_key};
+            if(st_storage_update_client_audited(f.path,initial.id,"latest-name-before-delete",1,7,"fixture",1,&actual,NULL)!=0) { failed=1;goto done; }
+            break;
+        case 11:
+            snprintf(change,sizeof(change),"CREATE TRIGGER late_delete_failure BEFORE DELETE ON peer_mesh_device WHEN OLD.client_id=%lld BEGIN SELECT RAISE(ABORT,'injected late failure'); END",initial.id);
+            expected_rc=-1;break;
+        case 12:
+            snprintf(change,sizeof(change),"CREATE TRIGGER resurrect_deleted_client AFTER DELETE ON client_account WHEN OLD.rowid=%lld BEGIN INSERT INTO client_account(rowid,tenant_id,client_name,owner_username,enabled,connection_limit_per_minute,created_at,updated_at) VALUES(OLD.rowid,OLD.tenant_id,OLD.client_name,OLD.owner_username,OLD.enabled,OLD.connection_limit_per_minute,OLD.created_at,OLD.updated_at); END",initial.id);
+            expected_rc=-1;break;
+        case 13: actor=(st_storage_management_actor){"builtin","default",""};published_before=NULL;break;
+        case 14: strcpy(change,"UPDATE specus_management_user SET enabled=0 WHERE login_name='alice'");expected_rc=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        case 15: case 16: resolved=NULL;expected_rc=ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;break;
+        default: failed=1;goto done;
+    }
+    if(change[0]!='\0' && execute(f.db,change)!=0) { failed=1;goto done; }
+    if(st_storage_get_client(f.path,initial.id,&expected)!=0) { failed=1;goto done; }
+    memset(&before,0x7f,sizeof(before));memset(&updated,0x7f,sizeof(updated));
+    int rc=deleting
+        ? st_storage_delete_client_visible_audited(f.path,initial.id,resolved,&builtin,1,published_before,&revoked,&closed,&closed_count)
+        : st_storage_patch_client_visible_audited(f.path,initial.id,resolved,&builtin,&patch,1,published_before,published_after,&revoked);
+    int found=st_storage_get_client(f.path,initial.id,&actual)==0;
+    if(rc!=expected_rc || (deleting && (closed!=NULL || closed_count!=0)) || revoked.ids!=NULL || revoked.len!=0 || revoked.cap!=0) {
+        fprintf(stderr,"direct client mutation scenario=%d rc=%d expected=%d closed=%zu revoked=%zu\n",scenario,rc,expected_rc,closed_count,revoked.len);failed=1;goto done;
+    }
+    if(rc==0 && deleting) {
+        if(found || scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_device")!=0) failed=1;
+    } else {
+        st_storage_client wanted=expected;
+        if(rc==0) { wanted.connection_rate_limit_per_minute=scenario==1?30:9;if(scenario==0)wanted.enabled=0; }
+        if(!found || !same_client_state(&wanted,&actual,rc!=0) || scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_device")!=1) failed=1;
+        if(rc==0 && published_after!=NULL && !same_client_state(published_after,&actual,1)) failed=1;
+    }
+    if(scalar(f.db,"SELECT COUNT(*) FROM specus_client_identity")!=1) failed=1;
+    if(rc==0 && published_before!=NULL && !same_client_state(published_before,&expected,1)) failed=1;
+    const st_storage_client *outputs[]={&before,&updated};
+    int provided[]={published_before!=NULL,published_after!=NULL};
+    for(size_t n=0;n<2;++n) {
+        if(provided[n] && rc==0) continue;
+        const unsigned char *bytes=(const unsigned char *)outputs[n];
+        unsigned char value=provided[n]?0:0x7f;
+        for(size_t i=0;i<sizeof(*outputs[n]);++i) if(bytes[i]!=value) failed=1;
+    }
+done:
+    free(closed);st_storage_share_ids_free(&revoked);finish(&f);
+    printf("%s direct client mutation coordination: scenario=%d\n",failed?"FAIL":"PASS",scenario);
+    return failed;
+}
+
 int main(int argc,char **argv)
 {
     if(argc!=3)return 2;
@@ -660,5 +872,8 @@ int main(int argc,char **argv)
     for(int scenario=0;scenario<10;++scenario) failed+=direct_credential_coordination(scenario);
     for(int scenario=0;scenario<14;++scenario) failed+=native_credential_create_race(scenario);
     for(int scenario=0;scenario<16;++scenario) failed+=direct_credential_create_coordination(scenario);
+    for(int scenario=0;scenario<15;++scenario)
+        for(int deleting=0;deleting<2;++deleting) if(!(scenario==12 && deleting)) failed+=native_client_mutation_race(deleting,scenario);
+    for(int scenario=0;scenario<17;++scenario) failed+=direct_client_mutation(scenario);
     return failed?1:0;
 }
