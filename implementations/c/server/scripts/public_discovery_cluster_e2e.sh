@@ -3,29 +3,30 @@ set -euo pipefail
 
 SERVER_BINARY="${1:?C server binary is required}"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/specus-c-cluster.XXXXXX")"
-REDIS_PORT="${SPECUS_TEST_CLUSTER_REDIS_PORT:-16390}"
-CONTROL_ONE="${SPECUS_TEST_CLUSTER_CONTROL_ONE:-17310}"
-ADMIN_ONE="${SPECUS_TEST_CLUSTER_ADMIN_ONE:-17311}"
-CONTROL_TWO="${SPECUS_TEST_CLUSTER_CONTROL_TWO:-17320}"
-ADMIN_TWO="${SPECUS_TEST_CLUSTER_ADMIN_TWO:-17321}"
+source "$(dirname "${BASH_SOURCE[0]}")/test_fixture_resources.sh"
 
 cleanup() {
   set +e
   if [[ -n "${SERVER_ONE_PID:-}" ]]; then kill "$SERVER_ONE_PID" 2>/dev/null || true; fi
   if [[ -n "${SERVER_TWO_PID:-}" ]]; then kill "$SERVER_TWO_PID" 2>/dev/null || true; fi
   if [[ -n "${REDIS_PID:-}" ]]; then kill "$REDIS_PID" 2>/dev/null || true; fi
+  if [[ -n "${SERVER_ONE_PID:-}" ]]; then wait "$SERVER_ONE_PID" 2>/dev/null || true; fi
+  if [[ -n "${SERVER_TWO_PID:-}" ]]; then wait "$SERVER_TWO_PID" 2>/dev/null || true; fi
+  if [[ -n "${REDIS_PID:-}" ]]; then wait "$REDIS_PID" 2>/dev/null || true; fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
+PORTS="$(specus_test_pick_ports "${SPECUS_TEST_CLUSTER_REDIS_PORT:-}" \
+  "${SPECUS_TEST_CLUSTER_CONTROL_ONE:-}" "${SPECUS_TEST_CLUSTER_ADMIN_ONE:-}" \
+  "${SPECUS_TEST_CLUSTER_CONTROL_TWO:-}" "${SPECUS_TEST_CLUSTER_ADMIN_TWO:-}")"
+read -r REDIS_PORT CONTROL_ONE ADMIN_ONE CONTROL_TWO ADMIN_TWO <<< "$PORTS"
+PREFIX="specus:test:discovery-e2e:${TMP_DIR##*/}"
+
 redis-server --bind 127.0.0.1 --port "$REDIS_PORT" --protected-mode yes \
   --save '' --appendonly no --dir "$TMP_DIR" >"$TMP_DIR/redis.log" 2>&1 &
 REDIS_PID=$!
-for _ in $(seq 1 60); do
-  if redis-cli -h 127.0.0.1 -p "$REDIS_PORT" ping >/dev/null 2>&1; then break; fi
-  sleep 0.05
-done
-redis-cli -h 127.0.0.1 -p "$REDIS_PORT" ping >/dev/null
+specus_test_wait_redis "$REDIS_PID" "$REDIS_PORT" "$TMP_DIR/redis.log"
 
 start_server() {
   local control_port="$1"
@@ -39,7 +40,7 @@ start_server() {
   SPECUS_ADMIN_PORT="$admin_port" \
   SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED=true \
   SPECUS_PUBLIC_TRANSFER_REDIS_URI="redis://127.0.0.1:$REDIS_PORT/0" \
-  SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX="specus:test:discovery-e2e" \
+  SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX="$PREFIX" \
   SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS=2 \
   SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS=200 \
   SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS=500 \
