@@ -89,6 +89,8 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/storage.o $(BUILD_DIR)/owner_transfer.o: src/owner_transfer_internal.h src/owner_transfer.h src/storage.h
+
 $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -245,7 +247,7 @@ $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $
 	  -DST_CLIENT_PEER_DELETION_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/client-peer-deletion-v1.json)"' \
 	  tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(OWNER_TRANSFER_TESTS): $(CORE_OBJS) tests/owner_transfer_tests.c tests/server_harness.c | $(BUILD_DIR)
+$(OWNER_TRANSFER_TESTS): $(CORE_OBJS) tests/owner_transfer_tests.c tests/owner_transfer_write_tests.h tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) \
 	  -DST_OWNER_TRANSFER_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/client-owner-transfer-plan-v1.json)"' \
 	  tests/owner_transfer_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@

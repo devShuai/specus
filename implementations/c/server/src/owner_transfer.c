@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "owner_transfer.h"
+#include "owner_transfer_internal.h"
 #include "crypto.h"
 #include "json.h"
 
@@ -135,13 +136,12 @@ static const char snapshot_sql[] =
     " UNION ALL SELECT 3,p.id,p.tenant_id,p.client_name,p.owner_username,p.enabled,NULL,p.client_id FROM peer_mesh_device p"
     " WHERE p.tenant_id=:tenant AND p.client_id IN (SELECT id FROM affected_clients)";
 
-int st_owner_snapshot_load(const char *path, const char *tenant, int group, long long id, st_owner_snapshot *snapshot)
+int st_owner_snapshot_load_on_db(sqlite3 *db, const char *tenant, int group, long long id, st_owner_snapshot *snapshot)
 {
     memset(snapshot, 0, sizeof(*snapshot));
-    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    sqlite3_stmt *stmt = NULL;
     int status = -1;
-    if (path == NULL || tenant == NULL || sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) goto done;
-    sqlite3_busy_timeout(db, 5000);
+    if (db == NULL || tenant == NULL) goto done;
     if (sqlite3_prepare_v2(db, snapshot_sql, -1, &stmt, NULL) != SQLITE_OK
         || sqlite3_bind_int64(stmt, sqlite3_bind_parameter_index(stmt, ":id"), id) != SQLITE_OK
         || sqlite3_bind_text(stmt, sqlite3_bind_parameter_index(stmt, ":tenant"), tenant, -1, SQLITE_STATIC) != SQLITE_OK
@@ -159,9 +159,90 @@ int st_owner_snapshot_load(const char *path, const char *tenant, int group, long
     }
     if (rc == SQLITE_DONE) status = 0;
 done:
-    sqlite3_finalize(stmt); sqlite3_close(db);
+    sqlite3_finalize(stmt);
     if (status != 0) st_owner_snapshot_free(snapshot);
     return status;
+}
+
+int st_owner_snapshot_load(const char *path, const char *tenant, int group, long long id, st_owner_snapshot *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    sqlite3 *db = NULL;
+    if (path == NULL || tenant == NULL || sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db); return -1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    int rc = st_owner_snapshot_load_on_db(db, tenant, group, id, snapshot);
+    sqlite3_close(db);
+    return rc;
+}
+
+/* Compare every real schema column except the explicitly mutable ones. Private TEMP
+ * snapshots include secrets only inside this connection; none reach JSON or audit. */
+int st_owner_transfer_rows_preserved(sqlite3 *db, const char *table, const char *before,
+    const char *where, const char *const *ignored, size_t ignored_count)
+{
+    owner_buffer columns = {0}, sql = {0};
+    sqlite3_stmt *stmt = NULL;
+    char *pragma = sqlite3_mprintf("PRAGMA table_info(\"%w\")", table);
+    int rc = pragma != NULL && sqlite3_prepare_v2(db, pragma, -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    sqlite3_free(pragma);
+    int first = 1, step = SQLITE_DONE;
+    while (rc == 0 && (step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+        if (name == NULL) { rc = -1; break; }
+        int skip = 0;
+        for (size_t i = 0; i < ignored_count; ++i) if (strcmp(name, ignored[i]) == 0) skip = 1;
+        if (skip) continue;
+        char *quoted = sqlite3_mprintf("\"%w\"", name);
+        if (quoted == NULL) { rc = -1; break; }
+        append(&columns, "%s%s", first ? "" : ",", quoted); first = 0;
+        sqlite3_free(quoted);
+    }
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (rc != 0 || step != SQLITE_DONE || first || columns.failed) { rc = -1; goto done; }
+    /* table/before/where are internal, compile-time identifiers/clauses, never requests. */
+    append(&sql, "SELECT EXISTS(SELECT %s FROM %s EXCEPT SELECT %s FROM %s WHERE %s) OR "
+                 "EXISTS(SELECT %s FROM %s WHERE %s EXCEPT SELECT %s FROM %s)",
+           columns.data, before, columns.data, table, where,
+           columns.data, table, where, columns.data, before);
+    rc = !sql.failed && sqlite3_prepare_v2(db, sql.data, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0 ? 0 : -1;
+done:
+    sqlite3_finalize(stmt); free(columns.data); free(sql.data); return rc;
+}
+
+int st_owner_transfer_encode_result(const char *tenant, const char *actor, int group, long long id,
+    const char *target, long long credential_id, const st_owner_snapshot *before, const char *preview,
+    const long long *client_ids, size_t client_count, int changed,
+    const st_storage_peer_close *closed, size_t closed_count, char **response, char **audit)
+{
+    *response = NULL; *audit = NULL;
+    owner_buffer result = {0}, record = {0};
+    append(&result, "{\"scope\":\"%s\",\"targetUsername\":", group ? "credential-group" : "single"); text(&result, target);
+    append(&result, ",\"credentialId\":");
+    if (credential_id == 0) append(&result, "null"); else append(&result, "%lld", credential_id);
+    append(&result, ",\"affectedClientIds\":[");
+    for (size_t i = 0; i < client_count; ++i) append(&result, "%s%lld", i ? "," : "", client_ids[i]);
+    append(&result, "],\"changed\":%s,\"accessRetained\":true}", changed ? "true" : "false");
+    if (changed) {
+        append(&record, "{\"tenantId\":"); text(&record, tenant);
+        append(&record, ",\"actorUsername\":"); text(&record, actor);
+        append(&record, ",\"scope\":\"%s\",\"resourceId\":%lld,\"targetUsername\":", group ? "credential-group" : "single", id); text(&record, target);
+        append(&record, ",\"before\":%s,\"result\":%s,\"peerOwnersBefore\":[", preview, result.data == NULL ? "null" : result.data);
+        for (size_t i = 0; i < before->peers.len; ++i) {
+            const st_owner_row *peer = &before->peers.items[i];
+            append(&record, "%s{\"id\":%lld,\"clientId\":%lld,\"ownerUsername\":", i ? "," : "", peer->id, peer->client_id); text(&record, peer->owner_username); append(&record, "}");
+        }
+        append(&record, "],\"closedPeerSessions\":[");
+        for (size_t i = 0; i < closed_count; ++i) {
+            append(&record, "%s{\"id\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":", i ? "," : "", closed[i].id, closed[i].source_client_id); text(&record, closed[i].source_client_name);
+            append(&record, ",\"targetClientId\":%lld,\"targetClientName\":", closed[i].target_client_id); text(&record, closed[i].target_client_name); append(&record, "}");
+        }
+        append(&record, "]}");
+    }
+    if (result.failed || record.failed) { free(result.data); free(record.data); return -1; }
+    *response = result.data; *audit = record.data; return 0;
 }
 
 static int compare_id(const void *a, const void *b)

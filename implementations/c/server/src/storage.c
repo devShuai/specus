@@ -4,6 +4,7 @@
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
+#include "owner_transfer_internal.h"
 #include "traffic_capture.h"
 
 #include <arpa/inet.h>
@@ -773,6 +774,11 @@ int st_storage_init(const char *path, int seed_demo_client)
 
     int rc = exec_sql(db,
         "CREATE TABLE IF NOT EXISTS client_account (" CLIENT_ACCOUNT_COLUMNS ");"
+        "CREATE TABLE IF NOT EXISTS client_owner_transfer_audit ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,actor_username TEXT NOT NULL,"
+        "scope TEXT NOT NULL,resource_id INTEGER NOT NULL,credential_id INTEGER,"
+        "target_username TEXT NOT NULL,payload_json TEXT NOT NULL,occurred_at_ms INTEGER NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS idx_owner_transfer_audit_tenant_id ON client_owner_transfer_audit(tenant_id,id);"
         "CREATE TABLE IF NOT EXISTS specus_management_user ("
         "username TEXT PRIMARY KEY,"
         "login_name TEXT,"
@@ -12941,4 +12947,268 @@ int st_storage_delete_management_user_audited(const char *path,
         return ST_STORAGE_ACCOUNT_STILL_OWNS;
     }
     return rc == 0 ? 0 : -1;
+}
+
+void st_storage_owner_transfer_result_free(st_storage_owner_transfer_result *result)
+{
+    if (result == NULL) return;
+    free(result->json); free(result->client_ids); free(result->closed);
+    memset(result, 0, sizeof(*result));
+}
+
+static int owner_transfer_scalar(sqlite3 *db, const char *sql, long long *value)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW ? 0 : -1;
+    if (rc == 0) *value = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt); return rc;
+}
+
+static int owner_transfer_target(sqlite3 *db, const char *tenant, const char *name,
+    const st_storage_share_builtin_admin *builtin, st_storage_management_user *target)
+{
+    if (builtin != NULL && builtin->accepted && builtin->username != NULL && builtin->tenant_id != NULL
+        && strcmp(tenant, builtin->tenant_id) == 0 && sqlite3_stricmp(name, builtin->username) == 0) {
+        st_storage_management_actor descriptor = {name, tenant, ""};
+        return load_management_actor(db, &descriptor, builtin, target) == 0 ? 0 : 1;
+    }
+    int found = management_user_lookup(db, 1, 0, tenant, name, target);
+    return found < 0 ? -1 : found != 0 || !target->enabled ? 1 : 0;
+}
+
+static int owner_transfer_compare_id(const void *a, const void *b)
+{
+    long long x = *(const long long *)a, y = *(const long long *)b;
+    return (x > y) - (x < y);
+}
+
+static int owner_transfer_capture(sqlite3 *db, const st_owner_snapshot *before)
+{
+    if (exec_sql(db, "CREATE TEMP TABLE st_owner_ids(id INTEGER PRIMARY KEY);"
+                     "CREATE TEMP TABLE st_owner_credentials(id INTEGER PRIMARY KEY);"
+                     "CREATE TEMP TABLE st_owner_peer_ids(id INTEGER PRIMARY KEY);"
+                     "CREATE TEMP TABLE st_owner_closed(id INTEGER PRIMARY KEY);") != 0) return -1;
+    const st_owner_rows *rows[] = {&before->clients, &before->credentials, &before->peers};
+    const char *sql[] = {"INSERT INTO st_owner_ids VALUES(?)", "INSERT INTO st_owner_credentials VALUES(?)",
+                         "INSERT INTO st_owner_peer_ids VALUES(?)"};
+    for (size_t n = 0; n < 3; ++n) {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, sql[n], -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        for (size_t i = 0; rc == 0 && i < rows[n]->len; ++i) {
+            sqlite3_bind_int64(stmt, 1, rows[n]->items[i].id);
+            if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+        }
+        sqlite3_finalize(stmt); if (rc != 0) return -1;
+    }
+    return exec_sql(db,
+        "CREATE TEMP TABLE st_owner_before_clients AS SELECT * FROM client_account WHERE rowid IN (SELECT id FROM st_owner_ids);"
+        "CREATE TEMP TABLE st_owner_before_credentials AS SELECT * FROM specus_client_credential WHERE id IN (SELECT id FROM st_owner_credentials);"
+        "CREATE TEMP TABLE st_owner_before_peers AS SELECT * FROM peer_mesh_device WHERE client_id IN (SELECT id FROM st_owner_ids);"
+        "CREATE TEMP TABLE st_owner_foreign_peers AS SELECT * FROM st_owner_before_peers WHERE id NOT IN (SELECT id FROM st_owner_peer_ids);"
+        "CREATE TEMP TABLE st_owner_before_identities AS SELECT * FROM specus_client_identity WHERE client_id IN (SELECT id FROM st_owner_ids) OR credential_id IN (SELECT id FROM st_owner_credentials);"
+        "CREATE TEMP TABLE st_owner_before_access AS SELECT * FROM specus_client_session WHERE client_id IN (SELECT id FROM st_owner_ids) OR credential_id IN (SELECT id FROM st_owner_credentials);"
+        "CREATE TEMP TABLE st_owner_before_sessions AS SELECT * FROM peer_mesh_session WHERE source_client_id IN (SELECT id FROM st_owner_ids) OR target_client_id IN (SELECT id FROM st_owner_ids);"
+        "CREATE TEMP TABLE st_owner_kept_sessions AS SELECT * FROM st_owner_before_sessions;");
+}
+
+static int owner_transfer_update_rows(sqlite3 *db, const st_owner_rows *rows, const char *sql,
+    const char *tenant, const char *target)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    for (size_t i = 0; rc == 0 && i < rows->len; ++i) {
+        const st_owner_row *row = &rows->items[i];
+        if (row->owner_username != NULL && strcmp(row->owner_username, target) == 0) continue;
+        sqlite3_bind_text(stmt, 1, target, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, row->id);
+        sqlite3_bind_text(stmt, 3, tenant, -1, SQLITE_TRANSIENT);
+        if (row->owner_username == NULL) sqlite3_bind_null(stmt, 4);
+        else sqlite3_bind_text(stmt, 4, row->owner_username, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE || sqlite3_changes(db) != 1) rc = -1;
+        sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+    }
+    sqlite3_finalize(stmt); return rc;
+}
+
+static int owner_transfer_close_lost(sqlite3 *db, const char *tenant, st_storage_owner_transfer_result *result)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT id,tenant_id,source_client_id,source_client_name,target_client_id,target_client_name "
+        "FROM peer_mesh_session WHERE tenant_id=? AND status<>'CLOSED' AND "
+        "(source_client_id IN (SELECT id FROM st_owner_ids) OR target_client_id IN (SELECT id FROM st_owner_ids)) ORDER BY id",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc != 0) return -1;
+    sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+    size_t capacity = 0; int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        st_storage_client source = {0}, target = {0}; int allowed = 0;
+        /* Missing/corrupt endpoints cannot keep an effective grant. */
+        if (load_client(db, sqlite3_column_int64(stmt, 2), &source) == 0
+            && load_client(db, sqlite3_column_int64(stmt, 4), &target) == 0
+            && strcmp(source.tenant_id, tenant) == 0 && strcmp(target.tenant_id, tenant) == 0) {
+            if (can_peer_on_db(db, &source, &target, &allowed) != 0) { rc = -1; break; }
+        }
+        if (allowed) continue;
+        if (storage_reserve((void **)&result->closed, result->closed_count, &capacity, sizeof(*result->closed)) != 0) { rc = -1; break; }
+        st_storage_peer_close *closed = &result->closed[result->closed_count]; memset(closed, 0, sizeof(*closed));
+        closed->id = sqlite3_column_int64(stmt, 0);
+        closed->source_client_id = sqlite3_column_int64(stmt, 2); closed->target_client_id = sqlite3_column_int64(stmt, 4);
+        if (copy_text_column(stmt, 1, closed->tenant_id, sizeof(closed->tenant_id)) != 0
+            || copy_text_column(stmt, 3, closed->source_client_name, sizeof(closed->source_client_name)) != 0
+            || copy_text_column(stmt, 5, closed->target_client_name, sizeof(closed->target_client_name)) != 0) { rc = -1; break; }
+        ++result->closed_count;
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    for (size_t i = 0; rc == 0 && i < result->closed_count; ++i) {
+        if (close_peer_session(db, result->closed[i].id) != 0) { rc = -1; break; }
+        sqlite3_stmt *insert = NULL;
+        rc = sqlite3_prepare_v2(db, "INSERT INTO st_owner_closed VALUES(?)", -1, &insert, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) { sqlite3_bind_int64(insert, 1, result->closed[i].id); rc = sqlite3_step(insert) == SQLITE_DONE ? 0 : -1; }
+        sqlite3_finalize(insert);
+    }
+    if (rc == 0) rc = exec_sql(db, "DELETE FROM st_owner_kept_sessions WHERE id IN (SELECT id FROM st_owner_closed)");
+    return rc;
+}
+
+static int owner_transfer_validate_preserved(sqlite3 *db)
+{
+    static const char *const ownership[] = {"owner_username", "updated_at"};
+    static const char *const session_state[] = {"status", "closed_at", "updated_at"};
+    const char *client_scope = "rowid IN (SELECT id FROM st_owner_ids)";
+    const char *credential_scope = "id IN (SELECT id FROM st_owner_credentials)";
+    const char *peer_scope = "client_id IN (SELECT id FROM st_owner_ids)";
+    const char *identity_scope = "client_id IN (SELECT id FROM st_owner_ids) OR credential_id IN (SELECT id FROM st_owner_credentials)";
+    const char *session_scope = "source_client_id IN (SELECT id FROM st_owner_ids) OR target_client_id IN (SELECT id FROM st_owner_ids)";
+    if (st_owner_transfer_rows_preserved(db, "client_account", "st_owner_before_clients", client_scope, ownership, 2) != 0
+        || st_owner_transfer_rows_preserved(db, "specus_client_credential", "st_owner_before_credentials", credential_scope, ownership, 2) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_device", "st_owner_before_peers", peer_scope, ownership, 2) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_device", "st_owner_foreign_peers",
+            "client_id IN (SELECT id FROM st_owner_ids) AND id NOT IN (SELECT id FROM st_owner_peer_ids)", NULL, 0) != 0
+        || st_owner_transfer_rows_preserved(db, "specus_client_identity", "st_owner_before_identities", identity_scope, NULL, 0) != 0
+        || st_owner_transfer_rows_preserved(db, "specus_client_session", "st_owner_before_access", identity_scope, NULL, 0) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_session", "st_owner_before_sessions", session_scope, session_state, 3) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_session", "st_owner_kept_sessions",
+            "id IN (SELECT id FROM st_owner_kept_sessions)", NULL, 0) != 0) return -1;
+    long long invalid = 0;
+    if (owner_transfer_scalar(db, "SELECT COUNT(*) FROM peer_mesh_session WHERE id IN (SELECT id FROM st_owner_closed) "
+        "AND (status<>'CLOSED' OR COALESCE(closed_at,'')='')", &invalid) != 0 || invalid != 0) return -1;
+    return 0;
+}
+
+int st_storage_transfer_owner(const char *path, const st_storage_management_actor *actor,
+    const st_storage_share_builtin_admin *builtin, int group, long long id,
+    const char *request, long long now_ms, st_storage_owner_transfer_result *out, const char **code)
+{
+    const char *local_code = NULL;
+    if (code == NULL) code = &local_code;
+    *code = "INTERNAL_SERVER_ERROR";
+    if (out != NULL) {
+        if (out->json != NULL || out->client_ids != NULL || out->closed != NULL
+            || out->client_count != 0 || out->closed_count != 0) return 500;
+        memset(out, 0, sizeof(*out));
+    }
+    if (path == NULL || *path == '\0') return 500;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return 500;
+    st_owner_snapshot before = {0}, after = {0};
+    st_storage_management_user current_actor = {0}, target = {0}, checked = {0};
+    st_storage_owner_transfer_result staged = {0};
+    char *preview = NULL, *requested_target = NULL, *audit = NULL, *after_json = NULL;
+    int status = 500, transaction = 0;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    int actor_status = load_management_actor(db, actor, builtin, &current_actor);
+    if (actor_status != 0 || !management_actor_is_admin(current_actor.role)) {
+        if (actor_status >= 0) { status = 403; *code = "FORBIDDEN"; } goto done;
+    }
+    if ((group != 0 && group != 1) || id <= 0 || id > 9007199254740991LL
+        || request == NULL || !st_json_is_valid_object(request)) { status = 400; *code = "INVALID_TRANSFER_REQUEST"; goto done; }
+    if (st_owner_snapshot_load_on_db(db, current_actor.tenant_id, group, id, &before) != 0) goto done;
+    status = st_owner_transfer_prepare(current_actor.tenant_id, 1, group, id, &before, request, &preview, &requested_target, code);
+    if (status != 200) goto done;
+    status = 500; *code = "INTERNAL_SERVER_ERROR";
+    int found = owner_transfer_target(db, current_actor.tenant_id, requested_target, builtin, &target);
+    if (found != 0) { if (found > 0) { status = 400; *code = "INVALID_TARGET_OWNER"; } goto done; }
+    if (before.credentials.len > 1 || before.clients.len > SIZE_MAX / sizeof(*staged.client_ids)) goto done;
+    long long credential_id = before.credentials.len == 0 ? 0 : before.credentials.items[0].id;
+    staged.client_count = before.clients.len;
+    if (staged.client_count != 0) {
+        staged.client_ids = malloc(staged.client_count * sizeof(*staged.client_ids));
+        if (staged.client_ids == NULL) goto done;
+        for (size_t i = 0; i < staged.client_count; ++i) staged.client_ids[i] = before.clients.items[i].id;
+        qsort(staged.client_ids, staged.client_count, sizeof(*staged.client_ids), owner_transfer_compare_id);
+    }
+    strcpy(staged.tenant_id, current_actor.tenant_id); strcpy(staged.target_username, target.username);
+    const st_owner_rows *lists[] = {&before.clients, &before.credentials, &before.peers};
+    for (size_t n = 0; n < 3; ++n) for (size_t i = 0; i < lists[n]->len; ++i)
+        if (lists[n]->items[i].owner_username == NULL || strcmp(lists[n]->items[i].owner_username, target.username) != 0) staged.changed = 1;
+    long long audit_before = 0;
+    if (staged.changed) {
+        if (owner_transfer_scalar(db, "SELECT COUNT(*) FROM client_owner_transfer_audit", &audit_before) != 0
+            || owner_transfer_capture(db, &before) != 0
+            || owner_transfer_update_rows(db, &before.clients,
+                "UPDATE client_account SET owner_username=?1,updated_at=CURRENT_TIMESTAMP WHERE rowid=?2 AND tenant_id=?3 AND owner_username IS ?4", current_actor.tenant_id, target.username) != 0
+            || owner_transfer_update_rows(db, &before.credentials,
+                "UPDATE specus_client_credential SET owner_username=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND tenant_id=?3 AND owner_username IS ?4", current_actor.tenant_id, target.username) != 0
+            || owner_transfer_update_rows(db, &before.peers,
+                "UPDATE peer_mesh_device SET owner_username=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND tenant_id=?3 AND owner_username IS ?4", current_actor.tenant_id, target.username) != 0
+            || owner_transfer_close_lost(db, current_actor.tenant_id, &staged) != 0) goto done;
+    }
+    if (st_owner_transfer_encode_result(current_actor.tenant_id, current_actor.username, group, id, target.username,
+        credential_id, &before, preview, staged.client_ids, staged.client_count, staged.changed,
+        staged.closed, staged.closed_count, &staged.json, &audit) != 0) goto done;
+    if (staged.changed) {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, "INSERT INTO client_owner_transfer_audit(tenant_id,actor_username,scope,resource_id,credential_id,target_username,payload_json,occurred_at_ms) VALUES(?,?,?,?,?,?,?,?)", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, current_actor.tenant_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, current_actor.username, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, group ? "credential-group" : "single", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(stmt, 4, id);
+            if (credential_id == 0) sqlite3_bind_null(stmt, 5); else sqlite3_bind_int64(stmt, 5, credential_id);
+            sqlite3_bind_text(stmt, 6, target.username, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 7, audit, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 8, now_ms);
+            rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+        }
+        sqlite3_finalize(stmt); if (rc != 0) goto done;
+        staged.audit_id = sqlite3_last_insert_rowid(db);
+        long long audit_after = 0;
+        if (staged.audit_id <= 0 || owner_transfer_scalar(db, "SELECT COUNT(*) FROM client_owner_transfer_audit", &audit_after) != 0
+            || audit_after != audit_before + 1 || owner_transfer_validate_preserved(db) != 0) goto done;
+        rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_owner_transfer_audit WHERE id=? AND tenant_id=? AND actor_username=? AND scope=? AND resource_id=? AND credential_id IS ? AND target_username=? AND payload_json=? AND occurred_at_ms=?", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, staged.audit_id); sqlite3_bind_text(stmt, 2, current_actor.tenant_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, current_actor.username, -1, SQLITE_TRANSIENT); sqlite3_bind_text(stmt, 4, group ? "credential-group" : "single", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(stmt, 5, id); if (credential_id == 0) sqlite3_bind_null(stmt, 6); else sqlite3_bind_int64(stmt, 6, credential_id);
+            sqlite3_bind_text(stmt, 7, target.username, -1, SQLITE_TRANSIENT); sqlite3_bind_text(stmt, 8, audit, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 9, now_ms);
+            rc = sqlite3_step(stmt) == SQLITE_ROW ? 0 : -1;
+        }
+        sqlite3_finalize(stmt); if (rc != 0) goto done;
+    }
+    /* Re-read after all DML, including audit triggers. Current target/account identity,
+     * complete group and final owners must still be valid before any output is published. */
+    if (load_management_actor(db, actor, builtin, &checked) != 0 || !management_actor_is_admin(checked.role)) goto done;
+    st_storage_management_actor target_descriptor = {target.username, target.tenant_id, target.account_key};
+    if (load_management_actor(db, &target_descriptor, builtin, &checked) != 0) goto done;
+    if (st_owner_snapshot_load_on_db(db, current_actor.tenant_id, group, id, &after) != 0) goto done;
+    char after_revision[65]; const char *after_code = NULL;
+    if (st_owner_transfer_preview(current_actor.tenant_id, 1, group, id, &after, &after_json, after_revision, &after_code) != 200
+        || after_revision[0] == '\0' || after.clients.len != before.clients.len
+        || after.credentials.len != before.credentials.len || after.peers.len != before.peers.len) goto done;
+    const st_owner_rows *final[] = {&after.clients, &after.credentials, &after.peers};
+    for (size_t n = 0; n < 3; ++n) for (size_t i = 0; i < final[n]->len; ++i)
+        if (final[n]->items[i].owner_username == NULL || strcmp(final[n]->items[i].owner_username, target.username) != 0) goto done;
+    if (exec_sql(db, "COMMIT") != 0) goto done;
+    transaction = 0; status = 200; *code = NULL;
+    if (out != NULL) { *out = staged; memset(&staged, 0, sizeof(staged)); }
+done:
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db); st_owner_snapshot_free(&before); st_owner_snapshot_free(&after);
+    free(preview); free(requested_target); free(audit); free(after_json);
+    st_storage_owner_transfer_result_free(&staged);
+    return status;
 }

@@ -205,12 +205,15 @@ static int http_scenario(test_server *server)
     CHECK(server_stop(server,10000)==0&&server_start(server)==0,"restart native same DB");CHECK(http_request(server->admin_port,"GET",path,NULL,token,&status,&body)==0&&status==200,"restart GET");current=st_json_get_top_level_string(body,"revision");CHECK(current!=NULL&&strcmp(revision,current)==0,"stateless restart revision");free(current);free(body);free(revision);sqlite3_close(db);free(token);
     printf("16 real HTTP vectors, auth priority, 1050 unbounded UTF8 rows and restart revision passed\n");return 0;
 }
+#include "owner_transfer_write_tests.h"
+
 int main(int argc,char **argv)
 {
     if(argc!=2)return 2;
     server_binary=argv[1];signal(SIGPIPE,SIG_IGN);setvbuf(stdout,NULL,_IOLBF,0);
     FILE *file=fopen(ST_OWNER_TRANSFER_VECTOR_FILE,"rb");CHECK(file!=NULL,"shared vector file");CHECK(fseek(file,0,SEEK_END)==0,"vector seek");long size=ftell(file);CHECK(size>0&&fseek(file,0,SEEK_SET)==0,"vector size");vector=malloc((size_t)size+1U);CHECK(vector!=NULL&&fread(vector,1,(size_t)size,file)==(size_t)size,"vector read");fclose(file);vector[size]='\0';
     base=st_json_get_top_level_raw(vector,"base");snapshots=st_json_get_top_level_raw(vector,"snapshots");CHECK(base!=NULL&&snapshots!=NULL&&st_json_get_raw_array(vector,"cases",&cases,&case_count)==0,"vector decode");
-    int failed=shared_vectors()|revisions();if(!failed)failed=run_on_fresh_server("owner-transfer-preview",http_scenario,NULL);
+    int failed=shared_vectors()|revisions();if(!failed)failed=ownership_writer_tests();
+    if(!failed)failed=run_on_fresh_server("owner-transfer-preview",http_scenario,NULL);
     st_json_free_string_array(cases,case_count);free(snapshots);free(base);free(vector);return failed?1:0;
 }

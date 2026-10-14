@@ -1896,4 +1896,26 @@ int st_storage_delete_management_user_audited(const char *path,
                                               st_storage_share_ids *revoked,
                                               st_storage_account_owned *owned);
 
+typedef struct {
+    char *json;
+    char tenant_id[64];
+    char target_username[81];
+    long long audit_id;
+    int changed;
+    long long *client_ids;
+    size_t client_count;
+    st_storage_peer_close *closed;
+    size_t closed_count;
+} st_storage_owner_transfer_result;
+
+/* Internal transfer writer, NOT an exposed POST. Contract HTTP status/stable code;
+ * fresh actor/target/group/revision, ownership, selective session closure and one audit
+ * are atomic. Outputs only after commit; NULL output still validates everything.
+ * Caller supplies an empty output and frees successful outputs with the matching helper.
+ * Runtime notification/outbox consumption must be integrated before exposing a route. */
+int st_storage_transfer_owner(const char *path, const st_storage_management_actor *actor,
+    const st_storage_share_builtin_admin *builtin, int group, long long id,
+    const char *request, long long now_ms, st_storage_owner_transfer_result *out, const char **code);
+void st_storage_owner_transfer_result_free(st_storage_owner_transfer_result *result);
+
 #endif
