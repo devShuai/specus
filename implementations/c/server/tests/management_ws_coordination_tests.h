@@ -1,5 +1,5 @@
-/* Included only by client_identity_coordination_tests.c. Real native HTTP/WS/control,
- * not a transfer API: committed SQL ownership fixtures test existing authorization. */
+/* Included only by client_identity_coordination_tests.c. Real native HTTP/WS/control.
+ * Retain SQL authorization controls and separately exercise actual transfer POSTs. */
 typedef struct {
     test_server *server;
     const char *ticket, *endpoint;
@@ -169,11 +169,70 @@ static int management_expect_control_message(int fd,const char *sender)
     return -1;
 }
 
-static int management_owner_visibility(int independent_admin)
+static int management_http_owner_transfer(test_server *preview_server,test_server *write_server,
+                                           long long client_id,long long credential_id,int group)
+{
+    char admin[2048],path[180],request[400],*response=NULL,*revision=NULL;int status=0,failed=1;
+    if(st_security_issue_local_token(ADMIN_USERNAME,"default","ADMIN",ADMIN_JWT_SECRET,600,admin,sizeof(admin))!=0)return 1;
+    snprintf(path,sizeof(path),"/api/admin/%s/%lld/owner-transfer",group?"client-credentials":"clients",group?credential_id:client_id);
+    if(http_request(preview_server->admin_port,"GET",path,NULL,admin,&status,&response)!=0 || status!=200)goto done;
+    revision=st_json_get_top_level_string(response,"revision");free(response);response=NULL;if(revision==NULL)goto done;
+    snprintf(request,sizeof(request),"{\"scope\":\"%s\",\"targetUsername\":\"bob\",\"expectedRevision\":\"%s\"}",group?"credential-group":"single",revision);
+    if(http_request(write_server->admin_port,"POST",path,request,admin,&status,&response)!=0 || status!=200) {
+        fprintf(stderr,"management WS transfer POST status%d\n",status);goto done;
+    }
+    int changed=0,retained=0;
+    if(st_json_get_bool(response,"changed",&changed)!=0 || !changed
+        || st_json_get_bool(response,"accessRetained",&retained)!=0 || !retained)goto done;
+    failed=0;
+done:
+    free(response);free(revision);return failed;
+}
+
+static int management_transfer_during_upgrade(test_server *server,test_server *writer,const char *token,
+                                               const char *endpoint,int ready_fd,int resume_fd,
+                                               long long client_id,long long credential_id)
+{
+    char *ticket=management_ticket(server,token,endpoint);if(ticket==NULL)return -1;
+    management_ws_upgrade upgrade={server,ticket,endpoint,-1,0};pthread_t thread;int started=0,ok=0;
+    if(pthread_create(&thread,NULL,management_upgrade,&upgrade)!=0)goto done;
+    started=1;struct pollfd event={.fd=ready_fd,.events=POLLIN};int polled;
+    do { polled=poll(&event,1,IO_TIMEOUT_MS); }while(polled<0&&errno==EINTR);
+    char signal=0;
+    if(polled!=1 || read(ready_fd,&signal,1)!=1 || signal!='R')goto done;
+    /* The real account lookup is CLOSED and its ticket consumed, but this socket is
+     * not yet registered. No database lock is held over the independent HTTP POST. */
+    if(management_http_owner_transfer(server,writer,client_id,credential_id,1)!=0)goto done;
+    if(write(resume_fd,"C",1)!=1)goto done;
+    pthread_join(thread,NULL);started=0;
+    if(upgrade.status!=101 || upgrade.fd<0)goto done;
+    char text[2048];int opcode=0;
+    if(strcmp(endpoint,"client-messages")==0
+        && (management_frame(upgrade.fd,&opcode,text,sizeof(text),IO_TIMEOUT_MS)<=0 || opcode!=1 || strstr(text,"\"type\":\"hello\"")==NULL))goto done;
+    if(management_send(upgrade.fd,9,"post-transfer-ready")!=0
+        || management_frame(upgrade.fd,&opcode,text,sizeof(text),IO_TIMEOUT_MS)<=0 || opcode!=10)goto done;
+    management_ws_upgrade reused={server,ticket,endpoint,-1,0};management_upgrade(&reused);close_fd(&reused.fd);
+    if(reused.status!=403)goto done;
+    ok=1;
+done:
+    if(started) { if(write(resume_fd,"C",1)!=1)fprintf(stderr,"ownership WS resume failed\n");pthread_join(thread,NULL); }
+    free(ticket);
+    if(!ok) { close_fd(&upgrade.fd);return -1; }
+    return upgrade.fd;
+}
+
+/* mode0: original SQL control; mode1: real single POST; mode2: GET A/group POST B;
+ * modes3/4: ticket consumed -> real remote group POST -> register messages/connections.
+ * Existing management sockets stay on A, where the actual connection event is produced.
+ * This checks fresh authorization across instances, not cross-instance event fan-out. */
+static int management_owner_visibility(int independent_admin,int mode)
 {
     test_server server;if(server_prepare(&server)!=0) return 1;
+    test_server second={.pid=-1};int second_prepared=0,second_started=0;
     const char *stage="prepare";
     int failed=1,started=0,control=-1,data=-1,messages[3]={-1,-1,-1},events[3]={-1,-1,-1};
+    int ready_fd=-1,resume_fd=-1;char ready[400]={0},resume[400]={0};
+    char preload[1024],ready_env[450],resume_env[450],account_env[200];
     char tokens[3][2048],*response=NULL;sqlite3 *db=NULL;
     const char *names[]={"alice","bob","alice"},*tenants[]={"default","default","foreign"};
     st_storage_management_user users[3];st_storage_client_credential credential;runtime_session runtime;
@@ -182,9 +241,29 @@ static int management_owner_visibility(int independent_admin)
         if(st_storage_create_management_user(server.db_path,names[i],tenants[i],"fixture-only-hash",role,1,&users[i])!=0
             || st_security_issue_local_token_for_account(names[i],tenants[i],role,users[i].account_key,ADMIN_JWT_SECRET,600,tokens[i],sizeof(tokens[i]))!=0) goto done;
     }
+    if(mode>=3) {
+        snprintf(ready,sizeof(ready),"%s/owner-ws-ready",server.dir);snprintf(resume,sizeof(resume),"%s/owner-ws-resume",server.dir);
+        if(mkfifo(ready,0600)!=0 || mkfifo(resume,0600)!=0)goto done;
+        ready_fd=open(ready,O_RDWR|O_NONBLOCK|O_CLOEXEC);resume_fd=open(resume,O_RDWR|O_NONBLOCK|O_CLOEXEC);
+        if(ready_fd<0 || resume_fd<0)goto done;
+        Dl_info sanitizer={0};void *asan=dlsym(RTLD_DEFAULT,"__asan_init");
+        if(asan!=NULL && dladdr(asan,&sanitizer)!=0 && sanitizer.dli_fname!=NULL)
+            snprintf(preload,sizeof(preload),"LD_PRELOAD=%s:%s",sanitizer.dli_fname,barrier_library);
+        else snprintf(preload,sizeof(preload),"LD_PRELOAD=%s",barrier_library);
+        snprintf(ready_env,sizeof(ready_env),"SPECUS_TEST_AUTH_BARRIER_READY=%s",ready);
+        snprintf(resume_env,sizeof(resume_env),"SPECUS_TEST_AUTH_BARRIER_RESUME=%s",resume);
+        snprintf(account_env,sizeof(account_env),"SPECUS_TEST_AUTH_BARRIER_WS_ACCOUNT=%s",users[0].account_key);
+        server.extra_env[0]=preload;server.extra_env[1]=ready_env;server.extra_env[2]=resume_env;server.extra_env[3]=account_env;
+    }
     stage="credential/start";
     if(insert_credential(server.db_path,&credential)!=0 || server_start(&server)!=0) goto done;
     started=1;
+    if(mode>=2) {
+        if(server_prepare(&second)!=0)goto done;
+        second_prepared=1;snprintf(second.db_path,sizeof(second.db_path),"%s",server.db_path);
+        if(server_start(&second)!=0)goto done;
+        second_started=1;
+    }
     stage="native login";harness_login_environment_extra=",\"receiveMessages\":true,\"sendMessages\":true";
     int login=http_client_login(&server,TEST_KEY,TEST_SECRET,"ws-ownership-device","user",&runtime);
     harness_login_environment_extra="";
@@ -195,21 +274,37 @@ static int management_owner_visibility(int independent_admin)
     const int order[]={1,0,2};char text[4096];int opcode=0;
     stage="register sockets";
     for(int n=0;n<3;++n) {
-        int i=order[n];messages[i]=management_open(&server,tokens[i],"client-messages");events[i]=management_open(&server,tokens[i],"connections");
+        int i=order[n];
+        if(i==0 && mode>=3) {
+            const char *endpoint=mode==3?"client-messages":"connections";
+            int paused=management_transfer_during_upgrade(&server,&second,tokens[i],endpoint,ready_fd,resume_fd,runtime.client_id,credential.id);
+            if(paused<0)goto done;
+            if(mode==3) { messages[i]=paused;events[i]=management_open(&server,tokens[i],"connections"); }
+            else { events[i]=paused;messages[i]=management_open(&server,tokens[i],"client-messages"); }
+        } else { messages[i]=management_open(&server,tokens[i],"client-messages");events[i]=management_open(&server,tokens[i],"connections"); }
         if(messages[i]<0 || events[i]<0) goto done;
     }
-    stage="ownership fixture";
+    stage=mode==0?"ownership SQL control":"actual ownership POST";
     if(sqlite3_open(server.db_path,&db)!=SQLITE_OK) goto done;
     sqlite3_busy_timeout(db,IO_TIMEOUT_MS);
-    char sql[800];
-    snprintf(sql,sizeof(sql),"BEGIN IMMEDIATE; UPDATE client_account SET owner_username='bob' WHERE rowid=%lld; UPDATE specus_client_credential SET owner_username='bob' WHERE id=%lld; UPDATE peer_mesh_device SET owner_username='bob' WHERE client_id=%lld; COMMIT",runtime.client_id,credential.id,runtime.client_id);
-    if(execute(db,sql)!=0) goto done;
+    if(mode==0) {
+        char sql[800];
+        snprintf(sql,sizeof(sql),"BEGIN IMMEDIATE; UPDATE client_account SET owner_username='bob' WHERE rowid=%lld; UPDATE specus_client_credential SET owner_username='bob' WHERE id=%lld; UPDATE peer_mesh_device SET owner_username='bob' WHERE client_id=%lld; COMMIT",runtime.client_id,credential.id,runtime.client_id);
+        if(execute(db,sql)!=0) goto done;
+    } else if(mode<=2) {
+        if(management_http_owner_transfer(&server,mode==2?&second:&server,runtime.client_id,credential.id,mode==2)!=0
+            || scalar(db,"SELECT COUNT(*) FROM client_owner_transfer_audit")!=1)goto done;
+    } else if(scalar(db,"SELECT COUNT(*) FROM client_owner_transfer_audit")!=1)goto done;
     char path[160];snprintf(path,sizeof(path),"/api/admin/clients/%lld",runtime.client_id);
     stage="current REST and outbound WS";
     for(int i=0;i<3;++i) {
         int status=0,allowed=i==1 || (i==0 && independent_admin);
         if(http_request(server.admin_port,"GET",path,NULL,tokens[i],&status,&response)!=0 || status!=(allowed?200:404)) { fprintf(stderr,"current REST owner=%d admin=%d status=%d\n",i,independent_admin,status);goto done; }
         free(response);response=NULL;
+        if(mode>=2) {
+            if(http_request(second.admin_port,"GET",path,NULL,tokens[i],&status,&response)!=0 || status!=(allowed?200:404))goto done;
+            free(response);response=NULL;
+        }
         char command[800];snprintf(command,sizeof(command),"{\"type\":\"message\",\"messageId\":\"owner-check\",\"toClientName\":\"%s\",\"message\":\"ownership-message\"}",runtime.client_name);
         if(management_send(messages[i],1,command)!=0) goto done;
         if(allowed) {
@@ -251,7 +346,13 @@ done:
     harness_login_environment_extra="";free(response);sqlite3_close(db);close_fd(&control);close_fd(&data);
     for(int i=0;i<3;++i) { close_fd(&messages[i]);close_fd(&events[i]); }
     if(started&&server_stop(&server,10000)!=0) failed=1;
+    if(second_started&&server_stop(&second,10000)!=0)failed=1;
+    if(ready_fd>=0)close(ready_fd);
+    if(resume_fd>=0)close(resume_fd);
+    if(ready[0])unlink(ready);
+    if(resume[0])unlink(resume);
     if(failed) { fprintf(stderr,"owner visibility stopped at stage=%s admin=%d\n",stage,independent_admin);dump_server_log(&server); }
+    if(second_prepared)server_cleanup(&second,failed);
     server_cleanup(&server,failed);
-    printf("%s native current REST/WS owner visibility: independent-admin=%d\n",failed?"FAIL":"PASS",independent_admin);return failed;
+    printf("%s native current REST/WS owner visibility: independent-admin=%d mode=%d\n",failed?"FAIL":"PASS",independent_admin,mode);return failed;
 }

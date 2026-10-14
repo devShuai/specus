@@ -1288,7 +1288,8 @@ int main(int argc,char **argv)
     for(int scenario=0;scenario<13;++scenario) failed+=direct_runtime_snapshot(scenario);
     for(int messages=0;messages<2;++messages)
         for(int scenario=0;scenario<6;++scenario) failed+=management_post_registration(messages,scenario);
-    for(int admin=0;admin<2;++admin) failed+=management_owner_visibility(admin);
+    for(int mode=0;mode<5;++mode)
+        for(int admin=0;admin<2;++admin) failed+=management_owner_visibility(admin,mode);
     for(int scenario=0;scenario<17;++scenario)
         for(int null_output=0;null_output<2;++null_output) failed+=direct_peer_session_creation(scenario,null_output);
     for(int scenario=0;scenario<3;++scenario)
