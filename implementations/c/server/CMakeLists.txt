@@ -467,6 +467,16 @@ add_test(NAME client_identity_coordination_tests COMMAND specus_c_client_identit
     $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_auth_read_barrier>)
 set_tests_properties(client_identity_coordination_tests PROPERTIES TIMEOUT 120)
 
+add_library(specus_c_nat_lifecycle_barrier SHARED tests/nat_lifecycle_barrier.c)
+target_link_libraries(specus_c_nat_lifecycle_barrier PRIVATE ${CMAKE_DL_LIBS} pthread)
+target_compile_options(specus_c_nat_lifecycle_barrier PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specus_c_nat_lifecycle_tests tests/nat_lifecycle_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_nat_lifecycle_tests PRIVATE specus_c_core ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_nat_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME nat_lifecycle_tests COMMAND specus_c_nat_lifecycle_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_nat_lifecycle_barrier>)
+set_tests_properties(nat_lifecycle_tests PROPERTIES TIMEOUT 60)
+
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_tls_transport_tests PRIVATE -Wall -Wextra -Wpedantic)

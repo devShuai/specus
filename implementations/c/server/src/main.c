@@ -124,6 +124,9 @@ typedef struct external_write_chunk {
 
 typedef struct external_conn {
     int fd;
+    int owned_fd; /* Closed only after both workers finish; snapshots cannot name a reused fd. */
+    int reader_finished; /* map_lock */
+    int writer_finished; /* map_lock */
     int port;
     uint32_t stream_id;
     char channel_id[ST_CHANNEL_ID_SIZE];
@@ -236,6 +239,9 @@ struct specus_session {
     ws_conn *ws_conns;
     specus_listener *listeners;
     direct_http_pending *direct_pending;
+    /* Irreversible namespace retirement: map admissions use map_lock, writers a snapshot. */
+    atomic_int nat_retired;
+    int direct_retired; /* direct_lock: registration and fail-all share one admission fence. */
     int active;
     /*
      * Set, under active_session_lock, when the connection was taken out of service: by a newer
@@ -298,6 +304,7 @@ static size_t live_connection_count = 0U;
 static int server_stopping = 0;
 
 static char *json_http_request(const st_direct_http_request *request);
+static void retire_data_namespace(specus_session *session);
 static char *json_http_request_fin(const st_direct_http_request *request, int *failed);
 static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason);
@@ -1337,7 +1344,8 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
 static int session_send_packet_locked(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
-    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed) {
+    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed
+        && !atomic_load(&session->nat_retired)) {
         rc = session->tls_connection == NULL
             ? send_all(session->control_fd, packet->data, packet->len)
             : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
@@ -1378,6 +1386,7 @@ static int session_send_packet(specus_session *session, st_buffer *packet)
 static void direct_pending_fail_all(specus_session *session, const char *message)
 {
     pthread_mutex_lock(&session->direct_lock);
+    session->direct_retired = 1;
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
         if (!pending->done) {
             free(pending->error);
@@ -1790,9 +1799,12 @@ static void active_session_close_data_locked(specus_session *control)
     if (control == NULL || control->is_data_connection) {
         return;
     }
-    for (specus_session *data = active_sessions; data != NULL; data = data->active_next) {
+    for (specus_session *data = active_sessions, *next; data != NULL; data = next) {
+        next = data->active_next;
         if (data->is_data_connection && data->data_control == control) {
             shutdown(data->control_fd, SHUT_RDWR);
+            active_session_remove_locked(data);
+            retire_data_namespace(data);
         }
     }
 }
@@ -1842,25 +1854,7 @@ static void displace_session_locked(specus_session *session, const char *reason)
     ++session->references;
     shutdown(session->control_fd, SHUT_RDWR);
     active_session_remove_locked(session);
-}
-
-/*
- * Releases the public TCP ports of a displaced data connection before the replacing login is
- * answered. Its own thread would close them too, but only after it notices the shutdown; the
- * client's next REGISTER for the same port would otherwise race that and fail to bind. Shutting a
- * listening socket down takes it out of LISTEN, which with SO_REUSEADDR already frees the port;
- * the descriptor itself is left to the listener thread, which closes it once accept() fails, so
- * no descriptor is closed under a thread still blocked on it.
- */
-static void release_session_listeners(specus_session *session)
-{
-    pthread_mutex_lock(&session->map_lock);
-    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
-        if (listener->fd >= 0) {
-            shutdown(listener->fd, SHUT_RDWR);
-        }
-    }
-    pthread_mutex_unlock(&session->map_lock);
+    retire_data_namespace(session);
 }
 
 /*
@@ -1913,11 +1907,6 @@ static int activate_session(specus_session *session, displaced_sessions *displac
                old->is_data_connection ? "data" : "control",
                old->config.client_name,
                old->remote);
-        /* Under the new connection's send_lock, which is fine: no thread sends while holding a
-         * map_lock, so none can hold this one and wait for that send_lock. */
-        if (old->is_data_connection) {
-            release_session_listeners(old);
-        }
     }
     *reason = NULL;
     return 0;
@@ -1974,9 +1963,6 @@ static int close_client_connections(void *ctx, const char *client_name, const ch
                closed[i]->config.client_name,
                closed[i]->remote,
                reason);
-        if (closed[i]->is_data_connection) {
-            release_session_listeners(closed[i]);
-        }
         session_reference_release(closed[i]);
     }
     return (int)closed_count;
@@ -2146,6 +2132,12 @@ static int direct_http_forward(void *ctx,
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
+    if (session->direct_retired) {
+        pthread_mutex_unlock(&session->direct_lock);
+        pthread_cond_destroy(&pending.cond);
+        session_reference_release(session);
+        return -1;
+    }
     if (direct_pending_count_locked(session) >= ST_MAX_PENDING_DIRECT_STREAMS) {
         pthread_mutex_unlock(&session->direct_lock);
         pthread_cond_destroy(&pending.cond);
@@ -2425,6 +2417,13 @@ static void connectivity_probe(void *ctx,
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
+    if (session->direct_retired) {
+        pthread_mutex_unlock(&session->direct_lock);
+        pthread_cond_destroy(&pending.cond);
+        session_reference_release(session);
+        answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
+        return;
+    }
     if (direct_pending_count_locked(session) >= ST_MAX_PENDING_DIRECT_STREAMS) {
         pthread_mutex_unlock(&session->direct_lock);
         pthread_cond_destroy(&pending.cond);
@@ -2540,6 +2539,12 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     st_admin_direct_ws_retain(conn->stream);
 
     pthread_mutex_lock(&session->map_lock);
+    if (atomic_load(&session->nat_retired)) {
+        pthread_mutex_unlock(&session->map_lock);
+        free_ws_conn(conn);
+        session_reference_release(session);
+        return -1;
+    }
     conn->stream_id = session->next_stream_id++;
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
@@ -3656,11 +3661,6 @@ static int create_listener_on(const char *bind_address, int port)
     return fd;
 }
 
-static int create_listener(int port)
-{
-    return create_listener_on("0.0.0.0", port);
-}
-
 static void configure_control_socket(int fd, const server_config *config)
 {
     struct timeval timeout;
@@ -4191,11 +4191,49 @@ static void close_conn_locked(external_conn *conn)
     pthread_mutex_unlock(&conn->write_lock);
     if (conn->fd >= 0) {
         shutdown(conn->fd, SHUT_RDWR);
-        close(conn->fd);
         conn->fd = -1;
     }
     release_external_count(conn);
     conn->done = 1;
+    if (conn->reader_finished && conn->writer_finished && conn->owned_fd >= 0) {
+        close(conn->owned_fd);
+        conn->owned_fd = -1;
+    }
+}
+
+/* The final worker releases the actual descriptor promptly, not at session teardown. Until then
+ * shutdown has made the socket unusable, but its number cannot be reused under another worker's
+ * already-captured fd. No registry/send/SQL work after acquiring this local map lock. */
+static void external_worker_finished(external_conn *conn, int writer)
+{
+    pthread_mutex_lock(&conn->session->map_lock);
+    if (writer) conn->writer_finished = 1;
+    else conn->reader_finished = 1;
+    if (conn->done && conn->reader_finished && conn->writer_finished && conn->owned_fd >= 0) {
+        close(conn->owned_fd);
+        conn->owned_fd = -1;
+    }
+    pthread_mutex_unlock(&conn->session->map_lock);
+}
+
+/* Called before a successor is published, and before teardown waits for retained HTTP callers.
+ * No socket writes, SQL or thread joins under the registry lock. A listener's descriptor remains
+ * owned by its binder/accept thread: shutdown releases LISTEN without fd-reuse races. A binder
+ * already outside map_lock can finish bind, but the same lock forbids its subsequent listen.
+ * Closing each stream returns its quota exactly once, even if an old worker finally runs later. */
+static void retire_data_namespace(specus_session *session)
+{
+    if (!session->is_data_connection) return;
+    pthread_mutex_lock(&session->map_lock);
+    atomic_store(&session->nat_retired, 1);
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+        if (listener->fd >= 0) shutdown(listener->fd, SHUT_RDWR);
+    }
+    for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
+        close_conn_locked(conn);
+    }
+    pthread_mutex_unlock(&session->map_lock);
+    direct_pending_fail_all(session, "data connection retired");
 }
 
 static void free_external_write_queue(external_conn *conn)
@@ -4438,6 +4476,7 @@ static void *external_writer_thread(void *arg)
         pthread_mutex_unlock(&session->map_lock);
         break;
     }
+    external_worker_finished(conn, 1);
     return NULL;
 }
 
@@ -4450,6 +4489,7 @@ static void *external_conn_thread(void *arg)
 
     if (send_open(session, conn->stream_id, conn->channel_id, conn->port) != 0) {
         mark_conn_done(conn);
+        external_worker_finished(conn, 0);
         return NULL;
     }
 
@@ -4497,6 +4537,7 @@ static void *external_conn_thread(void *arg)
     pthread_mutex_unlock(&session->map_lock);
     printf("[nat] external read side closed channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
+    external_worker_finished(conn, 0);
     return NULL;
 }
 
@@ -4511,6 +4552,7 @@ static int start_external_conn(specus_session *session,
         return -1;
     }
     conn->fd = fd;
+    conn->owned_fd = fd;
     conn->port = port;
     conn->session = session;
     conn->send_credit = ST_STREAM_INITIAL_WINDOW;
@@ -4528,7 +4570,7 @@ static int start_external_conn(specus_session *session,
     }
 
     pthread_mutex_lock(&session->map_lock);
-    if (try_count_external_connection(conn) != 0) {
+    if (atomic_load(&session->nat_retired) || try_count_external_connection(conn) != 0) {
         pthread_mutex_unlock(&session->map_lock);
         fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
                 port, session->config.client_name);
@@ -4553,6 +4595,8 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        conn->reader_finished = 1;
+        conn->writer_finished = 1;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         return -1;
@@ -4561,6 +4605,7 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        conn->reader_finished = 1;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         pthread_join(conn->writer_thread, NULL);
@@ -4615,9 +4660,23 @@ static int listener_exists_locked(specus_session *session, int port)
     return 0;
 }
 
+/* Only for a candidate that never started an accept thread. Retirement visits the same list under
+ * map_lock, so removing it here transfers sole ownership back to the binder for immediate free. */
+static void remove_listener_candidate_locked(specus_session *session, specus_listener *candidate)
+{
+    specus_listener **cursor = &session->listeners;
+    while (*cursor != NULL) {
+        if (*cursor == candidate) {
+            *cursor = candidate->next;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
 static int start_specus_listener(specus_session *session, int port, char *reason, size_t reason_len)
 {
-    int fd = create_listener(port);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         snprintf(reason, reason_len, "port %d bind failed", port);
         return -1;
@@ -4634,7 +4693,7 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     listener->session = session;
 
     pthread_mutex_lock(&session->map_lock);
-    if (listener_exists_locked(session, port)) {
+    if (atomic_load(&session->nat_retired) || listener_exists_locked(session, port)) {
         pthread_mutex_unlock(&session->map_lock);
         close(fd);
         free(listener);
@@ -4645,13 +4704,32 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     session->listeners = listener;
     pthread_mutex_unlock(&session->map_lock);
 
+    /* Publish ownership BEFORE bind, but never enter LISTEN after retirement. bind may finish
+     * late; SO_REUSEADDR permits the successor to bind/listen while this old candidate is paused
+     * before listen. Never close a descriptor under an in-flight bind or accept. */
+    int one = 1;
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
+                                  .sin_addr.s_addr = htonl(INADDR_ANY)};
+    int configured = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int bound = configured == 0 ? bind(fd, (struct sockaddr *)&address, sizeof(address)) : -1;
+    pthread_mutex_lock(&session->map_lock);
+    if (bound != 0 || atomic_load(&session->nat_retired) || listen(fd, 128) != 0) {
+        close(fd);
+        remove_listener_candidate_locked(session, listener);
+        pthread_mutex_unlock(&session->map_lock);
+        free(listener);
+        snprintf(reason, reason_len, "port %d bind failed or data connection retired", port);
+        return -1;
+    }
+    pthread_mutex_unlock(&session->map_lock);
+
     if (pthread_create(&listener->thread, NULL, listener_thread, listener) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
         close(listener->fd);
-        listener->fd = -1;
-        listener->done = 1;
+        remove_listener_candidate_locked(session, listener);
         pthread_mutex_unlock(&session->map_lock);
+        free(listener);
         snprintf(reason, reason_len, "failed to start listener thread");
         return -1;
     }
@@ -4666,8 +4744,6 @@ static void stop_specus_listener(specus_session *session, int port)
         if (!listener->done && listener->port == port) {
             if (listener->fd >= 0) {
                 shutdown(listener->fd, SHUT_RDWR);
-                close(listener->fd);
-                listener->fd = -1;
             }
             listener->done = 1;
         }
@@ -4917,6 +4993,7 @@ static int process_nat_message(specus_session *session, const st_nat_message *me
 
 static void session_shutdown(specus_session *session)
 {
+    retire_data_namespace(session);
     direct_pending_fail_all(session, "control connection closed");
 
     pthread_mutex_lock(&session->send_lock);
@@ -4938,8 +5015,6 @@ static void session_shutdown(specus_session *session)
     for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
-            close(listener->fd);
-            listener->fd = -1;
         }
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
@@ -4973,6 +5048,7 @@ static void session_shutdown(specus_session *session)
     external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
+        if (conn->owned_fd >= 0) close(conn->owned_fd);
         free_external_write_queue(conn);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
@@ -5055,6 +5131,7 @@ static void *client_thread(void *arg)
         return NULL;
     }
     session->control_fd = args->fd;
+    atomic_init(&session->nat_retired, 0);
     session->config = args->config;
     session->active = 1;
     session->references = 1U;
@@ -5424,6 +5501,7 @@ static void *client_thread(void *arg)
         active_session_close_data_locked(session);
     }
     active_session_remove_locked(session);
+    retire_data_namespace(session);
     while (session->references > 1U) {
         pthread_cond_wait(&session->reference_cond, &active_session_lock);
     }
