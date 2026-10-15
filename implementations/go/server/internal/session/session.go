@@ -142,6 +142,23 @@ func (r *Registry) FindData(name string) (Session, bool) {
 	return session, ok
 }
 
+// CurrentDataControl snapshots the pairing under the short registry mutex, without
+// waiting on control lifecycle work or holding that mutex across any stream I/O.
+// Namespace retirement must still guard work that outlives this admission snapshot.
+func (r *Registry) CurrentDataControl(data Session) (Session, bool) {
+	if data == nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name := data.ClientName()
+	if r.data[name] != data {
+		return nil, false
+	}
+	control, ok := r.controls[name]
+	return control, ok
+}
+
 // WaitForDataReconnect blocks until the named data connection is registered or the
 // context ends. Unknown clients fail immediately; only partially connected or recently
 // disconnected clients consume the grace period.

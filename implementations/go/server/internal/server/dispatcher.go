@@ -30,6 +30,7 @@ type Dispatcher struct {
 	clientMessage     func(conn *control.Conn, request protocol.MessageRequest) error
 	onLoginSuccess    func(conn *control.Conn)
 	onDataLogin       func(conn *control.Conn)
+	onDataBinding     func(conn *control.Conn) func()
 	onDisconnect      func(conn *control.Conn)
 	onControlGone     func(conn *control.Conn)
 	onControlBinding  func(conn *control.Conn, account store.ClientAccount)
@@ -54,6 +55,10 @@ func (d *Dispatcher) SetOnLoginSuccess(hook func(conn *control.Conn)) { d.onLogi
 // data connection authenticates but before the registry lists it and before the success
 // response is written, with conn's write lock held, so it must not write to conn.
 func (d *Dispatcher) SetOnDataLoginSuccess(hook func(conn *control.Conn)) { d.onDataLogin = hook }
+
+// SetOnDataBinding publishes the mandatory namespace before login success. Its returned
+// retirement cleanup runs after the reply and outside the write/lifecycle locks.
+func (d *Dispatcher) SetOnDataBinding(hook func(conn *control.Conn) func()) { d.onDataBinding = hook }
 
 // SetOnDisconnect installs a connection-teardown hook, e.g. to release NAT state (G3).
 func (d *Dispatcher) SetOnDisconnect(hook func(conn *control.Conn)) { d.onDisconnect = hook }
@@ -121,6 +126,15 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 		}
 		return conn.Send(protocol.LogoutResponse{Success: true})
 	case protocol.NatMessage:
+		controlSession, controlBound := d.sessions.CurrentDataControl(conn)
+		owner, concrete := controlSession.(*control.Conn)
+		current := controlBound && concrete && conn.Context().Err() == nil &&
+			owner.ClientSessionID() == conn.ClientSessionID() && owner.Context().Err() == nil
+		// Do not wait on a control lifecycle lease for stream credit or data. The coordinator's
+		// registered namespace and terminal retirement protect this admitted reference.
+		if !current {
+			return errUnauthenticated
+		}
 		if d.natHandler != nil {
 			return d.natHandler(conn, p)
 		}
@@ -272,7 +286,8 @@ func (d *Dispatcher) handleLogin(conn *control.Conn, request protocol.LoginReque
 }
 
 func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequest) {
-	defer conn.ReadGate.Resume()
+	resumeLogin := loginReadResume(conn)
+	defer resumeLogin()
 	ctx := conn.Context()
 	if request.ConnectionRole != protocol.ConnectionRoleControl && request.ConnectionRole != protocol.ConnectionRoleData {
 		reason := "登录包缺少有效 connectionRole"
@@ -307,19 +322,41 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 			return
 		}
 		defer release()
-		d.finishLogin(conn, request, result, clientName, dataConnection, release)
+		d.finishLogin(conn, request, result, clientName, dataConnection, release, resumeLogin)
 		return
 	}
-	d.finishLogin(conn, request, result, clientName, dataConnection, func() {})
+	d.finishLogin(conn, request, result, clientName, dataConnection, func() {}, resumeLogin)
 }
 
-func (d *Dispatcher) finishLogin(conn *control.Conn, request protocol.LoginRequest, result auth.Result, clientName string, dataConnection bool, release func()) {
+// Called only by the same login worker. A later NAT backpressure pause must not be
+// overwritten when deferred old-browser cleanup finally lets that worker return.
+func loginReadResume(conn *control.Conn) func() {
+	resumed := false
+	return func() {
+		if !resumed {
+			resumed = true
+			conn.ReadGate.Resume()
+		}
+	}
+}
+
+func (d *Dispatcher) finishLogin(conn *control.Conn, request protocol.LoginRequest, result auth.Result, clientName string, dataConnection bool, release, resumeLogin func()) {
+	var dataRetirement func()
+	defer func() {
+		release()
+		if dataRetirement != nil {
+			// The new authenticated namespace is already published and its reply sent.
+			// Resume its reader before any slow old-browser close handshake.
+			resumeLogin()
+			dataRetirement()
+		}
+	}()
 	ctx := conn.Context()
 	var err error
 	if result.Success && dataConnection {
 		bound, ok := d.sessions.Find(clientName)
 		controlConn, concrete := bound.(*control.Conn)
-		if !ok || !concrete || controlConn.ClientSessionID() != result.Session.ID {
+		if !ok || !concrete || controlConn.ClientSessionID() != result.Session.ID || controlConn.Context().Err() != nil {
 			result.Success = false
 			result.Reason = "数据连接未找到匹配的控制连接"
 		}
@@ -414,6 +451,9 @@ func (d *Dispatcher) finishLogin(conn *control.Conn, request protocol.LoginReque
 			}
 			// Attach the stream namespace before the registry lists the data connection, so a
 			// request that finds the client online can open a stream on it.
+			if d.onDataBinding != nil {
+				dataRetirement = d.onDataBinding(conn)
+			}
 			if d.onDataLogin != nil {
 				d.onDataLogin(conn)
 			}

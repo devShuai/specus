@@ -353,7 +353,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	dispatcher.SetOnDisconnect(func(conn *control.Conn) {
 		coordinator.Close(conn)
 	})
-	dispatcher.SetOnDataLoginSuccess(coordinator.Attach)
+	dispatcher.SetOnDataBinding(coordinator.Attach)
 	dispatcher.SetClientMessageHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
 		return (&App{db: db, sessions: sessions, peerMesh: peerMesh, clientMessages: clientMessages, logger: logger}).handleClientMessage(conn, request)
 	})
