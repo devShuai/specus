@@ -1,6 +1,7 @@
 #include "storage.h"
 
 #include "crypto.h"
+#include "control_presence.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
@@ -1516,6 +1517,8 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_client_identity_client ON specus_client_identity(client_id);"
             "CREATE INDEX IF NOT EXISTS idx_client_session_token ON specus_client_session(token_hash);"
             "CREATE INDEX IF NOT EXISTS idx_client_session_credential_status ON specus_client_session(credential_id, status);"
+            "CREATE INDEX IF NOT EXISTS idx_client_session_channel_status ON specus_client_session(channel_id, status);"
+            "CREATE INDEX IF NOT EXISTS idx_connection_channel_open ON connection_record(channel_id, disconnected_at);"
             "CREATE INDEX IF NOT EXISTS idx_client_session_machine_status ON specus_client_session(credential_id, machine_fingerprint, os_user, status);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_source ON peer_mesh_acl(tenant_id, source_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_target ON peer_mesh_acl(tenant_id, target_client_id);"
@@ -7576,6 +7579,156 @@ int st_storage_control_source_validate(const char *path, const st_storage_contro
     int rc = control_source_on_db(db, source, source->client_id, source->tenant_id);
     sqlite3_close(db);
     return rc;
+}
+
+int st_storage_control_sources_validate(const char *path, const st_storage_control_source *sources,
+                                        size_t count, int *results)
+{
+    if (count == 0U) return 0;
+    if (count > ST_STORAGE_CONTROL_SOURCE_BATCH || sources == NULL || results == NULL) return -1;
+    for (size_t i = 0; i < count; ++i) results[i] = -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = sqlite3_busy_timeout(db, 25) == SQLITE_OK
+        && sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        results[i] = control_source_on_db(db, &sources[i], sources[i].client_id, sources[i].tenant_id);
+        if (results[i] == -1) rc = -1;
+    }
+    if (rc == 0 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc != 0) {
+        (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        for (size_t i = 0; i < count; ++i) results[i] = -1;
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_control_channel_unused(const char *path, const char *channel, int *unused)
+{
+    if (!unused || !channel) return -1;
+    *unused = 0;
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT NOT EXISTS(SELECT 1 FROM specus_client_session WHERE channel_id=?1 AND status='NETTY_ONLINE') "
+        "AND NOT EXISTS(SELECT 1 FROM connection_record WHERE channel_id=?1 AND (disconnected_at IS NULL OR disconnected_at=''))",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, channel, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) *unused = sqlite3_column_int(stmt, 0);
+        else rc = -1;
+    }
+    sqlite3_finalize(stmt); sqlite3_close(db); return rc;
+}
+
+typedef struct { long long id; int valid; char channel[161]; } dead_control_candidate;
+static int read_dead_control_page(const char *path, int audits, long long credential,
+                                  long long excluded, long long after, long long *upper,
+                                  dead_control_candidate rows[64], size_t *count)
+{
+    *count = 0;
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = 0;
+    if (*upper < 0) {
+        rc = sqlite3_prepare_v2(db, audits ? "SELECT COALESCE(MAX(id),0) FROM connection_record"
+            : "SELECT COALESCE(MAX(id),0) FROM specus_client_session", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0 && sqlite3_step(stmt) == SQLITE_ROW) *upper = sqlite3_column_int64(stmt, 0);
+        else rc = -1;
+        sqlite3_finalize(stmt); stmt = NULL;
+    }
+    if (rc == 0) rc = sqlite3_prepare_v2(db, audits
+        ? "SELECT id,COALESCE(channel_id,'') FROM connection_record WHERE id>?1 AND id<=?2 "
+          "AND (disconnected_at IS NULL OR disconnected_at='') ORDER BY id LIMIT 64"
+        : "SELECT id,COALESCE(channel_id,'') FROM specus_client_session WHERE id>?1 AND id<=?2 "
+          "AND status='NETTY_ONLINE' AND (?3=0 OR credential_id=?3) AND id<>?4 ORDER BY id LIMIT 64",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_int64(stmt, 1, after); sqlite3_bind_int64(stmt, 2, *upper);
+        if (!audits) { sqlite3_bind_int64(stmt, 3, credential); sqlite3_bind_int64(stmt, 4, excluded); }
+        int step;
+        while ((step = sqlite3_step(stmt)) == SQLITE_ROW && *count < 64U) {
+            dead_control_candidate *row = &rows[(*count)++]; memset(row, 0, sizeof(*row));
+            row->id = sqlite3_column_int64(stmt, 0);
+            const char *channel = (const char *)sqlite3_column_text(stmt, 1);
+            int bytes = sqlite3_column_bytes(stmt, 1);
+            if (channel && bytes >= 0 && (size_t)bytes < sizeof(row->channel) && !memchr(channel, '\0', (size_t)bytes)) {
+                memcpy(row->channel, channel, (size_t)bytes); row->valid = 1;
+            }
+        }
+        if (step != SQLITE_DONE) rc = -1;
+    }
+    sqlite3_finalize(stmt); sqlite3_close(db); return rc;
+}
+
+static int reap_dead_control_row(const char *path, int audit_only, const dead_control_candidate *row,
+                                 const char *now, const char *reason, int *closed)
+{
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL; int changed = 0;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0 && !audit_only) {
+        rc = sqlite3_prepare_v2(db, "UPDATE specus_client_session SET status='DISCONNECTED',"
+            "disconnected_at=COALESCE(NULLIF(disconnected_at,''),?1) "
+            "WHERE id=?2 AND status='NETTY_ONLINE' AND COALESCE(channel_id,'')=?3 COLLATE BINARY", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 2, row->id);
+            sqlite3_bind_text(stmt, 3, row->channel, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+        }
+        sqlite3_finalize(stmt); stmt = NULL;
+    }
+    if (rc == 0) rc = sqlite3_prepare_v2(db, audit_only
+        ? "UPDATE connection_record SET disconnected_at=?1,disconnect_reason=COALESCE(NULLIF(disconnect_reason,''),?2) "
+          "WHERE id=?4 AND COALESCE(channel_id,'')=?3 COLLATE BINARY AND (disconnected_at IS NULL OR disconnected_at='')"
+        : "UPDATE connection_record SET disconnected_at=?1,disconnect_reason=COALESCE(NULLIF(disconnect_reason,''),?2) "
+          "WHERE COALESCE(channel_id,'')=?3 COLLATE BINARY AND (disconnected_at IS NULL OR disconnected_at='')",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT); sqlite3_bind_text(stmt, 2, reason, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, row->channel, -1, SQLITE_TRANSIENT);
+        if (audit_only) sqlite3_bind_int64(stmt, 4, row->id);
+        if (sqlite3_step(stmt) == SQLITE_DONE) changed = sqlite3_changes(db); else rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc == 0) {
+        *closed += changed;
+        int unused = 0;
+        if (st_storage_control_channel_unused(path, row->channel, &unused) == 0 && unused)
+            st_control_presence_forget_dead(path, row->channel);
+    }
+    return rc;
+}
+
+int st_storage_reap_dead_control_channels(const char *path, long long credential_id,
+                                          long long exclude_session_id, const char *now,
+                                          const char *reason, int *closed_audits)
+{
+    if (closed_audits) *closed_audits = 0;
+    if (!now || !reason || credential_id < 0) return -1;
+    int closed = 0;
+    for (int audits = 0; audits < (credential_id == 0 ? 2 : 1); ++audits) {
+        long long after = 0, upper = -1;
+        for (;;) {
+            dead_control_candidate rows[64]; size_t count = 0;
+            if (read_dead_control_page(path, audits, credential_id, exclude_session_id, after, &upper, rows, &count) != 0) return -1;
+            if (!count) break;
+            /* The entire native read is closed before any filesystem probe. No registry lock,
+             * socket wait or advisory lock wait is taken while owning a SQLite transaction. */
+            for (size_t i = 0; i < count; ++i) {
+                after = rows[i].id;
+                if (!rows[i].valid || st_control_presence_probe(path, rows[i].channel) != ST_CONTROL_PRESENCE_DEAD) continue;
+                if (reap_dead_control_row(path, audits, &rows[i], now, reason, &closed) != 0) return -1;
+            }
+            if (after >= upper) break;
+        }
+    }
+    if (closed_audits) *closed_audits = closed;
+    return 0;
 }
 
 static int peer_control_write_check(sqlite3 *db, const st_storage_control_source *control,

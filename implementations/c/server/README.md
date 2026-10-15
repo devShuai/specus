@@ -61,6 +61,28 @@ The login response carries `nettyTls`, derived as Java and Go derive it: `true` 
 `SPECUS_TLS_MODE` is `file` or `self-signed`, or `SPECUS_TLS_TERMINATED_UPSTREAM=true`. Clients
 whose `controlTls.enabled` is unset follow it.
 
+## Shared SQLite CONTROL ownership
+
+Current C instances sharing the same SQLite file register each physical CONTROL before writing
+`NETTY_ONLINE`. Registration uses a private `<database>.control-c-<random-id>.lock` sidecar with a
+nonblocking [advisory file lock](https://man7.org/linux/man-pages/man2/flock.2.html), held through that connection's socket and audit cleanup. The database
+directory must be writable and its filesystem must provide working cross-process advisory locks;
+keep these sidecars with the database and do not remove them while an instance is running. Normal
+teardown removes an unused sidecar; after a killed process, startup/re-login can recover the exact
+dead channel and its audit without marking another instance's live sessions offline. A missing or
+unreadable modern sidecar is **unknown**, not proof of death (including channels from an older C
+instance during an upgrade); those rows are preserved and may require explicit administrative
+revocation if the old owner cannot be recovered. Historical unattributed channel rows retain the
+legacy startup-recovery behavior. This does not make network-filesystem SQLite deployments safe.
+All instances must use ownership-aware cleanup: an older binary's global cleanup can still
+overwrite shared state, which a newer instance cannot prevent.
+
+A separate monotonic background worker checks up to 64 native CONTROL sources per round, in fair
+FIFO order. It retires a permanently replaced/expired source and its DATA/streams without waiting
+for another business packet. The check does not add SQL to heartbeat processing; temporarily
+disabled policy or a database error does not by itself permanently revoke the physical connection.
+This is bounded periodic detection, not an atomic cross-instance catalog-publication fence.
+
 ## Build
 
 ```bash

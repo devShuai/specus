@@ -3,6 +3,7 @@
 #include "admin_http.h"
 #include "crypto.h"
 #include "control_lifecycle.h"
+#include "control_presence.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
@@ -55,8 +56,6 @@
 #define ST_HTTP_MAX_RESPONSE_BODY (64U * 1024U * 1024U)
 /* How long a graceful shutdown waits for closed channels to finish their bookkeeping. */
 #define ST_SHUTDOWN_DRAIN_SECONDS 10
-/* Upper bound on NETTY_ONLINE rows one control login inspects for stale-session cleanup. */
-#define ST_MAX_STALE_SESSION_SCAN 256U
 /* A displaced client has at most one control and one data connection; slack covers a race. */
 #define ST_MAX_DISPLACED_SESSIONS 8U
 
@@ -227,6 +226,10 @@ struct specus_session {
     int is_data_connection;
     char physical_channel_id[35];
     st_storage_control_source control_source_guard; /* Immutable after native authentication. */
+    st_control_presence *control_presence; /* Held before native ONLINE until final local teardown. */
+    specus_session *source_watch_prev;
+    specus_session *source_watch_next;
+    int source_watch_queued; /* Intrusive fair queue, active_session_lock; no extra owner ref. */
     atomic_int control_cancelled;
     pthread_cond_t control_work_cond;
     int control_work_busy;
@@ -311,6 +314,9 @@ static pthread_mutex_t global_external_lock = PTHREAD_MUTEX_INITIALIZER;
 static int global_external_connections = 0;
 static pthread_mutex_t active_session_lock = PTHREAD_MUTEX_INITIALIZER;
 static specus_session *active_sessions = NULL;
+static specus_session *source_watch_head;
+static specus_session *source_watch_tail;
+static size_t source_watch_count;
 /*
  * Serialises control-login admission (stale-session cleanup, the online-instance counts and the
  * NETTY_ONLINE write) with the DISCONNECTED write of a control connection that is going away.
@@ -952,10 +958,9 @@ static int load_config(server_config *config)
         }
         char startup_time[64];
         if (current_utc_timestamp(startup_time) == 0) {
-            /* Nothing is connected yet, so every online session and open connection record was
-             * left behind by a previous process that never ran its disconnect handlers. */
-            (void)st_storage_close_client_sessions_by_status(database_path, "NETTY_ONLINE", startup_time);
-            (void)st_storage_close_open_connections(database_path, "SERVER_RESTARTED", startup_time, NULL);
+            /* Another instance may already own live channels in this SQLite database. */
+            if (st_storage_reap_dead_control_channels(database_path, 0, 0, startup_time, "SERVER_RESTARTED", NULL) != 0)
+                return -1;
         }
     }
     if (access_token_hash != NULL && *access_token_hash != '\0') {
@@ -1738,6 +1743,29 @@ static int config_has_http_route(const server_config *config, const char *route)
     return 0;
 }
 
+static void source_watch_remove_locked(specus_session *session)
+{
+    if (!session->source_watch_queued) return;
+    if (session->source_watch_prev) session->source_watch_prev->source_watch_next = session->source_watch_next;
+    else source_watch_head = session->source_watch_next;
+    if (session->source_watch_next) session->source_watch_next->source_watch_prev = session->source_watch_prev;
+    else source_watch_tail = session->source_watch_prev;
+    session->source_watch_prev = session->source_watch_next = NULL;
+    session->source_watch_queued = 0;
+    --source_watch_count;
+}
+
+static void source_watch_append_locked(specus_session *session)
+{
+    session->source_watch_prev = source_watch_tail;
+    session->source_watch_next = NULL;
+    if (source_watch_tail) source_watch_tail->source_watch_next = session;
+    else source_watch_head = session;
+    source_watch_tail = session;
+    session->source_watch_queued = 1;
+    ++source_watch_count;
+}
+
 static void active_session_add_locked(specus_session *session)
 {
     if (session == NULL) {
@@ -1746,11 +1774,14 @@ static void active_session_add_locked(specus_session *session)
     session->active_next = active_sessions;
     session->bound = 1;
     active_sessions = session;
+    if (!session->is_data_connection && session->config.client_session_db_backed)
+        source_watch_append_locked(session);
 }
 
 static void active_session_remove_locked(specus_session *session)
 {
     if (session == NULL) return;
+    source_watch_remove_locked(session);
     session->bound = 0;
     specus_session **cursor = &active_sessions;
     while (*cursor != NULL) {
@@ -3205,6 +3236,110 @@ static int control_source_current(void *ctx)
     return rc == 0 && control_source_active(session);
 }
 
+/* Rotate before releasing the registry. New arrivals append behind existing waiters, so even
+ * continuous admission cannot starve an old idle source. Selected objects remain referenced
+ * through validation and retirement, without retaining any registry/CID lock across SQLite. */
+static size_t control_source_watch_take(specus_session **selected)
+{
+    pthread_mutex_lock(&active_session_lock);
+    size_t count = source_watch_count < ST_STORAGE_CONTROL_SOURCE_BATCH
+        ? source_watch_count : ST_STORAGE_CONTROL_SOURCE_BATCH;
+    for (size_t i = 0; i < count; ++i) {
+        specus_session *session = source_watch_head;
+        source_watch_remove_locked(session);
+        source_watch_append_locked(session);
+        ++session->references;
+        selected[i] = session;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    return count;
+}
+
+static void control_source_watch_tick(const char *database_path)
+{
+    if (connection_registry_stopping()) return;
+    specus_session *selected[ST_STORAGE_CONTROL_SOURCE_BATCH];
+    st_storage_control_source guards[ST_STORAGE_CONTROL_SOURCE_BATCH];
+    int results[ST_STORAGE_CONTROL_SOURCE_BATCH];
+    size_t count = control_source_watch_take(selected);
+    for (size_t i = 0; i < count; ++i) guards[i] = selected[i]->control_source_guard;
+    int rc = st_storage_control_sources_validate(database_path, guards, count, results);
+    for (size_t i = 0; i < count; ++i) {
+        /* Disabled policy and database failure are not permanent epoch loss. No native query
+         * or lifecycle wait occurs here; exact referenced physical objects cannot alias a new FD. */
+        if (rc == 0 && results[i] == ST_STORAGE_CONTROL_SOURCE_RETIRED
+            && control_source_active(selected[i])) control_retire_native_source(selected[i]);
+        session_reference_release(selected[i]);
+    }
+}
+
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t condition;
+    pthread_t thread;
+    int started;
+    int stop;
+    char database_path[512];
+} control_source_watch = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+static void *control_source_watch_thread(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&control_source_watch.lock);
+    while (!control_source_watch.stop) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) break;
+        ++deadline.tv_sec;
+        int rc = pthread_cond_timedwait(&control_source_watch.condition, &control_source_watch.lock, &deadline);
+        if (control_source_watch.stop) break;
+        if (rc != ETIMEDOUT) continue;
+        pthread_mutex_unlock(&control_source_watch.lock);
+        control_source_watch_tick(control_source_watch.database_path);
+        pthread_mutex_lock(&control_source_watch.lock);
+    }
+    pthread_mutex_unlock(&control_source_watch.lock);
+    return NULL;
+}
+
+static int control_source_watch_start(const char *database_path)
+{
+    pthread_mutex_lock(&control_source_watch.lock);
+    if (control_source_watch.started) { pthread_mutex_unlock(&control_source_watch.lock); return 0; }
+    pthread_condattr_t attributes;
+    int rc = pthread_condattr_init(&attributes);
+    if (rc == 0) {
+        rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+        if (rc == 0) rc = pthread_cond_init(&control_source_watch.condition, &attributes);
+        pthread_condattr_destroy(&attributes);
+    }
+    if (rc != 0) { pthread_mutex_unlock(&control_source_watch.lock); return -1; }
+    control_source_watch.stop = 0;
+    snprintf(control_source_watch.database_path, sizeof(control_source_watch.database_path), "%s", database_path);
+    rc = pthread_create(&control_source_watch.thread, NULL, control_source_watch_thread, NULL);
+    if (rc == 0) control_source_watch.started = 1;
+    else pthread_cond_destroy(&control_source_watch.condition);
+    pthread_mutex_unlock(&control_source_watch.lock);
+    return rc == 0 ? 0 : -1;
+}
+
+static void control_source_watch_stop(void)
+{
+    pthread_mutex_lock(&control_source_watch.lock);
+    int started = control_source_watch.started;
+    if (started) {
+        control_source_watch.stop = 1;
+        pthread_cond_broadcast(&control_source_watch.condition);
+    }
+    pthread_mutex_unlock(&control_source_watch.lock);
+    if (!started) return;
+    pthread_join(control_source_watch.thread, NULL);
+    pthread_mutex_lock(&control_source_watch.lock);
+    control_source_watch.started = 0;
+    control_source_watch.database_path[0] = '\0';
+    pthread_cond_destroy(&control_source_watch.condition);
+    pthread_mutex_unlock(&control_source_watch.lock);
+}
+
 static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *session)
 {
     st_peer_mesh_runtime runtime = {0};
@@ -3610,6 +3745,7 @@ static void *peer_mesh_maintenance_thread(void *unused)
 static int peer_mesh_maintenance_start(const char *database_path)
 {
     if (database_path == NULL || database_path[0] == '\0') return 0;
+    if (control_source_watch_start(database_path) != 0) return -1;
     pthread_mutex_lock(&peer_mesh_maintenance.lock);
     peer_mesh_maintenance.stop = 0;
     time_t now = time(NULL);
@@ -3631,6 +3767,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
     if (pthread_create(&peer_mesh_maintenance.thread, NULL,
                        peer_mesh_maintenance_thread, NULL) != 0) {
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+        control_source_watch_stop();
         return -1;
     }
     peer_mesh_maintenance.started = 1;
@@ -3640,6 +3777,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
 
 static void peer_mesh_maintenance_stop(void)
 {
+    control_source_watch_stop();
     pthread_mutex_lock(&peer_mesh_maintenance.lock);
     int started = peer_mesh_maintenance.started;
     peer_mesh_maintenance.stop = 1;
@@ -3661,34 +3799,17 @@ static void peer_mesh_maintenance_stop(void)
 }
 
 /*
- * Java ClientAuthService.closeStaleOnlineSessions: before the online-instance limits are counted,
- * a NETTY_ONLINE row of this credential whose session no bound control connection carries is
- * marked DISCONNECTED. Such a row is left by a disconnect whose DISCONNECTED write failed, and
- * would otherwise lock the machine user out until the next restart. Runs under
- * control_admission_lock, so a control that is still being admitted cannot be mistaken for stale.
+ * Before quota counts, recover positively dead physical owners. Local registry absence is not
+ * evidence of global death; another process may own this credential's other devices. Presence
+ * is held even between native ONLINE and local publication/audit, so admission gaps are protected.
  */
-static void close_stale_online_sessions(const char *database_path,
+static int close_stale_online_sessions(const char *database_path,
                                         long long credential_id,
                                         long long current_session_id,
                                         const char *now_text)
 {
-    long long ids[ST_MAX_STALE_SESSION_SCAN];
-    size_t id_count = 0U;
-    if (st_storage_list_online_session_ids_by_credential(database_path,
-                                                         credential_id,
-                                                         ids,
-                                                         ST_MAX_STALE_SESSION_SCAN,
-                                                         &id_count) != 0) {
-        return;
-    }
-    for (size_t i = 0; i < id_count; ++i) {
-        if (ids[i] == current_session_id || control_session_live(ids[i])) {
-            continue;
-        }
-        if (st_storage_mark_client_session_disconnected(database_path, ids[i], now_text) == 0) {
-            printf("[control] closed stale online session=%lld credential=%lld\n", ids[i], credential_id);
-        }
-    }
+    return st_storage_reap_dead_control_channels(database_path, credential_id, current_session_id,
+        now_text, "SOURCE_PROCESS_GONE", NULL);
 }
 
 static int verify_database_login(specus_session *session, const st_login_request *request, const char **reason)
@@ -3793,8 +3914,10 @@ static int verify_database_login(specus_session *session, const st_login_request
     }
 
     int online_count = 0;
-    if (!session->is_data_connection) {
-        close_stale_online_sessions(config->database_path, client_session.credential_id, client_session.id, now_text);
+    if (!session->is_data_connection
+        && close_stale_online_sessions(config->database_path, client_session.credential_id, client_session.id, now_text) != 0) {
+        *reason = "客户端在线状态不可用";
+        return 0;
     }
     /* Both counts leave this session out: a re-login of the same session is the same instance
      * coming back, not "another" one, and activate_session() replaces its old connections. */
@@ -5630,6 +5753,11 @@ static void *client_thread(void *arg)
             if (logged_in && control_login && session->config.client_id != login_client_id) {
                 logged_in = 0; reason = "客户端访问令牌无效";
             }
+            if (logged_in && control_login && session->config.database_path[0] != '\0'
+                && st_control_presence_acquire(session->config.database_path, session->physical_channel_id,
+                    &session->control_presence) != 0) {
+                logged_in = 0; reason = "服务器暂不可用：控制连接归属登记失败";
+            }
             if (logged_in && control_login && session->config.client_session_db_backed) {
                 st_storage_control_source *guard = &session->control_source_guard;
                 guard->client_id = session->config.client_id;
@@ -5939,6 +6067,13 @@ static void *client_thread(void *arg)
         }
     }
     session_shutdown(session);
+    if (session->control_presence) {
+        int unused = 0;
+        int forget = st_storage_control_channel_unused(session->config.database_path,
+            session->physical_channel_id, &unused) == 0 && unused;
+        st_control_presence_release(session->control_presence, forget);
+        session->control_presence = NULL;
+    }
     connection_unregister(session);
     pthread_mutex_destroy(&session->send_lock);
     pthread_mutex_destroy(&session->map_lock);
@@ -6291,10 +6426,8 @@ int main(void)
         char stopped_at[64];
         if (current_utc_timestamp(stopped_at) == 0) {
             int swept = 0;
-            (void)st_storage_close_open_connections(config.database_path, "SERVER_SHUTDOWN", stopped_at, &swept);
-            if (unfinished > 0U) {
-                (void)st_storage_close_client_sessions_by_status(config.database_path, "NETTY_ONLINE", stopped_at);
-            }
+            (void)st_storage_reap_dead_control_channels(config.database_path, 0, 0,
+                stopped_at, "SERVER_SHUTDOWN", &swept);
             printf("[server] stopped: %zu connection(s) unfinished, %d open connection record(s) swept\n",
                    unfinished, swept);
         }

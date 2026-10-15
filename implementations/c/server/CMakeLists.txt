@@ -21,6 +21,7 @@ add_library(specus_c_core
     src/client_package.c
     src/connectivity_check.c
     src/control_lifecycle.c
+    src/control_presence.c
     src/crypto.c
     src/decompression_limits.c
     src/elasticsearch_traffic.c
@@ -88,6 +89,24 @@ target_link_libraries(specus_c_control_queue_tests PRIVATE specus_c_core pthread
 target_compile_options(specus_c_control_queue_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME control_queue_tests COMMAND specus_c_control_queue_tests)
 set_tests_properties(control_queue_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_control_source_watch_tests tests/control_source_watch_tests.c)
+target_link_libraries(specus_c_control_source_watch_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_source_watch_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_source_watch_tests COMMAND specus_c_control_source_watch_tests)
+set_tests_properties(control_source_watch_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_control_presence_tests tests/control_presence_tests.c)
+target_link_libraries(specus_c_control_presence_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_presence_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME control_presence_tests COMMAND specus_c_control_presence_tests)
+set_tests_properties(control_presence_tests PROPERTIES TIMEOUT 30)
+add_library(specus_c_control_source_watch_barrier SHARED tests/control_source_watch_barrier.c)
+target_link_libraries(specus_c_control_source_watch_barrier PRIVATE SQLite::SQLite3 pthread dl)
+add_executable(specus_c_control_source_watch_e2e_tests tests/control_source_watch_e2e_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_control_source_watch_e2e_tests PRIVATE specus_c_core pthread dl)
+target_compile_options(specus_c_control_source_watch_e2e_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_source_watch_e2e_tests COMMAND specus_c_control_source_watch_e2e_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_control_source_watch_barrier>)
+set_tests_properties(control_source_watch_e2e_tests PROPERTIES TIMEOUT 60)
 add_executable(specus_c_catalog_reconnect_tests tests/catalog_reconnect_tests.c)
 add_executable(specus_c_control_source_storage_tests tests/control_source_storage_tests.c)
 target_link_libraries(specus_c_control_source_storage_tests PRIVATE specus_c_core pthread)

@@ -19,6 +19,7 @@ endif
 BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_auth_nonce.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/oidc.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/traffic_capture.o $(BUILD_DIR)/turn_auth.o $(BUILD_DIR)/stream_tombstones.o $(BUILD_DIR)/workbench.o $(BUILD_DIR)/http_share.o $(BUILD_DIR)/product_metrics.o $(BUILD_DIR)/upstream_browser_headers.o
 SERVER := $(BUILD_DIR)/specus-server-c
+CORE_OBJS += $(BUILD_DIR)/control_presence.o
 CORE_OBJS += $(BUILD_DIR)/owner_transfer.o
 CORE_OBJS += $(BUILD_DIR)/control_lifecycle.o
 OWNER_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_tests
@@ -98,6 +99,13 @@ CATALOG_RECONNECT_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_e2e_tests
 ALL_TESTS += $(CATALOG_RECONNECT_E2E_TESTS)
 CONTROL_SOURCE_STORAGE_TESTS := $(BUILD_DIR)/specus_c_control_source_storage_tests
 ALL_TESTS += $(CONTROL_SOURCE_STORAGE_TESTS)
+CONTROL_SOURCE_WATCH_TESTS := $(BUILD_DIR)/specus_c_control_source_watch_tests
+ALL_TESTS += $(CONTROL_SOURCE_WATCH_TESTS)
+CONTROL_SOURCE_WATCH_E2E_TESTS := $(BUILD_DIR)/specus_c_control_source_watch_e2e_tests
+CONTROL_SOURCE_WATCH_BARRIER := $(BUILD_DIR)/libspecus_c_control_source_watch_barrier.so
+ALL_TESTS += $(CONTROL_SOURCE_WATCH_E2E_TESTS) $(CONTROL_SOURCE_WATCH_BARRIER)
+CONTROL_PRESENCE_TESTS := $(BUILD_DIR)/specus_c_control_presence_tests
+ALL_TESTS += $(CONTROL_PRESENCE_TESTS)
 
 .PHONY: all test release clean
 
@@ -111,8 +119,9 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/storage.o $(BUILD_DIR)/owner_transfer.o: src/owner_transfer_internal.h src/owner_transfer.h src/storage.h
 $(BUILD_DIR)/peer_mesh.o: src/peer_mesh.h src/storage.h
+$(BUILD_DIR)/control_presence.o $(BUILD_DIR)/storage.o: src/control_presence.h
 
-$(SERVER): $(CORE_OBJS) src/main.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
+$(SERVER): $(CORE_OBJS) src/main.c src/peer_mesh.h src/storage.h src/control_presence.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
@@ -303,6 +312,18 @@ $(CATALOG_RECONNECT_TESTS): $(CORE_OBJS) tests/catalog_reconnect_tests.c src/pee
 $(CONTROL_SOURCE_STORAGE_TESTS): $(CORE_OBJS) tests/control_source_storage_tests.c src/peer_mesh.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_storage_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
 
+$(CONTROL_SOURCE_WATCH_TESTS): $(CORE_OBJS) tests/control_source_watch_tests.c src/main.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_watch_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONTROL_PRESENCE_TESTS): $(CORE_OBJS) tests/control_presence_tests.c src/storage.c src/control_presence.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/control_presence_tests.c $(filter-out $(BUILD_DIR)/storage.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CONTROL_SOURCE_WATCH_E2E_TESTS): $(CORE_OBJS) tests/control_source_watch_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_watch_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CONTROL_SOURCE_WATCH_BARRIER): tests/control_source_watch_barrier.c | $(BUILD_DIR)
+	$(CC) -std=c11 -Wall -Wextra -fPIC -shared $< -lsqlite3 -lpthread -ldl -o $@
+
 $(CATALOG_RECONNECT_E2E_TESTS): $(CORE_OBJS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
 
@@ -317,6 +338,9 @@ test: all
 	$(CONTROL_QUEUE_TESTS)
 	$(CATALOG_RECONNECT_TESTS)
 	$(CONTROL_SOURCE_STORAGE_TESTS)
+	$(CONTROL_SOURCE_WATCH_TESTS)
+	$(CONTROL_PRESENCE_TESTS)
+	$(CONTROL_SOURCE_WATCH_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_SOURCE_WATCH_BARRIER))
 	$(CATALOG_RECONNECT_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	$(CONTROL_BUSINESS_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	@for test in $(TESTS); do $$test || exit 1; done

@@ -22,6 +22,19 @@ typedef struct {
  * disabled, -1 database failure. Disabled is never permission to write or a trusted fallback,
  * but does not invent permanent connection revocation for a reversible policy switch. */
 int st_storage_control_source_validate(const char *path, const st_storage_control_source *source);
+#define ST_STORAGE_CONTROL_SOURCE_BATCH 64U
+/* Background-only bounded read snapshot, 25ms SQLite busy wait, no writes. On any database
+ * failure all results are -1 and the caller must not retire a source. count must be <=64. */
+int st_storage_control_sources_validate(const char *path, const st_storage_control_source *sources,
+                                        size_t count, int *results);
+/* Query outside any registry lock; successful unused result permits terminal sidecar removal. */
+int st_storage_control_channel_unused(const char *path, const char *channel, int *unused);
+/* Recover only positively dead physical owners, not "absent from this process". credential_id=0
+ * also scans open audits at startup/shutdown. Native snapshots close before nonblocking probes;
+ * every update is conditional on the exact observed channel, never a global ONLINE sweep. */
+int st_storage_reap_dead_control_channels(const char *path, long long credential_id,
+                                          long long exclude_session_id, const char *now,
+                                          const char *reason, int *closed_audits);
 
 typedef struct {
     long long id;

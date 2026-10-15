@@ -228,7 +228,13 @@ static int cross_process_write(const char *library, int writer_first)
     REQUIRE(peer_config(current) == 0 && report(current, &runtime, writer_first ? 101 : 2) == 0
         && wait_revision(&a, runtime.client_id, writer_first ? "101" : "2") == 0, "replacement actual business persists");
     if (!writer_first) REQUIRE(marker(&a, "resume") == 0, "release old source only after replacement native report");
-    else REQUIRE(report(old, &runtime, 102) == 0, "old source observes retirement on subsequent business");
+    else {
+        /* The independent idle watcher may already have retired this physical source. Either
+         * the packet is submitted or EOF is proven; the native revision/old-family assertions
+         * below remain mandatory in both cases. */
+        REQUIRE(report(old, &runtime, 102) == 0 || expect_channel_closed(old, IO_TIMEOUT_MS) == 0,
+            "old source submits business or has already been retired by background native observation");
+    }
     int old_closed = expect_channel_closed(old, IO_TIMEOUT_MS);
     REQUIRE(db_scalar(a.db_path, "SELECT revision FROM peer_mesh_egress_activity WHERE egress_client_id=?", NULL,
         runtime.client_id, after, sizeof(after)) == 0, "read actual final revision after old request resumes");
