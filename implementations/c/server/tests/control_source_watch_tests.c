@@ -18,6 +18,18 @@ static void destroy(specus_session *session)
     pthread_mutex_destroy(&session->map_lock); pthread_mutex_destroy(&session->direct_lock);
     pthread_cond_destroy(&session->reference_cond);
 }
+static int retry_cadence(void)
+{
+    unsigned int retry_ms = 50U;
+    static const unsigned int expected[] = {50U, 100U, 200U, 400U, 800U, 1000U, 1000U};
+    CHECK(control_source_watch_wait_ms(0, &retry_ms) == 1000U && retry_ms == 50U);
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i)
+        CHECK(control_source_watch_wait_ms(-1, &retry_ms) == expected[i]);
+    CHECK(control_source_watch_wait_ms(0, &retry_ms) == 1000U && retry_ms == 50U);
+    CHECK(control_source_watch_wait_ms(-1, &retry_ms) == 50U);
+    puts("PASS transient read retry is prompt, exponentially bounded at 1s, and reset by a successful native round");
+    return 0;
+}
 static int fair_queue(void)
 {
     enum { count = ST_STORAGE_CONTROL_SOURCE_BATCH + 3U };
@@ -103,11 +115,11 @@ static int native_tick(void)
     for (size_t i = 0; i < ST_STORAGE_CONTROL_SOURCE_BATCH; ++i) CHECK(results[i] == (i == 1 || i == 2 ? ST_STORAGE_CONTROL_SOURCE_RETIRED : 0));
     CHECK(st_storage_control_sources_validate(NULL, NULL, 0, NULL) == 0);
     CHECK(st_storage_control_sources_validate(path, guards, ST_STORAGE_CONTROL_SOURCE_BATCH + 1, results) == -1);
-    control_source_watch_tick(path); CHECK(control_source_active(session) && session->references == 1);
+    CHECK(control_source_watch_tick(path) == 0); CHECK(control_source_active(session) && session->references == 1);
     CHECK(execute(path, "UPDATE client_account SET enabled=0") == 0);
-    control_source_watch_tick(path); CHECK(control_source_active(session) && session->references == 1);
+    CHECK(control_source_watch_tick(path) == 0); CHECK(control_source_active(session) && session->references == 1);
     CHECK(execute(path, "UPDATE client_account SET enabled=1; UPDATE specus_client_credential SET enabled=0") == 0);
-    control_source_watch_tick(path); CHECK(control_source_active(session) && session->references == 1);
+    CHECK(control_source_watch_tick(path) == 0); CHECK(control_source_active(session) && session->references == 1);
     CHECK(execute(path, "UPDATE specus_client_credential SET enabled=1") == 0);
     sqlite3 *writer = NULL; CHECK(sqlite3_open(path, &writer) == SQLITE_OK);
     CHECK(sqlite3_exec(writer, "BEGIN EXCLUSIVE", NULL, NULL, NULL) == SQLITE_OK);
@@ -115,7 +127,7 @@ static int native_tick(void)
     CHECK(st_storage_control_sources_validate(path, guards, ST_STORAGE_CONTROL_SOURCE_BATCH, results) == -1);
     CHECK(control_monotonic_ms() - started < 1000);
     for (size_t i = 0; i < ST_STORAGE_CONTROL_SOURCE_BATCH; ++i) CHECK(results[i] == -1);
-    control_source_watch_tick(path); CHECK(control_source_active(session) && session->references == 1);
+    CHECK(control_source_watch_tick(path) == -1); CHECK(control_source_active(session) && session->references == 1);
     CHECK(sqlite3_exec(writer, "ROLLBACK", NULL, NULL, NULL) == SQLITE_OK); sqlite3_close(writer);
     CHECK(st_storage_mark_client_session_online(path, native.id, "replacement-watch", "127.0.0.1:10", "2026-10-16T00:00:01Z") == 0);
     control_source_watch_tick(path);
@@ -133,4 +145,4 @@ static int native_tick(void)
     puts("PASS native bounded batch, disabled policy and SQL busy never retire, original physical source retirement/ABA/ref release, monotonic watcher start/stop");
     return 0;
 }
-int main(void) { return fair_queue() || native_tick(); }
+int main(void) { return retry_cadence() || fair_queue() || native_tick(); }

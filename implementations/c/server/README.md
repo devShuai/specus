@@ -81,6 +81,10 @@ A separate monotonic background worker checks up to 64 native CONTROL sources pe
 FIFO order. It retires a permanently replaced/expired source and its DATA/streams without waiting
 for another business packet. The check does not add SQL to heartbeat processing; temporarily
 disabled policy or a database error does not by itself permanently revoke the physical connection.
+Successful rounds use a one-second cadence. Failed native reads retry after 50ms, with exponential
+backoff capped at one second during a sustained outage; a successful round resets that backoff.
+Every attempt retains the 64-source bound and 25ms SQLite busy budget. Database contention can
+still delay detection: neither the cadence nor retries promise a global retirement deadline.
 This is bounded periodic detection, not an atomic cross-instance catalog-publication fence.
 
 ## Build

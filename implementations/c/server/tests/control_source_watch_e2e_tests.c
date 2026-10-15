@@ -174,6 +174,36 @@ done:
     return failed;
 #undef REQUIRE
 }
+static int busy_recovery(const char *library)
+{
+    fixture f; int failed = 1; sqlite3 *writer = NULL; char path[512], sql[256];
+#define REQUIRE(c, label) do { if (!(c)) { fprintf(stderr, "FAIL idle source BUSY recovery: %s\n", label); goto done; } } while (0)
+    REQUIRE(prepare(&f, library, 0) == 0, "completed idle original CONTROL/DATA/public stream and valid witness");
+    REQUIRE(sqlite3_open(f.a.db_path, &writer) == SQLITE_OK && sqlite3_busy_timeout(writer, 5000) == SQLITE_OK
+        && sqlite3_exec(writer, "BEGIN EXCLUSIVE", NULL, NULL, NULL) == SQLITE_OK, "real independent exclusive writer");
+    REQUIRE(expect_channel_alive(f.control) == 0 && expect_channel_alive(f.data) == 0,
+        "database outage does not block heartbeat or permanently retire the original source");
+    snprintf(sql, sizeof(sql), "UPDATE specus_client_session SET expires_at='2000-01-01T00:00:00Z' WHERE id=%lld", f.runtime.session_id);
+    REQUIRE(sqlite3_exec(writer, sql, NULL, NULL, NULL) == SQLITE_OK, "stage genuine expiry behind writer lock");
+    snprintf(path, sizeof(path), "%s/arm", f.a.dir); FILE *arm = fopen(path, "w");
+    REQUIRE(arm != NULL, "arm actual background native query observation"); fclose(arm);
+    REQUIRE(wait_marker(&f, "watch-busy") == 0, "background native query really returned BUSY, not a guessed timer phase");
+    REQUIRE(sqlite3_exec(writer, "COMMIT", NULL, NULL, NULL) == SQLITE_OK, "commit expiry and restore database availability");
+    sqlite3_close(writer); writer = NULL;
+    long long started = monotonic_ms();
+    int closed = expect_channel_closed(f.control, 500);
+    fprintf(stderr, "OBSERVATION actual BUSY recovery close_rc=%d elapsed_ms=%lld\n", closed, monotonic_ms() - started);
+    REQUIRE(closed == 0, "fresh successful native check retires idle source within 500ms after observed BUSY ends, without business");
+    REQUIRE(expect_channel_closed(f.data, IO_TIMEOUT_MS) == 0 && expect_socket_eof(f.public_fd, IO_TIMEOUT_MS) == 0
+        && expect_channel_alive(f.receiver) == 0, "exact retired family closes, unrelated witness survives");
+    failed = 0;
+done:
+    if (writer) { sqlite3_exec(writer, "ROLLBACK", NULL, NULL, NULL); sqlite3_close(writer); }
+    failed = cleanup(&f, failed);
+    printf("%s actual native BUSY release triggers prompt idle physical-source retirement WITHOUT business\n", failed ? "FAIL" : "PASS");
+    return failed;
+#undef REQUIRE
+}
 static int expiry(const char *library)
 {
     fixture f; int failed = 1; char sql[256];
@@ -292,8 +322,10 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN); server_binary = argv[1];
     if (argc == 4) {
         if (!strcmp(argv[3], "same-sid")) return same_sid(argv[2]);
+        if (!strcmp(argv[3], "busy-recovery")) return busy_recovery(argv[2]);
+        if (!strcmp(argv[3], "batch")) return beyond_batch(argv[2]);
         if (!strcmp(argv[3], "process-lifecycle")) return process_lifecycle(argv[2]);
         return 2;
     }
-    return same_sid(argv[2]) + policy_and_busy(argv[2]) + expiry(argv[2]) + beyond_batch(argv[2]) + process_lifecycle(argv[2]) ? 1 : 0;
+    return same_sid(argv[2]) + policy_and_busy(argv[2]) + busy_recovery(argv[2]) + expiry(argv[2]) + beyond_batch(argv[2]) + process_lifecycle(argv[2]) ? 1 : 0;
 }

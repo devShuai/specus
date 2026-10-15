@@ -3255,9 +3255,9 @@ static size_t control_source_watch_take(specus_session **selected)
     return count;
 }
 
-static void control_source_watch_tick(const char *database_path)
+static int control_source_watch_tick(const char *database_path)
 {
-    if (connection_registry_stopping()) return;
+    if (connection_registry_stopping()) return 0;
     specus_session *selected[ST_STORAGE_CONTROL_SOURCE_BATCH];
     st_storage_control_source guards[ST_STORAGE_CONTROL_SOURCE_BATCH];
     int results[ST_STORAGE_CONTROL_SOURCE_BATCH];
@@ -3271,6 +3271,18 @@ static void control_source_watch_tick(const char *database_path)
             && control_source_active(selected[i])) control_retire_native_source(selected[i]);
         session_reference_release(selected[i]);
     }
+    return rc;
+}
+
+/* A transient native read failure is not epoch loss. Retry promptly after a short outage,
+ * but back off to the ordinary cadence during a sustained one. Each attempt still pins at
+ * most 64 sources and keeps the same 25ms SQLite busy budget; no registry/CID lock spans SQL. */
+static unsigned int control_source_watch_wait_ms(int result, unsigned int *retry_ms)
+{
+    if (result == 0) { *retry_ms = 50U; return 1000U; }
+    unsigned int delay = *retry_ms;
+    *retry_ms = delay >= 500U ? 1000U : delay * 2U;
+    return delay;
 }
 
 static struct {
@@ -3285,17 +3297,21 @@ static struct {
 static void *control_source_watch_thread(void *unused)
 {
     (void)unused;
+    unsigned int delay_ms = 1000U, retry_ms = 50U;
     pthread_mutex_lock(&control_source_watch.lock);
     while (!control_source_watch.stop) {
         struct timespec deadline;
         if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) break;
-        ++deadline.tv_sec;
+        deadline.tv_sec += delay_ms / 1000U;
+        deadline.tv_nsec += (long)(delay_ms % 1000U) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000L; }
         int rc = pthread_cond_timedwait(&control_source_watch.condition, &control_source_watch.lock, &deadline);
         if (control_source_watch.stop) break;
         if (rc != ETIMEDOUT) continue;
         pthread_mutex_unlock(&control_source_watch.lock);
-        control_source_watch_tick(control_source_watch.database_path);
+        int result = control_source_watch_tick(control_source_watch.database_path);
         pthread_mutex_lock(&control_source_watch.lock);
+        delay_ms = control_source_watch_wait_ms(result, &retry_ms);
     }
     pthread_mutex_unlock(&control_source_watch.lock);
     return NULL;
