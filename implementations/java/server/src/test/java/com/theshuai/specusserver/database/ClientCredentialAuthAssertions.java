@@ -159,6 +159,8 @@ final class ClientCredentialAuthAssertions {
         PeerReadSnapshotAssertions.verify(context, independent);
         ClientMessageRelayAssertions.verify(context, independent);
         ManagementMessageAssertions.verify(context, independent);
+        com.theshuai.specusserver.management.service.PeerCatalogCacheAssertions.verify(context, independent);
+        com.theshuai.specusserver.management.service.PeerCatalogCommitAssertions.verify(context, independent);
     }
 
     private static void verifyManagementWrites(ConfigurableApplicationContext context, DataSource independent,

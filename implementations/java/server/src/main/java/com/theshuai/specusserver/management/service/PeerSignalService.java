@@ -59,9 +59,13 @@ public class PeerSignalService {
         return TransactionSynchronizationManager.isSynchronizationActive() && TransactionSynchronizationManager.isActualTransactionActive();
     }
     private static void afterCommit(Runnable effect) {
-        if (transactionActive()) TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override public void afterCommit() { effect.run(); }
-        }); else effect.run();
+        Runnable committed = () -> PeerCatalogCache.committedEffect(() -> {
+            PeerCatalogCache.flushCommittedEffects();
+            effect.run();
+        });
+        if (transactionActive() && !PeerCatalogCache.inCommittedEffect()) TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() { committed.run(); }
+        }); else committed.run();
     }
     private static ClientAccount reference(ClientAccount account) {
         ClientAccount result = new ClientAccount(); result.setId(account.getId()); result.setTenantId(account.getTenantId()); result.setClientName(account.getClientName()); return result;

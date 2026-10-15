@@ -56,10 +56,12 @@ public class PeerServiceDiscoveryService {
     private final SpecusMappingRepository specusMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final WorkbenchReferences workbenchReferences;
-    private final Map<CatalogKey, CatalogSnapshot> catalogs = new ConcurrentHashMap<>();
-    private final Map<CatalogKey, Long> catalogRevisions = new ConcurrentHashMap<>();
-    private final Map<CatalogKey, Long> reportRevisions = new ConcurrentHashMap<>();
-    private final Map<CatalogKey, List<com.theshuai.common.peermesh.PeerMdnsCandidate>> mdnsCandidates = new ConcurrentHashMap<>();
+    private final PeerCatalogCache catalogCache = new PeerCatalogCache(4096);
+    private final Map<CatalogKey, CatalogSnapshot> catalogs = catalogCache.index(0, PeerServiceDiscoveryService::copySnapshot);
+    private final Map<CatalogKey, Long> catalogRevisions = catalogCache.index(1, java.util.function.UnaryOperator.identity());
+    private final Map<CatalogKey, Long> reportRevisions = catalogCache.index(2, java.util.function.UnaryOperator.identity());
+    private final Map<CatalogKey, List<com.theshuai.common.peermesh.PeerMdnsCandidate>> mdnsCandidates =
+            catalogCache.index(3, PeerServiceDiscovery::sanitizeMdnsCandidates);
     private final Map<Long, ConcurrentLinkedDeque<Long>> reportTimestamps = new ConcurrentHashMap<>();
     private final Map<String, Long> auditLogTimestamps = new ConcurrentHashMap<>();
     private final ConcurrentLinkedDeque<AuditEvent> audits = new ConcurrentLinkedDeque<>();
@@ -117,6 +119,7 @@ public class PeerServiceDiscoveryService {
         return setSharing(context, enabled, null);
     }
 
+    @Transactional
     public SharingMutationResult setSharing(ManagementContext context, Boolean enabled, Boolean mdnsImportEnabled) {
         requireAdmin(context);
         if (enabled == null && mdnsImportEnabled == null) {
@@ -215,11 +218,13 @@ public class PeerServiceDiscoveryService {
                 republishClient(row.getTenantId(), row.getClientId(), "service-deleted"));
     }
 
+    @Transactional
     public List<CatalogDelivery> handleReport(ClientAccount source, PeerControlMessage report) {
         return acceptReport(source, report, authenticatedSessionId(source));
     }
 
     List<CatalogDelivery> acceptReport(ClientAccount source, PeerControlMessage report, long publisherSessionId) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> acceptReport(source, report, publisherSessionId));
         if (source == null || report == null) {
             throw new IllegalArgumentException("invalid service-report");
         }
@@ -269,7 +274,9 @@ public class PeerServiceDiscoveryService {
         return fanout(source, publisherSessionId, catalogRevision, advertised, expiresAt);
     }
 
+    @Transactional
     public List<CatalogDelivery> onClientDisconnected(ClientAccount account, Long sessionId) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> onClientDisconnected(account, sessionId));
         if (account == null || sessionId == null) {
             return List.of();
         }
@@ -288,15 +295,18 @@ public class PeerServiceDiscoveryService {
         }
     }
 
+    @Transactional
     public List<CatalogDelivery> onAuthorizationChanged(String tenantId) {
         return onAuthorizationChanged(tenantId, null);
     }
 
+    @Transactional
     public List<CatalogDelivery> onClientAuthorizationChanged(String tenantId, long clientId) {
         return onAuthorizationChanged(tenantId, clientId);
     }
 
     private List<CatalogDelivery> onAuthorizationChanged(String tenantId, Long publisherClientId) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> onAuthorizationChanged(tenantId, publisherClientId));
         if (!StringUtils.hasText(tenantId)) {
             return List.of();
         }
@@ -306,6 +316,9 @@ public class PeerServiceDiscoveryService {
                     || (publisherClientId != null && entry.getKey().publisherClientId() != publisherClientId)) {
                 continue;
             }
+            catalogCache.lockKey(entry.getKey());
+            CatalogSnapshot current = catalogs.get(entry.getKey());
+            if (current == null) continue;
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
                     entry.getKey().publisherClientId(), tenantId).orElse(null);
             if (publisher == null) {
@@ -313,7 +326,6 @@ public class PeerServiceDiscoveryService {
                 continue;
             }
             long revision = nextRevision(entry.getKey());
-            CatalogSnapshot current = entry.getValue();
             List<PeerAdvertisedService> services = effectiveSharing(publisher) ? current.services() : List.of();
             if (services.isEmpty()) {
                 catalogs.remove(entry.getKey());
@@ -358,6 +370,7 @@ public class PeerServiceDiscoveryService {
         return deliveries;
     }
 
+    @Transactional
     public List<CatalogDelivery> withdrawClient(String tenantId, long clientId, String reason) {
         return republishClient(tenantId, clientId, reason);
     }
@@ -370,13 +383,18 @@ public class PeerServiceDiscoveryService {
         return catalogRevisions.size() + reportRevisions.size();
     }
 
+    @Transactional
     public List<CatalogDelivery> expireStale() {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(this::expireStale);
         Instant now = Instant.now();
         List<CatalogDelivery> deliveries = new ArrayList<>();
-        catalogs.entrySet().removeIf(entry -> {
+        for (var entry : catalogs.entrySet()) {
             if (entry.getValue().expiresAt().isAfter(now)) {
-                return false;
+                continue;
             }
+            catalogCache.lockKey(entry.getKey());
+            CatalogSnapshot current = catalogs.get(entry.getKey());
+            if (current == null || current.expiresAt().isAfter(now)) continue;
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
                     entry.getKey().publisherClientId(), entry.getKey().tenantId()).orElse(null);
             if (publisher != null) {
@@ -385,8 +403,8 @@ public class PeerServiceDiscoveryService {
             }
             audit("catalog-expire", entry.getKey().tenantId(), entry.getKey().publisherClientId(),
                     entry.getKey().publisherSessionId(), null, "ttl");
-            return true;
-        });
+            catalogs.remove(entry.getKey());
+        }
         return deliveries;
     }
 
@@ -396,7 +414,9 @@ public class PeerServiceDiscoveryService {
     }
 
     /** The publisher row is gone, but peers still need an empty snapshot for its old catalog. */
+    @Transactional
     public List<CatalogDelivery> withdrawDeletedClient(ClientAccount publisher) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> withdrawDeletedClient(publisher));
         List<CatalogDelivery> deliveries = withdrawClientCatalogs(
                 publisher.getTenantId(), publisher.getId(), publisher, "client-deleted");
         catalogRevisions.keySet().removeIf(key -> {
@@ -413,28 +433,34 @@ public class PeerServiceDiscoveryService {
 
     private List<CatalogDelivery> withdrawClientCatalogs(String tenantId, long clientId,
                                                         ClientAccount publisher, String reason) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> withdrawClientCatalogs(tenantId, clientId, publisher, reason));
         List<CatalogDelivery> deliveries = new ArrayList<>();
-        catalogs.entrySet().removeIf(entry -> {
+        for (var entry : catalogs.entrySet()) {
             if (!tenantId.equals(entry.getKey().tenantId()) || entry.getKey().publisherClientId() != clientId) {
-                return false;
+                continue;
             }
+            catalogCache.lockKey(entry.getKey());
+            if (catalogs.get(entry.getKey()) == null) continue;
             if (publisher != null) {
                 deliveries.addAll(fanoutAuthorizationChange(publisher, entry.getKey().publisherSessionId(),
                         nextRevision(entry.getKey()), List.of(), Instant.now()));
             }
             audit("catalog-withdraw", tenantId, clientId, entry.getKey().publisherSessionId(), null, reason);
             mdnsCandidates.remove(entry.getKey());
-            return true;
-        });
+            catalogs.remove(entry.getKey());
+        }
         return deliveries;
     }
 
     private List<CatalogDelivery> withdrawTenant(String tenantId, String reason) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> withdrawTenant(tenantId, reason));
         List<CatalogDelivery> deliveries = new ArrayList<>();
-        catalogs.entrySet().removeIf(entry -> {
+        for (var entry : catalogs.entrySet()) {
             if (!tenantId.equals(entry.getKey().tenantId())) {
-                return false;
+                continue;
             }
+            catalogCache.lockKey(entry.getKey());
+            if (catalogs.get(entry.getKey()) == null) continue;
             ClientAccount publisher = clientAccountRepository.findByIdAndTenantId(
                     entry.getKey().publisherClientId(), tenantId).orElse(null);
             if (publisher != null) {
@@ -444,8 +470,8 @@ public class PeerServiceDiscoveryService {
             audit("catalog-withdraw", tenantId, entry.getKey().publisherClientId(),
                     entry.getKey().publisherSessionId(), null, reason);
             mdnsCandidates.remove(entry.getKey());
-            return true;
-        });
+            catalogs.remove(entry.getKey());
+        }
         return deliveries;
     }
 
@@ -517,13 +543,14 @@ public class PeerServiceDiscoveryService {
                                          Instant expiresAt) {
         List<CatalogDelivery> deliveries = new ArrayList<>();
         for (ClientAccount recipient : clientAccountRepository.findByTenantIdOrderByIdDesc(publisher.getTenantId())) {
-            if (Objects.equals(recipient.getId(), publisher.getId()) || !peerMeshService.canPeer(publisher, recipient)) {
+            if (Objects.equals(recipient.getId(), publisher.getId())) {
                 continue;
             }
             Channel channel = SessionUtil.getChannel(recipient.getClientName());
             if (channel == null || !SessionUtil.hasLogin(channel)) {
                 continue;
             }
+            if (!peerMeshService.canPeer(publisher, recipient)) continue;
             List<PeerAdvertisedService> visible = services.stream()
                     .filter(service -> visibleTo(publisher, recipient, service))
                     .map(PeerServiceDiscovery::copyAdvertised)
@@ -617,7 +644,7 @@ public class PeerServiceDiscoveryService {
             throw new IllegalArgumentException("publisher session is required");
         }
         var session = clientSessionRepository.findById(sessionId)
-                .filter(row -> row.getClientId() == source.getId())
+                .filter(row -> Objects.equals(row.getClientId(), source.getId()))
                 .filter(row -> Objects.equals(row.getTenantId(), source.getTenantId()))
                 .filter(row -> ClientAuthService.STATUS_NETTY_ONLINE.equals(row.getStatus()))
                 .orElseThrow(() -> new IllegalArgumentException("publisher session is not current"));
@@ -1018,6 +1045,12 @@ public class PeerServiceDiscoveryService {
             copy.add(stats);
         }
         return List.copyOf(copy);
+    }
+
+    private static CatalogSnapshot copySnapshot(CatalogSnapshot value) {
+        var services = value.services().stream().map(PeerServiceDiscovery::copyAdvertised).toList();
+        return new CatalogSnapshot(value.revision(), value.instanceId(), value.generatedAt(), value.expiresAt(),
+                services, value.publisherClientName(), copyStats(value.stats(), services));
     }
 
     private static PeerServiceStats statsFor(List<PeerServiceStats> stats, String serviceId) {
