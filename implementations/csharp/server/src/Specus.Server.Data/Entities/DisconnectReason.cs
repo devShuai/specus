@@ -22,6 +22,10 @@ public enum DisconnectReason
     ServerShutdown,
     ServerRestarted,
     Unknown,
+    // Append: preserve existing numeric values. These describe physical CONTROL lifecycle,
+    // not management ownership transfer or a security handoff.
+    AuthSourceRetired,
+    SourceProcessGone,
 }
 
 public static class DisconnectReasonExtensions
@@ -37,6 +41,8 @@ public static class DisconnectReasonExtensions
         DisconnectReason.ProtocolViolation => "PROTOCOL_VIOLATION",
         DisconnectReason.RegisterFailed => "REGISTER_FAILED",
         DisconnectReason.ReplacedByNewLogin => "REPLACED_BY_NEW_LOGIN",
+        DisconnectReason.AuthSourceRetired => "AUTH_SOURCE_RETIRED",
+        DisconnectReason.SourceProcessGone => "SOURCE_PROCESS_GONE",
         DisconnectReason.AdminDisabled => "ADMIN_DISABLED",
         DisconnectReason.AdminRenamed => "ADMIN_RENAMED",
         DisconnectReason.AdminDeleted => "ADMIN_DELETED",
@@ -58,6 +64,8 @@ public static class DisconnectReasonExtensions
         "PROTOCOL_VIOLATION" => DisconnectReason.ProtocolViolation,
         "REGISTER_FAILED" => DisconnectReason.RegisterFailed,
         "REPLACED_BY_NEW_LOGIN" => DisconnectReason.ReplacedByNewLogin,
+        "AUTH_SOURCE_RETIRED" => DisconnectReason.AuthSourceRetired,
+        "SOURCE_PROCESS_GONE" => DisconnectReason.SourceProcessGone,
         "ADMIN_DISABLED" => DisconnectReason.AdminDisabled,
         "ADMIN_RENAMED" => DisconnectReason.AdminRenamed,
         "ADMIN_DELETED" => DisconnectReason.AdminDeleted,

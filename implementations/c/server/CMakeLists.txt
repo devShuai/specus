@@ -80,6 +80,13 @@ target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(specus_c_disconnect_reasons_vector_tests tests/disconnect_reasons_vector_tests.c)
+target_link_libraries(specus_c_disconnect_reasons_vector_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_disconnect_reasons_vector_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+target_compile_definitions(specus_c_disconnect_reasons_vector_tests PRIVATE
+    ST_DISCONNECT_REASONS_FIXTURE_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/disconnect-reasons-v1.json")
+add_test(NAME disconnect_reasons_vector_tests COMMAND specus_c_disconnect_reasons_vector_tests)
+set_tests_properties(disconnect_reasons_vector_tests PROPERTIES TIMEOUT 30)
 add_executable(specus_c_control_lifecycle_tests tests/control_lifecycle_tests.c)
 target_link_libraries(specus_c_control_lifecycle_tests PRIVATE specus_c_core pthread)
 target_compile_options(specus_c_control_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)

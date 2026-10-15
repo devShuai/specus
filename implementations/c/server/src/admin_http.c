@@ -4333,6 +4333,12 @@ static const char *admin_disconnect_reason_text(const char *reason)
     if (strcmp(reason, "REPLACED_BY_NEW_LOGIN") == 0) {
         return "被新登录替换";
     }
+    if (strcmp(reason, "AUTH_SOURCE_RETIRED") == 0) {
+        return "原控制连接已失效";
+    }
+    if (strcmp(reason, "SOURCE_PROCESS_GONE") == 0) {
+        return "所属服务进程退出后清理";
+    }
     if (strcmp(reason, "ADMIN_DISABLED") == 0) {
         return "管理员停用账号";
     }

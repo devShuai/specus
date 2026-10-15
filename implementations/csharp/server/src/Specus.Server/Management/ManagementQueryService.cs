@@ -991,6 +991,8 @@ public sealed class ManagementQueryService
         DisconnectReason.ProtocolViolation => "协议违规",
         DisconnectReason.RegisterFailed => "注册失败",
         DisconnectReason.ReplacedByNewLogin => "被新登录替换",
+        DisconnectReason.AuthSourceRetired => "原控制连接已失效",
+        DisconnectReason.SourceProcessGone => "所属服务进程退出后清理",
         DisconnectReason.AdminDisabled => "管理员停用账号",
         DisconnectReason.AdminRenamed => "管理员修改账号名",
         DisconnectReason.AdminDeleted => "管理员删除账号",

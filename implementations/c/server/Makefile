@@ -106,6 +106,8 @@ CONTROL_SOURCE_WATCH_BARRIER := $(BUILD_DIR)/libspecus_c_control_source_watch_ba
 ALL_TESTS += $(CONTROL_SOURCE_WATCH_E2E_TESTS) $(CONTROL_SOURCE_WATCH_BARRIER)
 CONTROL_PRESENCE_TESTS := $(BUILD_DIR)/specus_c_control_presence_tests
 ALL_TESTS += $(CONTROL_PRESENCE_TESTS)
+DISCONNECT_REASONS_TESTS := $(BUILD_DIR)/specus_c_disconnect_reasons_vector_tests
+ALL_TESTS += $(DISCONNECT_REASONS_TESTS)
 
 .PHONY: all test release clean
 
@@ -132,6 +134,9 @@ $(DIRECT_WEBSOCKET_TESTS): $(CORE_OBJS) tests/direct_websocket_tests.c | $(BUILD
 
 $(CLIENT_ADDRESS_TESTS): $(CORE_OBJS) tests/client_address_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_address_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(DISCONNECT_REASONS_TESTS): $(CORE_OBJS) tests/disconnect_reasons_vector_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration -DST_DISCONNECT_REASONS_FIXTURE_FILE='"$(abspath ../../../protocol/test-vectors/disconnect-reasons-v1.json)"' tests/disconnect_reasons_vector_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(CLIENT_AUTH_NONCE_TESTS): $(CORE_OBJS) tests/client_auth_nonce_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_auth_nonce_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -334,6 +339,7 @@ $(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 test: all
+	$(DISCONNECT_REASONS_TESTS)
 	$(CONTROL_LIFECYCLE_TESTS)
 	$(CONTROL_QUEUE_TESTS)
 	$(CATALOG_RECONNECT_TESTS)
