@@ -10,7 +10,6 @@ import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.specusserver.config.PeerMeshProperties;
 import com.theshuai.specusserver.management.model.ClientAccount;
-import com.theshuai.specusserver.management.model.ClientSession;
 import com.theshuai.specusserver.management.model.PeerMeshAcl;
 import com.theshuai.specusserver.management.model.PeerMeshAclView;
 import com.theshuai.specusserver.management.model.PeerMeshDevice;
@@ -21,14 +20,14 @@ import com.theshuai.specusserver.management.model.PeerMeshSession;
 import com.theshuai.specusserver.management.model.PeerMeshSessionView;
 import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
-import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.common.peermesh.LocalPeerService;
 import com.theshuai.specusserver.management.model.PeerMeshSharedService;
 import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRepository;
-import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
+import com.theshuai.specusserver.management.repository.PeerReadSnapshotRepository;
+import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.peer.TurnCredentialService;
@@ -84,10 +83,9 @@ public class PeerMeshService {
     private final PeerMeshSessionRepository sessionRepository;
     private final ClientAccountRepository clientAccountRepository;
     private final TurnCredentialService turnCredentialService;
-    private final ClientSessionRepository clientSessionRepository;
     private final PeerMeshServiceSharingRepository sharingRepository;
-    private final PeerMeshSharedServiceRepository sharedServiceRepository;
     private final ManagementWriteAuthority authority;
+    private final PeerReadSnapshotRepository peerReads;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, AtomicLong> pendingRelayBytes = new ConcurrentHashMap<>();
     private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
@@ -106,22 +104,20 @@ public class PeerMeshService {
                            PeerMeshSessionRepository sessionRepository,
                            ClientAccountRepository clientAccountRepository,
                            TurnCredentialService turnCredentialService,
-                           ClientSessionRepository clientSessionRepository,
                            PeerMeshServiceSharingRepository sharingRepository,
-                           PeerMeshSharedServiceRepository sharedServiceRepository,
                            PlatformTransactionManager transactionManager,
                            MeterRegistry meterRegistry,
-                           ManagementWriteAuthority authority) {
+                           ManagementWriteAuthority authority,
+                           PeerReadSnapshotRepository peerReads) {
         this.properties = properties;
         this.deviceRepository = deviceRepository;
         this.aclRepository = aclRepository;
         this.sessionRepository = sessionRepository;
         this.clientAccountRepository = clientAccountRepository;
         this.turnCredentialService = turnCredentialService;
-        this.clientSessionRepository = clientSessionRepository;
         this.sharingRepository = sharingRepository;
-        this.sharedServiceRepository = sharedServiceRepository;
         this.authority = authority;
+        this.peerReads = peerReads;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.relayTrafficFlushFailures = Counter.builder("specus.peer_mesh.relay.traffic.flush.failures")
                 .description("Relay traffic batches restored after a persistence failure")
@@ -141,18 +137,18 @@ public class PeerMeshService {
         return properties.isEnabled();
     }
 
-    private List<LocalPeerService> localServices(ClientAccount account, int clientProtocolVersion) {
-        if (account == null || sharedServiceRepository == null || clientProtocolVersion < 2) {
+    private List<LocalPeerService> localServices(PeerReadSnapshotRepository.Snapshot snapshot, int clientProtocolVersion) {
+        if (clientProtocolVersion < 2) {
             return List.of();
         }
-        return sharedServiceRepository
-                .findByTenantIdAndClientIdOrderByNameAsc(account.getTenantId(), account.getId())
-                .stream()
-                .map(row -> toLocalService(account, row))
+        if (snapshot.source() == null || !snapshot.source().available(snapshot.tenant())) return List.of();
+        return snapshot.definitions().stream()
+                .sorted(java.util.Comparator.comparing(PeerMeshSharedService::getName).thenComparing(PeerMeshSharedService::getId))
+                .map(row -> toLocalService(snapshot, row))
                 .toList();
     }
 
-    private LocalPeerService toLocalService(ClientAccount publisher, PeerMeshSharedService row) {
+    private LocalPeerService toLocalService(PeerReadSnapshotRepository.Snapshot publisher, PeerMeshSharedService row) {
         LocalPeerService service = new LocalPeerService();
         service.setServiceId(row.getServiceId());
         service.setName(row.getName());
@@ -169,24 +165,22 @@ public class PeerMeshService {
         return service;
     }
 
-    private List<String> allowedPeerVirtualIps(ClientAccount publisher, PeerMeshSharedService definition) {
-        if (publisher == null || definition == null || !definition.isEnabled()) {
+    private List<String> allowedPeerVirtualIps(PeerReadSnapshotRepository.Snapshot publisher, PeerMeshSharedService definition) {
+        if (publisher.source() == null || definition == null || !definition.isEnabled()) {
             return List.of();
         }
         List<Long> explicit = PeerServiceDiscovery.decodeClientIds(definition.getAllowedClientIds());
-        return clientAccountRepository.findByTenantIdOrderByIdDesc(publisher.getTenantId()).stream()
-                .filter(recipient -> !Objects.equals(recipient.getId(), publisher.getId()))
-                .filter(recipient -> canPeer(publisher, recipient))
+        // The consumer initiates toward this publisher, not the reverse direction.
+        return publisher.edges().stream()
+                .filter(edge -> edge.target().id() != publisher.source().id())
+                .filter(edge -> edge.incoming(publisher.tenant()))
+                .map(PeerReadSnapshotRepository.Edge::target)
                 .filter(recipient -> PeerServiceDiscovery.VISIBILITY_OWNER.equals(definition.getVisibility())
-                        ? normalizeOwner(publisher.getOwnerUsername()).equals(normalizeOwner(recipient.getOwnerUsername()))
-                        : explicit.isEmpty() || explicit.contains(recipient.getId()))
-                .map(recipient -> deviceRepository
-                        .findByTenantIdAndClientId(publisher.getTenantId(), recipient.getId())
-                        .filter(PeerMeshDevice::isEnabled)
-                        .map(PeerMeshDevice::getVirtualIp)
-                        .filter(StringUtils::hasText)
-                        .orElse(null))
-                .filter(Objects::nonNull)
+                        ? normalizeOwner(publisher.source().owner()).equals(normalizeOwner(recipient.owner()))
+                        : explicit.isEmpty() || explicit.contains(recipient.id()))
+                .map(PeerReadSnapshotRepository.Peer::virtualIp)
+                .filter(StringUtils::hasText)
+                .sorted()
                 .distinct()
                 .toList();
     }
@@ -203,7 +197,7 @@ public class PeerMeshService {
         int clientProtocolVersion = environment == null || environment.getClientPeerServiceCapabilities() == null
                 ? 0
                 : PeerServiceDiscovery.normalizeVersion(environment.getClientPeerServiceCapabilities().getVersion());
-        return buildConfig(account, device, requestServerName, clientProtocolVersion);
+        return buildConfig(account, device, requestServerName, clientProtocolVersion, readPeers(account));
     }
 
     @Transactional
@@ -213,13 +207,15 @@ public class PeerMeshService {
         if (properties.isEnabled()) {
             device = currentDevice(account);
         }
-        return buildConfig(account, device, null, currentPeerServiceProtocolVersion(account));
+        var snapshot = readPeers(account);
+        return buildConfig(account, device, null, currentPeerServiceProtocolVersion(snapshot), snapshot);
     }
 
     private ClientAuthLoginResponse.PeerMeshConfig buildConfig(ClientAccount account,
                                                                PeerMeshDevice device,
                                                                String requestServerName,
-                                                               int clientProtocolVersion) {
+                                                               int clientProtocolVersion,
+                                                               PeerReadSnapshotRepository.Snapshot snapshot) {
         ClientAuthLoginResponse.PeerMeshConfig config = new ClientAuthLoginResponse.PeerMeshConfig();
         config.setEnabled(false);
         config.setClientId(account.getId());
@@ -237,7 +233,7 @@ public class PeerMeshService {
         config.setPeerServiceDiscoveryVersion(PeerServiceDiscovery.PROTOCOL_VERSION);
         config.setServiceSharing(PeerServiceSharingStatus.of(
                 properties.isEnabled(), configuredSharing, deviceEnabled, mdnsImport));
-        config.setLocalServices(localServices(account, clientProtocolVersion));
+        config.setLocalServices(localServices(snapshot, clientProtocolVersion));
         if (!properties.isEnabled() || device == null) {
             return config;
         }
@@ -258,16 +254,9 @@ public class PeerMeshService {
         return config;
     }
 
-    private int currentPeerServiceProtocolVersion(ClientAccount account) {
-        if (account == null) {
-            return 0;
-        }
-        return clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
-                        account.getTenantId(), List.of(account.getId()), ClientAuthService.STATUS_NETTY_ONLINE)
-                .stream()
-                .mapToInt(ClientSession::getPeerServiceDiscoveryVersion)
-                .max()
-                .orElse(0);
+    private int currentPeerServiceProtocolVersion(PeerReadSnapshotRepository.Snapshot snapshot) {
+        var capabilities = boundCapabilities(snapshot, snapshot.source());
+        return capabilities == null ? 0 : capabilities.discoveryVersion();
     }
 
     @Transactional
@@ -368,35 +357,10 @@ public class PeerMeshService {
 
     @Transactional(readOnly = true)
     public boolean canPeer(ClientAccount source, ClientAccount target) {
-        if (source == null || target == null) {
-            return false;
-        }
-        if (!source.getTenantId().equals(target.getTenantId())) {
-            return false;
-        }
-        if (!isDeviceEnabled(source) || !isDeviceEnabled(target)) {
-            return false;
-        }
-        if (normalizeOwner(source.getOwnerUsername()).equals(normalizeOwner(target.getOwnerUsername()))) {
-            return true;
-        }
-        // S4.4 方向性 ACL：OUTBOUND=source→target, INBOUND=target→source, BOTH=双向
-        return aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(
-                        source.getTenantId(), source.getId(), target.getId())
-                .filter(PeerMeshAcl::isAllowed)
-                .filter(acl -> "OUTBOUND".equals(acl.getDirection()) || "BOTH".equals(acl.getDirection()))
-                .isPresent()
-                || aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(
-                        source.getTenantId(), target.getId(), source.getId())
-                .filter(PeerMeshAcl::isAllowed)
-                .filter(acl -> "INBOUND".equals(acl.getDirection()) || "BOTH".equals(acl.getDirection()))
-                .isPresent();
-    }
-
-    private boolean isDeviceEnabled(ClientAccount account) {
-        return deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId())
-                .map(PeerMeshDevice::isEnabled)
-                .orElse(false);
+        if (source == null || source.getId() == null || source.getTenantId() == null || target == null || target.getId() == null
+                || !Objects.equals(source.getTenantId(), target.getTenantId())) return false;
+        var snapshot = peerReads.readPair(source.getTenantId(), source.getId(), target.getId());
+        return snapshot.edge(target.getId()).map(edge -> edge.outgoing(snapshot.tenant())).orElse(false);
     }
 
     @Transactional(readOnly = true)
@@ -404,9 +368,12 @@ public class PeerMeshService {
         if (account == null) {
             return new PeerIdentity("", "");
         }
-        return deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId())
-                .map(device -> new PeerIdentity(device.getVirtualIp(), device.getPublicKey()))
-                .orElseGet(() -> new PeerIdentity("", ""));
+        var snapshot = account.getId() == null || account.getTenantId() == null
+                ? PeerReadSnapshotRepository.Snapshot.empty(null)
+                : peerReads.readPair(account.getTenantId(), account.getId(), account.getId());
+        var peer = snapshot.source();
+        return peer != null && peer.available(snapshot.tenant())
+                ? new PeerIdentity(peer.virtualIp(), peer.publicKey()) : new PeerIdentity("", "");
     }
 
     @Transactional
@@ -1215,73 +1182,62 @@ public class PeerMeshService {
         if (!properties.isEnabled()) {
             return List.of();
         }
-        List<PeerMeshDevice> sameOwner = deviceRepository
-                .findByTenantIdAndOwnerUsernameAndEnabledTrueOrderByClientNameAsc(
-                        account.getTenantId(), normalizeOwner(account.getOwnerUsername()));
-        Map<Long, PeerMeshDevice> devices = sameOwner.stream()
-                .collect(Collectors.toMap(PeerMeshDevice::getClientId, item -> item, (left, right) -> left));
-        for (PeerMeshAcl acl : aclRepository.findByTenantIdOrderByIdDesc(account.getTenantId())) {
-            if (acl.isAllowed() && acl.getSourceClientId().equals(account.getId())) {
-                deviceRepository.findByTenantIdAndClientId(account.getTenantId(), acl.getTargetClientId())
-                        .filter(PeerMeshDevice::isEnabled)
-                        .ifPresent(device -> devices.put(device.getClientId(), device));
-            }
-        }
-        devices.remove(account.getId());
-        Map<Long, ClientSession> onlineSessions = devices.isEmpty()
-                ? Map.of()
-                : clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
-                                account.getTenantId(),
-                                devices.keySet().stream().toList(),
-                                ClientAuthService.STATUS_NETTY_ONLINE)
-                        .stream()
-                        .collect(Collectors.toMap(
-                                ClientSession::getClientId,
-                                session -> session,
-                                this::mergeMessageCapabilities));
-        return devices.values().stream()
-                .map(device -> {
-                    ClientSession session = onlineSessions.get(device.getClientId());
-                    boolean online = SessionUtil.getChannel(device.getClientName()) != null;
+        var snapshot = readPeers(account);
+        return snapshot.edges().stream()
+                .filter(edge -> edge.target().id() != snapshot.source().id() && edge.outgoing(snapshot.tenant()))
+                .map(PeerReadSnapshotRepository.Edge::target)
+                .sorted(java.util.Comparator.comparing(PeerReadSnapshotRepository.Peer::name)
+                        .thenComparingLong(PeerReadSnapshotRepository.Peer::id))
+                .map(peer -> {
+                    var binding = boundPeer(snapshot, peer);
+                    var session = binding.capabilities();
+                    boolean online = binding.online();
                     return new PeerRosterItem(
-                            device.getClientId(),
-                            device.getClientName(),
-                            device.getVirtualIp(),
-                            device.getPublicKey(),
+                            peer.id(),
+                            peer.name(),
+                            peer.virtualIp(),
+                            peer.publicKey(),
                             online,
-                            online && session != null && session.isMessageSendCapable(),
-                            online && session != null && session.isMessageReceiveCapable(),
-                            online && session != null && session.isMessageAttachmentsCapable(),
-                            online && session != null && session.isMessageMediaPreviewCapable(),
-                            online && session != null ? session.getMessageMaxAttachmentBytes() : 0,
-                            online && session != null ? session.getPeerServiceDiscoveryVersion() : 0,
+                            online && session != null && session.send(),
+                            online && session != null && session.receive(),
+                            online && session != null && session.attachments(),
+                            online && session != null && session.media(),
+                            online && session != null ? session.maxBytes() : 0,
+                            online && session != null ? session.discoveryVersion() : 0,
                             online && session != null
-                                    ? PeerServiceDiscovery.decodeApplications(session.getPeerServiceApplications())
+                                    ? PeerServiceDiscovery.decodeApplications(session.applications())
                                     : List.of());
                 })
                 .toList();
     }
 
-    private ClientSession mergeMessageCapabilities(ClientSession left, ClientSession right) {
-        if (left == null) {
-            return right;
-        }
-        if (right == null) {
-            return left;
-        }
-        if (right.getPeerServiceDiscoveryVersion() > left.getPeerServiceDiscoveryVersion()) {
-            return right;
-        }
-        if (right.getPeerServiceDiscoveryVersion() < left.getPeerServiceDiscoveryVersion()) {
-            return left;
-        }
-        if (right.isMessageReceiveCapable() && !left.isMessageReceiveCapable()) {
-            return right;
-        }
-        if (right.isMessageSendCapable() && !left.isMessageSendCapable()) {
-            return right;
-        }
-        return right.getMessageMaxAttachmentBytes() > left.getMessageMaxAttachmentBytes() ? right : left;
+    private PeerReadSnapshotRepository.Snapshot readPeers(ClientAccount account) {
+        return account == null || account.getId() == null || account.getTenantId() == null
+                ? PeerReadSnapshotRepository.Snapshot.empty(null) : peerReads.read(account.getTenantId(), account.getId());
+    }
+
+    private io.netty.channel.Channel boundChannel(String tenant, PeerReadSnapshotRepository.Peer peer) {
+        if (peer == null || !peer.available(tenant)) return null;
+        var channel = SessionUtil.getChannel(peer.name());
+        var session = channel == null ? null : SessionUtil.getSession(channel);
+        return channel != null && channel.isActive() && session != null && peer.name().equals(session.getClientName())
+                && tenant.equals(channel.attr(ServerAttributes.TENANT_ID).get()) ? channel : null;
+    }
+
+    private PeerReadSnapshotRepository.Capabilities boundCapabilities(PeerReadSnapshotRepository.Snapshot snapshot,
+                                                                      PeerReadSnapshotRepository.Peer peer) {
+        return boundPeer(snapshot, peer).capabilities();
+    }
+
+    private record BoundPeer(boolean online, PeerReadSnapshotRepository.Capabilities capabilities) {}
+
+    private BoundPeer boundPeer(PeerReadSnapshotRepository.Snapshot snapshot, PeerReadSnapshotRepository.Peer peer) {
+        var channel = boundChannel(snapshot.tenant(), peer);
+        var id = channel == null ? null : channel.attr(ServerAttributes.CLIENT_SESSION_ID).get();
+        var capabilities = id == null ? null : snapshot.sessions().getOrDefault(peer.id(), List.of()).stream()
+                .filter(row -> row.sessionId() == id).findFirst().orElse(null);
+        boolean current = channel != null && channel.isActive() && SessionUtil.getChannel(peer.name()) == channel;
+        return new BoundPeer(current && (id == null || capabilities != null), current ? capabilities : null);
     }
 
     @Transactional(readOnly = true)

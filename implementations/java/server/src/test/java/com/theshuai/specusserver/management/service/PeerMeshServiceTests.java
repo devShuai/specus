@@ -12,12 +12,12 @@ import com.theshuai.specusserver.management.model.PeerMeshSession;
 import com.theshuai.specusserver.management.model.PeerMeshSharedService;
 import com.theshuai.specusserver.management.model.SortableInstant;
 import com.theshuai.specusserver.management.repository.ClientAccountRepository;
-import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshServiceSharingRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSharedServiceRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshSessionRepository;
+import com.theshuai.specusserver.management.repository.PeerReadSnapshotRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
 import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.peer.TurnCredentialService;
@@ -49,12 +49,13 @@ class PeerMeshServiceTests {
     private final PeerMeshSessionRepository sessionRepository = mock(PeerMeshSessionRepository.class);
     private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
     private final TurnCredentialService turnCredentialService = mock(TurnCredentialService.class);
-    private final ClientSessionRepository clientSessionRepository = mock(ClientSessionRepository.class);
     private final PeerMeshServiceSharingRepository sharingRepository = mock(PeerMeshServiceSharingRepository.class);
     private final PeerMeshSharedServiceRepository sharedServiceRepository = mock(PeerMeshSharedServiceRepository.class);
     private final PeerMeshProperties properties = new PeerMeshProperties();
     private final PlatformTransactionManager transactionManager = transactionManager();
     private final ManagementWriteAuthority authority = mock(ManagementWriteAuthority.class);
+    private final PeerReadSnapshotRepository peerReads = mock(PeerReadSnapshotRepository.class);
+    private final java.util.Map<Long, ClientAccount> fixtureClients = new java.util.LinkedHashMap<>();
     private final PeerMeshService service = new PeerMeshService(
             properties,
             deviceRepository,
@@ -62,14 +63,24 @@ class PeerMeshServiceTests {
             sessionRepository,
             clientAccountRepository,
             turnCredentialService,
-            clientSessionRepository,
             sharingRepository,
-            sharedServiceRepository,
             transactionManager,
-            new SimpleMeterRegistry(), authority
+            new SimpleMeterRegistry(), authority, peerReads
     );
 
     {
+        org.mockito.Mockito.doAnswer(invocation -> peerReads.read(invocation.getArgument(0), invocation.getArgument(1)))
+                .when(peerReads).readPair(any(), org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong());
+        when(peerReads.read(any(), org.mockito.ArgumentMatchers.anyLong())).thenAnswer(invocation -> {
+            String tenant = invocation.getArgument(0);
+            var source = fixtureClients.get(invocation.<Long>getArgument(1));
+            if (source == null) return PeerReadSnapshotRepository.Snapshot.empty(tenant);
+            var anchor = snapshotPeer(source);
+            var edges = fixtureClients.values().stream().map(target -> new PeerReadSnapshotRepository.Edge(anchor, snapshotPeer(target),
+                    snapshotAcl(tenant, source.getId(), target.getId()), snapshotAcl(tenant, target.getId(), source.getId()))).toList();
+            return new PeerReadSnapshotRepository.Snapshot(tenant, anchor, edges, java.util.Map.of(),
+                    sharedServiceRepository.findByTenantIdAndClientIdOrderByNameAsc(tenant, source.getId()));
+        });
         when(sessionRepository.lockCurrent(org.mockito.ArgumentMatchers.anyLong())).thenAnswer(invocation -> sessionRepository.findById(invocation.getArgument(0)));
         when(sessionRepository.findReference(org.mockito.ArgumentMatchers.anyLong())).thenAnswer(invocation -> sessionRepository.findById(invocation.<Long>getArgument(0))
                 .map(row -> new com.theshuai.specusserver.management.repository.PeerMeshSessionRepositoryCustom.Reference(row.getId(), row.getTenantId(), row.getSourceClientId(), row.getTargetClientId())));
@@ -514,11 +525,9 @@ class PeerMeshServiceTests {
                 sessionRepository,
                 clientAccountRepository,
                 turnCredentialService,
-                clientSessionRepository,
                 sharingRepository,
-                sharedServiceRepository,
                 transactionManager(),
-                meterRegistry, authority);
+                meterRegistry, authority, peerReads);
 
         assertThat(retryingService.authorizeRelayFrameForRelay(
                 new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512)).isTrue();
@@ -614,7 +623,20 @@ class PeerMeshServiceTests {
         account.setClientName(name);
         account.setEnabled(true);
         when(clientAccountRepository.lockCurrent(id, "tenant-a")).thenReturn(Optional.of(account));
+        fixtureClients.put(id, account);
         return account;
+    }
+
+    private PeerReadSnapshotRepository.Peer snapshotPeer(ClientAccount account) {
+        var device = deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId()).orElse(null);
+        return new PeerReadSnapshotRepository.Peer(account.getId(), account.getTenantId(), account.getOwnerUsername(),
+                account.getClientName(), account.isEnabled(), device == null ? null : account.getTenantId(),
+                device != null && device.isEnabled(), device == null ? null : device.getVirtualIp(), device == null ? null : device.getPublicKey());
+    }
+
+    private PeerReadSnapshotRepository.Acl snapshotAcl(String tenant, long source, long target) {
+        var acl = aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(tenant, source, target).orElse(null);
+        return new PeerReadSnapshotRepository.Acl(tenant, acl != null && acl.isAllowed(), acl == null ? null : acl.getDirection());
     }
 
     private void mockDeviceEnabled(long clientId) {
