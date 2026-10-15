@@ -19,6 +19,23 @@ public sealed class SessionRegistry
     private readonly ConcurrentDictionary<string, SpecusConnectionContext> _controls = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SpecusConnectionContext> _data = new(StringComparer.Ordinal);
     private readonly ILogger<SessionRegistry> _logger;
+    // Bounded process-local lifecycle stripes. The key is the authenticated immutable client ID,
+    // never a supplied/renamable client name. Do not hold these while forwarding NAT traffic.
+    private readonly SemaphoreSlim[] _lifecycles = Enumerable.Range(0, 256)
+        .Select(_ => new SemaphoreSlim(1, 1)).ToArray();
+
+    internal async ValueTask<IDisposable> AcquireLifecycleAsync(long clientId, CancellationToken cancellationToken)
+    {
+        var gate = _lifecycles[(int)((ulong)clientId % (uint)_lifecycles.Length)];
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new LifecycleLease(gate);
+    }
+
+    private sealed class LifecycleLease(SemaphoreSlim gate) : IDisposable
+    {
+        private SemaphoreSlim? _gate = gate;
+        public void Dispose() => Interlocked.Exchange(ref _gate, null)?.Release();
+    }
 
     public SessionRegistry(ILogger<SessionRegistry> logger)
     {

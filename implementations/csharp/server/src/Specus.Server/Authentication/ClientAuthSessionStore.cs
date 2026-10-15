@@ -67,23 +67,43 @@ public sealed class ClientAuthSessionStore
         return _byTokenHash.TryGetValue(hash, out var session) ? session : null;
     }
 
-    public int CountOnlineByCredential(long credentialId) =>
+    public int CountOnlineByCredential(long credentialId, long? excludingSessionId = null) =>
         _byTokenHash.Values.Count(s => s.CredentialId == credentialId
+            && s.Id != excludingSessionId
             && s.Status == ClientAuthSessionStatus.NettyOnline);
 
-    public int CountOnlineByMachineUser(long credentialId, string machineFingerprint, string osUser) =>
+    public int CountOnlineByMachineUser(long credentialId, string machineFingerprint, string osUser,
+        long? excludingSessionId = null) =>
         _byTokenHash.Values.Count(s => s.CredentialId == credentialId
+            && s.Id != excludingSessionId
             && s.Status == ClientAuthSessionStatus.NettyOnline
             && string.Equals(s.MachineFingerprint, machineFingerprint, StringComparison.Ordinal)
             && string.Equals(s.OsUser, osUser, StringComparison.Ordinal));
 
     public void MarkOnline(ClientAuthSession session, string channelId, string? remoteAddress)
     {
-        session.Status = ClientAuthSessionStatus.NettyOnline;
-        session.ChannelId = channelId;
-        session.RemoteAddress = remoteAddress;
-        session.NettyConnectedAt = DateTimeOffset.UtcNow;
-        session.DisconnectedAt = null;
+        lock (session)
+        {
+            session.Status = ClientAuthSessionStatus.NettyOnline;
+            session.ChannelId = channelId;
+            session.RemoteAddress = remoteAddress;
+            session.NettyConnectedAt = DateTimeOffset.UtcNow;
+            session.DisconnectedAt = null;
+        }
+    }
+
+    public bool MarkDisconnected(long? sessionId, string channelId)
+    {
+        var session = FindById(sessionId);
+        if (session is null) return false;
+        lock (session)
+        {
+            if (session.Status != ClientAuthSessionStatus.NettyOnline || session.ChannelId != channelId)
+                return false;
+            session.Status = ClientAuthSessionStatus.Disconnected;
+            session.DisconnectedAt = DateTimeOffset.UtcNow;
+            return true;
+        }
     }
 
     public void MarkDisconnected(long? sessionId)
@@ -94,8 +114,11 @@ public sealed class ClientAuthSessionStore
         {
             return;
         }
-        session.Status = ClientAuthSessionStatus.Disconnected;
-        session.DisconnectedAt = DateTimeOffset.UtcNow;
+        lock (session)
+        {
+            session.Status = ClientAuthSessionStatus.Disconnected;
+            session.DisconnectedAt = DateTimeOffset.UtcNow;
+        }
     }
 
     private static string TokenHash(string token) =>

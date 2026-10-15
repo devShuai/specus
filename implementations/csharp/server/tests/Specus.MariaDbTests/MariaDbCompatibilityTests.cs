@@ -15,6 +15,14 @@ namespace Specus.IntegrationTests;
 
 public sealed class MariaDbCompatibilityTests
 {
+    [Fact]
+    public async Task NativeControlDisconnectCannotOverwriteANewerPhysicalChannel()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ControlDisconnectProviderProof.VerifyAsync(server);
+    }
+
     private const string Previous = "20261013031423_BindManagementWebSocketAccount";
     private const string Repair = "20261014023000_WidenHttpTrafficText";
 

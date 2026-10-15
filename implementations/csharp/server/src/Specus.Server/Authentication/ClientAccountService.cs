@@ -123,6 +123,15 @@ public sealed class ClientAccountService
         => await AuthenticateCoreAsync(packet, channelId, remoteAddress, dataConnection: false, cancellationToken)
             .ConfigureAwait(false);
 
+    internal long? AuthenticatedClientId(LoginRequestPacket packet) =>
+        _sessionStore.Find(packet.ClientSessionId, packet.AccessToken)?.ClientId;
+
+    internal long? SessionClientId(long? sessionId) => _sessionStore.FindById(sessionId)?.ClientId;
+
+    internal bool HasNewerControl(long? sessionId, string channelId) =>
+        _sessionStore.FindById(sessionId) is { Status: ClientAuthSessionStatus.NettyOnline } current
+        && current.ChannelId != channelId;
+
     public async Task<AuthenticationResult> AuthenticateDataAsync(
         LoginRequestPacket packet, string channelId, string? remoteAddress, CancellationToken cancellationToken)
         => await AuthenticateCoreAsync(packet, channelId, remoteAddress, dataConnection: true, cancellationToken)
@@ -173,12 +182,12 @@ public sealed class ClientAccountService
             return AuthenticationResult.Fail(account, "连接频率超过限制");
         }
         if (!dataConnection && _sessionStore.CountOnlineByMachineUser(
-                session.CredentialId, session.MachineFingerprint, session.OsUser) >= PerMachineUserMaxInstances)
+                session.CredentialId, session.MachineFingerprint, session.OsUser, session.Id) >= PerMachineUserMaxInstances)
         {
             return AuthenticationResult.Fail(account, "同一台机器和用户已经有在线实例");
         }
         if (!dataConnection
-            && _sessionStore.CountOnlineByCredential(session.CredentialId) >= credential.MaxOnlineInstances)
+            && _sessionStore.CountOnlineByCredential(session.CredentialId, session.Id) >= credential.MaxOnlineInstances)
         {
             return AuthenticationResult.Fail(account, "在线实例数已达上限");
         }
@@ -187,9 +196,9 @@ public sealed class ClientAccountService
         packet.ClientSessionId = session.Id;
         if (!dataConnection)
         {
-            _sessionStore.MarkOnline(session, channelId, remoteAddress);
             await MarkSessionOnlineAsync(session, channelId, remoteAddress, cancellationToken)
                 .ConfigureAwait(false);
+            _sessionStore.MarkOnline(session, channelId, remoteAddress);
         }
         return AuthenticationResult.Pass(account);
     }
@@ -235,22 +244,22 @@ public sealed class ClientAccountService
         return count >= limit;
     }
 
-    public void MarkNettyDisconnected(long? sessionId)
+    public async Task<bool> MarkNettyDisconnectedAsync(long? sessionId, string channelId,
+        CancellationToken cancellationToken)
     {
-        _sessionStore.MarkDisconnected(sessionId);
         if (sessionId is null or <= 0)
         {
-            return;
+            return false;
         }
-
-        var row = _db.ClientSessions.FirstOrDefault(s => s.Id == sessionId.Value);
-        if (row is null || row.Status != StatusNettyOnline)
-        {
-            return;
-        }
-        row.Status = StatusDisconnected;
-        row.DisconnectedAt = DateTimeOffset.UtcNow;
-        _db.SaveChanges();
+        var now = DateTimeOffset.UtcNow;
+        // One native conditional write, not a query followed by an unconditional tracked Save.
+        // EF maps/quotes the provider's actual column names (including PostgreSQL's Id).
+        var changed = await _db.ClientSessions
+            .Where(s => s.Id == sessionId.Value && s.ChannelId == channelId && s.Status == StatusNettyOnline)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(s => s.Status, StatusDisconnected)
+                .SetProperty(s => s.DisconnectedAt, now), cancellationToken).ConfigureAwait(false);
+        _sessionStore.MarkDisconnected(sessionId, channelId);
+        return changed != 0;
     }
 
     private async Task<ClientCredential> AuthenticateCredentialAsync(

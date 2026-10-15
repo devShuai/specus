@@ -13,6 +13,14 @@ namespace Specus.IntegrationTests;
 
 public sealed class MySqlTrafficSchemaTests
 {
+    [Fact]
+    public async Task NativeControlDisconnectCannotOverwriteANewerPhysicalChannel()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ControlDisconnectProviderProof.VerifyAsync(server);
+    }
+
     private const string Previous = "20261013031423_BindManagementWebSocketAccount";
     private const string Repair = "20261014023000_WidenHttpTrafficText";
     private static readonly string[] WideColumns = ["request_headers", "response_headers", "request_preview_hex", "response_preview_hex"];

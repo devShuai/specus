@@ -13,6 +13,14 @@ namespace Specus.IntegrationTests;
 
 public sealed class PostgresBootstrapTests
 {
+    [Fact]
+    public async Task NativeControlDisconnectCannotOverwriteANewerPhysicalChannel()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ControlDisconnectProviderProof.VerifyAsync(server);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

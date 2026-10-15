@@ -521,6 +521,31 @@ public sealed partial class PeerMeshService
         }
     }
 
+    // Called under the transport lifecycle lease, before publishing the new physical control,
+    // outside its socket write lock. Raw client revisions belong to one physical publisher.
+    internal async Task OnControlConnectedAsync(ClientAccount publisher, long sessionId,
+        CancellationToken cancellationToken)
+    {
+        var key = (publisher.TenantId, publisher.Id, sessionId);
+        var gate = CatalogMutationGate(key);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var hadPublisher = _serviceCatalogs.TryRemove(key, out _)
+                | _serviceReportRevisions.ContainsKey(key);
+            if (hadPublisher)
+            {
+                await FanoutAsync(publisher, sessionId, NextCatalogRevision(key), [], DateTimeOffset.UtcNow,
+                    includeDenied: true, cancellationToken).ConfigureAwait(false);
+            }
+            _serviceCatalogRevisions.TryRemove(key, out _);
+            _serviceReportRevisions.TryRemove(key, out _);
+            _serviceReportWindows.TryRemove(sessionId, out _);
+            // The process-owned outbound sequence is deliberately NOT reset.
+        }
+        finally { gate.Release(); }
+    }
+
     public async Task OnClientDisconnectedAsync(long sessionId, CancellationToken cancellationToken)
     {
         if (sessionId <= 0)

@@ -77,6 +77,15 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             throw new InvalidOperationException("packet is not allowed on this connection role");
         }
 
+        using var messageLease = packet is MessageRequestPacket && context.ClientId is { } sourceClientId
+            ? await _sessions.AcquireLifecycleAsync(sourceClientId, context.Lifetime).ConfigureAwait(false)
+            : null;
+        // A queued message may have passed the initial snapshot before replacement. Keep its
+        // original physical binding through admission and publication; never resolve it anew by SID.
+        if (packet is MessageRequestPacket && (!_sessions.HasLogin(context)
+            || context.Lifetime.IsCancellationRequested))
+            throw new InvalidOperationException("message from retired control connection");
+
         switch (packet)
         {
             case LoginRequestPacket login:
@@ -254,20 +263,10 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             await _nat.OnConnectionClosedAsync(context).ConfigureAwait(false);
         }
 
-        if (context.ClientName is { } name)
-        {
-            _sessions.Unbind(name, context);
-        }
-
         if (dataConnection)
         {
+            if (context.ClientName is { } dataName) _sessions.Unbind(dataName, context);
             return;
-        }
-        if (context.ClientName is { } controlName
-            && _sessions.FindData(controlName) is { } data
-            && data.ClientSessionId == context.ClientSessionId)
-        {
-            data.CloseAsync();
         }
 
         var reason = context.ReadDisconnectReason() ?? DisconnectReason.ClientClosed;
@@ -278,25 +277,55 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         {
             await using var scope = _services.CreateAsyncScope();
             var clientService = scope.ServiceProvider.GetRequiredService<ClientAccountService>();
-            clientService.MarkNettyDisconnected(context.ClientSessionId);
-            var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
-            if (context.ClientSessionId is { } disconnectedSessionId)
+            var clientId = context.ClientId ?? clientService.SessionClientId(context.ClientSessionId);
+            using (var lease = clientId is { } id
+                ? await _sessions.AcquireLifecycleAsync(id, CancellationToken.None).ConfigureAwait(false)
+                : null)
             {
-                await peerMesh.OnClientDisconnectedAsync(disconnectedSessionId, CancellationToken.None)
-                    .ConfigureAwait(false);
+                var successor = context.ClientName is { } boundName ? _sessions.Find(boundName) : null;
+                // The registry can still contain the OLD binding when a new login fails after
+                // native ONLINE but before publication. Its mere presence is not newer ownership.
+                var replacedSameSession = clientService.HasNewerControl(context.ClientSessionId, context.ChannelId);
+                if (context.ClientName is { } name) _sessions.Unbind(name, context);
+                if (!replacedSameSession)
+                {
+                    if (successor is not null && !ReferenceEquals(successor, context)
+                        && context.ClientSessionId is > 0 && successor.ClientSessionId == context.ClientSessionId)
+                    {
+                        _sessions.Unbind(successor.ClientName!, successor);
+                        successor.MarkDisconnectIfAbsent(DisconnectReason.ReplacedByNewLogin);
+                        successor.CloseAsync();
+                    }
+                    if (context.ClientName is { } controlName
+                        && _sessions.FindData(controlName) is { } data
+                        && data.ClientSessionId == context.ClientSessionId)
+                    {
+                        _sessions.Unbind(controlName, data);
+                        data.CloseAsync();
+                    }
+                    await clientService.MarkNettyDisconnectedAsync(context.ClientSessionId,
+                        context.ChannelId, CancellationToken.None).ConfigureAwait(false);
+                    var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
+                    if (context.ClientSessionId is { } disconnectedSessionId)
+                        await peerMesh.OnClientDisconnectedAsync(disconnectedSessionId, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    if (context.ClientName is { } departedName)
+                        await peerMesh.PushOnLogoutAsync(departedName, CancellationToken.None).ConfigureAwait(false);
+                }
             }
-            if (context.ClientName is { } departedName)
-            {
-                // After the unbind above, so the roster its peers are sent counts it as offline.
-                await peerMesh.PushOnLogoutAsync(departedName, CancellationToken.None).ConfigureAwait(false);
-            }
-            if (context.ConnectionRecordId is not { } recordId)
-            {
-                return;
-            }
-            var records = scope.ServiceProvider.GetRequiredService<ConnectionRecordService>();
-            await records.RecordDisconnectAsync(recordId, reason, CancellationToken.None)
-                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[{ChannelId}] failed to clean up disconnect", context.ChannelId);
+        }
+        // A replaced physical connection still owns its audit record, even if shared cleanup
+        // is skipped or fails. Never stamp the successor's connection record.
+        if (context.ConnectionRecordId is not { } recordId) return;
+        try
+        {
+            await using var scope = _services.CreateAsyncScope();
+            await scope.ServiceProvider.GetRequiredService<ConnectionRecordService>()
+                .RecordDisconnectAsync(recordId, reason, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -349,6 +378,12 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         }
         var dataConnection = packet.ConnectionRole == ConnectionRole.Data;
 
+        var clientId = clientService.AuthenticatedClientId(packet);
+        using var loginLease = clientId is { } authenticatedClientId
+            ? await _sessions.AcquireLifecycleAsync(authenticatedClientId, context.Lifetime).ConfigureAwait(false)
+            : null;
+        context.Lifetime.ThrowIfCancellationRequested();
+
         AuthenticationResult result;
         try
         {
@@ -376,11 +411,19 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         if (result.Success && dataConnection)
         {
             var control = _sessions.Find(packet.ClientName!);
-            if (control is null || control.ClientSessionId != packet.ClientSessionId)
+            if (control is null || control.Lifetime.IsCancellationRequested
+                || control.ClientSessionId != packet.ClientSessionId)
             {
                 result = AuthenticationResult.Fail(result.Account, "数据连接未找到匹配的控制连接",
                     result.AuditTenantId);
             }
+        }
+
+        if (result.Success)
+        {
+            context.Lifetime.ThrowIfCancellationRequested();
+            context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                packet.ClientSessionId, packet.ConnectionRole!, result.Account!.TenantId, result.Account.Id);
         }
 
         long? recordId = null;
@@ -415,8 +458,29 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         if (result.Success)
         {
             context.ConnectionRecordId = recordId;
-            context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                packet.ClientSessionId, packet.ConnectionRole!, result.Account!.TenantId);
+            if (!dataConnection)
+            {
+                // Retire the companion belonging to the displaced physical control before the
+                // new control is visible. Its late callback must not select a new companion.
+                if (_sessions.FindData(packet.ClientName!) is { } oldData)
+                {
+                    _sessions.Unbind(packet.ClientName!, oldData);
+                    oldData.CloseAsync();
+                }
+                try
+                {
+                    await scope.ServiceProvider.GetRequiredService<PeerMeshService>()
+                        .OnControlConnectedAsync(result.Account!, packet.ClientSessionId!.Value, context.Lifetime)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "[{ChannelId}] failed to retire prior publisher", context.ChannelId);
+                    context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
+                    context.CloseAsync();
+                    return;
+                }
+            }
             publish = dataConnection
                 ? () =>
                 {
@@ -443,11 +507,15 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             context.CloseAsync();
             return;
         }
+        finally
+        {
+            // Commit may have displaced a connection even if writing the reply failed/cancelled.
+            displaced?.CloseAsync();
+            loginLease?.Dispose();
+        }
 
         if (result.Success)
         {
-            displaced?.CloseAsync();
-
             if (dataConnection)
             {
                 _logger.LogInformation("[{ChannelId}] dedicated data connection ready for {ClientName}",
