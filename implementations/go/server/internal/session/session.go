@@ -29,16 +29,47 @@ type Registry struct {
 	data     map[string]Session
 	closedAt map[string]time.Time
 	changed  chan struct{}
+	// Fixed stripes bound memory independently of attacker-controlled client names. These
+	// leases never hold mu: lifecycle work may query storage and send to other sessions.
+	controlLeases [256]chan struct{}
 }
 
 // NewRegistry builds an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{
+	registry := &Registry{
 		controls: make(map[string]Session),
 		data:     make(map[string]Session),
 		closedAt: make(map[string]time.Time),
 		changed:  make(chan struct{}),
 	}
+	for i := range registry.controlLeases {
+		registry.controlLeases[i] = make(chan struct{}, 1)
+		registry.controlLeases[i] <- struct{}{}
+	}
+	return registry
+}
+
+// AcquireControlLease serializes control replacement, report admission, companion data
+// attachment and teardown for one canonical client name. Waiting is cancellable/bounded by
+// the caller; unlike mu, this lease may span DB work. Release is idempotent.
+func (r *Registry) AcquireControlLease(ctx context.Context, name string) (func(), error) {
+	hash := uint32(2166136261)
+	for i := 0; i < len(name); i++ {
+		hash = (hash ^ uint32(name[i])) * 16777619
+	}
+	gate := r.controlLeases[hash%uint32(len(r.controlLeases))]
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-gate:
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { gate <- struct{}{} }) }
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 // Replace binds session under its client name, returning any previously bound session that

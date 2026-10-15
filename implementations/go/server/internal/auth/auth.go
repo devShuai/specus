@@ -182,6 +182,23 @@ func (s *SessionStore) MarkDisconnected(sessionID int64) {
 	s.updateStatus(sessionID, StatusDisconnected)
 }
 
+// A replacement transport for the same authenticated session is not another online instance.
+// Compute both quota counts from one snapshot, without subtracting a stale cached status.
+func (s *SessionStore) onlineCountsExcluding(current Session) (machine, credential int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, candidate := range s.byTokenHash {
+		if candidate.ID == current.ID || candidate.CredentialID != current.CredentialID || candidate.Status != StatusNettyOnline {
+			continue
+		}
+		credential++
+		if candidate.MachineFingerprint == current.MachineFingerprint && candidate.OSUser == current.OSUser {
+			machine++
+		}
+	}
+	return
+}
+
 func (s *SessionStore) CountOnlineByMachineUser(credentialID int64, machineFingerprint, osUser string) int {
 	if credentialID <= 0 || machineFingerprint == "" || osUser == "" {
 		return 0
@@ -378,14 +395,14 @@ func (a *Authenticator) authenticate(ctx context.Context, request protocol.Login
 		if !dataConnection {
 			a.closeStaleOnlineSessions(ctx, session)
 		}
-		if !dataConnection && a.sessions.CountOnlineByMachineUser(session.CredentialID, session.MachineFingerprint, session.OSUser) >=
-			a.perMachineUserMaxInstances {
+		machineCount, credentialCount := a.sessions.onlineCountsExcluding(session)
+		if !dataConnection && machineCount >= a.perMachineUserMaxInstances {
 			return Result{Reason: "同一台机器和用户已经有在线实例", Account: account}, nil
 		}
 		// maxOnlineInstances == 0 表示拒绝所有登录（与 Java ClientAuthService.isOnlineLimitExceeded
 		// 一致：online >= 0 恒为真）。不做 > 0 守卫，确保 0 语义为"拒绝全部"。
 		if !dataConnection &&
-			a.sessions.CountOnlineByCredential(session.CredentialID) >= credential.MaxOnlineInstances {
+			credentialCount >= credential.MaxOnlineInstances {
 			return Result{Reason: "在线实例数已达上限", Account: account}, nil
 		}
 	}
@@ -412,11 +429,22 @@ func (a *Authenticator) closeStaleOnlineSessions(ctx context.Context, current Se
 		return
 	}
 	for _, candidate := range a.sessions.FindOnlineByCredential(current.CredentialID) {
-		if _, bound := a.registry.Find(candidate.ClientName); bound {
+		// Do not classify the DB-online/registry-publication interval of a login as stale.
+		leaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		release, err := a.registry.AcquireControlLease(leaseCtx, candidate.ClientName)
+		cancel()
+		if err != nil {
 			continue
 		}
-		a.sessions.MarkDisconnected(candidate.ID)
-		_ = a.db.MarkClientSessionDisconnected(ctx, candidate.ID, StatusDisconnected, a.now())
+		bound, found := a.registry.Find(candidate.ClientName)
+		if identified, ok := bound.(interface{ ClientSessionID() int64 }); ok && identified.ClientSessionID() != candidate.ID {
+			found = false
+		}
+		if !found {
+			a.sessions.MarkDisconnected(candidate.ID)
+			_ = a.db.MarkClientSessionDisconnected(ctx, candidate.ID, StatusDisconnected, a.now())
+		}
+		release()
 	}
 }
 

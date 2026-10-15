@@ -273,8 +273,41 @@ func (s *Service) OnClientDisconnected(ctx context.Context, clientName string, s
 	if err != nil || account == nil {
 		return
 	}
-	s.withdrawSession(ctx, *account, sessionID)
 	key := catalogKey{account.TenantID, account.ID, sessionID}
+	s.catalogMu.Lock()
+	_, hasCatalog := s.catalogs[key]
+	_, hasReport := s.reportRevisions[key]
+	s.catalogMu.Unlock()
+	if !hasCatalog && !hasReport {
+		s.catalogMu.Lock()
+		delete(s.catalogRevisions, key)
+		delete(s.serviceReportRates, sessionID)
+		s.catalogMu.Unlock()
+		return
+	}
+	s.withdrawSession(ctx, *account, sessionID)
+	s.catalogMu.Lock()
+	delete(s.catalogRevisions, key)
+	delete(s.reportRevisions, key)
+	delete(s.serviceReportRates, sessionID)
+	s.catalogMu.Unlock()
+}
+
+// OnControlConnected retires only this authenticated session's prior physical publisher.
+// The transport calls it under the same lifecycle lease as report admission and disconnect,
+// before publishing the new binding/login response and without holding a socket write lock.
+func (s *Service) OnControlConnected(ctx context.Context, publisher store.ClientAccount, sessionID int64) {
+	if s == nil || sessionID <= 0 {
+		return
+	}
+	key := catalogKey{publisher.TenantID, publisher.ID, sessionID}
+	s.catalogMu.Lock()
+	_, hasCatalog := s.catalogs[key]
+	_, hasReport := s.reportRevisions[key]
+	s.catalogMu.Unlock()
+	if hasCatalog || hasReport {
+		s.withdrawSession(ctx, publisher, sessionID)
+	}
 	s.catalogMu.Lock()
 	delete(s.catalogRevisions, key)
 	delete(s.reportRevisions, key)

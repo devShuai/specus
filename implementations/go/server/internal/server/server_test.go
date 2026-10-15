@@ -24,7 +24,7 @@ func startTestApp(t *testing.T) (*App, int) {
 	return startTestAppWithConfig(t, cfg)
 }
 
-func startTestAppWithConfig(t *testing.T, cfg config.Config) (*App, int) {
+func startTestAppWithConfig(t *testing.T, cfg config.Config, beforeStart ...func(*App)) (*App, int) {
 	t.Helper()
 	cfg.Netty.Port = 0
 	cfg.ManagementAddr = "127.0.0.1:0"
@@ -41,6 +41,10 @@ func startTestAppWithConfig(t *testing.T, cfg config.Config) (*App, int) {
 	app, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("new app: %v", err)
+	}
+	// Configure deterministic test hooks before listener/background goroutines can read them.
+	for _, configure := range beforeStart {
+		configure(app)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

@@ -32,6 +32,7 @@ type Dispatcher struct {
 	onDataLogin       func(conn *control.Conn)
 	onDisconnect      func(conn *control.Conn)
 	onControlGone     func(conn *control.Conn)
+	onControlBinding  func(conn *control.Conn, account store.ClientAccount)
 	onConnectionEvent func(eventType string, record store.ConnectionRecord)
 }
 
@@ -61,6 +62,12 @@ func (d *Dispatcher) SetOnDisconnect(hook func(conn *control.Conn)) { d.onDiscon
 // unbound: the point from which everyone else sees that client as offline. The teardown hook
 // above runs for the data connection and before any unbinding, so it cannot say that.
 func (d *Dispatcher) SetOnControlGone(hook func(conn *control.Conn)) { d.onControlGone = hook }
+
+// SetOnControlBinding runs before a new control binding is published, under its lifecycle
+// lease but outside CommitAndSend's socket write lock. It must not write to the new socket.
+func (d *Dispatcher) SetOnControlBinding(hook func(conn *control.Conn, account store.ClientAccount)) {
+	d.onControlBinding = hook
+}
 
 // SetPeerControlHandler installs the Peer Mesh control-plane signal handler.
 func (d *Dispatcher) SetPeerControlHandler(handler func(conn *control.Conn, request protocol.MessageRequest) error) {
@@ -119,6 +126,16 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 		}
 		return nil
 	case protocol.MessageRequest:
+		leaseCtx, cancel := context.WithTimeout(conn.Context(), 5*time.Second)
+		release, err := d.sessions.AcquireControlLease(leaseCtx, conn.ClientName())
+		cancel()
+		if err != nil {
+			return err
+		}
+		defer release()
+		if !d.sessions.IsBound(conn) {
+			return errUnauthenticated
+		}
 		if p.MessageType == protocol.MessageTypePeerControl {
 			if d.peerControl == nil {
 				d.logger.Info("dropped PEER_CONTROL: peer mesh handler is not configured",
@@ -175,27 +192,21 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 		d.onDisconnect(conn)
 	}
 	if name := conn.ClientName(); name != "" {
-		d.sessions.Unbind(name, conn)
-	}
-	if dataConnection {
-		return
-	}
-	if data, ok := d.sessions.FindData(conn.ClientName()); ok {
-		if dataConn, concrete := data.(*control.Conn); concrete &&
-			dataConn.ClientSessionID() == conn.ClientSessionID() {
-			data.Close(store.ReasonClientClosed)
-		}
-	}
-	d.auth.MarkDisconnected(conn.ClientSessionID())
-	if sessionID := conn.ClientSessionID(); sessionID > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := d.db.MarkClientSessionDisconnected(ctx, sessionID, auth.StatusDisconnected, time.Now()); err != nil {
-			d.logger.Error("mark client session disconnected failed", "session", sessionID, "err", err)
+		release, err := d.sessions.AcquireControlLease(ctx, name)
+		if err != nil {
+			d.logger.Error("acquire disconnect lifecycle lease failed", "channel", conn.ChannelID(), "err", err)
+		} else {
+			d.sessions.Unbind(name, conn)
+			if !dataConnection {
+				d.retireControl(ctx, conn)
+			}
+			release()
 		}
 		cancel()
 	}
-	if d.onControlGone != nil && conn.ClientName() != "" {
-		d.onControlGone(conn)
+	if dataConnection {
+		return
 	}
 	recordID := conn.ConnectionRecordID()
 	if recordID == 0 {
@@ -219,6 +230,31 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 			ID: recordID, TenantID: conn.TenantID(), ClientName: conn.ClientName(), ChannelID: &channelID,
 			ConnectedAt: now, DisconnectedAt: &now, Success: true, DisconnectReason: &reasonCopy,
 		})
+	}
+}
+
+func (d *Dispatcher) retireControl(ctx context.Context, conn *control.Conn) {
+	if current, ok := d.sessions.Find(conn.ClientName()); ok {
+		if successor, concrete := current.(*control.Conn); concrete && successor != conn && successor.ClientSessionID() == conn.ClientSessionID() {
+			return // The local auth/data/catalog key now belongs to this physical successor.
+		}
+	}
+	_, err := d.db.MarkClientSessionDisconnectedForChannel(ctx, conn.ClientSessionID(), conn.ChannelID(), auth.StatusDisconnected, time.Now())
+	if err != nil {
+		d.logger.Error("mark current client session disconnected failed", "channel", conn.ChannelID(), "err", err)
+	}
+	// Native status may already be retired by HTTP re-authentication/admin actions. The
+	// departed local generation still owns its old cache key unless a same-ID successor
+	// is bound above. Never let that suppress withdrawal or leak an online quota slot.
+	d.auth.MarkDisconnected(conn.ClientSessionID())
+	if data, ok := d.sessions.FindData(conn.ClientName()); ok {
+		if dataConn, concrete := data.(*control.Conn); concrete && dataConn.ClientSessionID() == conn.ClientSessionID() {
+			d.sessions.Unbind(conn.ClientName(), data)
+			data.Close(store.ReasonClientClosed)
+		}
+	}
+	if d.onControlGone != nil {
+		d.onControlGone(conn)
 	}
 }
 
@@ -262,6 +298,24 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 	if result.Account != nil {
 		clientName = result.Account.ClientName
 	}
+	if result.Success {
+		leaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		release, leaseErr := d.sessions.AcquireControlLease(leaseCtx, clientName)
+		cancel()
+		if leaseErr != nil {
+			conn.Close(store.ReasonServerBusy)
+			return
+		}
+		defer release()
+		d.finishLogin(conn, request, result, clientName, dataConnection, release)
+		return
+	}
+	d.finishLogin(conn, request, result, clientName, dataConnection, func() {})
+}
+
+func (d *Dispatcher) finishLogin(conn *control.Conn, request protocol.LoginRequest, result auth.Result, clientName string, dataConnection bool, release func()) {
+	ctx := conn.Context()
+	var err error
 	if result.Success && dataConnection {
 		bound, ok := d.sessions.Find(clientName)
 		controlConn, concrete := bound.(*control.Conn)
@@ -334,6 +388,13 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 	var displaced session.Session
 	var publish func()
 	if result.Success {
+		if !dataConnection {
+			// Detach the old companion before a same-token replacement can attach its own.
+			if data, found := d.sessions.FindData(clientName); found {
+				d.sessions.Unbind(clientName, data)
+				data.Close(store.ReasonReplacedByNewLogin)
+			}
+		}
 		// Commit authenticated connection state before publishing the success response.
 		// Once the client observes success it may immediately send heartbeat/NAT frames, and a
 		// public request may at once open a stream on a new data connection.
@@ -343,6 +404,9 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID,
 			time.Now().UnixMilli(), request.ConnectionRole)
 		conn.SetHTTPRouteCapability(result.Session.HTTPRouteCapability)
+		if !dataConnection && d.onControlBinding != nil {
+			d.onControlBinding(conn, *result.Account)
+		}
 		publish = func() {
 			if !dataConnection {
 				displaced = d.sessions.Replace(conn)
@@ -359,9 +423,13 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 	// The client reads the login response before any other frame, so whatever the published
 	// state lets other goroutines send on conn must queue behind it.
 	if err := conn.CommitAndSend(publish, response); err != nil {
+		if displaced != nil {
+			displaced.Close(store.ReasonReplacedByNewLogin)
+		}
 		conn.Close(store.ReasonIOError)
 		return
 	}
+	release()
 
 	if !result.Success {
 		conn.MarkReason(store.ReasonLoginFailure)

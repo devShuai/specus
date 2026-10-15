@@ -342,13 +342,16 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		}
 		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		peerMesh.OnClientDisconnected(pushCtx, conn.ClientName(), conn.ClientSessionID())
 		peerMesh.PushOnLogout(pushCtx, conn.ClientName())
+	})
+	dispatcher.SetOnControlBinding(func(conn *control.Conn, account store.ClientAccount) {
+		if peerMesh != nil {
+			peerMesh.OnControlConnected(conn.Context(), account, conn.ClientSessionID())
+		}
 	})
 	dispatcher.SetOnDisconnect(func(conn *control.Conn) {
 		coordinator.Close(conn)
-		if peerMesh != nil {
-			peerMesh.OnClientDisconnected(conn.Context(), conn.ClientName(), conn.ClientSessionID())
-		}
 	})
 	dispatcher.SetOnDataLoginSuccess(coordinator.Attach)
 	dispatcher.SetClientMessageHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
