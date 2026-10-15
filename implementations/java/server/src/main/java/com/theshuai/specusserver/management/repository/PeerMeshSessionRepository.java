@@ -9,7 +9,7 @@ import org.springframework.data.jpa.repository.Query;
 
 import java.util.List;
 
-public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession, Long> {
+public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession, Long>, PeerMeshSessionRepositoryCustom {
     Page<PeerMeshSession> findByTenantIdOrderByUpdatedAtDesc(String tenantId, Pageable pageable);
 
     Page<PeerMeshSession> findByTenantIdAndStatusNotOrderByUpdatedAtDesc(String tenantId, String status, Pageable pageable);

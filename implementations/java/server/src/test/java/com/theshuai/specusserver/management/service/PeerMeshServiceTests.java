@@ -70,6 +70,10 @@ class PeerMeshServiceTests {
     );
 
     {
+        when(sessionRepository.lockCurrent(org.mockito.ArgumentMatchers.anyLong())).thenAnswer(invocation -> sessionRepository.findById(invocation.getArgument(0)));
+        when(sessionRepository.findReference(org.mockito.ArgumentMatchers.anyLong())).thenAnswer(invocation -> sessionRepository.findById(invocation.<Long>getArgument(0))
+                .map(row -> new com.theshuai.specusserver.management.repository.PeerMeshSessionRepositoryCustom.Reference(row.getId(), row.getTenantId(), row.getSourceClientId(), row.getTargetClientId())));
+        when(sessionRepository.saveCurrent(any())).thenAnswer(invocation -> sessionRepository.save(invocation.getArgument(0)));
         when(authority.current(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(deviceRepository.lockCurrent(any(), any())).thenAnswer(invocation ->
                 deviceRepository.findByTenantIdAndClientId(invocation.getArgument(0), invocation.getArgument(1)));
@@ -325,8 +329,11 @@ class PeerMeshServiceTests {
             saved.set(session);
             return session;
         });
+        org.mockito.Mockito.doAnswer(invocation -> Optional.ofNullable(saved.get()))
+                .when(sessionRepository).lockCurrent(org.mockito.ArgumentMatchers.anyLong());
 
         var first = service.createSession(client(1, "alice", "a"), client(2, "alice", "b"), PeerMeshService.PATH_DIRECT);
+        assertThat(sessionRepository.lockCurrent(first.session().id())).containsSame(saved.get());
         var second = service.createSession(client(1, "alice", "a"), client(2, "alice", "b"), PeerMeshService.PATH_DIRECT);
         var reverse = service.createSession(client(2, "alice", "b"), client(1, "alice", "a"), PeerMeshService.PATH_DIRECT);
 
@@ -494,10 +501,10 @@ class PeerMeshServiceTests {
     @Test
     void relayTrafficFlushRestoresBatchAfterRepositoryFailure() {
         PeerMeshSession session = activeSession();
-        when(sessionRepository.findById(100L))
-                .thenReturn(Optional.of(session))
-                .thenThrow(new IllegalStateException("database unavailable"))
-                .thenReturn(Optional.of(session));
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        org.mockito.Mockito.doReturn(Optional.of(session))
+                .doThrow(new IllegalStateException("database unavailable"))
+                .doReturn(Optional.of(session)).when(sessionRepository).lockCurrent(100L);
         when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
         SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
         PeerMeshService retryingService = new PeerMeshService(
@@ -626,6 +633,8 @@ class PeerMeshServiceTests {
     }
 
     private PeerMeshSession activeSession() {
+        client(1, "alice", "a"); client(2, "alice", "b");
+        mockDeviceEnabled(1); mockDeviceEnabled(2);
         Instant now = Instant.now();
         PeerMeshSession session = new PeerMeshSession();
         session.setId(100L);

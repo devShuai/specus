@@ -65,6 +65,7 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 @Service
@@ -458,9 +459,9 @@ public class PeerMeshService {
                 source.getId(),
                 target.getId(),
                 STATUS_CLOSED);
-        for (PeerMeshSession session : sessions) {
+        for (PeerMeshSession session : lockSessionRows(sessions)) {
             if (closeIfExpired(session, now)) {
-                sessionRepository.save(session);
+                sessionRepository.saveCurrent(session);
                 continue;
             }
             String token = pendingOrCachedSessionToken(session.getId());
@@ -477,10 +478,12 @@ public class PeerMeshService {
         if (report.getSessionId() == null || report.getSessionId() <= 0) {
             throw new IllegalArgumentException("sessionId is required");
         }
-        PeerMeshSession session = findReportableSession(reporter, report.getSessionId());
+        CurrentPeerSession current = findReportableSession(reporter, report.getSessionId());
+        PeerMeshSession session = current.row();
         Instant now = Instant.now();
-        if (closeIfExpired(session, now)) {
-            return toSessionView(sessionRepository.save(session));
+        if (!current.allowed() || closeIfExpired(session, now)) {
+            if (!current.allowed()) markClosed(session, now);
+            return toSessionView(sessionRepository.saveCurrent(session));
         }
         if (StringUtils.hasText(report.getPathType())) {
             if (session.getDirectBytes() <= 0 && session.getRelayBytes() <= 0) {
@@ -492,13 +495,14 @@ public class PeerMeshService {
         session.setStatus(StringUtils.hasText(report.getStatus())
                 ? limit(report.getStatus(), 40)
                 : STATUS_ACTIVE);
+        if (STATUS_CLOSED.equals(session.getStatus())) markClosed(session, now);
         session.setRttMillis(report.getRttMillis());
         session.setLocalEndpoint(limit(report.getLocalEndpoint(), 255));
         session.setRemoteEndpoint(limit(report.getRemoteEndpoint(), 255));
         session.setUpdatedAt(now.toString());
         session.setLastKeepaliveAt(now.toString());
         invalidateRelayAuthorization(session.getId());
-        return toSessionView(sessionRepository.save(session));
+        return toSessionView(sessionRepository.saveCurrent(session));
     }
 
     @Transactional
@@ -506,12 +510,14 @@ public class PeerMeshService {
         if (report.getSessionId() == null || report.getSessionId() <= 0) {
             throw new IllegalArgumentException("sessionId is required");
         }
-        PeerMeshSession session = findReportableSession(reporter, report.getSessionId());
+        CurrentPeerSession current = findReportableSession(reporter, report.getSessionId());
+        PeerMeshSession session = current.row();
         Instant now = Instant.now();
-        if (!closeIfExpired(session, now)) {
+        if (!current.allowed()) markClosed(session, now);
+        else if (!closeIfExpired(session, now)) {
             applyTraffic(session, Math.max(0, report.getDirectBytes()), Math.max(0, report.getRelayBytes()), now);
         }
-        return toSessionView(sessionRepository.save(session));
+        return toSessionView(sessionRepository.saveCurrent(session));
     }
 
     @Transactional
@@ -568,12 +574,12 @@ public class PeerMeshService {
         if (sessionId <= 0 || bytes <= 0) {
             return;
         }
-        sessionRepository.findById(sessionId).ifPresent(session -> {
+        sessionRepository.lockCurrent(sessionId).ifPresent(session -> {
             Instant now = Instant.now();
             if (!closeIfExpired(session, now)) {
                 applyTraffic(session, 0, bytes, now);
             }
-            sessionRepository.save(session);
+            sessionRepository.saveCurrent(session);
         });
     }
 
@@ -585,9 +591,11 @@ public class PeerMeshService {
         if (header == null || fromClientId <= 0 || toClientId <= 0 || bytes <= 0) {
             return false;
         }
-        return sessionRepository.findById(header.sessionId())
-                .map(session -> authorizeRelayFrame(
-                        session, fromClientId, toClientId, bytes, Instant.now()))
+        return lockPeerSession(header.sessionId(), null, true)
+                .map(current -> {
+                    if (!current.allowed()) { markClosed(current.row(), Instant.now()); sessionRepository.saveCurrent(current.row()); return false; }
+                    return authorizeRelayFrame(current.row(), fromClientId, toClientId, bytes, Instant.now());
+                })
                 .orElse(false);
     }
 
@@ -650,21 +658,24 @@ public class PeerMeshService {
                 || PeerUdpProbe.TYPE_CHECK_RESPONSE.equals(probe.getType()))) {
             return false;
         }
-        Boolean allowed = transactionTemplate.execute(status -> sessionRepository.findById(probe.getSessionId())
-                .map(session -> authorizeRelayProbe(session, probe, Instant.now()))
+        Boolean allowed = transactionTemplate.execute(status -> lockPeerSession(probe.getSessionId(), null, true)
+                .map(current -> {
+                    if (!current.allowed()) { markClosed(current.row(), Instant.now()); sessionRepository.saveCurrent(current.row()); return false; }
+                    return authorizeRelayProbe(current.row(), probe, Instant.now());
+                })
                 .orElse(false));
         return Boolean.TRUE.equals(allowed);
     }
 
     private boolean authorizeRelayProbe(PeerMeshSession session, PeerUdpProbe probe, Instant now) {
         if (closeIfExpired(session, now)) {
-            sessionRepository.save(session);
+            sessionRepository.saveCurrent(session);
             return false;
         }
-        boolean forward = probe.getFromClientId() == session.getSourceClientId()
-                && probe.getToClientId() == session.getTargetClientId();
-        boolean reverse = probe.getFromClientId() == session.getTargetClientId()
-                && probe.getToClientId() == session.getSourceClientId();
+        boolean forward = Objects.equals(probe.getFromClientId(), session.getSourceClientId())
+                && Objects.equals(probe.getToClientId(), session.getTargetClientId());
+        boolean reverse = Objects.equals(probe.getFromClientId(), session.getTargetClientId())
+                && Objects.equals(probe.getToClientId(), session.getSourceClientId());
         if ((!forward && !reverse) || STATUS_CLOSED.equals(session.getStatus())) {
             return false;
         }
@@ -692,9 +703,11 @@ public class PeerMeshService {
 												 boolean account) {
         SessionCachePublication publication = new SessionCachePublication(header.sessionId(), null);
         try {
-            Boolean allowed = transactionTemplate.execute(status -> sessionRepository.findById(header.sessionId())
-                    .map(session -> authorizeRelayFrameForRelaySlow(
-                            session, header, fromClientId, toClientId, bytes, nowNanos, account, publication))
+            Boolean allowed = transactionTemplate.execute(status -> lockPeerSession(header.sessionId(), null, true)
+                    .map(current -> {
+                        if (!current.allowed()) { markClosed(current.row(), Instant.now()); sessionRepository.saveCurrent(current.row()); return false; }
+                        return authorizeRelayFrameForRelaySlow(current.row(), header, fromClientId, toClientId, bytes, nowNanos, account, publication);
+                    })
                     .orElse(false));
             return Boolean.TRUE.equals(allowed);
         } finally { publication.discardIfUnsubmitted(); }
@@ -710,7 +723,7 @@ public class PeerMeshService {
                                                      SessionCachePublication publication) {
         Instant now = Instant.now();
         if (closeIfExpired(session, now)) {
-            sessionRepository.save(session);
+            sessionRepository.saveCurrent(session);
             afterCommit(() -> evictClosedSession(header.sessionId()));
             return false;
         }
@@ -734,7 +747,7 @@ public class PeerMeshService {
             session.setPathType(PATH_RELAY);
             session.setUpdatedAt(now.toString());
             session.setLastKeepaliveAt(now.toString());
-            sessionRepository.save(session);
+            sessionRepository.saveCurrent(session);
             log.debug("[peer-mesh] relay frame activated session {}: {} -> {}",
                     session.getId(), STATUS_NEGOTIATING, STATUS_ACTIVE);
         }
@@ -772,20 +785,21 @@ public class PeerMeshService {
         if (close.getSessionId() == null || close.getSessionId() <= 0) {
             throw new IllegalArgumentException("sessionId is required");
         }
-        PeerMeshSession session = findReportableSession(reporter, close.getSessionId());
+        PeerMeshSession session = findReportableSession(reporter, close.getSessionId()).row();
         markClosed(session, Instant.now());
-        return toSessionView(sessionRepository.save(session));
+        return toSessionView(sessionRepository.saveCurrent(session));
     }
 
     @Transactional
     public PeerMeshSessionView closeSession(ManagementContext context, long sessionId) {
         PeerMeshSession session = findAccessibleSession(context, sessionId);
         markClosed(session, Instant.now());
-        return toSessionView(sessionRepository.save(session));
+        return toSessionView(sessionRepository.saveCurrent(session));
     }
 
     @Transactional
     public List<PeerMeshSessionView> closeOpenSessions(ManagementContext context) {
+        context = authority.current(context);
         Instant now = Instant.now();
         List<PeerMeshSession> sessions;
         if (context.isAdmin()) {
@@ -799,11 +813,13 @@ public class PeerMeshService {
             sessions = sessionRepository.findVisibleOpen(
                     context.tenant().tenantId(), visible, STATUS_CLOSED);
         }
+        Map<Long, ClientAccount> parents = lockSessionParents(sessions, context.tenant().tenantId());
+        ManagementContext actor = context;
+        sessions = lockSessionRows(sessions).stream().filter(row -> actor.isAdmin()
+                || ownedBy(parents.get(row.getSourceClientId()), actor) || ownedBy(parents.get(row.getTargetClientId()), actor)).toList();
         for (PeerMeshSession session : sessions) {
             markClosed(session, now);
-        }
-        if (!sessions.isEmpty()) {
-            sessionRepository.saveAll(sessions);
+            sessionRepository.saveCurrent(session);
         }
         return sessions.stream().map(this::toSessionView).toList();
     }
@@ -822,11 +838,12 @@ public class PeerMeshService {
                 tenantId,
                 clientId,
                 STATUS_CLOSED);
+        sessions = lockSessionRows(sessions);
         for (PeerMeshSession session : sessions) {
             markClosedState(session, now);
+            sessionRepository.saveCurrent(session);
         }
         if (!sessions.isEmpty()) {
-            sessionRepository.saveAll(sessions);
             List<Long> ids = sessions.stream().map(PeerMeshSession::getId).toList();
             afterCommit(() -> ids.forEach(this::evictClosedSession));
         }
@@ -835,22 +852,19 @@ public class PeerMeshService {
 
     @Transactional
     public List<PeerMeshSessionView> closeUnauthorizedSessions(ManagementContext context) {
+        // System policy reconciliation after a committed mutation, not a manual close command.
+        // A later-disabled request actor must not prevent cleanup of now-unauthorized sessions.
         List<PeerMeshSession> sessions = sessionRepository.findByTenantIdAndStatusNotOrderByUpdatedAtDesc(
                 context.tenant().tenantId(), STATUS_CLOSED);
         List<PeerMeshSession> closed = new ArrayList<>();
         Instant now = Instant.now();
-        for (PeerMeshSession session : sessions) {
-            ClientAccount source = clientAccountRepository.findByIdAndTenantId(
-                    session.getSourceClientId(), context.tenant().tenantId()).orElse(null);
-            ClientAccount target = clientAccountRepository.findByIdAndTenantId(
-                    session.getTargetClientId(), context.tenant().tenantId()).orElse(null);
-            if (source == null || target == null || !canPeer(source, target)) {
+        Map<Long, ClientAccount> parents = lockSessionParents(sessions, context.tenant().tenantId());
+        for (PeerMeshSession session : lockSessionRows(sessions)) {
+            if (!canPeerLocked(parents.get(session.getSourceClientId()), parents.get(session.getTargetClientId()))) {
                 markClosed(session, now);
+                sessionRepository.saveCurrent(session);
                 closed.add(session);
             }
-        }
-        if (!closed.isEmpty()) {
-            sessionRepository.saveAll(closed);
         }
         return closed.stream().map(this::toSessionView).toList();
     }
@@ -1068,23 +1082,32 @@ public class PeerMeshService {
             if (bytes <= 0) {
                 return;
             }
+            AtomicBoolean restored = new AtomicBoolean();
+            Runnable restore = () -> { if (restored.compareAndSet(false, true)) restoreRelayTrafficBatch(sessionId, bytes); };
             try {
-                RelayTrafficFlushResult result = transactionTemplate.execute(status ->
-                        persistRelayTrafficBatch(sessionId, bytes, Instant.now()));
+                RelayTrafficFlushResult result = transactionTemplate.execute(status -> {
+                    if (TransactionSynchronizationManager.isSynchronizationActive())
+                        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                            @Override public void afterCompletion(int completion) { if (completion != STATUS_COMMITTED) restore.run(); }
+                        });
+                    return persistRelayTrafficBatch(sessionId, bytes, Instant.now());
+                });
                 if (result == null) {
                     throw new IllegalStateException("relay traffic transaction returned no result");
                 }
-                lastRelayTrafficFlushSuccessMillis.set(System.currentTimeMillis());
-                if (result == RelayTrafficFlushResult.MISSING) {
-                    invalidateRelayAuthorization(sessionId);
-                    pendingRelayBytes.remove(sessionId, counter);
-                } else if (result == RelayTrafficFlushResult.CLOSED) {
-                    invalidateRelayAuthorization(sessionId);
-                    pendingRelayBytes.computeIfPresent(sessionId, (ignored, current) ->
-                            current == counter && current.get() == 0 ? null : current);
-                }
+                afterCommit(() -> {
+                    lastRelayTrafficFlushSuccessMillis.set(System.currentTimeMillis());
+                    if (result == RelayTrafficFlushResult.MISSING) {
+                        evictClosedSession(sessionId);
+                        pendingRelayBytes.remove(sessionId, counter);
+                    } else if (result == RelayTrafficFlushResult.CLOSED) {
+                        evictClosedSession(sessionId);
+                        pendingRelayBytes.computeIfPresent(sessionId, (ignored, current) ->
+                                current == counter && current.get() == 0 ? null : current);
+                    }
+                });
             } catch (RuntimeException e) {
-                restoreRelayTrafficBatch(sessionId, bytes);
+                restore.run();
                 relayTrafficFlushFailures.increment();
                 log.warn("Peer mesh relay traffic flush failed: session={}, bytes={}, reason={}",
                         sessionId, bytes, e.getMessage());
@@ -1093,14 +1116,14 @@ public class PeerMeshService {
     }
 
     private RelayTrafficFlushResult persistRelayTrafficBatch(long sessionId, long bytes, Instant now) {
-        Optional<PeerMeshSession> found = sessionRepository.findById(sessionId);
+        Optional<PeerMeshSession> found = sessionRepository.lockCurrent(sessionId);
         if (found.isEmpty()) {
             return RelayTrafficFlushResult.MISSING;
         }
         PeerMeshSession session = found.get();
         boolean expired = closeIfExpired(session, now);
         applyTraffic(session, 0, bytes, now);
-        sessionRepository.save(session);
+        sessionRepository.saveCurrent(session);
         return expired ? RelayTrafficFlushResult.CLOSED : RelayTrafficFlushResult.PERSISTED;
     }
 
@@ -1395,35 +1418,69 @@ public class PeerMeshService {
         return host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
     }
 
-    private PeerMeshSession findReportableSession(ClientAccount reporter, long sessionId) {
-        PeerMeshSession session = sessionRepository.findById(sessionId)
-                .filter(row -> row.getTenantId().equals(reporter.getTenantId()))
+    private record CurrentPeerSession(PeerMeshSession row, Map<Long, ClientAccount> parents, boolean allowed) {}
+
+    private Optional<CurrentPeerSession> lockPeerSession(long id, String requiredTenant, boolean checkPolicy) {
+        var hint = sessionRepository.findReference(id).filter(row -> requiredTenant == null || requiredTenant.equals(row.tenant()));
+        if (hint.isEmpty()) return Optional.empty();
+        var reference = hint.get();
+        Map<Long, ClientAccount> parents = clientAccountRepository.lockCurrentAll(List.of(reference.source(), reference.target()), reference.tenant());
+        boolean allowed = checkPolicy && canPeerLocked(parents.get(reference.source()), parents.get(reference.target()));
+        return sessionRepository.lockCurrent(id).filter(row -> row.getTenantId().equals(reference.tenant())
+                        && row.getSourceClientId() == reference.source() && row.getTargetClientId() == reference.target())
+                .map(row -> new CurrentPeerSession(row, parents, allowed));
+    }
+
+    private CurrentPeerSession findReportableSession(ClientAccount reporter, long sessionId) {
+        if (reporter == null || reporter.getId() == null || reporter.getTenantId() == null)
+            throw new IllegalArgumentException("peer session report source mismatch");
+        CurrentPeerSession current = lockPeerSession(sessionId, reporter.getTenantId(), true)
                 .orElseThrow(() -> new IllegalArgumentException("peer session not found: " + sessionId));
+        PeerMeshSession session = current.row();
         boolean reporterInSession = reporter.getId().equals(session.getSourceClientId())
                 || reporter.getId().equals(session.getTargetClientId());
-        if (!reporterInSession) {
+        ClientAccount actor = current.parents().get(reporter.getId());
+        if (!reporterInSession || actor == null || !actor.isEnabled()) {
             throw new IllegalArgumentException("peer session report source mismatch");
         }
-        return session;
+        return current;
     }
 
     private PeerMeshSession findAccessibleSession(ManagementContext context, long sessionId) {
-        PeerMeshSession session = sessionRepository.findById(sessionId)
-                .filter(row -> row.getTenantId().equals(context.tenant().tenantId()))
+        ManagementContext actor = authority.current(context);
+        CurrentPeerSession current = lockPeerSession(sessionId, actor.tenant().tenantId(), false)
                 .orElseThrow(() -> new IllegalArgumentException("peer session not found: " + sessionId));
-        if (context.isAdmin() || ownsClient(context, session.getSourceClientId()) || ownsClient(context, session.getTargetClientId())) {
-            return session;
+        if (actor.isAdmin() || ownedBy(current.parents().get(current.row().getSourceClientId()), actor)
+                || ownedBy(current.parents().get(current.row().getTargetClientId()), actor)) {
+            return current.row();
         }
         throw new IllegalArgumentException("peer session not found: " + sessionId);
     }
 
-    private boolean ownsClient(ManagementContext context, Long clientId) {
-        if (clientId == null) {
-            return false;
+    private boolean ownedBy(ClientAccount row, ManagementContext actor) {
+        return row != null && actor.username().equals(normalizeOwner(row.getOwnerUsername()));
+    }
+
+    private Map<Long, ClientAccount> lockSessionParents(List<PeerMeshSession> hints, String tenant) {
+        List<Long> ids = hints.stream().flatMap(row -> java.util.stream.Stream.of(row.getSourceClientId(), row.getTargetClientId())).distinct().sorted().toList();
+        return clientAccountRepository.lockCurrentAll(ids, tenant);
+    }
+
+    /** Discovery is not current authority. Lock by globally ordered primary keys, never a
+     * missing-pair range (InnoDB gap locks), and never mutate a cached JPA discovery entity. */
+    private List<PeerMeshSession> lockSessionRows(List<PeerMeshSession> hints) {
+        Map<Long, PeerMeshSession> byId = hints.stream().collect(Collectors.toMap(PeerMeshSession::getId, row -> row, (a,b) -> a));
+        List<PeerMeshSession> result = new ArrayList<>();
+        for (Long id : byId.keySet().stream().sorted().toList()) {
+            var old = byId.get(id);
+            sessionRepository.lockCurrent(id).filter(row -> Objects.equals(row.getTenantId(), old.getTenantId())
+                    && Objects.equals(row.getSourceClientId(), old.getSourceClientId()) && Objects.equals(row.getTargetClientId(), old.getTargetClientId()))
+                    .ifPresent(row -> {
+                        if (STATUS_CLOSED.equals(row.getStatus())) afterCommit(() -> evictClosedSession(row.getId()));
+                        else result.add(row);
+                    });
         }
-        return clientAccountRepository
-                .findByIdAndTenantIdAndOwnerUsername(clientId, context.tenant().tenantId(), context.username())
-                .isPresent();
+        return result;
     }
 
     private void applyTraffic(PeerMeshSession session, long directBytes, long relayBytes, Instant now) {
@@ -1444,7 +1501,7 @@ public class PeerMeshService {
                                         long bytes,
                                         Instant now) {
         if (closeIfExpired(session, now)) {
-            sessionRepository.save(session);
+            sessionRepository.saveCurrent(session);
             return false;
         }
         if (!STATUS_ACTIVE.equals(session.getStatus())) {
@@ -1458,7 +1515,7 @@ public class PeerMeshService {
             return false;
         }
         applyTraffic(session, 0, bytes, now);
-        sessionRepository.save(session);
+        sessionRepository.saveCurrent(session);
         return true;
     }
 
@@ -1468,17 +1525,17 @@ public class PeerMeshService {
                         STATUS_CLOSED,
                         SortableInstant.format(now),
                         PageRequest.of(0, Math.clamp(limit, 1, 1000)));
+        expired = lockSessionRows(expired).stream().filter(row -> isExpired(row, now)).toList();
         for (PeerMeshSession session : expired) {
             markClosed(session, now);
-        }
-        if (!expired.isEmpty()) {
-            sessionRepository.saveAll(expired);
+            sessionRepository.saveCurrent(session);
         }
         return expired.size();
     }
 
     private boolean closeIfExpired(PeerMeshSession session, Instant now) {
         if (STATUS_CLOSED.equals(session.getStatus())) {
+            afterCommit(() -> evictClosedSession(session.getId()));
             return true;
         }
         if (!isExpired(session, now)) {
