@@ -95,11 +95,24 @@ discards the stage without changing the last committed cohort. A policy/source c
 an audit trigger is rolled back as a failed operation, not treated as permanent CONTROL loss.
 No cache mutex or socket I/O is held across that transaction. Conflicting cache mutations fail
 or remain queued for retry rather than clearing a reserved cell.
+Each output revision also owns its `createdAtMillis`; withdrawal retries retain that timestamp
+and the complete wire payload, including when a retry crosses a wall-clock second.
 
-This acceptance boundary does not yet fence every later cache read, replay, or recipient push
-against a cross-instance takeover after commit. The online-peer hint is also obtained before the
-writer, not from a single transactional recipient-policy snapshot. These remain separate
-alignment work; shared SQLite does not currently provide atomic distributed catalog publication.
+Management instance/mDNS reads require an explicit database path and validate each cached
+original CONTROL (including its discovery capability), current account/device and sharing policy
+in one native read snapshot. They copy no mDNS heap pointer across the unlocked native read and
+recheck the committed cache version before copying output. A retired/temporarily hidden cohort
+is omitted without deleting it; a database error fails the read rather than reporting false success.
+
+Nonempty catalog payloads, including replay, use one fresh native read snapshot for the original
+publisher source, current publisher/recipient ownership, consumer-to-publisher ACL, sharing and
+the reported service definitions. Unknown visibility and malformed recipient lists do not grant
+access. A new port/protocol/path is not advertised until it matches the publisher's accepted report.
+These reads release SQLite before socket I/O. Consequently a takeover after the read snapshot but
+before blocking send acceptance is not yet fenced across instances; original recipient binding
+and distributed output ordering also remain separate alignment work. The online-peer hint is
+still obtained before the report writer. Shared SQLite does not currently provide atomic
+distributed catalog publication.
 
 ## Build
 

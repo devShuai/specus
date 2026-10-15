@@ -61,6 +61,8 @@ int sqlite3_step(sqlite3_stmt *stmt)
         && strstr(sql, "FROM client_account ORDER BY client_name") && sqlite3_get_autocommit(db)) selected = db;
     if (!strcmp(mode, "writer") && rc == SQLITE_DONE && strstr(sql, "INSERT INTO peer_mesh_service_audit")
         && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_WRITE) pause_once();
+    if (!strcmp(mode, "read") && rc == SQLITE_ROW && strstr(sql, "SELECT c.enabled,k.enabled FROM specus_client_session s")
+        && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_READ) pause_once();
     return rc;
 }
 int sqlite3_close(sqlite3 *db)

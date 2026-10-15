@@ -5931,7 +5931,7 @@ static int append_peer_mesh_service_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_append(builder, ",\"instances\":[");
     st_peer_mesh_service_instance instances[64];
     size_t instance_count = 0U;
-    if (rc == 0 && st_peer_mesh_list_service_instances(service->tenant_id, service->client_id,
+    if (rc == 0 && st_peer_mesh_list_service_instances(database_path, service->tenant_id, service->client_id,
             service->service_id, instances, 64U, &instance_count) != 0) rc = -1;
     for (size_t i = 0; rc == 0 && i < instance_count; ++i) {
         st_peer_mesh_service_instance *instance = &instances[i];
@@ -7229,7 +7229,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         }
         st_peer_mesh_mdns_candidate candidates[256];
         size_t candidate_count = 0U;
-        if (st_peer_mesh_list_mdns_candidates(client.tenant_id, client.id, candidates,
+        if (st_peer_mesh_list_mdns_candidates(database_path, client.tenant_id, client.id, candidates,
                                               256U, &candidate_count) != 0) {
             rc = -1;
         }

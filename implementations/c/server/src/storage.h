@@ -1528,6 +1528,25 @@ int st_storage_commit_peer_service_report_from_control(const char *path,
     const st_storage_control_source *control, const st_storage_client *cached,
     long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
     st_storage_client *committed_client);
+typedef struct {
+    int guarded; /* False only for an explicit trusted service call, never network fallback. */
+    st_storage_control_source control;
+} st_storage_peer_catalog_source;
+typedef struct {
+    st_storage_client publisher, recipient;
+    int publisher_current, recipient_current, sharing_enabled, mdns_enabled, allowed;
+    st_storage_peer_mesh_service *services;
+    size_t service_count;
+} st_storage_peer_catalog_view;
+/* One native read snapshot for original physical sources, current parents/devices/sharing,
+ * consumer->publisher ACL and at most 32 reported definitions. No cache locks or network I/O.
+ * source_visible and view are published only on successful completion; SQL failure clears them.
+ * A hidden/missing publisher or source is a successful empty projection, not permanent cleanup. */
+int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
+    const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
+    long long recipient_id, const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_view *view);
+void st_storage_peer_catalog_view_free(st_storage_peer_catalog_view *view);
 int st_storage_list_peer_mesh_service_audits(const char *path,
                                              const char *tenant_id,
                                              st_storage_peer_mesh_service_audit *events,

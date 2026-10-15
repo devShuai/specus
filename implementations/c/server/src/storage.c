@@ -9548,18 +9548,34 @@ void st_storage_peer_mesh_config_free(st_storage_peer_mesh_config *config)
 
 static int config_service_allows(const st_storage_peer_mesh_service *service, long long id)
 {
-    if (service->allowed_client_ids[0] == '\0') return 1;
+    const char *nonspace = service->allowed_client_ids;
+    while (isspace((unsigned char)*nonspace)) ++nonspace;
+    if (*nonspace == '\0') return 1;
     char copy[sizeof(service->allowed_client_ids)];
     strcpy(copy, service->allowed_client_ids);
+    int matched = 0;
     for (char *part = copy; part != NULL;) {
         char *next = strchr(part, ',');
         if (next != NULL) *next++ = '\0';
+        while (isspace((unsigned char)*part)) ++part;
+        char *last = part + strlen(part);
+        while (last > part && isspace((unsigned char)last[-1])) *--last = '\0';
         char *end = NULL;
+        errno = 0;
         long long value = strtoll(part, &end, 10);
-        if (end != part && *end == '\0' && value == id) return 1;
+        if (errno || end == part || *end != '\0' || value <= 0) return 0;
+        matched |= value == id;
         part = next;
     }
-    return 0;
+    return matched;
+}
+
+static int catalog_service_allows(const st_storage_peer_mesh_service *service,
+    const st_storage_client *publisher, const st_storage_client *recipient)
+{
+    if (!strcmp(service->visibility, "OWNER"))
+        return !strcmp(normalize_owner_username(publisher->owner_username), normalize_owner_username(recipient->owner_username));
+    return !strcmp(service->visibility, "ACL") && config_service_allows(service, recipient->id);
 }
 
 int st_storage_load_peer_mesh_config(const char *path, const st_storage_client *cached,
@@ -9630,7 +9646,7 @@ int st_storage_load_peer_mesh_config(const char *path, const st_storage_client *
         st_storage_peer_mesh_device device = {0};
         int allowed = 0;
         if (load_client(db, sqlite3_column_int64(stmt, 0), &client) != 0
-            || can_peer_on_db(db, &staged.client, &client, &allowed) != 0) { rc = -1; break; }
+            || can_peer_on_db(db, &client, &staged.client, &allowed) != 0) { rc = -1; break; }
         if (!allowed) continue;
         if (read_peer_mesh_device(db, client.tenant_id, client.id, &device) != 0) { rc = -1; break; }
         if (device.virtual_ip[0] == '\0') continue;
@@ -9645,9 +9661,7 @@ int st_storage_load_peer_mesh_config(const char *path, const st_storage_client *
         size_t capacity = 0;
         for (size_t j = 0; service->service.enabled && j < recipient_count; ++j) {
             const config_recipient *recipient = &recipients[j];
-            if (strcmp(service->service.visibility, "OWNER") == 0
-                ? strcmp(recipient->client.owner_username, staged.client.owner_username) != 0
-                : !config_service_allows(&service->service, recipient->client.id)) continue;
+            if (!catalog_service_allows(&service->service, &staged.client, &recipient->client)) continue;
             if (storage_reserve((void **)&service->allowed_peer_ips, service->allowed_peer_count, &capacity,
                                 sizeof(*service->allowed_peer_ips)) != 0) { rc = -1; break; }
             strcpy(service->allowed_peer_ips[service->allowed_peer_count++], recipient->ip);
@@ -10337,6 +10351,115 @@ int st_storage_commit_peer_service_report_from_control(const char *path,
         return ST_STORAGE_CONTROL_SOURCE_RETIRED;
     }
     return commit_peer_service_report_impl(path, control, cached, session_id, stage, context, committed_client);
+}
+
+void st_storage_peer_catalog_view_free(st_storage_peer_catalog_view *view)
+{
+    if (view == NULL) return;
+    free(view->services); memset(view, 0, sizeof(*view));
+}
+
+/* Unlike load_client's legacy API, distinguish absence from a failed read. */
+static int catalog_client_on_db(sqlite3 *db, const char *tenant, long long id, st_storage_client *client)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE rowid=? AND tenant_id COLLATE BINARY=?", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_int64(stmt, 1, id); sqlite3_bind_text(stmt, 2, tenant, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt); sqlite3_finalize(stmt);
+    return rc == SQLITE_ROW ? load_client(db, id, client) : rc == SQLITE_DONE ? 1 : -1;
+}
+
+static int catalog_device_on_db(sqlite3 *db, const st_storage_client *client, int *enabled)
+{
+    *enabled = 0; sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT 1 FROM peer_mesh_device WHERE tenant_id COLLATE BINARY=? "
+        "AND client_id=? AND owner_username COLLATE BINARY=? AND client_name COLLATE BINARY=? AND enabled=1", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, client->tenant_id, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 2, client->id);
+    sqlite3_bind_text(stmt, 3, client->owner_username, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, client->client_name, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt); *enabled = rc == SQLITE_ROW; sqlite3_finalize(stmt);
+    return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int catalog_source_discovery_on_db(sqlite3 *db, const st_storage_control_source *source, int *enabled)
+{
+    *enabled = 0; sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT peer_service_discovery_version FROM specus_client_session WHERE id=?", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_int64(stmt, 1, source->session_id); rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) *enabled = sqlite3_column_int(stmt, 0) >= 2;
+    sqlite3_finalize(stmt); return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
+    const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
+    long long recipient_id, const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_view *view)
+{
+    if (view == NULL) return -1;
+    memset(view, 0, sizeof(*view));
+    if (source_count && source_visible && source_count <= 4096U) memset(source_visible, 0, source_count * sizeof(*source_visible));
+    if (path == NULL || !*path || source_count > 4096U || service_count > 32U || publisher_id <= 0 || tenant_id == NULL || !*tenant_id
+        || (source_count && (sources == NULL || source_visible == NULL)) || (service_count && service_ids == NULL)) return -1;
+    int *visible = source_count ? calloc(source_count, sizeof(*visible)) : NULL;
+    if (source_count && visible == NULL) return -1;
+    st_storage_peer_catalog_view staged = {0}; st_storage_peer_mesh_service_sharing sharing = {0};
+    sqlite3 *db = NULL; int rc = open_db(path, &db);
+    if (rc == 0) rc = exec_sql(db, "BEGIN");
+    int present = 1, device = 0;
+    if (rc == 0) { present = catalog_client_on_db(db, tenant_id, publisher_id, &staged.publisher); if (present < 0) rc = -1; }
+    if (rc == 0 && present == 0) {
+        rc = catalog_device_on_db(db, &staged.publisher, &device);
+        if (rc == 0 && read_peer_mesh_service_sharing(db, tenant_id, &sharing) < 0) rc = -1;
+        staged.publisher_current = staged.publisher.enabled && device;
+        staged.sharing_enabled = sharing.enabled; staged.mdns_enabled = sharing.enabled && sharing.mdns_import_enabled;
+    }
+    for (size_t i = 0; rc == 0 && i < source_count; ++i) {
+        if (!staged.publisher_current || !staged.sharing_enabled) continue;
+        if (!sources[i].guarded) { visible[i] = 1; continue; }
+        int check = control_source_on_db(db, &sources[i].control, publisher_id, tenant_id);
+        if (check == 0) rc = catalog_source_discovery_on_db(db, &sources[i].control, &visible[i]);
+        else if (check != ST_STORAGE_CONTROL_SOURCE_RETIRED && check != ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE) rc = -1;
+    }
+    int any_source = source_count == 0;
+    for (size_t i = 0; i < source_count; ++i) any_source |= visible[i];
+    if (rc == 0 && recipient_id > 0) {
+        present = catalog_client_on_db(db, tenant_id, recipient_id, &staged.recipient);
+        if (present < 0) rc = -1;
+        if (rc == 0 && present == 0) {
+            device = 0; rc = catalog_device_on_db(db, &staged.recipient, &device);
+            staged.recipient_current = staged.recipient.enabled && device;
+            if (rc == 0 && any_source && staged.recipient_current && staged.publisher_current && staged.sharing_enabled
+                && recipient_id != publisher_id) rc = can_peer_on_db(db, &staged.recipient, &staged.publisher, &staged.allowed);
+        }
+    }
+    if (rc == 0 && staged.allowed && service_count) {
+        staged.services = calloc(service_count, sizeof(*staged.services));
+        if (staged.services == NULL) rc = -1;
+        sqlite3_stmt *stmt = NULL; char sql[1024];
+        int length = snprintf(sql, sizeof(sql), "%s WHERE s.tenant_id COLLATE BINARY=? AND s.client_id=? AND s.service_id COLLATE BINARY=?", peer_mesh_service_select());
+        if (rc == 0 && (length < 0 || (size_t)length >= sizeof(sql) || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)) rc = -1;
+        for (size_t i = 0; rc == 0 && i < service_count; ++i) {
+            if (memchr(service_ids[i], '\0', 65) == NULL) { rc = -1; break; }
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+            sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 2, publisher_id);
+            sqlite3_bind_text(stmt, 3, service_ids[i], -1, SQLITE_TRANSIENT);
+            int step = sqlite3_step(stmt);
+            if (step == SQLITE_DONE) continue;
+            st_storage_peer_mesh_service service;
+            if (step != SQLITE_ROW || scan_peer_mesh_service(stmt, &service) != 0 || sqlite3_step(stmt) != SQLITE_DONE) { rc = -1; break; }
+            int permitted = catalog_service_allows(&service, &staged.publisher, &staged.recipient);
+            if (service.enabled && permitted) staged.services[staged.service_count++] = service;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0 && db != NULL) (void)exec_sql(db, "ROLLBACK");
+    if (db != NULL) sqlite3_close(db);
+    if (rc == 0) { *view = staged; memset(&staged, 0, sizeof(staged)); if (source_count) memcpy(source_visible, visible, source_count * sizeof(*visible)); }
+    free(visible); st_storage_peer_catalog_view_free(&staged); return rc;
 }
 
 int st_storage_list_peer_mesh_service_audits(const char *path,

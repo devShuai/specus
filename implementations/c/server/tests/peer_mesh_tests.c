@@ -1434,7 +1434,7 @@ static int test_deleted_client_catalog_retry(void)
         || !contains(catalog, "\"revision\":4") || catalog_for(&ctx.capture, "del-peer") != NULL)) failed = 1;
     st_peer_mesh_service_instance instances[2];
     size_t instance_count = 0U;
-    if (!failed && (st_peer_mesh_list_service_instances(publisher.tenant_id, publisher.id, service.service_id,
+    if (!failed && (st_peer_mesh_list_service_instances(path, publisher.tenant_id, publisher.id, service.service_id,
                                                         instances, 2U, &instance_count) != 0 || instance_count != 0U)) failed = 1;
     ctx.capture.count = 0U;
     if (!failed) failed = st_peer_mesh_drain_client_deletions(&runtime) != 0;
@@ -1772,10 +1772,10 @@ int main(void)
     size_t mdns_count = 0U;
     st_peer_mesh_service_instance instances[8];
     size_t instance_count = 0U;
-    if (st_peer_mesh_list_mdns_candidates(source.tenant_id, source.id, mdns, 8U, &mdns_count) != 0
+    if (st_peer_mesh_list_mdns_candidates(path, source.tenant_id, source.id, mdns, 8U, &mdns_count) != 0
         || mdns_count != 1 || strcmp(mdns[0].target_host, "127.0.0.1") != 0
         || strcmp(mdns[0].transport, "tcp") != 0
-        || st_peer_mesh_list_service_instances(source.tenant_id, source.id, service.service_id,
+        || st_peer_mesh_list_service_instances(path, source.tenant_id, source.id, service.service_id,
                                                instances, 8U, &instance_count) != 0
         || instance_count != 1 || !instances[0].advertised || !instances[0].online
         || instances[0].bytes_in != 12 || instances[0].bytes_out != 34

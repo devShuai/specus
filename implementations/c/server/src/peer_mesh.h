@@ -96,12 +96,12 @@ int st_peer_mesh_owner_changes_drain(const st_peer_mesh_runtime *runtime, st_pee
 int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
                                    const char *client_name);
 int st_peer_mesh_expire_catalogs(const st_peer_mesh_runtime *runtime);
-int st_peer_mesh_list_mdns_candidates(const char *tenant_id,
+int st_peer_mesh_list_mdns_candidates(const char *database_path, const char *tenant_id,
                                       long long client_id,
                                       st_peer_mesh_mdns_candidate *out,
                                       size_t capacity,
                                       size_t *out_count);
-int st_peer_mesh_list_service_instances(const char *tenant_id,
+int st_peer_mesh_list_service_instances(const char *database_path, const char *tenant_id,
                                         long long client_id,
                                         const char *service_id,
                                         st_peer_mesh_service_instance *out,

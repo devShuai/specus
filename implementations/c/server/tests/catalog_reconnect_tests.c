@@ -163,6 +163,11 @@ static int native_retry_and_fresh_raw_report(void)
         && st_peer_mesh_control_connected_commit(item) == 0);
     CHECK(st_peer_mesh_drain_control_withdrawals(&runtime) == -1 && peer_control_withdrawal_count == 1
         && state.in_flight_charge == 1 && peer_control_withdrawal_head->audited);
+    /* A retry must retain the entire wire payload, not only its output revision. Cross a real
+     * wall-clock second so a rebuilt createdAtMillis cannot pass merely due to fast execution. */
+    long long first_created_at = 0;
+    CHECK(state.count == 1 && st_json_get_i64(state.messages[0], "createdAtMillis", &first_created_at) == 0 && first_created_at > 0);
+    struct timespec crossing = {1, 100000000}; nanosleep(&crossing, NULL);
     const char *report = "{\"type\":\"service-report\",\"enabled\":false,\"revision\":1,\"services\":[]}";
     st_peer_mesh_runtime other = runtime; other.authenticated_client_id = recipient.id; other.publisher_session_id = 51;
     CHECK(st_peer_mesh_handle_control(&other, recipient.client_name, NULL, report) == 0 && peer_control_withdrawal_count == 1);

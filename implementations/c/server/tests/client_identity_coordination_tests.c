@@ -1198,10 +1198,11 @@ static int direct_runtime_snapshot(int scenario)
             snprintf(change,sizeof(change),"DELETE FROM peer_mesh_device WHERE client_id=%lld; UPDATE peer_mesh_shared_service SET description=printf('%%0400d',0)",source.id);expected=-1;break;
         case 8: cached=NULL;expected=-1;break;
         case 9: strcpy(change,"UPDATE peer_mesh_shared_service SET description=printf('%0400d',0)");services=0;break;
-        case 10:
-            strcpy(service.visibility,"TENANT");snprintf(service.allowed_client_ids,sizeof(service.allowed_client_ids),"%lld",new_peer.id);
+        case 10: case 13: case 14:
+            strcpy(service.visibility,scenario==13?"FUTURE":"ACL");snprintf(service.allowed_client_ids,sizeof(service.allowed_client_ids),"%lld",new_peer.id);
             if(st_storage_upsert_peer_mesh_service(f.path,&service,NULL)!=0
-                || st_storage_upsert_peer_mesh_acl(f.path,"default","policy-admin",&source,&new_peer,1,"OUTBOUND",NULL)!=0) { failed=1;goto done; }
+                || st_storage_upsert_peer_mesh_acl(f.path,"default","policy-admin",scenario==14?&source:&new_peer,
+                    scenario==14?&new_peer:&source,1,"OUTBOUND",NULL)!=0) { failed=1;goto done; }
             break;
         case 11: strcpy(change,"UPDATE peer_mesh_shared_service SET enabled=0");break;
         case 12:
@@ -1224,9 +1225,10 @@ static int direct_runtime_snapshot(int scenario)
             || snapshot.service_count!=(size_t)services) { failed=1;goto done; }
         if(ensure && (snapshot.device.client_id!=current.id || strcmp(snapshot.device.owner_username,current.owner_username)!=0)) failed=1;
         if(services) {
-            size_t wanted=(scenario==1 || scenario==11)?0:scenario==12?301:1;
-            if(snapshot.services[0].allowed_peer_count!=wanted) failed=1;
-            if(wanted==1 && strcmp(snapshot.services[0].allowed_peer_ips[0],(scenario==0 || scenario==10)?new_device.virtual_ip:old_device.virtual_ip)!=0) failed=1;
+            size_t wanted=(scenario==1 || scenario==11 || scenario==13 || scenario==14)?0:scenario==12?301:1;
+            if(snapshot.services[0].allowed_peer_count!=wanted) { failed=1;goto done; }
+            if(wanted==1 && (snapshot.services[0].allowed_peer_ips==NULL
+                || strcmp(snapshot.services[0].allowed_peer_ips[0],(scenario==0 || scenario==10)?new_device.virtual_ip:old_device.virtual_ip)!=0)) failed=1;
         }
     }
 done:
@@ -1285,7 +1287,7 @@ int main(int argc,char **argv)
     for(int scenario=0;scenario<18;++scenario) failed+=direct_client_create(scenario);
     for(int scenario=0;scenario<12;++scenario) failed+=current_peer_permission(scenario);
     for(int scenario=0;scenario<9;++scenario) failed+=runtime_config_race(scenario);
-    for(int scenario=0;scenario<13;++scenario) failed+=direct_runtime_snapshot(scenario);
+    for(int scenario=0;scenario<15;++scenario) failed+=direct_runtime_snapshot(scenario);
     for(int messages=0;messages<2;++messages)
         for(int scenario=0;scenario<6;++scenario) failed+=management_post_registration(messages,scenario);
     for(int mode=0;mode<5;++mode)

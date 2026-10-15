@@ -194,7 +194,8 @@ static int egress_and_live_catalogue(void)
     strcpy(policy.egress_client_name,f.source.client_name);
     snprintf(policy.allowed_consumer_client_ids,sizeof(policy.allowed_consumer_client_ids),"%lld,%lld",f.target.id,f.explicit_peer.id);
     st_storage_peer_mesh_service service={.tenant_id="default",.client_id=f.source.id,.service_id="owner-live-service",.name="live service",
-        .transport="tcp",.application="http",.target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="TENANT"};
+        /* Service visibility is OWNER or ACL; an undeclared TENANT value must not grant access. */
+        .transport="tcp",.application="http",.target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="ACL"};
     strcpy(service.client_name,f.source.client_name);
     CHECK(st_storage_upsert_peer_mesh_egress_switch(f.path,&enabled)==0 && st_storage_upsert_peer_mesh_egress_policy(f.path,&policy,NULL)==0
         && st_storage_upsert_peer_mesh_service_sharing(f.path,"default",1,1,"fixture",NULL)==0
@@ -212,7 +213,7 @@ static int egress_and_live_catalogue(void)
     const char *catalogue=last_signal(&ctx,f.target.client_name,"egress-catalog");
     CHECK(catalogue!=NULL && strstr(catalogue,"\"egresses\":[]")!=NULL,"consumer egress catalogue retained lost grant");
     st_peer_mesh_service_instance instances[2];size_t count=0;
-    CHECK(st_peer_mesh_list_service_instances("default",f.source.id,"owner-live-service",instances,2,&count)==0
+    CHECK(st_peer_mesh_list_service_instances(f.path,"default",f.source.id,"owner-live-service",instances,2,&count)==0
         && count==1 && instances[0].advertised && instances[0].online,"transfer deleted publisher state");
     CHECK(scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_egress_policy WHERE owner_username='alice'")==1
         && scalar(f.db,"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE enabled=1")==1,"policy ownership/service changed");
@@ -273,7 +274,7 @@ static int snapshot_ordering(void)
     st_peer_mesh_runtime runtime={f.path,ordered_send,ordered_online,&ctx,0,2};st_peer_mesh_owner_cursor cursor={0};
     st_storage_owner_transfer_result result={0};ordering_worker worker={.runtime=&runtime,.rc=-1};
     st_storage_peer_mesh_service service={.tenant_id="default",.client_id=f.source.id,.service_id="ordering-service",.name="ordering",
-        .transport="tcp",.application="http",.target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="TENANT"};
+        .transport="tcp",.application="http",.target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="ACL"};
     strcpy(service.client_name,f.source.client_name);
     if(st_storage_upsert_peer_mesh_service_sharing(f.path,"default",1,0,"fixture",NULL)!=0
         || st_storage_upsert_peer_mesh_service(f.path,&service,NULL)!=0 || st_peer_mesh_owner_changes_init(f.path,&cursor)!=0

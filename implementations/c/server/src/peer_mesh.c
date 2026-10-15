@@ -68,6 +68,11 @@ typedef struct {
 } pm_service_stats;
 
 typedef struct {
+    char transport[8], application[16], path[129];
+    int published_port;
+} pm_reported_endpoint;
+
+typedef struct {
     int in_use;
     int active;
     char tenant_id[64];
@@ -76,11 +81,13 @@ typedef struct {
     long long publisher_session_id;
     long long report_revision;
     long long catalog_revision;
+    long long created_at_millis; /* Immutable wire metadata for this output revision. */
     char instance_id[65];
     time_t generated_at;
     time_t expires_at;
     pm_rate_window rate;
     char service_ids[ST_PEER_MESH_MAX_CATALOG_SERVICES][65];
+    pm_reported_endpoint endpoints[ST_PEER_MESH_MAX_CATALOG_SERVICES];
     size_t service_count;
     pm_service_stats stats[ST_PEER_MESH_MAX_CATALOG_SERVICES];
     size_t stats_count;
@@ -791,22 +798,6 @@ static int pm_append_public_stun_servers(pm_builder *builder)
     return pm_append(builder, "]");
 }
 
-static int pm_service_allows_client(const st_storage_peer_mesh_service *service,
-                                    long long client_id)
-{
-    if (service->allowed_client_ids[0] == '\0') return 1;
-    char copy[sizeof(service->allowed_client_ids)];
-    snprintf(copy, sizeof(copy), "%s", service->allowed_client_ids);
-    char *save = NULL;
-    for (char *part = strtok_r(copy, ",", &save); part != NULL;
-         part = strtok_r(NULL, ",", &save)) {
-        char *end = NULL;
-        long long value = strtoll(part, &end, 10);
-        if (end != part && *end == '\0' && value == client_id) return 1;
-    }
-    return 0;
-}
-
 static int pm_append_allowed_peer_ips(pm_builder *builder,
                                       const st_storage_peer_mesh_config_service *service)
 {
@@ -946,6 +937,11 @@ static int pm_read_report_services(const char *message, pm_catalog *catalog)
         }
         if (valid) {
             snprintf(catalog->service_ids[i], sizeof(catalog->service_ids[i]), "%s", service_id);
+            snprintf(catalog->endpoints[i].transport, sizeof(catalog->endpoints[i].transport), "%s", transport);
+            snprintf(catalog->endpoints[i].application, sizeof(catalog->endpoints[i].application), "%s", application);
+            const char *default_path = !strcmp(application, "http") || !strcmp(application, "https") ? "/" : "";
+            snprintf(catalog->endpoints[i].path, sizeof(catalog->endpoints[i].path), "%s", path == NULL || !*path ? default_path : path);
+            catalog->endpoints[i].published_port = published_port;
             ports[i] = published_port;
         }
         free(service_id); free(name); free(description); free(transport); free(application); free(path);
@@ -1154,23 +1150,13 @@ static int pm_has_authorized_online_peer(const st_peer_mesh_runtime *runtime,
         found = clients[i].id != publisher->id
             && strcmp(clients[i].tenant_id, publisher->tenant_id) == 0
             && clients[i].enabled
-            && st_storage_can_peer(runtime->database_path, publisher, &clients[i], &allowed) == 0
+            && st_storage_can_peer(runtime->database_path, &clients[i], publisher, &allowed) == 0
             && allowed
             && runtime->online != NULL
             && runtime->online(runtime->ctx, clients[i].id, clients[i].client_name);
     }
     free(clients);
     return found;
-}
-
-static int pm_catalog_service_visible(const st_storage_client *publisher,
-                                      const st_storage_client *recipient,
-                                      const st_storage_peer_mesh_service *service)
-{
-    return service->enabled
-        && (strcmp(service->visibility, "OWNER") == 0
-            ? strcmp(publisher->owner_username, recipient->owner_username) == 0
-            : pm_service_allows_client(service, recipient->id));
 }
 
 static int pm_append_advertised_service(pm_builder *builder,
@@ -1187,7 +1173,7 @@ static int pm_append_advertised_service(pm_builder *builder,
         && pm_append(builder, ",\"application\":") == 0
         && pm_append_json_string(builder, service->application) == 0
         && pm_appendf(builder, ",\"publishedPort\":%d,\"path\":", service->published_port) == 0
-        && pm_append_json_string(builder, service->path) == 0
+        && pm_append_json_string(builder, !*service->path && (!strcmp(service->application, "http") || !strcmp(service->application, "https")) ? "/" : service->path) == 0
         && pm_append(builder, "}") == 0 ? 0 : -1;
 }
 
@@ -1204,42 +1190,49 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
                                       const st_storage_client *recipient,
                                       int authorized)
 {
-    st_storage_peer_mesh_service_sharing sharing = {0};
-    if (authorized && catalog->active
-        && (st_storage_get_peer_mesh_service_sharing(runtime->database_path, catalog->tenant_id, &sharing) != 0
-            || !sharing.enabled)) authorized = 0;
+    (void)publisher; /* A cached caller-owned account must not grant OWNER visibility. */
+    st_storage_peer_catalog_view view = {0};
+    int visible = 0;
+    if (authorized && catalog->active && catalog->expires_at > time(NULL)
+        && !strcmp(catalog->database_path, runtime->database_path)) {
+        st_storage_peer_catalog_source source = {.guarded=catalog->has_control_source, .control=catalog->control_source};
+        if (st_storage_read_peer_catalog(runtime->database_path, catalog->tenant_id, catalog->publisher_client_id,
+                &source, 1, &visible, recipient->id, catalog->service_ids, catalog->service_count, &view) != 0) return NULL;
+        if (view.recipient.id && strcmp(view.recipient.client_name, recipient->client_name)) {
+            st_storage_peer_catalog_view_free(&view); return NULL;
+        }
+    }
     char expires_at[32];
     pm_format_instant(catalog->expires_at, expires_at);
     pm_builder builder = {0};
-    st_storage_peer_mesh_service *definitions = NULL;
-    size_t count = 0U;
     if (pm_appendf(&builder,
                    "{\"type\":\"service-catalog\",\"publisherClientId\":%lld,\"publisherClientName\":",
                    catalog->publisher_client_id) != 0
-        || pm_append_json_string(&builder, catalog->publisher_client_name) != 0
+        || pm_append_json_string(&builder, view.publisher.id ? view.publisher.client_name : catalog->publisher_client_name) != 0
         || pm_appendf(&builder, ",\"publisherSessionId\":%lld,\"revision\":%lld,\"expiresAt\":",
                       catalog->publisher_session_id, catalog->catalog_revision) != 0
         || pm_append_json_string(&builder, expires_at) != 0
         || pm_append(&builder, ",\"services\":[") != 0) goto failed;
-    if (authorized && catalog->active
-        && st_storage_list_peer_mesh_services_visible(runtime->database_path, publisher->tenant_id,
-                                                       "", 1, &definitions, &count) != 0) goto failed;
     int first = 1;
-    for (size_t i = 0; authorized && catalog->active && i < count; ++i) {
-        st_storage_peer_mesh_service *service = &definitions[i];
-        if (service->client_id != publisher->id
-            || !pm_catalog_has_service(catalog, service->service_id)
-            || !pm_catalog_service_visible(publisher, recipient, service)) continue;
+    for (size_t i = 0; visible && i < view.service_count; ++i) {
+        st_storage_peer_mesh_service *service = &view.services[i];
+        size_t offered = 0;
+        while (offered < catalog->service_count && strcmp(catalog->service_ids[offered], service->service_id)) ++offered;
+        if (offered == catalog->service_count) continue;
+        const pm_reported_endpoint *endpoint = &catalog->endpoints[offered];
+        const char *definition_path = !*service->path && (!strcmp(service->application, "http") || !strcmp(service->application, "https")) ? "/" : service->path;
+        if (strcmp(endpoint->transport, service->transport) || strcmp(endpoint->application, service->application)
+            || strcmp(endpoint->path, definition_path) || endpoint->published_port != service->published_port) continue;
         if ((!first && pm_append(&builder, ",") != 0)
             || pm_append_advertised_service(&builder, service) != 0) goto failed;
         first = 0;
     }
     if (pm_appendf(&builder, "],\"createdAtMillis\":%lld}",
-                   (long long)time(NULL) * 1000LL) != 0) goto failed;
-    free(definitions);
+                   catalog->created_at_millis) != 0) goto failed;
+    st_storage_peer_catalog_view_free(&view);
     return builder.data;
 failed:
-    free(definitions);
+    st_storage_peer_catalog_view_free(&view);
     free(builder.data);
     return NULL;
 }
@@ -1259,12 +1252,7 @@ static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
             || strcmp(recipient->tenant_id, publisher->tenant_id) != 0
             || runtime->online == NULL
             || !runtime->online(runtime->ctx, recipient->id, recipient->client_name)) continue;
-        int allowed = 0;
-        if (catalog->active && st_storage_can_peer(runtime->database_path, publisher, recipient, &allowed) != 0) {
-            rc = -1;
-            continue;
-        }
-        char *message = pm_build_catalog_message(runtime, catalog, publisher, recipient, allowed);
+        char *message = pm_build_catalog_message(runtime, catalog, publisher, recipient, 1);
         if (message == NULL
             || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
         free(message);
@@ -1388,6 +1376,7 @@ static int pm_report_stage(void *context, const st_storage_client *current,
     snprintf(staged->instance_id, sizeof(staged->instance_id), "%s", lease->instance_id == NULL ? "" : lease->instance_id);
     staged->service_count = lease->incoming->service_count;
     memcpy(staged->service_ids, lease->incoming->service_ids, sizeof(staged->service_ids));
+    memcpy(staged->endpoints, lease->incoming->endpoints, sizeof(staged->endpoints));
     staged->stats_count = lease->incoming->stats_count;
     memcpy(staged->stats, lease->incoming->stats, sizeof(staged->stats));
     staged->mdns_candidates = staged->active && sharing->mdns_import_enabled ? lease->incoming_mdns : NULL;
@@ -1410,6 +1399,7 @@ static int pm_report_commit(pm_report_lease *lease, pm_catalog *snapshot)
             lease->slot->pending_report = NULL; lease->slot = NULL;
             pthread_mutex_unlock(&peer_catalog_lock); return -1;
         }
+        lease->staged.created_at_millis = (long long)time(NULL) * 1000LL;
     }
     st_peer_mesh_mdns_candidate *old_mdns = lease->slot->mdns_candidates;
     lease->staged.pending_report = NULL;
@@ -1538,6 +1528,7 @@ static int pm_drain_control_withdrawal(const st_peer_mesh_runtime *runtime, long
         snapshot.publisher_session_id = item->publisher_session_id;
         snapshot.catalog_revision = item->revision;
         snapshot.expires_at = item->expires_at;
+        snapshot.created_at_millis = (long long)item->expires_at * 1000LL;
         snprintf(snapshot.tenant_id, sizeof(snapshot.tenant_id), "%s", item->tenant_id);
         snprintf(snapshot.publisher_client_name, sizeof(snapshot.publisher_client_name), "%s", item->publisher_client_name);
         snprintf(publisher.tenant_id, sizeof(publisher.tenant_id), "%s", item->tenant_id);
@@ -1680,6 +1671,7 @@ static int pm_replay_catalogs(const st_peer_mesh_runtime *runtime,
     for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
         if (!catalog->in_use || !catalog->active || catalog->expires_at <= now
+            || strcmp(catalog->database_path, runtime->database_path) != 0
             || strcmp(catalog->tenant_id, recipient->tenant_id) != 0
             || catalog->publisher_client_id == recipient->id) continue;
         snapshots[count++] = *catalog;
@@ -1687,13 +1679,7 @@ static int pm_replay_catalogs(const st_peer_mesh_runtime *runtime,
     pthread_mutex_unlock(&peer_catalog_lock);
     int rc = 0;
     for (size_t i = 0; i < count; ++i) {
-        st_storage_client publisher;
-        int allowed = 0;
-        if (st_storage_get_client_by_name(runtime->database_path,
-                                          snapshots[i].publisher_client_name, &publisher) != 0
-            || st_storage_can_peer(runtime->database_path, &publisher, recipient, &allowed) != 0
-            || !allowed) continue;
-        char *message = pm_build_catalog_message(runtime, &snapshots[i], &publisher, recipient, 1);
+        char *message = pm_build_catalog_message(runtime, &snapshots[i], NULL, recipient, 1);
         if (message == NULL
             || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
         free(message);
@@ -1721,6 +1707,7 @@ int st_peer_mesh_expire_catalogs(const st_peer_mesh_runtime *runtime)
         catalog->active = 0;
         catalog->expires_at = now;
         catalog->catalog_revision = revision;
+        catalog->created_at_millis = (long long)now * 1000LL;
         catalog->service_count = 0U;
         snapshots[count++] = *catalog;
         free(catalog->mdns_candidates);
@@ -1786,6 +1773,7 @@ int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
         break;
     }
     if (snapshot.catalog_revision == 0) snapshot.catalog_revision = pm_next_catalog_revision_locked(0);
+    snapshot.created_at_millis = (long long)snapshot.expires_at * 1000LL;
     pthread_mutex_unlock(&peer_catalog_lock);
     (void)st_storage_record_peer_mesh_service_audit(runtime->database_path,
         "publisher-offline", publisher.tenant_id, publisher.id,
@@ -1863,6 +1851,7 @@ static int pm_prepare_deleted_catalogs(pm_client_deletion *item)
         snapshot->active = 0;
         snapshot->expires_at = time(NULL);
         snapshot->catalog_revision = pm_next_catalog_revision_locked(snapshot->catalog_revision);
+        snapshot->created_at_millis = (long long)snapshot->expires_at * 1000LL;
         snapshot->service_count = 0U;
         snapshot->stats_count = 0U;
         snapshot->mdns_candidates = NULL;
@@ -1953,47 +1942,96 @@ int st_peer_mesh_drain_client_deletions(const st_peer_mesh_runtime *runtime)
     return rc;
 }
 
-int st_peer_mesh_list_mdns_candidates(const char *tenant_id,
+typedef struct {
+    size_t slot;
+    long long revision;
+    st_storage_peer_catalog_source source;
+} pm_catalog_read_ref;
+
+/* Snapshot only bounded identity/version metadata under the cache mutex. Native authority is
+ * read after releasing it; then copy committed payload only if that exact cohort still exists.
+ * Never retain mDNS heap pointers across the unlocked native read. Hidden sources stay cached
+ * for recovery, but are not returned. SQL failure is not an empty successful projection. */
+static int pm_catalog_read_refs(const char *path, const char *tenant, long long cid,
+    pm_catalog_read_ref **out, int **out_visible, size_t *out_count, st_storage_peer_catalog_view *view)
+{
+    *out = NULL; *out_visible = NULL; *out_count = 0;
+    pm_catalog_read_ref *refs = calloc(ST_PEER_MESH_MAX_CATALOGS, sizeof(*refs));
+    st_storage_peer_catalog_source *sources = calloc(ST_PEER_MESH_MAX_CATALOGS, sizeof(*sources));
+    int *visible = calloc(ST_PEER_MESH_MAX_CATALOGS, sizeof(*visible));
+    if (!refs || !sources || !visible) { free(refs); free(sources); free(visible); return -1; }
+    size_t count = 0; time_t now = time(NULL);
+    pthread_mutex_lock(&peer_catalog_lock);
+    for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
+        pm_catalog *catalog = &peer_catalogs[i];
+        if (!catalog->in_use || !catalog->active || catalog->expires_at <= now || catalog->publisher_client_id != cid
+            || strcmp(catalog->tenant_id, tenant) || strcmp(catalog->database_path, path)) continue;
+        refs[count].slot = i; refs[count].revision = catalog->catalog_revision;
+        refs[count].source.guarded = catalog->has_control_source; refs[count].source.control = catalog->control_source;
+        sources[count] = refs[count].source; ++count;
+    }
+    pthread_mutex_unlock(&peer_catalog_lock);
+    int rc = count ? st_storage_read_peer_catalog(path, tenant, cid, sources, count, visible, 0, NULL, 0, view) : 0;
+    free(sources);
+    if (rc != 0) { free(refs); free(visible); return rc; }
+    *out = refs; *out_visible = visible; *out_count = count; return 0;
+}
+
+static int pm_catalog_read_ref_matches(const pm_catalog *catalog, const pm_catalog_read_ref *ref,
+    const char *path, const char *tenant, long long cid)
+{
+    return catalog->in_use && catalog->active && catalog->expires_at > time(NULL)
+        && catalog->publisher_client_id == cid && catalog->catalog_revision == ref->revision
+        && !strcmp(catalog->database_path, path) && !strcmp(catalog->tenant_id, tenant)
+        && pm_same_control_source(catalog, ref->source.guarded ? &ref->source.control : NULL);
+}
+
+int st_peer_mesh_list_mdns_candidates(const char *database_path, const char *tenant_id,
                                       long long client_id,
                                       st_peer_mesh_mdns_candidate *out,
                                       size_t capacity,
                                       size_t *out_count)
 {
-    if (!pm_has_text(tenant_id) || client_id <= 0 || out_count == NULL
+    if (!pm_has_text(database_path) || !pm_has_text(tenant_id) || client_id <= 0 || out_count == NULL
         || (capacity > 0U && out == NULL)) return -1;
     *out_count = 0U;
-    time_t now = time(NULL);
+    if (!capacity) return 0;
+    pm_catalog_read_ref *refs = NULL; int *visible = NULL; size_t count = 0;
+    st_storage_peer_catalog_view view = {0};
+    int rc = pm_catalog_read_refs(database_path, tenant_id, client_id, &refs, &visible, &count, &view);
+    if (rc != 0) return rc;
     pthread_mutex_lock(&peer_catalog_lock);
-    for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
-        pm_catalog *catalog = &peer_catalogs[i];
-        if (!catalog->in_use || !catalog->active || catalog->expires_at <= now
-            || catalog->publisher_client_id != client_id
-            || strcmp(catalog->tenant_id, tenant_id) != 0) continue;
+    for (size_t i = 0; view.mdns_enabled && i < count; ++i) {
+        pm_catalog *catalog = &peer_catalogs[refs[i].slot];
+        if (!visible[i] || !pm_catalog_read_ref_matches(catalog, &refs[i], database_path, tenant_id, client_id)) continue;
         for (size_t j = 0; j < catalog->mdns_count && *out_count < capacity; ++j) {
             out[(*out_count)++] = catalog->mdns_candidates[j];
         }
     }
     pthread_mutex_unlock(&peer_catalog_lock);
+    free(refs); free(visible); st_storage_peer_catalog_view_free(&view);
     return 0;
 }
 
-int st_peer_mesh_list_service_instances(const char *tenant_id,
+int st_peer_mesh_list_service_instances(const char *database_path, const char *tenant_id,
                                         long long client_id,
                                         const char *service_id,
                                         st_peer_mesh_service_instance *out,
                                         size_t capacity,
                                         size_t *out_count)
 {
-    if (!pm_has_text(tenant_id) || client_id <= 0 || !pm_has_text(service_id)
+    if (!pm_has_text(database_path) || !pm_has_text(tenant_id) || client_id <= 0 || !pm_has_text(service_id)
         || out_count == NULL || (capacity > 0U && out == NULL)) return -1;
     *out_count = 0U;
-    time_t now = time(NULL);
+    if (!capacity) return 0;
+    pm_catalog_read_ref *refs = NULL; int *visible = NULL; size_t count = 0;
+    st_storage_peer_catalog_view view = {0};
+    int rc = pm_catalog_read_refs(database_path, tenant_id, client_id, &refs, &visible, &count, &view);
+    if (rc != 0) return rc;
     pthread_mutex_lock(&peer_catalog_lock);
-    for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS && *out_count < capacity; ++i) {
-        pm_catalog *catalog = &peer_catalogs[i];
-        if (!catalog->in_use || !catalog->active || catalog->expires_at <= now
-            || catalog->publisher_client_id != client_id
-            || strcmp(catalog->tenant_id, tenant_id) != 0) continue;
+    for (size_t i = 0; i < count && *out_count < capacity; ++i) {
+        pm_catalog *catalog = &peer_catalogs[refs[i].slot];
+        if (!visible[i] || !pm_catalog_read_ref_matches(catalog, &refs[i], database_path, tenant_id, client_id)) continue;
         st_peer_mesh_service_instance *instance = &out[(*out_count)++];
         memset(instance, 0, sizeof(*instance));
         instance->publisher_session_id = catalog->publisher_session_id;
@@ -2013,6 +2051,7 @@ int st_peer_mesh_list_service_instances(const char *tenant_id,
         }
     }
     pthread_mutex_unlock(&peer_catalog_lock);
+    free(refs); free(visible); st_storage_peer_catalog_view_free(&view);
     return 0;
 }
 
@@ -2791,6 +2830,7 @@ static int pm_refresh_tenant_impl(const st_peer_mesh_runtime *runtime,
         long long revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
         if (revision == 0) { rc = -1; continue; }
         catalog->catalog_revision = revision;
+        catalog->created_at_millis = (long long)now * 1000LL;
         snapshots[snapshot_count++] = *catalog;
     }
     pthread_mutex_unlock(&peer_catalog_lock);

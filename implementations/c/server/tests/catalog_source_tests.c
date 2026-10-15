@@ -183,6 +183,7 @@ static int scenario(const char *mode)
     REQUIRE(!strcmp(mode, "stale") ? rc == ST_STORAGE_CONTROL_SOURCE_RETIRED : rc == -1,
         "stale physical source is rejected; SQL/rolled-back authority failure is not permanent retirement");
     REQUIRE(after.report_revision == before.report_revision && after.catalog_revision == before.catalog_revision
+        && after.created_at_millis == before.created_at_millis
         && !memcmp(&after.rate, &before.rate, sizeof(after.rate)) && after.stats[0].bytes_in == 3
         && after.mdns_count == before.mdns_count && !strcmp(old_mdns, new_mdns)
         && peer_catalog_sequence == clock && peer_catalog_reserved_revisions == 0 && f.sent == sent,
@@ -226,6 +227,7 @@ static int policy_scenario(const char *mode)
     REQUIRE(snapshot(&f, &after, last) == 0, "observe committed cache only");
     fprintf(stderr, "OBSERVATION catalog policy %s rc=%d raw=%lld stats=%lld mdns=%s\n", mode, rc, after.report_revision, after.stats[0].bytes_in, last);
     REQUIRE(rc == -1 && after.report_revision == before.report_revision && after.catalog_revision == before.catalog_revision
+        && after.created_at_millis == before.created_at_millis
         && !memcmp(&after.rate, &before.rate, sizeof(after.rate)) && after.stats[0].bytes_in == 3
         && !strcmp(first, last) && after.pending_report == NULL && peer_catalog_reserved_revisions == 0
         && audit_count(f.path) == 1 && f.sent == sent && current(&f), "changed policy rolls back audit/private stage without retiring original CONTROL");

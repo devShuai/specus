@@ -255,16 +255,56 @@ done:
         failed ? "FAIL" : "PASS", writer_first ? "writer-first" : "replace-first"); return failed;
 #undef REQUIRE
 }
+static int consistent_read(const char *library)
+{
+    source_fixture f; int failed=1; long long revision=0;
+#define REQUIRE(c, text) do { if (!(c)) { fprintf(stderr,"FAIL real catalog single-read: %s\n",text); goto done; } } while(0)
+    REQUIRE(source_setup(&f,library,"read") == 0,"signed v2 publisher/recipient and accepted native fixture");
+    REQUIRE(sql(&f.a,"PRAGMA journal_mode=WAL") == 0 && marker(&f.a,"arm") == 0
+        && send_report(f.control,&f.publisher,2,"read-snapshot",0) == 0 && wait_marker(&f.a) == 0,
+        "actual original-source check paused inside native READ transaction");
+    REQUIRE(expect_channel_alive(f.control) == 0 && expect_channel_alive(f.recipient) == 0,
+        "independent heartbeats while catalog reader is paused");
+    char mutation[1024]; snprintf(mutation,sizeof(mutation),
+        "BEGIN IMMEDIATE; UPDATE client_account SET owner_username='changed-owner' WHERE rowid=%lld; "
+        "UPDATE peer_mesh_device SET owner_username='changed-owner' WHERE client_id=%lld; "
+        "UPDATE peer_mesh_shared_service SET name='After Snapshot' WHERE client_id=%lld; COMMIT;",
+        f.publisher.client_id,f.publisher.client_id,f.publisher.client_id);
+    REQUIRE(sql(&f.a,mutation) == 0,"independent WAL writer commits parent/device/definition changes during native read");
+    REQUIRE(marker(&f.a,"resume") == 0,"resume the same reader, not a rebuilt/fake view");
+    int observed=0; long long deadline=monotonic_ms()+IO_TIMEOUT_MS;
+    while(!observed && monotonic_ms()<deadline) {
+        st_frame_header header; uint8_t *body=NULL; st_message_response message={0};
+        REQUIRE(read_frame(f.recipient,(int)(deadline-monotonic_ms()),&header,&body) == 1,"physical catalog response");
+        int decoded=header.command==ST_CMD_MESSAGE_RESPONSE && st_protocol_decode_message_response(body,header.length,&message)==0;
+        free(body);
+        if(decoded && source_catalog(&message,&f.publisher)) {
+            observed=strstr(message.message,"\"name\":\"Catalog Service\"") != NULL
+                && strstr(message.message,"After Snapshot") == NULL
+                && st_json_get_i64(message.message,"revision",&revision) == 0 && revision==f.first_revision+1;
+            st_message_response_free(&message); REQUIRE(observed,"one coherent pre-mutation parent/policy/definition snapshot, never mixed rows");
+        } else st_message_response_free(&message);
+    }
+    REQUIRE(observed && send_report(f.control,&f.publisher,3,"after-snapshot",0)==0
+        && wait_peer(f.recipient,"service-catalog",&f.publisher,1,&revision)==0
+        && revision==f.first_revision+2,"next native snapshot sees transferred owner and withdraws lost access");
+    REQUIRE(expect_channel_alive(f.control)==0 && expect_channel_alive(f.recipient)==0,"management-only transfer preserves both physical connections");
+    failed=0;
+done:
+    failed=source_cleanup(&f,failed); printf("%s real catalog single native READ snapshot across actual WAL writer, independent heartbeat and next-view revocation\n",failed?"FAIL":"PASS"); return failed;
+#undef REQUIRE
+}
 int main(int argc, char **argv)
 {
     if (argc != 3 && argc != 4) return 2;
     signal(SIGPIPE, SIG_IGN); server_binary = argv[1];
     if (argc == 4) {
+        if (!strcmp(argv[3], "read-snapshot")) return consistent_read(argv[2]);
         if (!strcmp(argv[3], "replace-first")) return takeover(argv[2], 0);
         if (!strcmp(argv[3], "writer-first")) return takeover(argv[2], 1);
         if (strcmp(argv[3], "audit-insert") && strcmp(argv[3], "audit-prune") && strcmp(argv[3], "trigger")) return 2;
         return audit_failure(argv[2], argv[3]);
     }
     return audit_failure(argv[2], "audit-insert") + audit_failure(argv[2], "audit-prune") + audit_failure(argv[2], "trigger")
-        + takeover(argv[2], 0) + takeover(argv[2], 1) ? 1 : 0;
+        + takeover(argv[2], 0) + takeover(argv[2], 1) + consistent_read(argv[2]) ? 1 : 0;
 }
