@@ -109,6 +109,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         var publication = new CompletableFuture<Boolean>();
         // 0 queued/not started, 1 owned by the I/O callback, 2 cancelled before that callback.
         var publicationState = new AtomicInteger();
+        SessionUtil.PreparedBinding preparation = null;
         try {
             boolean validRole = ConnectionRole.isValid(packet.getConnectionRole());
             AuthenticationResult authentication;
@@ -138,6 +139,12 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             if (authentication.success() && !dataConnection) {
                 peerSignalService.onControlConnected(authentication.account(), authentication.clientSessionId());
             }
+            if(authentication.success()) {
+                preparation=SessionUtil.prepareBinding(new Session(packet.getClientName()),ctx.channel(),
+                        authenticatedControl,authentication.clientSessionId(),dataConnection);
+                if(preparation != null) preparation.awaitRetired(); // Worker only; no DB/registry lock is held.
+            }
+            SessionUtil.PreparedBinding ready=preparation;
 
             LoginResponsePacket response = new LoginResponsePacket();
             response.setVersion(packet.getVersion());
@@ -165,21 +172,17 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                         ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.CLIENT_SESSION_ID).set(
                                 finalAuthentication.clientSessionId());
                     }
-                    if (dataConnection) {
-                        if (!SessionUtil.bindDataSession(new Session(packet.getClientName()), ctx.channel(),
-                                authenticatedControl, finalAuthentication.clientSessionId())) {
+                    if (ready == null || !ready.publish()) {
                             // Authentication ran on a worker. Its CONTROL may have gone away or
                             // been replaced while this event-loop callback was queued.
                             response.setSuccess(false);
-                            response.setReason("数据连接要求控制连接先登录：原控制连接已改变，请重新建立数据连接");
+                            response.setReason(dataConnection ? "数据连接要求控制连接先登录：原控制连接已改变，请重新建立数据连接"
+                                    : "原控制连接已改变，请重新登录");
                             ctx.channel().attr(ServerAttributes.TENANT_ID).set(null);
                             ctx.channel().attr(ServerAttributes.CONNECTION_ROLE).set(null);
                             ctx.channel().attr(ServerAttributes.CLIENT_SESSION_ID).set(null);
                             ctx.channel().attr(ServerAttributes.CLIENT_ID).set(null);
                             ctx.channel().attr(ServerAttributes.LOGIN_TIME_MS).set(null);
-                        }
-                    } else {
-                        SessionUtil.bindControlSession(new Session(packet.getClientName()), ctx.channel());
                     }
                     if (response.isSuccess() && ctx.pipeline().context(Spliter.PRE_AUTH_HANDLER_NAME) != null) {
                         ctx.pipeline().replace(
@@ -207,6 +210,8 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                 publication.complete(response.isSuccess());
                 } catch (Throwable failure) {
                     publication.completeExceptionally(failure);ctx.close();
+                } finally {
+                    if(dataConnection && ready != null) ready.close();
                 }
             };
             if (ctx.channel().eventLoop().inEventLoop()) publish.run();
@@ -223,9 +228,13 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
                 log.debug("login admission interrupted for client={}",packet.getClientName());
+            } else if(e instanceof java.util.concurrent.CancellationException) {
+                log.debug("login channel closed during retirement for client={}",packet.getClientName());
             } else log.error("login handling failed for client={}", packet.getClientName(), e);
             DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.IO_ERROR);
             ctx.close();
+        } finally {
+            if(preparation != null && (!dataConnection || publicationState.get() == 2)) preparation.close();
         }
     }
 

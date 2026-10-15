@@ -11,6 +11,8 @@ import com.theshuai.specusserver.management.model.DisconnectReason;
 import com.theshuai.specusserver.server.RemotePortServerManager;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import com.theshuai.specusserver.testsupport.PairedDataFixture;
 
 import java.util.Map;
 
@@ -28,6 +30,9 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class NatServerHandlerTests {
+    private PairedDataFixture pair;
+    private void bindPair(EmbeddedChannel data) {pair=new PairedDataFixture("client-a",data);}
+    @AfterEach void closePair() {if(pair != null) pair.close();}
 
     @Test
     void shouldAcceptInboundKeepaliveWithoutClosingChannel() {
@@ -35,7 +40,7 @@ class NatServerHandlerTests {
                 null, null, null, null, mock(WebSocketStreamRegistry.class),
                 mock(WebSocketSpecusHandler.class));
         EmbeddedChannel channel = new EmbeddedChannel(handler);
-        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        bindPair(channel);
         try {
             NatMessagePacket keepalive = new NatMessagePacket();
             keepalive.setNatMessageType(NatMessageType.KEEPALIVE);
@@ -55,7 +60,7 @@ class NatServerHandlerTests {
         NatServerHandler handler = new NatServerHandler(
                 null, null, null, null, mock(WebSocketStreamRegistry.class), webSocketHandler);
         EmbeddedChannel channel = new EmbeddedChannel(handler);
-        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        bindPair(channel);
         channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
         try {
             NatMessagePacket data = new NatMessagePacket();
@@ -84,7 +89,7 @@ class NatServerHandlerTests {
         } finally {
             channel.finishAndReleaseAll();
         }
-        verify(webSocketHandler).onControlChannelInactive("client-a");
+        verify(webSocketHandler).onDataChannelInactive(channel);
     }
 
     @Test
@@ -93,7 +98,7 @@ class NatServerHandlerTests {
                 null, null, null, null, mock(WebSocketStreamRegistry.class),
                 mock(WebSocketSpecusHandler.class));
         EmbeddedChannel channel = new EmbeddedChannel(handler);
-        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        bindPair(channel);
         channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
         try {
             channel.writeInbound(rst(43));
@@ -112,7 +117,7 @@ class NatServerHandlerTests {
                 null, null, null, null, mock(WebSocketStreamRegistry.class),
                 mock(WebSocketSpecusHandler.class));
         EmbeddedChannel channel = new EmbeddedChannel(handler);
-        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        bindPair(channel);
         channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
         HttpStreamExchange exchange = new HttpStreamExchange(44);
         try {
@@ -139,7 +144,7 @@ class NatServerHandlerTests {
                 null, null, remotePorts, null, mock(WebSocketStreamRegistry.class),
                 mock(WebSocketSpecusHandler.class));
         EmbeddedChannel channel = new EmbeddedChannel(handler);
-        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        bindPair(channel);
         channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
         try {
             NatMessagePacket register = new NatMessagePacket();
@@ -170,7 +175,7 @@ class NatServerHandlerTests {
                 null, null, null, null, mock(WebSocketStreamRegistry.class),
                 mock(WebSocketSpecusHandler.class));
         EmbeddedChannel channel = new EmbeddedChannel(handler);
-        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        bindPair(channel);
         channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
         HttpStreamExchange exchange = new HttpStreamExchange(73);
         try {

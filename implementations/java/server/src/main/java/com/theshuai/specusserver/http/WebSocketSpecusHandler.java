@@ -65,6 +65,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     /** channelId → clientName，用于关闭时定位要发 DISCONNECTED 的控制连接。 */
     private final Map<String, String> channelClientNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> channelStreamIds = new ConcurrentHashMap<>();
+    // Immutable physical DATA owner. Browser close/data must never look up a successor by name.
+    private final Map<String, Channel> channelDataChannels = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> fragmentOpcodes = new ConcurrentHashMap<>();
     private final Map<Integer, ByteArrayOutputStream> fragmentPayloads = new ConcurrentHashMap<>();
 
@@ -86,22 +88,26 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         String clientName = (String) session.getAttributes().get(ATTR_CLIENT_NAME);
         String route = (String) session.getAttributes().get(ATTR_ROUTE);
         Channel controlChannel = SessionUtil.getDataChannel(clientName);
-        if (controlChannel == null || !controlChannel.isActive()) {
+        if (!isActiveData(controlChannel)) {
             log.warn("[ws-specus][server] clientName={} rejected=client-offline channelId={}", clientName, channelId);
             releaseShareStream(session);
             session.close(CloseStatus.SERVER_ERROR.withReason("客户端不在线"));
             return;
         }
 
-        registry.register(streamId, channelId, session, clientName);
+        NatServerHandler nat=controlChannel.pipeline().get(NatServerHandler.class);
+        if(!nat.openWebSocketStream(streamId,() -> {
+            registry.register(streamId,channelId,session,clientName);
+            channelClientNames.put(channelId,clientName);
+            channelStreamIds.put(channelId,streamId);
+            channelDataChannels.put(channelId,controlChannel);
+        })) {
+            releaseShareStream(session);session.close(CloseStatus.SERVER_ERROR.withReason("数据连接已改变"));return;
+        }
         if (session.getAttributes().get(ATTR_SHARE_STREAM) instanceof HttpShareStreamRegistry.InFlight shareStream) {
             // A share that ends (revoked, expired, lapsed) closes this WebSocket with 1008.
             shareStream.attach(() -> terminate(channelId, CloseStatus.POLICY_VIOLATION, "HTTP share ended"));
         }
-        markStreamOpened(controlChannel, streamId);
-        StreamFlowController.get(controlChannel).open(streamId, null);
-        channelClientNames.put(channelId, clientName);
-        channelStreamIds.put(channelId, streamId);
 
         NatMessagePacket connected = new NatMessagePacket();
         connected.setNatMessageType(NatMessageType.OPEN);
@@ -116,6 +122,9 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         metaData.put("headers", session.getAttributes().get(ATTR_HEADERS));
         metaData.put("body", session.getAttributes().get(ATTR_BODY));
         connected.setMetaData(metaData);
+        if(!ownsStream(streamId,controlChannel) || !isActiveData(controlChannel)) {
+            closeFromClient(streamId);return;
+        }
         controlChannel.writeAndFlush(connected).addListener(future -> {
             if (!future.isSuccess()) {
                 log.warn("[ws-specus][server->client] channelId={} clientName={} write=connected-failed error={}",
@@ -157,8 +166,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         if (channelId == null || streamId == null || clientName == null) {
             return;
         }
-        Channel controlChannel = SessionUtil.getDataChannel(clientName);
-        if (controlChannel == null || !controlChannel.isActive()) {
+        Channel controlChannel = channelDataChannels.get(channelId);
+        if (!isActiveData(controlChannel)) {
             closeFromBrowser(channelId);
             return;
         }
@@ -197,13 +206,13 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     public void terminate(String channelId, CloseStatus status, String resetReason) {
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
-        Channel controlChannel = clientName == null || streamId == null
-                ? null : SessionUtil.getDataChannel(clientName);
+        Channel controlChannel = channelDataChannels.remove(channelId);
         WebSocketSession session = registry.remove(channelId);
+        if(session != null) releaseShareStream(session);
         if (streamId != null) {
             clearFragmentState(streamId);
         }
-        if (controlChannel != null && controlChannel.isActive()) {
+        if (streamId != null && isActiveData(controlChannel)) {
             markStreamClosed(controlChannel, streamId);
             StreamFlowController.get(controlChannel).reset(streamId, 8, resetReason);
         }
@@ -323,18 +332,17 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         String channelId = registry.channelIdOf(streamId);
         String clientName = channelId == null ? null : registry.clientNameOf(channelId);
         WebSocketSession session = registry.removeByStreamId(streamId);
+        if(session != null) releaseShareStream(session);
         if (channelId == null) {
             return;
         }
         channelClientNames.remove(channelId);
         channelStreamIds.remove(channelId);
         clearFragmentState(streamId);
-        if (clientName != null) {
-            Channel controlChannel = SessionUtil.getDataChannel(clientName);
-            if (controlChannel != null) {
-                markStreamClosed(controlChannel, streamId);
-                StreamFlowController.get(controlChannel).remove(streamId);
-            }
+        Channel controlChannel = channelDataChannels.remove(channelId);
+        if (controlChannel != null) {
+            markStreamClosed(controlChannel, streamId);
+            StreamFlowController.get(controlChannel).remove(streamId);
         }
         if (session != null && session.isOpen()) {
             try {
@@ -355,9 +363,8 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
     private void detachBrowser(String channelId, CloseStatus status, boolean closeSession) {
         String clientName = channelClientNames.remove(channelId);
         Integer streamId = channelStreamIds.remove(channelId);
-        Channel controlChannel = clientName == null || streamId == null
-                ? null : SessionUtil.getDataChannel(clientName);
-        if (controlChannel != null && controlChannel.isActive()) {
+        Channel controlChannel = channelDataChannels.remove(channelId);
+        if (streamId != null && isActiveData(controlChannel)) {
             markStreamClosed(controlChannel, streamId);
         }
         WebSocketSession session = registry.remove(channelId);
@@ -370,7 +377,7 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
             }
         }
         if (clientName == null || streamId == null) return;
-        if (controlChannel == null || !controlChannel.isActive()) return;
+        if (!isActiveData(controlChannel)) return;
         byte[] reason = status.getReason() == null
                 ? new byte[0] : status.getReason().getBytes(StandardCharsets.UTF_8);
         if (reason.length > 123) {
@@ -420,9 +427,25 @@ public class WebSocketSpecusHandler extends AbstractWebSocketHandler {
         }
     }
 
-    /** 控制连接断开时由 {@code NatServerHandler.channelInactive} 调用：关闭所有挂起的浏览器会话。 */
-    public void onControlChannelInactive(String clientName) {
-        registry.closeAll(clientName);
+    public boolean ownsStream(int streamId,Channel data) {
+        String channelId=registry.channelIdOf(streamId);
+        return channelId != null && channelDataChannels.get(channelId) == data;
+    }
+
+    /** Snapshot only the original physical DATA's sessions; delayed cleanup leaves successors alone. */
+    public void onDataChannelInactive(Channel data) {
+        channelDataChannels.forEach((channelId,owner) -> {
+            if(owner == data) {
+                Integer streamId=channelStreamIds.get(channelId);
+                if(streamId != null) closeFromClient(streamId);
+            }
+        });
+    }
+
+    private static boolean isActiveData(Channel channel) {
+        if(channel == null || !SessionUtil.isCurrentData(channel)) return false;
+        NatServerHandler nat=channel.pipeline().get(NatServerHandler.class);
+        return nat != null && nat.isActiveData();
     }
 
     static final String ATTR_CHANNEL_ID = "ws.channelId";
