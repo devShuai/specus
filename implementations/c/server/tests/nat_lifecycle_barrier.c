@@ -17,6 +17,7 @@
 static int (*native_bind)(int, const struct sockaddr *, socklen_t);
 static int (*native_accept)(int, struct sockaddr *, socklen_t *);
 static ssize_t (*native_recv)(int, void *, size_t, int);
+static ssize_t (*native_send)(int, const void *, size_t, int);
 static int (*native_listen)(int, int);
 static int (*native_close)(int);
 static int (*native_thread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
@@ -28,6 +29,7 @@ static _Thread_local int bound_fd = -1;
 static _Thread_local int late_accept;
 static _Thread_local int watched_close_completed;
 static _Thread_local size_t marker_matched;
+static _Thread_local size_t send_marker_matched;
 
 static void mark(const char *name, int result)
 {
@@ -47,11 +49,12 @@ static void symbols(void)
     memcpy(&native_bind, &b, sizeof(b));
     memcpy(&native_accept, &a, sizeof(a));
     memcpy(&native_recv, &r, sizeof(r));
+    void *s = dlsym(RTLD_NEXT, "send"); memcpy(&native_send, &s, sizeof(s));
     void *l = dlsym(RTLD_NEXT, "listen"), *c = dlsym(RTLD_NEXT, "close"), *t = dlsym(RTLD_NEXT, "pthread_create");
     memcpy(&native_listen, &l, sizeof(l)); memcpy(&native_close, &c, sizeof(c));
     memcpy(&native_thread_create, &t, sizeof(t));
     void *m = dlsym(RTLD_NEXT, "pthread_mutex_destroy"); memcpy(&native_mutex_destroy, &m, sizeof(m));
-    if (!native_bind || !native_accept || !native_recv || !native_listen || !native_close || !native_thread_create || !native_mutex_destroy) _exit(91);
+    if (!native_bind || !native_accept || !native_recv || !native_send || !native_listen || !native_close || !native_thread_create || !native_mutex_destroy) _exit(91);
 }
 
 static int pause_operation(const char *mode, int port, int owned_fd)
@@ -128,6 +131,29 @@ int listen(int fd, int backlog)
     int result = native_listen(fd, backlog);
     int saved_errno = errno;
     if (fd == bound_fd) mark("late-listen", result);
+    errno = saved_errno;
+    return result;
+}
+
+ssize_t send(int fd, const void *buffer, size_t length, int flags)
+{
+    pthread_once(&once, symbols);
+    ssize_t result = native_send(fd, buffer, length, flags);
+    int saved_errno = errno;
+    const char marker[] = "nat-retire-hold";
+    for (ssize_t i = 0; i < result; ++i) {
+        char byte = ((const char *)buffer)[i];
+        if (byte == marker[send_marker_matched]) ++send_marker_matched;
+        else send_marker_matched = byte == marker[0] ? 1U : 0U;
+        if (send_marker_matched == sizeof(marker) - 1) {
+            send_marker_matched = 0;
+            struct sockaddr_in local;
+            socklen_t size = sizeof(local);
+            if (getsockname(fd, (struct sockaddr *)&local, &size) == 0 && local.sin_family == AF_INET)
+                pause_operation("send", ntohs(local.sin_port), fd);
+            break;
+        }
+    }
     errno = saved_errno;
     return result;
 }

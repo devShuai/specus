@@ -44,6 +44,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,8 @@ typedef struct {
  */
 struct st_admin_direct_ws_stream {
     int fd;
+    int fd_attached; /* admin_direct_ws_ref_lock: cleared before the browser owner returns/closes. */
+    atomic_int retired;
     pthread_mutex_t send_lock;
     pthread_cond_t handshake_cond;
     pthread_mutex_t flow_lock;
@@ -15598,6 +15601,15 @@ static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
     fflush(stderr);
 }
 
+static void direct_sink_on_link_lost(void *ctx)
+{
+    /* The forwarder invokes this under its pending-list lock and removes that pending entry
+     * before returning. This browser owner cannot close/reuse fd until that return. No send,
+     * share-registry callback or lock acquisition here: shutdown interrupts an in-flight send. */
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    shutdown(state->fd, SHUT_RDWR);
+}
+
 static void direct_free_strings(char **values, size_t values_len)
 {
     if (values == NULL) {
@@ -16444,7 +16456,7 @@ static int admin_direct_ws_write_locked(st_admin_direct_ws_stream *stream,
                                         const uint8_t *payload,
                                         size_t payload_len)
 {
-    if (stream->closed || stream->close_sent || stream->handshake_pending) {
+    if (stream->closed || stream->close_sent || stream->handshake_pending || atomic_load(&stream->retired)) {
         return -1;
     }
     if (admin_send_websocket_frame_ex(stream->fd, fin, 0U, opcode, payload, payload_len) != 0) {
@@ -16479,7 +16491,9 @@ static void admin_direct_ws_abort_locked(st_admin_direct_ws_stream *stream)
 {
     if (!stream->closed) {
         stream->closed = 1;
-        shutdown(stream->fd, SHUT_RDWR);
+        pthread_mutex_lock(&admin_direct_ws_ref_lock);
+        if (stream->fd_attached) shutdown(stream->fd, SHUT_RDWR);
+        pthread_mutex_unlock(&admin_direct_ws_ref_lock);
     }
     pthread_cond_broadcast(&stream->handshake_cond);
 }
@@ -16495,10 +16509,16 @@ static void admin_direct_ws_close_flow(st_admin_direct_ws_stream *stream)
 /* Client frames may race the 101 response, so they queue behind it rather than precede it. */
 static int admin_direct_ws_wait_handshake_locked(st_admin_direct_ws_stream *stream)
 {
-    while (stream->handshake_pending && !stream->closed) {
-        pthread_cond_wait(&stream->handshake_cond, &stream->send_lock);
+    while (stream->handshake_pending && !stream->closed && !atomic_load(&stream->retired)) {
+        /* Retirement cannot wait for send_lock (it may be held by a blocked write). Its atomic
+         * predicate plus this bounded wait also covers a broadcast racing entry to cond_wait. */
+        struct timespec wake;
+        clock_gettime(CLOCK_MONOTONIC, &wake);
+        wake.tv_nsec += 100L * 1000000L;
+        if (wake.tv_nsec >= 1000000000L) { ++wake.tv_sec; wake.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&stream->handshake_cond, &stream->send_lock, &wake);
     }
-    return stream->closed ? -1 : 0;
+    return stream->closed || atomic_load(&stream->retired) ? -1 : 0;
 }
 
 /* Non-zero once a CLOSE went to the browser: the monotonic bound on waiting for its reply. */
@@ -16539,7 +16559,7 @@ static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream
         if (stream->close_deadline_ms > 0 && (limit == 0 || stream->close_deadline_ms < limit)) {
             limit = stream->close_deadline_ms;
         }
-        if (stream->flow_closed) {
+        if (stream->flow_closed || atomic_load(&stream->retired)) {
             pthread_mutex_unlock(&stream->flow_lock);
             return -1;
         }
@@ -16684,7 +16704,9 @@ int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
     pthread_mutex_lock(&stream->send_lock);
     (void)admin_direct_ws_wait_handshake_locked(stream);
     int result;
-    if (stream->peer_finished) {
+    if (atomic_load(&stream->retired)) {
+        result = ST_ADMIN_DIRECT_WS_ACCEPTED; /* A retained callback cannot revive the stream. */
+    } else if (stream->peer_finished) {
         result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
     } else if (!decoded || stream->peer_close_received) {
         /* A malformed envelope, or anything after the client's own CLOSE. */
@@ -16719,7 +16741,9 @@ int st_admin_direct_ws_peer_finished(st_admin_direct_ws_stream *stream)
     }
     pthread_mutex_lock(&stream->send_lock);
     int result = ST_ADMIN_DIRECT_WS_ACCEPTED;
-    if (stream->peer_finished) {
+    if (atomic_load(&stream->retired)) {
+        /* Already retired, including a FIN captured before the namespace was detached. */
+    } else if (stream->peer_finished) {
         result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
         admin_direct_ws_fail_locked(stream, result);
     } else {
@@ -16747,7 +16771,7 @@ static void admin_direct_ws_shutdown(st_admin_direct_ws_stream *stream,
                                      uint16_t code,
                                      const char *reason)
 {
-    if (stream == NULL) {
+    if (stream == NULL || atomic_load(&stream->retired)) {
         return;
     }
     pthread_mutex_lock(&stream->send_lock);
@@ -16779,7 +16803,7 @@ int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32
         return -1;
     }
     /* Credit racing the stream's own shutdown is harmless; only window overflow is a violation. */
-    if (!stream->flow_closed) {
+    if (!stream->flow_closed && !atomic_load(&stream->retired)) {
         stream->send_credit += credit;
         pthread_cond_broadcast(&stream->flow_cond);
     }
@@ -16790,6 +16814,31 @@ int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
 {
     admin_direct_ws_shutdown(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "");
+}
+
+void st_admin_direct_ws_retire(st_admin_direct_ws_stream *stream)
+{
+    if (stream == NULL) return;
+    atomic_store(&stream->retired, 1);
+    /* Never wait for a writer. A single nonblocking send preserves graceful 1001 when possible;
+     * a partial/failed write or an occupied send lock instead gets immediate transport abort. */
+    if (pthread_mutex_trylock(&stream->send_lock) == 0) {
+        if (!stream->closed && !stream->close_sent && !stream->handshake_pending) {
+            const uint8_t close_frame[] = {0x88U, 2U, 0x03U, 0xe9U};
+            if (send(stream->fd, close_frame, sizeof(close_frame), MSG_DONTWAIT | MSG_NOSIGNAL)
+                == (ssize_t)sizeof(close_frame)) stream->close_sent = 1;
+        }
+        stream->closed = 1;
+        pthread_cond_broadcast(&stream->handshake_cond);
+        pthread_mutex_unlock(&stream->send_lock);
+    }
+    /* Ref lifetime is separate from fd lifetime: a captured NAT reference can outlive the browser
+     * handler. mark_closed clears attached under this lock BEFORE handle_client closes/reuses fd. */
+    pthread_mutex_lock(&admin_direct_ws_ref_lock);
+    if (stream->fd_attached) shutdown(stream->fd, SHUT_RDWR);
+    pthread_mutex_unlock(&admin_direct_ws_ref_lock);
+    pthread_cond_broadcast(&stream->handshake_cond);
+    admin_direct_ws_close_flow(stream);
 }
 
 /* The share this WebSocket was opened through ended: 1008 to the browser, RST to the client. */
@@ -17856,6 +17905,9 @@ static void admin_direct_ws_mark_closed(st_admin_direct_ws_stream *stream)
 {
     pthread_mutex_lock(&stream->send_lock);
     stream->closed = 1;
+    pthread_mutex_lock(&admin_direct_ws_ref_lock);
+    stream->fd_attached = 0;
+    pthread_mutex_unlock(&admin_direct_ws_ref_lock);
     stream->handshake_pending = 0;
     pthread_cond_broadcast(&stream->handshake_cond);
     pthread_mutex_unlock(&stream->send_lock);
@@ -18281,17 +18333,19 @@ static void admin_direct_ws_run(st_admin_server *server,
         return;
     }
     stream->fd = fd;
+    stream->fd_attached = 1;
+    atomic_init(&stream->retired, 0);
     stream->send_credit = ST_ADMIN_STREAM_INITIAL_WINDOW;
     stream->handshake_pending = 1;
     stream->refs = 1U;
     admin_utf8_reset(&stream->outbound_utf8);
     pthread_mutex_init(&stream->send_lock, NULL);
-    pthread_cond_init(&stream->handshake_cond, NULL);
     pthread_mutex_init(&stream->flow_lock, NULL);
     /* Credit waits are bounded by monotonic deadlines, so the condition uses that clock too. */
     pthread_condattr_t flow_cond_attr;
     pthread_condattr_init(&flow_cond_attr);
     pthread_condattr_setclock(&flow_cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&stream->handshake_cond, &flow_cond_attr);
     pthread_cond_init(&stream->flow_cond, &flow_cond_attr);
     pthread_condattr_destroy(&flow_cond_attr);
 
@@ -18313,6 +18367,7 @@ static void admin_direct_ws_run(st_admin_server *server,
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
     if (open_rc != 0) {
+        admin_direct_ws_mark_closed(stream);
         st_admin_direct_ws_release(stream);
         free(accept_key);
         if (open_rc == -3) {
@@ -18343,7 +18398,8 @@ static void admin_direct_ws_run(st_admin_server *server,
      * 101 is written under send_lock, so no WebSocket frame can reach the browser before it.
      */
     pthread_mutex_lock(&stream->send_lock);
-    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response)
+    int upgraded = !stream->closed && !atomic_load(&stream->retired)
+        && response_len > 0 && (size_t)response_len < sizeof(response)
         && send_all(fd, response, (size_t)response_len) == 0;
     stream->handshake_pending = 0;
     if (!upgraded) {
@@ -18546,6 +18602,7 @@ static void admin_forward_direct_http(st_admin_server *server,
         .on_data = direct_sink_on_data,
         .on_end = direct_sink_on_end,
         .on_reset = direct_sink_on_reset,
+        .on_link_lost = direct_sink_on_link_lost,
         .bind_cancel = share == NULL ? NULL : direct_sink_bind_cancel
     };
     char remote_address[128];

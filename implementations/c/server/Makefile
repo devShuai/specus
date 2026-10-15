@@ -26,6 +26,7 @@ IDENTITY_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_client_identity_coordinatio
 AUTH_READ_BARRIER := $(BUILD_DIR)/libspecus_c_auth_read_barrier.so
 NAT_LIFECYCLE_BARRIER := $(BUILD_DIR)/libspecus_c_nat_lifecycle_barrier.so
 NAT_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_nat_lifecycle_tests
+STREAM_RETIREMENT_TESTS := $(BUILD_DIR)/specus_c_stream_retirement_tests
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
 DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
@@ -83,6 +84,7 @@ ALL_TESTS += $(OWNER_TRANSFER_TESTS)
 ALL_TESTS += $(OWNER_RUNTIME_TESTS)
 ALL_TESTS += $(IDENTITY_COORDINATION_TESTS) $(AUTH_READ_BARRIER)
 ALL_TESTS += $(NAT_LIFECYCLE_TESTS) $(NAT_LIFECYCLE_BARRIER)
+ALL_TESTS += $(STREAM_RETIREMENT_TESTS)
 
 .PHONY: all test release clean
 
@@ -267,6 +269,9 @@ $(NAT_LIFECYCLE_BARRIER): tests/nat_lifecycle_barrier.c | $(BUILD_DIR)
 $(NAT_LIFECYCLE_TESTS): $(CORE_OBJS) tests/nat_lifecycle_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_lifecycle_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
 
+$(STREAM_RETIREMENT_TESTS): $(CORE_OBJS) tests/stream_retirement_tests.c tests/server_harness.c tests/server_harness.h src/admin_http.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stream_retirement_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
 $(OWNER_RUNTIME_TESTS): $(CORE_OBJS) tests/owner_transfer_runtime_tests.c tests/server_harness.c tests/server_harness.h src/peer_mesh.h src/storage.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/owner_transfer_runtime_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -302,6 +307,7 @@ test: all
 	$(OWNER_RUNTIME_TESTS) $(SERVER)
 	$(IDENTITY_COORDINATION_TESTS) $(abspath $(SERVER)) $(abspath $(AUTH_READ_BARRIER))
 	$(NAT_LIFECYCLE_TESTS) $(abspath $(SERVER)) $(abspath $(NAT_LIFECYCLE_BARRIER))
+	$(STREAM_RETIREMENT_TESTS) $(abspath $(SERVER)) $(abspath $(NAT_LIFECYCLE_BARRIER))
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
 release: clean $(SERVER)

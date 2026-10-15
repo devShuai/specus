@@ -12,6 +12,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -407,6 +408,7 @@ typedef struct {
     int early_started;
     pthread_t early_thread;
     int early_result;
+    int retire_before_upgrade;
 } fake_nat;
 
 static fake_nat nat = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
@@ -437,6 +439,7 @@ static void nat_reset_state(void)
     nat.early_frame = 0;
     nat.early_started = 0;
     nat.early_result = 99;
+    nat.retire_before_upgrade = 0;
     pthread_mutex_unlock(&nat.lock);
 }
 
@@ -537,6 +540,7 @@ static int fake_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     st_admin_direct_ws_retain(request->stream);
     nat.opened = 1;
     int early = nat.early_frame;
+    int retire = nat.retire_before_upgrade;
     pthread_cond_broadcast(&nat.cond);
     pthread_mutex_unlock(&nat.lock);
     if (early && pthread_create(&nat.early_thread, NULL, early_deliver, NULL) == 0) {
@@ -544,6 +548,7 @@ static int fake_ws_open(void *ctx, const st_admin_direct_ws_request *request)
         /* Let the early frame reach the stream before the 101 response is written. */
         sleep_ms(150);
     }
+    if (retire) st_admin_direct_ws_retire(request->stream);
     return 0;
 }
 
@@ -1518,6 +1523,74 @@ static int test_handshake_gate(void)
     return session_finish(fd);
 }
 
+static int test_retire_before_upgrade(void)
+{
+    pthread_mutex_lock(&nat.lock);
+    nat.early_frame = 1;
+    nat.retire_before_upgrade = 1;
+    pthread_mutex_unlock(&nat.lock);
+    long long started = now_ms();
+    int fd = browser_connect();
+    CHECK(fd < 0, "a retired stream emitted 101");
+    CHECK(nat_wait_ended(WAIT_MS) == 0, "pre-upgrade retirement did not finish");
+    CHECK(now_ms() - started < 2000, "pre-upgrade retirement waited for the normal socket timeout");
+    pthread_mutex_lock(&nat.lock);
+    int early = nat.early_started;
+    pthread_mutex_unlock(&nat.lock);
+    CHECK(early, "early sender was not created");
+    pthread_join(nat.early_thread, NULL);
+    pthread_mutex_lock(&nat.lock);
+    nat.early_started = 0;
+    int result = nat.early_result;
+    pthread_mutex_unlock(&nat.lock);
+    CHECK(result == ST_ADMIN_DIRECT_WS_ACCEPTED, "captured pre-101 frame failed to leave the retired handshake");
+    nat_reset_state();
+    return 0;
+}
+
+static int test_retired_reference_cannot_shutdown_reused_fd(void)
+{
+    int browser;
+    if (session_open(&browser)) return 1;
+    st_admin_direct_ws_stream *retained = nat_acquire();
+    CHECK(retained != NULL, "retain old stream");
+    struct sockaddr_in browser_local;
+    socklen_t size = sizeof(browser_local);
+    CHECK(getsockname(browser, (struct sockaddr *)&browser_local, &size) == 0, "browser endpoint");
+    int owner_fd = -1;
+    /* This admin fixture and browser live in the same test process. Identify the actual server
+     * endpoint, not a guessed fd or a different peer's socket. No descriptor is closed here. */
+    for (int candidate = 3; candidate < 4096; ++candidate) {
+        struct sockaddr_in local, peer;
+        socklen_t local_size = sizeof(local), peer_size = sizeof(peer);
+        if (getsockname(candidate, (struct sockaddr *)&local, &local_size) == 0 && local.sin_family == AF_INET
+            && ntohs(local.sin_port) == admin_port && getpeername(candidate, (struct sockaddr *)&peer, &peer_size) == 0
+            && peer.sin_family == AF_INET && peer.sin_port == browser_local.sin_port) { owner_fd = candidate; break; }
+    }
+    CHECK(owner_fd >= 0, "actual browser server fd not found");
+    CHECK(browser_send_close(browser, 1000U, "") == 0, "browser close");
+    if (browser_expect_close(browser, 1000U, "") || browser_expect_eof(browser) || session_finish(browser)) return 1;
+    long long deadline = now_ms() + WAIT_MS;
+    while (fcntl(owner_fd, F_GETFD) != -1 && now_ms() < deadline) sleep_ms(1);
+    CHECK(fcntl(owner_fd, F_GETFD) == -1 && errno == EBADF, "browser owner has not actually closed fd");
+    int pair[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "owned fd-reuse fixture");
+    if (pair[0] != owner_fd && pair[1] != owner_fd) {
+        /* Only overwrite the verified-closed target in this isolated test process. */
+        CHECK(fcntl(owner_fd, F_GETFD) == -1 && errno == EBADF, "fd target unexpectedly acquired an owner");
+        CHECK(dup2(pair[0], owner_fd) == owner_fd, "force actual fd reuse");
+        close(pair[0]); pair[0] = owner_fd;
+    }
+    st_admin_direct_ws_retire(retained);
+    st_admin_direct_ws_retire(retained); /* Idempotent, even after descriptor reuse. */
+    const uint8_t byte = 0x5a; uint8_t received = 0;
+    int intact = send(pair[0], &byte, 1, MSG_NOSIGNAL) == 1 && recv(pair[1], &received, 1, 0) == 1 && received == byte
+        && send(pair[1], &byte, 1, MSG_NOSIGNAL) == 1 && recv(pair[0], &received, 1, 0) == 1 && received == byte;
+    close(pair[0]); close(pair[1]); st_admin_direct_ws_release(retained);
+    CHECK(intact, "retained old stream shut down an unrelated reused fd");
+    return 0;
+}
+
 static int test_close_credit_timeout(void)
 {
     /* With the client withholding credit, the browser's CLOSE cannot be forwarded; after the close
@@ -1594,6 +1667,8 @@ int main(void)
         {"client message limit", test_client_message_limit},
         {"client fragments and control frames", test_client_fragments_and_control},
         {"handshake gate", test_handshake_gate},
+        {"retirement before upgrade", test_retire_before_upgrade},
+        {"retained retirement reference cannot shut down a reused fd", test_retired_reference_cannot_shutdown_reused_fd},
         {"close credit timeout", test_close_credit_timeout},
     };
     for (size_t i = 0U; i < sizeof(tests) / sizeof(tests[0]); ++i) {

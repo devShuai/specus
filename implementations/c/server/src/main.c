@@ -181,6 +181,9 @@ typedef struct direct_http_event {
 typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
+    int link_lost; /* Terminal independently of allocating an error string. */
+    int callback_active; /* direct_lock: abort only an in-flight sink write; otherwise return 502. */
+    const st_admin_direct_http_sink *sink; /* Valid until pending removal under direct_lock. */
     int response_started;
     /* Either side reset the stream; frames the client sent before it saw an RST are dropped. */
     int reset;
@@ -305,6 +308,7 @@ static int server_stopping = 0;
 
 static char *json_http_request(const st_direct_http_request *request);
 static void retire_data_namespace(specus_session *session);
+static void direct_pending_free_events(direct_http_pending *pending);
 static char *json_http_request_fin(const st_direct_http_request *request, int *failed);
 static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason);
@@ -1389,9 +1393,13 @@ static void direct_pending_fail_all(specus_session *session, const char *message
     session->direct_retired = 1;
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
         if (!pending->done) {
+            pending->link_lost = 1;
+            direct_pending_free_events(pending);
             free(pending->error);
             pending->error = dup_string(message);
             pending->done = 1;
+            if (pending->callback_active && pending->sink != NULL && pending->sink->on_link_lost != NULL)
+                pending->sink->on_link_lost(pending->sink->ctx);
             pthread_cond_broadcast(&pending->cond);
         }
     }
@@ -1548,6 +1556,10 @@ static direct_http_event *direct_pending_pop(direct_http_pending *pending)
 static int process_direct_http_message(specus_session *session, const st_nat_message *message)
 {
     pthread_mutex_lock(&session->direct_lock);
+    if (session->direct_retired) {
+        pthread_mutex_unlock(&session->direct_lock);
+        return 1; /* A frame admitted before detach cannot re-populate a retired namespace. */
+    }
     direct_http_pending *pending = find_direct_pending_locked(session, message->stream_id);
     if (pending == NULL) {
         pthread_mutex_unlock(&session->direct_lock);
@@ -2119,6 +2131,7 @@ static int direct_http_forward(void *ctx,
 
     direct_http_pending pending;
     memset(&pending, 0, sizeof(pending));
+    pending.sink = sink;
     pending.send_credit = ST_STREAM_INITIAL_WINDOW;
     pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
     pthread_cond_init(&pending.cond, NULL);
@@ -2213,7 +2226,7 @@ static int direct_http_forward(void *ctx,
     int delivered_head = 0;
     for (;;) {
         pthread_mutex_lock(&session->direct_lock);
-        while (pending.events_head == NULL && pending.error == NULL && !pending.cancelled
+        while (pending.events_head == NULL && pending.error == NULL && !pending.cancelled && !pending.link_lost
                && !(pending.done && pending.response_started)) {
             int rc = delivered_head
                 ? pthread_cond_wait(&pending.cond, &session->direct_lock)
@@ -2224,14 +2237,22 @@ static int direct_http_forward(void *ctx,
             }
         }
         int cancelled = pending.cancelled;
+        int link_lost = pending.link_lost;
         int already_reset = pending.reset;
-        direct_http_event *event = result == 0 && !cancelled ? direct_pending_pop(&pending) : NULL;
+        direct_http_event *event = result == 0 && !cancelled && !link_lost
+            ? direct_pending_pop(&pending) : NULL;
+        pending.callback_active = event != NULL;
         char *pending_error = !cancelled && event == NULL && pending.error != NULL
             ? dup_string(pending.error) : NULL;
         int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
+        if (link_lost) {
+            free(pending_error);
+            result = -1;
+            break;
+        }
         if (cancelled) {
             if (!already_reset) {
                 send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE,
@@ -2290,7 +2311,13 @@ static int direct_http_forward(void *ctx,
                 pthread_mutex_unlock(&session->direct_lock);
                 if (result == 0
                     && send_window_update(session, pending.stream_id, event->data_len) != 0) {
-                    result = -1;
+                    pthread_mutex_lock(&session->direct_lock);
+                    /* A complete response received before detach may drain its already-admitted
+                     * events. Its retired transport no longer needs replenished receive credit. */
+                    int completed_before_detach = pending.done && !pending.reset && !pending.link_lost
+                        && atomic_load(&session->nat_retired);
+                    pthread_mutex_unlock(&session->direct_lock);
+                    if (!completed_before_detach) result = -1;
                 }
             }
         } else if (event->type == ST_NAT_FIN) {
@@ -2309,6 +2336,10 @@ static int direct_http_forward(void *ctx,
             break;
         }
         direct_event_free(event);
+        pthread_mutex_lock(&session->direct_lock);
+        pending.callback_active = 0;
+        if (pending.link_lost && result == 0) result = -1;
+        pthread_mutex_unlock(&session->direct_lock);
         if (result != 0) {
             send_reset(session, pending.stream_id, 31U, "HTTP downstream closed");
             break;
@@ -2455,7 +2486,7 @@ static void connectivity_probe(void *ctx,
             deadline.tv_nsec -= 1000000000L;
         }
         pthread_mutex_lock(&session->direct_lock);
-        while (pending.events_head == NULL && pending.error == NULL) {
+        while (pending.events_head == NULL && pending.error == NULL && !pending.link_lost) {
             if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
                 break;
             }
@@ -2476,7 +2507,7 @@ static void connectivity_probe(void *ctx,
         } else if (pending.error != NULL && pending.client_reset) {
             answer->kind = ST_CONNECTIVITY_PROBE_RESET;
             snprintf(answer->failure, sizeof(answer->failure), "%s", pending.failure);
-        } else if (pending.error != NULL) {
+        } else if (pending.error != NULL || pending.link_lost) {
             /* The data connection closed or was replaced, which fails every pending stream. */
             answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
         } else {
@@ -4025,7 +4056,7 @@ static void free_ws_conn(ws_conn *conn)
 static st_admin_direct_ws_stream *acquire_ws_stream(specus_session *session, uint32_t stream_id)
 {
     pthread_mutex_lock(&session->map_lock);
-    ws_conn *ws = find_ws_stream_locked(session, stream_id);
+    ws_conn *ws = atomic_load(&session->nat_retired) ? NULL : find_ws_stream_locked(session, stream_id);
     st_admin_direct_ws_stream *stream = ws == NULL ? NULL : ws->stream;
     st_admin_direct_ws_retain(stream);
     pthread_mutex_unlock(&session->map_lock);
@@ -4217,7 +4248,7 @@ static void external_worker_finished(external_conn *conn, int writer)
 }
 
 /* Called before a successor is published, and before teardown waits for retained HTTP callers.
- * No socket writes, SQL or thread joins under the registry lock. A listener's descriptor remains
+ * No blocking socket writes, SQL or thread joins under the registry lock. A listener's descriptor remains
  * owned by its binder/accept thread: shutdown releases LISTEN without fd-reuse races. A binder
  * already outside map_lock can finish bind, but the same lock forbids its subsequent listen.
  * Closing each stream returns its quota exactly once, even if an old worker finally runs later. */
@@ -4231,6 +4262,15 @@ static void retire_data_namespace(specus_session *session)
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
         close_conn_locked(conn);
+    }
+    ws_conn *ws = session->ws_conns;
+    session->ws_conns = NULL;
+    while (ws != NULL) {
+        ws_conn *next = ws->next;
+        st_stream_tombstones_add(&session->closed_streams, ws->stream_id);
+        st_admin_direct_ws_retire(ws->stream);
+        free_ws_conn(ws);
+        ws = next;
     }
     pthread_mutex_unlock(&session->map_lock);
     direct_pending_fail_all(session, "data connection retired");

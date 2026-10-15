@@ -62,6 +62,9 @@ typedef struct {
      * ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED.
      */
     void (*bind_cancel)(void *ctx, void (*cancel)(void *cancel_ctx), void *cancel_ctx);
+    /* Optional, nonblocking and non-reentrant: abort an unfinished browser exchange when its
+     * DATA namespace retires. Called only while the forwarder still owns this sink/context. */
+    void (*on_link_lost)(void *ctx);
 } st_admin_direct_http_sink;
 
 /*
@@ -348,6 +351,9 @@ void st_admin_direct_ws_peer_reset(st_admin_direct_ws_stream *stream);
 int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32_t credit);
 /* The control connection is gone: the browser is closed with 1001 and the socket is dropped. */
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream);
+/* Irreversibly cut a retired DATA namespace without waiting for a blocked browser writer.
+ * Best-effort nonblocking CLOSE 1001 when uncontended; otherwise abort the transport. */
+void st_admin_direct_ws_retire(st_admin_direct_ws_stream *stream);
 void st_admin_direct_ws_retain(st_admin_direct_ws_stream *stream);
 void st_admin_direct_ws_release(st_admin_direct_ws_stream *stream);
 
