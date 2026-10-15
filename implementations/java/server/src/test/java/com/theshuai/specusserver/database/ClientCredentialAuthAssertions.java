@@ -157,6 +157,7 @@ final class ClientCredentialAuthAssertions {
         PeerSessionCurrentAssertions.verify(context, independent);
         PeerSignalCommitAssertions.verify(context, independent);
         PeerReadSnapshotAssertions.verify(context, independent);
+        ClientMessageRelayAssertions.verify(context, independent);
     }
 
     private static void verifyManagementWrites(ConfigurableApplicationContext context, DataSource independent,

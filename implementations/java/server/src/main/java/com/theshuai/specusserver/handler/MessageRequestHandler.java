@@ -1,12 +1,12 @@
 package com.theshuai.specusserver.handler;
 
 import com.theshuai.common.protocol.request.MessageRequestPacket;
-import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.session.Session;
+import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.management.model.ClientAccount;
 import com.theshuai.specusserver.management.service.ClientAccountService;
-import com.theshuai.specusserver.management.service.PeerMeshService;
+import com.theshuai.specusserver.management.service.ClientMessageRelayService;
 import com.theshuai.specusserver.management.service.PeerSignalService;
 import com.theshuai.specusserver.session.SessionUtil;
 import com.theshuai.specusserver.websocket.ClientMessagesWebSocketHandler;
@@ -28,16 +28,16 @@ import org.springframework.util.StringUtils;
 public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRequestPacket> {
     private final PeerSignalService peerSignalService;
     private final ClientAccountService clientAccountService;
-    private final PeerMeshService peerMeshService;
+    private final ClientMessageRelayService clientMessageRelayService;
     private final ClientMessagesWebSocketHandler clientMessagesWebSocketHandler;
 
     public MessageRequestHandler(PeerSignalService peerSignalService,
                                  ClientAccountService clientAccountService,
-                                 PeerMeshService peerMeshService,
+                                 ClientMessageRelayService clientMessageRelayService,
                                  ClientMessagesWebSocketHandler clientMessagesWebSocketHandler) {
         this.peerSignalService = peerSignalService;
         this.clientAccountService = clientAccountService;
-        this.peerMeshService = peerMeshService;
+        this.clientMessageRelayService = clientMessageRelayService;
         this.clientMessagesWebSocketHandler = clientMessagesWebSocketHandler;
     }
 
@@ -46,7 +46,7 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
         Session session = SessionUtil.getSession(ctx.channel());
 
         switch (messageRequestPacket.getMessageType()) {
-            case CLIENT_TO_CLIENT -> clientToClient(messageRequestPacket, session);
+            case CLIENT_TO_CLIENT -> clientToClient(messageRequestPacket, session, ctx.channel());
             case CLIENT_TO_SERVER -> clientToServer(messageRequestPacket, session);
             case SERVER_TO_CLIENT -> serverToClient(messageRequestPacket, session);
             case PEER_CONTROL -> peerControl(messageRequestPacket, session, ctx.channel());
@@ -65,8 +65,9 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
         }
     }
 
-    private void clientToClient(MessageRequestPacket messageRequestPacket, Session session) {
-        if (session == null || !StringUtils.hasText(session.getClientName())) {
+    private void clientToClient(MessageRequestPacket messageRequestPacket, Session session, Channel incoming) {
+        if (session == null || !StringUtils.hasText(session.getClientName()) || !incoming.isActive()
+                || SessionUtil.getChannel(session.getClientName()) != incoming || SessionUtil.getSession(incoming) != session) {
             log.warn("client->client rejected: unauthenticated sender");
             return;
         }
@@ -80,56 +81,24 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
             return;
         }
 
-        ClientAccount source = clientAccountService.findClientByName(session.getClientName())
-                .orElse(null);
         String targetName = messageRequestPacket.getToClientName().trim();
-        if (source == null || !source.isEnabled()) {
+        if (!targetName.regionMatches(true, 0, "admin:", 0, "admin:".length())) {
+            try {
+                clientMessageRelayService.submit(messageRequestPacket, session, incoming);
+            } catch (RuntimeException rejected) {
+                log.warn("client->client rejected: source={}, target={}, reason={}", session.getClientName(), targetName, rejected.getClass().getSimpleName());
+            }
+            return;
+        }
+        ClientAccount source = clientAccountService.findClientByName(session.getClientName()).orElse(null);
+        if (source == null || !source.isEnabled() || !source.getTenantId().equals(incoming.attr(ServerAttributes.TENANT_ID).get())) {
             log.warn("client->client rejected: source account unavailable, source={}", session.getClientName());
             return;
         }
-        if (targetName.regionMatches(true, 0, "admin:", 0, "admin:".length())) {
-            boolean delivered = clientMessagesWebSocketHandler.deliverFromClient(
-                    source, targetName, messageRequestPacket.getMessage());
-            log.info("client->admin websocket {}: source={}, target={}",
-                    delivered ? "delivered" : "not-delivered",
-                    source.getClientName(), targetName);
-            return;
-        }
-        ClientAccount target = clientAccountService.findClientByName(messageRequestPacket.getToClientName().trim())
-                .orElse(null);
-        if (target == null || !target.isEnabled()) {
-            log.warn("client->client rejected: source/target account unavailable, source={}, target={}",
-                    session.getClientName(), messageRequestPacket.getToClientName());
-            return;
-        }
-        if (!peerMeshService.canPeer(source, target)) {
-            log.warn("client->client rejected: peer access denied, source={}, target={}",
-                    source.getClientName(), target.getClientName());
-            return;
-        }
-
-        MessageResponsePacket messageResponsePacket = new MessageResponsePacket();
-        messageResponsePacket.setClientName(source.getClientName());
-        messageResponsePacket.setToClientName(target.getClientName());
-        messageResponsePacket.setMessageType(MessageType.CLIENT_TO_CLIENT);
-        messageResponsePacket.setMessage(messageRequestPacket.getMessage());
-
-        Channel toClientChannel = SessionUtil.getChannel(target.getClientName());
-
-        if (toClientChannel != null && SessionUtil.hasLogin(toClientChannel)) {
-            toClientChannel.writeAndFlush(messageResponsePacket).addListener(future -> {
-                if (future.isSuccess()) {
-                    log.info("client->client fallback delivered: source={}, target={}",
-                            source.getClientName(), target.getClientName());
-                } else if (future.cause() != null) {
-                    log.warn("client->client fallback delivery failed: source={}, target={}, reason={}",
-                            source.getClientName(), target.getClientName(), future.cause().getMessage());
-                }
-            });
-        } else {
-            log.info("client->client fallback target offline: source={}, target={}",
-                    source.getClientName(), target.getClientName());
-        }
+        boolean delivered = clientMessagesWebSocketHandler.deliverFromClient(
+                source, targetName, messageRequestPacket.getMessage());
+        log.info("client->admin websocket {}: source={}, target={}",
+                delivered ? "delivered" : "not-delivered", source.getClientName(), targetName);
     }
 
     private void serverToClient(MessageRequestPacket messageRequestPacket, Session session) {
