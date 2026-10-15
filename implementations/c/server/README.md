@@ -87,6 +87,20 @@ Every attempt retains the 64-source bound and 25ms SQLite busy budget. Database 
 still delay detection: neither the cadence nor retries promise a global retirement deadline.
 This is bounded periodic detection, not an atomic cross-instance catalog-publication fence.
 
+Service reports reserve an invisible, bounded cache stage before opening the native writer.
+The report's physical CONTROL identity, current account/device/sharing policy, audit insertion,
+and audit retention are checked in one SQLite transaction. Only a successful commit publishes
+the staged raw revision, rate window, statistics, mDNS candidates, and output revision; rejection
+discards the stage without changing the last committed cohort. A policy/source change caused by
+an audit trigger is rolled back as a failed operation, not treated as permanent CONTROL loss.
+No cache mutex or socket I/O is held across that transaction. Conflicting cache mutations fail
+or remain queued for retry rather than clearing a reserved cell.
+
+This acceptance boundary does not yet fence every later cache read, replay, or recipient push
+against a cross-instance takeover after commit. The online-peer hint is also obtained before the
+writer, not from a single transactional recipient-policy snapshot. These remain separate
+alignment work; shared SQLite does not currently provide atomic distributed catalog publication.
+
 ## Build
 
 ```bash

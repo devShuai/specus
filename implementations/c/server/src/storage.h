@@ -1512,6 +1512,22 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
                                               long long session_id,
                                               const char *service_id,
                                               const char *reason);
+/* The stage callback mutates only caller-owned, invisible memory. It must not perform SQL,
+ * socket I/O, or acquire/wait for registry/CID/cache locks. Reserve cache resources BEFORE
+ * calling; publish them only after this function commits successfully, otherwise discard.
+ * Current client/device/sharing and the immutable physical source are read under the same
+ * native writer as the audit insert+retention. A rolled-back authority change returns -1,
+ * not permanent retirement. The unguarded entrypoint is for explicit trusted service calls. */
+typedef int (*st_storage_peer_service_report_stage_fn)(void *context,
+    const st_storage_client *current, const st_storage_peer_mesh_device *device,
+    const st_storage_peer_mesh_service_sharing *sharing, const char **audit_reason);
+int st_storage_commit_peer_service_report(const char *path, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client);
+int st_storage_commit_peer_service_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client);
 int st_storage_list_peer_mesh_service_audits(const char *path,
                                              const char *tenant_id,
                                              st_storage_peer_mesh_service_audit *events,

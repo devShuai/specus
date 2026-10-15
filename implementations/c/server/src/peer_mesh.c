@@ -86,6 +86,11 @@ typedef struct {
     size_t stats_count;
     st_peer_mesh_mdns_candidate *mdns_candidates;
     size_t mdns_count;
+    /* Internal reservation only: readers continue to see the committed cohort. */
+    void *pending_report;
+    char database_path[512];
+    int has_control_source;
+    st_storage_control_source control_source;
 } pm_catalog;
 
 static pm_catalog peer_catalogs[ST_PEER_MESH_MAX_CATALOGS];
@@ -1268,36 +1273,159 @@ static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
     return rc;
 }
 
-static pm_catalog *pm_find_or_allocate_catalog_locked(const st_storage_client *source,
-                                                       long long session_id,
-                                                       time_t now)
+typedef struct {
+    const st_peer_mesh_runtime *runtime;
+    const pm_catalog *incoming;
+    const char *instance_id;
+    st_peer_mesh_mdns_candidate *incoming_mdns;
+    size_t incoming_mdns_count;
+    long long revision, ttl;
+    int report_enabled, online_hint, outcome, advances, reserved;
+    pm_catalog *slot;
+    pm_catalog staged;
+} pm_report_lease;
+
+/* Only immutable reservation identity is read here; the SQL callback changes other staged
+ * fields without a cache lock. Even a previously empty/expired slot has an owned pending key. */
+static int pm_pending_report_for(const pm_catalog *catalog, long long cid, const char *tenant, long long sid)
 {
-    pm_catalog *free_slot = NULL;
+    const pm_report_lease *lease = catalog->pending_report;
+    return lease != NULL && lease->staged.publisher_client_id == cid
+        && (sid <= 0 || lease->staged.publisher_session_id == sid)
+        && strcmp(lease->staged.tenant_id, tenant) == 0;
+}
+
+static int pm_same_control_source(const pm_catalog *catalog, const st_storage_control_source *source)
+{
+    if (catalog->has_control_source != (source != NULL)) return 0;
+    if (source == NULL) return 1; /* Explicit trusted service call, not network fallback. */
+    const st_storage_control_source *old = &catalog->control_source;
+    return old->client_id == source->client_id && old->session_id == source->session_id
+        && !strncmp(old->tenant_id, source->tenant_id, sizeof(old->tenant_id))
+        && !strncmp(old->client_name, source->client_name, sizeof(old->client_name))
+        && !strncmp(old->channel_id, source->channel_id, sizeof(old->channel_id))
+        && !strncmp(old->token_hash, source->token_hash, sizeof(old->token_hash));
+}
+
+/* Reserve a bounded cell and future output-clock budget BEFORE taking the native writer.
+ * A lease is nonblocking: no cache mutex is retained while waiting for SQLite or sockets.
+ * Even eviction of an expired other publisher remains private until the native commit. */
+static int pm_report_prepare(pm_report_lease *lease, const st_storage_client *source)
+{
+    const st_peer_mesh_runtime *runtime = lease->runtime;
+    if (!pm_has_text(runtime->database_path) || strlen(runtime->database_path) >= 512U) return -1;
+    time_t now = time(NULL); pm_catalog *slot = NULL, *unused = NULL; int existing = 0;
+    pthread_mutex_lock(&peer_catalog_lock);
     for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
-        if (catalog->in_use
-            && catalog->publisher_client_id == source->id
-            && catalog->publisher_session_id == session_id
-            && strcmp(catalog->tenant_id, source->tenant_id) == 0) return catalog;
-        if (!catalog->in_use || catalog->expires_at < now) free_slot = catalog;
+        if (pm_pending_report_for(catalog, source->id, source->tenant_id, runtime->publisher_session_id)) {
+            pthread_mutex_unlock(&peer_catalog_lock); return -1;
+        }
+        if (catalog->in_use && catalog->publisher_client_id == source->id
+            && catalog->publisher_session_id == runtime->publisher_session_id
+            && !strcmp(catalog->tenant_id, source->tenant_id)) { slot = catalog; existing = 1; break; }
+        if (catalog->pending_report == NULL && (!catalog->in_use || catalog->expires_at < now)) unused = catalog;
     }
-    if (free_slot != NULL) {
-        free(free_slot->mdns_candidates);
-        memset(free_slot, 0, sizeof(*free_slot));
-        free_slot->in_use = 1;
-        snprintf(free_slot->tenant_id, sizeof(free_slot->tenant_id), "%s", source->tenant_id);
-        free_slot->publisher_client_id = source->id;
-        snprintf(free_slot->publisher_client_name, sizeof(free_slot->publisher_client_name),
-                 "%s", source->client_name);
-        free_slot->publisher_session_id = session_id;
+    if (slot == NULL) slot = unused;
+    if (slot == NULL || slot->pending_report != NULL
+        || (existing && *slot->database_path && strcmp(slot->database_path, runtime->database_path))) {
+        pthread_mutex_unlock(&peer_catalog_lock); return -1;
     }
-    return free_slot;
+    if (existing && pm_same_control_source(slot, runtime->control_source)) lease->staged = *slot;
+    else {
+        memset(&lease->staged, 0, sizeof(lease->staged));
+        if (existing) lease->staged.catalog_revision = slot->catalog_revision;
+    }
+    pm_catalog *staged = &lease->staged;
+    staged->pending_report = NULL; staged->in_use = 1;
+    snprintf(staged->database_path, sizeof(staged->database_path), "%s", runtime->database_path);
+    snprintf(staged->tenant_id, sizeof(staged->tenant_id), "%s", source->tenant_id);
+    snprintf(staged->publisher_client_name, sizeof(staged->publisher_client_name), "%s", source->client_name);
+    staged->publisher_client_id = source->id; staged->publisher_session_id = runtime->publisher_session_id;
+    staged->has_control_source = runtime->control_source != NULL;
+    if (runtime->control_source != NULL) staged->control_source = *runtime->control_source;
+    /* Duplicates consume the valid source's rate window, but require no new wire revision. */
+    if (lease->revision > staged->report_revision) {
+        long long floor = peer_catalog_sequence > staged->catalog_revision ? peer_catalog_sequence : staged->catalog_revision;
+        if (floor >= LLONG_MAX - (long long)peer_catalog_reserved_revisions) {
+            pthread_mutex_unlock(&peer_catalog_lock); return -1;
+        }
+        ++peer_catalog_reserved_revisions; lease->reserved = 1;
+    }
+    slot->pending_report = lease; lease->slot = slot;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    return 0;
+}
+
+static void pm_report_abort(pm_report_lease *lease)
+{
+    if (lease->slot == NULL) return;
+    pthread_mutex_lock(&peer_catalog_lock);
+    if (lease->slot->pending_report == lease) lease->slot->pending_report = NULL;
+    if (lease->reserved) { --peer_catalog_reserved_revisions; lease->reserved = 0; }
+    lease->slot = NULL;
+    pthread_mutex_unlock(&peer_catalog_lock);
+}
+
+/* Called inside the guarded SQLite writer: private memory and clocks only, no SQL, locks or I/O. */
+static int pm_report_stage(void *context, const st_storage_client *current,
+    const st_storage_peer_mesh_device *device, const st_storage_peer_mesh_service_sharing *sharing,
+    const char **reason)
+{
+    pm_report_lease *lease = context; pm_catalog *staged = &lease->staged;
+    if (!pm_rate_window_admit(&staged->rate, pm_monotonic_ms(), ST_PEER_REPORT_RATE_LIMIT, 60000LL)) {
+        lease->outcome = 2; *reason = "rate-limited"; return 0;
+    }
+    if (lease->revision <= staged->report_revision) {
+        lease->outcome = 1; *reason = "ignored-revision"; return 0;
+    }
+    if (!lease->reserved) return -1;
+    int sharing_enabled = sharing->enabled && device->enabled;
+    staged->active = lease->report_enabled && sharing_enabled && lease->online_hint;
+    staged->report_revision = lease->revision; lease->advances = 1;
+    staged->generated_at = time(NULL); staged->expires_at = staged->generated_at + (time_t)lease->ttl;
+    snprintf(staged->publisher_client_name, sizeof(staged->publisher_client_name), "%s", current->client_name);
+    snprintf(staged->instance_id, sizeof(staged->instance_id), "%s", lease->instance_id == NULL ? "" : lease->instance_id);
+    staged->service_count = lease->incoming->service_count;
+    memcpy(staged->service_ids, lease->incoming->service_ids, sizeof(staged->service_ids));
+    staged->stats_count = lease->incoming->stats_count;
+    memcpy(staged->stats, lease->incoming->stats, sizeof(staged->stats));
+    staged->mdns_candidates = staged->active && sharing->mdns_import_enabled ? lease->incoming_mdns : NULL;
+    staged->mdns_count = staged->mdns_candidates == NULL ? 0U : lease->incoming_mdns_count;
+    *reason = staged->active ? (staged->service_count == 0U ? "empty" : "published")
+        : (!lease->report_enabled || !sharing_enabled ? "withdrawn" : "no-authorized-peer");
+    return 0;
+}
+
+static int pm_report_commit(pm_report_lease *lease, pm_catalog *snapshot)
+{
+    pthread_mutex_lock(&peer_catalog_lock);
+    if (lease->slot == NULL || lease->slot->pending_report != lease) {
+        pthread_mutex_unlock(&peer_catalog_lock); pm_report_abort(lease); return -1;
+    }
+    if (lease->reserved) { --peer_catalog_reserved_revisions; lease->reserved = 0; }
+    if (lease->advances) {
+        lease->staged.catalog_revision = pm_next_catalog_revision_locked(lease->staged.catalog_revision);
+        if (lease->staged.catalog_revision == 0) {
+            lease->slot->pending_report = NULL; lease->slot = NULL;
+            pthread_mutex_unlock(&peer_catalog_lock); return -1;
+        }
+    }
+    st_peer_mesh_mdns_candidate *old_mdns = lease->slot->mdns_candidates;
+    lease->staged.pending_report = NULL;
+    *lease->slot = lease->staged; *snapshot = lease->staged;
+    if (old_mdns != snapshot->mdns_candidates) free(old_mdns);
+    if (snapshot->mdns_candidates == lease->incoming_mdns) lease->incoming_mdns = NULL;
+    lease->slot = NULL;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    return 0;
 }
 
 static pm_catalog *pm_find_catalog_locked(long long cid, const char *tenant, long long sid)
 {
     for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
+        if (pm_pending_report_for(catalog, cid, tenant, sid)) return catalog;
         if (catalog->in_use && catalog->publisher_client_id == cid && catalog->publisher_session_id == sid
             && strcmp(catalog->tenant_id, tenant) == 0) return catalog;
     }
@@ -1315,9 +1443,11 @@ int st_peer_mesh_control_connected_prepare(const st_peer_mesh_runtime *runtime,
         || runtime->authenticated_client_id <= 0 || !pm_has_text(runtime->authenticated_tenant)
         || strlen(runtime->authenticated_tenant) >= 64U || !pm_has_text(client_name) || strlen(client_name) >= 256U) return -1;
     pthread_mutex_lock(&peer_catalog_lock);
-    int found = pm_find_catalog_locked(runtime->authenticated_client_id, runtime->authenticated_tenant,
-                                      runtime->publisher_session_id) != NULL;
+    pm_catalog *found_catalog = pm_find_catalog_locked(runtime->authenticated_client_id, runtime->authenticated_tenant,
+                                      runtime->publisher_session_id);
+    int found = found_catalog != NULL, busy = found_catalog != NULL && found_catalog->pending_report != NULL;
     pthread_mutex_unlock(&peer_catalog_lock);
+    if (busy) return -1;
     if (!found) return 0;
     st_peer_mesh_control_transition *item = calloc(1, sizeof(*item));
     if (item == NULL) return -1;
@@ -1327,9 +1457,10 @@ int st_peer_mesh_control_connected_prepare(const st_peer_mesh_runtime *runtime,
     item->publisher_client_id = runtime->authenticated_client_id;
     item->publisher_session_id = runtime->publisher_session_id;
     pthread_mutex_lock(&peer_catalog_lock);
-    found = pm_find_catalog_locked(item->publisher_client_id, item->tenant_id, item->publisher_session_id) != NULL;
+    found_catalog = pm_find_catalog_locked(item->publisher_client_id, item->tenant_id, item->publisher_session_id);
+    found = found_catalog != NULL;
     if (!found) { pthread_mutex_unlock(&peer_catalog_lock); free(item); return 0; }
-    if (peer_control_withdrawal_count >= ST_PEER_MESH_MAX_CATALOGS
+    if (found_catalog->pending_report != NULL || peer_control_withdrawal_count >= ST_PEER_MESH_MAX_CATALOGS
         || peer_catalog_sequence >= LLONG_MAX - (long long)peer_catalog_reserved_revisions) {
         pthread_mutex_unlock(&peer_catalog_lock); free(item); return -1;
     }
@@ -1356,9 +1487,10 @@ int st_peer_mesh_control_connected_commit(st_peer_mesh_control_transition *item)
     pthread_mutex_lock(&peer_catalog_lock);
     --peer_catalog_reserved_revisions;
     pm_catalog *catalog = pm_find_catalog_locked(item->publisher_client_id, item->tenant_id, item->publisher_session_id);
-    if (catalog == NULL) {
+    if (catalog == NULL || catalog->pending_report != NULL) {
         --peer_control_withdrawal_count;
-        pthread_mutex_unlock(&peer_catalog_lock); free(item); return 0;
+        int rc = catalog == NULL ? 0 : -1;
+        pthread_mutex_unlock(&peer_catalog_lock); free(item); return rc;
     }
     item->revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
     if (item->revision == 0) {
@@ -1447,7 +1579,7 @@ int st_peer_mesh_catalogs_occupy_for_testing(size_t count)
     pthread_mutex_lock(&peer_catalog_lock);
     for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS && occupied < count; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
-        if (catalog->in_use && catalog->expires_at >= now) continue;
+        if (catalog->pending_report != NULL || (catalog->in_use && catalog->expires_at >= now)) continue;
         free(catalog->mdns_candidates);
         memset(catalog, 0, sizeof(*catalog));
         catalog->in_use = 1;
@@ -1506,80 +1638,34 @@ static int pm_handle_service_report(const st_peer_mesh_runtime *runtime,
         free(instance_id);
         return -1;
     }
-    st_storage_peer_mesh_service_sharing sharing = {0};
-    int sharing_enabled = st_storage_get_peer_mesh_service_sharing(runtime->database_path,
-        source->tenant_id, &sharing) == 0 && sharing.enabled && source_device->enabled;
-    int active = report_enabled && sharing_enabled && pm_has_authorized_online_peer(runtime, source);
-    st_peer_mesh_mdns_candidate *mdns_copy = NULL;
-    if (active && sharing.mdns_import_enabled && incoming_mdns_count > 0U) {
-        mdns_copy = (st_peer_mesh_mdns_candidate *)calloc(incoming_mdns_count,
-                                                           sizeof(*mdns_copy));
-        if (mdns_copy == NULL) {
+    (void)source_device; /* Enabled/sharing are reloaded under the guarded native writer. */
+    pm_report_lease lease = {.runtime=runtime, .incoming=&incoming, .instance_id=instance_id,
+        .revision=revision, .report_enabled=report_enabled, .incoming_mdns_count=incoming_mdns_count};
+    lease.online_hint = pm_has_authorized_online_peer(runtime, source); /* Never called under SQL/cache locks. */
+    lease.ttl = pm_env_i64("SPECUS_PEER_MESH_CATALOG_TTL_SECONDS", ST_PEER_MESH_CATALOG_TTL_SECONDS);
+    if (lease.ttl < 1 || lease.ttl > 86400) lease.ttl = ST_PEER_MESH_CATALOG_TTL_SECONDS;
+    if (incoming_mdns_count > 0U) {
+        lease.incoming_mdns = calloc(incoming_mdns_count, sizeof(*lease.incoming_mdns));
+        if (lease.incoming_mdns == NULL) {
             free(instance_id);
             return -1;
         }
-        memcpy(mdns_copy, incoming_mdns, incoming_mdns_count * sizeof(*mdns_copy));
+        memcpy(lease.incoming_mdns, incoming_mdns, incoming_mdns_count * sizeof(*lease.incoming_mdns));
     }
-    time_t now = time(NULL);
-    pm_catalog snapshot;
-    pthread_mutex_lock(&peer_catalog_lock);
-    pm_catalog *catalog = pm_find_or_allocate_catalog_locked(source, runtime->publisher_session_id, now);
-    if (catalog == NULL) {
-        pthread_mutex_unlock(&peer_catalog_lock);
-        free(mdns_copy);
-        free(instance_id);
-        return -1;
-    }
-    if (!pm_rate_window_admit(&catalog->rate, pm_monotonic_ms(), ST_PEER_REPORT_RATE_LIMIT, 60000LL)) {
-        pthread_mutex_unlock(&peer_catalog_lock);
-        free(mdns_copy);
-        free(instance_id);
-        (void)st_storage_record_peer_mesh_service_audit(runtime->database_path,
-            "service-report", source->tenant_id, source->id,
-            runtime->publisher_session_id, NULL, "rate-limited");
-        return -1;
-    }
-    if (revision <= catalog->report_revision) {
-        pthread_mutex_unlock(&peer_catalog_lock);
-        free(mdns_copy);
-        free(instance_id);
-        (void)st_storage_record_peer_mesh_service_audit(runtime->database_path,
-            "service-report", source->tenant_id, source->id,
-            runtime->publisher_session_id, NULL, "ignored-revision");
-        return 0;
-    }
-    long long output_revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
-    if (output_revision == 0) {
-        pthread_mutex_unlock(&peer_catalog_lock);
-        free(mdns_copy);
-        free(instance_id);
-        return -1;
-    }
-    catalog->catalog_revision = output_revision;
-    catalog->report_revision = revision;
-    catalog->active = active;
-    catalog->generated_at = now;
-    long long catalog_ttl = pm_env_i64("SPECUS_PEER_MESH_CATALOG_TTL_SECONDS",
-                                       ST_PEER_MESH_CATALOG_TTL_SECONDS);
-    if (catalog_ttl < 1 || catalog_ttl > 86400) catalog_ttl = ST_PEER_MESH_CATALOG_TTL_SECONDS;
-    catalog->expires_at = now + (time_t)catalog_ttl;
-    snprintf(catalog->instance_id, sizeof(catalog->instance_id), "%s", instance_id == NULL ? "" : instance_id);
-    catalog->service_count = incoming.service_count;
-    memcpy(catalog->service_ids, incoming.service_ids, sizeof(catalog->service_ids));
-    catalog->stats_count = incoming.stats_count;
-    memcpy(catalog->stats, incoming.stats, sizeof(catalog->stats));
-    free(catalog->mdns_candidates);
-    catalog->mdns_candidates = mdns_copy;
-    catalog->mdns_count = mdns_copy == NULL ? 0U : incoming_mdns_count;
-    snapshot = *catalog;
-    pthread_mutex_unlock(&peer_catalog_lock);
+    pm_catalog snapshot; st_storage_client committed = {0};
+    int rc = pm_report_prepare(&lease, source);
+    if (rc == 0) rc = runtime->control_source == NULL
+        ? st_storage_commit_peer_service_report(runtime->database_path, source, runtime->publisher_session_id,
+            pm_report_stage, &lease, &committed)
+        : st_storage_commit_peer_service_report_from_control(runtime->database_path, runtime->control_source,
+            source, runtime->publisher_session_id, pm_report_stage, &lease, &committed);
+    if (rc == 0) rc = pm_report_commit(&lease, &snapshot);
+    if (rc != 0) pm_report_abort(&lease);
+    else if (lease.outcome == 2) rc = -1;
+    else if (lease.outcome == 0) rc = pm_fanout_catalog(runtime, &snapshot, &committed);
+    free(lease.incoming_mdns);
     free(instance_id);
-    const char *reason = active ? (snapshot.service_count == 0U ? "empty" : "published")
-        : (!report_enabled || !sharing_enabled ? "withdrawn" : "no-authorized-peer");
-    (void)st_storage_record_peer_mesh_service_audit(runtime->database_path,
-        "service-report", source->tenant_id, source->id,
-        runtime->publisher_session_id, NULL, reason);
-    return pm_fanout_catalog(runtime, &snapshot, source);
+    return rc;
 }
 
 static int pm_replay_catalogs(const st_peer_mesh_runtime *runtime,
@@ -1629,7 +1715,7 @@ int st_peer_mesh_expire_catalogs(const st_peer_mesh_runtime *runtime)
     pthread_mutex_lock(&peer_catalog_lock);
     for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
-        if (!catalog->in_use || !catalog->active || catalog->expires_at > now) continue;
+        if (catalog->pending_report != NULL || !catalog->in_use || !catalog->active || catalog->expires_at > now) continue;
         long long revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
         if (revision == 0) { rc = -1; continue; }
         catalog->active = 0;
@@ -1681,9 +1767,13 @@ int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
     pthread_mutex_lock(&peer_catalog_lock);
     for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
+        if (pm_pending_report_for(catalog, publisher.id, publisher.tenant_id, runtime->publisher_session_id)) {
+            pthread_mutex_unlock(&peer_catalog_lock); return -1;
+        }
         if (!catalog->in_use || catalog->publisher_client_id != publisher.id
             || catalog->publisher_session_id != runtime->publisher_session_id
             || strcmp(catalog->tenant_id, publisher.tenant_id) != 0) continue;
+        if (catalog->pending_report != NULL) { pthread_mutex_unlock(&peer_catalog_lock); return -1; }
         long long revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
         if (revision == 0) { pthread_mutex_unlock(&peer_catalog_lock); return -1; }
         snapshot = *catalog;
@@ -1741,6 +1831,11 @@ static int pm_prepare_deleted_catalogs(pm_client_deletion *item)
     long long floor = peer_catalog_sequence;
     for (size_t i = 0U; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         const pm_catalog *catalog = &peer_catalogs[i];
+        if (pm_pending_report_for(catalog, item->client.id, item->client.tenant_id, 0)
+            || (catalog->in_use && catalog->publisher_client_id == item->client.id
+                && strcmp(catalog->tenant_id, item->client.tenant_id) == 0 && catalog->pending_report != NULL)) {
+            pthread_mutex_unlock(&peer_catalog_lock); return -1;
+        }
         if (catalog->in_use && catalog->publisher_client_id == item->client.id
             && strcmp(catalog->tenant_id, item->client.tenant_id) == 0) {
             ++count;
@@ -2691,7 +2786,7 @@ static int pm_refresh_tenant_impl(const st_peer_mesh_runtime *runtime,
     pthread_mutex_lock(&peer_catalog_lock);
     for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
         pm_catalog *catalog = &peer_catalogs[i];
-        if (!catalog->in_use || !catalog->active || catalog->expires_at <= now
+        if (catalog->pending_report != NULL || !catalog->in_use || !catalog->active || catalog->expires_at <= now
             || strcmp(catalog->tenant_id, tenant_id) != 0) continue;
         long long revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
         if (revision == 0) { rc = -1; continue; }

@@ -108,6 +108,11 @@ CONTROL_PRESENCE_TESTS := $(BUILD_DIR)/specus_c_control_presence_tests
 ALL_TESTS += $(CONTROL_PRESENCE_TESTS)
 DISCONNECT_REASONS_TESTS := $(BUILD_DIR)/specus_c_disconnect_reasons_vector_tests
 ALL_TESTS += $(DISCONNECT_REASONS_TESTS)
+CATALOG_SOURCE_TESTS := $(BUILD_DIR)/specus_c_catalog_source_tests
+ALL_TESTS += $(CATALOG_SOURCE_TESTS)
+CATALOG_SOURCE_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_source_e2e_tests
+CATALOG_SOURCE_BARRIER := $(BUILD_DIR)/libspecus_c_catalog_source_barrier.so
+ALL_TESTS += $(CATALOG_SOURCE_E2E_TESTS) $(CATALOG_SOURCE_BARRIER)
 
 .PHONY: all test release clean
 
@@ -137,6 +142,15 @@ $(CLIENT_ADDRESS_TESTS): $(CORE_OBJS) tests/client_address_tests.c | $(BUILD_DIR
 
 $(DISCONNECT_REASONS_TESTS): $(CORE_OBJS) tests/disconnect_reasons_vector_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration -DST_DISCONNECT_REASONS_FIXTURE_FILE='"$(abspath ../../../protocol/test-vectors/disconnect-reasons-v1.json)"' tests/disconnect_reasons_vector_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CATALOG_SOURCE_TESTS): $(CORE_OBJS) tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_source_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CATALOG_SOURCE_E2E_TESTS): $(CORE_OBJS) tests/catalog_source_e2e_tests.c tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_source_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CATALOG_SOURCE_BARRIER): tests/catalog_source_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 $(CLIENT_AUTH_NONCE_TESTS): $(CORE_OBJS) tests/client_auth_nonce_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_auth_nonce_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -339,6 +353,8 @@ $(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 test: all
+	$(CATALOG_SOURCE_TESTS)
+	$(CATALOG_SOURCE_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CATALOG_SOURCE_BARRIER))
 	$(DISCONNECT_REASONS_TESTS)
 	$(CONTROL_LIFECYCLE_TESTS)
 	$(CONTROL_QUEUE_TESTS)

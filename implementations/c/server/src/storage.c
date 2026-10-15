@@ -10225,7 +10225,7 @@ int st_storage_upsert_peer_mesh_egress_switch(const char *path,
     return rc;
 }
 
-int st_storage_record_peer_mesh_service_audit(const char *path,
+static int record_peer_mesh_service_audit_on_db(sqlite3 *db,
                                               const char *action,
                                               const char *tenant_id,
                                               long long client_id,
@@ -10234,8 +10234,6 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
                                               const char *reason)
 {
     if (action == NULL || *action == '\0') return -1;
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_service_audit(action,tenant_id,client_id,session_id,service_id,reason) "
@@ -10262,8 +10260,83 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
         } else rc = -1;
         sqlite3_finalize(stmt);
     }
+    return rc;
+}
+
+int st_storage_record_peer_mesh_service_audit(const char *path, const char *action,
+    const char *tenant_id, long long client_id, long long session_id,
+    const char *service_id, const char *reason)
+{
+    if (action == NULL || *action == '\0') return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = record_peer_mesh_service_audit_on_db(db, action, tenant_id, client_id,
+        session_id, service_id, reason);
     sqlite3_close(db);
     return rc;
+}
+
+static int service_report_policy_on_db(sqlite3 *db, const st_storage_client *client,
+    st_storage_peer_mesh_device *device, st_storage_peer_mesh_service_sharing *sharing)
+{
+    memset(device, 0, sizeof(*device)); memset(sharing, 0, sizeof(*sharing));
+    if (!client->enabled || read_peer_mesh_device(db, client->tenant_id, client->id, device) != 0
+        || strcmp(device->owner_username, client->owner_username) != 0
+        || strcmp(device->client_name, client->client_name) != 0) return -1;
+    return read_peer_mesh_service_sharing(db, client->tenant_id, sharing) < 0 ? -1 : 0;
+}
+
+static int commit_peer_service_report_impl(const char *path, const st_storage_control_source *control,
+    const st_storage_client *cached, long long session_id, st_storage_peer_service_report_stage_fn stage,
+    void *context, st_storage_client *committed_client)
+{
+    if (committed_client != NULL) memset(committed_client, 0, sizeof(*committed_client));
+    if (stage == NULL || session_id <= 0) return -1;
+    if (control != NULL && session_id != control->session_id) return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    sqlite3 *db = NULL; st_storage_client current = {0}, checked = {0};
+    st_storage_peer_mesh_device device = {0}, checked_device = {0};
+    st_storage_peer_mesh_service_sharing sharing = {0}, checked_sharing = {0};
+    if (peer_client_write_begin(path, cached, &db, &current, NULL) != 0) return -1;
+    int rc = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (rc == 0) rc = service_report_policy_on_db(db, &current, &device, &sharing);
+    const char *reason = NULL;
+    if (rc == 0) rc = stage(context, &current, &device, &sharing, &reason);
+    if (rc == 0 && (reason == NULL || *reason == '\0')) rc = -1;
+    if (rc == 0) rc = record_peer_mesh_service_audit_on_db(db, "service-report", current.tenant_id,
+        current.id, session_id, NULL, reason);
+    /* A trigger is part of our transaction too. Do not publish a stage computed under a
+     * different policy, nor misclassify our rolled-back trigger as permanent source loss. */
+    if (rc == 0 && (load_client(db, current.id, &checked) != 0
+        || strcmp(checked.tenant_id, current.tenant_id) != 0
+        || strcmp(checked.client_name, current.client_name) != 0
+        || strcmp(checked.owner_username, current.owner_username) != 0
+        || checked.enabled != current.enabled
+        || service_report_policy_on_db(db, &checked, &checked_device, &checked_sharing) != 0
+        || checked_device.enabled != device.enabled || checked_sharing.enabled != sharing.enabled
+        || checked_sharing.mdns_import_enabled != sharing.mdns_import_enabled)) rc = -1;
+    rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc == 0 && committed_client != NULL) *committed_client = checked;
+    return rc;
+}
+
+int st_storage_commit_peer_service_report(const char *path, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client)
+{ return commit_peer_service_report_impl(path, NULL, cached, session_id, stage, context, committed_client); }
+
+int st_storage_commit_peer_service_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client)
+{
+    if (control == NULL) {
+        if (committed_client != NULL) memset(committed_client, 0, sizeof(*committed_client));
+        return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    }
+    return commit_peer_service_report_impl(path, control, cached, session_id, stage, context, committed_client);
 }
 
 int st_storage_list_peer_mesh_service_audits(const char *path,
