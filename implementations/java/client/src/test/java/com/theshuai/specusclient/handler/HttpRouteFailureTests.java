@@ -11,6 +11,8 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.ConnectTimeoutException;
@@ -23,11 +25,13 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandshakeTimeoutException;
+import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.resolver.AddressResolver;
 import io.netty.resolver.AddressResolverGroup;
 import io.netty.resolver.InetNameResolver;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.Promise;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -59,7 +63,10 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import javax.net.ssl.KeyManagerFactory;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -210,23 +217,23 @@ class HttpRouteFailureTests {
 
     @Test
     void anUntrustedCertificateIsTlsFailed() throws Exception {
-        SslContext serverTls = untrustedTls;
-        Channel server = new ServerBootstrap()
-                .group(serverGroup)
-                .channel(NioServerSocketChannel.class)
-                .childHandler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel channel) {
-                        channel.pipeline().addLast(serverTls.newHandler(channel.alloc()));
-                    }
-                })
-                .bind(InetAddress.getLoopbackAddress(), 0).sync().channel();
-        try {
-            int port = ((InetSocketAddress) server.localAddress()).getPort();
-            NatMessagePacket reset = resetFor(List.of(route("https://127.0.0.1:" + port)), null);
-            assertFailure(HttpRouteFailure.TLS_FAILED, reset);
-        } finally {
-            server.close().syncUninterruptibly();
+        try (ObservedTlsTarget target = new ObservedTlsTarget(false)) {
+            NatMessagePacket reset = resetFor(List.of(route(target.url())), null);
+            target.noteReset(reset);
+            assertFailure(HttpRouteFailure.TLS_FAILED, reset, target::diagnostic);
+        }
+    }
+
+    @Test
+    void anUntrustedTargetHeldBeforeCertificateExchangeIsStillConnectTimeout() throws Exception {
+        // The certificate does not determine the failure before it is exchanged. Exercise the
+        // SAME default five-second DNS/TCP/TLS deadline, not a longer budget or a fake exception.
+        assertEquals(5_000, HttpUpstreamDial.DEFAULT.connectTimeoutMillis());
+        try (ObservedTlsTarget target = new ObservedTlsTarget(true)) {
+            NatMessagePacket reset = resetFor(List.of(route(target.url())), null);
+            target.noteReset(reset);
+            assertTrue(target.wireMessages.get() > 0, target::diagnostic);
+            assertFailure(HttpRouteFailure.CONNECT_TIMEOUT, reset, target::diagnostic);
         }
     }
 
@@ -354,11 +361,117 @@ class HttpRouteFailureTests {
     }
 
     private static void assertFailure(HttpRouteFailure expected, NatMessagePacket reset) {
+        assertFailure(expected, reset, () -> "");
+    }
+
+    private static void assertFailure(HttpRouteFailure expected, NatMessagePacket reset,
+                                      Supplier<String> diagnostic) {
         assertEquals(8, reset.getValue(), "the RST value is unchanged");
         Object reason = reset.getMetaData().get("reason");
         assertTrue(reason instanceof String text && !text.isBlank(), "the reason is still carried");
         assertEquals(expected.wireName(), reset.getMetaData().get(HttpRouteFailure.METADATA_KEY),
-                "metadata " + reset.getMetaData());
+                () -> "metadata " + reset.getMetaData() + "\n" + diagnostic.get());
+    }
+
+    /** Owned-loopback phase evidence, deliberately excluding certificates, payloads and paths. */
+    private static final class ObservedTlsTarget implements AutoCloseable {
+        private final long started = System.nanoTime();
+        private final Queue<String> events = new ConcurrentLinkedQueue<>();
+        private final Queue<Channel> children = new ConcurrentLinkedQueue<>();
+        private final AtomicInteger wireMessages = new AtomicInteger();
+        private final AtomicReference<Thread> ioThread = new AtomicReference<>();
+        private final Channel listener;
+
+        private ObservedTlsTarget(boolean holdBeforeCertificate) throws Exception {
+            listener = new ServerBootstrap().group(serverGroup).channel(NioServerSocketChannel.class)
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel channel) {
+                            children.add(channel);
+                            event("child-initialized");
+                            channel.pipeline().addLast(new ChannelDuplexHandler() {
+                                @Override
+                                public void channelActive(ChannelHandlerContext ctx) throws Exception {
+                                    ioThread.set(Thread.currentThread());
+                                    event("tcp-active");
+                                    super.channelActive(ctx);
+                                }
+
+                                @Override
+                                public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                                    wireMessages.incrementAndGet();
+                                    event(holdBeforeCertificate ? "tls-bytes-held" : "tls-bytes-received");
+                                    if (holdBeforeCertificate) ReferenceCountUtil.release(msg);
+                                    else super.channelRead(ctx, msg);
+                                }
+
+                                @Override
+                                public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
+                                        throws Exception {
+                                    event("tls-bytes-written");
+                                    super.write(ctx, msg, promise);
+                                }
+
+                                @Override
+                                public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+                                    event("tcp-inactive");
+                                    super.channelInactive(ctx);
+                                }
+                            });
+                            var ssl = untrustedTls.newHandler(channel.alloc());
+                            event("server-engine=" + ssl.engine().getClass().getName());
+                            ssl.handshakeFuture().addListener(done -> event("server-tls-completed=" + done.isSuccess()
+                                    + " cause=" + (done.cause() == null ? "none" : done.cause().getClass().getName())));
+                            channel.pipeline().addLast(ssl);
+                            channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                                @Override
+                                public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+                                    if (evt instanceof SslHandshakeCompletionEvent handshake)
+                                        event("server-tls-event=" + handshake.isSuccess());
+                                    super.userEventTriggered(ctx, evt);
+                                }
+
+                                @Override
+                                public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+                                    event("server-exception=" + cause.getClass().getName());
+                                    ctx.close();
+                                }
+                            });
+                        }
+                    }).bind(InetAddress.getLoopbackAddress(), 0).sync().channel();
+            event("listener-bound");
+        }
+
+        private String url() { return "https://127.0.0.1:" + ((InetSocketAddress) listener.localAddress()).getPort(); }
+
+        private void event(String value) {
+            if (events.size() < 64)
+                events.add(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) + "ms " + value);
+        }
+
+        private void noteReset(NatMessagePacket reset) {
+            event("client-reset=" + reset.getMetaData().get(HttpRouteFailure.METADATA_KEY));
+        }
+
+        private String diagnostic() {
+            StringBuilder text = new StringBuilder("Owned TLS target phases (not a historical root-cause claim):\n");
+            events.forEach(event -> text.append(event).append('\n'));
+            Thread thread = ioThread.get();
+            if (thread != null) {
+                text.append("server-io-state=").append(thread.getState()).append('\n');
+                var stack = thread.getStackTrace();
+                for (int i = 0; i < Math.min(20, stack.length); i++)
+                    text.append(stack[i].getClassName()).append('.').append(stack[i].getMethodName()).append('\n');
+            }
+            return text.toString();
+        }
+
+        @Override
+        public void close() {
+            children.forEach(channel -> assertTrue(channel.close().awaitUninterruptibly(10, TimeUnit.SECONDS),
+                    this::diagnostic));
+            assertTrue(listener.close().awaitUninterruptibly(10, TimeUnit.SECONDS), this::diagnostic);
+        }
     }
 
     private static void assertNoFailure(NatMessagePacket reset) {
