@@ -18,7 +18,7 @@
 #define ADMIN_PASSWORD "lifecycle-e2e-password-2026"
 #define ADMIN_JWT_SECRET "lifecycle-e2e-jwt-secret-that-is-long-and-random-2026"
 #define IO_TIMEOUT_MS 5000
-#define MAX_EXTRA_ENV 4
+#define MAX_EXTRA_ENV 8
 
 typedef struct {
     pid_t pid;

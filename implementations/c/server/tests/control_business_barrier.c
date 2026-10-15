@@ -12,22 +12,27 @@
 #include <sys/syscall.h>
 static int (*real_step)(sqlite3_stmt *);
 static int (*real_close)(sqlite3 *);
+static int (*real_exec)(sqlite3 *, const char *, int (*)(void *, int, char **, char **), void *, char **);
 static int (*real_random)(unsigned char *, int);
 static int (*real_cond_timedwait)(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static atomic_int fired;
 static _Thread_local sqlite3 *selected;
+static _Thread_local int activity_read_closed;
 static void symbols(void)
 {
     void *step = dlsym(RTLD_NEXT, "sqlite3_step"), *close = dlsym(RTLD_NEXT, "sqlite3_close");
     _Static_assert(sizeof(step) == sizeof(real_step), "POSIX pointers");
     _Static_assert(sizeof(close) == sizeof(real_close), "POSIX pointers");
     memcpy(&real_step, &step, sizeof(step)); memcpy(&real_close, &close, sizeof(close));
+    void *exec = dlsym(RTLD_NEXT, "sqlite3_exec");
+    _Static_assert(sizeof(exec) == sizeof(real_exec), "POSIX pointers");
+    memcpy(&real_exec, &exec, sizeof(exec));
     void *random = dlsym(RTLD_NEXT, "RAND_bytes"), *wait = dlsym(RTLD_NEXT, "pthread_cond_timedwait");
     _Static_assert(sizeof(random) == sizeof(real_random), "POSIX pointers");
     _Static_assert(sizeof(wait) == sizeof(real_cond_timedwait), "POSIX pointers");
     memcpy(&real_random, &random, sizeof(random)); memcpy(&real_cond_timedwait, &wait, sizeof(wait));
-    if (!real_step || !real_close || !real_random || !real_cond_timedwait) _exit(91);
+    if (!real_step || !real_close || !real_exec || !real_random || !real_cond_timedwait) _exit(91);
 }
 static void barrier_pause(void)
 {
@@ -63,12 +68,35 @@ int pthread_cond_timedwait(pthread_cond_t *condition, pthread_mutex_t *mutex, co
     }
     return real_cond_timedwait(condition, mutex, deadline);
 }
+int sqlite3_exec(sqlite3 *db, const char *sql, int (*callback)(void *, int, char **, char **), void *context, char **error)
+{
+    pthread_once(&once, symbols);
+    const char *dir = getenv("SPECUS_TEST_CONTROL_BARRIER_DIR"), *mode = getenv("SPECUS_TEST_CONTROL_SOURCE_MODE");
+    /* Login's actual configuration reload reaches schema writes before native ONLINE. Do not
+     * wait for a later ONLINE step while the earlier writer is correctly blocked. */
+    if (dir && mode && !strcmp(mode, "observer") && sql && strstr(sql, "CREATE TABLE IF NOT EXISTS")) {
+        char path[512]; snprintf(path, sizeof(path), "%s/arm", dir);
+        if (access(path, F_OK) == 0) {
+            snprintf(path, sizeof(path), "%s/native-write-attempt", dir);
+            FILE *file = fopen(path, "w"); if (!file) _exit(95); fputs("actual configuration native writer entered", file); fclose(file);
+        }
+    }
+    return real_exec(db, sql, callback, context, error);
+}
 int sqlite3_step(sqlite3_stmt *stmt)
 {
     pthread_once(&once, symbols);
-    int rc = real_step(stmt);
     const char *sql = sqlite3_sql(stmt), *dir = getenv("SPECUS_TEST_CONTROL_BARRIER_DIR");
-    if ((rc == SQLITE_ROW || rc == SQLITE_DONE) && dir && sql
+    const char *mode = getenv("SPECUS_TEST_CONTROL_SOURCE_MODE");
+    int rc = real_step(stmt);
+    if (rc == SQLITE_ROW && dir && mode && !strcmp(mode, "writer") && activity_read_closed && sql
+        && strstr(sql, "FROM specus_client_session s JOIN client_account c")
+        && !sqlite3_get_autocommit(sqlite3_db_handle(stmt))
+        && sqlite3_txn_state(sqlite3_db_handle(stmt), "main") == SQLITE_TXN_WRITE) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&fired, &expected, 1)) barrier_pause();
+    }
+    if ((rc == SQLITE_ROW || rc == SQLITE_DONE) && dir && (!mode || strcmp(mode, "observer")) && sql
         && strstr(sql, "FROM peer_mesh_egress_activity WHERE tenant_id=? AND egress_client_id=?")) {
         char path[512]; snprintf(path, sizeof(path), "%s/arm", dir);
         if (access(path, F_OK) == 0) selected = sqlite3_db_handle(stmt);
@@ -82,7 +110,9 @@ int sqlite3_close(sqlite3 *db)
     if (chosen) selected = NULL;
     int rc = real_close(db), expected = 0;
     if (chosen && rc == SQLITE_OK && atomic_compare_exchange_strong(&fired, &expected, 1)) {
-        barrier_pause();
+        const char *mode = getenv("SPECUS_TEST_CONTROL_SOURCE_MODE");
+        if (mode && !strcmp(mode, "writer")) { activity_read_closed = 1; atomic_store(&fired, 0); }
+        else barrier_pause();
     }
     return rc;
 }

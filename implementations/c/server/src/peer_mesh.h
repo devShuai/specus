@@ -27,6 +27,9 @@ typedef struct {
     const char *authenticated_tenant;
     int (*source_active)(void *ctx); /* registry-only, no SQL; cancellation while waiting. */
     int (*source_current)(void *ctx); /* fresh native epoch check after acquiring dispatch. */
+    /* Borrowed immutable session-owned authority; present for every DB-backed network CONTROL.
+     * NULL is reserved for explicit trusted service/environment callers, not a failed check. */
+    const st_storage_control_source *control_source;
 } st_peer_mesh_runtime;
 
 typedef struct {

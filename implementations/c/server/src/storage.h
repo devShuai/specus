@@ -6,6 +6,23 @@
 
 #include "password_hash.h"
 
+/* Immutable authority of one database-backed physical CONTROL, never supplied by a report body.
+ * Guarded writers validate this under their SQLite writer fence; NULL/malformed is not trusted. */
+typedef struct {
+    long long client_id;
+    long long session_id;
+    char tenant_id[64];
+    char client_name[256];
+    char channel_id[161];
+    char token_hash[65];
+} st_storage_control_source;
+#define ST_STORAGE_CONTROL_SOURCE_RETIRED (-31)
+#define ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE (-32)
+/* One native snapshot: 0 current, RETIRED identity/epoch lost, UNAVAILABLE temporarily
+ * disabled, -1 database failure. Disabled is never permission to write or a trusted fallback,
+ * but does not invent permanent connection revocation for a reversible policy switch. */
+int st_storage_control_source_validate(const char *path, const st_storage_control_source *source);
+
 typedef struct {
     long long id;
     char tenant_id[64];
@@ -1197,6 +1214,9 @@ int st_storage_list_peer_mesh_acls_visible(const char *path,
 int st_storage_ensure_peer_mesh_device(const char *path,
                                        const st_storage_client *client,
                                        st_storage_peer_mesh_device *out_device);
+int st_storage_ensure_peer_mesh_device_from_control(const char *path, const st_storage_control_source *control,
+                                                    const st_storage_client *client,
+                                                    st_storage_peer_mesh_device *out_device);
 int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                const st_storage_client *client,
                                                int enabled,
@@ -1234,6 +1254,12 @@ int st_storage_update_peer_mesh_device_report(const char *path,
                                               const char *virtual_device_status,
                                               const char *virtual_device_error,
                                               st_storage_peer_mesh_device *out_device);
+int st_storage_update_peer_mesh_device_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *client, const char *public_key,
+    const char *nat_type, const char *nat_mapping_behavior, const char *nat_filtering_behavior,
+    const char *nat_behavior_discovery, const char *last_endpoint, const char *virtual_device_mode,
+    const char *virtual_device_name, const char *virtual_device_status, const char *virtual_device_error,
+    st_storage_peer_mesh_device *out_device);
 int st_storage_get_peer_mesh_acl(const char *path, long long id, st_storage_peer_mesh_acl *acl);
 int st_storage_can_peer(const char *path,
                         const st_storage_client *source,
@@ -1360,6 +1386,9 @@ int st_storage_create_peer_mesh_session(const char *path,
                                         const char *token_hash,
                                         long long ttl_seconds,
                                         st_storage_peer_mesh_session *out_session);
+int st_storage_create_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *source, const st_storage_client *target, const char *path_type,
+    const char *token_hash, long long ttl_seconds, st_storage_peer_mesh_session *out_session);
 int st_storage_get_peer_mesh_session(const char *path,
                                      const char *tenant_id,
                                      long long id,
@@ -1384,6 +1413,10 @@ int st_storage_report_peer_mesh_session(const char *path,
                                         long long relay_bytes,
                                         int close_session,
                                         st_storage_peer_mesh_session *out_session);
+int st_storage_report_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *reporter, long long id, const char *path_type, const char *status,
+    long long rtt_millis, const char *local_endpoint, const char *remote_endpoint,
+    long long direct_bytes, long long relay_bytes, int close_session, st_storage_peer_mesh_session *out_session);
 int st_storage_authorize_peer_mesh_relay(const char *path,
                                          long long session_id,
                                          long long from_client_id,
@@ -1451,6 +1484,8 @@ int st_storage_find_peer_mesh_egress_activity(const char *path,
                                               st_storage_peer_mesh_egress_activity *out_row);
 int st_storage_upsert_peer_mesh_egress_activity(const char *path,
                                                 const st_storage_peer_mesh_egress_activity *row);
+int st_storage_upsert_peer_mesh_egress_activity_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_peer_mesh_egress_activity *row);
 /* Returns 0 on a hit, 1 when the tenant has never set it, -1 on a storage failure. */
 int st_storage_get_peer_mesh_egress_switch(const char *path,
                                            const char *tenant_id,

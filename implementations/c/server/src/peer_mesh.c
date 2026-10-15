@@ -508,6 +508,17 @@ static char *pm_build_grant(const st_storage_client *source,
     return builder.data;
 }
 
+static int pm_report_session(const st_peer_mesh_runtime *runtime, const st_storage_client *source,
+    long long id, const char *path_type, const char *status, long long rtt,
+    const char *local, const char *remote, long long direct, long long relay, int close_session)
+{
+    return runtime->control_source == NULL
+        ? st_storage_report_peer_mesh_session(runtime->database_path, source, id, path_type, status, rtt,
+                                              local, remote, direct, relay, close_session, NULL)
+        : st_storage_report_peer_mesh_session_from_control(runtime->database_path, runtime->control_source,
+            source, id, path_type, status, rtt, local, remote, direct, relay, close_session, NULL);
+}
+
 static int pm_handle_report(const st_peer_mesh_runtime *runtime,
                             const st_storage_client *source,
                             const char *type,
@@ -523,9 +534,12 @@ static int pm_handle_report(const st_peer_mesh_runtime *runtime,
         char *name = st_json_get_top_level_string(message, "virtualDeviceName");
         char *status = st_json_get_top_level_string(message, "virtualDeviceStatus");
         char *error = st_json_get_top_level_string(message, "virtualDeviceError");
-        int rc = st_storage_update_peer_mesh_device_report(runtime->database_path, source, NULL,
-            nat_type, nat_mapping, nat_filtering, nat_discovery, last_endpoint,
-            mode, name, status, error, NULL);
+        int rc = runtime->control_source == NULL
+            ? st_storage_update_peer_mesh_device_report(runtime->database_path, source, NULL, nat_type,
+                nat_mapping, nat_filtering, nat_discovery, last_endpoint, mode, name, status, error, NULL)
+            : st_storage_update_peer_mesh_device_report_from_control(runtime->database_path,
+                runtime->control_source, source, NULL, nat_type, nat_mapping, nat_filtering,
+                nat_discovery, last_endpoint, mode, name, status, error, NULL);
         free(nat_type); free(nat_mapping); free(nat_filtering); free(nat_discovery);
         free(last_endpoint); free(mode); free(name); free(status); free(error);
         return rc;
@@ -538,17 +552,16 @@ static int pm_handle_report(const st_peer_mesh_runtime *runtime,
      * a path-report carries the path but no bytes.
      */
     if (strcmp(type, "close") == 0) {
-        pm_forget_session_token(session_id);
-        return st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
-            NULL, NULL, -1, NULL, NULL, 0, 0, 1, NULL);
+        int rc = pm_report_session(runtime, source, session_id, NULL, NULL, -1, NULL, NULL, 0, 0, 1);
+        if (rc == 0) pm_forget_session_token(session_id);
+        return rc;
     }
     if (strcmp(type, "traffic-report") == 0) {
         long long direct = 0;
         long long relay = 0;
         (void)st_json_get_i64(message, "directBytes", &direct);
         (void)st_json_get_i64(message, "relayBytes", &relay);
-        return st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
-            NULL, NULL, -1, NULL, NULL, direct, relay, 0, NULL);
+        return pm_report_session(runtime, source, session_id, NULL, NULL, -1, NULL, NULL, direct, relay, 0);
     }
     char *path_type = st_json_get_top_level_string(message, "pathType");
     char *status = st_json_get_top_level_string(message, "status");
@@ -556,8 +569,8 @@ static int pm_handle_report(const st_peer_mesh_runtime *runtime,
     char *remote = st_json_get_top_level_string(message, "remoteEndpoint");
     long long rtt = -1;
     (void)st_json_get_i64(message, "rttMillis", &rtt);
-    int rc = st_storage_report_peer_mesh_session(runtime->database_path, source, session_id,
-        path_type, pm_has_text(status) ? status : "ACTIVE", rtt, local, remote, 0, 0, 0, NULL);
+    int rc = pm_report_session(runtime, source, session_id, path_type,
+                              pm_has_text(status) ? status : "ACTIVE", rtt, local, remote, 0, 0, 0);
     free(path_type); free(status); free(local); free(remote);
     return rc;
 }
@@ -581,11 +594,14 @@ static int pm_handle_control_impl(const st_peer_mesh_runtime *runtime,
     if (st_storage_get_client_by_name(runtime->database_path, authenticated_client_name, &source) != 0
         || !source.enabled
         || (runtime->authenticated_client_id > 0 && source.id != runtime->authenticated_client_id)
-        || (runtime->authenticated_tenant != NULL && strcmp(source.tenant_id, runtime->authenticated_tenant) != 0)
-        || st_storage_ensure_peer_mesh_device(runtime->database_path, &source, &source_device) != 0) {
+        || (runtime->authenticated_tenant != NULL && strcmp(source.tenant_id, runtime->authenticated_tenant) != 0)) {
         free(type);
         return -1;
     }
+    int device_rc = runtime->control_source == NULL
+        ? st_storage_ensure_peer_mesh_device(runtime->database_path, &source, &source_device)
+        : st_storage_ensure_peer_mesh_device_from_control(runtime->database_path, runtime->control_source, &source, &source_device);
+    if (device_rc != 0) { free(type); return device_rc; }
     if (strcmp(type, "service-report") == 0) {
         int rc = pm_handle_service_report(runtime, &source, &source_device,
                                           target_client_name, message);
@@ -647,10 +663,13 @@ static int pm_handle_control_impl(const st_peer_mesh_runtime *runtime,
         }
         st_sha256((const uint8_t *)token, strlen(token), token_hash_bytes);
         st_hex_encode(token_hash_bytes, sizeof(token_hash_bytes), token_hash);
-        if (st_storage_create_peer_mesh_session(runtime->database_path, &source, &target,
-                                                "DIRECT", token_hash, ttl, &opened) != 0) {
+        int open_rc = runtime->control_source == NULL
+            ? st_storage_create_peer_mesh_session(runtime->database_path, &source, &target, "DIRECT", token_hash, ttl, &opened)
+            : st_storage_create_peer_mesh_session_from_control(runtime->database_path, runtime->control_source,
+                &source, &target, "DIRECT", token_hash, ttl, &opened);
+        if (open_rc != 0) {
             free(type);
-            return -1;
+            return open_rc;
         }
         pm_remember_session_token(opened.id, token);
     }
@@ -2568,7 +2587,9 @@ static int pm_handle_egress_report(const st_peer_mesh_runtime *runtime,
     row.bytes_out = pm_report_counter(message, "bytesOut");
     pm_encode_rejected_flows(message, row.rejected_flows, sizeof(row.rejected_flows));
     pm_format_instant(time(NULL), row.reported_at);
-    return st_storage_upsert_peer_mesh_egress_activity(runtime->database_path, &row);
+    return runtime->control_source == NULL
+        ? st_storage_upsert_peer_mesh_egress_activity(runtime->database_path, &row)
+        : st_storage_upsert_peer_mesh_egress_activity_from_control(runtime->database_path, runtime->control_source, &row);
 }
 
 static int pm_push_on_login_impl(const st_peer_mesh_runtime *runtime,

@@ -226,6 +226,7 @@ struct specus_session {
     st_tls_connection *tls_connection;
     int is_data_connection;
     char physical_channel_id[35];
+    st_storage_control_source control_source_guard; /* Immutable after native authentication. */
     atomic_int control_cancelled;
     pthread_cond_t control_work_cond;
     int control_work_busy;
@@ -3178,30 +3179,30 @@ static int control_source_active(void *ctx)
 
 /* The lifecycle is held by the business worker, never by a heartbeat. Every database handle is
  * closed before this returns or the caller waits for another lock. A name alone is not identity. */
+static void control_retire_native_source(specus_session *session)
+{
+    atomic_store(&session->control_cancelled, 1);
+    pthread_mutex_lock(&active_session_lock);
+    if (session->displaced_reason == NULL) session->displaced_reason = "AUTH_SOURCE_RETIRED";
+    active_session_close_data_locked(session);
+    active_session_remove_locked(session);
+    retire_data_namespace(session);
+    pthread_mutex_unlock(&active_session_lock);
+    /* Interrupt only. The owning reader drains its worker and TLS/NAT resources before close;
+     * registry protection prevents shutting down a numeric descriptor already reused elsewhere. */
+    pthread_mutex_lock(&connection_registry_lock);
+    if (session->control_fd >= 0) shutdown(session->control_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&connection_registry_lock);
+}
+
 static int control_source_current(void *ctx)
 {
     specus_session *session = ctx;
     if (!control_source_active(session)) return 0;
     if (!session->config.client_session_db_backed) return 1; /* Explicit trusted environment token. */
-    char token_hash[65], now[64];
-    st_hex_encode(session->config.access_token_hash, ST_SHA256_LEN, token_hash);
-    st_storage_client_session native;
-    st_storage_client account;
-    st_storage_client_credential credential;
-    int current = st_storage_get_client_session_for_login(session->config.database_path,
-        session->config.client_session_id, token_hash, &native) == 0
-        && native.client_id == session->config.client_id
-        && strcmp(native.tenant_id, session->config.tenant_id) == 0
-        && strcmp(native.status, "NETTY_ONLINE") == 0
-        && strcmp(native.channel_id, session->physical_channel_id) == 0
-        && current_utc_timestamp(now) == 0
-        && (native.expires_at[0] == '\0' || strcmp(native.expires_at, now) > 0)
-        && st_storage_get_client(session->config.database_path, native.client_id, &account) == 0
-        && account.enabled && strcmp(account.tenant_id, native.tenant_id) == 0
-        && strcmp(account.client_name, session->config.client_name) == 0
-        && st_storage_get_client_credential(session->config.database_path, native.credential_id, &credential) == 0
-        && credential.enabled && strcmp(credential.tenant_id, native.tenant_id) == 0;
-    return current && control_source_active(session);
+    int rc = st_storage_control_source_validate(session->config.database_path, &session->control_source_guard);
+    if (rc == ST_STORAGE_CONTROL_SOURCE_RETIRED) control_retire_native_source(session);
+    return rc == 0 && control_source_active(session);
 }
 
 static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *session)
@@ -3217,6 +3218,7 @@ static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *sessio
     runtime.authenticated_tenant = session->config.tenant_id;
     runtime.source_active = control_source_active;
     runtime.source_current = control_source_current;
+    runtime.control_source = session->config.client_session_db_backed ? &session->control_source_guard : NULL;
     return runtime;
 }
 
@@ -3260,6 +3262,8 @@ static void control_process_message(specus_session *session, st_message_response
         st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
         int rc = st_peer_mesh_handle_control(&runtime, session->config.client_name,
             message->to_client_name, message->message);
+        if (rc == ST_STORAGE_CONTROL_SOURCE_RETIRED) control_retire_native_source(session);
+        else if (rc != 0) (void)control_source_current(session); /* Retire only a definitive lost native authority. */
         printf("[peer-mesh] signal %s source=%s target=%s\n", rc == 0 ? "accepted" : "rejected",
             session->config.client_name, message->to_client_name == NULL ? "" : message->to_client_name);
     } else fprintf(stderr, "[message] unsupported type=%d source=%s target=%s\n", message->message_type,
@@ -5625,6 +5629,15 @@ static void *client_thread(void *arg)
             logged_in = admission_allowed && verify_login(session, &request, &reason);
             if (logged_in && control_login && session->config.client_id != login_client_id) {
                 logged_in = 0; reason = "客户端访问令牌无效";
+            }
+            if (logged_in && control_login && session->config.client_session_db_backed) {
+                st_storage_control_source *guard = &session->control_source_guard;
+                guard->client_id = session->config.client_id;
+                guard->session_id = session->config.client_session_id;
+                snprintf(guard->tenant_id, sizeof(guard->tenant_id), "%s", session->config.tenant_id);
+                snprintf(guard->client_name, sizeof(guard->client_name), "%s", session->config.client_name);
+                snprintf(guard->channel_id, sizeof(guard->channel_id), "%s", session->physical_channel_id);
+                st_hex_encode(session->config.access_token_hash, ST_SHA256_LEN, guard->token_hash);
             }
             if (logged_in && control_login && control_worker_start(session) != 0) {
                 logged_in = 0; reason = "服务器繁忙：控制连接处理器暂不可用，请稍后重试";

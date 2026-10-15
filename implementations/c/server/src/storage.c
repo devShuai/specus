@@ -7528,6 +7528,71 @@ static int ensure_peer_mesh_device_on_db(sqlite3 *db, const st_storage_client *c
     return rc;
 }
 
+/* The caller already owns BEGIN IMMEDIATE when mutation follows this check. Reading the
+ * source in another connection, or only before waiting for the SQLite writer, is not authority. */
+static int control_source_on_db(sqlite3 *db, const st_storage_control_source *source,
+                                 long long client_id, const char *tenant_id)
+{
+    if (source == NULL || source->client_id <= 0 || source->session_id <= 0
+        || source->client_id != client_id || tenant_id == NULL
+        || !memchr(source->tenant_id, '\0', sizeof(source->tenant_id))
+        || !memchr(source->client_name, '\0', sizeof(source->client_name))
+        || !memchr(source->channel_id, '\0', sizeof(source->channel_id))
+        || !memchr(source->token_hash, '\0', sizeof(source->token_hash))
+        || !*source->tenant_id || !*source->client_name || !*source->channel_id
+        || strlen(source->token_hash) != 64U || strcmp(source->tenant_id, tenant_id) != 0)
+        return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT c.enabled,k.enabled FROM specus_client_session s JOIN client_account c ON c.rowid=s.client_id "
+        "JOIN specus_client_credential k ON k.id=s.credential_id "
+        "WHERE s.id=? AND s.client_id=? AND s.tenant_id COLLATE BINARY=? "
+        "AND s.channel_id COLLATE BINARY=? AND s.token_hash COLLATE BINARY=? AND s.status='NETTY_ONLINE' "
+        "AND (s.expires_at='' OR s.expires_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+        "AND c.tenant_id COLLATE BINARY=s.tenant_id "
+        "AND c.client_name COLLATE BINARY=? AND k.tenant_id COLLATE BINARY=s.tenant_id",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, source->session_id); sqlite3_bind_int64(stmt, 2, source->client_id);
+        sqlite3_bind_text(stmt, 3, source->tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, source->channel_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, source->token_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, source->client_name, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(stmt);
+        rc = step == SQLITE_ROW
+            ? (sqlite3_column_int(stmt, 0) == 1 && sqlite3_column_int(stmt, 1) == 1
+                ? 0 : ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE)
+            : step == SQLITE_DONE ? ST_STORAGE_CONTROL_SOURCE_RETIRED : -1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int st_storage_control_source_validate(const char *path, const st_storage_control_source *source)
+{
+    if (source == NULL) return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = control_source_on_db(db, source, source->client_id, source->tenant_id);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int peer_control_write_check(sqlite3 *db, const st_storage_control_source *control,
+                                     long long client_id, const char *tenant_id)
+{
+    if (control == NULL) return 0; /* Only explicit pre-existing trusted service entrypoints. */
+    return control_source_on_db(db, control, client_id, tenant_id);
+}
+
+/* A trigger may change authority within our own transaction. Roll it all back, but do not
+ * classify a rolled-back change as permanent retirement of the physical CONTROL. */
+static int peer_control_write_postcheck(sqlite3 *db, const st_storage_control_source *control,
+                                       long long client_id, const char *tenant_id, int rc)
+{
+    return rc == 0 && peer_control_write_check(db, control, client_id, tenant_id) != 0 ? -1 : rc;
+}
+
 static int peer_client_write_begin(const char *path, const st_storage_client *cached,
                                   sqlite3 **db, st_storage_client *current,
                                   st_storage_peer_mesh_device *out_device)
@@ -7571,13 +7636,29 @@ static int peer_client_write_end(sqlite3 *db, const st_storage_client *current, 
     return rc == 0 ? 0 : -1;
 }
 
-int st_storage_ensure_peer_mesh_device(const char *path, const st_storage_client *client,
-                                     st_storage_peer_mesh_device *out_device)
+static int ensure_peer_mesh_device_impl(const char *path, const st_storage_client *client,
+                                       st_storage_peer_mesh_device *out_device,
+                                       const st_storage_control_source *control)
 {
     sqlite3 *db = NULL;
     st_storage_client current;
     if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
-    return peer_client_write_end(db, &current, ensure_peer_mesh_device_on_db(db, &current), out_device);
+    int guard = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (guard != 0) { (void)exec_sql(db, "ROLLBACK"); sqlite3_close(db); return guard; }
+    int rc = ensure_peer_mesh_device_on_db(db, &current);
+    rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
+    return peer_client_write_end(db, &current, rc, out_device);
+}
+
+int st_storage_ensure_peer_mesh_device(const char *path, const st_storage_client *client,
+                                       st_storage_peer_mesh_device *out_device)
+{ return ensure_peer_mesh_device_impl(path, client, out_device, NULL); }
+
+int st_storage_ensure_peer_mesh_device_from_control(const char *path, const st_storage_control_source *control,
+                                                    const st_storage_client *client, st_storage_peer_mesh_device *out_device)
+{
+    if (control == NULL) { if (out_device != NULL) memset(out_device, 0, sizeof(*out_device)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return ensure_peer_mesh_device_impl(path, client, out_device, control);
 }
 
 int st_storage_update_peer_mesh_device_enabled(const char *path,
@@ -7768,7 +7849,7 @@ int st_storage_list_open_peer_mesh_sessions(const char *path,
     return 0;
 }
 
-int st_storage_update_peer_mesh_device_report(const char *path,
+static int update_peer_mesh_device_report_impl(const char *path,
                                               const st_storage_client *client,
                                               const char *public_key,
                                               const char *nat_type,
@@ -7780,11 +7861,14 @@ int st_storage_update_peer_mesh_device_report(const char *path,
                                               const char *virtual_device_name,
                                               const char *virtual_device_status,
                                               const char *virtual_device_error,
-                                              st_storage_peer_mesh_device *out_device)
+                                              st_storage_peer_mesh_device *out_device,
+                                              const st_storage_control_source *control)
 {
     sqlite3 *db = NULL;
     st_storage_client current;
     if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    int guard = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (guard != 0) { (void)exec_sql(db, "ROLLBACK"); sqlite3_close(db); return guard; }
     if (ensure_peer_mesh_device_on_db(db, &current) != 0)
         return peer_client_write_end(db, &current, -1, out_device);
     sqlite3_stmt *stmt = NULL;
@@ -7818,7 +7902,30 @@ int st_storage_update_peer_mesh_device_report(const char *path,
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
+    rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
     return peer_client_write_end(db, &current, rc, out_device);
+}
+
+int st_storage_update_peer_mesh_device_report(const char *path, const st_storage_client *client,
+    const char *public_key, const char *nat_type, const char *nat_mapping_behavior, const char *nat_filtering_behavior,
+    const char *nat_behavior_discovery, const char *last_endpoint, const char *virtual_device_mode,
+    const char *virtual_device_name, const char *virtual_device_status, const char *virtual_device_error,
+    st_storage_peer_mesh_device *out_device)
+{ return update_peer_mesh_device_report_impl(path, client, public_key, nat_type, nat_mapping_behavior,
+    nat_filtering_behavior, nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
+    virtual_device_status, virtual_device_error, out_device, NULL); }
+
+int st_storage_update_peer_mesh_device_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *client, const char *public_key,
+    const char *nat_type, const char *nat_mapping_behavior, const char *nat_filtering_behavior,
+    const char *nat_behavior_discovery, const char *last_endpoint, const char *virtual_device_mode,
+    const char *virtual_device_name, const char *virtual_device_status, const char *virtual_device_error,
+    st_storage_peer_mesh_device *out_device)
+{
+    if (control == NULL) { if (out_device != NULL) memset(out_device, 0, sizeof(*out_device)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return update_peer_mesh_device_report_impl(path, client,
+    public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery, last_endpoint,
+    virtual_device_mode, virtual_device_name, virtual_device_status, virtual_device_error, out_device, control);
 }
 
 /* Caller supplies current rows under one SQLite transaction, not caller snapshots. */
@@ -8722,13 +8829,14 @@ static int read_peer_mesh_session(sqlite3 *db,
     return ok ? 0 : -1;
 }
 
-int st_storage_create_peer_mesh_session(const char *path,
+static int create_peer_mesh_session_impl(const char *path,
                                         const st_storage_client *source,
                                         const st_storage_client *target,
                                         const char *path_type,
                                         const char *token_hash,
                                         long long ttl_seconds,
-                                        st_storage_peer_mesh_session *out_session)
+                                        st_storage_peer_mesh_session *out_session,
+                                        const st_storage_control_source *control)
 {
     if (source == NULL || target == NULL || source->id <= 0 || target->id <= 0
         || source->id == target->id || token_hash == NULL || ttl_seconds <= 0) {
@@ -8746,6 +8854,7 @@ int st_storage_create_peer_mesh_session(const char *path,
     st_storage_client checked_source = {0}, checked_target = {0};
     st_storage_peer_mesh_session staged = {0};
     int allowed = 0, rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0) rc = peer_control_write_check(db, control, source->id, source->tenant_id);
     if (rc == 0 && (load_client(db, source->id, &current_source) != 0
         || load_client(db, target->id, &current_target) != 0
         || strcmp(current_source.tenant_id, source->tenant_id) != 0
@@ -8801,6 +8910,7 @@ int st_storage_create_peer_mesh_session(const char *path,
         || strcmp(checked_source.client_name, current_source.client_name) != 0
         || strcmp(checked_target.client_name, current_target.client_name) != 0
         || can_peer_on_db(db, &checked_source, &checked_target, &allowed) != 0 || !allowed)) rc = -1;
+    rc = peer_control_write_postcheck(db, control, source->id, source->tenant_id, rc);
     if (rc == 0) rc = exec_sql(db, "COMMIT");
     if (rc != 0) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     sqlite3_close(db);
@@ -8808,7 +8918,20 @@ int st_storage_create_peer_mesh_session(const char *path,
         if (rc == 0) *out_session = staged;
         else memset(out_session, 0, sizeof(*out_session));
     }
-    return rc == 0 ? 0 : -1;
+    return rc;
+}
+
+int st_storage_create_peer_mesh_session(const char *path, const st_storage_client *source,
+    const st_storage_client *target, const char *path_type, const char *token_hash,
+    long long ttl_seconds, st_storage_peer_mesh_session *out_session)
+{ return create_peer_mesh_session_impl(path, source, target, path_type, token_hash, ttl_seconds, out_session, NULL); }
+
+int st_storage_create_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *source, const st_storage_client *target, const char *path_type,
+    const char *token_hash, long long ttl_seconds, st_storage_peer_mesh_session *out_session)
+{
+    if (control == NULL) { if (out_session != NULL) memset(out_session, 0, sizeof(*out_session)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return create_peer_mesh_session_impl(path, source, target, path_type, token_hash, ttl_seconds, out_session, control);
 }
 
 int st_storage_get_peer_mesh_session(const char *path,
@@ -8929,7 +9052,7 @@ static int peer_session_pair_matches(const peer_session_state *state, long long 
  * - a reported path type is taken as is only while nothing has been counted, and is the effective
  *   one after that.
  */
-int st_storage_report_peer_mesh_session(const char *path,
+static int report_peer_mesh_session_impl(const char *path,
                                         const st_storage_client *reporter,
                                         long long id,
                                         const char *path_type,
@@ -8940,17 +9063,22 @@ int st_storage_report_peer_mesh_session(const char *path,
                                         long long direct_bytes,
                                         long long relay_bytes,
                                         int close_session,
-                                        st_storage_peer_mesh_session *out_session)
+                                        st_storage_peer_mesh_session *out_session,
+                                        const st_storage_control_source *control)
 {
+    if (out_session != NULL) memset(out_session, 0, sizeof(*out_session));
     if (reporter == NULL || id <= 0) return -1;
     if (direct_bytes < 0) direct_bytes = 0;
     if (relay_bytes < 0) relay_bytes = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
+    int rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0) rc = peer_control_write_check(db, control, reporter->id, reporter->tenant_id);
     peer_session_state state;
-    int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
-    int rc = found == 1
-        && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    if (rc == 0) {
+        int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
+        rc = found == 1 && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    }
     if (rc == 0 && close_session) {
         rc = close_peer_session(db, id);
     } else if (rc == 0) {
@@ -8996,9 +9124,31 @@ int st_storage_report_peer_mesh_session(const char *path,
             sqlite3_finalize(stmt);
         }
     }
-    if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, out_session);
+    st_storage_peer_mesh_session staged = {0};
+    if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, &staged);
+    rc = peer_control_write_postcheck(db, control, reporter->id, reporter->tenant_id, rc);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
+    if (rc == 0 && out_session != NULL) *out_session = staged;
     return rc;
+}
+
+int st_storage_report_peer_mesh_session(const char *path, const st_storage_client *reporter,
+    long long id, const char *path_type, const char *status, long long rtt_millis,
+    const char *local_endpoint, const char *remote_endpoint, long long direct_bytes, long long relay_bytes,
+    int close_session, st_storage_peer_mesh_session *out_session)
+{ return report_peer_mesh_session_impl(path, reporter, id, path_type, status, rtt_millis, local_endpoint,
+    remote_endpoint, direct_bytes, relay_bytes, close_session, out_session, NULL); }
+
+int st_storage_report_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *reporter, long long id, const char *path_type, const char *status,
+    long long rtt_millis, const char *local_endpoint, const char *remote_endpoint,
+    long long direct_bytes, long long relay_bytes, int close_session, st_storage_peer_mesh_session *out_session)
+{
+    if (control == NULL) { if (out_session != NULL) memset(out_session, 0, sizeof(*out_session)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return report_peer_mesh_session_impl(path, reporter, id, path_type, status, rtt_millis, local_endpoint,
+        remote_endpoint, direct_bytes, relay_bytes, close_session, out_session, control);
 }
 
 /*
@@ -9815,12 +9965,18 @@ int st_storage_find_peer_mesh_egress_activity(const char *path,
     return result;
 }
 
-int st_storage_upsert_peer_mesh_egress_activity(const char *path,
-                                                const st_storage_peer_mesh_egress_activity *row)
+static int upsert_peer_mesh_egress_activity_impl(const char *path,
+    const st_storage_peer_mesh_egress_activity *row, const st_storage_control_source *control)
 {
     if (row == NULL || row->egress_client_id <= 0) return -1;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
+    if (control != NULL) {
+        int guard = exec_sql(db, "BEGIN IMMEDIATE");
+        if (guard == 0) guard = peer_control_write_check(db, control, row->egress_client_id, row->tenant_id);
+        if (guard == 0 && row->session_id != control->session_id) guard = ST_STORAGE_CONTROL_SOURCE_RETIRED;
+        if (guard != 0) { (void)exec_sql(db, "ROLLBACK"); sqlite3_close(db); return guard; }
+    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_egress_activity(tenant_id,egress_client_id,egress_client_name,session_id,"
@@ -9834,7 +9990,7 @@ int st_storage_upsert_peer_mesh_egress_activity(const char *path,
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, normalize_tenant_id(row->tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 2, row->egress_client_id);
-        sqlite3_bind_text(stmt, 3, row->egress_client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, control == NULL ? row->egress_client_name : control->client_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 4, row->session_id);
         sqlite3_bind_int64(stmt, 5, row->revision);
         sqlite3_bind_int64(stmt, 6, row->active_flows);
@@ -9846,9 +10002,21 @@ int st_storage_upsert_peer_mesh_egress_activity(const char *path,
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
+    if (control != NULL) {
+        rc = peer_control_write_postcheck(db, control, row->egress_client_id, row->tenant_id, rc);
+        if (rc == 0) rc = exec_sql(db, "COMMIT");
+        if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    }
     sqlite3_close(db);
     return rc;
 }
+
+int st_storage_upsert_peer_mesh_egress_activity(const char *path, const st_storage_peer_mesh_egress_activity *row)
+{ return upsert_peer_mesh_egress_activity_impl(path, row, NULL); }
+
+int st_storage_upsert_peer_mesh_egress_activity_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_peer_mesh_egress_activity *row)
+{ return control == NULL ? ST_STORAGE_CONTROL_SOURCE_RETIRED : upsert_peer_mesh_egress_activity_impl(path, row, control); }
 
 int st_storage_get_peer_mesh_egress_switch(const char *path,
                                            const char *tenant_id,

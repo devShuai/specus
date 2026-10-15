@@ -96,6 +96,8 @@ CATALOG_RECONNECT_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_tests
 ALL_TESTS += $(CATALOG_RECONNECT_TESTS)
 CATALOG_RECONNECT_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_e2e_tests
 ALL_TESTS += $(CATALOG_RECONNECT_E2E_TESTS)
+CONTROL_SOURCE_STORAGE_TESTS := $(BUILD_DIR)/specus_c_control_source_storage_tests
+ALL_TESTS += $(CONTROL_SOURCE_STORAGE_TESTS)
 
 .PHONY: all test release clean
 
@@ -298,6 +300,9 @@ $(CONTROL_QUEUE_TESTS): $(CORE_OBJS) tests/control_queue_tests.c src/main.c | $(
 $(CATALOG_RECONNECT_TESTS): $(CORE_OBJS) tests/catalog_reconnect_tests.c src/peer_mesh.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
 
+$(CONTROL_SOURCE_STORAGE_TESTS): $(CORE_OBJS) tests/control_source_storage_tests.c src/peer_mesh.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_storage_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
 $(CATALOG_RECONNECT_E2E_TESTS): $(CORE_OBJS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
 
@@ -311,6 +316,7 @@ test: all
 	$(CONTROL_LIFECYCLE_TESTS)
 	$(CONTROL_QUEUE_TESTS)
 	$(CATALOG_RECONNECT_TESTS)
+	$(CONTROL_SOURCE_STORAGE_TESTS)
 	$(CATALOG_RECONNECT_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	$(CONTROL_BUSINESS_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	@for test in $(TESTS); do $$test || exit 1; done
