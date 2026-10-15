@@ -132,7 +132,7 @@ public sealed class PeerMeshServiceTests
 
         Assert.Single(services);
         Assert.Single(services[0].Instances);
-        Assert.Equal(4, services[0].Instances[0].Revision);
+        Assert.Equal(1, services[0].Instances[0].Revision);
         Assert.Contains(sibling.RecentAudits(admin), item => item.Action == "service-report");
     }
 
@@ -170,28 +170,30 @@ public sealed class PeerMeshServiceTests
                 ServiceReport(3, "instance-3", "svc-race001"), 79, CancellationToken.None));
 
         var key = (publisher.TenantId, publisher.Id, SessionId: 79L);
-        Assert.Equal(3, fixture.State.ServiceCatalogRevisions[key]);
+        Assert.InRange(fixture.State.ServiceCatalogRevisions[key], 1, 2);
         Assert.Equal(3, fixture.State.ServiceReportRevisions[key]);
-        Assert.Equal(3, fixture.State.ServiceCatalogs[key].Revision);
+        Assert.Equal(fixture.State.ServiceCatalogRevisions[key], fixture.State.ServiceCatalogs[key].Revision);
         Assert.Equal("instance-3", fixture.State.ServiceCatalogs[key].InstanceId);
 
+        var beforeWithdrawal = fixture.State.ServiceCatalogRevisions[key];
         await scopeA.HandleServiceReportAsync(publisher, ServiceReport(4, "instance-4", "svc-race001", false),
             79, CancellationToken.None);
         await scopeB.HandleServiceReportAsync(publisher, ServiceReport(3, "late-instance", "svc-race001"),
             79, CancellationToken.None);
 
         Assert.False(fixture.State.ServiceCatalogs.ContainsKey(key));
-        Assert.Equal(4, fixture.State.ServiceCatalogRevisions[key]);
+        Assert.Equal(beforeWithdrawal + 1, fixture.State.ServiceCatalogRevisions[key]);
 
         await scopeA.HandleServiceReportAsync(publisher, ServiceReport(5, "instance-5", "svc-race001"),
             79, CancellationToken.None);
         var admin = new ManagementContext(publisher.TenantId, "admin", ManagementRole.Admin, true);
+        var beforeDisable = fixture.State.ServiceCatalogRevisions[key];
         await scopeB.UpdateSharedServiceAsync(admin, 9011,
             new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null,
                 false, null), CancellationToken.None);
 
         Assert.False(fixture.State.ServiceCatalogs.ContainsKey(key));
-        Assert.True(fixture.State.ServiceCatalogRevisions[key] > 5);
+        Assert.True(fixture.State.ServiceCatalogRevisions[key] > beforeDisable);
 
         await scopeB.UpdateSharedServiceAsync(admin, 9011,
             new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null,
@@ -200,10 +202,11 @@ public sealed class PeerMeshServiceTests
             79, CancellationToken.None);
         Assert.True(fixture.State.ServiceCatalogs.ContainsKey(key));
 
+        var beforeDelete = fixture.State.ServiceCatalogRevisions[key];
         await scopeB.DeleteSharedServiceAsync(admin, 9011, CancellationToken.None);
 
         Assert.False(fixture.State.ServiceCatalogs.ContainsKey(key));
-        Assert.True(fixture.State.ServiceCatalogRevisions[key] > 10);
+        Assert.True(fixture.State.ServiceCatalogRevisions[key] > beforeDelete);
     }
 
     [Fact]
@@ -222,6 +225,46 @@ public sealed class PeerMeshServiceTests
         Assert.Empty(restarted.ServiceCatalogRevisions);
         Assert.Empty(restarted.ServiceReportRevisions);
         Assert.Empty(restarted.Audits);
+    }
+
+    [Fact]
+    public async Task ServerOwnedCatalogRevisionsSurviveHugeReportsAndSessionCleanup()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var publisher = fixture.AddClient(7301, "tenant-revision", "alice", "revision-publisher");
+        var recipient = fixture.AddClient(7302, "tenant-revision", "alice", "revision-consumer");
+        fixture.AddDevice(publisher, "100.96.0.31", "publisher-key");fixture.AddDevice(recipient, "100.96.0.32", "consumer-key");
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshServiceSharings.Add(new PeerMeshServiceSharing { TenantId=publisher.TenantId, Enabled=true, UpdatedBy="admin", UpdatedAt=now });
+        fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService {
+            Id=7391,TenantId=publisher.TenantId,ClientId=publisher.Id,ClientName=publisher.ClientName,ServiceId="svc-revision",
+            Name="revision-service",Transport="tcp",Application="http",TargetHost="127.0.0.1",TargetPort=8080,PublishedPort=18080,
+            Path="/",Enabled=true,Visibility="OWNER",CreatedAt=now,UpdatedAt=now });
+        var session=CurrentPublisherSession(7381,publisher,now);fixture.Db.ClientSessions.Add(session);await fixture.SaveChangesAsync();
+        var writer=fixture.Bind(recipient);var admin=new ManagementContext(publisher.TenantId,"admin",ManagementRole.Admin,true);
+        var wire=new List<string>();
+        void Capture(long revision,int count) {
+            var catalogs=writer.RawPeerMessages().Where(raw=>JsonSerializer.Deserialize<PeerControlMessage>(raw)!.Type=="service-catalog").ToArray();
+            var raw=Assert.Single(catalogs);var message=JsonSerializer.Deserialize<PeerControlMessage>(raw)!;
+            Assert.Equal(revision,message.Revision);Assert.Equal(count,message.Services?.Count??0);wire.Add(raw);writer.Clear();
+        }
+        await fixture.Service.HandleServiceReportAsync(publisher,ServiceReport(long.MaxValue-1,"max-1","svc-revision"),7381,CancellationToken.None);Capture(1,1);
+        await fixture.CreateSiblingService().HandleServiceReportAsync(publisher,ServiceReport(long.MaxValue,"max","svc-revision"),7381,CancellationToken.None);Capture(2,1);
+        await fixture.Service.HandleServiceReportAsync(publisher,ServiceReport(long.MaxValue,"duplicate","svc-revision"),7381,CancellationToken.None);
+        await fixture.Service.HandleServiceReportAsync(publisher,ServiceReport(long.MaxValue-1,"older","svc-revision"),7381,CancellationToken.None);Assert.Empty(writer.RawPeerMessages());
+        await fixture.Service.SetSharingAsync(admin,false,CancellationToken.None);Capture(3,0);
+        session.Status="DISCONNECTED";await fixture.SaveChangesAsync();await fixture.Service.OnClientDisconnectedAsync(7381,CancellationToken.None);Capture(4,0);
+        Assert.Empty(fixture.State.ServiceCatalogRevisions);Assert.Empty(fixture.State.ServiceReportRevisions);
+        session.Status=ClientAccountService.StatusNettyOnline;session.ChannelId="new-control";await fixture.SaveChangesAsync();
+        await fixture.CreateSiblingService().SetSharingAsync(admin,true,CancellationToken.None);writer.Clear();
+        await fixture.CreateSiblingService().HandleServiceReportAsync(publisher,ServiceReport(1,"reconnected","svc-revision"),7381,CancellationToken.None);Capture(5,1);
+        typeof(PeerMeshServiceState).GetField("_serviceCatalogSequence",BindingFlags.Instance|BindingFlags.NonPublic)!.SetValue(fixture.State,long.MaxValue);
+        await Assert.ThrowsAsync<InvalidOperationException>(()=>fixture.Service.HandleServiceReportAsync(publisher,ServiceReport(2,"exhausted","svc-revision"),7381,CancellationToken.None));
+        Assert.Empty(writer.RawPeerMessages());Assert.Equal(5,fixture.State.ServiceCatalogRevisions[(publisher.TenantId,publisher.Id,7381)]);
+        Assert.Equal(1,fixture.State.ServiceReportRevisions[(publisher.TenantId,publisher.Id,7381)]);
+        if(Environment.GetEnvironmentVariable("SPECUS_TEST_CATALOG_REVISION_WIRE_DIR") is { Length:>0 } directory) {
+            Directory.CreateDirectory(directory);await File.WriteAllLinesAsync(Path.Combine(directory,"dotnet.jsonl"),wire);
+        }
     }
 
     [Fact]

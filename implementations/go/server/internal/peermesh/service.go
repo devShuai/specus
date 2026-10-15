@@ -477,10 +477,12 @@ type Service struct {
 	catalogMu           sync.Mutex
 	catalogs            map[catalogKey]catalogSnapshot
 	catalogRevisions    map[catalogKey]int64
-	reportRevisions     map[catalogKey]int64
-	serviceReportRates  map[int64][]time.Time
-	auditMu             sync.Mutex
-	audits              []AuditEvent
+	// Server-owned process-lifetime output clock; report counters never seed it.
+	catalogSequence    int64
+	reportRevisions    map[catalogKey]int64
+	serviceReportRates map[int64][]time.Time
+	auditMu            sync.Mutex
+	audits             []AuditEvent
 }
 
 type relayAuthorization struct {

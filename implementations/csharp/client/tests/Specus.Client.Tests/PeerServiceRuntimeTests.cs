@@ -12,6 +12,65 @@ namespace Specus.Client.Tests;
 public class PeerServiceRuntimeTests
 {
     [Fact]
+    public void CatalogRevisionWirePublisherReconnect()
+    {
+        var directory = Environment.GetEnvironmentVariable("SPECUS_TEST_CATALOG_REVISION_WIRE_DIR");
+        var producers = string.IsNullOrWhiteSpace(directory) ? new[] { "canonical" } : ["java", "go", "dotnet", "c"];
+        foreach (var producer in producers)
+        {
+            // An actual-wire run requires every producer and preserves its original timestamps.
+            var wire = producer == "canonical"
+                ? Enumerable.Range(1, 5).Select(revision => JsonSerializer.Serialize(new
+                {
+                    type = "service-catalog", publisherClientId = 7301, publisherClientName = "revision-publisher",
+                    publisherSessionId = 7381, revision, expiresAt = DateTimeOffset.UtcNow.AddMinutes(5).ToString("O"),
+                    services = revision is 3 or 4 ? Array.Empty<AdvertisedService>() :
+                    [new AdvertisedService { ServiceId = "svc-revision", Name = "revision-service",
+                        Transport = "tcp", Application = "http", PublishedPort = 18080, Path = "/" }],
+                }, new JsonSerializerOptions(JsonSerializerDefaults.Web))).ToArray()
+                : File.ReadAllLines(Path.Combine(directory!, producer + ".jsonl"));
+            Assert.Equal(5, wire.Length);
+            using var runtime = new PeerServiceRuntime(_ => { });
+            runtime.ApplyConfig(Config(sharing: true, FreePort(), enabled: false));
+            runtime.SetRosterLookup(_ => new PeerServiceRuntime.RosterHint("100.96.0.2", true));
+            var counts = new[] { 1, 1, 0, 0, 1 };
+            long publisher = 0, session = 0;
+            void Apply(string raw, int? stage = null)
+            {
+                using var document = JsonDocument.Parse(raw);
+                var message = document.RootElement;
+                Assert.Equal("service-catalog", message.GetProperty("type").GetString());
+                var id = message.GetProperty("publisherClientId").GetInt64();
+                var sessionId = message.GetProperty("publisherSessionId").GetInt64();
+                Assert.True(id > 0 && sessionId > 0);
+                if (publisher == 0) { publisher = id; session = sessionId; }
+                Assert.Equal(publisher, id); Assert.Equal(session, sessionId);
+                var services = message.TryGetProperty("services", out var values)
+                    ? values.Deserialize<List<AdvertisedService>>(new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? [] : [];
+                var expires = message.GetProperty("expiresAt").GetString();
+                if (stage is { } index)
+                {
+                    Assert.Equal(index + 1L, message.GetProperty("revision").GetInt64());
+                    Assert.Equal(counts[index], services.Count);
+                    if (services.Count > 0)
+                        Assert.True(DateTimeOffset.Parse(expires!) > DateTimeOffset.UtcNow,
+                            "Captured catalog expired: regenerate producers, do not rewrite wire timestamps");
+                }
+                runtime.ApplyCatalog(id, message.TryGetProperty("publisherClientName", out var name) ? name.GetString() : null,
+                    sessionId, message.GetProperty("revision").GetInt64(), expires, services);
+            }
+            for (var i = 0; i < wire.Length; i++)
+            {
+                Apply(wire[i], i);
+                Assert.Equal(counts[i], runtime.RemoteServices().Count);
+            }
+            Apply(wire[1]); Apply(wire[3]);
+            Assert.Single(runtime.RemoteServices());
+            Console.WriteLine($"[catalog-revision-wire] {producer} -> dotnet PASS (5 stages + 2 stale replays)");
+        }
+    }
+
+    [Fact]
     public void DoesNotProbeOrReportWhenSharingIsOff()
     {
         var port = FreePort();

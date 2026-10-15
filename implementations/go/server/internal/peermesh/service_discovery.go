@@ -460,6 +460,9 @@ func (s *Service) fanoutCatalog(ctx context.Context, publisher store.ClientAccou
 
 func (s *Service) fanoutCatalogMode(ctx context.Context, publisher store.ClientAccount, publisherSessionID, revision int64,
 	services []AdvertisedService, expiresAt time.Time, includeDenied bool) {
+	if revision < 1 {
+		return
+	} // Allocation failure is never a wire revision.
 	clients, err := s.db.ListClients(ctx)
 	if err != nil {
 		return
@@ -605,12 +608,9 @@ func (s *Service) acceptReportRevision(key catalogKey, revision int64) (int64, b
 	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
 		return 0, false
 	}
-	catalogRevision := revision
-	if previous := s.catalogRevisions[key]; catalogRevision <= previous {
-		if previous == int64(^uint64(0)>>1) {
-			return 0, false
-		}
-		catalogRevision = previous + 1
+	catalogRevision := s.allocateCatalogRevisionLocked(s.catalogRevisions[key])
+	if catalogRevision == 0 {
+		return 0, false
 	}
 	s.reportRevisions[key] = revision
 	s.catalogRevisions[key] = catalogRevision
@@ -619,14 +619,25 @@ func (s *Service) acceptReportRevision(key catalogKey, revision int64) (int64, b
 
 func (s *Service) nextCatalogRevisionLocked(key catalogKey) int64 {
 	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
-		return int64(^uint64(0) >> 1)
+		return 0
 	}
-	next := s.catalogRevisions[key] + 1
-	if next < 1 {
-		next = 1
+	next := s.allocateCatalogRevisionLocked(s.catalogRevisions[key])
+	if next == 0 {
+		return 0
 	}
 	s.catalogRevisions[key] = next
 	return next
+}
+
+// Called under catalogMu. Per-session cleanup must not reset this output clock: a
+// reconnect can reuse its authenticated session ID while consumers stay connected.
+func (s *Service) allocateCatalogRevisionLocked(previous int64) int64 {
+	floor := max(previous, s.catalogSequence)
+	if floor == int64(^uint64(0)>>1) {
+		return 0
+	} // Fail closed, never wrap or emit an invalid revision.
+	s.catalogSequence = floor + 1
+	return s.catalogSequence
 }
 
 func (s *Service) expireServiceCatalogs(ctx context.Context, now time.Time) {

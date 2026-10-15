@@ -36,6 +36,21 @@ public sealed class PeerMeshServiceState
     internal ConcurrentDictionary<long, ConcurrentQueue<long>> EgressReportWindows { get; } = new();
 
     private long _egressRevisions;
+    private long _serviceCatalogSequence;
+
+    // Shared across scoped service instances and retained after session cleanup. The client
+    // report revision is only an input dedupe cursor, never an output ordering authority.
+    internal long NextServiceCatalogRevision(long previous)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _serviceCatalogSequence);
+            var floor = Math.Max(current, previous);
+            if (floor == long.MaxValue) throw new InvalidOperationException("service catalog sequence exhausted");
+            var next = floor + 1;
+            if (Interlocked.CompareExchange(ref _serviceCatalogSequence, next, current) == current) return next;
+        }
+    }
 
     /// <summary>
     /// Bumped on every egress push so a client can ignore a snapshot it has already applied.

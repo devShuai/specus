@@ -176,7 +176,7 @@ class PeerServiceDiscoveryServiceTests {
         stale.setRevision(1L);
         var ignored = service.acceptReport(publisher, stale, 99L);
         assertThat(ignored).isEmpty();
-        assertThat(service.currentCatalog("tenant-a", 1L, 99L).revision()).isEqualTo(2L);
+        assertThat(service.currentCatalog("tenant-a", 1L, 99L).revision()).isEqualTo(1L);
         assertThat(service.currentCatalog("tenant-a", 1L, 99L).services())
                 .allSatisfy(item -> {
                     assertThat(item.getName()).isEqualTo("local-ssh");
@@ -187,7 +187,7 @@ class PeerServiceDiscoveryServiceTests {
                 .satisfies(delivery -> {
                     assertThat(delivery.recipient()).isSameAs(peer);
                     assertThat(delivery.catalog().getPublisherSessionId()).isEqualTo(99L);
-                    assertThat(delivery.catalog().getRevision()).isEqualTo(2L);
+                    assertThat(delivery.catalog().getRevision()).isEqualTo(1L);
                     assertThat(delivery.catalog().getServices()).hasSize(1);
                 });
     }
@@ -223,7 +223,7 @@ class PeerServiceDiscoveryServiceTests {
         withdrawal.setRevision(3L);
         withdrawal.setEnabled(false);
         var deliveries = service.acceptReport(publisher, withdrawal, 99L);
-        assertThat(deliveries).allSatisfy(item -> assertThat(item.catalog().getRevision()).isEqualTo(3L));
+        assertThat(deliveries).allSatisfy(item -> assertThat(item.catalog().getRevision()).isEqualTo(2L));
         assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNull();
 
         assertThat(service.acceptReport(publisher, published, 99L)).isEmpty();

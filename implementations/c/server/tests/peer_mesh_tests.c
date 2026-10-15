@@ -6,6 +6,7 @@
 #include "storage.h"
 
 #include <sqlite3.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1292,6 +1293,7 @@ static int test_service_report_lifecycle(void)
         "\"transport\":\"tcp\",\"application\":\"ssh\",\"publishedPort\":2222}]}";
     char report[1024];
     const char *catalog = NULL;
+    long long first_revision = 0, published_revision = 0, withdrawal_revision = 0;
 
     /* Sharing has never been switched on: the peer is told of no service. */
     snprintf(report, sizeof(report), report_format, "true", 1);
@@ -1302,13 +1304,15 @@ static int test_service_report_lifecycle(void)
         fprintf(stderr, "a report advertised services with sharing off: %s\n", catalog == NULL ? "(none)" : catalog);
         failed = 1;
     }
+    if (catalog != NULL) (void)st_json_get_i64(catalog, "revision", &first_revision);
     /* Sharing on: published from the stored definition, on the server's expiry. */
     snprintf(report, sizeof(report), report_format, "true", 2);
     ctx.count = 0;
     if (!failed && (st_storage_upsert_peer_mesh_service_sharing(path, publisher.tenant_id, 1, 0, "admin", NULL) != 0
                     || st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
                     || (catalog = catalog_for(&ctx, "life-peer")) == NULL
-                    || !contains(catalog, "\"serviceId\":\"svc-life0001\"") || !contains(catalog, "\"revision\":2")
+                    || !contains(catalog, "\"serviceId\":\"svc-life0001\"")
+                    || st_json_get_i64(catalog, "revision", &published_revision) != 0 || published_revision <= first_revision
                     || !contains(catalog, "\"name\":\"local-ssh\"") || contains(catalog, "client-supplied-name")
                     || contains(catalog, "targetHost") || contains(catalog, "2099-"))) {
         fprintf(stderr, "a published catalogue did not follow the definition and the server's expiry: %s\n",
@@ -1320,7 +1324,8 @@ static int test_service_report_lifecycle(void)
     ctx.count = 0;
     if (!failed && (st_peer_mesh_handle_control(&runtime, publisher.client_name, NULL, report) != 0
                     || (catalog = catalog_for(&ctx, "life-peer")) == NULL
-                    || !contains(catalog, "\"revision\":3") || !contains(catalog, "\"services\":[]"))) {
+                    || st_json_get_i64(catalog, "revision", &withdrawal_revision) != 0 || withdrawal_revision <= published_revision
+                    || !contains(catalog, "\"services\":[]"))) {
         fprintf(stderr, "a withdrawal did not reach the peer: %s\n", catalog == NULL ? "(none)" : catalog);
         failed = 1;
     }
@@ -1599,6 +1604,63 @@ static int test_service_report_bounds(void)
     return failed;
 }
 
+static int test_server_owned_catalog_revisions(void)
+{
+    char path[64];
+    if (temp_database(path, "catalog_revisions") != 0) return 1;
+    st_storage_client publisher, peer;
+    st_storage_peer_mesh_device device;
+    st_storage_peer_mesh_service service = {0};
+    int failed = st_storage_upsert_client(path, 0, "tenant-revision", "revision-publisher", "alice", 1, 60, &publisher) != 0
+        || st_storage_upsert_client(path, 0, "tenant-revision", "revision-consumer", "alice", 1, 60, &peer) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &publisher, 1, &device) != 0
+        || st_storage_update_peer_mesh_device_enabled(path, &peer, 1, &device) != 0
+        || st_storage_upsert_peer_mesh_service_sharing(path, publisher.tenant_id, 1, 0, "admin", NULL) != 0;
+    snprintf(service.tenant_id,sizeof(service.tenant_id),"%s",publisher.tenant_id);
+    service.client_id=publisher.id;snprintf(service.client_name,sizeof(service.client_name),"%s",publisher.client_name);
+    snprintf(service.service_id,sizeof(service.service_id),"svc-revision");snprintf(service.name,sizeof(service.name),"revision-service");
+    snprintf(service.transport,sizeof(service.transport),"tcp");snprintf(service.application,sizeof(service.application),"http");
+    snprintf(service.target_host,sizeof(service.target_host),"127.0.0.1");snprintf(service.path,sizeof(service.path),"/");
+    service.target_port=8080;service.published_port=18080;service.enabled=1;snprintf(service.visibility,sizeof(service.visibility),"OWNER");
+    failed=failed||st_storage_upsert_peer_mesh_service(path,&service,NULL)!=0;
+    peer_test_context ctx={0};st_peer_mesh_runtime runtime={path,capture_signal,always_online,&ctx,7381,2};
+    char report[512];char wire[5][8192];
+    for (int step=0;step<5&&!failed;step++) {
+        ctx.count=0;
+        int rc;
+        if(step==2)rc=st_storage_upsert_peer_mesh_service_sharing(path,publisher.tenant_id,0,0,"admin",NULL)!=0
+            ? -1 : st_peer_mesh_refresh_tenant(&runtime,publisher.tenant_id);
+        else if(step==3)rc=st_peer_mesh_handle_disconnect(&runtime,publisher.client_name);
+        else {
+            if(step==4&&st_storage_upsert_peer_mesh_service_sharing(path,publisher.tenant_id,1,0,"admin",NULL)!=0){failed=1;break;}
+            long long revision=step==0?LLONG_MAX-1LL:step==1?LLONG_MAX:1LL;
+            snprintf(report,sizeof(report),"{\"type\":\"service-report\",\"enabled\":true,\"revision\":%lld,\"services\":[{\"serviceId\":\"svc-revision\",\"name\":\"probe\",\"transport\":\"tcp\",\"application\":\"http\",\"publishedPort\":18080,\"path\":\"/\"}]}",revision);
+            rc=st_peer_mesh_handle_control(&runtime,publisher.client_name,NULL,report);
+        }
+        const char *catalog=catalog_for(&ctx,peer.client_name);long long output=0;
+        if(rc!=0||catalog==NULL||st_json_get_i64(catalog,"revision",&output)!=0||output!=step+1LL
+            ||((step==2||step==3)?!contains(catalog,"\"services\":[]"):!contains(catalog,"\"serviceId\":\"svc-revision\""))) {
+            fprintf(stderr,"server-owned catalog revision step %d failed rc=%d output=%lld\n",step,rc,output);failed=1;break;
+        }
+        snprintf(wire[step],sizeof(wire[step]),"%s",catalog);
+        if(step==1) {
+            ctx.count=0;
+            if(st_peer_mesh_handle_control(&runtime,publisher.client_name,NULL,report)!=0||ctx.count!=0){failed=1;break;}
+            snprintf(report,sizeof(report),"{\"type\":\"service-report\",\"enabled\":true,\"revision\":%lld,\"services\":[]}",LLONG_MAX-1LL);
+            if(st_peer_mesh_handle_control(&runtime,publisher.client_name,NULL,report)!=0||ctx.count!=0){failed=1;break;}
+        }
+    }
+    const char *directory=getenv("SPECUS_TEST_CATALOG_REVISION_WIRE_DIR");
+    if(!failed&&directory!=NULL&&*directory!='\0') {
+        char output[1024];snprintf(output,sizeof(output),"%s/c.jsonl",directory);FILE *file=fopen(output,"wb");
+        if(file==NULL)failed=1;
+        else {for(int i=0;i<5;i++)if(fprintf(file,"%s\n",wire[i])<0)failed=1;if(fclose(file)!=0)failed=1;}
+    }
+    (void)st_peer_mesh_handle_disconnect(&runtime,publisher.client_name);unlink(path);
+    if(!failed)printf("server-owned catalog revision rawMAX/withdraw/reconnect/replay passed\n");
+    return failed;
+}
+
 int main(void)
 {
     char path[] = "/tmp/specus_c_peer_mesh_tests.XXXXXX";
@@ -1609,6 +1671,7 @@ int main(void)
     setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
     setenv("SPECUS_PEER_MESH_CIDR", "100.96.0.0/11", 1);
     setenv("SPECUS_PEER_MESH_SESSION_TTL_SECONDS", "3600", 1);
+    if (test_server_owned_catalog_revisions() != 0) return 1;
     if (st_storage_init(path, 0) != 0) return 1;
 
     st_storage_client source;

@@ -57,6 +57,10 @@ public class PeerServiceDiscoveryService {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final WorkbenchReferences workbenchReferences;
     private final PeerCatalogCache catalogCache = new PeerCatalogCache(4096);
+    // Output ordering belongs to the server, never the untrusted report counter. Keep one
+    // process-lifetime clock after per-session cleanup, so the same token can reconnect without
+    // its new directory falling below a still-connected consumer's old high-water mark.
+    private final java.util.concurrent.atomic.AtomicLong catalogSequence = new java.util.concurrent.atomic.AtomicLong();
     private final Map<CatalogKey, CatalogSnapshot> catalogs = catalogCache.index(0, PeerServiceDiscoveryService::copySnapshot);
     private final Map<CatalogKey, Long> catalogRevisions = catalogCache.index(1, java.util.function.UnaryOperator.identity());
     private final Map<CatalogKey, Long> reportRevisions = catalogCache.index(2, java.util.function.UnaryOperator.identity());
@@ -499,12 +503,7 @@ public class PeerServiceDiscoveryService {
                             key.publisherSessionId(), null, "catalog-revision-table-full");
                     return null;
                 }
-                if (delivered != null && delivered == Long.MAX_VALUE) {
-                    return null;
-                }
-                long catalogRevision = delivered == null || revision > delivered
-                        ? revision
-                        : delivered + 1L;
+                long catalogRevision = allocateCatalogRevision(delivered == null ? 0L : delivered);
                 reportRevisions.put(key, revision);
                 catalogRevisions.put(key, catalogRevision);
                 return catalogRevision;
@@ -515,12 +514,22 @@ public class PeerServiceDiscoveryService {
     private long nextRevision(CatalogKey key) {
         synchronized (catalogRevisions) {
             if (!catalogRevisions.containsKey(key) && catalogRevisions.size() >= 4096) {
-                return Long.MAX_VALUE;
+                throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "service catalog revision table is full; retry");
             }
-            long next = Math.max(0L, catalogRevisions.getOrDefault(key, 0L)) + 1L;
+            long next = allocateCatalogRevision(catalogRevisions.getOrDefault(key, 0L));
             catalogRevisions.put(key, next);
             return next;
         }
+    }
+
+    private long allocateCatalogRevision(long previous) {
+        // Gaps after rollback are harmless; reusing or wrapping a number is not. A server-owned
+        // clock cannot be exhausted by one client sending Long.MAX_VALUE in a service-report.
+        return catalogSequence.updateAndGet(current -> {
+            long floor = Math.max(current, previous);
+            if (floor == Long.MAX_VALUE) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "service catalog sequence exhausted");
+            return floor + 1L;
+        });
     }
 
     private List<PeerAdvertisedService> advertisedFromReport(ClientAccount source,

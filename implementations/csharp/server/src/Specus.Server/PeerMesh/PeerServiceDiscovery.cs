@@ -621,11 +621,7 @@ public sealed partial class PeerMeshService
             return false;
         }
         var deliveredRevision = _serviceCatalogRevisions.GetValueOrDefault(key);
-        if (revision <= deliveredRevision && deliveredRevision == long.MaxValue)
-        {
-            return false;
-        }
-        catalogRevision = revision > deliveredRevision ? revision : checked(deliveredRevision + 1);
+        catalogRevision = _state.NextServiceCatalogRevision(deliveredRevision);
         _serviceReportRevisions[key] = revision;
         _serviceCatalogRevisions[key] = catalogRevision;
         return true;
@@ -635,9 +631,11 @@ public sealed partial class PeerMeshService
     {
         if (!_serviceCatalogRevisions.ContainsKey(key) && _serviceCatalogRevisions.Count >= 4096)
         {
-            return long.MaxValue;
+            throw new InvalidOperationException("service catalog revision table is full");
         }
-        return _serviceCatalogRevisions.AddOrUpdate(key, 1, static (_, current) => checked(current + 1));
+        var next = _state.NextServiceCatalogRevision(_serviceCatalogRevisions.GetValueOrDefault(key));
+        _serviceCatalogRevisions[key] = next;
+        return next;
     }
 
     private async Task WithdrawClientAsync(string tenantId, long clientId, CancellationToken cancellationToken)
