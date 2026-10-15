@@ -23,6 +23,12 @@ public final class SessionUtil {
 
     private static final Map<String, Channel> controlChannels = new ConcurrentHashMap<>();
     private static final Map<String, Channel> dataChannels = new ConcurrentHashMap<>();
+    // Bounded, short registry-only locks. Never perform socket I/O, DB work, or wait on a future
+    // while holding one: close callbacks may bind a successor on a different event loop.
+    private static final Object[] bindingLocks = new Object[256];
+    static {
+        for (int i = 0; i < bindingLocks.length; i++) bindingLocks[i] = new Object();
+    }
 
     private SessionUtil() {
     }
@@ -32,33 +38,64 @@ public final class SessionUtil {
     }
 
     public static void bindControlSession(Session session, Channel channel) {
-        Channel oldChannel = controlChannels.put(session.getClientName(), channel);
+        Channel oldChannel;
+        Channel oldData;
+        synchronized (bindingLock(session.getClientName())) {
+            // Detach the old pair before publishing its successor. Closing the old CONTROL can
+            // synchronously accept a new DATA; it must not be removed by a later name-only cleanup.
+            oldData = dataChannels.remove(session.getClientName());
+            channel.attr(ServerAttributes.SESSION).set(session);
+            oldChannel = controlChannels.put(session.getClientName(), channel);
+            if (oldChannel != null && oldChannel != channel) {
+                oldChannel.attr(ServerAttributes.SESSION).set(null);
+            }
+        }
+        channel.closeFuture().addListener(future -> unBindSession(channel));
         if (oldChannel != null && oldChannel != channel) {
-            oldChannel.attr(ServerAttributes.SESSION).set(null);
             // 让 channelInactive 能识别本次关闭是"被新登录替换"，而不是默认的 CLIENT_CLOSED。
             DisconnectReason.markIfAbsent(oldChannel, DisconnectReason.REPLACED_BY_NEW_LOGIN);
             oldChannel.close();
             log.info("{} 旧连接已替换", session.getClientName());
         }
-        Channel oldData = dataChannels.remove(session.getClientName());
         if (oldData != null && oldData != channel) {
             DisconnectReason.markIfAbsent(oldData, DisconnectReason.REPLACED_BY_NEW_LOGIN);
             oldData.close();
         }
-        channel.attr(ServerAttributes.SESSION).set(session);
-        channel.closeFuture().addListener(future -> unBindSession(channel));
     }
 
+    /** Trusted in-process binding. Network login must use the physical-CONTROL overload below. */
     public static void bindDataSession(Session session, Channel channel) {
-        Channel oldChannel = dataChannels.put(session.getClientName(), channel);
+        bindDataSession(session, channel, null, null, false);
+    }
+
+    /** Rechecks the exact CONTROL observed after authentication, atomically with DATA publication.
+     * Reusing the same HTTP access token does not make two physical CONTROLs interchangeable. */
+    public static boolean bindDataSession(Session session, Channel channel, Channel expectedControl,
+                                          Long clientSessionId) {
+        return bindDataSession(session, channel, expectedControl, clientSessionId, true);
+    }
+
+    private static boolean bindDataSession(Session session, Channel channel, Channel expectedControl,
+                                           Long clientSessionId, boolean requireControl) {
+        Channel oldChannel;
+        synchronized (bindingLock(session.getClientName())) {
+            if (requireControl && (!channel.isActive() || expectedControl == null
+                    || matchingControl(session.getClientName(), clientSessionId) != expectedControl)) {
+                return false;
+            }
+            channel.attr(ServerAttributes.SESSION).set(session);
+            oldChannel = dataChannels.put(session.getClientName(), channel);
+            if (oldChannel != null && oldChannel != channel) {
+                oldChannel.attr(ServerAttributes.SESSION).set(null);
+            }
+        }
+        channel.closeFuture().addListener(future -> unBindSession(channel));
         if (oldChannel != null && oldChannel != channel) {
-            oldChannel.attr(ServerAttributes.SESSION).set(null);
             DisconnectReason.markIfAbsent(oldChannel, DisconnectReason.REPLACED_BY_NEW_LOGIN);
             oldChannel.close();
             log.info("{} 旧数据连接已替换", session.getClientName());
         }
-        channel.attr(ServerAttributes.SESSION).set(session);
-        channel.closeFuture().addListener(future -> unBindSession(channel));
+        return true;
     }
 
     /**
@@ -76,13 +113,17 @@ public final class SessionUtil {
         if (session == null) {
             return;
         }
-        if (controlChannels.remove(session.getClientName(), channel)) {
-            closeDataSession(session.getClientName());
-            channel.attr(ServerAttributes.DEPARTED_CLIENT).set(session.getClientName());
+        Channel oldData = null;
+        synchronized (bindingLock(session.getClientName())) {
+            if (controlChannels.remove(session.getClientName(), channel)) {
+                oldData = dataChannels.remove(session.getClientName());
+                channel.attr(ServerAttributes.DEPARTED_CLIENT).set(session.getClientName());
+            }
+            dataChannels.remove(session.getClientName(), channel);
+            channel.attr(ServerAttributes.SESSION).set(null);
+            channel.attr(ServerAttributes.TENANT_ID).set(null);
         }
-        dataChannels.remove(session.getClientName(), channel);
-        channel.attr(ServerAttributes.SESSION).set(null);
-        channel.attr(ServerAttributes.TENANT_ID).set(null);
+        if (oldData != null) oldData.close();
         log.info("{} 退出登录", session.getClientName());
     }
 
@@ -95,15 +136,30 @@ public final class SessionUtil {
     }
 
     public static boolean hasMatchingControl(String clientName, Long clientSessionId) {
+        return getMatchingControl(clientName, clientSessionId) != null;
+    }
+
+    /** A snapshot, not a lease. Callers must recheck it when publishing a dependent DATA. */
+    public static Channel getMatchingControl(String clientName, Long clientSessionId) {
+        synchronized (bindingLock(clientName)) {
+            return matchingControl(clientName, clientSessionId);
+        }
+    }
+
+    private static Channel matchingControl(String clientName, Long clientSessionId) {
         Channel channel = controlChannels.get(clientName);
         return channel != null
                 && channel.isActive()
                 && clientSessionId != null
-                && clientSessionId.equals(channel.attr(ServerAttributes.CLIENT_SESSION_ID).get());
+                && clientSessionId.equals(channel.attr(ServerAttributes.CLIENT_SESSION_ID).get())
+                ? channel : null;
     }
 
     public static void closeDataSession(String clientName) {
-        Channel channel = dataChannels.remove(clientName);
+        Channel channel;
+        synchronized (bindingLock(clientName)) {
+            channel = dataChannels.remove(clientName);
+        }
         if (channel != null) {
             channel.close();
         }
@@ -115,5 +171,9 @@ public final class SessionUtil {
 
     public static Session getSession(Channel channel) {
         return channel.attr(ServerAttributes.SESSION).get();
+    }
+
+    private static Object bindingLock(String clientName) {
+        return bindingLocks[(clientName.hashCode() ^ (clientName.hashCode() >>> 16)) & (bindingLocks.length - 1)];
     }
 }

@@ -6,6 +6,7 @@ import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.session.Session;
 import com.theshuai.specusserver.session.SessionUtil;
+import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.management.model.DisconnectReason;
 import com.theshuai.specusserver.management.service.AuthenticationResult;
 import com.theshuai.specusserver.management.service.ClientAuthService;
@@ -15,6 +16,7 @@ import com.theshuai.specusserver.management.service.PeerSignalService;
 import com.theshuai.specusserver.config.NettyServerProperties;
 import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import io.netty.channel.ChannelHandler;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.AttributeKey;
@@ -92,9 +94,10 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                     : AuthenticationResult.failure(null, validRole
                     ? "客户端必须先通过 HTTP 登录获取访问令牌"
                     : "登录包缺少有效 connectionRole");
-            if (authentication.success() && dataConnection
-                    && !SessionUtil.hasMatchingControl(packet.getClientName(), authentication.clientSessionId())) {
-                authentication = AuthenticationResult.failure(authentication.account(), "数据连接未找到匹配的控制连接");
+            Channel authenticatedControl = authentication.success() && dataConnection
+                    ? SessionUtil.getMatchingControl(packet.getClientName(), authentication.clientSessionId()) : null;
+            if (authentication.success() && dataConnection && authenticatedControl == null) {
+                authentication = AuthenticationResult.failure(authentication.account(), "数据连接要求控制连接先登录：未找到匹配的控制连接");
             }
             AuthenticationResult finalAuthentication = authentication;
             long connectionRecordId = dataConnection ? 0L : connectionRecordService.recordConnection(
@@ -111,12 +114,6 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             // event loop so it stays ordered relative to other I/O on this connection.
             ctx.channel().eventLoop().execute(() -> {
                 if (finalAuthentication.success()) {
-                    if (ctx.pipeline().context(Spliter.PRE_AUTH_HANDLER_NAME) != null) {
-                        ctx.pipeline().replace(
-                                Spliter.PRE_AUTH_HANDLER_NAME,
-                                Spliter.AUTHENTICATED_HANDLER_NAME,
-                                new Spliter(nettyProperties.getMaxFrameSize()));
-                    }
                     if (connectionRecordId > 0) {
                         ctx.channel().attr(CONNECTION_RECORD_ID).set(connectionRecordId);
                     }
@@ -130,13 +127,29 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                                 finalAuthentication.clientSessionId());
                     }
                     if (dataConnection) {
-                        SessionUtil.bindDataSession(new Session(packet.getClientName()), ctx.channel());
+                        if (!SessionUtil.bindDataSession(new Session(packet.getClientName()), ctx.channel(),
+                                authenticatedControl, finalAuthentication.clientSessionId())) {
+                            // Authentication ran on a worker. Its CONTROL may have gone away or
+                            // been replaced while this event-loop callback was queued.
+                            response.setSuccess(false);
+                            response.setReason("数据连接要求控制连接先登录：原控制连接已改变，请重新建立数据连接");
+                            ctx.channel().attr(ServerAttributes.TENANT_ID).set(null);
+                            ctx.channel().attr(ServerAttributes.CONNECTION_ROLE).set(null);
+                            ctx.channel().attr(ServerAttributes.CLIENT_SESSION_ID).set(null);
+                            ctx.channel().attr(ServerAttributes.LOGIN_TIME_MS).set(null);
+                        }
                     } else {
                         SessionUtil.bindControlSession(new Session(packet.getClientName()), ctx.channel());
                     }
+                    if (response.isSuccess() && ctx.pipeline().context(Spliter.PRE_AUTH_HANDLER_NAME) != null) {
+                        ctx.pipeline().replace(
+                                Spliter.PRE_AUTH_HANDLER_NAME,
+                                Spliter.AUTHENTICATED_HANDLER_NAME,
+                                new Spliter(nettyProperties.getMaxFrameSize()));
+                    }
                 }
                 io.netty.channel.ChannelFuture writeFuture = ctx.writeAndFlush(response);
-                if (finalAuthentication.success()) {
+                if (response.isSuccess()) {
                     if (!dataConnection) {
                         // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
                         submit(() -> pushNatControlOnLogin(packet.getClientName()));
