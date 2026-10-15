@@ -20,6 +20,8 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
     private readonly IPAddress _targetAddress;
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _cts = new();
+    private readonly CancellationToken _stopToken;
+    private readonly object _lifecycle = new();
     private readonly ILogger? _logger;
     private readonly ConcurrentDictionary<TcpClient, TcpClient> _splices = new();
     private readonly SemaphoreSlim _slots = new(PeerServiceResourceLimiter.MaxTcpPerService,
@@ -38,6 +40,7 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         _targetAddress = targetAddress;
         _listener = listener;
         _logger = logger;
+        _stopToken = _cts.Token;
         _ = AcceptLoopAsync();
     }
 
@@ -69,12 +72,12 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
 
     private async Task AcceptLoopAsync()
     {
-        while (!_cts.IsCancellationRequested)
+        while (!_stopToken.IsCancellationRequested)
         {
             TcpClient inbound;
             try
             {
-                inbound = await _listener.AcceptTcpClientAsync(_cts.Token).ConfigureAwait(false);
+                inbound = await _listener.AcceptTcpClientAsync(_stopToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -84,27 +87,40 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
             {
                 return;
             }
-            if (inbound.Client.RemoteEndPoint is not IPEndPoint remote
-                || !PeerServiceDiscovery.IsSourceAllowed(remote.Address, _service))
+            var outbound = new TcpClient();
+            // Track every accepted socket before auditing, ACL checks or forwarding. Withdrawal
+            // must also close accepted connections that have not reached SpliceAsync yet.
+            lock (_lifecycle)
             {
-                AuditAccessOnce("deny", inbound.Client.RemoteEndPoint, "source-not-allowed");
-                inbound.Dispose();
-                continue;
+                if (Volatile.Read(ref _disposed) != 0 || !_splices.TryAdd(inbound, outbound))
+                {
+                    inbound.Dispose(); outbound.Dispose(); return;
+                }
             }
-            AuditAccessOnce("allow", remote, "acl-authorized");
-            if (!_slots.Wait(0))
+            var handedOff = false;
+            try
             {
-                inbound.Dispose();
-                continue;
+                if (inbound.Client.RemoteEndPoint is not IPEndPoint remote
+                    || !PeerServiceDiscovery.IsSourceAllowed(remote.Address, _service))
+                {
+                    AuditAccessOnce("deny", inbound.Client.RemoteEndPoint, "source-not-allowed");
+                    continue;
+                }
+                AuditAccessOnce("allow", remote, "acl-authorized");
+                if (!_slots.Wait(0)) continue;
+                var lease = PeerServiceResourceLimiter.TryAcquireTcp(remote.Address);
+                if (lease is null)
+                {
+                    _slots.Release(); continue;
+                }
+                _ = SpliceAsync(inbound, outbound, lease);
+                handedOff = true;
             }
-            var lease = PeerServiceResourceLimiter.TryAcquireTcp(remote.Address);
-            if (lease is null)
+            catch (Exception) when (_stopToken.IsCancellationRequested)
             {
-                _slots.Release();
-                inbound.Dispose();
-                continue;
+                return;
             }
-            _ = SpliceAsync(inbound, lease);
+            finally { if (!handedOff) CloseSplice(inbound, outbound); }
         }
     }
 
@@ -120,21 +136,18 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         }
     }
 
-    private async Task SpliceAsync(TcpClient inbound, PeerServiceResourceLimiter.Lease lease)
+    private async Task SpliceAsync(TcpClient inbound, TcpClient outbound, PeerServiceResourceLimiter.Lease lease)
     {
         using var resourceLease = lease;
         using var inboundClient = inbound;
-        using var outbound = new TcpClient();
-        if (_cts.IsCancellationRequested || !_splices.TryAdd(inboundClient, outbound))
-        {
-            return;
-        }
+        using var outboundClient = outbound;
         Interlocked.Increment(ref _totalConnections);
         try
         {
             inboundClient.NoDelay = true;
             outbound.NoDelay = true;
-            using var connectCts = new CancellationTokenSource(PeerServiceResourceLimiter.ConnectTimeout);
+            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(_stopToken);
+            connectCts.CancelAfter(PeerServiceResourceLimiter.ConnectTimeout);
             await outbound.ConnectAsync(_targetAddress, _service.TargetPort, connectCts.Token).ConfigureAwait(false);
             await using var inboundStream = inboundClient.GetStream();
             await using var outboundStream = outbound.GetStream();
@@ -142,13 +155,14 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
             var down = CopyCountedAsync(outboundStream, inboundStream, incrementIn: false);
             await Task.WhenAny(up, down).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex)
         {
-            _logger?.LogDebug(ex, "Peer-only 桥接转发失败 service={ServiceId}", _service.ServiceId);
+            if (!_stopToken.IsCancellationRequested)
+                _logger?.LogDebug(ex, "Peer-only 桥接转发失败 service={ServiceId}", _service.ServiceId);
         }
         finally
         {
-            _splices.TryRemove(inboundClient, out _);
+            CloseSplice(inboundClient, outbound);
             _slots.Release();
         }
     }
@@ -156,9 +170,9 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
     private async Task CopyCountedAsync(NetworkStream from, NetworkStream to, bool incrementIn)
     {
         var buffer = new byte[8192];
-        while (!_cts.IsCancellationRequested)
+        while (!_stopToken.IsCancellationRequested)
         {
-            using var idle = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            using var idle = CancellationTokenSource.CreateLinkedTokenSource(_stopToken);
             idle.CancelAfter(PeerServiceResourceLimiter.IdleTimeout);
             var read = await from.ReadAsync(buffer, idle.Token).ConfigureAwait(false);
             if (read <= 0)
@@ -196,12 +210,21 @@ internal sealed class PeerServiceBridge : IPeerServiceForwarder
         {
             // ignored
         }
-        foreach (var splice in _splices)
+        lock (_lifecycle)
         {
-            splice.Key.Dispose();
-            splice.Value.Dispose();
+            foreach (var splice in _splices)
+            {
+                splice.Key.Dispose();
+                splice.Value.Dispose();
+            }
+            _splices.Clear();
         }
-        _splices.Clear();
         _cts.Dispose();
+    }
+
+    private void CloseSplice(TcpClient inbound, TcpClient outbound)
+    {
+        inbound.Dispose(); outbound.Dispose();
+        _splices.TryRemove(inbound, out _);
     }
 }

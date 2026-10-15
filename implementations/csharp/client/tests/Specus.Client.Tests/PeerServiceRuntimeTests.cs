@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Microsoft.Extensions.Logging;
 using Specus.Client.Configuration;
 using Specus.Client.Control;
 using Specus.Client.PeerMesh;
@@ -276,6 +277,26 @@ public class PeerServiceRuntimeTests
     }
 
     [Fact]
+    public async Task WithdrawalClosesAcceptedConnectionBeforeForwardingStarts()
+    {
+        using var target = Listen(0);
+        using var audit = new PausedAcceptAudit();
+        var local = Config(sharing: true, ((IPEndPoint)target.LocalEndpoint).Port, enabled: true).LocalServices![0];
+        local.PublishedPort = FreePort();
+        local.AllowedPeerVirtualIps = ["127.0.0.1"];
+        using var bridge = PeerServiceBridge.Bind("127.0.0.1", local, audit);
+        using var caller = new TcpClient();
+        await caller.ConnectAsync(IPAddress.Loopback, local.PublishedPort);
+        try
+        {
+            await audit.Accepted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            bridge.Dispose();
+            Assert.True(await ReadClosedAsync(caller));
+        }
+        finally { audit.Resume.Set(); }
+    }
+
+    [Fact]
     public async Task OnlineConfigCreatesReplacesAndClosesBridgeWithinFiveSeconds()
     {
         using var firstTarget = Listen(0);
@@ -292,8 +313,7 @@ public class PeerServiceRuntimeTests
         runtime.ApplyConfig(first);
         using var firstCaller = new TcpClient();
         await firstCaller.ConnectAsync(IPAddress.Loopback, firstPublishedPort);
-        using var firstAcceptTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        using var firstForwarded = await firstTarget.AcceptTcpClientAsync(firstAcceptTimeout.Token);
+        using var firstForwarded = await AcceptForwardedAsync(firstTarget, firstCaller, 1);
         Assert.True(DateTimeOffset.UtcNow - started < TimeSpan.FromSeconds(5));
 
         var replacement = Config(sharing: true, ((IPEndPoint)secondTarget.LocalEndpoint).Port, enabled: true);
@@ -309,8 +329,7 @@ public class PeerServiceRuntimeTests
 
         using var secondCaller = new TcpClient();
         await secondCaller.ConnectAsync(IPAddress.Loopback, secondPublishedPort);
-        using var secondAcceptTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        using var secondForwarded = await secondTarget.AcceptTcpClientAsync(secondAcceptTimeout.Token);
+        using var secondForwarded = await AcceptForwardedAsync(secondTarget, secondCaller, 2);
         replacement.LocalServices[0].Enabled = false;
         runtime.ApplyConfig(replacement);
         Assert.True(await ReadClosedAsync(secondCaller));
@@ -566,6 +585,25 @@ public class PeerServiceRuntimeTests
         }
     }
 
+    private static async Task<TcpClient> AcceptForwardedAsync(TcpListener target, TcpClient caller, byte marker)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await caller.GetStream().WriteAsync(new[] { marker }, timeout.Token);
+        while (true)
+        {
+            var accepted = await target.AcceptTcpClientAsync(timeout.Token);
+            try
+            {
+                var received = new byte[1];
+                // Runtime reachability probes also connect to target. They close without data;
+                // only the caller's forwarded marker proves the actual splice is established.
+                if (await accepted.GetStream().ReadAsync(received, timeout.Token) == 0) { accepted.Dispose(); continue; }
+                Assert.Equal(marker, received[0]); return accepted;
+            }
+            catch { accepted.Dispose(); throw; }
+        }
+    }
+
     private static PeerMeshConfig Config(bool sharing, int targetPort, bool enabled) => new()
     {
         Enabled = true,
@@ -624,6 +662,22 @@ public class PeerServiceRuntimeTests
         public string[] Applications { get; set; } = [];
         public Dictionary<string, JsonElement> ServiceReports { get; set; } = [];
         public LegacyCompatibilityVector LegacyCompatibility { get; set; } = new();
+    }
+
+    private sealed class PausedAcceptAudit : ILogger, IDisposable
+    {
+        internal TaskCompletionSource Accepted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal ManualResetEventSlim Resume { get; } = new(false);
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel level) => true;
+        public void Log<TState>(LogLevel level, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (!formatter(state, exception).Contains("action=allow", StringComparison.Ordinal)) return;
+            Accepted.TrySetResult();
+            if (!Resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("accept observation was not released");
+        }
+        public void Dispose() { Resume.Set(); }
     }
 
     private sealed class LegacyCompatibilityVector
