@@ -460,6 +460,11 @@ public class PeerMeshService {
                 target.getId(),
                 STATUS_CLOSED);
         for (PeerMeshSession session : lockSessionRows(sessions)) {
+            ClientAccount originalSource = Objects.equals(session.getSourceClientId(), source.getId()) ? source : target;
+            ClientAccount originalTarget = Objects.equals(session.getTargetClientId(), target.getId()) ? target : source;
+            if (!canPeerLocked(originalSource, originalTarget)) {
+                markClosed(session, now); sessionRepository.saveCurrent(session); continue;
+            }
             if (closeIfExpired(session, now)) {
                 sessionRepository.saveCurrent(session);
                 continue;
@@ -471,6 +476,64 @@ public class PeerMeshService {
             return Optional.of(new PeerSessionGrant(toSessionView(session), token));
         }
         return Optional.empty();
+    }
+
+    public record SignalPeer(ClientAccount account, PeerIdentity identity) {}
+    public record AuthorizedSignal(SignalPeer source, SignalPeer target, PeerSessionGrant grant) {}
+
+    /** Control forwarding must use current authority, not readonly/JPA roster hints. This also
+     * runs again on the publication worker, before any network write and after the producer commits. */
+    @Transactional
+    public AuthorizedSignal authorizeSignal(ClientAccount source, ClientAccount target, Long sessionId, String suppliedToken) {
+        if (source == null || target == null || source.getId() == null || target.getId() == null
+                || source.getTenantId() == null || !source.getTenantId().equals(target.getTenantId()))
+            throw new IllegalArgumentException("peer access denied");
+        var parents = clientAccountRepository.lockCurrentAll(List.of(source.getId(), target.getId()), source.getTenantId());
+        ClientAccount a = parents.get(source.getId()), b = parents.get(target.getId());
+        if (!canPeerLocked(a,b)) throw new IllegalArgumentException("peer access denied");
+        PeerSessionGrant grant = null;
+        if (sessionId != null) {
+            PeerMeshSession row = sessionRepository.lockCurrent(sessionId)
+                    .filter(current -> a.getTenantId().equals(current.getTenantId()))
+                    .filter(current -> Objects.equals(current.getSourceClientId(),a.getId()) && Objects.equals(current.getTargetClientId(),b.getId())
+                            || Objects.equals(current.getSourceClientId(),b.getId()) && Objects.equals(current.getTargetClientId(),a.getId()))
+                    .filter(current -> !STATUS_CLOSED.equals(current.getStatus()) && !isExpired(current,Instant.now()))
+                    .orElseThrow(() -> new IllegalArgumentException("peer session unavailable"));
+            if (!canPeerLocked(parents.get(row.getSourceClientId()),parents.get(row.getTargetClientId())))
+                throw new IllegalArgumentException("peer session unavailable");
+            String token = pendingOrCachedSessionToken(sessionId);
+            if (!matchesSessionToken(row,token)) token = suppliedToken;
+            if (!matchesSessionToken(row,token)) throw new IllegalArgumentException("peer session token unavailable");
+            grant = new PeerSessionGrant(toSessionView(row),token);
+        }
+        var ad = deviceRepository.lockCurrent(a.getTenantId(),a.getId()).orElseThrow();
+        var bd = deviceRepository.lockCurrent(b.getTenantId(),b.getId()).orElseThrow();
+        return new AuthorizedSignal(new SignalPeer(a,new PeerIdentity(ad.getVirtualIp(),ad.getPublicKey())),
+                new SignalPeer(b,new PeerIdentity(bd.getVirtualIp(),bd.getPublicKey())),grant);
+    }
+
+    @Transactional
+    public void publishAuthorizedSignal(ClientAccount source, ClientAccount target, Long sessionId, String token,
+                                        java.util.function.Consumer<AuthorizedSignal> publisher) {
+        // This transaction changes no session/grant state. Holding current parents/policy here
+        // linearizes forwarding with concurrent ownership/ACL writers; the grant already committed.
+        publisher.accept(authorizeSignal(source,target,sessionId,token));
+    }
+
+    private boolean matchesSessionToken(PeerMeshSession row, String token) {
+        return StringUtils.hasText(token) && StringUtils.hasText(row.getTokenHash()) && MessageDigest.isEqual(
+                row.getTokenHash().getBytes(StandardCharsets.US_ASCII),
+                HexFormat.of().formatHex(HmacSigner.sha256(token)).getBytes(StandardCharsets.US_ASCII));
+    }
+
+    public record SignalClosure(PeerMeshSessionView session, ClientAccount source, ClientAccount target) {}
+    @Transactional
+    public SignalClosure closeSignalSession(ClientAccount reporter, PeerControlMessage close) {
+        if (close.getSessionId() == null || close.getSessionId() <= 0) throw new IllegalArgumentException("sessionId is required");
+        CurrentPeerSession current = findReportableSession(reporter,close.getSessionId());
+        markClosed(current.row(),Instant.now());
+        var view = toSessionView(sessionRepository.saveCurrent(current.row()));
+        return new SignalClosure(view,current.parents().get(current.row().getSourceClientId()),current.parents().get(current.row().getTargetClientId()));
     }
 
     @Transactional

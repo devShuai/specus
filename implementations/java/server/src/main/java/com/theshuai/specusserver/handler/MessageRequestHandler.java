@@ -49,14 +49,14 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
             case CLIENT_TO_CLIENT -> clientToClient(messageRequestPacket, session);
             case CLIENT_TO_SERVER -> clientToServer(messageRequestPacket, session);
             case SERVER_TO_CLIENT -> serverToClient(messageRequestPacket, session);
-            case PEER_CONTROL -> peerControl(messageRequestPacket, session);
+            case PEER_CONTROL -> peerControl(messageRequestPacket, session, ctx.channel());
             default -> log.info("未知消息类型");
         }
     }
 
-    private void peerControl(MessageRequestPacket messageRequestPacket, Session session) {
+    private void peerControl(MessageRequestPacket messageRequestPacket, Session session, Channel incoming) {
         try {
-            peerSignalService.handle(messageRequestPacket, session);
+            peerSignalService.handle(messageRequestPacket, session, incoming);
         } catch (Exception e) {
             log.warn("[peer-mesh] signal rejected from {} to {}: {}",
                     session == null ? "?" : session.getClientName(),
