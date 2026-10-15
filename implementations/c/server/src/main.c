@@ -3538,6 +3538,8 @@ static void *peer_mesh_maintenance_thread(void *unused)
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
         if (st_peer_mesh_drain_client_deletions(&runtime) != 0)
             fprintf(stderr, "[peer-mesh] deleted client notification failed; retrying\n");
+        if (st_peer_mesh_drain_control_withdrawals(&runtime) != 0)
+            fprintf(stderr, "[peer-mesh] reconnect withdrawal failed; retained for retry\n");
         if (peer_owner_cursor.initialized && st_peer_mesh_owner_changes_drain(&runtime, &peer_owner_cursor) != 0)
             fprintf(stderr, "[peer-mesh] ownership-change notification failed; cursor retained for retry\n");
         st_admin_http_share_tick();
@@ -5607,6 +5609,7 @@ static void *client_thread(void *arg)
             size_t nat_control_http_routes = 0U;
             size_t nat_control_json_bytes = 0U;
             st_control_lifecycle *login_gate = NULL;
+            st_peer_mesh_control_transition *catalog_transition = NULL;
             long long login_client_id = session->config.client_id;
             int admission_allowed = 1;
             if (control_login) {
@@ -5627,6 +5630,12 @@ static void *client_thread(void *arg)
                 logged_in = 0; reason = "服务器繁忙：控制连接处理器暂不可用，请稍后重试";
             }
             if (logged_in && control_login && session->config.client_session_db_backed) {
+                st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
+                if (st_peer_mesh_control_connected_prepare(&runtime, session->config.client_name, &catalog_transition) != 0) {
+                    logged_in = 0; reason = "服务器繁忙：服务目录重连状态暂不可用，请稍后重试";
+                }
+            }
+            if (logged_in && control_login && session->config.client_session_db_backed) {
                 char connected_at[64];
                 if (current_utc_timestamp(connected_at) != 0
                     || st_storage_mark_client_session_online(session->config.database_path,
@@ -5635,6 +5644,17 @@ static void *client_thread(void *arg)
                     logged_in = 0; reason = "服务器繁忙：客户端会话状态更新失败，请稍后重试";
                 }
             }
+            if (logged_in && control_login) {
+                if (st_peer_mesh_control_connected_commit(catalog_transition) != 0) {
+                    logged_in = 0; reason = "服务器繁忙：服务目录重连状态提交失败，请稍后重试";
+                    if (session->config.client_session_db_backed) {
+                        char disconnected_at[64];
+                        if (current_utc_timestamp(disconnected_at) == 0)
+                            (void)st_storage_mark_client_session_disconnected_if_channel(session->config.database_path,
+                                session->config.client_session_id, session->physical_channel_id, disconnected_at, NULL);
+                    }
+                }
+            } else st_peer_mesh_control_connected_abort(catalog_transition);
             if (logged_in && control_login) {
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                              session->config.nat_control_json);

@@ -57,6 +57,18 @@ int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime,
                                 const char *message);
 int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime,
                                const char *client_name);
+typedef struct st_peer_mesh_control_transition st_peer_mesh_control_transition;
+/* Caller holds the immutable CID lifecycle. Prepare reserves bounded resources, without SQL,
+ * I/O or changing the old cache. Abort on failed native admission. Commit only after native
+ * ONLINE succeeds and BEFORE publishing the new physical CONTROL; both consume the reservation.
+ * Commit atomically detaches the old SID cache and queues an immutable empty catalog. */
+int st_peer_mesh_control_connected_prepare(const st_peer_mesh_runtime *runtime,
+                                           const char *client_name,
+                                           st_peer_mesh_control_transition **out);
+int st_peer_mesh_control_connected_commit(st_peer_mesh_control_transition *transition);
+void st_peer_mesh_control_connected_abort(st_peer_mesh_control_transition *transition);
+/* Bounded, nonblocking dispatcher admission; failed delivery retains the same revision for retry. */
+int st_peer_mesh_drain_control_withdrawals(const st_peer_mesh_runtime *runtime);
 /* Tell the tenant's online peers that a client has left; call after it is no longer active. */
 int st_peer_mesh_push_on_logout(const st_peer_mesh_runtime *runtime,
                                 const char *client_name);

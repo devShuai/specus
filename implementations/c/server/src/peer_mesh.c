@@ -93,10 +93,13 @@ static pthread_mutex_t peer_catalog_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Output clock is process-owned, independent of untrusted report counters and retained
  * after per-session cleanup. Called only while peer_catalog_lock is held. */
 static long long peer_catalog_sequence;
+/* A prepared native admission owns one future output revision, not an already allocated one.
+ * Other publications must leave this budget intact until its cache cutover commits or aborts. */
+static size_t peer_catalog_reserved_revisions;
 static long long pm_next_catalog_revision_locked(long long previous)
 {
     long long floor = peer_catalog_sequence > previous ? peer_catalog_sequence : previous;
-    if (floor == LLONG_MAX) return 0; /* No signed overflow or reusable wire revision. */
+    if (floor >= LLONG_MAX - (long long)peer_catalog_reserved_revisions) return 0;
     peer_catalog_sequence = floor + 1LL;
     return peer_catalog_sequence;
 }
@@ -104,6 +107,23 @@ static long long pm_next_catalog_revision_locked(long long previous)
  * an older peer-config/roster may arrive after the committed ownership refresh.
  * Runtime send/online callbacks must not re-enter these dispatch operations. */
 static pthread_mutex_t peer_snapshot_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct st_peer_mesh_control_transition {
+    char database_path[512];
+    char tenant_id[64];
+    char publisher_client_name[256];
+    long long publisher_client_id;
+    long long publisher_session_id;
+    long long revision;
+    time_t expires_at;
+    int audited;
+    struct st_peer_mesh_control_transition *next;
+};
+/* The cap includes reserved, queued AND executing withdrawals. Cache removal and queue insertion
+ * share peer_catalog_lock; no database handle or network callback is used while it is held. */
+static size_t peer_control_withdrawal_count;
+static st_peer_mesh_control_transition *peer_control_withdrawal_head;
+static st_peer_mesh_control_transition *peer_control_withdrawal_tail;
 
 typedef struct pm_client_deletion {
     st_storage_client client;
@@ -1216,7 +1236,7 @@ static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
             || runtime->online == NULL
             || !runtime->online(runtime->ctx, recipient->id, recipient->client_name)) continue;
         int allowed = 0;
-        if (st_storage_can_peer(runtime->database_path, publisher, recipient, &allowed) != 0) {
+        if (catalog->active && st_storage_can_peer(runtime->database_path, publisher, recipient, &allowed) != 0) {
             rc = -1;
             continue;
         }
@@ -1253,6 +1273,148 @@ static pm_catalog *pm_find_or_allocate_catalog_locked(const st_storage_client *s
         free_slot->publisher_session_id = session_id;
     }
     return free_slot;
+}
+
+static pm_catalog *pm_find_catalog_locked(long long cid, const char *tenant, long long sid)
+{
+    for (size_t i = 0; i < ST_PEER_MESH_MAX_CATALOGS; ++i) {
+        pm_catalog *catalog = &peer_catalogs[i];
+        if (catalog->in_use && catalog->publisher_client_id == cid && catalog->publisher_session_id == sid
+            && strcmp(catalog->tenant_id, tenant) == 0) return catalog;
+    }
+    return NULL;
+}
+
+int st_peer_mesh_control_connected_prepare(const st_peer_mesh_runtime *runtime,
+                                           const char *client_name, st_peer_mesh_control_transition **out)
+{
+    if (out == NULL) return -1;
+    *out = NULL;
+    if (runtime == NULL) return -1;
+    if (!pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0) || runtime->publisher_session_id <= 0) return 0;
+    if (!pm_has_text(runtime->database_path) || strlen(runtime->database_path) >= 512U
+        || runtime->authenticated_client_id <= 0 || !pm_has_text(runtime->authenticated_tenant)
+        || strlen(runtime->authenticated_tenant) >= 64U || !pm_has_text(client_name) || strlen(client_name) >= 256U) return -1;
+    pthread_mutex_lock(&peer_catalog_lock);
+    int found = pm_find_catalog_locked(runtime->authenticated_client_id, runtime->authenticated_tenant,
+                                      runtime->publisher_session_id) != NULL;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    if (!found) return 0;
+    st_peer_mesh_control_transition *item = calloc(1, sizeof(*item));
+    if (item == NULL) return -1;
+    snprintf(item->database_path, sizeof(item->database_path), "%s", runtime->database_path);
+    snprintf(item->tenant_id, sizeof(item->tenant_id), "%s", runtime->authenticated_tenant);
+    snprintf(item->publisher_client_name, sizeof(item->publisher_client_name), "%s", client_name);
+    item->publisher_client_id = runtime->authenticated_client_id;
+    item->publisher_session_id = runtime->publisher_session_id;
+    pthread_mutex_lock(&peer_catalog_lock);
+    found = pm_find_catalog_locked(item->publisher_client_id, item->tenant_id, item->publisher_session_id) != NULL;
+    if (!found) { pthread_mutex_unlock(&peer_catalog_lock); free(item); return 0; }
+    if (peer_control_withdrawal_count >= ST_PEER_MESH_MAX_CATALOGS
+        || peer_catalog_sequence >= LLONG_MAX - (long long)peer_catalog_reserved_revisions) {
+        pthread_mutex_unlock(&peer_catalog_lock); free(item); return -1;
+    }
+    ++peer_control_withdrawal_count;
+    ++peer_catalog_reserved_revisions;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    *out = item;
+    return 0;
+}
+
+void st_peer_mesh_control_connected_abort(st_peer_mesh_control_transition *item)
+{
+    if (item == NULL) return;
+    pthread_mutex_lock(&peer_catalog_lock);
+    --peer_catalog_reserved_revisions;
+    --peer_control_withdrawal_count;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    free(item);
+}
+
+int st_peer_mesh_control_connected_commit(st_peer_mesh_control_transition *item)
+{
+    if (item == NULL) return 0;
+    pthread_mutex_lock(&peer_catalog_lock);
+    --peer_catalog_reserved_revisions;
+    pm_catalog *catalog = pm_find_catalog_locked(item->publisher_client_id, item->tenant_id, item->publisher_session_id);
+    if (catalog == NULL) {
+        --peer_control_withdrawal_count;
+        pthread_mutex_unlock(&peer_catalog_lock); free(item); return 0;
+    }
+    item->revision = pm_next_catalog_revision_locked(catalog->catalog_revision);
+    if (item->revision == 0) {
+        --peer_control_withdrawal_count;
+        pthread_mutex_unlock(&peer_catalog_lock); free(item); return -1;
+    }
+    item->expires_at = time(NULL);
+    free(catalog->mdns_candidates);
+    memset(catalog, 0, sizeof(*catalog)); /* Includes the raw cursor, rate window, stats and mDNS. */
+    if (peer_control_withdrawal_tail != NULL) peer_control_withdrawal_tail->next = item;
+    else peer_control_withdrawal_head = item;
+    peer_control_withdrawal_tail = item;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    return 0;
+}
+
+/* Dispatcher ownership is required. A failed item retains its capacity charge and exact wire
+ * revision. Different publisher keys can progress while maintenance retries a failing peer. */
+static int pm_drain_control_withdrawal(const st_peer_mesh_runtime *runtime, long long cid,
+                                      const char *tenant, long long sid)
+{
+    pthread_mutex_lock(&peer_catalog_lock);
+    st_peer_mesh_control_transition *previous = NULL, *item = peer_control_withdrawal_head;
+    while (item != NULL && (strcmp(item->database_path, runtime->database_path) != 0
+        || (cid > 0 && (item->publisher_client_id != cid || item->publisher_session_id != sid
+                        || strcmp(item->tenant_id, tenant) != 0)))) { previous = item; item = item->next; }
+    if (item != NULL) {
+        if (previous != NULL) previous->next = item->next;
+        else peer_control_withdrawal_head = item->next;
+        if (peer_control_withdrawal_tail == item) peer_control_withdrawal_tail = previous;
+        item->next = NULL;
+    }
+    pthread_mutex_unlock(&peer_catalog_lock);
+    if (item == NULL) return 0;
+    int rc = 0;
+    if (!item->audited) {
+        rc = st_storage_record_peer_mesh_service_audit(runtime->database_path, "publisher-offline", item->tenant_id,
+            item->publisher_client_id, item->publisher_session_id, NULL, "control-reconnected");
+        if (rc == 0) item->audited = 1;
+    }
+    if (rc == 0) {
+        pm_catalog snapshot = {0};
+        st_storage_client publisher = {0};
+        snapshot.publisher_client_id = publisher.id = item->publisher_client_id;
+        snapshot.publisher_session_id = item->publisher_session_id;
+        snapshot.catalog_revision = item->revision;
+        snapshot.expires_at = item->expires_at;
+        snprintf(snapshot.tenant_id, sizeof(snapshot.tenant_id), "%s", item->tenant_id);
+        snprintf(snapshot.publisher_client_name, sizeof(snapshot.publisher_client_name), "%s", item->publisher_client_name);
+        snprintf(publisher.tenant_id, sizeof(publisher.tenant_id), "%s", item->tenant_id);
+        snprintf(publisher.client_name, sizeof(publisher.client_name), "%s", item->publisher_client_name);
+        rc = pm_fanout_catalog(runtime, &snapshot, &publisher);
+    }
+    pthread_mutex_lock(&peer_catalog_lock);
+    if (rc != 0) {
+        if (peer_control_withdrawal_tail != NULL) peer_control_withdrawal_tail->next = item;
+        else peer_control_withdrawal_head = item;
+        peer_control_withdrawal_tail = item;
+    } else --peer_control_withdrawal_count;
+    pthread_mutex_unlock(&peer_catalog_lock);
+    if (rc == 0) free(item);
+    return rc == 0 ? 1 : -1;
+}
+
+int st_peer_mesh_drain_control_withdrawals(const st_peer_mesh_runtime *runtime)
+{
+    if (runtime == NULL || !pm_has_text(runtime->database_path) || runtime->send == NULL || runtime->online == NULL) return -1;
+    if (pthread_mutex_trylock(&peer_snapshot_dispatch_lock) != 0) return 0;
+    int rc = 0;
+    for (size_t i = 0; i < 64U; ++i) {
+        int drained = pm_drain_control_withdrawal(runtime, 0, NULL, 0);
+        if (drained <= 0) { rc = drained; break; }
+    }
+    pthread_mutex_unlock(&peer_snapshot_dispatch_lock);
+    return rc;
 }
 
 /*
@@ -1566,7 +1728,8 @@ static int pm_prepare_deleted_catalogs(pm_client_deletion *item)
             if (catalog->catalog_revision > floor) floor = catalog->catalog_revision;
         }
     }
-    if (count > (unsigned long long)(LLONG_MAX - floor)) {
+    if (peer_catalog_reserved_revisions > (unsigned long long)(LLONG_MAX - floor)
+        || count > (unsigned long long)(LLONG_MAX - floor) - peer_catalog_reserved_revisions) {
         pthread_mutex_unlock(&peer_catalog_lock);
         return -1;
     }
@@ -2591,6 +2754,22 @@ static int pm_source_dispatch_lock(const st_peer_mesh_runtime *runtime)
         }
     } else pthread_mutex_lock(&peer_snapshot_dispatch_lock);
     if (runtime != NULL && runtime->source_current != NULL && !runtime->source_current(runtime->ctx)) {
+        pthread_mutex_unlock(&peer_snapshot_dispatch_lock);
+        return -1;
+    }
+    int drained = 0;
+    if (runtime != NULL && runtime->authenticated_client_id > 0 && pm_has_text(runtime->authenticated_tenant)
+        && runtime->publisher_session_id > 0) {
+        if (!pm_has_text(runtime->database_path) || runtime->send == NULL || runtime->online == NULL
+            || (drained = pm_drain_control_withdrawal(runtime, runtime->authenticated_client_id,
+                                                    runtime->authenticated_tenant, runtime->publisher_session_id)) < 0) {
+            pthread_mutex_unlock(&peer_snapshot_dispatch_lock);
+            return -1;
+        }
+    }
+    /* A queued withdrawal may have waited in real SQL/socket I/O. Do not turn the earlier source
+     * check into authority to publish a fresh report after that physical source has retired. */
+    if (drained > 0 && runtime != NULL && runtime->source_current != NULL && !runtime->source_current(runtime->ctx)) {
         pthread_mutex_unlock(&peer_snapshot_dispatch_lock);
         return -1;
     }

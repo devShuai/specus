@@ -92,6 +92,10 @@ CONTROL_BUSINESS_TESTS := $(BUILD_DIR)/specus_c_control_business_tests
 CONTROL_BUSINESS_BARRIER := $(BUILD_DIR)/libspecus_c_control_business_barrier.so
 ALL_TESTS += $(CONTROL_LIFECYCLE_TESTS) $(CONTROL_BUSINESS_TESTS) $(CONTROL_BUSINESS_BARRIER)
 ALL_TESTS += $(CONTROL_QUEUE_TESTS)
+CATALOG_RECONNECT_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_tests
+ALL_TESTS += $(CATALOG_RECONNECT_TESTS)
+CATALOG_RECONNECT_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_e2e_tests
+ALL_TESTS += $(CATALOG_RECONNECT_E2E_TESTS)
 
 .PHONY: all test release clean
 
@@ -291,6 +295,12 @@ $(CONTROL_LIFECYCLE_TESTS): $(CORE_OBJS) tests/control_lifecycle_tests.c | $(BUI
 $(CONTROL_QUEUE_TESTS): $(CORE_OBJS) tests/control_queue_tests.c src/main.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_queue_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(CATALOG_RECONNECT_TESTS): $(CORE_OBJS) tests/catalog_reconnect_tests.c src/peer_mesh.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CATALOG_RECONNECT_E2E_TESTS): $(CORE_OBJS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
 $(CONTROL_BUSINESS_TESTS): $(CORE_OBJS) tests/control_business_tests.c tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_business_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
 
@@ -300,6 +310,8 @@ $(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
 test: all
 	$(CONTROL_LIFECYCLE_TESTS)
 	$(CONTROL_QUEUE_TESTS)
+	$(CATALOG_RECONNECT_TESTS)
+	$(CATALOG_RECONNECT_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	$(CONTROL_BUSINESS_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
