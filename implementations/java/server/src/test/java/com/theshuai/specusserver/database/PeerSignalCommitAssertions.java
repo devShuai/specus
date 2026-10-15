@@ -163,7 +163,7 @@ public final class PeerSignalCommitAssertions {
     }
     private static PeerSignalService service(ConfigurableApplicationContext context,int capacity){
         return new PeerSignalService(context.getBean(ClientAccountService.class),context.getBean(PeerMeshService.class),
-                context.getBean(PeerServiceDiscoveryService.class),context.getBean(ClientSessionRepository.class),context.getBean(PeerEgressService.class),capacity);
+                context.getBean(PeerServiceDiscoveryService.class),context.getBean(ClientSessionRepository.class),context.getBean(PeerEgressService.class),context.getBean(com.theshuai.specusserver.management.service.PeerCatalogPublicationService.class),capacity);
     }
     private static Fixture fixture(ConfigurableApplicationContext context,long base){
         var jdbc=context.getBean(JdbcTemplate.class);String now=Instant.now().toString();

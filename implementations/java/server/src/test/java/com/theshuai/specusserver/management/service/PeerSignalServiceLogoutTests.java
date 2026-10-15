@@ -36,7 +36,7 @@ class PeerSignalServiceLogoutTests {
     private final PeerServiceDiscoveryService discovery = mock(PeerServiceDiscoveryService.class);
     private final PeerSignalService service = new PeerSignalService(accounts, mesh,
             discovery, mock(ClientSessionRepository.class),
-            mock(PeerEgressService.class));
+            mock(PeerEgressService.class), mock(PeerCatalogPublicationService.class));
     private final List<EmbeddedChannel> bound = new ArrayList<>();
 
     @AfterEach

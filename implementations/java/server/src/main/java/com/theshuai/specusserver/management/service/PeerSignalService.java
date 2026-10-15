@@ -47,6 +47,7 @@ public class PeerSignalService {
     private final PeerServiceDiscoveryService peerServiceDiscoveryService;
     private final ClientSessionRepository clientSessionRepository;
     private final PeerEgressService peerEgressService;
+    private final PeerCatalogPublicationService catalogPublisher;
     private final ConcurrentLinkedQueue<ClientPeerReferences.Deleted> deletedClients = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<PendingNegotiation> pendingSignals = new ConcurrentLinkedQueue<>();
     private final Semaphore signalSlots;
@@ -146,14 +147,15 @@ public class PeerSignalService {
                              PeerMeshService peerMeshService,
                              PeerServiceDiscoveryService peerServiceDiscoveryService,
                              ClientSessionRepository clientSessionRepository,
-                             PeerEgressService peerEgressService) {
-        this(clientAccountService,peerMeshService,peerServiceDiscoveryService,clientSessionRepository,peerEgressService,1024);
+                             PeerEgressService peerEgressService, PeerCatalogPublicationService catalogPublisher) {
+        this(clientAccountService,peerMeshService,peerServiceDiscoveryService,clientSessionRepository,peerEgressService,catalogPublisher,1024);
     }
 
     @Autowired
     public PeerSignalService(ClientAccountService clientAccountService, PeerMeshService peerMeshService,
                              PeerServiceDiscoveryService peerServiceDiscoveryService, ClientSessionRepository clientSessionRepository,
-                             PeerEgressService peerEgressService, @Value("${specus.peer-mesh.signal-queue-capacity:1024}") int capacity) {
+                             PeerEgressService peerEgressService, PeerCatalogPublicationService catalogPublisher,
+                             @Value("${specus.peer-mesh.signal-queue-capacity:1024}") int capacity) {
         if (capacity < 1 || capacity > 65536) throw new IllegalArgumentException("invalid peer signal queue capacity");
         signalSlots = new Semaphore(capacity);
         this.clientAccountService = clientAccountService;
@@ -161,6 +163,7 @@ public class PeerSignalService {
         this.peerServiceDiscoveryService = peerServiceDiscoveryService;
         this.clientSessionRepository = clientSessionRepository;
         this.peerEgressService = peerEgressService;
+        this.catalogPublisher = catalogPublisher;
     }
 
     @Transactional
@@ -463,11 +466,7 @@ public class PeerSignalService {
             return;
         }
         for (PeerServiceDiscoveryService.CatalogDelivery delivery : deliveries) {
-            Channel channel = SessionUtil.getChannel(delivery.recipient().getClientName());
-            if (channel == null || !SessionUtil.hasLogin(channel)) {
-                continue;
-            }
-            sendSignal(channel, "server", delivery.recipient().getClientName(), delivery.catalog());
+            catalogPublisher.submit(delivery);
         }
     }
 

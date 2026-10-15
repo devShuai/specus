@@ -250,13 +250,8 @@ public class PeerServiceDiscoveryService {
             return fanoutAuthorizationChange(source, publisherSessionId, catalogRevision, List.of(),
                     Instant.now().plus(PeerServiceDiscovery.CATALOG_TTL));
         }
-        if (!hasAuthorizedOnlinePeer(source)) {
-            catalogs.remove(key);
-            mdnsCandidates.remove(key);
-            audit("service-report", source.getTenantId(), source.getId(), publisherSessionId, null, "no-authorized-peer");
-            return fanoutAuthorizationChange(source, publisherSessionId, catalogRevision, List.of(),
-                    Instant.now().plus(PeerServiceDiscovery.CATALOG_TTL));
-        }
+        // Retain an authenticated publisher's bounded offer even while consumers are offline.
+        // An outgoing roster is not evidence about incoming consumers (one-way ACLs differ).
         List<PeerAdvertisedService> advertised = advertisedFromReport(source, report.getServices());
         Instant generatedAt = Instant.now();
         Instant expiresAt = generatedAt.plus(PeerServiceDiscovery.CATALOG_TTL);
@@ -358,7 +353,7 @@ public class PeerServiceDiscoveryService {
             if (publisher == null) {
                 continue;
             }
-            List<PeerAdvertisedService> visible = peerMeshService.canPeer(publisher, recipient)
+            List<PeerAdvertisedService> visible = peerMeshService.canPeer(recipient, publisher)
                     ? snapshot.services().stream()
                     .filter(service -> visibleTo(publisher, recipient, service))
                     .map(PeerServiceDiscovery::copyAdvertised)
@@ -377,6 +372,17 @@ public class PeerServiceDiscoveryService {
 
     public CatalogSnapshot currentCatalog(String tenantId, long clientId, long sessionId) {
         return catalogs.get(new CatalogKey(tenantId, clientId, sessionId));
+    }
+
+    /** Called inside the publication guard's transaction, after current ordered parent locks.
+     * Keep the cache lease through network acceptance so a new report/withdrawal cannot replace
+     * the checked snapshot between this check and the write. No DB wait under a cache monitor. */
+    boolean currentForPublication(String tenant, long publisher, long session, long revision, boolean snapshot) {
+        if (!PeerCatalogCache.hasScope()) throw new IllegalStateException("catalog publication transaction required");
+        CatalogKey key = new CatalogKey(tenant, publisher, session);
+        catalogCache.lockKey(key);
+        CatalogSnapshot current = catalogs.get(key);
+        return snapshot ? current != null && current.revision() == revision : current == null;
     }
 
     int trackedCatalogRevisionCount() {
@@ -550,7 +556,7 @@ public class PeerServiceDiscoveryService {
             if (channel == null || !SessionUtil.hasLogin(channel)) {
                 continue;
             }
-            if (!peerMeshService.canPeer(publisher, recipient)) continue;
+            if (!peerMeshService.canPeer(recipient, publisher)) continue;
             List<PeerAdvertisedService> visible = services.stream()
                     .filter(service -> visibleTo(publisher, recipient, service))
                     .map(PeerServiceDiscovery::copyAdvertised)
@@ -575,7 +581,7 @@ public class PeerServiceDiscoveryService {
             if (channel == null || !SessionUtil.hasLogin(channel)) {
                 continue;
             }
-            List<PeerAdvertisedService> visible = peerMeshService.canPeer(publisher, recipient)
+            List<PeerAdvertisedService> visible = peerMeshService.canPeer(recipient, publisher)
                     ? services.stream().filter(service -> visibleTo(publisher, recipient, service))
                     .map(PeerServiceDiscovery::copyAdvertised).toList()
                     : List.of();
@@ -627,11 +633,6 @@ public class PeerServiceDiscoveryService {
 
     private boolean configuredEnabled(String tenantId) {
         return sharingRepository.findById(tenantId).map(PeerMeshServiceSharing::isEnabled).orElse(false);
-    }
-
-    private boolean hasAuthorizedOnlinePeer(ClientAccount account) {
-        return peerMeshService.allowedRoster(account).stream()
-                .anyMatch(PeerMeshService.PeerRosterItem::online);
     }
 
     private long authenticatedSessionId(ClientAccount source) {

@@ -448,6 +448,17 @@ public class PeerMeshService {
     public record SignalPeer(ClientAccount account, PeerIdentity identity) {}
     public record AuthorizedSignal(SignalPeer source, SignalPeer target, PeerSessionGrant grant) {}
 
+    /** Current directional access without throwing for an expected denial. Catalog withdrawals
+     * must still commit; catching an exception from another transactional service would instead
+     * leave their transaction rollback-only. Ordered parent/policy locks survive the caller TX. */
+    @Transactional
+    public boolean canPeerCurrent(ClientAccount source, ClientAccount target) {
+        if (source == null || target == null || source.getId() == null || target.getId() == null
+                || source.getTenantId() == null || !source.getTenantId().equals(target.getTenantId())) return false;
+        var current=clientAccountRepository.lockCurrentAll(List.of(source.getId(),target.getId()),source.getTenantId());
+        return canPeerLocked(current.get(source.getId()),current.get(target.getId()));
+    }
+
     /** Control forwarding must use current authority, not readonly/JPA roster hints. This also
      * runs again on the publication worker, before any network write and after the producer commits. */
     @Transactional

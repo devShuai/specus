@@ -74,6 +74,20 @@ public class ClientControlSessionAuthority {
                 && (row[0] instanceof Boolean flag ? flag : row[0] instanceof Number number && number.intValue() != 0);
     }
 
+    /** Discovery is negotiated by this exact control session, not a different online login. */
+    public boolean discoveryAllowed(ClientAccount account, Long sessionId, String channelId) {
+        // Expected revocation is a result, not an exception crossing repository advice: an
+        // exception there would mark the caller rollback-only or be translated into a DB error.
+        try { verify(account, sessionId, channelId); } catch (IllegalArgumentException revoked) { return false; }
+        if (sessionId == null) return false;
+        var rows = entities.createNativeQuery("select peer_service_discovery_version,tenant_id,client_id from specus_client_session where id=?1" + rowLock())
+                .setParameter(1, sessionId).getResultList();
+        if (rows.size() != 1) return false;
+        Object[] row = (Object[]) rows.getFirst();
+        return account.getTenantId().equals(row[1]) && Objects.equals(account.getId(), number(row[2]))
+                && row[0] instanceof Number version && version.intValue() >= com.theshuai.common.peermesh.PeerServiceDiscovery.PROTOCOL_VERSION;
+    }
+
     private String rowLock() {
         return entities.unwrap(Session.class).doReturningWork(connection -> connection.getMetaData().supportsSelectForUpdate() ? " for update" : "");
     }
