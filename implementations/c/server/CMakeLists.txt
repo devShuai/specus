@@ -20,6 +20,7 @@ add_library(specus_c_core
     src/client_auth_nonce.c
     src/client_package.c
     src/connectivity_check.c
+    src/control_lifecycle.c
     src/crypto.c
     src/decompression_limits.c
     src/elasticsearch_traffic.c
@@ -78,6 +79,23 @@ target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(specus_c_control_lifecycle_tests tests/control_lifecycle_tests.c)
+target_link_libraries(specus_c_control_lifecycle_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_lifecycle_tests COMMAND specus_c_control_lifecycle_tests)
+add_executable(specus_c_control_queue_tests tests/control_queue_tests.c)
+target_link_libraries(specus_c_control_queue_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_queue_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_queue_tests COMMAND specus_c_control_queue_tests)
+set_tests_properties(control_queue_tests PROPERTIES TIMEOUT 30)
+add_library(specus_c_control_business_barrier SHARED tests/control_business_barrier.c)
+target_link_libraries(specus_c_control_business_barrier PRIVATE SQLite::SQLite3 pthread dl)
+add_executable(specus_c_control_business_tests tests/control_business_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_control_business_tests PRIVATE specus_c_core pthread dl)
+target_compile_options(specus_c_control_business_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_business_tests COMMAND specus_c_control_business_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_control_business_barrier>)
+set_tests_properties(control_business_tests PROPERTIES TIMEOUT 90)
 add_executable(specus_c_admin_http_tests tests/admin_http_tests.c)
 target_link_libraries(specus_c_admin_http_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_admin_http_tests PRIVATE -Wall -Wextra -Wpedantic)

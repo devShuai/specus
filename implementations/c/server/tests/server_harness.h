@@ -127,6 +127,8 @@ int db_scalar(const char *db_path, const char *sql, const char *text_arg, long l
 void dump_server_log(const test_server *server);
 int server_prepare(test_server *server);
 int server_start(test_server *server);
+/* For the deterministic accept/crypto/drain test: readiness must not create another CONTROL. */
+int server_start_without_control_probe(test_server *server);
 /* Sends SIGTERM and waits for the exit; returns the exit status, or -1 if it had to be killed. */
 int server_stop(test_server *server, int timeout_ms);
 void server_cleanup(test_server *server, int failed);

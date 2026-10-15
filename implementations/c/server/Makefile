@@ -20,6 +20,7 @@ BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_auth_nonce.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/oidc.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/traffic_capture.o $(BUILD_DIR)/turn_auth.o $(BUILD_DIR)/stream_tombstones.o $(BUILD_DIR)/workbench.o $(BUILD_DIR)/http_share.o $(BUILD_DIR)/product_metrics.o $(BUILD_DIR)/upstream_browser_headers.o
 SERVER := $(BUILD_DIR)/specus-server-c
 CORE_OBJS += $(BUILD_DIR)/owner_transfer.o
+CORE_OBJS += $(BUILD_DIR)/control_lifecycle.o
 OWNER_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_tests
 OWNER_RUNTIME_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_runtime_tests
 IDENTITY_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_client_identity_coordination_tests
@@ -85,6 +86,12 @@ ALL_TESTS += $(OWNER_RUNTIME_TESTS)
 ALL_TESTS += $(IDENTITY_COORDINATION_TESTS) $(AUTH_READ_BARRIER)
 ALL_TESTS += $(NAT_LIFECYCLE_TESTS) $(NAT_LIFECYCLE_BARRIER)
 ALL_TESTS += $(STREAM_RETIREMENT_TESTS)
+CONTROL_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_control_lifecycle_tests
+CONTROL_QUEUE_TESTS := $(BUILD_DIR)/specus_c_control_queue_tests
+CONTROL_BUSINESS_TESTS := $(BUILD_DIR)/specus_c_control_business_tests
+CONTROL_BUSINESS_BARRIER := $(BUILD_DIR)/libspecus_c_control_business_barrier.so
+ALL_TESTS += $(CONTROL_LIFECYCLE_TESTS) $(CONTROL_BUSINESS_TESTS) $(CONTROL_BUSINESS_BARRIER)
+ALL_TESTS += $(CONTROL_QUEUE_TESTS)
 
 .PHONY: all test release clean
 
@@ -278,7 +285,22 @@ $(OWNER_RUNTIME_TESTS): $(CORE_OBJS) tests/owner_transfer_runtime_tests.c tests/
 $(IDENTITY_COORDINATION_TESTS): $(CORE_OBJS) tests/client_identity_coordination_tests.c tests/management_ws_coordination_tests.h tests/peer_session_coordination_tests.h tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_identity_coordination_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
 
+$(CONTROL_LIFECYCLE_TESTS): $(CORE_OBJS) tests/control_lifecycle_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_lifecycle_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONTROL_QUEUE_TESTS): $(CORE_OBJS) tests/control_queue_tests.c src/main.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_queue_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONTROL_BUSINESS_TESTS): $(CORE_OBJS) tests/control_business_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_business_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
+
 test: all
+	$(CONTROL_LIFECYCLE_TESTS)
+	$(CONTROL_QUEUE_TESTS)
+	$(CONTROL_BUSINESS_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
 	python3 tests/fixture_isolation_tests.py

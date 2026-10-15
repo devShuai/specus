@@ -1836,6 +1836,32 @@ int main(void)
         unlink(path);
         return 1;
     }
+    /* Same reusable SID, different physical CONTROL: only the current channel may retire it. */
+    int channel_changed = -1;
+    if (st_storage_mark_client_session_online(path, session.id, "channel-replacement", "127.0.0.1:7011",
+                                              "2026-06-25T00:02:30Z") != 0
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "channel-1",
+                                                                  "old-cleanup", &channel_changed) != 0
+        || channel_changed != 0
+        || st_storage_get_client_session_for_login(path, session.id, session.token_hash, &login_session) != 0
+        || strcmp(login_session.status, "NETTY_ONLINE") != 0
+        || strcmp(login_session.channel_id, "channel-replacement") != 0
+        || strcmp(login_session.remote_address, "127.0.0.1:7011") != 0
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "", "invalid", NULL) != -1
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "channel-replacement",
+                                                                  "2026-06-25T00:02:40Z", &channel_changed) != 0
+        || channel_changed != 1
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "channel-replacement",
+                                                                  "must-not-overwrite", &channel_changed) != 0
+        || channel_changed != 0
+        || st_storage_get_client_session_for_login(path, session.id, session.token_hash, &login_session) != 0
+        || strcmp(login_session.disconnected_at, "2026-06-25T00:02:40Z") != 0
+        || st_storage_mark_client_session_online(path, session.id, "channel-1", "127.0.0.1:7010",
+                                                 "2026-06-25T00:02:50Z") != 0) {
+        fprintf(stderr, "conditional physical-channel disconnect mismatch\n");
+        unlink(path);
+        return 1;
+    }
     if (st_storage_mark_client_session_disconnected(path,
                                                     session.id,
                                                     "2026-06-25T00:03:00Z") != 0

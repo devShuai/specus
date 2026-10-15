@@ -4976,6 +4976,29 @@ int st_storage_mark_client_session_disconnected(const char *path,
     return rc == 0 ? 0 : -1;
 }
 
+int st_storage_mark_client_session_disconnected_if_channel(const char *path, long long id,
+    const char *channel_id, const char *disconnected_at, int *changed)
+{
+    if (changed != NULL) *changed = 0;
+    if (id <= 0 || channel_id == NULL || *channel_id == '\0') return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE specus_client_session SET status = 'DISCONNECTED', disconnected_at = COALESCE(disconnected_at, ?) "
+        "WHERE id = ? AND channel_id = ? AND status = 'NETTY_ONLINE'", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, disconnected_at == NULL ? "" : disconnected_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, id);
+        sqlite3_bind_text(stmt, 3, channel_id, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        if (rc == 0 && changed != NULL) *changed = sqlite3_changes(db);
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
 int st_storage_close_client_sessions_by_status(const char *path,
                                                const char *from_status,
                                                const char *disconnected_at)

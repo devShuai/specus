@@ -560,6 +560,8 @@ static int pm_handle_control_impl(const st_peer_mesh_runtime *runtime,
     st_storage_peer_mesh_device source_device;
     if (st_storage_get_client_by_name(runtime->database_path, authenticated_client_name, &source) != 0
         || !source.enabled
+        || (runtime->authenticated_client_id > 0 && source.id != runtime->authenticated_client_id)
+        || (runtime->authenticated_tenant != NULL && strcmp(source.tenant_id, runtime->authenticated_tenant) != 0)
         || st_storage_ensure_peer_mesh_device(runtime->database_path, &source, &source_device) != 0) {
         free(type);
         return -1;
@@ -1483,6 +1485,8 @@ int st_peer_mesh_handle_disconnect(const st_peer_mesh_runtime *runtime,
     if (st_storage_get_client_by_name(runtime->database_path, client_name, &publisher) != 0) {
         return -1;
     }
+    if ((runtime->authenticated_client_id > 0 && publisher.id != runtime->authenticated_client_id)
+        || (runtime->authenticated_tenant != NULL && strcmp(publisher.tenant_id, runtime->authenticated_tenant) != 0)) return -1;
     pm_catalog snapshot;
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.in_use = 1;
@@ -2414,6 +2418,8 @@ static int pm_push_on_login_impl(const st_peer_mesh_runtime *runtime,
     st_storage_client *clients = NULL;
     size_t client_count = 0U;
     if (st_storage_get_client_by_name(runtime->database_path, client_name, &source) != 0
+        || (runtime->authenticated_client_id > 0 && source.id != runtime->authenticated_client_id)
+        || (runtime->authenticated_tenant != NULL && strcmp(source.tenant_id, runtime->authenticated_tenant) != 0)
         || st_storage_list_all_clients(runtime->database_path, &clients, &client_count) != 0) return -1;
     if (pm_push_config(runtime, &source) != 0) {
         free(clients);
@@ -2452,6 +2458,8 @@ static int pm_push_on_logout_impl(const st_peer_mesh_runtime *runtime,
         || !pm_env_bool("SPECUS_PEER_MESH_ENABLED", 0)) return 0;
     st_storage_client departed;
     if (st_storage_get_client_by_name(runtime->database_path, client_name, &departed) != 0) return -1;
+    if ((runtime->authenticated_client_id > 0 && departed.id != runtime->authenticated_client_id)
+        || (runtime->authenticated_tenant != NULL && strcmp(departed.tenant_id, runtime->authenticated_tenant) != 0)) return -1;
     if (runtime->online(runtime->ctx, departed.id, departed.client_name)) return 0;
     st_storage_client *clients = NULL;
     size_t client_count = 0U;
@@ -2573,16 +2581,32 @@ int st_peer_mesh_owner_changes_drain(const st_peer_mesh_runtime *runtime, st_pee
     return 0;
 }
 
+static int pm_source_dispatch_lock(const st_peer_mesh_runtime *runtime)
+{
+    if (runtime != NULL && runtime->source_active != NULL) {
+        while (pthread_mutex_trylock(&peer_snapshot_dispatch_lock) != 0) {
+            if (!runtime->source_active(runtime->ctx)) return -1;
+            struct timespec delay = {0, 25L * 1000000L};
+            nanosleep(&delay, NULL);
+        }
+    } else pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    if (runtime != NULL && runtime->source_current != NULL && !runtime->source_current(runtime->ctx)) {
+        pthread_mutex_unlock(&peer_snapshot_dispatch_lock);
+        return -1;
+    }
+    return 0;
+}
+
 int st_peer_mesh_handle_control(const st_peer_mesh_runtime *runtime, const char *authenticated_client_name,
                                 const char *target_client_name, const char *message)
 {
-    pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    if (pm_source_dispatch_lock(runtime) != 0) return -1;
     int rc = pm_handle_control_impl(runtime, authenticated_client_name, target_client_name, message);
     pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return rc;
 }
 int st_peer_mesh_push_on_login(const st_peer_mesh_runtime *runtime, const char *client_name)
 {
-    pthread_mutex_lock(&peer_snapshot_dispatch_lock);
+    if (pm_source_dispatch_lock(runtime) != 0) return -1;
     int rc = pm_push_on_login_impl(runtime, client_name);
     pthread_mutex_unlock(&peer_snapshot_dispatch_lock); return rc;
 }

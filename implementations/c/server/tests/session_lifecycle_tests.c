@@ -1291,9 +1291,8 @@ static int admin_create_mapping(const test_server *server, const char *token, lo
 }
 
 /*
- * Sends a heartbeat on a control connection and reads up to its answer: 0 when a NAT_CONTROL came
- * first and the last one lists the TCP mapping on port. Whatever the server sent before it read
- * the heartbeat, a push by the login thread itself included, arrives ahead of the answer.
+ * Heartbeats deliberately bypass queued business. Within the original IO timeout require BOTH
+ * the heartbeat answer and the actual updated NAT_CONTROL, not a heartbeat-as-SQL barrier.
  */
 static int expect_last_nat_control_lists_port(int fd, int port)
 {
@@ -1305,7 +1304,7 @@ static int expect_last_nat_control_lists_port(int fd, int port)
     int nat_controls = 0;
     int answered = 0;
     long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
-    while (!answered) {
+    while (!answered || last == NULL || !nat_control_lists_port(last, port)) {
         long long remaining = deadline - monotonic_ms();
         st_frame_header header;
         uint8_t *body = NULL;
@@ -1329,7 +1328,7 @@ static int expect_last_nat_control_lists_port(int fd, int port)
     }
     int listed = answered && last != NULL && nat_control_lists_port(last, port);
     if (!listed) {
-        fprintf(stderr, "%d NAT_CONTROL(s) before the heartbeat answer%s, the last: %s\n", nat_controls,
+        fprintf(stderr, "%d NAT_CONTROL(s) within the business deadline%s, the last: %s\n", nat_controls,
                 answered ? "" : " (never answered)", last == NULL ? "(none)" : last);
     }
     free(last);

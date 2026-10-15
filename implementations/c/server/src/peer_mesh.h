@@ -21,6 +21,12 @@ typedef struct {
     void *ctx;
     long long publisher_session_id;
     int peer_service_discovery_version;
+    /* Network callers pin the original immutable identity. NULL/0 are explicit trusted service
+     * calls (management/maintenance/tests), not a network authentication fallback. */
+    long long authenticated_client_id;
+    const char *authenticated_tenant;
+    int (*source_active)(void *ctx); /* registry-only, no SQL; cancellation while waiting. */
+    int (*source_current)(void *ctx); /* fresh native epoch check after acquiring dispatch. */
 } st_peer_mesh_runtime;
 
 typedef struct {

@@ -920,6 +920,10 @@ int st_storage_mark_client_session_online(const char *path,
 int st_storage_mark_client_session_disconnected(const char *path,
                                                 long long id,
                                                 const char *disconnected_at);
+/* Physical CONTROL cleanup: a reusable SID must not mark a successor's native binding offline.
+ * Returns 0 for either a successful CAS or a mismatch, -1 for storage failure; changed is 0/1. */
+int st_storage_mark_client_session_disconnected_if_channel(const char *path, long long id,
+    const char *channel_id, const char *disconnected_at, int *changed);
 int st_storage_close_client_sessions_by_status(const char *path,
                                                const char *from_status,
                                                const char *disconnected_at);

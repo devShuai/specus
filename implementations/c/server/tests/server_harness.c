@@ -730,7 +730,7 @@ int server_prepare(test_server *server)
     return st_storage_init(server->db_path, 1);
 }
 
-int server_start(test_server *server)
+static int server_start_impl(test_server *server, int control_probe)
 {
     if (pick_free_port_pair(&server->control_port, &server->admin_port) != 0) {
         fprintf(stderr, "server startup refused before fork: control_port=%d admin_port=%d reason=%s\n",
@@ -789,9 +789,10 @@ int server_start(test_server *server)
             return -1;
         }
         int admin = connect_local(server->admin_port);
-        int control = admin < 0 ? -1 : connect_local(server->control_port);
+        int control = admin < 0 || !control_probe ? -1 : connect_local(server->control_port);
+        int admin_ready = admin >= 0;
         close_fd(&admin);
-        if (control >= 0) {
+        if (control >= 0 || (!control_probe && admin_ready)) {
             close_fd(&control);
             return 0;
         }
@@ -800,6 +801,9 @@ int server_start(test_server *server)
     fprintf(stderr, "server did not become ready\n");
     return -1;
 }
+
+int server_start(test_server *server) { return server_start_impl(server, 1); }
+int server_start_without_control_probe(test_server *server) { return server_start_impl(server, 0); }
 
 int server_stop(test_server *server, int timeout_ms)
 {
@@ -811,6 +815,9 @@ int server_stop(test_server *server, int timeout_ms)
     while (monotonic_ms() < deadline) {
         int status = 0;
         if (waitpid(server->pid, &status, WNOHANG) == server->pid) {
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                fprintf(stderr, "server shutdown pid=%ld raw_status=%d exit=%d signal=%d\n", (long)server->pid,
+                        status, WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
             server->pid = -1;
             return WIFEXITED(status) ? WEXITSTATUS(status) : 1000 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
         }

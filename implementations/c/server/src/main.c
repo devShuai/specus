@@ -2,6 +2,7 @@
 
 #include "admin_http.h"
 #include "crypto.h"
+#include "control_lifecycle.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
@@ -27,6 +28,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -115,6 +117,12 @@ typedef struct {
 } server_config;
 
 typedef struct specus_session specus_session;
+
+typedef struct control_work_item {
+    st_message_response message;
+    size_t charge;
+    struct control_work_item *next;
+} control_work_item;
 
 typedef struct external_write_chunk {
     uint8_t *data;
@@ -217,6 +225,20 @@ struct specus_session {
     int control_fd;
     st_tls_connection *tls_connection;
     int is_data_connection;
+    char physical_channel_id[35];
+    atomic_int control_cancelled;
+    pthread_cond_t control_work_cond;
+    int control_work_busy;
+    int control_work_queued;
+    specus_session *control_ready_prev;
+    specus_session *control_ready_next;
+    int control_work_stopping; /* control_queue_lock, including queued login audit on shutdown. */
+    int login_audit_pending;
+    unsigned long login_route_generation;
+    control_work_item *control_work_head;
+    control_work_item *control_work_tail;
+    size_t control_work_count;
+    size_t control_work_bytes;
     int bound; /* Routing-list membership, read/written only under active_session_lock. */
     /* Original physical CONTROL, retained under active_session_lock through DATA teardown.
      * A reusable HTTP token/SID does not make a replacement CONTROL interchangeable. */
@@ -295,6 +317,20 @@ static specus_session *active_sessions = NULL;
  * departing connection, leaving a live control whose session the database reports as offline.
  */
 static pthread_mutex_t control_admission_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Includes queued AND executing work. Metadata only: never held across SQL, a lifecycle wait or I/O.
+ * One legal 32-MiB MESSAGE still fits; an idle physical CONTROL consumes no lifecycle-table slot. */
+static pthread_mutex_t control_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t control_work_bytes;
+static pthread_cond_t control_ready_cond = PTHREAD_COND_INITIALIZER;
+static specus_session *control_ready_head;
+static specus_session *control_ready_tail;
+#define ST_CONTROL_POOL_SIZE 4U
+static pthread_t control_pool[ST_CONTROL_POOL_SIZE];
+static size_t control_pool_count;
+static int control_pool_stopping;
+#define ST_CONTROL_WORK_ITEMS 32U
+#define ST_CONTROL_WORK_BYTES (2U * ST_MAX_FRAME_SIZE)
+#define ST_CONTROL_GLOBAL_WORK_BYTES (8U * ST_MAX_FRAME_SIZE)
 /*
  * Every accepted connection, logged in or not, so a graceful shutdown can close each of them and
  * wait for its bookkeeping. A session's socket is closed only while holding this lock, which lets
@@ -955,6 +991,13 @@ static int64_t now_ms(void)
     return (int64_t)tv.tv_sec * 1000LL + (int64_t)tv.tv_usec / 1000LL;
 }
 
+static long long control_monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
 static int current_utc_date(char out[11])
 {
     time_t now = time(NULL);
@@ -1093,7 +1136,7 @@ static void record_login_success_event(specus_session *session)
     if (session->config.database_path[0] == '\0') {
         return;
     }
-    if (current_utc_timestamp(session->connected_at) != 0) {
+    if (session->connected_at[0] == '\0' && current_utc_timestamp(session->connected_at) != 0) {
         return;
     }
     long long record_id = 0;
@@ -1101,7 +1144,7 @@ static void record_login_success_event(specus_session *session)
                                                                session->config.tenant_id,
                                                                session->config.client_id,
                                                                session->config.client_name,
-                                                               NULL,
+                                                               session->physical_channel_id,
                                                                session->remote,
                                                                1,
                                                                NULL,
@@ -1864,6 +1907,7 @@ static void displace_session_locked(specus_session *session, const char *reason)
 {
     session->displaced_reason = reason;
     ++session->references;
+    atomic_store(&session->control_cancelled, 1);
     shutdown(session->control_fd, SHUT_RDWR);
     active_session_remove_locked(session);
     retire_data_namespace(session);
@@ -3014,7 +3058,8 @@ static int deliver_runtime_client_message_to_admin(specus_session *source_sessio
     if (st_storage_get_client_by_name(source_session->config.database_path,
                                       source_session->config.client_name,
                                       &source) != 0
-        || !source.enabled) {
+        || !source.enabled || source.id != source_session->config.client_id
+        || strcmp(source.tenant_id, source_session->config.tenant_id) != 0) {
         return -1;
     }
     return st_admin_deliver_client_message_to_admin(source.tenant_id,
@@ -3052,7 +3097,7 @@ static int forward_runtime_client_message(specus_session *source_session,
         || st_storage_get_client_by_name(source_session->config.database_path,
                                          canonical_input,
                                          &target) != 0
-        || !source.enabled || !target.enabled
+        || !source.enabled || !target.enabled || source.id != source_session->config.client_id
         || strcmp(source.tenant_id, source_session->config.tenant_id) != 0) {
         return -1;
     }
@@ -3121,16 +3166,264 @@ static int peer_mesh_runtime_send(void *ctx,
     return rc;
 }
 
+static int control_source_active(void *ctx)
+{
+    specus_session *session = ctx;
+    pthread_mutex_lock(&active_session_lock);
+    int current = session != NULL && session->bound && !session->is_data_connection
+        && !atomic_load(&session->control_cancelled);
+    pthread_mutex_unlock(&active_session_lock);
+    return current;
+}
+
+/* The lifecycle is held by the business worker, never by a heartbeat. Every database handle is
+ * closed before this returns or the caller waits for another lock. A name alone is not identity. */
+static int control_source_current(void *ctx)
+{
+    specus_session *session = ctx;
+    if (!control_source_active(session)) return 0;
+    if (!session->config.client_session_db_backed) return 1; /* Explicit trusted environment token. */
+    char token_hash[65], now[64];
+    st_hex_encode(session->config.access_token_hash, ST_SHA256_LEN, token_hash);
+    st_storage_client_session native;
+    st_storage_client account;
+    st_storage_client_credential credential;
+    int current = st_storage_get_client_session_for_login(session->config.database_path,
+        session->config.client_session_id, token_hash, &native) == 0
+        && native.client_id == session->config.client_id
+        && strcmp(native.tenant_id, session->config.tenant_id) == 0
+        && strcmp(native.status, "NETTY_ONLINE") == 0
+        && strcmp(native.channel_id, session->physical_channel_id) == 0
+        && current_utc_timestamp(now) == 0
+        && (native.expires_at[0] == '\0' || strcmp(native.expires_at, now) > 0)
+        && st_storage_get_client(session->config.database_path, native.client_id, &account) == 0
+        && account.enabled && strcmp(account.tenant_id, native.tenant_id) == 0
+        && strcmp(account.client_name, session->config.client_name) == 0
+        && st_storage_get_client_credential(session->config.database_path, native.credential_id, &credential) == 0
+        && credential.enabled && strcmp(credential.tenant_id, native.tenant_id) == 0;
+    return current && control_source_active(session);
+}
+
 static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *session)
 {
-    st_peer_mesh_runtime runtime;
+    st_peer_mesh_runtime runtime = {0};
     runtime.database_path = session->config.database_path;
     runtime.send = peer_mesh_runtime_send;
     runtime.online = peer_mesh_runtime_online;
     runtime.ctx = session;
     runtime.publisher_session_id = session->config.client_session_id;
     runtime.peer_service_discovery_version = session->config.peer_service_discovery_version;
+    runtime.authenticated_client_id = session->config.client_id;
+    runtime.authenticated_tenant = session->config.tenant_id;
+    runtime.source_active = control_source_active;
+    runtime.source_current = control_source_current;
     return runtime;
+}
+
+/* Reservations exist only for callers that are executing/waiting, not every idle connection.
+ * Saturation/OOM cannot make a caller run without a gate; cancelled queued work leaves promptly. */
+static st_control_lifecycle *control_lifecycle_wait(long long client_id, const atomic_int *cancelled,
+                                                   long long deadline_ms)
+{
+    for (;;) {
+        if ((cancelled != NULL && atomic_load(cancelled)) || (deadline_ms > 0 && control_monotonic_ms() >= deadline_ms)) return NULL;
+        st_control_lifecycle *gate = st_control_lifecycle_retain(client_id);
+        if (gate != NULL) {
+            if (st_control_lifecycle_lock(gate, cancelled, deadline_ms) == 0) return gate;
+            st_control_lifecycle_release(gate);
+            return NULL;
+        }
+        struct timespec delay = {0, 25L * 1000000L};
+        nanosleep(&delay, NULL);
+    }
+}
+
+static void control_lifecycle_done(st_control_lifecycle *gate)
+{
+    if (gate != NULL) { st_control_lifecycle_unlock(gate); st_control_lifecycle_release(gate); }
+}
+
+static void control_process_message(specus_session *session, st_message_response *message)
+{
+    if (message->message_type == ST_MESSAGE_TYPE_CLIENT_TO_CLIENT
+        && message->to_client_name != NULL && message->message != NULL) {
+        int admin = message_target_is_admin(message->to_client_name);
+        int rc = admin ? deliver_runtime_client_message_to_admin(session, message)
+            : forward_runtime_client_message(session, message);
+        printf("[message] client->%s %s source=%s target=%s\n", admin ? "admin" : "client",
+            rc == 0 ? "delivered" : "not-delivered", session->config.client_name, message->to_client_name);
+    } else if (message->message_type == ST_MESSAGE_TYPE_CLIENT_TO_SERVER) {
+        printf("[message] client->server source=%s bytes=%zu\n", session->config.client_name,
+            message->message == NULL ? 0U : strlen(message->message));
+    } else if (message->message_type == ST_MESSAGE_TYPE_PEER_CONTROL && message->message != NULL
+        && session->config.database_path[0] != '\0') {
+        st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
+        int rc = st_peer_mesh_handle_control(&runtime, session->config.client_name,
+            message->to_client_name, message->message);
+        printf("[peer-mesh] signal %s source=%s target=%s\n", rc == 0 ? "accepted" : "rejected",
+            session->config.client_name, message->to_client_name == NULL ? "" : message->to_client_name);
+    } else fprintf(stderr, "[message] unsupported type=%d source=%s target=%s\n", message->message_type,
+        session->config.client_name, message->to_client_name == NULL ? "" : message->to_client_name);
+}
+
+/* Called under control_queue_lock, including when discarding work on detach. */
+static void control_work_free_locked(specus_session *session, control_work_item *item)
+{
+    --session->control_work_count;
+    session->control_work_bytes -= item->charge;
+    control_work_bytes -= item->charge;
+    st_message_response_free(&item->message);
+    free(item);
+}
+
+/* Ready-list ownership, busy state and session lifetime are all protected by the queue mutex. */
+static void control_ready_remove_locked(specus_session *session)
+{
+    if (!session->control_work_queued) return;
+    if (session->control_ready_prev != NULL) session->control_ready_prev->control_ready_next = session->control_ready_next;
+    else control_ready_head = session->control_ready_next;
+    if (session->control_ready_next != NULL) session->control_ready_next->control_ready_prev = session->control_ready_prev;
+    else control_ready_tail = session->control_ready_prev;
+    session->control_ready_prev = session->control_ready_next = NULL;
+    session->control_work_queued = 0;
+}
+
+static void control_ready_schedule_locked(specus_session *session)
+{
+    if (session->control_work_busy || session->control_work_queued
+        || (!session->login_audit_pending && session->control_work_head == NULL)) return;
+    session->control_ready_prev = control_ready_tail;
+    if (control_ready_tail != NULL) control_ready_tail->control_ready_next = session;
+    else control_ready_head = session;
+    control_ready_tail = session;
+    session->control_work_queued = 1;
+    pthread_cond_signal(&control_ready_cond);
+}
+
+static void *control_business_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&control_queue_lock);
+        while (control_ready_head == NULL && !control_pool_stopping)
+            pthread_cond_wait(&control_ready_cond, &control_queue_lock);
+        if (control_ready_head == NULL && control_pool_stopping) {
+            pthread_mutex_unlock(&control_queue_lock);
+            break;
+        }
+        specus_session *session = control_ready_head;
+        control_ready_remove_locked(session);
+        session->control_work_busy = 1;
+        int login = session->login_audit_pending;
+        session->login_audit_pending = 0;
+        control_work_item *item = NULL;
+        if (!login && session->control_work_head != NULL) {
+            item = session->control_work_head;
+            session->control_work_head = item->next;
+            if (session->control_work_head == NULL) session->control_work_tail = NULL;
+        }
+        pthread_mutex_unlock(&control_queue_lock);
+        /* An actual accepted login is an audit event even if replaced before its worker runs.
+         * Cleanup waits for this job before stamping that record; no acceptance is silently lost. */
+        if (login) { record_login_success_event(session); record_client_online_milestone(session); }
+        st_control_lifecycle *gate = control_lifecycle_wait(session->config.client_id,
+            &session->control_cancelled, 0);
+        if (gate != NULL) {
+            if (control_source_current(session)) {
+                if (login) {
+                    push_routes_changed_during_login(session, session->login_route_generation);
+                    if (session->config.database_path[0] != '\0') {
+                        st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
+                        if (st_peer_mesh_push_on_login(&runtime, session->config.client_name) != 0)
+                            fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n", session->config.client_name);
+                    }
+                } else if (item != NULL) control_process_message(session, &item->message);
+            }
+            control_lifecycle_done(gate);
+        }
+        pthread_mutex_lock(&control_queue_lock);
+        if (item != NULL) control_work_free_locked(session, item);
+        session->control_work_busy = 0;
+        control_ready_schedule_locked(session);
+        pthread_cond_broadcast(&session->control_work_cond);
+        pthread_mutex_unlock(&control_queue_lock);
+    }
+    return NULL;
+}
+
+static int control_worker_start(specus_session *session)
+{
+    (void)session;
+    pthread_mutex_lock(&control_queue_lock);
+    while (!control_pool_stopping && control_pool_count < ST_CONTROL_POOL_SIZE) {
+        if (pthread_create(&control_pool[control_pool_count], NULL, control_business_worker, NULL) != 0) break;
+        ++control_pool_count;
+    }
+    int ready = !control_pool_stopping && control_pool_count > 0U;
+    pthread_mutex_unlock(&control_queue_lock);
+    return ready ? 0 : -1;
+}
+
+static void control_login_audit_enqueue(specus_session *session, unsigned long route_generation)
+{
+    pthread_mutex_lock(&control_queue_lock);
+    session->login_route_generation = route_generation;
+    session->login_audit_pending = 1;
+    control_ready_schedule_locked(session);
+    pthread_mutex_unlock(&control_queue_lock);
+}
+
+/* Takes ownership only on success. A queue includes its in-flight item in both slot and byte
+ * budgets; a blocked worker cannot replenish its budget by simply dequeuing more packets. */
+static int control_message_enqueue(specus_session *session, st_message_response *message)
+{
+    size_t charge = sizeof(control_work_item) + (message->client_name == NULL ? 0U : strlen(message->client_name) + 1U)
+        + (message->to_client_name == NULL ? 0U : strlen(message->to_client_name) + 1U)
+        + (message->message == NULL ? 0U : strlen(message->message) + 1U);
+    control_work_item *item = calloc(1, sizeof(*item));
+    if (item == NULL) return -1;
+    pthread_mutex_lock(&control_queue_lock);
+    if (session->control_work_stopping || session->control_work_count >= ST_CONTROL_WORK_ITEMS
+        || charge > ST_CONTROL_WORK_BYTES - session->control_work_bytes
+        || charge > ST_CONTROL_GLOBAL_WORK_BYTES - control_work_bytes) {
+        pthread_mutex_unlock(&control_queue_lock); free(item); return -1;
+    }
+    item->message = *message;
+    memset(message, 0, sizeof(*message));
+    item->charge = charge;
+    if (session->control_work_tail != NULL) session->control_work_tail->next = item;
+    else session->control_work_head = item;
+    session->control_work_tail = item;
+    ++session->control_work_count;
+    session->control_work_bytes += charge;
+    control_work_bytes += charge;
+    control_ready_schedule_locked(session);
+    pthread_mutex_unlock(&control_queue_lock);
+    return 0;
+}
+
+static void control_worker_stop(specus_session *session)
+{
+    atomic_store(&session->control_cancelled, 1);
+    pthread_mutex_lock(&control_queue_lock);
+    session->control_work_stopping = 1;
+    control_work_item *item = session->control_work_head;
+    session->control_work_head = session->control_work_tail = NULL;
+    while (item != NULL) { control_work_item *next = item->next; control_work_free_locked(session, item); item = next; }
+    if (!session->login_audit_pending) control_ready_remove_locked(session);
+    else control_ready_schedule_locked(session);
+    while (session->control_work_busy || session->login_audit_pending || session->control_work_queued)
+        pthread_cond_wait(&session->control_work_cond, &control_queue_lock);
+    pthread_mutex_unlock(&control_queue_lock);
+}
+
+static void control_pool_stop(void)
+{
+    pthread_mutex_lock(&control_queue_lock);
+    control_pool_stopping = 1;
+    pthread_cond_broadcast(&control_ready_cond);
+    pthread_mutex_unlock(&control_queue_lock);
+    for (size_t i = 0; i < control_pool_count; ++i) pthread_join(control_pool[i], NULL);
 }
 
 /* The management API's PEER_CONTROL messages (a session it closed) go out like the runtime's own. */
@@ -3146,12 +3439,10 @@ static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
     if (config == NULL || config->database_path[0] == '\0'
         || tenant_id == NULL || *tenant_id == '\0') return -1;
     st_peer_mesh_runtime runtime = {
-        config->database_path,
-        peer_mesh_runtime_send,
-        peer_mesh_runtime_online,
-        NULL,
-        0,
-        2
+        .database_path = config->database_path,
+        .send = peer_mesh_runtime_send,
+        .online = peer_mesh_runtime_online,
+        .peer_service_discovery_version = 2
     };
     return st_peer_mesh_refresh_tenant(&runtime, tenant_id);
 }
@@ -3239,12 +3530,10 @@ static void *peer_mesh_maintenance_thread(void *unused)
         if (peer_mesh_maintenance.stop) break;
         if (wait_rc != ETIMEDOUT) continue;
         st_peer_mesh_runtime runtime = {
-            peer_mesh_maintenance.database_path,
-            peer_mesh_runtime_send,
-            peer_mesh_runtime_online,
-            NULL,
-            0,
-            2
+            .database_path = peer_mesh_maintenance.database_path,
+            .send = peer_mesh_runtime_send,
+            .online = peer_mesh_runtime_online,
+            .peer_service_discovery_version = 2
         };
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
         if (st_peer_mesh_drain_client_deletions(&runtime) != 0)
@@ -3531,20 +3820,7 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "在线实例数已达上限";
         return 0;
     }
-    if (!session->is_data_connection
-        && st_storage_mark_client_session_online(config->database_path,
-                                              client_session.id,
-                                              session->remote,
-                                              session->remote,
-                                              now_text) != 0) {
-        *reason = "客户端会话状态更新失败";
-        return 0;
-    }
     if (reload_config_for_client_session(config, &client_session, &client) != 0) {
-        /* A failed re-login must not take a session offline that an older control still carries. */
-        if (!session->is_data_connection && !control_session_live(client_session.id)) {
-            (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
-        }
         *reason = "客户端配置加载失败";
         return 0;
     }
@@ -3605,6 +3881,23 @@ static int verify_login(specus_session *session, const st_login_request *request
 
     *reason = NULL;
     return 1;
+}
+
+/* Resolve a trusted immutable key with a CLOSED native read before waiting for its lifecycle.
+ * A second full login read below revalidates this result after acquisition. */
+static int control_login_key(specus_session *session, const st_login_request *request, long long *client_id)
+{
+    *client_id = session->config.client_id;
+    if (session->config.database_path[0] == '\0' || request->access_token == NULL
+        || *request->access_token == '\0' || request->client_session_id <= 0) return 0;
+    uint8_t hash[ST_SHA256_LEN]; char token_hash[65];
+    st_sha256((const uint8_t *)request->access_token, strlen(request->access_token), hash);
+    st_hex_encode(hash, sizeof(hash), token_hash);
+    st_storage_client_session native;
+    int rc = st_storage_get_client_session_for_login(session->config.database_path, request->client_session_id,
+        token_hash, &native);
+    if (rc == 0) *client_id = native.client_id;
+    return rc < 0 ? -1 : 0;
 }
 
 static void remote_text(const struct sockaddr_storage *remote, socklen_t remote_len, char *out, size_t out_len)
@@ -5172,6 +5465,7 @@ static void *client_thread(void *arg)
     }
     session->control_fd = args->fd;
     atomic_init(&session->nat_retired, 0);
+    atomic_init(&session->control_cancelled, 0);
     session->config = args->config;
     session->active = 1;
     session->references = 1U;
@@ -5180,6 +5474,7 @@ static void *client_thread(void *arg)
     pthread_mutex_init(&session->map_lock, NULL);
     pthread_mutex_init(&session->direct_lock, NULL);
     pthread_cond_init(&session->reference_cond, NULL);
+    pthread_cond_init(&session->control_work_cond, NULL);
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
@@ -5190,9 +5485,26 @@ static void *client_thread(void *arg)
         pthread_mutex_destroy(&session->map_lock);
         pthread_mutex_destroy(&session->direct_lock);
         pthread_cond_destroy(&session->reference_cond);
+        pthread_cond_destroy(&session->control_work_cond);
         free(session);
         return NULL;
     }
+    /* Register BEFORE entering OpenSSL: shutdown must await even a not-yet-authenticated
+     * reader before process-global crypto cleanup. An accept/probe can race immediate SIGTERM. */
+    uint8_t physical_random[16];
+    if (RAND_bytes(physical_random, sizeof(physical_random)) != 1) {
+        session_shutdown(session);
+        connection_unregister(session);
+        pthread_mutex_destroy(&session->send_lock);
+        pthread_mutex_destroy(&session->map_lock);
+        pthread_mutex_destroy(&session->direct_lock);
+        pthread_cond_destroy(&session->reference_cond);
+        pthread_cond_destroy(&session->control_work_cond);
+        free(session);
+        return NULL;
+    }
+    memcpy(session->physical_channel_id, "c-", 2);
+    st_hex_encode(physical_random, sizeof(physical_random), session->physical_channel_id + 2);
     printf("[control] accepted %s\n", session->remote);
 
     if (st_tls_server_context_enabled(session->config.tls_context)) {
@@ -5209,6 +5521,7 @@ static void *client_thread(void *arg)
             pthread_mutex_destroy(&session->map_lock);
             pthread_mutex_destroy(&session->direct_lock);
             pthread_cond_destroy(&session->reference_cond);
+            pthread_cond_destroy(&session->control_work_cond);
             free(session);
             return NULL;
         }
@@ -5293,11 +5606,35 @@ static void *client_thread(void *arg)
             size_t nat_control_tcp_routes = 0U;
             size_t nat_control_http_routes = 0U;
             size_t nat_control_json_bytes = 0U;
+            st_control_lifecycle *login_gate = NULL;
+            long long login_client_id = session->config.client_id;
+            int admission_allowed = 1;
             if (control_login) {
+                if (control_login_key(session, &request, &login_client_id) != 0
+                    || (login_gate = control_lifecycle_wait(login_client_id, &session->control_cancelled,
+                        control_monotonic_ms() + (long long)session->config.control_read_idle_seconds * 1000LL)) == NULL) {
+                    admission_allowed = 0;
+                    reason = "服务器繁忙：控制连接生命周期暂不可用，请稍后重试";
+                }
                 pthread_mutex_lock(&control_admission_lock);
             }
             unsigned long route_generation = atomic_load(&runtime_nat_control_generation);
-            logged_in = verify_login(session, &request, &reason);
+            logged_in = admission_allowed && verify_login(session, &request, &reason);
+            if (logged_in && control_login && session->config.client_id != login_client_id) {
+                logged_in = 0; reason = "客户端访问令牌无效";
+            }
+            if (logged_in && control_login && control_worker_start(session) != 0) {
+                logged_in = 0; reason = "服务器繁忙：控制连接处理器暂不可用，请稍后重试";
+            }
+            if (logged_in && control_login && session->config.client_session_db_backed) {
+                char connected_at[64];
+                if (current_utc_timestamp(connected_at) != 0
+                    || st_storage_mark_client_session_online(session->config.database_path,
+                        session->config.client_session_id, session->physical_channel_id,
+                        session->remote, connected_at) != 0) {
+                    logged_in = 0; reason = "服务器繁忙：客户端会话状态更新失败，请稍后重试";
+                }
+            }
             if (logged_in && control_login) {
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                              session->config.nat_control_json);
@@ -5319,6 +5656,7 @@ static void *client_thread(void *arg)
             if (control_login) {
                 pthread_mutex_unlock(&control_admission_lock);
             }
+            control_lifecycle_done(login_gate);
             if (logged_in) {
                 login_test_gate_wait(session, "published");
             }
@@ -5358,8 +5696,8 @@ static void *client_thread(void *arg)
                    session->is_data_connection ? "data" : "control",
                    session->config.client_name, session->remote);
             if (!session->is_data_connection) {
-                record_login_success_event(session);
-                record_client_online_milestone(session);
+                (void)current_utc_timestamp(session->connected_at);
+                control_login_audit_enqueue(session, route_generation);
                 if (nat_control_rc != 0) {
                     /*
                      * The control socket has a write timeout, so a failed write may have left half a
@@ -5387,14 +5725,7 @@ static void *client_thread(void *arg)
                                              nat_control_http_routes, nat_control_json_bytes);
                 }
             }
-            push_routes_changed_during_login(session, route_generation);
-            if (!session->is_data_connection && session->config.database_path[0] != '\0') {
-                st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
-                if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
-                    fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n",
-                            session->config.client_name);
-                }
-            }
+            if (session->is_data_connection) push_routes_changed_during_login(session, route_generation);
             st_login_request_free(&request);
             continue;
         }
@@ -5403,6 +5734,7 @@ static void *client_thread(void *arg)
             free(body);
             break;
         }
+        if (!session->is_data_connection && !control_source_active(session)) { free(body); break; }
 
         if (header.command == ST_CMD_HEARTBEAT_REQUEST) {
             free(body);
@@ -5452,42 +5784,13 @@ static void *client_thread(void *arg)
                 break;
             }
             free(body);
-            if (message_request.message_type == ST_MESSAGE_TYPE_CLIENT_TO_CLIENT
-                && message_request.to_client_name != NULL
-                && message_request.message != NULL) {
-                int admin_target = message_target_is_admin(message_request.to_client_name);
-                int delivery_rc = admin_target
-                    ? deliver_runtime_client_message_to_admin(session, &message_request)
-                    : forward_runtime_client_message(session, &message_request);
-                printf("[message] client->%s %s source=%s target=%s\n",
-                       admin_target ? "admin" : "client",
-                       delivery_rc == 0 ? "delivered" : "not-delivered",
-                       session->config.client_name,
-                       message_request.to_client_name);
-            } else if (message_request.message_type == ST_MESSAGE_TYPE_CLIENT_TO_SERVER) {
-                printf("[message] client->server source=%s bytes=%zu\n",
-                       session->config.client_name,
-                       message_request.message == NULL ? 0U : strlen(message_request.message));
-            } else if (message_request.message_type == ST_MESSAGE_TYPE_PEER_CONTROL
-                       && message_request.message != NULL
-                       && session->config.database_path[0] != '\0') {
-                st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
-                int delivery_rc = st_peer_mesh_handle_control(&peer_runtime,
-                                                              session->config.client_name,
-                                                              message_request.to_client_name,
-                                                              message_request.message);
-                printf("[peer-mesh] signal %s source=%s target=%s\n",
-                       delivery_rc == 0 ? "accepted" : "rejected",
-                       session->config.client_name,
-                       message_request.to_client_name == NULL ? "" : message_request.to_client_name);
-            } else {
-                fprintf(stderr,
-                        "[message] unsupported type=%d source=%s target=%s\n",
-                        message_request.message_type,
-                        session->config.client_name,
-                        message_request.to_client_name == NULL ? "" : message_request.to_client_name);
-            }
+            int enqueued = control_message_enqueue(session, &message_request);
             st_message_response_free(&message_request);
+            if (enqueued != 0) {
+                fprintf(stderr, "[control] bounded business queue exceeded client=%s\n", session->config.client_name);
+                disconnect_reason = "IO_ERROR";
+                break;
+            }
             continue;
         }
 
@@ -5542,6 +5845,9 @@ static void *client_thread(void *arg)
     }
     active_session_remove_locked(session);
     retire_data_namespace(session);
+    pthread_mutex_unlock(&active_session_lock);
+    control_worker_stop(session);
+    pthread_mutex_lock(&active_session_lock);
     while (session->references > 1U) {
         pthread_cond_wait(&session->reference_cond, &active_session_lock);
     }
@@ -5552,6 +5858,9 @@ static void *client_thread(void *arg)
         disconnect_reason = "SERVER_SHUTDOWN";
     }
     if (logged_in && !session->is_data_connection) {
+        /* Acquire BEFORE admission: waiting for this client's prior business/cleanup must never
+         * serialize unrelated clients' authentication. Keep it through catalog withdrawal too. */
+        st_control_lifecycle *cleanup_gate = control_lifecycle_wait(session->config.client_id, NULL, 0);
         /*
          * The runtime session goes offline only if no other control carries it: after a re-login
          * of the same session the newer control does, and writing DISCONNECTED here would leave
@@ -5567,9 +5876,8 @@ static void *client_thread(void *arg)
             && session->config.client_session_id > 0) {
             char disconnected_at[64];
             if (current_utc_timestamp(disconnected_at) == 0) {
-                (void)st_storage_mark_client_session_disconnected(session->config.database_path,
-                                                                  session->config.client_session_id,
-                                                                  disconnected_at);
+                (void)st_storage_mark_client_session_disconnected_if_channel(session->config.database_path,
+                    session->config.client_session_id, session->physical_channel_id, disconnected_at, NULL);
             }
         }
         pthread_mutex_unlock(&control_admission_lock);
@@ -5583,14 +5891,19 @@ static void *client_thread(void *arg)
                 fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
                         session->config.client_name);
             }
-            /* After active_session_remove_locked above, so the rosters count it as offline; a
-             * client already back on a newer control is still online and is left alone. */
-            if (!client_deleted && st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
-                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n",
-                        session->config.client_name);
-            }
         }
         record_session_disconnected_event(session, disconnect_reason);
+        control_lifecycle_done(cleanup_gate);
+        /* Roster-only publication takes the global Peer dispatcher, not this CID's lifecycle.
+         * It rechecks online after acquiring that dispatcher. A replacement already published is
+         * left alone; one published later queues its own current roster after this broadcast.
+         * Holding the CID here would turn unrelated slow publication into a reconnect outage. */
+        if (session->config.database_path[0] != '\0'
+            && (disconnect_reason == NULL || strcmp(disconnect_reason, "ADMIN_DELETED") != 0)) {
+            st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0)
+                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n", session->config.client_name);
+        }
     }
     session_shutdown(session);
     connection_unregister(session);
@@ -5598,6 +5911,7 @@ static void *client_thread(void *arg)
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
     pthread_cond_destroy(&session->reference_cond);
+    pthread_cond_destroy(&session->control_work_cond);
     free(session);
     return NULL;
 }
@@ -5935,6 +6249,7 @@ int main(void)
     fflush(stdout);
     close(listener);
     size_t unfinished = close_live_connections_and_wait(ST_SHUTDOWN_DRAIN_SECONDS);
+    if (unfinished == 0U) control_pool_stop();
     if (unfinished > 0U) {
         fprintf(stderr, "[server] %zu connection(s) did not finish within %d s\n",
                 unfinished, ST_SHUTDOWN_DRAIN_SECONDS);
