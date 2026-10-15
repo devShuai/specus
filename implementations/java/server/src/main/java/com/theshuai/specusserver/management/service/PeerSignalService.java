@@ -166,6 +166,28 @@ public class PeerSignalService {
         this.catalogPublisher = catalogPublisher;
     }
 
+    /** Network admission is called on the bounded business executor, outside the transactional
+     * handle proxy. Its native identity read releases the connection before lifecycle contention. */
+    public com.theshuai.specusserver.session.ControlLifecycle.Lease admitOriginalControl(Session original, Channel incoming)
+            throws InterruptedException {
+        if (original == null || incoming == null) throw new IllegalArgumentException("authenticated CONTROL is required");
+        var binding = new ChannelBinding(incoming);
+        if (!binding.matches(original.getClientName()) || binding.session() != original
+                || binding.authenticatedSession() == null) throw new IllegalArgumentException("CONTROL is no longer current");
+        var nativeSession = clientSessionRepository.findById(binding.authenticatedSession()).orElseThrow(
+                () -> new IllegalArgumentException("authenticated CONTROL session is missing"));
+        if (!Objects.equals(nativeSession.getClientName(), original.getClientName())
+                || !Objects.equals(nativeSession.getTenantId(), binding.tenant())
+                || !Objects.equals(nativeSession.getChannelId(), incoming.id().asLongText())
+                || !ClientAuthService.STATUS_NETTY_ONLINE.equals(nativeSession.getStatus()))
+            throw new IllegalArgumentException("authenticated CONTROL session changed");
+        var lease = com.theshuai.specusserver.session.ControlLifecycle.acquire(nativeSession.getClientId(), incoming);
+        if (!binding.matches(original.getClientName())) {
+            lease.close();throw new IllegalArgumentException("CONTROL was replaced before admission");
+        }
+        return lease;
+    }
+
     @Transactional
     public void handle(MessageRequestPacket request, Session session) {
         handle(request,session,session == null ? null : SessionUtil.getChannel(session.getClientName()));
@@ -403,6 +425,10 @@ public class PeerSignalService {
         }
     }
 
+    public void onControlConnected(ClientAccount account, Long sessionId) {
+        pushCatalogs(peerServiceDiscoveryService.onControlConnected(account, sessionId));
+    }
+
     public void onClientDisconnected(Long sessionId) {
         if (sessionId == null || sessionId <= 0) {
             return;
@@ -411,8 +437,17 @@ public class PeerSignalService {
         if (session == null || !StringUtils.hasText(session.getClientName())) {
             return;
         }
-        clientAccountService.findClientByName(session.getClientName()).ifPresent(account ->
-                pushCatalogs(peerServiceDiscoveryService.onClientDisconnected(account, sessionId)));
+        // This entry point is deliberately not @Transactional: waiting for the lifecycle while
+        // holding the only JDBC connection would deadlock a reconnect waiting to authenticate.
+        try (var ignored = com.theshuai.specusserver.session.ControlLifecycle.acquire(session.getClientId(), null)) {
+            var current = clientSessionRepository.findById(sessionId).orElse(null);
+            if (current == null || !Objects.equals(current.getClientId(), session.getClientId())
+                    || ClientAuthService.STATUS_NETTY_ONLINE.equals(current.getStatus())) return;
+            clientAccountService.findClientByName(current.getClientName()).ifPresent(account ->
+                    pushCatalogs(peerServiceDiscoveryService.onClientDisconnected(account, sessionId)));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();throw new IllegalStateException("CONTROL cleanup interrupted", interrupted);
+        }
     }
 
     public void pushSharingConfig(ManagementContext context) {

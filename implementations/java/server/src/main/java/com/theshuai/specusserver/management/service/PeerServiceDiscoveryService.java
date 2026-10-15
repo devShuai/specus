@@ -273,6 +273,17 @@ public class PeerServiceDiscoveryService {
         return fanout(source, publisherSessionId, catalogRevision, advertised, expiresAt);
     }
 
+    /** A new physical publisher may reuse its HTTP session/token, but never its raw input cursor.
+     * The caller holds the authenticated client's CONTROL lifecycle through binding publication. */
+    @Transactional
+    public List<CatalogDelivery> onControlConnected(ClientAccount account, Long sessionId) {
+        if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> onControlConnected(account, sessionId));
+        CatalogKey key = new CatalogKey(account.getTenantId(), account.getId(), sessionId);
+        reportTimestamps.remove(sessionId);
+        if (!catalogs.containsKey(key) && !catalogRevisions.containsKey(key) && !reportRevisions.containsKey(key)) return List.of();
+        return onClientDisconnected(account, sessionId);
+    }
+
     @Transactional
     public List<CatalogDelivery> onClientDisconnected(ClientAccount account, Long sessionId) {
         if (!PeerCatalogCache.hasScope()) return PeerCatalogCache.mutation(() -> onClientDisconnected(account, sessionId));

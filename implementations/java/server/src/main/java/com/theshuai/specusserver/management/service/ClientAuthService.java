@@ -198,6 +198,18 @@ public class ClientAuthService {
 
     public AuthenticationResult authenticateNetty(LoginRequestPacket packet, String channelId,
                                                    String remoteAddress, boolean dataConnection) {
+        return authenticateNetty(packet, channelId, remoteAddress, dataConnection, null);
+    }
+
+    /** Resolve before acquiring the process lifecycle: the lookup must release its JDBC connection
+     * before a caller waits for another CONTROL generation. The writer revalidates this identity. */
+    public Long controlClientId(String accessToken) {
+        if (!StringUtils.hasText(accessToken)) return null;
+        return sessionRepository.findByTokenHash(tokenHash(accessToken)).map(ClientSession::getClientId).orElse(null);
+    }
+
+    public AuthenticationResult authenticateNetty(LoginRequestPacket packet, String channelId,
+                                                   String remoteAddress, boolean dataConnection, Long expectedClientId) {
         if (packet == null || !StringUtils.hasText(packet.getAccessToken())) {
             return AuthenticationResult.failure(null, "缺少客户端访问令牌");
         }
@@ -205,6 +217,9 @@ public class ClientAuthService {
         ClientSession session = sessionRepository.findByTokenHash(expectedToken).orElse(null);
         if (session == null) {
             return AuthenticationResult.failure(null, "客户端访问令牌无效");
+        }
+        if (expectedClientId != null && !Objects.equals(expectedClientId, session.getClientId())) {
+            return AuthenticationResult.failure(null, "客户端访问令牌或身份已变更");
         }
         // Like signed HTTP login, the initial lookup is not the admission decision. Start a
         // short writer only for a known token; its FIRST statement locks the credential and
@@ -253,11 +268,12 @@ public class ClientAuthService {
             return AuthenticationResult.failure(account, "连接频率超过限制");
         }
         List<SessionSnapshot> online = closeStaleOnlineSessions(sessionRepository.lockOnline(credential.getId(), selectedTenant));
-        if (online.stream().filter(row -> Objects.equals(row.machineFingerprint(), current.machineFingerprint())
+        if (online.stream().filter(row -> !Objects.equals(row.id(), current.id()))
+                .filter(row -> Objects.equals(row.machineFingerprint(), current.machineFingerprint())
                 && Objects.equals(row.osUser(), current.osUser())).count() >= properties.getPerMachineUserMaxInstances()) {
             return AuthenticationResult.failure(account, "同一台机器和用户已经有在线实例");
         }
-        if (online.size() >= credential.getMaxOnlineInstances()) {
+        if (online.stream().filter(row -> !Objects.equals(row.id(), current.id())).count() >= credential.getMaxOnlineInstances()) {
             return AuthenticationResult.failure(account, "在线实例数已达上限");
         }
 
@@ -274,6 +290,12 @@ public class ClientAuthService {
             return false;
         }
         return sessionRepository.disconnectChannel(sessionId, channelId, Instant.now().toString()) == 1;
+    }
+
+    public boolean isSessionDisconnected(Long sessionId, Long clientId) {
+        return sessionId != null && clientId != null && sessionRepository.findById(sessionId)
+                .filter(row -> Objects.equals(row.getClientId(), clientId))
+                .filter(row -> STATUS_DISCONNECTED.equals(row.getStatus())).isPresent();
     }
 
     private ClientCredential authenticateCredential(ClientAuthLoginRequest request) {
@@ -403,7 +425,10 @@ public class ClientAuthService {
         int closed = 0;
         for (SessionSnapshot onlineSession : sessions) {
             Channel channel = SessionUtil.getChannel(onlineSession.clientName());
-            if (channel != null && channel.isActive() && SessionUtil.hasLogin(channel)) {
+            boolean current = channel != null && channel.isActive() && SessionUtil.hasLogin(channel)
+                    && Objects.equals(channel.id().asLongText(), onlineSession.channelId())
+                    && Objects.equals(channel.attr(com.theshuai.specusserver.attribute.ServerAttributes.CLIENT_SESSION_ID).get(), onlineSession.id());
+            if (current || com.theshuai.specusserver.session.ControlLifecycle.isPublishing(onlineSession.clientId(), onlineSession.channelId())) {
                 live.add(onlineSession);
                 continue;
             }

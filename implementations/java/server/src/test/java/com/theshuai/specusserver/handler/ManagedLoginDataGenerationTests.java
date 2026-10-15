@@ -127,6 +127,11 @@ class ManagedLoginDataGenerationTests {
                 LoginRequestPacket packet = invocation.getArgument(0);
                 return AuthenticationResult.success(account, packet.getClientSessionId());
             });
+            when(auth.controlClientId(anyString())).thenReturn(42L);
+            when(auth.authenticateNetty(any(), anyString(), anyString(), anyBoolean(), any())).thenAnswer(invocation -> {
+                LoginRequestPacket packet = invocation.getArgument(0);
+                return AuthenticationResult.success(account, packet.getClientSessionId());
+            });
             var handler = new ManagedLoginRequestHandler(auth, mock(ConnectionRecordService.class),
                     mock(NatControlService.class), mock(PeerSignalService.class), new NettyServerProperties(),
                     loginExecutor, mock(ProductMetricsService.class));

@@ -20,6 +20,9 @@ public final class ServerAttributes {
     /** HTTP 登录产生的客户端会话 ID，仅新 token 登录路径有值。 */
     public static final AttributeKey<Long> CLIENT_SESSION_ID = AttributeKey.valueOf("clientSessionId");
 
+    /** Immutable authenticated client identity; survives SESSION removal until inactive cleanup. */
+    public static final AttributeKey<Long> CLIENT_ID = AttributeKey.valueOf("authenticatedClientId");
+
     /** Mandatory v2 role: {@code control} or {@code data}. */
     public static final AttributeKey<String> CONNECTION_ROLE = AttributeKey.valueOf("connectionRole");
 

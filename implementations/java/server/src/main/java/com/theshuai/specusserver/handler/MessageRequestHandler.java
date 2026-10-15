@@ -55,9 +55,10 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
     }
 
     private void peerControl(MessageRequestPacket messageRequestPacket, Session session, Channel incoming) {
-        try {
+        try (var ignored = peerSignalService.admitOriginalControl(session, incoming)) {
             peerSignalService.handle(messageRequestPacket, session, incoming);
         } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warn("[peer-mesh] signal rejected from {} to {}: {}",
                     session == null ? "?" : session.getClientName(),
                     messageRequestPacket.getToClientName(),

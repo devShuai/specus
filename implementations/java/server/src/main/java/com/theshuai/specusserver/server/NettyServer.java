@@ -33,6 +33,10 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.EventExecutorGroup;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import jakarta.annotation.PreDestroy;
@@ -65,6 +69,7 @@ public class NettyServer implements ApplicationRunner {
     private final AtomicLong certificateExpiryEpochSeconds = new AtomicLong();
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
+    private EventExecutorGroup controlMessageGroup;
     private Channel channel;
 
     public NettyServer(NettyServerProperties nettyProperties,
@@ -109,6 +114,11 @@ public class NettyServer implements ApplicationRunner {
         validateConfiguration();
         bossGroup = newEventLoopGroup(nettyProperties.getBossThreads());
         workerGroup = newEventLoopGroup(nettyProperties.getWorkerThreads());
+        // Transactional CONTROL messages may wait for a physical-generation lifecycle. Keep both
+        // that wait and all database work off the socket loops; heartbeat/NAT retain their I/O path.
+        controlMessageGroup = new DefaultEventExecutorGroup(Math.max(1, nettyProperties.getControlMessageThreads()),
+                new DefaultThreadFactory("control-message", true), Math.max(16, nettyProperties.getControlMessageQueueCapacity()),
+                RejectedExecutionHandlers.reject());
 
         // Build the TLS context once, at startup. If TLS is disabled this is null
         // and we leave the pipeline plain.
@@ -169,7 +179,7 @@ public class NettyServer implements ApplicationRunner {
                                 webSocketStreamRegistry,
                                 webSocketSpecusHandler
                         ));
-                        ch.pipeline().addLast(serverMessageHandler);
+                        ch.pipeline().addLast(controlMessageGroup, serverMessageHandler);
                         ch.pipeline().addLast(LogoutRequestHandler.INSTANCE);
                     }
                 });
@@ -193,6 +203,9 @@ public class NettyServer implements ApplicationRunner {
     public void stop() {
         if (channel != null) {
             channel.close();
+        }
+        if (controlMessageGroup != null) {
+            controlMessageGroup.shutdownGracefully();
         }
         if (workerGroup != null) {
             workerGroup.shutdownGracefully();
