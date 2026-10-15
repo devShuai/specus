@@ -55,12 +55,27 @@ public class ClientControlSessionAuthority {
         if (!Objects.equals(current.clientId(), account.getId()) || !Objects.equals(current.credentialId(), key.getId())
                 || !Objects.equals(current.identityId(), identity) || !account.getClientName().equals(current.clientName())
                 || !ClientAuthService.STATUS_NETTY_ONLINE.equals(current.status()) || !channelId.equals(current.channelId())) throw denied();
-        String lock = entities.unwrap(Session.class).doReturningWork(connection -> connection.getMetaData().supportsSelectForUpdate() ? " for update" : "");
-        var rows = entities.createNativeQuery("select client_id,credential_id,tenant_id from specus_client_identity where id=?1" + lock)
+        var rows = entities.createNativeQuery("select client_id,credential_id,tenant_id from specus_client_identity where id=?1" + rowLock())
                 .setParameter(1, identity).getResultList();
         if (rows.size() != 1) throw denied();
         Object[] row = (Object[]) rows.getFirst();
         if (!Objects.equals(number(row[0]), account.getId()) || !Objects.equals(number(row[1]), credential) || !tenant.equals(row[2])) throw denied();
+    }
+
+    /** The capability belongs to this exact authenticated control session, never another login. */
+    public boolean verifyReceiver(ClientAccount account, Long sessionId, String channelId) {
+        verify(account, sessionId, channelId);
+        if (sessionId == null) return false;
+        var rows = entities.createNativeQuery("select message_receive_capable,tenant_id,client_id from specus_client_session where id=?1" + rowLock())
+                .setParameter(1, sessionId).getResultList();
+        if (rows.size() != 1) return false;
+        Object[] row = (Object[]) rows.getFirst();
+        return account.getTenantId().equals(row[1]) && Objects.equals(account.getId(), number(row[2]))
+                && (row[0] instanceof Boolean flag ? flag : row[0] instanceof Number number && number.intValue() != 0);
+    }
+
+    private String rowLock() {
+        return entities.unwrap(Session.class).doReturningWork(connection -> connection.getMetaData().supportsSelectForUpdate() ? " for update" : "");
     }
 
     private static Long number(Object value) { return value == null ? null : ((Number) value).longValue(); }

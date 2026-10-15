@@ -96,9 +96,9 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
             return;
         }
         boolean delivered = clientMessagesWebSocketHandler.deliverFromClient(
-                source, targetName, messageRequestPacket.getMessage());
+                source, targetName, messageRequestPacket.getMessage(), incoming);
         log.info("client->admin websocket {}: source={}, target={}",
-                delivered ? "delivered" : "not-delivered", source.getClientName(), targetName);
+                delivered ? "accepted" : "not-accepted", source.getClientName(), targetName);
     }
 
     private void serverToClient(MessageRequestPacket messageRequestPacket, Session session) {
