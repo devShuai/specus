@@ -52,7 +52,7 @@ public sealed class RemotePortServerManager : IHostedService, IAsyncDisposable
         }
         catch
         {
-            _servers.TryRemove(port, out _);
+            _servers.TryRemove(new KeyValuePair<int, RemotePortServer>(port, server));
             await server.DisposeAsync().ConfigureAwait(false);
             throw;
         }

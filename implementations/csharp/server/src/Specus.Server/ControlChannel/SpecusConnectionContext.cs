@@ -54,6 +54,7 @@ public sealed class SpecusConnectionContext
 
     public long? ClientSessionId { get; private set; }
     public long? ClientId { get; private set; }
+    internal SpecusConnectionContext? PairedControl { get; set; }
 
     public string? ConnectionRole { get; private set; }
 

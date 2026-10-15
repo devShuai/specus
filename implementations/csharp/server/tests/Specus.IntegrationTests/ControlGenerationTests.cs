@@ -286,13 +286,14 @@ public sealed class ControlGenerationTests
         }
     }
 
-    private sealed class Fixture : IAsyncDisposable
+    internal sealed class Fixture : IAsyncDisposable
     {
         public required TestServerFixture Server { get; init; }
         public DelayedCloseDispatcher Dispatcher => (DelayedCloseDispatcher)Server.HostServices.GetRequiredService<IControlChannelDispatcher>();
         public SessionRegistry Registry => Server.HostServices.GetRequiredService<SessionRegistry>();
 
-        public static async Task<Fixture> StartAsync(int limit, bool mesh = false, DbCommandInterceptor? barrier = null)
+        public static async Task<Fixture> StartAsync(int limit, bool mesh = false, DbCommandInterceptor? barrier = null,
+            Action<IServiceCollection>? configureServices = null)
         {
             var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
             {
@@ -308,6 +309,7 @@ public sealed class ControlGenerationTests
                     ActivatorUtilities.CreateInstance<ControlChannelDispatcher>(provider)));
                 if (barrier is not null)
                     services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(barrier));
+                configureServices?.Invoke(services);
             });
             return new Fixture { Server = server };
         }
@@ -430,7 +432,7 @@ public sealed class ControlGenerationTests
         }
     }
 
-    private sealed class DelayedCloseDispatcher(ControlChannelDispatcher inner) : IControlChannelDispatcher
+    internal sealed class DelayedCloseDispatcher(ControlChannelDispatcher inner) : IControlChannelDispatcher
     {
         public ControlChannelDispatcher Inner { get; } = inner;
         public SpecusConnectionContext? HeldClose;
@@ -445,9 +447,9 @@ public sealed class ControlGenerationTests
         }
     }
 
-    private static Task SendAsync(TcpClient tcp, Packet packet) => tcp.GetStream().WriteAsync(PacketCodec.Encode(packet)).AsTask();
+    internal static Task SendAsync(TcpClient tcp, Packet packet) => tcp.GetStream().WriteAsync(PacketCodec.Encode(packet)).AsTask();
 
-    private static async Task<Packet> ReadAsync(TcpClient tcp)
+    internal static async Task<Packet> ReadAsync(TcpClient tcp)
     {
         using var timeout = new CancellationTokenSource(Timeout);
         var stream = tcp.GetStream();

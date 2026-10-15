@@ -558,6 +558,7 @@ public sealed class ConnectivityCheckEndpointTests : IAsyncLifetime
             var device = new BoundDevice(services.GetRequiredService<NatServerHandler>(),
                 services.GetRequiredService<SessionRegistry>(), sessionId);
             device._registry.Replace(ClientName, device._control);
+            device._data.PairedControl = device._control;
             device._registry.ReplaceData(ClientName, device._data);
             device._nat.Attach(device._data);
             return device;

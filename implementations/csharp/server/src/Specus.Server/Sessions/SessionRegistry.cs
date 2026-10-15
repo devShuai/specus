@@ -19,6 +19,7 @@ public sealed class SessionRegistry
     private readonly ConcurrentDictionary<string, SpecusConnectionContext> _controls = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SpecusConnectionContext> _data = new(StringComparer.Ordinal);
     private readonly ILogger<SessionRegistry> _logger;
+    private readonly object _bindingsLock = new();
     // Bounded process-local lifecycle stripes. The key is the authenticated immutable client ID,
     // never a supplied/renamable client name. Do not hold these while forwarding NAT traffic.
     private readonly SemaphoreSlim[] _lifecycles = Enumerable.Range(0, 256)
@@ -56,13 +57,11 @@ public sealed class SessionRegistry
     public SpecusConnectionContext? Replace(string clientName, SpecusConnectionContext newContext)
     {
         SpecusConnectionContext? prior = null;
-        _controls.AddOrUpdate(clientName,
-            _ => newContext,
-            (_, existing) =>
-            {
-                prior = existing;
-                return newContext;
-            });
+        lock (_bindingsLock)
+        {
+            _controls.TryGetValue(clientName, out prior);
+            _controls[clientName] = newContext;
+        }
         if (prior is not null && !ReferenceEquals(prior, newContext))
         {
             prior.MarkDisconnectIfAbsent(DisconnectReason.ReplacedByNewLogin);
@@ -76,13 +75,11 @@ public sealed class SessionRegistry
     public SpecusConnectionContext? ReplaceData(string clientName, SpecusConnectionContext newContext)
     {
         SpecusConnectionContext? prior = null;
-        _data.AddOrUpdate(clientName,
-            _ => newContext,
-            (_, existing) =>
-            {
-                prior = existing;
-                return newContext;
-            });
+        lock (_bindingsLock)
+        {
+            _data.TryGetValue(clientName, out prior);
+            _data[clientName] = newContext;
+        }
         if (prior is not null && !ReferenceEquals(prior, newContext))
         {
             prior.MarkDisconnectIfAbsent(DisconnectReason.ReplacedByNewLogin);
@@ -96,8 +93,25 @@ public sealed class SessionRegistry
     public void Unbind(string clientName, SpecusConnectionContext context)
     {
         // ConcurrentDictionary.TryRemove with a value-equality overload requires .NET 5+; works on net10.
-        _controls.TryRemove(new KeyValuePair<string, SpecusConnectionContext>(clientName, context));
-        _data.TryRemove(new KeyValuePair<string, SpecusConnectionContext>(clientName, context));
+        lock (_bindingsLock)
+        {
+            _controls.TryRemove(new KeyValuePair<string, SpecusConnectionContext>(clientName, context));
+            _data.TryRemove(new KeyValuePair<string, SpecusConnectionContext>(clientName, context));
+        }
+    }
+
+    // Short paired snapshot only. Never carry this lock or a lifecycle lease into NAT I/O.
+    internal SpecusConnectionContext? CurrentDataControl(SpecusConnectionContext context)
+    {
+        lock (_bindingsLock)
+        {
+            return context.ClientName is { } name && context.PairedControl is { } paired
+                && _data.TryGetValue(name, out var data) && ReferenceEquals(data, context)
+                && _controls.TryGetValue(name, out var control) && ReferenceEquals(control, paired)
+                && control.ClientSessionId == context.ClientSessionId
+                && !control.Lifetime.IsCancellationRequested && !context.Lifetime.IsCancellationRequested
+                ? control : null;
+        }
     }
 
     public bool HasLogin(SpecusConnectionContext context) =>

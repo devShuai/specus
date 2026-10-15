@@ -417,6 +417,7 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 result = AuthenticationResult.Fail(result.Account, "数据连接未找到匹配的控制连接",
                     result.AuditTenantId);
             }
+            else context.PairedControl = control;
         }
 
         if (result.Success)
@@ -458,15 +459,29 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         if (result.Success)
         {
             context.ConnectionRecordId = recordId;
+            // Both control replacement and data replacement retire the prior physical DATA
+            // namespace before publication, not in a delayed old transport-close callback.
+            if (_sessions.FindData(packet.ClientName!) is { } oldData)
+            {
+                _sessions.Unbind(packet.ClientName!, oldData);
+                oldData.MarkDisconnectIfAbsent(DisconnectReason.ReplacedByNewLogin);
+                oldData.CloseAsync();
+            }
+            try
+            {
+                await _nat.RetireCurrentAsync(packet.ClientName!).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[{ChannelId}] failed to retire prior data namespace", context.ChannelId);
+                context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
+                context.CloseAsync();
+                return;
+            }
             if (!dataConnection)
             {
                 // Retire the companion belonging to the displaced physical control before the
                 // new control is visible. Its late callback must not select a new companion.
-                if (_sessions.FindData(packet.ClientName!) is { } oldData)
-                {
-                    _sessions.Unbind(packet.ClientName!, oldData);
-                    oldData.CloseAsync();
-                }
                 try
                 {
                     await scope.ServiceProvider.GetRequiredService<PeerMeshService>()
