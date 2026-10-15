@@ -153,6 +153,7 @@ final class ClientCredentialAuthAssertions {
         ClientOwnerTransferWriteAssertions.verify(context, independent);
         ClientOwnershipLockAssertions.verify(context, independent);
         PeerAclCoordinationAssertions.verify(context, independent);
+        PeerCacheCommitAssertions.verify(context, independent);
     }
 
     private static void verifyManagementWrites(ConfigurableApplicationContext context, DataSource independent,

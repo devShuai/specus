@@ -45,6 +45,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.net.InetAddress;
@@ -88,6 +90,10 @@ public class PeerMeshService {
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, AtomicLong> pendingRelayBytes = new ConcurrentHashMap<>();
     private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
+    // Guard publication and invalidation together. A detached in-flight publication keeps its
+    // old fence: closing/invalidation removes that fence, so a later callback cannot resurrect it.
+    private final Object sessionCacheMonitor = new Object();
+    private final Map<Long, SessionCacheFence> sessionCacheFences = new LinkedHashMap<>();
     private final TransactionTemplate transactionTemplate;
     private final Counter relayTrafficFlushFailures;
     private final AtomicLong lastRelayTrafficFlushSuccessMillis = new AtomicLong();
@@ -431,7 +437,7 @@ public class PeerMeshService {
         session.setUpdatedAt(now.toString());
         session.setExpiresAt(SortableInstant.format(now.plusSeconds(properties.getSessionTtlSeconds())));
         PeerMeshSession saved = sessionRepository.save(session);
-        sessionTokenCache.put(saved.getId(), token);
+        new SessionCachePublication(saved.getId(), token).submit(() -> sessionTokenCache.put(saved.getId(), token));
         return new PeerSessionGrant(toSessionView(saved), token);
     }
 
@@ -457,7 +463,7 @@ public class PeerMeshService {
                 sessionRepository.save(session);
                 continue;
             }
-            String token = sessionTokenCache.get(session.getId());
+            String token = pendingOrCachedSessionToken(session.getId());
             if (!StringUtils.hasText(token)) {
                 continue;
             }
@@ -491,7 +497,7 @@ public class PeerMeshService {
         session.setRemoteEndpoint(limit(report.getRemoteEndpoint(), 255));
         session.setUpdatedAt(now.toString());
         session.setLastKeepaliveAt(now.toString());
-        relayAuthorizationCache.remove(session.getId());
+        invalidateRelayAuthorization(session.getId());
         return toSessionView(sessionRepository.save(session));
     }
 
@@ -623,7 +629,7 @@ public class PeerMeshService {
                 return false;
             }
 			if (account) {
-				pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new AtomicLong()).addAndGet(bytes);
+				afterCommit(() -> recordPendingRelayBytes(header.sessionId(), bytes));
 			}
             return true;
         }
@@ -684,11 +690,14 @@ public class PeerMeshService {
                                                    long bytes,
                                                    long nowNanos,
 												 boolean account) {
-        Boolean allowed = transactionTemplate.execute(status -> sessionRepository.findById(header.sessionId())
-				.map(session -> authorizeRelayFrameForRelaySlow(
-                        session, header, fromClientId, toClientId, bytes, nowNanos, account))
-                .orElse(false));
-        return Boolean.TRUE.equals(allowed);
+        SessionCachePublication publication = new SessionCachePublication(header.sessionId(), null);
+        try {
+            Boolean allowed = transactionTemplate.execute(status -> sessionRepository.findById(header.sessionId())
+                    .map(session -> authorizeRelayFrameForRelaySlow(
+                            session, header, fromClientId, toClientId, bytes, nowNanos, account, publication))
+                    .orElse(false));
+            return Boolean.TRUE.equals(allowed);
+        } finally { publication.discardIfUnsubmitted(); }
     }
 
     private boolean authorizeRelayFrameForRelaySlow(PeerMeshSession session,
@@ -697,16 +706,16 @@ public class PeerMeshService {
                                                      long toClientId,
                                                      long bytes,
 													 long nowNanos,
-													 boolean account) {
+													 boolean account,
+                                                     SessionCachePublication publication) {
         Instant now = Instant.now();
         if (closeIfExpired(session, now)) {
             sessionRepository.save(session);
-            relayAuthorizationCache.remove(header.sessionId());
-            pendingRelayBytes.remove(header.sessionId());
+            afterCommit(() -> evictClosedSession(header.sessionId()));
             return false;
         }
         if (!matchesSessionPeers(session, fromClientId, toClientId)) {
-            relayAuthorizationCache.remove(header.sessionId());
+            invalidateRelayAuthorization(header.sessionId());
             return false;
         }
         // 首个通过身份校验的中继业务帧隐式激活 NEGOTIATING 会话。
@@ -718,7 +727,7 @@ public class PeerMeshService {
         // 未关闭）此时已完成校验，等待一条状态上报并不能提供额外安全性，只会制造竞态。
         if (!STATUS_ACTIVE.equals(session.getStatus())) {
             if (STATUS_CLOSED.equals(session.getStatus())) {
-                relayAuthorizationCache.remove(header.sessionId());
+                afterCommit(() -> evictClosedSession(header.sessionId()));
                 return false;
             }
             session.setStatus(STATUS_ACTIVE);
@@ -731,13 +740,12 @@ public class PeerMeshService {
         }
         RelayAuthorization authorization = RelayAuthorization.from(session, nowNanos + RELAY_AUTH_CACHE_TTL_NANOS);
         if (!authorization.active()) {
-            relayAuthorizationCache.remove(header.sessionId());
+            invalidateRelayAuthorization(header.sessionId());
             return false;
         }
-        relayAuthorizationCache.put(header.sessionId(), authorization);
-		if (account) {
-			pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new AtomicLong()).addAndGet(bytes);
-		}
+        publication.submit(() -> relayAuthorizationCache.put(header.sessionId(), authorization));
+        // A later revocation fences authorization, not accounting for already accepted bytes.
+        if (account) afterCommit(() -> recordPendingRelayBytes(header.sessionId(), bytes));
         return true;
     }
 
@@ -820,15 +828,7 @@ public class PeerMeshService {
         if (!sessions.isEmpty()) {
             sessionRepository.saveAll(sessions);
             List<Long> ids = sessions.stream().map(PeerMeshSession::getId).toList();
-            Runnable evict = () -> ids.forEach(this::evictClosedSession);
-            if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()) {
-                org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
-                        new org.springframework.transaction.support.TransactionSynchronization() {
-                            @Override public void afterCommit() { evict.run(); }
-                        });
-            } else {
-                evict.run();
-            }
+            afterCommit(() -> ids.forEach(this::evictClosedSession));
         }
         return sessions.stream().map(this::toSessionView).toList();
     }
@@ -1076,10 +1076,12 @@ public class PeerMeshService {
                 }
                 lastRelayTrafficFlushSuccessMillis.set(System.currentTimeMillis());
                 if (result == RelayTrafficFlushResult.MISSING) {
-                    relayAuthorizationCache.remove(sessionId);
+                    invalidateRelayAuthorization(sessionId);
                     pendingRelayBytes.remove(sessionId, counter);
                 } else if (result == RelayTrafficFlushResult.CLOSED) {
-                    relayAuthorizationCache.remove(sessionId);
+                    invalidateRelayAuthorization(sessionId);
+                    pendingRelayBytes.computeIfPresent(sessionId, (ignored, current) ->
+                            current == counter && current.get() == 0 ? null : current);
                 }
             } catch (RuntimeException e) {
                 restoreRelayTrafficBatch(sessionId, bytes);
@@ -1499,7 +1501,7 @@ public class PeerMeshService {
 
     private void markClosed(PeerMeshSession session, Instant now) {
         markClosedState(session, now);
-        evictClosedSession(session.getId());
+        afterCommit(() -> evictClosedSession(session.getId()));
     }
 
     private void markClosedState(PeerMeshSession session, Instant now) {
@@ -1514,10 +1516,88 @@ public class PeerMeshService {
 
     private void evictClosedSession(Long sessionId) {
         if (sessionId != null) {
-            relayAuthorizationCache.remove(sessionId);
-            pendingRelayBytes.remove(sessionId);
-            sessionTokenCache.remove(sessionId);
+            synchronized (sessionCacheMonitor) {
+                sessionCacheFences.remove(sessionId);
+                relayAuthorizationCache.remove(sessionId);
+                sessionTokenCache.remove(sessionId);
+                // Accepted bytes are still owed to accounting, even after closure. The flush
+                // writer can persist them on a CLOSED row; never discard them on invalidation.
+            }
         }
+    }
+
+    private void invalidateRelayAuthorization(Long sessionId) {
+        afterCommit(() -> {
+            synchronized (sessionCacheMonitor) {
+                sessionCacheFences.remove(sessionId);
+                relayAuthorizationCache.remove(sessionId);
+            }
+        });
+    }
+
+    private void recordPendingRelayBytes(long sessionId, long bytes) {
+        pendingRelayBytes.compute(sessionId, (ignored, counter) -> {
+            if (counter == null) counter = new AtomicLong();
+            counter.addAndGet(bytes); return counter;
+        });
+    }
+
+    private static void afterCommit(Runnable effect) {
+        if (TransactionSynchronizationManager.isSynchronizationActive() && TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { effect.run(); }
+            });
+        } else effect.run();
+    }
+
+    private String pendingOrCachedSessionToken(long sessionId) {
+        if (TransactionSynchronizationManager.isSynchronizationActive())
+            for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations())
+                if (sync instanceof SessionCachePublication publication && publication.belongsTo(this)
+                        && publication.sessionId == sessionId && publication.token != null) return publication.token;
+        return sessionTokenCache.get(sessionId);
+    }
+
+    private static final class SessionCacheFence { private int publications; }
+
+    /** Pending tokens live only in this transaction's synchronization list (also isolates REQUIRES_NEW).
+     * Fences exist only while a cache entry or pending publication needs them, not per arbitrary ID. */
+    private final class SessionCachePublication implements TransactionSynchronization {
+        private final long sessionId;
+        private final String token;
+        private final SessionCacheFence fence;
+        private Runnable effect;
+        private boolean submitted, completed;
+        private SessionCachePublication(long sessionId, String token) {
+            this.sessionId = sessionId; this.token = token;
+            synchronized (sessionCacheMonitor) {
+                fence = sessionCacheFences.computeIfAbsent(sessionId, ignored -> new SessionCacheFence());
+                fence.publications++;
+            }
+        }
+        private boolean belongsTo(PeerMeshService owner) { return PeerMeshService.this == owner; }
+        private void submit(Runnable effect) {
+            this.effect = effect; submitted = true;
+            if (TransactionSynchronizationManager.isSynchronizationActive() && TransactionSynchronizationManager.isActualTransactionActive())
+                TransactionSynchronizationManager.registerSynchronization(this);
+            else {
+                try { afterCommit(); } finally { afterCompletion(STATUS_COMMITTED); }
+            }
+        }
+        @Override public void afterCommit() {
+            synchronized (sessionCacheMonitor) {
+                if (sessionCacheFences.get(sessionId) == fence) effect.run();
+            }
+        }
+        @Override public void afterCompletion(int status) {
+            synchronized (sessionCacheMonitor) {
+                if (completed) return;
+                completed = true; fence.publications--;
+                if (fence.publications == 0 && !relayAuthorizationCache.containsKey(sessionId)
+                        && !sessionTokenCache.containsKey(sessionId)) sessionCacheFences.remove(sessionId, fence);
+            }
+        }
+        private void discardIfUnsubmitted() { if (!submitted) afterCompletion(STATUS_UNKNOWN); }
     }
 
     private long saturatedAdd(long current, long delta) {
