@@ -284,6 +284,20 @@ class NativeControlGenerationTests {
     }
 
     @Test
+    void anUnrelatedClientWithTheSameFormerStripeCannotBlockNativeLogin() throws Exception {
+        try(var fixture=new Fixture(4,4)) {
+            var auth=fixture.authenticate();
+            // Flipping bit 8 preserves the old 256-stripe hash, for every generated positive ID.
+            long unrelated=auth.getClientId() ^ 256L;
+            assertNotEquals(auth.getClientId(),unrelated);
+            try(var held=ControlLifecycle.acquire(unrelated,null)) {
+                assertTrue(fixture.control(auth).reply.isSuccess(),
+                        "an unrelated physical lifecycle must not stall real HTTP-authenticated TCP login");
+            }
+        }
+    }
+
+    @Test
     void anotherDeviceCannotDiscardAControlBetweenNativeOnlineAndBindingPublication() throws Exception {
         try (var fixture = new Fixture(1,4);var workers=Executors.newSingleThreadExecutor()) {
             var first=fixture.authenticate();var other=fixture.authenticate("-other-device");
