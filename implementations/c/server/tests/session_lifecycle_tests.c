@@ -1914,10 +1914,90 @@ static int scenario_shutdown_and_restart(test_server *server)
         || test_sigterm_at_first_accept_is_graceful(server);
 }
 
+/* A verified DATA is paused before publication. Reusing the access token/SID must not let
+ * it silently move from its original physical CONTROL to a replacement connection. */
+static int data_original_control_scenario(test_server *server, int mode)
+{
+    runtime_session runtime = {0}, replacement = {0};
+    int original = -1, successor = -1, data = -1, fresh_data = -1, public_fd = -1;
+    int failed = 1, command = 0, success = 0;
+    char reason[512] = "";
+    int public_port = pick_free_port();
+    if (create_credential(server->db_path, "data-parent-key", "data-parent-secret", 2) != 0
+        || http_client_login(server, "data-parent-key", "data-parent-secret", "parent-machine", "parent-user", &runtime) != 0
+        || public_port <= 0 || create_mapping(server->db_path, runtime.client_id, public_port) != 0) goto done;
+    if (mode == 4) {
+        int rc = channel_login(server->control_port, &runtime, ST_CONNECTION_ROLE_DATA, &data, reason, sizeof(reason));
+        if (rc != 0 || strstr(reason, "数据连接要求控制连接先登录") == NULL) {
+            fprintf(stderr, "DATA without CONTROL must be rejected with the retryable reason: rc=%d reason=%s\n", rc, reason);
+            goto done;
+        }
+        failed = 0; goto done;
+    }
+    if (gated_login(server, &runtime, ST_CONNECTION_ROLE_CONTROL, &original, reason, sizeof(reason)) != 0
+        || start_held_login(server, &runtime, ST_CONNECTION_ROLE_DATA, "loaded", &data) != 0) goto done;
+    if (mode == 0 || mode == 1) {
+        replacement = runtime;
+        if (mode == 1 && http_client_login(server, "data-parent-key", "data-parent-secret", "parent-machine", "parent-user", &replacement) != 0) goto done;
+        if (gated_login(server, &replacement, ST_CONNECTION_ROLE_CONTROL, &successor, reason, sizeof(reason)) != 0) goto done;
+    } else if (mode == 2) {
+        close_fd(&original);
+        long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+        while (admin_client_online(server, runtime.client_name) != 0) {
+            if (monotonic_ms() >= deadline) { fprintf(stderr, "original CONTROL remained routable\n"); goto done; }
+            sleep_ms(20);
+        }
+    }
+    /* Pre-release the publication gate too: on the old implementation the wrong successful
+     * LOGIN is observed as an assertion failure, not hidden behind a test-gate timeout. */
+    if (release_login_gate(ST_CONNECTION_ROLE_DATA, "published") != 0
+        || release_login_gate(ST_CONNECTION_ROLE_DATA, "loaded") != 0
+        || read_login_response(data, IO_TIMEOUT_MS, &command, &success, reason, sizeof(reason)) != 1) goto done;
+    if (mode != 3) {
+        if (success || strstr(reason, "数据连接要求控制连接先登录") == NULL) {
+            fprintf(stderr, "DATA followed a different/missing physical CONTROL: mode=%d success=%d reason=%s\n", mode, success, reason);
+            goto done;
+        }
+        if (expect_channel_closed(data, IO_TIMEOUT_MS) != 0) goto done;
+        if (successor >= 0 && expect_channel_alive(successor) != 0) goto done;
+        if (successor >= 0) {
+            clear_login_gate();
+            if (gated_login(server, &replacement, ST_CONNECTION_ROLE_DATA, &fresh_data, reason, sizeof(reason)) != 0
+                || nat_register(fresh_data, replacement.client_name, public_port, 9) != 0
+                || open_public_stream(fresh_data, public_port, &public_fd) != 0) {
+                fprintf(stderr, "fresh DATA under the replacement CONTROL must recover real TCP: %s\n", reason);
+                goto done;
+            }
+        }
+    } else {
+        if (!success || expect_channel_alive(original) != 0
+            || nat_register(data, runtime.client_name, public_port, 9) != 0
+            || open_public_stream(data, public_port, &public_fd) != 0) {
+            fprintf(stderr, "unchanged original CONTROL must still admit real public TCP: %s\n", reason);
+            goto done;
+        }
+    }
+    failed = 0;
+done:
+    /* Never leave a failed assertion holding a server thread in a test-only gate. */
+    (void)release_login_gate(ST_CONNECTION_ROLE_DATA, "loaded");
+    (void)release_login_gate(ST_CONNECTION_ROLE_DATA, "published");
+    (void)release_login_gate(ST_CONNECTION_ROLE_CONTROL, "loaded");
+    (void)release_login_gate(ST_CONNECTION_ROLE_CONTROL, "published");
+    close_fd(&public_fd);close_fd(&fresh_data);close_fd(&data);close_fd(&original);close_fd(&successor);
+    return failed;
+}
+
+static int data_parent_same_sid(test_server *server) { return data_original_control_scenario(server, 0); }
+static int data_parent_other_sid(test_server *server) { return data_original_control_scenario(server, 1); }
+static int data_parent_disconnected(test_server *server) { return data_original_control_scenario(server, 2); }
+static int data_parent_unchanged(test_server *server) { return data_original_control_scenario(server, 3); }
+static int data_parent_missing(test_server *server) { return data_original_control_scenario(server, 4); }
+
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <specus-server-c>\n", argv[0]);
+    if (argc < 2 || argc > 3 || (argc == 3 && strcmp(argv[2], "data-parent") != 0)) {
+        fprintf(stderr, "usage: %s <specus-server-c> [data-parent]\n", argv[0]);
         return 2;
     }
     server_binary = argv[1];
@@ -1929,6 +2009,8 @@ int main(int argc, char **argv)
     static const char *const two_per_machine[] = {"SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES=2", NULL};
     static const char *const short_idle[] = {"SPECUS_CONTROL_READ_IDLE_SECONDS=5", NULL};
     int failures = 0;
+    int parent_only = argc == 3;
+    if (!parent_only) {
     failures += run_on_fresh_server("login replay, relogin, supersession, single login, online limits, stale rows",
                                     scenario_default_limits, NULL);
     failures += run_on_fresh_server("new session replaces previous session",
@@ -1940,6 +2022,7 @@ int main(int argc, char **argv)
     static const char *const short_write_timeout[] = {"SPECUS_CONTROL_WRITE_TIMEOUT_SECONDS=1", NULL};
     failures += run_on_fresh_server("a write cut short by the write timeout closes the connection, nothing follows it",
                                     test_cut_write_closes_the_connection, short_write_timeout);
+    }
 
     const char *tmp = getenv("TMPDIR");
     snprintf(login_gate_dir, sizeof(login_gate_dir), "%s/specus-c-login-gate-XXXXXX",
@@ -1950,6 +2033,7 @@ int main(int argc, char **argv)
     }
     snprintf(login_gate_env, sizeof(login_gate_env), "SPECUS_LOGIN_TEST_GATE_DIR=%s", login_gate_dir);
     const char *const login_gate[] = {login_gate_env, NULL};
+    if (!parent_only) {
     failures += run_on_fresh_server("control login answered before a NAT_CONTROL push sent once it is published",
                                     test_control_login_answered_before_push, login_gate);
     clear_login_gate();
@@ -1968,6 +2052,20 @@ int main(int argc, char **argv)
     failures += run_on_fresh_server("a manual NAT_CONTROL push into a reset control connection answers offline",
                                     test_push_into_reset_control_answers_offline, login_gate);
     clear_login_gate();
+    }
+    const char *const parent_gate[] = {login_gate_env, "SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES=2", NULL};
+    static const struct { const char *name; server_scenario run; } parent_cases[] = {
+        {"pending DATA rejects a replacement physical CONTROL with the same SID", data_parent_same_sid},
+        {"pending DATA rejects a replacement CONTROL with a different SID", data_parent_other_sid},
+        {"pending DATA rejects its disconnected original CONTROL", data_parent_disconnected},
+        {"unchanged original CONTROL admits DATA and real public TCP", data_parent_unchanged},
+        {"DATA without CONTROL keeps the retryable rejection", data_parent_missing}
+    };
+    for (size_t i = 0; i < sizeof(parent_cases) / sizeof(parent_cases[0]); ++i) {
+        clear_login_gate();
+        failures += run_on_fresh_server(parent_cases[i].name, parent_cases[i].run, parent_gate);
+        clear_login_gate();
+    }
     rmdir(login_gate_dir);
 
     if (failures != 0) {

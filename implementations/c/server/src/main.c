@@ -211,6 +211,10 @@ struct specus_session {
     int control_fd;
     st_tls_connection *tls_connection;
     int is_data_connection;
+    int bound; /* Routing-list membership, read/written only under active_session_lock. */
+    /* Original physical CONTROL, retained under active_session_lock through DATA teardown.
+     * A reusable HTTP token/SID does not make a replacement CONTROL interchangeable. */
+    specus_session *data_control;
     /*
      * Settled by the login before the connection is published, and fixed from then on but for the
      * route set a runtime NAT_CONTROL push replaces (apply_runtime_route_config): mappings,
@@ -1675,11 +1679,14 @@ static void active_session_add_locked(specus_session *session)
         return;
     }
     session->active_next = active_sessions;
+    session->bound = 1;
     active_sessions = session;
 }
 
 static void active_session_remove_locked(specus_session *session)
 {
+    if (session == NULL) return;
+    session->bound = 0;
     specus_session **cursor = &active_sessions;
     while (*cursor != NULL) {
         if (*cursor == session) {
@@ -1703,9 +1710,27 @@ static specus_session *active_session_find_role_locked(const char *client_name, 
     return NULL;
 }
 
+static int data_control_matches_locked(const specus_session *data)
+{
+    return data != NULL && data->is_data_connection && data->data_control != NULL
+        && data->data_control->bound && !data->data_control->is_data_connection
+        && strcmp(data->data_control->config.client_name, data->config.client_name) == 0
+        && data->data_control->config.client_session_id == data->config.client_session_id;
+}
+
 static specus_session *active_data_session_find_locked(const char *client_name)
 {
-    return active_session_find_role_locked(client_name, 1);
+    specus_session *data = active_session_find_role_locked(client_name, 1);
+    return data_control_matches_locked(data) ? data : NULL;
+}
+
+/* Registry-only snapshot. Never retain active_session_lock while writing a socket or doing SQL. */
+static int data_session_is_current(specus_session *session)
+{
+    pthread_mutex_lock(&active_session_lock);
+    int current = session->bound && data_control_matches_locked(session);
+    pthread_mutex_unlock(&active_session_lock);
+    return current;
 }
 
 static specus_session *active_data_session_acquire_locked(const char *client_name)
@@ -1753,8 +1778,8 @@ static void session_reference_release(specus_session *session)
 
 /*
  * A control connection going away takes its data connection with it (protocol/spec/control-
- * protocol.md). Only the data connection of the same runtime session qualifies: one that belongs to
- * a newer session of the same client is that client's current pair and must survive. A data
+ * protocol.md). Only DATA that captured this exact physical CONTROL qualifies: a replacement
+ * CONTROL can reuse the same runtime SID, but its DATA is a different pair and must survive. A data
  * connection already marked inactive by a protocol violation is still in the list and is closed
  * too, so it cannot linger holding its listeners. The reverse is deliberately not done, as in Java
  * and Go: a data connection that goes away leaves its control alone, the client rebuilds the pair,
@@ -1766,9 +1791,7 @@ static void active_session_close_data_locked(specus_session *control)
         return;
     }
     for (specus_session *data = active_sessions; data != NULL; data = data->active_next) {
-        if (data->is_data_connection
-            && data->config.client_session_id == control->config.client_session_id
-            && strcmp(data->config.client_name, control->config.client_name) == 0) {
+        if (data->is_data_connection && data->data_control == control) {
             shutdown(data->control_fd, SHUT_RDWR);
         }
     }
@@ -1860,10 +1883,9 @@ static int activate_session(specus_session *session, displaced_sessions *displac
     displaced->count = 0U;
     pthread_mutex_lock(&active_session_lock);
     if (session->is_data_connection) {
-        specus_session *control = active_session_find_role_locked(session->config.client_name, 0);
-        if (control == NULL || control->config.client_session_id != session->config.client_session_id) {
+        if (!data_control_matches_locked(session)) {
             pthread_mutex_unlock(&active_session_lock);
-            *reason = "数据连接未找到匹配的控制连接";
+            *reason = "数据连接要求控制连接先登录：原控制连接已改变，请重新建立数据连接";
             return -1;
         }
     }
@@ -3383,10 +3405,15 @@ static int verify_database_login(specus_session *session, const st_login_request
         pthread_mutex_lock(&active_session_lock);
         specus_session *control = active_session_find_role_locked(client.client_name, 0);
         int matching_control = control != NULL
-            && control->config.client_session_id == client_session.id;
+            && control->config.client_session_id == client_session.id
+            && control->config.client_id == client.id;
+        if (matching_control) {
+            session->data_control = control;
+            ++control->references;
+        }
         pthread_mutex_unlock(&active_session_lock);
         if (!matching_control) {
-            *reason = "数据连接未找到匹配的控制连接";
+            *reason = "数据连接要求控制连接先登录：未找到匹配的控制连接";
             return 0;
         }
     }
@@ -3529,9 +3556,13 @@ static int verify_login(specus_session *session, const st_login_request *request
         specus_session *control = active_session_find_role_locked(request->client_name, 0);
         int matching_control = control != NULL
             && control->config.client_session_id == request->client_session_id;
+        if (matching_control) {
+            session->data_control = control;
+            ++control->references;
+        }
         pthread_mutex_unlock(&active_session_lock);
         if (!matching_control) {
-            *reason = "数据连接未找到匹配的控制连接";
+            *reason = "数据连接要求控制连接先登录：未找到匹配的控制连接";
             return 0;
         }
     }
@@ -5251,6 +5282,11 @@ static void *client_thread(void *arg)
             continue;
         }
 
+        if (session->is_data_connection && !data_session_is_current(session)) {
+            free(body);
+            break;
+        }
+
         if (header.command == ST_CMD_HEARTBEAT_REQUEST) {
             free(body);
             st_buffer response = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_RESPONSE);
@@ -5374,6 +5410,12 @@ static void *client_thread(void *arg)
 
     pthread_mutex_lock(&active_session_lock);
     const char *displaced_reason = session->displaced_reason;
+    if (session->data_control != NULL) {
+        specus_session *original_control = session->data_control;
+        session->data_control = NULL;
+        if (original_control->references > 1U) --original_control->references;
+        pthread_cond_broadcast(&original_control->reference_cond);
+    }
     /* A displaced control's data connection was retired with it, by the login that replaced it or
      * the admin who closed the client, and whatever of this client is still bound belongs to a
      * newer pair. A connection that never logged in owns no pair: its config still names the
