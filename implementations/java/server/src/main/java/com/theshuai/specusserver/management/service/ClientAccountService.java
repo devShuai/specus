@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -305,13 +306,15 @@ public class ClientAccountService {
         }
         // S1.3 60 秒 TTL 名称缓存。trafficUsageService.flushCounter() 每 5 秒为每个活跃
         // 客户端调一次本方法，加缓存后稳定状态下 DB 查询量降到 ~1/12。
+        long generation = nameCacheGeneration.get();
         CachedClient cached = nameCache.get(clientName);
         long now = System.currentTimeMillis();
-        if (cached != null && cached.expiresAtMillis > now) {
+        if (cached != null && cached.generation == generation && cached.expiresAtMillis > now) {
             return Optional.ofNullable(cached.account);
         }
         Optional<ClientAccount> fresh = clientAccountRepository.findByClientName(clientName);
-        nameCache.put(clientName, new CachedClient(fresh.orElse(null), now + NAME_CACHE_TTL_MILLIS));
+        if (generation == nameCacheGeneration.get())
+            nameCache.put(clientName, new CachedClient(fresh.orElse(null), now + NAME_CACHE_TTL_MILLIS, generation));
         return fresh;
     }
 
@@ -323,10 +326,21 @@ public class ClientAccountService {
     }
 
     /** 60s TTL 缓存条目；过期则从 DB 重读。 */
-    private record CachedClient(ClientAccount account, long expiresAtMillis) {}
+    private record CachedClient(ClientAccount account, long expiresAtMillis, long generation) {}
+
+    /** Committed ownership invalidation, including another server's journal event. An older
+     * in-flight lookup cannot install a cache entry usable in the new generation. This cache
+     * remains a lookup hint, never an authorization substitute for current database guards. */
+    public void invalidateOwnershipCache() {
+        if (TransactionSynchronizationManager.isActualTransactionActive())
+            throw new IllegalStateException("ownership cache invalidation must follow commit");
+        nameCacheGeneration.incrementAndGet();
+        nameCache.clear();
+    }
 
     private static final long NAME_CACHE_TTL_MILLIS = 60_000;
     private final Map<String, CachedClient> nameCache = new ConcurrentHashMap<>();
+    private final AtomicLong nameCacheGeneration = new AtomicLong();
 
     private ClientAccount findClientById(long id) {
         return clientAccountRepository.findById(id)

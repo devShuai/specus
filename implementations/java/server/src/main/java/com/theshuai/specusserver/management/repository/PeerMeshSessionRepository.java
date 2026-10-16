@@ -70,6 +70,14 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
             """)
     List<PeerMeshSession> findVisibleOpen(String tenantId, List<Long> clientIds, String closedStatus);
 
+    @Query("""
+            select s from PeerMeshSession s
+            where s.tenantId = :tenantId and s.status = :closedStatus
+              and (s.sourceClientId in :clientIds or s.targetClientId in :clientIds)
+            order by s.id
+            """)
+    List<PeerMeshSession> findVisibleClosed(String tenantId, List<Long> clientIds, String closedStatus);
+
     @Query(
             value = """
             select s from PeerMeshSession s

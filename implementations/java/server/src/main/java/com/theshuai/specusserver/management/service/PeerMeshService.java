@@ -897,9 +897,35 @@ public class PeerMeshService {
         // A later-disabled request actor must not prevent cleanup of now-unauthorized sessions.
         List<PeerMeshSession> sessions = sessionRepository.findByTenantIdAndStatusNotOrderByUpdatedAtDesc(
                 context.tenant().tenantId(), STATUS_CLOSED);
+        return closeUnauthorizedSessions(context.tenant().tenantId(), sessions);
+    }
+
+    @Transactional
+    public List<PeerMeshSessionView> closeUnauthorizedSessionsForClients(String tenant, List<Long> affected) {
+        Map<Long, PeerMeshSession> candidates = new java.util.TreeMap<>();
+        for (int offset=0; offset<affected.size(); offset+=400)
+            for (var session : sessionRepository.findVisibleOpen(tenant, affected.subList(offset, Math.min(offset+400, affected.size())), STATUS_CLOSED))
+                candidates.put(session.getId(), session);
+        return closeUnauthorizedSessions(tenant, new ArrayList<>(candidates.values()));
+    }
+
+    /** A different instance may have closed these rows before the owner of their physical sockets
+     * consumes the journal. Replay only authoritative CLOSED grants, not historical owner values.
+     * No wall-clock cutoff (cluster clocks can differ); IDs are immutable and a closed grant is
+     * never reused. Chunking bounds SQL parameters without truncating large transfer groups. */
+    @Transactional(readOnly = true)
+    public List<PeerMeshSessionView> closedSessionsForClients(String tenant, List<Long> affected) {
+        Map<Long, PeerMeshSession> closed = new java.util.TreeMap<>();
+        for (int offset=0; offset<affected.size(); offset+=400)
+            for (var session : sessionRepository.findVisibleClosed(tenant, affected.subList(offset, Math.min(offset+400, affected.size())), STATUS_CLOSED))
+                closed.put(session.getId(), session);
+        return closed.values().stream().map(this::toSessionView).toList();
+    }
+
+    private List<PeerMeshSessionView> closeUnauthorizedSessions(String tenant, List<PeerMeshSession> sessions) {
         List<PeerMeshSession> closed = new ArrayList<>();
         Instant now = Instant.now();
-        Map<Long, ClientAccount> parents = lockSessionParents(sessions, context.tenant().tenantId());
+        Map<Long, ClientAccount> parents = lockSessionParents(sessions, tenant);
         for (PeerMeshSession session : lockSessionRows(sessions)) {
             if (!canPeerLocked(parents.get(session.getSourceClientId()), parents.get(session.getTargetClientId()))) {
                 markClosed(session, now);

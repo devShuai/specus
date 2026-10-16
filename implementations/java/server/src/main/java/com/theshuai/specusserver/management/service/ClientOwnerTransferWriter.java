@@ -20,9 +20,9 @@ import java.util.Map;
 import java.util.Objects;
 import static com.theshuai.specusserver.management.service.ClientOwnerTransferPlan.*;
 
-/** Database-only transfer core. Deliberately NOT wired to POST until runtime/reference writers,
- * selective revocation and cross-instance publication satisfy the shared contract. An audit row
- * proves only database commit, never runtime notification/delivery. No precommit cache effects. */
+/** Coordinated database transfer core, called through its transaction proxy by the public resource.
+ * Its atomic audit also feeds the per-instance notification journal. An audit row proves only
+ * database commit, never runtime delivery. No precommit cache or connection effects. */
 @Service
 public class ClientOwnerTransferWriter {
     private final ManagementWriteAuthority authority;

@@ -492,8 +492,34 @@ public class PeerSignalService {
         for (ClientAccount account : clientAccountService.listTenantAccounts(context.tenant())) {
             pushConfig(account);
             pushRoster(account);
+            pushEgress(account);
         }
         pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(context.tenant().tenantId()));
+    }
+
+    /** System reconciliation of a committed journal event, not a management privilege grant.
+     * Selective current-policy revocation preserves explicitly authorized sessions and CONTROL. */
+    public void reconcileOwnership(String tenantId, List<Long> affectedClients) {
+        if (transactionActive()) throw new IllegalStateException("ownership reconciliation must follow commit");
+        if (affectedClients.isEmpty()) return; // A zero-device credential has no runtime grant to change.
+        peerMeshService.closeUnauthorizedSessionsForClients(tenantId, affectedClients);
+        for (var closed : peerMeshService.closedSessionsForClients(tenantId, affectedClients)) {
+            var message = closeMessage(closed, "ownership-changed");
+            sendOwnershipClose(tenantId, closed.sourceClientId(), closed.sourceClientName(), message);
+            sendOwnershipClose(tenantId, closed.targetClientId(), closed.targetClientName(), message);
+        }
+        for (ClientAccount account : clientAccountService.listTenantAccounts(tenantId)) {
+            pushConfig(account); pushRoster(account); pushEgress(account);
+        }
+        pushCatalogs(peerServiceDiscoveryService.onAuthorizationChanged(tenantId));
+    }
+
+    private void sendOwnershipClose(String tenant, long clientId, String name, PeerControlMessage message) {
+        Channel channel = SessionUtil.getChannel(name);
+        if (channel == null || !Objects.equals(channel.attr(ServerAttributes.CLIENT_ID).get(), clientId)
+                || !Objects.equals(channel.attr(ServerAttributes.TENANT_ID).get(), tenant)) return;
+        // Never route an old grant notice to a different client that later reuses this name.
+        writeEncoded(new ChannelBinding(channel), "server", name, JsonUtil.objectToString(message));
     }
 
     public void pushCatalogs(List<PeerServiceDiscoveryService.CatalogDelivery> deliveries) {

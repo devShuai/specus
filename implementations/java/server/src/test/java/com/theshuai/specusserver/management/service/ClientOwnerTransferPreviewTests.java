@@ -59,6 +59,8 @@ class ClientOwnerTransferPreviewTests {
     private static final List<String> TABLES = List.of("specus_client_account", "specus_client_credential",
             "specus_client_identity", "peer_mesh_device");
     @Autowired private ClientOwnerTransferService transfers;
+    @Autowired private ClientOwnerTransferWriter writer;
+    @Autowired private ClientOwnerTransferNotifications notifications;
     @Autowired private DataSource dataSource;
     @Autowired private ManagementContextResolver actualIdentityResolver;
     @Autowired private ManagementUserService users;
@@ -72,7 +74,7 @@ class ClientOwnerTransferPreviewTests {
         jdbc = new JdbcTemplate(dataSource);
         identities = mock(ManagementContextResolver.class);
         when(identities.resolve(any())).thenReturn(ADMIN);
-        mvc = standaloneSetup(new ClientOwnerTransferResource(transfers, identities))
+        mvc = standaloneSetup(new ClientOwnerTransferResource(transfers, identities, writer, notifications))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .setCustomArgumentResolvers(new AuthenticationPrincipalArgumentResolver()).build();
     }
@@ -136,7 +138,7 @@ class ClientOwnerTransferPreviewTests {
                 "preview-admin", "preview-test-password", ManagementRole.ADMIN, true));
         String accountKey = managementUsers.findByTenantIdAndLoginNameNormalized("tenant-a", "preview-admin")
                 .orElseThrow().getUsername();
-        MockMvc realIdentityMvc = standaloneSetup(new ClientOwnerTransferResource(transfers, actualIdentityResolver))
+        MockMvc realIdentityMvc = standaloneSetup(new ClientOwnerTransferResource(transfers, actualIdentityResolver, writer, notifications))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .setCustomArgumentResolvers(new AuthenticationPrincipalArgumentResolver()).build();
         Jwt jwt = Jwt.withTokenValue("fixture-already-validated-token").header("alg", "HS256")
@@ -236,13 +238,14 @@ class ClientOwnerTransferPreviewTests {
     }
 
     @Test
-    void postIsNotExposedBeforeMutationCoordinationIsImplemented() throws Exception {
+    void postRejectsNonAdministratorBeforeParsingMalformedJson() throws Exception {
         seed(snapshot(vector(), "shared"));
         List<List<Map<String, Object>>> before = rows();
+        when(identities.resolve(any())).thenReturn(new ManagementContext(new TenantContext("tenant-a"), "alice", false));
         for (String route : List.of(route("single", "1001"), route("credential-group", "501"))) {
             mvc.perform(post(route).contentType("application/json")
-                    .content("{\"scope\":\"credential-group\",\"targetUsername\":\"bob\",\"expectedRevision\":\"stale\"}"))
-                    .andExpect(status().isMethodNotAllowed());
+                    .content("{malformed-json"))
+                    .andExpect(status().isForbidden()).andExpect(jsonPath("$.code").value("FORBIDDEN"));
         }
         assertThat(rows()).isEqualTo(before);
     }
