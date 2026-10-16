@@ -504,7 +504,7 @@ func (s *Service) fanoutCatalogMode(ctx context.Context, publisher store.ClientA
 		if recipient.ID == publisher.ID || recipient.TenantID != publisher.TenantID {
 			continue
 		}
-		ok, err := s.CanPeer(ctx, publisher, recipient)
+		ok, err := s.CanPeer(ctx, recipient, publisher)
 		if err != nil || (!ok && !includeDenied) {
 			continue
 		}
@@ -576,7 +576,7 @@ func (s *Service) pushCurrentCatalogs(ctx context.Context, recipient store.Clien
 		if err != nil || publisher == nil {
 			continue
 		}
-		allowed, err := s.CanPeer(ctx, *publisher, recipient)
+		allowed, err := s.CanPeer(ctx, recipient, *publisher)
 		if err != nil {
 			continue
 		}
@@ -768,16 +768,24 @@ func (s *Service) effectiveSharing(ctx context.Context, account store.ClientAcco
 }
 
 func (s *Service) localServicesFor(ctx context.Context, account store.ClientAccount, clientProtocolVersion int) []LocalPeerService {
+	out, _ := s.localServicesForChecked(ctx, account, clientProtocolVersion)
+	return out
+}
+
+func (s *Service) localServicesForChecked(ctx context.Context, account store.ClientAccount, clientProtocolVersion int) ([]LocalPeerService, error) {
 	out := []LocalPeerService{}
 	if s.db == nil || clientProtocolVersion < 2 {
-		return out
+		return out, nil
 	}
 	rows, err := s.db.ListPeerMeshSharedServices(ctx, account.TenantID, []int64{account.ID})
 	if err != nil {
-		return out
+		return nil, err
 	}
 	for _, row := range rows {
-		allowedPeerVirtualIPs := s.allowedPeerVirtualIPs(ctx, account, row)
+		allowedPeerVirtualIPs, err := s.allowedPeerVirtualIPsChecked(ctx, account, row)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, LocalPeerService{
 			ServiceID:             row.ServiceID,
 			Name:                  row.Name,
@@ -793,16 +801,21 @@ func (s *Service) localServicesFor(ctx context.Context, account store.ClientAcco
 			AllowedPeerVirtualIPs: allowedPeerVirtualIPs,
 		})
 	}
-	return out
+	return out, nil
 }
 
 func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.ClientAccount, definition store.PeerMeshSharedService) []string {
+	out, _ := s.allowedPeerVirtualIPsChecked(ctx, publisher, definition)
+	return out
+}
+
+func (s *Service) allowedPeerVirtualIPsChecked(ctx context.Context, publisher store.ClientAccount, definition store.PeerMeshSharedService) ([]string, error) {
 	if !definition.Enabled {
-		return []string{}
+		return []string{}, nil
 	}
 	clients, err := s.db.ListClients(ctx)
 	if err != nil {
-		return []string{}
+		return nil, err
 	}
 	explicit := decodeClientIDs(definition.AllowedClientIDs)
 	allowed := make([]string, 0)
@@ -810,8 +823,11 @@ func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.Cli
 		if recipient.ID == publisher.ID || recipient.TenantID != publisher.TenantID {
 			continue
 		}
-		canPeer, err := s.CanPeer(ctx, publisher, recipient)
-		if err != nil || !canPeer {
+		canPeer, err := s.CanPeer(ctx, recipient, publisher)
+		if err != nil {
+			return nil, err
+		}
+		if !canPeer {
 			continue
 		}
 		visible := normalizeOwner(publisher.OwnerUsername) == normalizeOwner(recipient.OwnerUsername)
@@ -822,12 +838,15 @@ func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.Cli
 			continue
 		}
 		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, publisher.TenantID, recipient.ID)
-		if err == nil && device != nil && device.Enabled && strings.TrimSpace(device.VirtualIP) != "" {
+		if err != nil {
+			return nil, err
+		}
+		if device != nil && device.Enabled && strings.TrimSpace(device.VirtualIP) != "" {
 			allowed = append(allowed, strings.TrimSpace(device.VirtualIP))
 		}
 	}
 	slices.Sort(allowed)
-	return slices.Compact(allowed)
+	return slices.Compact(allowed), nil
 }
 
 func (s *Service) sharingStatusFor(account store.ClientAccount, device *store.PeerMeshDevice) ServiceSharingStatus {

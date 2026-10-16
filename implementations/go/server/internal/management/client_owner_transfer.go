@@ -40,7 +40,11 @@ func (a *API) commitOwnerTransfer(ctx context.Context, p managementPrincipal, sc
 	request.BuiltInTarget.Username = a.adminUsername()
 	request.BuiltInTarget.TenantID = a.defaultTenant()
 	request.BuiltInTarget.Enabled = a.tokens.PasswordLoginEnabled()
-	return a.db.TransferClientOwnership(ctx, request)
+	outcome, err := a.db.TransferClientOwnership(ctx, request)
+	if err == nil && outcome.AuditID != nil && a.ownerNotifications != nil {
+		a.ownerNotifications.Committed()
+	}
+	return outcome, err
 }
 
 func (a *API) handleClientOwnerTransferPreview(w http.ResponseWriter, r *http.Request) {

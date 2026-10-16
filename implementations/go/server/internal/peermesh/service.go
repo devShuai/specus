@@ -719,6 +719,10 @@ func (s *Service) BuildLoginConfig(ctx context.Context, account store.ClientAcco
 }
 
 func (s *Service) BuildRuntimeConfig(ctx context.Context, account store.ClientAccount) (LoginConfig, error) {
+	return s.buildRuntimeConfig(ctx, account, true)
+}
+
+func (s *Service) buildRuntimeConfig(ctx context.Context, account store.ClientAccount, createMissing bool) (LoginConfig, error) {
 	current, err := s.currentConfigAccount(ctx, account)
 	if err != nil {
 		return LoginConfig{}, err
@@ -730,7 +734,7 @@ func (s *Service) BuildRuntimeConfig(ctx context.Context, account store.ClientAc
 		if err != nil {
 			return LoginConfig{}, err
 		}
-		if device == nil {
+		if device == nil && createMissing {
 			device, err = s.createDevice(ctx, account)
 			if err != nil {
 				return LoginConfig{}, err

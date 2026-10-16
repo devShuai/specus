@@ -21,6 +21,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/httpshare"
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
+	"github.com/devShuai/specus/implementations/go/server/internal/ownership"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
 	"github.com/devShuai/specus/implementations/go/server/internal/productmetrics"
 	"github.com/devShuai/specus/implementations/go/server/internal/security"
@@ -32,35 +33,36 @@ import (
 
 // API holds the dependencies for the admin REST surface.
 type API struct {
-	db               *store.DB
-	sessions         *session.Registry
-	tokens           *security.LocalTokenService
-	oidcAuth         *security.OidcValidator
-	natControl       *nat.ControlService
-	remotePorts      *nat.RemotePortManager
-	oidc             config.OidcConfig
-	authConfig       config.AuthConfig
-	clientAuth       config.ClientAuthConfig
-	traffic          config.TrafficConfig
-	trafficUsage     *nat.TrafficService
-	seedDemo         func(ctx context.Context) error
-	peerMesh         *peermesh.Service
-	attachments      *transfer.Service
-	rooms            *transfer.RoomService
-	mediaCapture     *media.Service
-	turnstile        *security.TurnstileVerifier
-	loginLimiter     *security.LoginRateLimiter
-	addressResolver  *security.ClientAddressResolver
-	registration     *registrationService
-	packageDirectory string
-	downloadLimiter  *publicDownloadRateLimiter
-	workbench        *workbench
-	shares           *httpshare.Service
-	connectivity     *connectivity.Checker
-	productMetrics   *productmetrics.Service
-	clientTokens     *auth.SessionStore
-	accessRevoked    func(tenantID, username, reason string)
-	logger           *slog.Logger
+	db                 *store.DB
+	sessions           *session.Registry
+	tokens             *security.LocalTokenService
+	oidcAuth           *security.OidcValidator
+	natControl         *nat.ControlService
+	remotePorts        *nat.RemotePortManager
+	oidc               config.OidcConfig
+	authConfig         config.AuthConfig
+	clientAuth         config.ClientAuthConfig
+	traffic            config.TrafficConfig
+	trafficUsage       *nat.TrafficService
+	seedDemo           func(ctx context.Context) error
+	peerMesh           *peermesh.Service
+	attachments        *transfer.Service
+	rooms              *transfer.RoomService
+	mediaCapture       *media.Service
+	turnstile          *security.TurnstileVerifier
+	loginLimiter       *security.LoginRateLimiter
+	addressResolver    *security.ClientAddressResolver
+	registration       *registrationService
+	packageDirectory   string
+	downloadLimiter    *publicDownloadRateLimiter
+	workbench          *workbench
+	shares             *httpshare.Service
+	connectivity       *connectivity.Checker
+	productMetrics     *productmetrics.Service
+	clientTokens       *auth.SessionStore
+	ownerNotifications *ownership.Notifications
+	accessRevoked      func(tenantID, username, reason string)
+	logger             *slog.Logger
 }
 
 // Reasons an account's management WebSockets end (management-accounts.md 7.2); they are the reason of
@@ -83,6 +85,16 @@ func (a *API) SetMediaCapture(service *media.Service) { a.mediaCapture = service
 // SetClientTokenSessions attaches the store of issued client runtime tokens, so that deleting an
 // account revokes its tokens and renaming it renames its sessions.
 func (a *API) SetClientTokenSessions(sessions *auth.SessionStore) { a.clientTokens = sessions }
+
+func (a *API) SetOwnerNotifications(notifications *ownership.Notifications) {
+	a.ownerNotifications = notifications
+}
+
+func (a *API) RunOwnerNotifications(ctx context.Context) {
+	if a.ownerNotifications != nil {
+		a.ownerNotifications.Run(ctx)
+	}
+}
 
 // SetClientPackageDirectory configures the durable filesystem location used by the package
 // catalog. The directory is created lazily on the first upload so read-only deployments that do

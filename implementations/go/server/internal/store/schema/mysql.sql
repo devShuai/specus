@@ -774,3 +774,11 @@ CREATE TABLE IF NOT EXISTS client_owner_transfer_audit (
   detail_json LONGTEXT NOT NULL,
   KEY idx_owner_transfer_tenant_at (tenant_id, occurred_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_receipt (
+  id VARCHAR(200) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+  node_id VARCHAR(80) COLLATE utf8mb4_bin NOT NULL,
+  event_id BIGINT NOT NULL,
+  processed_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uq_owner_transfer_receipt_node_event (node_id, event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

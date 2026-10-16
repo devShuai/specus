@@ -24,6 +24,7 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/management"
 	"github.com/devShuai/specus/implementations/go/server/internal/media"
 	"github.com/devShuai/specus/implementations/go/server/internal/nat"
+	"github.com/devShuai/specus/implementations/go/server/internal/ownership"
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
 	"github.com/devShuai/specus/implementations/go/server/internal/productmetrics"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
@@ -268,6 +269,13 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			}
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments, rooms, addressResolver, logger)
+	ownerNotifications, err := ownership.New(db, peerMesh, logger)
+	if err != nil {
+		_ = publicTransferDiscovery.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("initialize ownership notifications: %w", err)
+	}
+	api.SetOwnerNotifications(ownerNotifications)
 	api.SetMediaCapture(mediaCapture)
 	api.SetClientTokenSessions(clientSessions)
 	api.ProductMetrics().SetAllowed(cfg.ProductMetrics.Allowed)
@@ -530,6 +538,7 @@ func (a *App) Run(ctx context.Context) error {
 	launch(a.attachments.RunExpiration)
 	launch(a.mediaCapture.Run)
 	launch(a.api.RunRegistrationCleanup)
+	launch(a.api.RunOwnerNotifications)
 	launch(a.api.RunWorkbenchSweep)
 	launch(a.api.RunProductMetricsSweep)
 	launch(a.api.HTTPShares().RunSweeper)

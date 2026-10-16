@@ -805,3 +805,11 @@ CREATE TABLE IF NOT EXISTS client_owner_transfer_audit (
   detail_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_owner_transfer_tenant_at ON client_owner_transfer_audit (tenant_id, occurred_at, id);
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_receipt (
+  id VARCHAR(200) PRIMARY KEY,
+  node_id VARCHAR(80) NOT NULL,
+  event_id BIGINT NOT NULL,
+  processed_at VARCHAR(40) NOT NULL,
+  UNIQUE (node_id, event_id)
+);

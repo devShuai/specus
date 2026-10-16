@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -196,6 +197,72 @@ func (c *Conn) Close(reason string) {
 // writeFrame); a packet that cannot be encoded writes nothing and leaves it open.
 func (c *Conn) Send(packet protocol.Packet) error {
 	return c.send(nil, packet, store.ReasonIOError)
+}
+
+// SendContext bounds background delivery without an unjoined sending goroutine. Waiting for
+// writeMu is cancellable and does not touch the current writer's deadline. Once acquired, a
+// context cancellation interrupts the actual socket write; an incomplete frame closes the
+// failed transport with the ordinary IO_ERROR rule, never an ownership-revocation reason.
+func (c *Conn) SendContext(ctx context.Context, packet protocol.Packet) error {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return errors.New("bounded control send requires a deadline")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
+	if err != nil {
+		return err
+	}
+	tracked := c.WriteBackpressure.AddPending(len(frame))
+	defer c.WriteBackpressure.ReleasePending(tracked)
+	if !c.writeMu.TryLock() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.ctx.Done():
+				return c.ctx.Err()
+			case <-ticker.C:
+			}
+			if c.writeMu.TryLock() {
+				break
+			}
+		}
+	}
+	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.netConn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = c.netConn.SetWriteDeadline(time.Now()); close(interrupted) })
+	err = c.writeFrameLocked(frame, store.ReasonIOError)
+	if !stop() {
+		<-interrupted
+	}
+	// The callback is finished before resetting the deadline and releasing the write lock.
+	// Otherwise a late cancellation could poison a subsequent ordinary business write.
+	resetErr := c.netConn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if resetErr != nil {
+		c.Close(store.ReasonIOError)
+		return resetErr
+	}
+	return nil
 }
 
 // CommitAndSend runs commit and then writes packet while holding the write lock across both,
