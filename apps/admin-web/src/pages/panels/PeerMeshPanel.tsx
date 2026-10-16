@@ -29,6 +29,7 @@ import { formatBytes, formatDateTime } from "../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { EmptyState } from "../../components/EmptyState";
 import { useNowTick } from "../../hooks/useNowTick";
+import { watchOwnershipChanges } from "../../lib/ownershipChanges";
 import { PeerMeshServicesTab } from "./PeerMeshServicesTab";
 import { PeerMeshEgressTab } from "./PeerMeshEgressTab";
 import {
@@ -86,10 +87,12 @@ export function PeerMeshPanel() {
   const [sessionTotal, setSessionTotal] = useState(0);
   const [sessionTotalPages, setSessionTotalPages] = useState(1);
   const sessionRequestId = useRef(0);
+  const overviewRequestId = useRef(0);
   // 新鲜度窗口 120s，30s tick 足够驱动过期判定，避免每秒整面板重渲染。
   const now = useNowTick(30_000);
 
   const loadOverview = useCallback(async () => {
+    const read = ++overviewRequestId.current;
     try {
       const [nextStatus, nextDevices, nextAcls, nextPathStats] = await Promise.all([
         adminApi.peerMeshStatus(),
@@ -98,14 +101,16 @@ export function PeerMeshPanel() {
         // stats 暂不可用时降级为 null，不影响面板其余部分。
         adminApi.peerMeshStats().catch(() => null),
       ]);
+      if (read !== overviewRequestId.current) return;
       setStatus(nextStatus);
       setPathStats(nextPathStats);
       setDevices(nextDevices);
       setAcls(nextAcls);
     } catch (error) {
+      if (read !== overviewRequestId.current) return;
       notifyError(error, "加载私有组网失败");
     } finally {
-      setDevicesLoading(false);
+      if (read === overviewRequestId.current) setDevicesLoading(false);
     }
   }, []);
 
@@ -156,6 +161,7 @@ export function PeerMeshPanel() {
   useEffect(() => {
     void loadSessions(sessionPage, true);
   }, [loadSessions, sessionPage]);
+  useEffect(() => watchOwnershipChanges(() => { void loadOverview(); void loadSessions(sessionPage, true); }), [loadOverview, loadSessions, sessionPage]);
 
   const enabledDevices = useMemo(() => devices.filter((device) => device.enabled), [devices]);
   const onlineDevices = useMemo(() => devices.filter((device) => device.online), [devices]);

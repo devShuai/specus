@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Button,
   Chip,
@@ -33,6 +33,10 @@ import { EmptyState } from "../../components/EmptyState";
 import { StatusChip, enabledTone, onlineTone } from "../../components/StatusChip";
 import { ClientOnboardingGuide } from "../../components/ClientOnboardingGuide";
 import { buildClientStartupConfig } from "../../lib/clientOnboarding";
+import { useAuth } from "../../auth/AuthContext";
+import { OwnerTransferDialog } from "../../components/OwnerTransferDialog";
+import { countOwnedResources, sameOwner, type TransferResource } from "../../lib/ownerTransfer";
+import { publishOwnershipChange, watchOwnershipChanges } from "../../lib/ownershipChanges";
 
 const PAGE_SIZE = 10;
 
@@ -64,6 +68,10 @@ function useLocalPagination<T>(items: T[], pageSize = PAGE_SIZE) {
 }
 
 export function ClientsPanel() {
+  const clientRead = useRef(0), credentialRead = useRef(0);
+  const { profile } = useAuth();
+  const [transferResource, setTransferResource] = useState<TransferResource | null>(null);
+  const [ownerFilter, setOwnerFilter] = useState(() => new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("owner") ?? "");
   const [clients, setClients] = useState<Client[]>([]);
   const [credentials, setCredentials] = useState<ClientCredential[]>([]);
   const [loadingClients, setLoadingClients] = useState(true);
@@ -86,38 +94,66 @@ export function ClientsPanel() {
   const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
   const loadClients = useCallback(async () => {
+    const read = ++clientRead.current;
     setLoadingClients(true);
     try {
-      setClients(await adminApi.listClients());
+      const next = await adminApi.listClients();
+      if (read !== clientRead.current) return true;
+      setClients(next);
+      setDetailClient(current => current ? next.find(client => client.id === current.id) ?? null : null);
       setClientsLoadError(false);
+      return true;
     } catch (error) {
+      if (read !== clientRead.current) return true;
       setClientsLoadError(true);
       notifyError(error, "加载客户端失败");
+      return false;
     } finally {
-      setLoadingClients(false);
+      if (read === clientRead.current) setLoadingClients(false);
     }
   }, []);
 
   const loadCredentials = useCallback(async () => {
+    const read = ++credentialRead.current;
     setLoadingCredentials(true);
     try {
-      setCredentials(await adminApi.listClientCredentials());
+      const next = await adminApi.listClientCredentials();
+      if (read !== credentialRead.current) return true;
+      setCredentials(next);
       setCredentialsLoadError(false);
+      return true;
     } catch (error) {
+      if (read !== credentialRead.current) return true;
       setCredentialsLoadError(true);
       notifyError(error, "加载接入凭证失败");
+      return false;
     } finally {
-      setLoadingCredentials(false);
+      if (read === credentialRead.current) setLoadingCredentials(false);
     }
   }, []);
 
   const load = useCallback(async () => {
-    await Promise.all([loadCredentials(), loadClients()]);
+    return (await Promise.all([loadCredentials(), loadClients()])).every(Boolean);
   }, [loadClients, loadCredentials]);
 
   useEffect(() => {
     void load();
   }, [load]);
+  useEffect(() => watchOwnershipChanges(() => { void load(); }, false), [load]);
+  useEffect(() => {
+    const sync = () => {
+      const query = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
+      setOwnerFilter(query.get("owner") ?? "");
+      const section = query.get("section");
+      if (section === "clients" || section === "credentials") document.getElementById(`owner-${section}`)?.scrollIntoView({ block: "start" });
+    };
+    window.addEventListener("hashchange", sync); sync();
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+  const openTransfer = (resource: TransferResource) => {
+    if (!profile?.admin) return;
+    setDetailClient(null); credentialModal.onClose(); setTransferResource(resource);
+  };
 
   const showSecret = (value?: string, credentialApiKey = "") => {
     if (!value) {
@@ -270,18 +306,26 @@ export function ClientsPanel() {
     </Tooltip>
   );
 
-  const credentialPagination = useLocalPagination(credentials);
-  const clientPagination = useLocalPagination(clients);
+  const visibleCredentials = ownerFilter ? credentials.filter(row => sameOwner(row.ownerUsername, ownerFilter)) : credentials;
+  const visibleClients = ownerFilter ? clients.filter(row => sameOwner(row.ownerUsername, ownerFilter)) : clients;
+  const credentialPagination = useLocalPagination(visibleCredentials);
+  const clientPagination = useLocalPagination(visibleClients);
+  const ownerCounts = countOwnedResources(ownerFilter, clients, credentials);
 
   return (
     <div className="mt-3 flex min-w-0 flex-col gap-5">
+      {ownerFilter && <div className="space-y-2 rounded-md border border-primary-200 bg-primary-50 p-4" role="status">
+        <p className="break-all font-medium">正在处理「{ownerFilter}」的资源</p>
+        <p className="text-small">{loadingClients || loadingCredentials ? "正在重新读取归属…" : clientsLoadError || credentialsLoadError ? "部分列表读取失败，请刷新后核对计数。" : `${ownerCounts.clients} 个客户端、${ownerCounts.credentials} 个接入凭证。零设备凭证也需要单独处理。`}</p>
+        <div className="flex flex-wrap gap-2"><Button as="a" role="link" href="#/clients" size="sm" variant="flat">查看全部资源</Button><Button as="a" role="link" href="#/system" size="sm" variant="flat">返回账号管理</Button></div>
+      </div>}
       <ClientOnboardingGuide loading={loadingClients || loadingCredentials} error={clientsLoadError || credentialsLoadError}
         online={clients.filter((client) => client.enabled && client.online).length} registered={clients.length} credentials={credentials.length}
         onRefresh={() => void load()} />
       <section className="flex min-w-0 flex-col gap-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
+            <h2 id="owner-credentials" className="scroll-mt-20 text-lg font-semibold text-foreground">接入凭证</h2>
             <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret；名称首次连接时自动生成，之后可在实例列表中修改。</p>
           </div>
           <Button className="w-full sm:w-auto" variant="flat" isLoading={loadingClients || loadingCredentials} onPress={() => void load()}>
@@ -335,6 +379,7 @@ export function ClientsPanel() {
                       <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
                         编辑
                       </Button>
+                      {profile?.admin && <Button size="sm" variant="flat" onPress={() => openTransfer({ kind: "credential", id: credential.id })}>转移管理归属</Button>}
                       <Button size="sm" color="danger" variant="flat" onPress={() => void removeCredential(credential)}>
                         删除
                       </Button>
@@ -376,6 +421,7 @@ export function ClientsPanel() {
                     <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
                       编辑
                     </Button>
+                    {profile?.admin && <Button size="sm" variant="flat" onPress={() => openTransfer({ kind: "credential", id: credential.id })}>转移管理归属</Button>}
                     <Button size="sm" color="danger" variant="flat" onPress={() => removeCredential(credential)}>
                       删除
                     </Button>
@@ -391,7 +437,7 @@ export function ClientsPanel() {
 
       <section className="flex min-w-0 flex-col gap-3">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">客户端实例</h2>
+          <h2 id="owner-clients" className="scroll-mt-20 text-lg font-semibold text-foreground">客户端实例</h2>
           <p className="text-small text-default-500">实例首次登录后自动注册并生成名称；可在编辑窗口中自定义，名称在全局范围内不可重复。</p>
         </div>
 
@@ -425,6 +471,7 @@ export function ClientsPanel() {
                       <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
                         编辑
                       </Button>
+                      {profile?.admin && <Button size="sm" variant="flat" onPress={() => openTransfer({ kind: "client", id: client.id })}>转移管理归属</Button>}
                       <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
                         下发映射
                       </Button>
@@ -476,6 +523,7 @@ export function ClientsPanel() {
                     <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
                       编辑
                     </Button>
+                    {profile?.admin && <Button size="sm" variant="flat" onPress={() => openTransfer({ kind: "client", id: client.id })}>转移管理归属</Button>}
                     <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
                       下发映射
                     </Button>
@@ -495,7 +543,7 @@ export function ClientsPanel() {
       <EditCredentialModal disclosure={credentialModal} credential={editingCredential} onSaved={(value, currentApiKey) => {
         showSecret(value, currentApiKey);
         void loadCredentials();
-      }} />
+      }} onTransfer={profile?.admin && editingCredential ? () => openTransfer({ kind: "credential", id: editingCredential.id }) : undefined} />
 
       <EditClientModal disclosure={clientModal} client={editingClient} onSaved={() => void loadClients()} />
 
@@ -528,7 +576,10 @@ export function ClientsPanel() {
           )}
         </ModalContent>
       </Modal>
-      <ClientDetailDrawer client={detailClient} open={detailClient != null} onClose={() => setDetailClient(null)} />
+      <ClientDetailDrawer client={detailClient} open={detailClient != null} onClose={() => setDetailClient(null)}
+        onTransfer={profile?.admin && detailClient ? () => openTransfer({ kind: "client", id: detailClient.id }) : undefined} />
+      {profile?.admin && transferResource && <OwnerTransferDialog key={`${transferResource.kind}:${transferResource.id}`}
+        resource={transferResource} onClose={() => setTransferResource(null)} onTransferred={async () => { publishOwnershipChange(); if (!await load()) throw new Error("列表刷新失败"); }} />}
       <ConfirmModal
         isOpen={confirm != null}
         onClose={() => setConfirm(null)}
@@ -546,9 +597,10 @@ interface EditCredentialModalProps {
   disclosure: ReturnType<typeof useDisclosure>;
   credential: ClientCredential | null;
   onSaved: (secret?: string, apiKey?: string) => void;
+  onTransfer?: () => void;
 }
 
-function EditCredentialModal({ disclosure, credential, onSaved }: EditCredentialModalProps) {
+function EditCredentialModal({ disclosure, credential, onSaved, onTransfer }: EditCredentialModalProps) {
   const [apiKey, setApiKey] = useState("");
   const [secret, setSecret] = useState("");
   const [enabled, setEnabled] = useState(true);
@@ -618,6 +670,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
               </Switch>
             </ModalBody>
             <ModalFooter>
+              {onTransfer && <Button variant="flat" isDisabled={saving} onPress={onTransfer}>转移管理归属</Button>}
               <Button variant="flat" onPress={onClose}>
                 取消
               </Button>

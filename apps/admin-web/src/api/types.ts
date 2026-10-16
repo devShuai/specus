@@ -99,6 +99,27 @@ export interface ClientCredentialResult {
   secret?: string;
 }
 
+export interface OwnedResourceCounts { clients: number; credentials: number }
+export type OwnerTransferScope = "single" | "credential-group";
+export interface OwnerTransferPreview {
+  scope: OwnerTransferScope;
+  clientId: number | null;
+  credentialId: number | null;
+  credentialOwnerUsername: string | null;
+  credentialEnabled: boolean | null;
+  affectedClients: { id: number; clientName: string; ownerUsername: string | null; enabled: boolean }[];
+  affectedClientCount: number;
+  canTransfer: boolean;
+  conflictCode: "CREDENTIAL_SHARED" | null;
+  revision: string | null;
+  accessRetained: true;
+}
+export interface OwnerTransferRequest { scope: OwnerTransferScope; targetUsername: string; expectedRevision: string }
+export interface OwnerTransferResult {
+  scope: OwnerTransferScope; targetUsername: string; credentialId: number | null;
+  affectedClientIds: number[]; changed: boolean; accessRetained: true;
+}
+
 export interface Specus {
   id: number;
   clientId: number;

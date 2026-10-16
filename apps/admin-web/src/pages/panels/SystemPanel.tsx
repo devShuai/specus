@@ -1,4 +1,4 @@
-import { useEffect, useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 import {
   Button,
   Card,
@@ -23,7 +23,9 @@ import {
   Textarea,
   useDisclosure,
 } from "@heroui/react";
-import { adminApi } from "../../api/client";
+import { adminApi, ApiError } from "../../api/client";
+import { countOwnedResources, ownerResourcesHash } from "../../lib/ownerTransfer";
+import { watchOwnershipChanges } from "../../lib/ownershipChanges";
 import type {
   ClientArch,
   ClientDownloadLink,
@@ -34,6 +36,9 @@ import type {
   ManagementRole,
   ManagementUser,
   ManagementUserMutation,
+  Client,
+  ClientCredential,
+  OwnedResourceCounts,
 } from "../../api/types";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
@@ -57,9 +62,12 @@ type SystemPanelProps = {
 };
 
 export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelProps) {
+  const userRead = useRef(0);
   const [users, setUsers] = useState<ManagementUser[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [savingUser, setSavingUser] = useState(false);
+  const [ownedResources, setOwnedResources] = useState<{ clients: Client[]; credentials: ClientCredential[] } | null>(null);
+  const [blockedDeletion, setBlockedDeletion] = useState<{ user: ManagementUser; counts: OwnedResourceCounts } | null>(null);
   const [userForm, setUserForm] = useState<ManagementUserMutation>({
     username: "",
     password: "",
@@ -68,19 +76,27 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
   });
 
   const loadUsers = async () => {
+    const read = ++userRead.current;
     setLoadingUsers(true);
     try {
-      setUsers(await adminApi.listUsers());
+      const [accounts, clients, credentials] = await Promise.allSettled([adminApi.listUsers(), adminApi.listClients(), adminApi.listClientCredentials()]);
+      if (read !== userRead.current) return;
+      if (accounts.status === "rejected") throw accounts.reason;
+      setUsers(accounts.value);
+      setOwnedResources(clients.status === "fulfilled" && credentials.status === "fulfilled"
+        ? { clients: clients.value, credentials: credentials.value } : null);
     } catch (error) {
+      if (read !== userRead.current) return;
       notifyError(error, "用户列表加载失败");
     } finally {
-      setLoadingUsers(false);
+      if (read === userRead.current) setLoadingUsers(false);
     }
   };
 
   useEffect(() => {
     void loadUsers();
   }, []);
+  useEffect(() => watchOwnershipChanges(() => { void loadUsers(); }), []);
 
   const createUser = async () => {
     setSavingUser(true);
@@ -146,7 +162,9 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
           notify("用户已删除");
           await loadUsers();
         } catch (error) {
-          notifyError(error, "删除用户失败");
+          if (error instanceof ApiError && error.status === 409 && error.ownedResources) {
+            setBlockedDeletion({ user, counts: error.ownedResources });
+          } else notifyError(error, "删除用户失败");
         }
       },
     });
@@ -335,6 +353,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                     }
                     fields={[
                       { label: "租户", value: user.tenantId },
+                      { label: "名下资源", value: ownedResources ? `${countOwnedResources(user.username, ownedResources.clients, ownedResources.credentials).clients} 个客户端、${countOwnedResources(user.username, ownedResources.clients, ownedResources.credentials).credentials} 个凭证` : "计数暂不可用" },
                       { label: "更新时间", value: formatDateTime(user.updatedAt) },
                     ]}
                     actions={
@@ -375,6 +394,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                 <TableColumn>租户</TableColumn>
                 <TableColumn>角色</TableColumn>
                 <TableColumn>状态</TableColumn>
+                <TableColumn>名下资源</TableColumn>
                 <TableColumn>更新时间</TableColumn>
                 <TableColumn className="text-right">操作</TableColumn>
               </TableHeader>
@@ -392,6 +412,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                     <TableCell>
                       <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
                     </TableCell>
+                    <TableCell>{ownedResources ? `${countOwnedResources(user.username, ownedResources.clients, ownedResources.credentials).clients} 个客户端、${countOwnedResources(user.username, ownedResources.clients, ownedResources.credentials).credentials} 个凭证` : "计数暂不可用"}</TableCell>
                     <TableCell className="whitespace-nowrap text-default-500">{formatDateTime(user.updatedAt)}</TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
@@ -464,6 +485,23 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
           </div>
         </CardBody>
       </Card>
+      <Modal isOpen={blockedDeletion !== null} onClose={() => setBlockedDeletion(null)} size="lg" placement="center">
+        <ModalContent><ModalHeader>先处理名下资源，再删除账号</ModalHeader><ModalBody>
+          {blockedDeletion && <>
+            <p className="break-all text-small">账号「{blockedDeletion.user.username}」尚未删除。服务端当前检查到：</p>
+            <div className="grid grid-cols-2 gap-3 rounded-md border border-default-200 bg-default-50 p-3">
+              <p><strong className="text-xl">{blockedDeletion.counts.clients}</strong> 个客户端</p><p><strong className="text-xl">{blockedDeletion.counts.credentials}</strong> 个接入凭证</p>
+            </div>
+            <p className="text-small text-default-600">请分别转移或删除这些资源。零设备凭证也会阻止删除；不会自动把资源交给其他账号。</p>
+            <div className="flex flex-wrap gap-2">
+              <Button as="a" role="link" href={ownerResourcesHash(blockedDeletion.user.username, "clients")} variant="flat">查看并转移客户端</Button>
+              <Button as="a" role="link" href={ownerResourcesHash(blockedDeletion.user.username, "credentials")} variant="flat">查看并转移接入凭证</Button>
+            </div>
+          </>}
+        </ModalBody><ModalFooter><Button variant="flat" onPress={() => setBlockedDeletion(null)}>稍后处理</Button>
+          <Button onPress={() => { const user = blockedDeletion?.user; setBlockedDeletion(null); if (user) deleteUser(user); }}>重新确认删除账号</Button>
+        </ModalFooter></ModalContent>
+      </Modal>
     </div>
 
     <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
