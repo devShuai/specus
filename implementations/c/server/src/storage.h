@@ -1515,7 +1515,7 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
 /* The stage callback mutates only caller-owned, invisible memory. It must not perform SQL,
  * socket I/O, or acquire/wait for registry/CID/cache locks. Reserve cache resources BEFORE
  * calling; publish them only after this function commits successfully, otherwise discard.
- * Current client/device/sharing and the immutable physical source are read under the same
+ * Current client/device/sharing, original session's discovery capability and immutable physical source are read under the same
  * native writer as the audit insert+retention. A rolled-back authority change returns -1,
  * not permanent retirement. The unguarded entrypoint is for explicit trusted service calls. */
 typedef int (*st_storage_peer_service_report_stage_fn)(void *context,
@@ -1534,17 +1534,18 @@ typedef struct {
 } st_storage_peer_catalog_source;
 typedef struct {
     st_storage_client publisher, recipient;
-    int publisher_current, recipient_current, sharing_enabled, mdns_enabled, allowed;
+    int publisher_current, recipient_current, recipient_authenticated, sharing_enabled, mdns_enabled, allowed;
     st_storage_peer_mesh_service *services;
     size_t service_count;
 } st_storage_peer_catalog_view;
-/* One native read snapshot for original physical sources, current parents/devices/sharing,
+/* One native read snapshot for original physical sources, captured original recipient capability, current parents/devices/sharing,
  * consumer->publisher ACL and at most 32 reported definitions. No cache locks or network I/O.
  * source_visible and view are published only on successful completion; SQL failure clears them.
  * A hidden/missing publisher or source is a successful empty projection, not permanent cleanup. */
 int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
     const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
-    long long recipient_id, const char (*service_ids)[65], size_t service_count,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
     st_storage_peer_catalog_view *view);
 void st_storage_peer_catalog_view_free(st_storage_peer_catalog_view *view);
 int st_storage_list_peer_mesh_service_audits(const char *path,

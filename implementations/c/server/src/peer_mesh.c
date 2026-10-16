@@ -1184,21 +1184,28 @@ static void pm_format_instant(time_t value, char out[32])
         || strftime(out, 32U, "%Y-%m-%dT%H:%M:%SZ", &utc) == 0U) out[0] = '\0';
 }
 
-static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
+static char *pm_build_bound_catalog_message(const st_peer_mesh_runtime *runtime,
                                       const pm_catalog *catalog,
                                       const st_storage_client *publisher,
                                       const st_storage_client *recipient,
-                                      int authorized)
+                                      int authorized, const st_storage_peer_catalog_source *recipient_source,
+                                      int *deliverable, int *nonempty)
 {
     (void)publisher; /* A cached caller-owned account must not grant OWNER visibility. */
+    if (deliverable) *deliverable = 1;
+    if (nonempty) *nonempty = 0;
     st_storage_peer_catalog_view view = {0};
     int visible = 0;
-    if (authorized && catalog->active && catalog->expires_at > time(NULL)
-        && !strcmp(catalog->database_path, runtime->database_path)) {
+    int data = authorized && catalog->active && catalog->expires_at > time(NULL)
+        && !strcmp(catalog->database_path, runtime->database_path);
+    if (data || recipient_source != NULL) {
         st_storage_peer_catalog_source source = {.guarded=catalog->has_control_source, .control=catalog->control_source};
         if (st_storage_read_peer_catalog(runtime->database_path, catalog->tenant_id, catalog->publisher_client_id,
-                &source, 1, &visible, recipient->id, catalog->service_ids, catalog->service_count, &view) != 0) return NULL;
-        if (view.recipient.id && strcmp(view.recipient.client_name, recipient->client_name)) {
+                data ? &source : NULL, data ? 1U : 0U, &visible, recipient->id, recipient_source,
+                data ? catalog->service_ids : NULL, data ? catalog->service_count : 0U, &view) != 0) return NULL;
+        if ((recipient_source != NULL && !view.recipient_authenticated)
+            || (view.recipient.id && strcmp(view.recipient.client_name, recipient->client_name))) {
+            if (deliverable) *deliverable = 0;
             st_storage_peer_catalog_view_free(&view); return NULL;
         }
     }
@@ -1208,7 +1215,7 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
     if (pm_appendf(&builder,
                    "{\"type\":\"service-catalog\",\"publisherClientId\":%lld,\"publisherClientName\":",
                    catalog->publisher_client_id) != 0
-        || pm_append_json_string(&builder, view.publisher.id ? view.publisher.client_name : catalog->publisher_client_name) != 0
+        || pm_append_json_string(&builder, visible && view.publisher.id ? view.publisher.client_name : catalog->publisher_client_name) != 0
         || pm_appendf(&builder, ",\"publisherSessionId\":%lld,\"revision\":%lld,\"expiresAt\":",
                       catalog->publisher_session_id, catalog->catalog_revision) != 0
         || pm_append_json_string(&builder, expires_at) != 0
@@ -1226,6 +1233,7 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime,
         if ((!first && pm_append(&builder, ",") != 0)
             || pm_append_advertised_service(&builder, service) != 0) goto failed;
         first = 0;
+        if (nonempty) *nonempty = 1;
     }
     if (pm_appendf(&builder, "],\"createdAtMillis\":%lld}",
                    catalog->created_at_millis) != 0) goto failed;
@@ -1235,6 +1243,48 @@ failed:
     st_storage_peer_catalog_view_free(&view);
     free(builder.data);
     return NULL;
+}
+
+static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime, const pm_catalog *catalog,
+    const st_storage_client *publisher, const st_storage_client *recipient, int authorized)
+{
+    return pm_build_bound_catalog_message(runtime,catalog,publisher,recipient,authorized,NULL,NULL,NULL);
+}
+
+static int pm_deliver_catalog(const st_peer_mesh_runtime *runtime, const pm_catalog *catalog,
+    const st_storage_client *publisher, const st_storage_client *recipient, int authorized)
+{
+    const st_peer_mesh_catalog_transport *transport = runtime->catalog_transport;
+    if (transport == NULL) {
+        if (runtime->catalog_transport_required || ((catalog->has_control_source || runtime->control_source != NULL)
+            && !runtime->trusted_catalog_transport)) return -1;
+        char *message=pm_build_catalog_message(runtime,catalog,publisher,recipient,authorized);
+        int rc=message && runtime->send(runtime->ctx,recipient->client_name,"server",message)==0 ? 0:-1;
+        free(message);return rc;
+    }
+    if (!transport->capture || !transport->send || !transport->release) return -1;
+    st_peer_mesh_catalog_binding from={0}, to={0}; char *message=NULL; int rc=0;
+    int captured=transport->capture(runtime->ctx,runtime->database_path,recipient,0,NULL,&to);
+    if (captured != 0 || to.handle == NULL) { rc=captured==1?0:-1;goto done; }
+    if (authorized && catalog->active && catalog->expires_at > time(NULL)) {
+        st_storage_client hint={.id=catalog->publisher_client_id};
+        snprintf(hint.tenant_id,sizeof(hint.tenant_id),"%s",catalog->tenant_id);
+        snprintf(hint.client_name,sizeof(hint.client_name),"%s",catalog->publisher_client_name);
+        st_storage_peer_catalog_source expected={.guarded=catalog->has_control_source,.control=catalog->control_source};
+        captured=transport->capture(runtime->ctx,runtime->database_path,&hint,catalog->publisher_session_id,&expected,&from);
+        if (captured<0 || (captured==0 && from.handle==NULL)) { rc=-1;goto done; }
+        if (captured!=0) authorized=0; /* Withdraw, never rebind the original publisher. */
+    }
+    int deliverable=1, nonempty=0;
+    message=pm_build_bound_catalog_message(runtime,catalog,publisher,recipient,authorized,&to.authority,&deliverable,&nonempty);
+    if (message == NULL) { rc=deliverable?-1:0;goto done; }
+    rc=transport->send(runtime->ctx,nonempty?&from:NULL,&to,message);
+    if (rc==1) rc=0; /* Captured physical endpoint retired; a successor gets its own fresh replay. */
+done:
+    free(message);
+    if (from.handle) transport->release(runtime->ctx,&from);
+    if (to.handle) transport->release(runtime->ctx,&to);
+    return rc;
 }
 
 static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
@@ -1252,10 +1302,7 @@ static int pm_fanout_catalog(const st_peer_mesh_runtime *runtime,
             || strcmp(recipient->tenant_id, publisher->tenant_id) != 0
             || runtime->online == NULL
             || !runtime->online(runtime->ctx, recipient->id, recipient->client_name)) continue;
-        char *message = pm_build_catalog_message(runtime, catalog, publisher, recipient, 1);
-        if (message == NULL
-            || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
-        free(message);
+        if (pm_deliver_catalog(runtime,catalog,publisher,recipient,1) != 0) rc=-1;
     }
     free(clients);
     return rc;
@@ -1679,10 +1726,7 @@ static int pm_replay_catalogs(const st_peer_mesh_runtime *runtime,
     pthread_mutex_unlock(&peer_catalog_lock);
     int rc = 0;
     for (size_t i = 0; i < count; ++i) {
-        char *message = pm_build_catalog_message(runtime, &snapshots[i], NULL, recipient, 1);
-        if (message == NULL
-            || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
-        free(message);
+        if (pm_deliver_catalog(runtime,&snapshots[i],NULL,recipient,1) != 0) rc=-1;
     }
     free(snapshots);
     return rc;
@@ -1905,9 +1949,7 @@ static int pm_dispatch_deleted_client(const st_peer_mesh_runtime *runtime, pm_cl
             free(message);
         }
         for (size_t j = 0U; j < item->withdrawal_count; ++j) {
-            char *message = pm_build_catalog_message(runtime, &item->withdrawals[j], &item->client, recipient, 0);
-            if (message == NULL || runtime->send(runtime->ctx, recipient->client_name, "server", message) != 0) rc = -1;
-            free(message);
+            if (pm_deliver_catalog(runtime,&item->withdrawals[j],&item->client,recipient,0) != 0) rc=-1;
         }
     }
     free(clients);
@@ -1971,7 +2013,7 @@ static int pm_catalog_read_refs(const char *path, const char *tenant, long long 
         sources[count] = refs[count].source; ++count;
     }
     pthread_mutex_unlock(&peer_catalog_lock);
-    int rc = count ? st_storage_read_peer_catalog(path, tenant, cid, sources, count, visible, 0, NULL, 0, view) : 0;
+    int rc = count ? st_storage_read_peer_catalog(path, tenant, cid, sources, count, visible, 0, NULL, NULL, 0, view) : 0;
     free(sources);
     if (rc != 0) { free(refs); free(visible); return rc; }
     *out = refs; *out_visible = visible; *out_count = count; return 0;

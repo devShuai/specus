@@ -108,9 +108,20 @@ Nonempty catalog payloads, including replay, use one fresh native read snapshot 
 publisher source, current publisher/recipient ownership, consumer-to-publisher ACL, sharing and
 the reported service definitions. Unknown visibility and malformed recipient lists do not grant
 access. A new port/protocol/path is not advertised until it matches the publisher's accepted report.
-These reads release SQLite before socket I/O. Consequently a takeover after the read snapshot but
-before blocking send acceptance is not yet fenced across instances; original recipient binding
-and distributed output ordering also remain separate alignment work. The online-peer hint is
+Network, management and maintenance catalog sends capture retained physical publisher/recipient
+references before SQL. Recipient authority uses that original session's current discovery capability,
+not a sibling session's latest capability. The send uses only the captured descriptor/object and
+checks local cancellation after waiting for its write lock; it never redirects a pending payload by
+name onto a reconnect. Empty withdrawals need no surviving publisher, but still require an
+authenticated original recipient. Missing required transport is an error, not a trusted fallback.
+Source report admission also checks its own original session's discovery capability inside the
+native writer and after audit triggers; rejection releases the private stage without consuming
+raw/rate/output state or permanently retiring an otherwise live CONTROL.
+
+These reads release SQLite before socket I/O. Consequently a native takeover after the read
+snapshot but before blocking send acceptance is not yet fenced across instances; retained local
+references do not make that interval atomic. Distributed output ordering also remains separate
+alignment work. The online-peer hint is
 still obtained before the report writer. Shared SQLite does not currently provide atomic
 distributed catalog publication.
 

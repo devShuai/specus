@@ -63,6 +63,8 @@ int sqlite3_step(sqlite3_stmt *stmt)
         && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_WRITE) pause_once();
     if (!strcmp(mode, "read") && rc == SQLITE_ROW && strstr(sql, "SELECT c.enabled,k.enabled FROM specus_client_session s")
         && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_READ) pause_once();
+    if (!strcmp(mode, "delivery") && rc == SQLITE_ROW && strstr(sql, "SELECT c.enabled,k.enabled FROM specus_client_session s")
+        && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_READ) selected = db;
     return rc;
 }
 int sqlite3_close(sqlite3 *db)

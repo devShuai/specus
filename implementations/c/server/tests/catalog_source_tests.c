@@ -126,7 +126,7 @@ static int prepare(fixture *f)
     f->runtime = (st_peer_mesh_runtime){.database_path=f->path, .send=send_catalog, .online=online, .ctx=f,
         .publisher_session_id=session.id, .peer_service_discovery_version=2,
         .authenticated_client_id=f->publisher.id, .authenticated_tenant=f->publisher.tenant_id,
-        .source_active=active, .source_current=current, .control_source=&f->guard};
+        .source_active=active, .source_current=current, .control_source=&f->guard, .trusted_catalog_transport=1};
     return report(f, 1, 3, "Original Local");
 }
 static void cleanup(fixture *f)
@@ -242,6 +242,32 @@ done:
 #undef REQUIRE
 }
 
+static int source_capability(int trigger)
+{
+    fixture f;int failed=1;pm_catalog before={0},after={0};char first[81],last[81];
+#define REQUIRE(c,text) do { if(!(c)){fprintf(stderr,"FAIL catalog source capability trigger=%d: %s\n",trigger,text);goto done;} }while(0)
+    REQUIRE(prepare(&f)==0 && snapshot(&f,&before,first)==0,"actual source/cache fixture");
+    int sent=f.sent;
+    REQUIRE(execute(f.path,trigger
+        ? "CREATE TRIGGER revoke_discovery AFTER INSERT ON peer_mesh_service_audit WHEN NEW.action='service-report' BEGIN UPDATE specus_client_session SET peer_service_discovery_version=0; END"
+        : "UPDATE specus_client_session SET peer_service_discovery_version=0")==0,"native capability change");
+    int rc=report(&f,100,900,"Unauthorized Capability");
+    REQUIRE(snapshot(&f,&after,last)==0,"last committed cohort remains present");
+    fprintf(stderr,"OBSERVATION source capability trigger=%d rc=%d raw=%lld sentDelta=%d\n",trigger,rc,after.report_revision,f.sent-sent);
+    REQUIRE(rc==(trigger?-1:ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE) && after.report_revision==before.report_revision
+        && after.catalog_revision==before.catalog_revision && after.created_at_millis==before.created_at_millis
+        && !memcmp(&after.rate,&before.rate,sizeof(after.rate)) && after.stats[0].bytes_in==3 && !strcmp(first,last)
+        && f.sent==sent && audit_count(f.path)==1 && current(&f),"original source capability fences the whole native/cache operation without permanent physical retirement");
+    REQUIRE(execute(f.path,"DROP TRIGGER IF EXISTS revoke_discovery; UPDATE specus_client_session SET peer_service_discovery_version=2")==0
+        && report(&f,2,7,"Capability Restored")==0 && snapshot(&f,&after,last)==0 && after.report_revision==2
+        && after.catalog_revision==before.catalog_revision+1 && f.sent==sent+1 && audit_count(f.path)==2,
+        "original CONTROL recovers with no unauthorized raw100/rate/output budget consumption");
+    failed=0;
+done:
+    cleanup(&f);printf("%s catalog original source capability trigger=%d guarded commit/rollback/recovery\n",failed?"FAIL":"PASS",trigger);return failed;
+#undef REQUIRE
+}
+
 static int reservations(void)
 {
     fixture f; int failed = 1; pm_catalog before = {0}, after = {0}; char first[81], last[81];
@@ -304,9 +330,13 @@ done:
 int main(int argc, char **argv)
 {
     setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
-    if (argc == 2) return scenario(argv[1]);
+    if (argc == 2) {
+        if(!strcmp(argv[1],"source-capability")) return source_capability(0);
+        if(!strcmp(argv[1],"source-capability-trigger")) return source_capability(1);
+        return scenario(argv[1]);
+    }
     if (argc != 1) return 2;
     return scenario("stale") + scenario("audit-insert") + scenario("audit-prune") + scenario("trigger")
         + policy_scenario("sharing") + policy_scenario("mdns") + policy_scenario("device") + policy_scenario("owner")
-        + reservations() ? 1 : 0;
+        + source_capability(0) + source_capability(1) + reservations() ? 1 : 0;
 }

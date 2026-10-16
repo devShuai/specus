@@ -96,7 +96,7 @@ static int source_catalog(const st_message_response *message, const runtime_sess
         && strstr(message->message, "\"services\":[]") == NULL;
 }
 /* The real later business frame is a completion fence for the original worker, not a sleep. */
-static int source_fence(source_fixture *f, int *nonempty)
+static int source_fence_named(source_fixture *f, int *nonempty, const char *old_name, const char *new_name, int *old_count)
 {
     st_buffer packet = st_protocol_encode_message_response(f->publisher.client_name, f->peer.client_name,
         ST_MESSAGE_TYPE_CLIENT_TO_CLIENT, "catalog-after-native-failure");
@@ -104,19 +104,27 @@ static int source_fence(source_fixture *f, int *nonempty)
     packet.data[6] = ST_CMD_MESSAGE_REQUEST;
     if (send_buffer(f->control, &packet)) return -1;
     long long deadline = monotonic_ms() + IO_TIMEOUT_MS; *nonempty = 0;
+    int completed = 0, fresh_seen = new_name == NULL;
+    if (old_count) *old_count = 0;
     while (monotonic_ms() < deadline) {
         st_frame_header header; uint8_t *body = NULL; st_message_response message = {0};
         int rc = read_frame(f->recipient, (int)(deadline-monotonic_ms()), &header, &body);
         if (rc != 1) { fprintf(stderr, "OBSERVATION catalog fence read rc=%d\n", rc); return -1; }
         int decoded = header.command == ST_CMD_MESSAGE_RESPONSE && st_protocol_decode_message_response(body, header.length, &message) == 0;
         free(body);
-        if (decoded && source_catalog(&message, &f->publisher)) ++*nonempty;
+        if (decoded && source_catalog(&message, &f->publisher)) {
+            ++*nonempty;
+            if (old_name && old_count && strstr(message.message,old_name)) ++*old_count;
+            if (new_name && strstr(message.message,new_name)) fresh_seen = 1;
+        }
         int done = decoded && message.message_type == ST_MESSAGE_TYPE_CLIENT_TO_CLIENT && message.message
             && !strcmp(message.message, "catalog-after-native-failure");
-        st_message_response_free(&message); if (done) return 0;
+        completed |= done;
+        st_message_response_free(&message); if (completed && fresh_seen) return 0;
     }
     return -1;
 }
+static int source_fence(source_fixture *f, int *nonempty) { return source_fence_named(f,nonempty,NULL,NULL,NULL); }
 static int audit_failure(const char *library, const char *mode)
 {
     source_fixture f; int failed = 1, nonempty = -1; char count[64];
@@ -294,11 +302,96 @@ done:
     failed=source_cleanup(&f,failed); printf("%s real catalog single native READ snapshot across actual WAL writer, independent heartbeat and next-view revocation\n",failed?"FAIL":"PASS"); return failed;
 #undef REQUIRE
 }
+static int recipient_replaced(const char *library)
+{
+    source_fixture f; int failed=1, nonempty=0, old_count=0; char reason[512];
+#define REQUIRE(c, text) do { if (!(c)) { fprintf(stderr,"FAIL real catalog recipient binding: %s\n",text); goto done; } } while(0)
+    REQUIRE(source_setup(&f,library,"delivery")==0 && marker(&f.a,"arm")==0
+        && send_report(f.control,&f.publisher,2,"pending-recipient",0)==0 && wait_marker(&f.a)==0,
+        "actual payload READ has committed and closed before original delivery");
+    REQUIRE(channel_login(f.a.control_port,&f.peer,ST_CONNECTION_ROLE_CONTROL,&f.replacement,reason,sizeof(reason))==1,
+        "same HTTP SID establishes a new physical recipient while publisher waits");
+    int old=f.recipient; f.recipient=f.replacement; f.replacement=old;
+    REQUIRE(sql(&f.a,"UPDATE peer_mesh_shared_service SET name='Fresh Recipient View'")==0 && marker(&f.a,"resume")==0,
+        "definition changes after old payload snapshot but before new login replay");
+    REQUIRE(source_fence_named(&f,&nonempty,"\"name\":\"Catalog Service\"","\"name\":\"Fresh Recipient View\"",&old_count)==0,
+        "later original publisher business AND fresh recipient replay are physically received");
+    fprintf(stderr,"OBSERVATION recipient replacement oldSnapshotOnNew=%d totalNonempty=%d\n",old_count,nonempty);
+    REQUIRE(old_count==0,"pending old-recipient payload is never redirected by name onto successor CONTROL");
+    REQUIRE(expect_channel_closed(f.replacement,IO_TIMEOUT_MS)==0 && expect_channel_alive(f.recipient)==0
+        && expect_channel_alive(f.control)==0,"only old physical recipient retires; source and successor remain usable");
+    failed=0;
+done:
+    failed=source_cleanup(&f,failed);printf("%s real catalog original recipient binding and independent fresh replay\n",failed?"FAIL":"PASS");return failed;
+#undef REQUIRE
+}
+static int publisher_detached(const char *library)
+{
+    source_fixture f; int failed=1, nonempty=0; char reason[512];
+#define REQUIRE(c, text) do { if (!(c)) { fprintf(stderr,"FAIL real catalog publisher binding: %s\n",text); goto done; } } while(0)
+    REQUIRE(source_setup(&f,library,"delivery")==0,"original physical publisher/recipient");
+    f.port=pick_free_port();
+    REQUIRE(f.port>0 && create_mapping(f.a.db_path,f.publisher.client_id,f.port)==0
+        && channel_login(f.a.control_port,&f.publisher,ST_CONNECTION_ROLE_DATA,&f.data,reason,sizeof(reason))==1
+        && nat_register(f.data,f.publisher.client_name,f.port,9)==0 && open_public_stream(f.data,f.port,&f.public_fd)==0,
+        "original publisher DATA/public TCP family established");
+    REQUIRE(db_scalar(f.a.db_path,"SELECT channel_id FROM specus_client_session WHERE id=?",NULL,f.publisher.session_id,
+        f.old_channel,sizeof(f.old_channel))==0 && marker(&f.a,"arm")==0
+        && send_report(f.control,&f.publisher,2,"detached-source",0)==0 && wait_marker(&f.a)==0,
+        "accepted report's final native READ is closed before send");
+    close_fd(&f.control);
+    REQUIRE(expect_channel_closed(f.data,IO_TIMEOUT_MS)==0 && expect_socket_eof(f.public_fd,IO_TIMEOUT_MS)==0
+        && expect_channel_alive(f.recipient)==0,"reader has actually detached original source/family while its worker waits");
+    REQUIRE(marker(&f.a,"resume")==0 && wait_native_closed(&f)==0 && drain_closed_source(&f,&nonempty)==0,
+        "original worker and native audit finish before recipient heartbeat completion fence");
+    fprintf(stderr,"OBSERVATION publisher detached lateNonempty=%d\n",nonempty);
+    REQUIRE(nonempty==0,"a locally detached original publisher cannot emit its pending nonempty snapshot");
+    failed=0;
+done:
+    failed=source_cleanup(&f,failed);printf("%s real catalog original publisher binding, actual family detach and recipient heartbeat\n",failed?"FAIL":"PASS");return failed;
+#undef REQUIRE
+}
+static int endpoint_capability(const char *library, int publisher)
+{
+    source_fixture f; int failed=1, nonempty=0; char change[512]; long long revision=0;
+#define REQUIRE(c, text) do { if (!(c)) { fprintf(stderr,"FAIL real catalog %s capability: %s\n",publisher?"publisher":"recipient",text); goto done; } } while(0)
+    REQUIRE(source_setup(&f,library,"pre")==0,"real original receiver with v2 capability");
+    harness_login_environment_extra=caps;
+    const runtime_session *subject=publisher?&f.publisher:&f.peer;
+    int login=http_client_login(&f.a,"ck_catalog_source","catalog-source-secret",publisher?"catalog-source-p":"catalog-source-r","user",&f.other);
+    harness_login_environment_extra="";
+    REQUIRE(login==0 && f.other.client_id==subject->client_id && f.other.session_id!=subject->session_id
+        && st_storage_mark_client_session_online(f.a.db_path,f.other.session_id,"other-capability-row","127.0.0.1","2026-10-16T00:00:00Z")==0,
+        "another signed same-client session advertises v2 but is not the physical receiver");
+    snprintf(change,sizeof(change),"UPDATE specus_client_session SET peer_service_discovery_version=0 WHERE id=%lld",subject->session_id);
+    REQUIRE(sql(&f.a,change)==0 && send_report(f.control,&f.publisher,publisher?100:2,"revoked-endpoint",0)==0 && source_fence(&f,&nonempty)==0,
+        "original receiver capability changes, then actual publisher business completes");
+    fprintf(stderr,"OBSERVATION %s original capability unauthorizedNonempty=%d\n",publisher?"publisher":"recipient",nonempty);
+    REQUIRE(nonempty==0 && expect_channel_alive(f.control)==0 && expect_channel_alive(f.recipient)==0,
+        "another session's v2 capability must not authorize this original receiver or cause physical retirement");
+    if(publisher) {
+        char count[32];REQUIRE(db_scalar(f.a.db_path,"SELECT COUNT(*) FROM peer_mesh_service_audit WHERE action='service-report' AND tenant_id=?",f.tenant,0,count,sizeof(count))==0
+            && !strcmp(count,"1"),"revoked publisher report never commits audit/private cache state despite another session's v2");
+    }
+    snprintf(change,sizeof(change),"UPDATE specus_client_session SET peer_service_discovery_version=2 WHERE id=%lld; UPDATE specus_client_session SET status='EXPIRED' WHERE id=%lld",subject->session_id,f.other.session_id);
+    REQUIRE(sql(&f.a,change)==0 && send_report(f.control,&f.publisher,publisher?2:3,"new-physical",0)==0
+        && wait_peer(f.recipient,"service-catalog",&f.publisher,0,&revision)==0 && revision==f.first_revision+(publisher?1:2),
+        "same original receiver recovers after its own capability is restored");
+    failed=0;
+done:
+    harness_login_environment_extra="";failed=source_cleanup(&f,failed);
+    printf("%s real catalog exact %s session capability, no sibling inheritance and recovery\n",failed?"FAIL":"PASS",publisher?"publisher":"recipient");return failed;
+#undef REQUIRE
+}
 int main(int argc, char **argv)
 {
     if (argc != 3 && argc != 4) return 2;
     signal(SIGPIPE, SIG_IGN); server_binary = argv[1];
     if (argc == 4) {
+        if (!strcmp(argv[3], "recipient-replaced")) return recipient_replaced(argv[2]);
+        if (!strcmp(argv[3], "publisher-detached")) return publisher_detached(argv[2]);
+        if (!strcmp(argv[3], "recipient-capability")) return endpoint_capability(argv[2],0);
+        if (!strcmp(argv[3], "publisher-capability")) return endpoint_capability(argv[2],1);
         if (!strcmp(argv[3], "read-snapshot")) return consistent_read(argv[2]);
         if (!strcmp(argv[3], "replace-first")) return takeover(argv[2], 0);
         if (!strcmp(argv[3], "writer-first")) return takeover(argv[2], 1);
@@ -306,5 +399,6 @@ int main(int argc, char **argv)
         return audit_failure(argv[2], argv[3]);
     }
     return audit_failure(argv[2], "audit-insert") + audit_failure(argv[2], "audit-prune") + audit_failure(argv[2], "trigger")
-        + takeover(argv[2], 0) + takeover(argv[2], 1) + consistent_read(argv[2]) ? 1 : 0;
+        + takeover(argv[2], 0) + takeover(argv[2], 1) + consistent_read(argv[2])
+        + recipient_replaced(argv[2]) + publisher_detached(argv[2]) + endpoint_capability(argv[2],0) + endpoint_capability(argv[2],1) ? 1 : 0;
 }

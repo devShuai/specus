@@ -1782,6 +1782,9 @@ static void active_session_remove_locked(specus_session *session)
 {
     if (session == NULL) return;
     source_watch_remove_locked(session);
+    /* A retained catalog reference must observe local detach before it can write, even while
+     * the owning reader is still draining its worker and has not closed the native row yet. */
+    if (session->bound && !session->is_data_connection) atomic_store(&session->control_cancelled, 1);
     session->bound = 0;
     specus_session **cursor = &active_sessions;
     while (*cursor != NULL) {
@@ -3198,6 +3201,73 @@ static int peer_mesh_runtime_send(void *ctx,
     return rc;
 }
 
+static int catalog_control_source_equal(const st_storage_control_source *a, const st_storage_control_source *b)
+{
+    return a->client_id==b->client_id && a->session_id==b->session_id
+        && !strncmp(a->tenant_id,b->tenant_id,sizeof(a->tenant_id))
+        && !strncmp(a->client_name,b->client_name,sizeof(a->client_name))
+        && !strncmp(a->channel_id,b->channel_id,sizeof(a->channel_id))
+        && !strncmp(a->token_hash,b->token_hash,sizeof(a->token_hash));
+}
+
+static int peer_catalog_capture(void *ctx, const char *path, const st_storage_client *hint,
+    long long expected_session, const st_storage_peer_catalog_source *expected, st_peer_mesh_catalog_binding *binding)
+{
+    (void)ctx;
+    if (binding==NULL) return -1;
+    memset(binding,0,sizeof(*binding));
+    if (path==NULL || hint==NULL || hint->id<=0) return -1;
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *session=active_session_find_role_locked(hint->client_name,0);
+    int matches=session && session->bound && !atomic_load(&session->control_cancelled)
+        && !atomic_load(&session->nat_retired) && session->config.peer_service_discovery_version>=2
+        && session->config.client_id==hint->id && !strcmp(session->config.tenant_id,hint->tenant_id)
+        && !strcmp(session->config.database_path,path)
+        && (expected_session<=0 || session->config.client_session_id==expected_session);
+    if (matches && expected) matches=expected->guarded==session->config.client_session_db_backed
+        && (!expected->guarded || catalog_control_source_equal(&expected->control,&session->control_source_guard));
+    if (matches) {
+        ++session->references; binding->handle=session;
+        binding->authority.guarded=session->config.client_session_db_backed;
+        if (binding->authority.guarded) binding->authority.control=session->control_source_guard;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    return matches?0:1;
+}
+
+static int peer_catalog_send(void *ctx, const st_peer_mesh_catalog_binding *publisher,
+    const st_peer_mesh_catalog_binding *recipient, const char *message)
+{
+    (void)ctx;
+    specus_session *target=recipient?recipient->handle:NULL;
+    specus_session *source=publisher?publisher->handle:NULL;
+    if (target==NULL || (publisher && source==NULL) || message==NULL) return -1;
+    st_buffer packet=st_protocol_encode_message_response("server",target->config.client_name,ST_MESSAGE_TYPE_PEER_CONTROL,message);
+    if (packet.data==NULL) return -1;
+    /* No SQLite/CID/registry lock here. The retained object pins its descriptor lifetime.
+     * Recheck cancellation AFTER any wait for send_lock; never look up a replacement by name. */
+    pthread_mutex_lock(&target->send_lock);
+    int retired=atomic_load(&target->control_cancelled) || atomic_load(&target->nat_retired)
+        || (source && (atomic_load(&source->control_cancelled) || atomic_load(&source->nat_retired)));
+    int rc;
+    if (retired) { st_buffer_free(&packet); rc=1; }
+    else rc=session_send_packet_locked(target,&packet);
+    pthread_mutex_unlock(&target->send_lock);
+    return rc;
+}
+
+static void peer_catalog_release(void *ctx, st_peer_mesh_catalog_binding *binding)
+{
+    (void)ctx;
+    if (binding==NULL) return;
+    session_reference_release(binding->handle);
+    memset(binding,0,sizeof(*binding));
+}
+
+static const st_peer_mesh_catalog_transport peer_catalog_transport={
+    .capture=peer_catalog_capture,.send=peer_catalog_send,.release=peer_catalog_release
+};
+
 static int control_source_active(void *ctx)
 {
     specus_session *session = ctx;
@@ -3370,6 +3440,8 @@ static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *sessio
     runtime.source_active = control_source_active;
     runtime.source_current = control_source_current;
     runtime.control_source = session->config.client_session_db_backed ? &session->control_source_guard : NULL;
+    runtime.catalog_transport=&peer_catalog_transport;
+    runtime.catalog_transport_required=1;
     return runtime;
 }
 
@@ -3597,7 +3669,9 @@ static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
         .database_path = config->database_path,
         .send = peer_mesh_runtime_send,
         .online = peer_mesh_runtime_online,
-        .peer_service_discovery_version = 2
+        .peer_service_discovery_version = 2,
+        .catalog_transport=&peer_catalog_transport,
+        .catalog_transport_required=1
     };
     return st_peer_mesh_refresh_tenant(&runtime, tenant_id);
 }
@@ -3688,7 +3762,9 @@ static void *peer_mesh_maintenance_thread(void *unused)
             .database_path = peer_mesh_maintenance.database_path,
             .send = peer_mesh_runtime_send,
             .online = peer_mesh_runtime_online,
-            .peer_service_discovery_version = 2
+            .peer_service_discovery_version = 2,
+            .catalog_transport=&peer_catalog_transport,
+            .catalog_transport_required=1
         };
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
         if (st_peer_mesh_drain_client_deletions(&runtime) != 0)

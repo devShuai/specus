@@ -10300,6 +10300,8 @@ static int service_report_policy_on_db(sqlite3 *db, const st_storage_client *cli
     return read_peer_mesh_service_sharing(db, client->tenant_id, sharing) < 0 ? -1 : 0;
 }
 
+static int catalog_source_discovery_on_db(sqlite3 *db, const st_storage_control_source *source, int *enabled);
+
 static int commit_peer_service_report_impl(const char *path, const st_storage_control_source *control,
     const st_storage_client *cached, long long session_id, st_storage_peer_service_report_stage_fn stage,
     void *context, st_storage_client *committed_client)
@@ -10312,6 +10314,11 @@ static int commit_peer_service_report_impl(const char *path, const st_storage_co
     st_storage_peer_mesh_service_sharing sharing = {0}, checked_sharing = {0};
     if (peer_client_write_begin(path, cached, &db, &current, NULL) != 0) return -1;
     int rc = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (rc == 0 && control != NULL) {
+        int discovery = 0;
+        rc = catalog_source_discovery_on_db(db, control, &discovery);
+        if (rc == 0 && !discovery) rc = ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE;
+    }
     if (rc == 0) rc = service_report_policy_on_db(db, &current, &device, &sharing);
     const char *reason = NULL;
     if (rc == 0) rc = stage(context, &current, &device, &sharing, &reason);
@@ -10328,6 +10335,10 @@ static int commit_peer_service_report_impl(const char *path, const st_storage_co
         || service_report_policy_on_db(db, &checked, &checked_device, &checked_sharing) != 0
         || checked_device.enabled != device.enabled || checked_sharing.enabled != sharing.enabled
         || checked_sharing.mdns_import_enabled != sharing.mdns_import_enabled)) rc = -1;
+    if (rc == 0 && control != NULL) {
+        int discovery = 0;
+        if (catalog_source_discovery_on_db(db, control, &discovery) != 0 || !discovery) rc = -1;
+    }
     rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
     if (rc == 0) rc = exec_sql(db, "COMMIT");
     if (rc != 0) (void)exec_sql(db, "ROLLBACK");
@@ -10395,7 +10406,8 @@ static int catalog_source_discovery_on_db(sqlite3 *db, const st_storage_control_
 
 int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
     const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
-    long long recipient_id, const char (*service_ids)[65], size_t service_count,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
     st_storage_peer_catalog_view *view)
 {
     if (view == NULL) return -1;
@@ -10429,8 +10441,16 @@ int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long l
         present = catalog_client_on_db(db, tenant_id, recipient_id, &staged.recipient);
         if (present < 0) rc = -1;
         if (rc == 0 && present == 0) {
-            device = 0; rc = catalog_device_on_db(db, &staged.recipient, &device);
-            staged.recipient_current = staged.recipient.enabled && device;
+            staged.recipient_authenticated = staged.recipient.enabled;
+            if (recipient_source != NULL && recipient_source->guarded) {
+                int check = control_source_on_db(db, &recipient_source->control, recipient_id, tenant_id);
+                if (check == 0) rc = catalog_source_discovery_on_db(db, &recipient_source->control, &staged.recipient_authenticated);
+                else if (check == ST_STORAGE_CONTROL_SOURCE_RETIRED || check == ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE)
+                    staged.recipient_authenticated = 0;
+                else rc = -1;
+            }
+            device = 0; if (rc == 0) rc = catalog_device_on_db(db, &staged.recipient, &device);
+            staged.recipient_current = staged.recipient_authenticated && staged.recipient.enabled && device;
             if (rc == 0 && any_source && staged.recipient_current && staged.publisher_current && staged.sharing_enabled
                 && recipient_id != publisher_id) rc = can_peer_on_db(db, &staged.recipient, &staged.publisher, &staged.allowed);
         }

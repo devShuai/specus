@@ -13,6 +13,24 @@ typedef int (*st_peer_mesh_online_fn)(void *ctx,
                                       const char *client_name);
 
 typedef struct {
+    st_storage_peer_catalog_source authority;
+    void *handle; /* Owned physical reference; never a name to look up again. */
+} st_peer_mesh_catalog_binding;
+typedef struct {
+    /* Called BEFORE native SQL, with no cache/CID/registry lock retained. 0 owns a non-NULL
+     * reference, 1 means no matching original connection, -1 is a resource/transport error.
+     * expected_session/source constrain a publisher; a recipient is captured exactly once. */
+    int (*capture)(void *ctx, const char *path, const st_storage_client *hint,
+        long long expected_session, const st_storage_peer_catalog_source *expected,
+        st_peer_mesh_catalog_binding *binding);
+    /* Called AFTER SQL closes. Never redirect either handle to a successor connection.
+     * publisher is NULL for an empty withdrawal. 1 means retired before socket acceptance. */
+    int (*send)(void *ctx, const st_peer_mesh_catalog_binding *publisher,
+        const st_peer_mesh_catalog_binding *recipient, const char *message);
+    void (*release)(void *ctx, st_peer_mesh_catalog_binding *binding);
+} st_peer_mesh_catalog_transport;
+
+typedef struct {
     /* send/online are invoked under the snapshot delivery fence. They must not
      * re-enter control/login/logout/refresh or ownership-drain dispatch. */
     const char *database_path;
@@ -30,6 +48,9 @@ typedef struct {
     /* Borrowed immutable session-owned authority; present for every DB-backed network CONTROL.
      * NULL is reserved for explicit trusted service/environment callers, not a failed check. */
     const st_storage_control_source *control_source;
+    const st_peer_mesh_catalog_transport *catalog_transport;
+    int catalog_transport_required; /* Every main.c network/admin/maintenance runtime sets this. */
+    int trusted_catalog_transport; /* Explicit synthetic/service transport with a guarded source. */
 } st_peer_mesh_runtime;
 
 typedef struct {
