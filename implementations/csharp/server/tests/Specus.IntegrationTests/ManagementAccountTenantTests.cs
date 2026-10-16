@@ -2,8 +2,11 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Specus.Server.Configuration;
 using Specus.Server.Authentication;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
@@ -78,10 +81,12 @@ public sealed class ManagementAccountTenantTests
         await using var server = await TestServerFixture.StartAsync();
         // An account that predates login names: its key is its name, and it lives in tenant-b.
         await SeedAccountAsync(server, "bob", "tenant-b", ManagementRole.User, "legacy-bob-password");
+        await SeedAccountAsync(server, "admin-a", "tenant-a", ManagementRole.Admin, "admin-a-password");
+        await SeedAccountAsync(server, "admin-c", "tenant-c", ManagementRole.Admin, "admin-c-password");
 
         await using var scope = server.HostServices.CreateAsyncScope();
         var users = scope.ServiceProvider.GetRequiredService<ManagementUserService>();
-        var tenantAAdmin = new ManagementContext("tenant-a", "admin-a", ManagementRole.Admin, BuiltInAdmin: false);
+        var tenantAAdmin = await AdminContextAsync(server, scope.ServiceProvider, "admin-a", "tenant-a");
         var created = await users.CreateUserAsync(tenantAAdmin,
             new UserMutation("Bob", "secret-password", "USER", true), CancellationToken.None);
 
@@ -98,7 +103,7 @@ public sealed class ManagementAccountTenantTests
 
         // Mutations look in the acting tenant only: tenant-a cannot reach tenant-b's bob, and a
         // missing name answers the same as a foreign one.
-        var tenantBOnly = new ManagementContext("tenant-c", "admin-c", ManagementRole.Admin, BuiltInAdmin: false);
+        var tenantBOnly = await AdminContextAsync(server, scope.ServiceProvider, "admin-c", "tenant-c");
         var update = await Assert.ThrowsAsync<ArgumentException>(() => users.UpdateUserAsync(tenantBOnly, "bob",
             new UserMutation("bob", null, "ADMIN", false), CancellationToken.None));
         Assert.Equal("用户不存在: bob", update.Message);
@@ -268,10 +273,11 @@ public sealed class ManagementAccountTenantTests
     {
         await using var server = await TestServerFixture.StartAsync();
         await SeedAccountAsync(server, "frank", "tenant-a", ManagementRole.User, "frank-a-password");
+        await SeedAccountAsync(server, "admin-b", "tenant-b", ManagementRole.Admin, "admin-b-password");
         await using (var seed = server.HostServices.CreateAsyncScope())
         {
             var created = await seed.ServiceProvider.GetRequiredService<ManagementUserService>().CreateUserAsync(
-                new ManagementContext("tenant-b", "admin-b", ManagementRole.Admin, BuiltInAdmin: false),
+                await AdminContextAsync(server, seed.ServiceProvider, "admin-b", "tenant-b"),
                 new UserMutation("Frank", "frank-b-password", "ADMIN", Enabled: false), CancellationToken.None);
             Assert.Equal("tenant-b", created.TenantId);
         }
@@ -287,6 +293,15 @@ public sealed class ManagementAccountTenantTests
         Assert.Equal(new HttpShareService.SharePrincipal("admin", "default", true),
             await shares.LoadPrincipalAsync("default", "admin", CancellationToken.None));
         Assert.Null(await shares.LoadPrincipalAsync("tenant-a", "admin", CancellationToken.None));
+    }
+
+    private static async Task<ManagementContext> AdminContextAsync(TestServerFixture server, IServiceProvider services, string username, string tenant)
+    {
+        using var client = server.CreateClient();
+        var token = await LoginAsync(client, username, username + "-password", tenant);
+        var principal = await services.GetRequiredService<AdminBearerTokenValidator>().ValidateAsync(token);
+        Assert.NotNull(principal);
+        return ManagementContext.From(new DefaultHttpContext { User = principal }, services.GetRequiredService<IOptions<AuthOptions>>().Value);
     }
 
     private static async Task SeedAccountAsync(TestServerFixture server, string username, string tenantId,

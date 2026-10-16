@@ -8,6 +8,19 @@ namespace Specus.IntegrationTests;
 
 public sealed class ManagementUserWriteCoordinationTests
 {
+    [Fact]
+    public async Task AccountCreationCannotFlushUnrelatedPendingChanges()
+    {
+        await using var server = await TestServerFixture.StartAsync();
+        await using var scope = server.HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        db.ClientCredentials.Add(new ClientCredential { Id = 9742, TenantId = "default", OwnerUsername = "unrelated", ApiKey = "unrelated-create-pending", SecretHash = "fixture" });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => scope.ServiceProvider.GetRequiredService<ManagementUserService>()
+            .CreateUserAsync(Admin, new UserMutation("must-not-create", "fixture-password", "USER", true), CancellationToken.None));
+        Assert.False(await db.ClientCredentials.AsNoTracking().AnyAsync(c => c.Id == 9742));
+        Assert.False(await db.ManagementUsers.AsNoTracking().AnyAsync(u => u.LoginName == "must-not-create"));
+    }
+
     private static readonly ManagementContext Admin = new("default", "admin", ManagementRole.Admin, true);
 
     [Theory]

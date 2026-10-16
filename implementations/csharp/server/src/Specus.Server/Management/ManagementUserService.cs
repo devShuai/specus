@@ -409,6 +409,11 @@ public sealed class ManagementUserService
         {
             throw new ArgumentException("内置 admin 用户不能重复创建");
         }
+        RequireCleanUserWriteScope();
+        await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, cancellationToken)
+            .ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        RequireAdmin(context);
         var loginNameNormalized = ManagementUser.NormalizeLoginName(username);
         if (await _db.ManagementUsers.AsNoTracking()
                 .AnyAsync(u => u.TenantId == context.TenantId && u.LoginNameNormalized == loginNameNormalized,
@@ -442,6 +447,7 @@ public sealed class ManagementUserService
             _db.Entry(user).State = EntityState.Detached;
             throw CreateConflict(context, username);
         }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return ToView(user);
     }
 
@@ -457,8 +463,9 @@ public sealed class ManagementUserService
         RequireCleanUserWriteScope();
         await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, cancellationToken)
             .ConfigureAwait(false);
-        var user = await RequireMutableUserInTenantAsync(context, normalized, "update", cancellationToken)
+        var (currentActor, user) = await RequireMutableUserInTenantAsync(context, normalized, "update", cancellationToken)
             .ConfigureAwait(false);
+        context = currentActor;
         var wasEnabled = user.Enabled;
         var previousRole = user.Role;
         if (!string.IsNullOrWhiteSpace(request.Password))
@@ -509,8 +516,9 @@ public sealed class ManagementUserService
         RequireCleanUserWriteScope();
         await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, cancellationToken)
             .ConfigureAwait(false);
-        var user = await RequireMutableUserInTenantAsync(context, normalized, "delete", cancellationToken)
+        var (currentActor, user) = await RequireMutableUserInTenantAsync(context, normalized, "delete", cancellationToken)
             .ConfigureAwait(false);
+        context = currentActor;
         // Everything keyed by the account records its identity: the tenant and the login name.
         var tenantId = ManagementContext.NormalizeTenant(user.TenantId);
         var loginName = user.EffectiveLoginName();
@@ -655,20 +663,20 @@ public sealed class ManagementUserService
     /// user that only exists in another tenant answer the same, so no tenant can probe another's
     /// login names; the refused attempt is still logged.
     /// </summary>
-    private async Task<ManagementUser> RequireMutableUserInTenantAsync(ManagementContext context,
+    private async Task<(ManagementContext Actor, ManagementUser User)> RequireMutableUserInTenantAsync(ManagementContext context,
         string loginName, string action, CancellationToken cancellationToken)
     {
         var hint = await FindByLoginNameAsync(_db.ManagementUsers.AsNoTracking(), context.TenantId, loginName,
                 cancellationToken)
             .ConfigureAwait(false);
+        var targetKeys = hint is not null && hint.TenantId == context.TenantId ? new[] { hint.Username } : Array.Empty<string>();
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken, targetKeys).ConfigureAwait(false);
+        RequireAdmin(context);
         ManagementUser? user = null;
         if (hint is not null && hint.TenantId == context.TenantId)
         {
-            // Pin the discovered account key, not a reusable login name. The transfer writer
-            // takes this same lock BEFORE resource locks. Counts and revocation decisions must
-            // use the state committed while we were waiting, never EF's earlier tracked row.
-            await ClientOwnershipWrite.LockAsync<ManagementUser>(_db, hint.Username, context.TenantId,
-                cancellationToken, nameof(ManagementUser.Username)).ConfigureAwait(false);
+            // The discovered original key was locked with the actor in canonical order. Never
+            // follow a replacement of the same name, or use an earlier tracked target snapshot.
             user = await _db.ManagementUsers.AsNoTracking().SingleOrDefaultAsync(u =>
                 u.Username == hint.Username && u.TenantId == context.TenantId, cancellationToken).ConfigureAwait(false);
             if (user is not null && (user.Username != hint.Username || user.TenantId != context.TenantId
@@ -691,7 +699,7 @@ public sealed class ManagementUserService
             tracked.State = EntityState.Unchanged;
             user = tracked.Entity;
         }
-        return user;
+        return (context, user);
     }
 
     private void RequireCleanUserWriteScope()

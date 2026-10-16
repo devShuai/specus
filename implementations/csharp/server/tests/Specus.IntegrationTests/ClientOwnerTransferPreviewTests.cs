@@ -66,12 +66,14 @@ public sealed class ClientOwnerTransferPreviewTests
         using var denied = await anonymous.GetAsync(Route("single", "1001"));
         Assert.Equal(HttpStatusCode.Unauthorized, denied.StatusCode);
         await using (var scope = server.HostServices.CreateAsyncScope())
-            await scope.ServiceProvider.GetRequiredService<ManagementUserService>().CreateUserAsync(Admin,
+            await scope.ServiceProvider.GetRequiredService<ManagementUserService>().CreateUserAsync(
+                (await OwnerTransferWriterProof.ActorAsync(server, scope.ServiceProvider)).Context,
                 new UserMutation("preview-admin", "preview-test-password", "ADMIN", true), CancellationToken.None);
         using var user = await LoginAsync(server, "preview-admin", "preview-test-password");
         using (var allowed = await user.GetAsync(Route("single", "1001"))) Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
         await using (var scope = server.HostServices.CreateAsyncScope())
-            await scope.ServiceProvider.GetRequiredService<ManagementUserService>().UpdateUserAsync(Admin, "preview-admin",
+            await scope.ServiceProvider.GetRequiredService<ManagementUserService>().UpdateUserAsync(
+                (await OwnerTransferWriterProof.ActorAsync(server, scope.ServiceProvider)).Context, "preview-admin",
                 new UserMutation(null, null, "USER", null), CancellationToken.None);
         foreach (var id in new[] { "1001", "999", "not-a-number", "0", "9007199254740992" })
         {
@@ -80,7 +82,8 @@ public sealed class ClientOwnerTransferPreviewTests
             Assert.Equal("FORBIDDEN", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
         }
         await using (var scope = server.HostServices.CreateAsyncScope())
-            await scope.ServiceProvider.GetRequiredService<ManagementUserService>().UpdateUserAsync(Admin, "preview-admin",
+            await scope.ServiceProvider.GetRequiredService<ManagementUserService>().UpdateUserAsync(
+                (await OwnerTransferWriterProof.ActorAsync(server, scope.ServiceProvider)).Context, "preview-admin",
                 new UserMutation(null, null, "ADMIN", false), CancellationToken.None);
         using var disabled = await user.GetAsync(Route("single", "1001"));
         Assert.Equal(HttpStatusCode.Unauthorized, disabled.StatusCode);
