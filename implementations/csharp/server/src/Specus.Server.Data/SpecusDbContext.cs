@@ -17,6 +17,7 @@ public sealed class SpecusDbContext : DbContext
 
     public DbSet<ClientAccount> ClientAccounts => Set<ClientAccount>();
     public DbSet<ClientCredential> ClientCredentials => Set<ClientCredential>();
+    public DbSet<ClientOwnerTransferAudit> ClientOwnerTransferAudits => Set<ClientOwnerTransferAudit>();
     public DbSet<ClientAuthNonce> ClientAuthNonces => Set<ClientAuthNonce>();
     public DbSet<WebSocketTicket> WebSocketTickets => Set<WebSocketTicket>();
     public DbSet<ClientIdentity> ClientIdentities => Set<ClientIdentity>();
@@ -132,6 +133,24 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_specus_client_tenant");
             b.HasIndex(x => new { x.TenantId, x.OwnerUsername }).HasDatabaseName("idx_specus_client_owner");
+        });
+
+        modelBuilder.Entity<ClientOwnerTransferAudit>(b =>
+        {
+            b.ToTable("client_owner_transfer_audit");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").HasMaxLength(40).HasConversion(iso).IsRequired();
+            b.Property(x => x.Actor).HasColumnName("actor").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(32).IsRequired();
+            b.Property(x => x.PathId).HasColumnName("path_id").IsRequired();
+            b.Property(x => x.TargetUsername).HasColumnName("target_username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.CredentialId).HasColumnName("credential_id");
+            b.Property(x => x.DetailJson).HasColumnName("detail_json").IsRequired();
+            if (Database.ProviderName == "MySql.EntityFrameworkCore")
+                b.Property(x => x.DetailJson).HasColumnType("longtext");
+            b.HasIndex(x => new { x.TenantId, x.Id }).HasDatabaseName("idx_owner_transfer_audit_tenant");
         });
 
         modelBuilder.Entity<ClientCredential>(b =>

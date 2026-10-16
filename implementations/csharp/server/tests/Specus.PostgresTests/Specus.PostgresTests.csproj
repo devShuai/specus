@@ -16,6 +16,7 @@
     <ProjectReference Include="../../src/Specus.Server/Specus.Server.csproj" />
     <Compile Include="../Specus.IntegrationTests/TestServerFixture.cs" Link="TestServerFixture.cs" />
     <Compile Include="../Specus.IntegrationTests/ControlDisconnectProviderProof.cs" Link="ControlDisconnectProviderProof.cs" />
+    <Compile Include="../Specus.IntegrationTests/OwnerTransferWriterProof.cs" Link="OwnerTransferWriterProof.cs" />
     <Using Include="Xunit" />
   </ItemGroup>
 </Project>

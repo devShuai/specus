@@ -16,6 +16,22 @@ namespace Specus.IntegrationTests;
 public sealed class MariaDbCompatibilityTests
 {
     [Fact]
+    public async Task NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyNativeTargetOrderingAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyAsync(server);
+    }
+
+    [Fact]
     public async Task NativeControlDisconnectCannotOverwriteANewerPhysicalChannel()
     {
         await using var database = await OwnedDatabase.CreateAsync();
