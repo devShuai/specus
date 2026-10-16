@@ -719,6 +719,10 @@ func TestAuthorizeRelayFrameRequiresActiveMatchingSessionAndAccountsBytes(t *tes
 
 	source := insertPeerClient(t, db, 3001, "tenant-a", "alice", "alice-laptop")
 	target := insertPeerClient(t, db, 3002, "tenant-a", "alice", "alice-nas")
+	// Model the enabled endpoint rows required by real session admission; assertions below
+	// still exercise relay activation/accounting, not a policy-free raw SQL fixture.
+	insertPeerDevice(t, db, source, "100.96.0.10", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.11", "target-key")
 	insertPeerSession(t, db, 9101, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
 
 	allowed := service.AuthorizeRelayFrame(ctx, DataFrameHeader{
@@ -808,6 +812,8 @@ func TestAuthorizeRelayFrameActivatesNegotiatingSession(t *testing.T) {
 
 	source := insertPeerClient(t, db, 3301, "tenant-a", "alice", "alice-laptop")
 	target := insertPeerClient(t, db, 3302, "tenant-a", "alice", "alice-nas")
+	insertPeerDevice(t, db, source, "100.96.0.10", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.11", "target-key")
 	insertPeerSession(t, db, 9104, source, target, StatusNegotiating, time.Now().UTC().Add(time.Hour))
 
 	allowed := service.AuthorizeRelayFrame(ctx, DataFrameHeader{
@@ -857,6 +863,8 @@ func TestAuthorizeRelayFrameAllowsUnidentifiedPeersWhenTurnAuthDisabled(t *testi
 
 	source := insertPeerClient(t, db, 3321, "tenant-a", "alice", "alice-laptop-3")
 	target := insertPeerClient(t, db, 3322, "tenant-a", "alice", "alice-nas-3")
+	insertPeerDevice(t, db, source, "100.96.0.10", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.11", "target-key")
 	insertPeerSession(t, db, 9124, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
 
 	if !service.AuthorizeRelayFrame(ctx, DataFrameHeader{SessionID: 9124, Sequence: 7}, 0, 0, 256) {
