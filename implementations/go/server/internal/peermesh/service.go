@@ -955,6 +955,9 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	if err := json.Unmarshal([]byte(request.Message), &signal); err != nil || strings.TrimSpace(signal.Type) == "" {
 		return errors.New("invalid peer signal")
 	}
+	if serverOnlyControlType(signal.Type) {
+		return fmt.Errorf("%s is server-only", strings.TrimSpace(signal.Type))
+	}
 	if signal.Type == TypeServiceReport {
 		if err := validateServiceReportEnvelope(request); err != nil {
 			return err
@@ -982,14 +985,14 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 		_, err := s.ReportDevice(ctx, *source, signal)
 		return err
 	case TypeClose:
-		_, err := s.CloseSessionFromClient(ctx, *source, signal)
-		if err != nil || strings.TrimSpace(request.ToClientName) == "" {
+		closed, err := s.CloseSessionFromClient(ctx, *source, signal)
+		if err != nil {
 			return err
 		}
-	case TypeServiceCatalog:
-		return errors.New("service-catalog is server-only")
-	case ControlTypeEgressConfig, ControlTypeEgressCatalog:
-		return fmt.Errorf("%s is server-only", signal.Type)
+		// A close is a server operation on the authenticated participant's stored session,
+		// not a relay to a client-selected third party. Never forward its supplied token.
+		s.sendCloseReason(closed, "peer-close")
+		return nil
 	}
 
 	targetName := strings.TrimSpace(request.ToClientName)
@@ -2000,11 +2003,15 @@ func (s *Service) sendSessionGrant(source, target store.ClientAccount, grant ses
 }
 
 func (s *Service) sendClose(closed SessionView) {
+	s.sendCloseReason(closed, "admin-force-close")
+}
+
+func (s *Service) sendCloseReason(closed SessionView, reason string) {
 	msg := ControlMessage{
 		Type: TypeClose, SessionID: &closed.ID,
 		SourceClientID: closed.SourceClientID, SourceClientName: closed.SourceClientName,
 		TargetClientID: closed.TargetClientID, TargetClientName: closed.TargetClientName,
-		Status: closed.Status, Reason: "admin-force-close", CreatedAtMillis: time.Now().UnixMilli(),
+		Status: closed.Status, Reason: reason, CreatedAtMillis: time.Now().UnixMilli(),
 	}
 	for _, name := range []string{closed.SourceClientName, closed.TargetClientName} {
 		if bound, ok := s.sessions.Find(name); ok && bound != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
 	"github.com/devShuai/specus/implementations/go/server/internal/control"
+	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 	"github.com/devShuai/specus/implementations/go/server/internal/session"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
@@ -161,16 +162,18 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 		names := []string{conn.ClientName()}
 		var targetName string
 		var originalTarget session.Session
-		if requested := strings.TrimSpace(p.ToClientName); peerControl && requested != "" {
+		if requested := strings.TrimSpace(p.ToClientName); peerControl && peermesh.SignalTargetsPeer(p.Message) && requested != "" {
 			// Resolve the canonical SQL name BEFORE taking any lifecycle stripe. Native
 			// collations can match aliases with a different case. Protect the actual name,
 			// and fence the later lookup rather than acquiring an unprotected extra stripe.
+			targetName = requested
 			target, err := d.db.FindClientByName(conn.Context(), requested)
-			if err != nil || target == nil {
-				d.logger.Debug("dropped unresolved Peer target", "client", conn.ClientName(), "err", err)
-				return nil
+			if err == nil && target != nil {
+				targetName = target.ClientName
 			}
-			targetName = target.ClientName
+			// A failed/absent prelookup must not skip server-bound reports, close effects
+			// or protocol validation. Protect the literal name in that case; the mesh's
+			// exact canonical-name fence rejects any later differently-cased SQL alias.
 			p.ToClientName = targetName
 			names = append(names, targetName)
 			originalTarget, _ = d.sessions.Find(targetName)

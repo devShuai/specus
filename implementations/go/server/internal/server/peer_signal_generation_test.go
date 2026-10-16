@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -232,6 +234,236 @@ func TestPeerSignalGenerationDataLogoutPreservesCompanionControl(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatal("valid original DATA logout did not complete")
+		}
+	}
+}
+
+func TestPeerSignalGenerationUnresolvedTargetDoesNotSkipServerHandling(t *testing.T) {
+	for _, scenario := range []string{"device-report", "close", "invalid-json", "server-only"} {
+		t.Run(scenario, func(t *testing.T) {
+			completed := make(chan error, 1)
+			f := newGenerationFixture(t, 4, func(app *App) {
+				original := app.dispatcher.peerControl
+				app.dispatcher.SetPeerControlHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
+					err := original(conn, request)
+					if strings.TrimSpace(request.ToClientName) == "missing-peer-name" {
+						completed <- err
+					}
+					return err
+				})
+			})
+			source := f.login(f.pub, protocol.ConnectionRoleControl)
+			body := `{"type":"device-report","natType":"symmetric"}`
+			var sessionID int64
+			switch scenario {
+			case "close":
+				if err := protocol.WritePacket(source.net, protocol.MessageRequest{
+					ToClientName: f.recipient.ClientName, MessageType: protocol.MessageTypePeerControl, Message: `{"type":"candidates"}`,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				grant := peerGenerationMessage(t, source, peermesh.TypeSessionGrant)
+				peerGenerationMessage(t, f.consumer, peermesh.TypeCandidates)
+				if grant.SessionID == nil {
+					t.Fatal("no native grant for close fixture")
+				}
+				sessionID = *grant.SessionID
+				encoded, err := json.Marshal(peermesh.ControlMessage{Type: peermesh.TypeClose, SessionID: &sessionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				body = string(encoded)
+			case "invalid-json":
+				body = "{"
+			case "server-only":
+				body = `{"type":"service-catalog"}`
+			}
+			if err := protocol.WritePacket(source.net, protocol.MessageRequest{
+				ToClientName: "missing-peer-name", MessageType: protocol.MessageTypePeerControl, Message: body,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-completed:
+				invalid := scenario == "invalid-json" || scenario == "server-only"
+				if invalid != (err != nil) {
+					t.Fatalf("unresolved target changed protocol outcome: scenario=%s err=%v", scenario, err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("target prelookup bypassed server-side Peer handling")
+			}
+			if scenario == "device-report" {
+				account, err := f.app.db.FindClientByName(context.Background(), f.pub.ClientName)
+				if err != nil || account == nil {
+					t.Fatal(err)
+				}
+				device, err := f.app.db.FindPeerMeshDeviceByClientID(context.Background(), account.TenantID, account.ID)
+				if err != nil || device == nil || device.NatType == nil || *device.NatType != "symmetric" {
+					t.Fatalf("unresolved target dropped valid device report: %+v / %v", device, err)
+				}
+			}
+			if scenario == "close" {
+				row, err := f.app.db.GetPeerMeshSession(context.Background(), sessionID)
+				if err != nil || row.Status != peermesh.StatusClosed {
+					t.Fatalf("unresolved target dropped valid session close: %+v / %v", row, err)
+				}
+			}
+			if scenario == "device-report" || scenario == "close" {
+				f.heartbeat(source)
+			}
+		})
+	}
+}
+
+func TestPeerSignalGenerationServerBoundReportDoesNotLeaseItsToName(t *testing.T) {
+	type result struct{ probe, handler error }
+	completed := make(chan result, 1)
+	f := newGenerationFixture(t, 4, func(app *App) {
+		original := app.dispatcher.peerControl
+		app.dispatcher.SetPeerControlHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			release, probe := app.sessions.AcquireControlLease(ctx, strings.TrimSpace(request.ToClientName))
+			if probe == nil {
+				release()
+			}
+			err := original(conn, request)
+			completed <- result{probe, err}
+			return err
+		})
+	})
+	source := f.login(f.pub, protocol.ConnectionRoleControl)
+	stripe := func(name string) uint32 { h := fnv.New32a(); _, _ = h.Write([]byte(name)); return h.Sum32() % 256 }
+	to := "not-a-report-target"
+	for i := 0; stripe(to) == stripe(f.pub.ClientName); i++ {
+		to = "not-a-report-target-" + strconv.Itoa(i)
+	}
+	if err := protocol.WritePacket(source.net, protocol.MessageRequest{
+		ToClientName: to, MessageType: protocol.MessageTypePeerControl, Message: `{"type":"device-report","natType":"symmetric"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-completed:
+		if result.probe != nil || result.handler != nil {
+			t.Fatalf("server-bound report participated in unrelated target lifecycle: probe=%v handler=%v", result.probe, result.handler)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server-bound report stalled")
+	}
+	f.heartbeat(source)
+}
+
+func TestPeerSignalGenerationRejectsForgedServerConfig(t *testing.T) {
+	for _, kind := range []string{peermesh.TypeConfig, peermesh.TypeRoster, peermesh.TypeSessionGrant, "PEER-CONFIG", " roster "} {
+		t.Run(kind, func(t *testing.T) {
+			completed := make(chan error, 1)
+			f := newGenerationFixture(t, 4, func(app *App) {
+				original := app.dispatcher.peerControl
+				app.dispatcher.SetPeerControlHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
+					err := original(conn, request)
+					completed <- err
+					return err
+				})
+			})
+			source := f.login(f.pub, protocol.ConnectionRoleControl)
+			body, err := json.Marshal(map[string]any{"type": kind, "token": "client-forged", "enabled": true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := protocol.WritePacket(source.net, protocol.MessageRequest{
+				ToClientName: f.recipient.ClientName, MessageType: protocol.MessageTypePeerControl, Message: string(body),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-completed:
+				if err == nil {
+					t.Fatal("client-originated server-only configuration was accepted")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("forged configuration did not reach protocol admission")
+			}
+			f.heartbeat(f.consumer)
+		})
+	}
+}
+
+func TestPeerSignalGenerationCloseNotifiesStoredParticipantsNotRequestedThirdParty(t *testing.T) {
+	completed := make(chan error, 1)
+	f := newGenerationFixture(t, 4, func(app *App) {
+		original := app.dispatcher.peerControl
+		app.dispatcher.SetPeerControlHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
+			err := original(conn, request)
+			var message peermesh.ControlMessage
+			_ = json.Unmarshal([]byte(request.Message), &message)
+			if message.Type == peermesh.TypeClose {
+				completed <- err
+			}
+			return err
+		})
+	})
+	source := f.login(f.pub, protocol.ConnectionRoleControl)
+	thirdLogin := clientAuthLoginWithEnvironmentForTest(t, f.managementURL, "ck_generation", "generation-secret", "generation-third-party", "admin", nil)
+	thirdAccount, err := f.app.db.FindClientByName(context.Background(), thirdLogin.ClientName)
+	if err != nil || thirdAccount == nil {
+		t.Fatal(err)
+	}
+	on := true
+	if _, err := f.app.peerMesh.UpdateDevice(context.Background(), peermesh.AccessContext{Username: "admin", TenantID: "default", Admin: true, BuiltIn: true}, thirdAccount.ID, peermesh.DeviceMutation{Enabled: &on}); err != nil {
+		t.Fatal(err)
+	}
+	third := f.login(thirdLogin, protocol.ConnectionRoleControl)
+	if err := protocol.WritePacket(source.net, protocol.MessageRequest{ToClientName: f.recipient.ClientName, MessageType: protocol.MessageTypePeerControl, Message: `{"type":"candidates"}`}); err != nil {
+		t.Fatal(err)
+	}
+	grant := peerGenerationMessage(t, source, peermesh.TypeSessionGrant)
+	peerGenerationMessage(t, f.consumer, peermesh.TypeCandidates)
+	body, err := json.Marshal(peermesh.ControlMessage{Type: peermesh.TypeClose, SessionID: grant.SessionID, TargetClientID: thirdAccount.ID, TargetClientName: thirdAccount.ClientName, Token: "client-input-must-not-forward"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WritePacket(source.net, protocol.MessageRequest{ToClientName: thirdLogin.ClientName, MessageType: protocol.MessageTypePeerControl, Message: string(body)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-completed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("native close did not complete")
+	}
+	// This barrier is the real handler's return, after every intended socket write.
+	row, err := f.app.db.GetPeerMeshSession(context.Background(), *grant.SessionID)
+	if err != nil || row.Status != peermesh.StatusClosed {
+		t.Fatalf("close did not persist: %+v / %v", row, err)
+	}
+	for _, wire := range []*generationWire{source, f.consumer} {
+		message := peerGenerationMessage(t, wire, peermesh.TypeClose)
+		if message.SessionID == nil || *message.SessionID != *grant.SessionID || message.SourceClientID != row.SourceClientID || message.TargetClientID != row.TargetClientID || message.Token != "" || message.Reason != "peer-close" {
+			t.Fatalf("close trusted requested third party or client token: %+v", message)
+		}
+	}
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		select {
+		case packet, ok := <-third.packets:
+			if !ok {
+				t.Fatal("unrelated third party control closed")
+			}
+			if response, ok := packet.(protocol.MessageResponse); ok {
+				var message peermesh.ControlMessage
+				_ = json.Unmarshal([]byte(response.Message), &message)
+				if message.Type == peermesh.TypeClose {
+					t.Fatal("close notification leaked to the client-requested third party")
+				}
+			}
+		case <-deadline:
+			f.heartbeat(source)
+			f.heartbeat(f.consumer)
+			f.heartbeat(third)
+			return
 		}
 	}
 }
