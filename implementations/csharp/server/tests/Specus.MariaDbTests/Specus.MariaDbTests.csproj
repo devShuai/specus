@@ -18,6 +18,7 @@
     <Compile Include="../Specus.IntegrationTests/TestServerFixture.cs" Link="TestServerFixture.cs" />
     <Compile Include="../Specus.IntegrationTests/ControlDisconnectProviderProof.cs" Link="ControlDisconnectProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/OwnerTransferWriterProof.cs" Link="OwnerTransferWriterProof.cs" />
+    <Compile Include="../Specus.IntegrationTests/ClientConfigurationProviderProof.cs" Link="ClientConfigurationProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ManagementUserActorProviderProof.cs" Link="ManagementUserActorProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ClientStartupProviderProof.cs" Link="ClientStartupProviderProof.cs" />
     <Using Include="Xunit" />

@@ -2,6 +2,7 @@ using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
+using Specus.Server.Persistence;
 
 namespace Specus.Server.Management;
 
@@ -358,9 +359,8 @@ public sealed class WorkbenchService
     /// </summary>
     public static Task<int> DeleteObjectReferencesAsync(SpecusDbContext db, string kind, long objectId,
         CancellationToken cancellationToken) =>
-        db.ManagementWorkbenchItems
-            .Where(row => row.Kind == kind && row.ObjectId == objectId)
-            .ExecuteDeleteAsync(cancellationToken);
+        db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM management_workbench_item WHERE kind={kind} AND object_id={objectId}",
+            cancellationToken);
 
     /// <summary>
     /// Cascade for a deleted client: the references to each of its routes, mappings and Peer
@@ -395,10 +395,14 @@ public sealed class WorkbenchService
             {
                 continue;
             }
-            await db.ManagementWorkbenchItems
-                .Where(row => row.Kind == kind && ids.Contains(row.ObjectId))
-                .ExecuteDeleteAsync(cancellationToken)
-                .ConfigureAwait(false);
+            foreach (var batch in ids.Chunk(256))
+            {
+                var names = batch.Select((_, index) => "@id" + index).ToArray();
+                var parameters = new[] { ("@kind", (object?)kind) }.Concat(batch.Select((id, index) => (names[index], (object?)id))).ToArray();
+                await using var command = ClientOwnershipWrite.Command(db,
+                    $"DELETE FROM management_workbench_item WHERE kind=@kind AND object_id IN ({string.Join(',', names)})", parameters);
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 

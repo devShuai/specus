@@ -282,7 +282,9 @@ public sealed class ManagementMutationService
         SpecusMappingMutation request,
         CancellationToken cancellationToken)
     {
-        var account = await FindClientAsync(context, clientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        var account = await LockClientForWriteAsync(context, clientId, cancellationToken).ConfigureAwait(false);
         var listenPort = RequirePort(request.ListenPort, "listenPort");
         await EnsureListenPortAvailableAsync(listenPort, existingId: null, cancellationToken).ConfigureAwait(false);
 
@@ -304,6 +306,7 @@ public sealed class ManagementMutationService
         await _natControl.EnsureFitsAsync(account.Id, mapping, null, cancellationToken).ConfigureAwait(false);
         _db.SpecusMappings.Add(mapping);
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(account.Id, cancellationToken).ConfigureAwait(false);
         return ToSpecusView(mapping);
     }
@@ -312,9 +315,9 @@ public sealed class ManagementMutationService
         SpecusMappingMutation request,
         CancellationToken cancellationToken)
     {
-        var mapping = await _db.SpecusMappings.FirstOrDefaultAsync(t => t.Id == id, cancellationToken)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"mapping not found: {id}");
-        await EnsureClientAccessAsync(context, mapping.ClientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        var mapping = await LockMappingForWriteAsync(context, id, cancellationToken).ConfigureAwait(false);
         var listenPort = RequirePort(request.ListenPort, "listenPort");
         if (listenPort != mapping.ListenPort)
         {
@@ -329,25 +332,22 @@ public sealed class ManagementMutationService
         mapping.UpdatedAt = DateTimeOffset.UtcNow;
         await _natControl.EnsureFitsAsync(mapping.ClientId, mapping, null, cancellationToken).ConfigureAwait(false);
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(mapping.ClientId, cancellationToken).ConfigureAwait(false);
         return ToSpecusView(mapping);
     }
 
     public async Task DeleteSpecusAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
-        var mapping = await _db.SpecusMappings.FirstOrDefaultAsync(t => t.Id == id, cancellationToken)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"mapping not found: {id}");
-        await EnsureClientAccessAsync(context, mapping.ClientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        var mapping = await LockMappingForWriteAsync(context, id, cancellationToken).ConfigureAwait(false);
         var clientId = mapping.ClientId;
-        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-                         .ConfigureAwait(false))
-        {
-            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.TcpMapping, mapping.Id,
-                cancellationToken).ConfigureAwait(false);
-            _db.SpecusMappings.Remove(mapping);
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
+        await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.TcpMapping, mapping.Id,
+            cancellationToken).ConfigureAwait(false);
+        _db.SpecusMappings.Remove(mapping);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
@@ -381,7 +381,9 @@ public sealed class ManagementMutationService
         HttpRouteMutation request,
         CancellationToken cancellationToken)
     {
-        var account = await FindClientAsync(context, clientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        var account = await LockClientForWriteAsync(context, clientId, cancellationToken).ConfigureAwait(false);
         var route = RequireRoute(request.Route);
         await EnsureRouteAvailableAsync(account.Id, route, existingId: null, cancellationToken).ConfigureAwait(false);
 
@@ -410,13 +412,9 @@ public sealed class ManagementMutationService
         };
         await _natControl.EnsureFitsAsync(account.Id, null, row, cancellationToken).ConfigureAwait(false);
         _db.HttpRouteMappings.Add(row);
-        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-                         .ConfigureAwait(false))
-        {
-            await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
-            await _shares.OnRouteCreatedAsync(context.Username, row, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
+        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        await _shares.OnRouteCreatedAsync(context.Username, row, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(account.Id, cancellationToken).ConfigureAwait(false);
         return ToHttpRouteView(row);
     }
@@ -425,9 +423,9 @@ public sealed class ManagementMutationService
         HttpRouteMutation request,
         CancellationToken cancellationToken)
     {
-        var row = await _db.HttpRouteMappings.FirstOrDefaultAsync(r => r.Id == id, cancellationToken)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"http route not found: {id}");
-        await EnsureClientAccessAsync(context, row.ClientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        var row = await LockHttpRouteForWriteAsync(context, id, cancellationToken).ConfigureAwait(false);
         var route = RequireRoute(request.Route);
         if (!string.Equals(route, row.Route, StringComparison.Ordinal))
         {
@@ -460,15 +458,10 @@ public sealed class ManagementMutationService
         var credentialsChanged = row.AuthEnabled
                                  && (authPasswordHash is not null
                                      || !string.Equals(authUsernameBefore, row.AuthUsername, StringComparison.Ordinal));
-        List<string> revokedShares;
-        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-                         .ConfigureAwait(false))
-        {
-            await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
-            revokedShares = await _shares.OnRouteUpdatedAsync(context.Username, row, exposureBefore,
-                credentialsChanged, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
+        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        var revokedShares = await _shares.OnRouteUpdatedAsync(context.Username, row, exposureBefore,
+            credentialsChanged, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
         await _natControl.PushSnapshotIfOnlineAsync(row.ClientId, cancellationToken).ConfigureAwait(false);
         return ToHttpRouteView(row);
@@ -476,23 +469,18 @@ public sealed class ManagementMutationService
 
     public async Task DeleteHttpRouteAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
-        var row = await _db.HttpRouteMappings.FirstOrDefaultAsync(r => r.Id == id, cancellationToken)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"http route not found: {id}");
-        await EnsureClientAccessAsync(context, row.ClientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        var row = await LockHttpRouteForWriteAsync(context, id, cancellationToken).ConfigureAwait(false);
         var clientId = row.ClientId;
         var exposureBefore = HttpShareService.Exposure(row);
-        List<string> revokedShares;
-        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-                         .ConfigureAwait(false))
-        {
-            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.HttpRoute, row.Id,
-                cancellationToken).ConfigureAwait(false);
-            _db.HttpRouteMappings.Remove(row);
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            revokedShares = await _shares.OnRouteDeletedAsync(context.Username, row, exposureBefore,
-                cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
+        await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.HttpRoute, row.Id,
+            cancellationToken).ConfigureAwait(false);
+        _db.HttpRouteMappings.Remove(row);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        var revokedShares = await _shares.OnRouteDeletedAsync(context.Username, row, exposureBefore,
+            cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
@@ -694,6 +682,45 @@ public sealed class ManagementMutationService
         }
     }
 
+    private async Task LockConfigurationRowAsync<T>(long id, long parent, string tenant, CancellationToken ct)
+    {
+        var (table, key) = ClientOwnershipWrite.Identifiers<T>(_db, "Id");
+        // Older configuration rows have NULL tenant_id. The locked current client is their
+        // authority; an explicit different tenant is never inherited or silently reassigned.
+        await using var command = ClientOwnershipWrite.Command(_db,
+            $"SELECT {key} FROM {table} WHERE {key}=@id AND client_id=@parent AND (tenant_id=@tenant OR tenant_id IS NULL)" + (ClientOwnershipWrite.IsNative(_db) ? " FOR UPDATE" : ""),
+            ("@id", id), ("@parent", parent), ("@tenant", tenant));
+        _ = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+    }
+
+    private async Task<SpecusMapping> LockMappingForWriteAsync(ManagementContext context, long id, CancellationToken ct)
+    {
+        var hint = await _db.SpecusMappings.AsNoTracking().SingleOrDefaultAsync(m => m.Id == id, ct).ConfigureAwait(false)
+            ?? throw new ArgumentException($"mapping not found: {id}");
+        var parent = await LockClientForWriteAsync(context, hint.ClientId, ct, $"mapping not found: {id}").ConfigureAwait(false);
+        await LockConfigurationRowAsync<SpecusMapping>(id, parent.Id, parent.TenantId, ct).ConfigureAwait(false);
+        var current = await _db.SpecusMappings.AsNoTracking().SingleOrDefaultAsync(m => m.Id == id, ct).ConfigureAwait(false)
+            ?? throw new ArgumentException($"mapping not found: {id}");
+        if (current.ClientId != parent.Id || (current.TenantId is not null && current.TenantId != parent.TenantId))
+            throw new InvalidOperationException("映射关联已变更，请刷新后重试");
+        var tracked = TrackCurrent(current, id); tracked.TenantId ??= parent.TenantId;
+        return tracked;
+    }
+
+    private async Task<HttpRouteMapping> LockHttpRouteForWriteAsync(ManagementContext context, long id, CancellationToken ct)
+    {
+        var hint = await _db.HttpRouteMappings.AsNoTracking().SingleOrDefaultAsync(r => r.Id == id, ct).ConfigureAwait(false)
+            ?? throw new ArgumentException($"http route not found: {id}");
+        var parent = await LockClientForWriteAsync(context, hint.ClientId, ct, $"http route not found: {id}").ConfigureAwait(false);
+        await LockConfigurationRowAsync<HttpRouteMapping>(id, parent.Id, parent.TenantId, ct).ConfigureAwait(false);
+        var current = await _db.HttpRouteMappings.AsNoTracking().SingleOrDefaultAsync(r => r.Id == id, ct).ConfigureAwait(false)
+            ?? throw new ArgumentException($"http route not found: {id}");
+        if (current.ClientId != parent.Id || (current.TenantId is not null && current.TenantId != parent.TenantId))
+            throw new InvalidOperationException("HTTP route 关联已变更，请刷新后重试");
+        var tracked = TrackCurrent(current, id); tracked.TenantId ??= parent.TenantId;
+        return tracked;
+    }
+
     private Task<IDbContextTransaction> BeginResourceWriteAsync(CancellationToken ct)
     {
         if (_db.ChangeTracker.HasChanges())
@@ -701,11 +728,11 @@ public sealed class ManagementMutationService
         return ClientOwnershipWrite.BeginAsync(_db, ct);
     }
 
-    private async Task<ClientAccount> LockClientForWriteAsync(ManagementContext context, long id, CancellationToken ct)
+    private async Task<ClientAccount> LockClientForWriteAsync(ManagementContext context, long id, CancellationToken ct, string? notFoundMessage = null)
     {
         await ClientOwnershipWrite.LockAsync<ClientAccount>(_db, id, context.TenantId, ct).ConfigureAwait(false);
         var current = await _db.ClientAccounts.AsNoTracking().SingleOrDefaultAsync(c => c.Id == id && c.TenantId == context.TenantId, ct)
-            .ConfigureAwait(false) ?? throw new ArgumentException($"client not found: {id}");
+            .ConfigureAwait(false) ?? throw new ArgumentException(notFoundMessage ?? $"client not found: {id}");
         if (!context.CanAccess(current) || current.TenantId != context.TenantId) throw new UnauthorizedAccessException("无权访问客户端");
         return TrackCurrent(current, id);
     }

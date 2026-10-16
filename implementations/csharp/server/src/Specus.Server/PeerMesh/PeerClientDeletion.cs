@@ -24,15 +24,16 @@ public sealed partial class PeerMeshService
             session.ClosedAt ??= now;
             session.UpdatedAt = now;
         }
-        await _db.PeerMeshAcls.Where(row => row.TenantId == tenant
-                && (row.SourceClientId == id || row.TargetClientId == id))
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.PeerMeshDevices.Where(row => row.TenantId == tenant && row.ClientId == id)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.PeerMeshEgressPolicies.Where(row => row.TenantId == tenant && row.EgressClientId == id)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.PeerMeshSharedServices.Where(row => row.TenantId == tenant && row.ClientId == id)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        // Same scoped cleanup in the caller's transaction, without the DELETE alias syntax
+        // Oracle EF emits that supported MariaDB versions reject.
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM peer_mesh_acl WHERE tenant_id={tenant} AND (source_client_id={id} OR target_client_id={id})",
+            cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM peer_mesh_device WHERE tenant_id={tenant} AND client_id={id}",
+            cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM peer_mesh_egress_policy WHERE tenant_id={tenant} AND egress_client_id={id}",
+            cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM peer_mesh_shared_service WHERE tenant_id={tenant} AND client_id={id}",
+            cancellationToken).ConfigureAwait(false);
 
         var policies = await _db.PeerMeshEgressPolicies.Where(row => row.TenantId == tenant)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
