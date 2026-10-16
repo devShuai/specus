@@ -973,6 +973,10 @@ func (s *Service) HandleSignal(ctx context.Context, request protocol.MessageRequ
 }
 
 func (s *Service) HandleSignalSession(ctx context.Context, request protocol.MessageRequest, sourceClientName string, publisherSessionID int64) error {
+	return s.handleSignalSession(ctx, request, sourceClientName, publisherSessionID, nil)
+}
+
+func (s *Service) handleSignalSession(ctx context.Context, request protocol.MessageRequest, sourceClientName string, publisherSessionID int64, runtime *store.RuntimeClientReference) error {
 	if !s.Enabled() {
 		return errors.New("peer mesh is disabled")
 	}
@@ -982,6 +986,9 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	}
 	if source.ClientName != sourceClientName {
 		return fmt.Errorf("%w: source canonical identity changed", ErrUndeliverable)
+	}
+	if runtime != nil && (source.ID != runtime.ClientID || source.TenantID != runtime.TenantID) {
+		return fmt.Errorf("%w: source runtime identity changed", ErrUndeliverable)
 	}
 	var signal ControlMessage
 	if err := json.Unmarshal([]byte(request.Message), &signal); err != nil || strings.TrimSpace(signal.Type) == "" {
@@ -1040,6 +1047,9 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	}
 	if target.ClientName != targetName {
 		return fmt.Errorf("%w: target canonical identity changed", ErrUndeliverable)
+	}
+	if runtime != nil {
+		return s.relayRuntimeSignal(ctx, *runtime, *source, *target, signal)
 	}
 	if ok, err := s.CanPeer(ctx, *source, *target); err != nil || !ok {
 		if err != nil {

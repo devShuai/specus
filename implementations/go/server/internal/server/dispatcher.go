@@ -487,6 +487,10 @@ func (d *Dispatcher) finishLogin(conn *control.Conn, request protocol.LoginReque
 		if recordID > 0 {
 			conn.SetConnectionRecordID(recordID)
 		}
+		if !conn.BindRuntimeReference(store.RuntimeClientReference{SessionID: result.Session.ID, CredentialID: result.Session.CredentialID, IdentityID: result.Session.IdentityID, ClientID: result.Account.ID, TenantID: result.Account.TenantID, ClientName: clientName, TokenHash: result.Session.TokenHash, MachineFingerprint: result.Session.MachineFingerprint, OSUser: result.Session.OSUser, ExpiresAt: result.Session.ExpiresAt}) {
+			conn.Close(store.ReasonProtocolViolation)
+			return
+		}
 		conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID,
 			time.Now().UnixMilli(), request.ConnectionRole)
 		conn.SetHTTPRouteCapability(result.Session.HTTPRouteCapability)

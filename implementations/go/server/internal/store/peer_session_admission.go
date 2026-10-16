@@ -270,6 +270,18 @@ func (db *DB) admitPeerMeshSessionOnce(ctx context.Context, source, target PeerC
 		return empty, err
 	}
 	defer tx.Rollback()
+	out, err := db.admitPeerMeshSessionOn(ctx, tx, source, target, seed)
+	if err != nil {
+		return empty, err
+	}
+	if err := tx.Commit(); err != nil {
+		return empty, err
+	}
+	return out, nil
+}
+
+func (db *DB) admitPeerMeshSessionOn(ctx context.Context, tx *sql.Tx, source, target PeerClientReference, seed PeerSessionSeed) (PeerSessionAdmission, error) {
+	var empty PeerSessionAdmission
 	for _, id := range sortedOwnerIDs([]int64{source.ID, target.ID}) {
 		parent, err := db.lockClientForOwnership(ctx, tx, source.TenantID, id)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -357,9 +369,6 @@ func (db *DB) admitPeerMeshSessionOnce(ctx context.Context, source, target PeerC
 			return empty, err
 		}
 		out.Created = true
-	}
-	if err := tx.Commit(); err != nil {
-		return empty, err
 	}
 	return out, nil
 }

@@ -5,9 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // Explicitly opt in with an owned, disposable database. Validate its name before Open runs
@@ -44,6 +49,44 @@ func openOwnedStartupProviderDB(t *testing.T) (*DB, context.Context) {
 		t.Fatal("refusing to migrate a database outside specus_startup_237_ fixture namespace")
 	}
 	db, err := Open(provider, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db, ctx
+}
+
+// Independent owned schemas keep provider scenarios' audit counts and names isolated.
+func openOwnedIsolatedStartupProviderDB(t *testing.T, suffix string) (*DB, context.Context) {
+	t.Helper()
+	parent, ctx := openOwnedStartupProviderDB(t)
+	for _, c := range suffix {
+		if !(c >= 'a' && c <= 'z' || c == '_') {
+			t.Fatal("invalid owned child database suffix")
+		}
+	}
+	name := "specus_startup_237_" + suffix + "_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if _, err := parent.sql.ExecContext(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatal(err)
+	}
+	dsn := os.Getenv("SPECUS_TEST_STARTUP_DSN")
+	if parent.dialect == DialectMySQL {
+		cfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.DBName = name
+		dsn = cfg.FormatDSN()
+	} else {
+		cfg, err := pgx.ParseConfig(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Database = name
+		dsn = stdlib.RegisterConnConfig(cfg)
+		t.Cleanup(func() { stdlib.UnregisterConnConfig(dsn) })
+	}
+	db, err := Open(os.Getenv("SPECUS_TEST_STARTUP_PROVIDER"), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}

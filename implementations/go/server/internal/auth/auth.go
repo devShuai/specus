@@ -39,6 +39,7 @@ type Session struct {
 	ID                 int64
 	TenantID           string
 	CredentialID       int64
+	IdentityID         int64
 	ClientID           int64
 	ClientName         string
 	MachineFingerprint string
@@ -106,6 +107,25 @@ func (s *SessionStore) SetHTTPRouteCapability(sessionID int64, version int) {
 		}
 	}
 	s.mu.Unlock()
+}
+
+// HTTP login binds the persisted identity before publishing its newly issued token.
+func (s *SessionStore) BindIdentityID(sessionID, identityID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if identityID <= 0 {
+		return false
+	}
+	if hash, ok := s.tokenHashBySessionID[sessionID]; ok {
+		item := s.byTokenHash[hash]
+		if item.IdentityID != 0 {
+			return item.IdentityID == identityID
+		}
+		item.IdentityID = identityID
+		s.byTokenHash[hash] = item
+		return true
+	}
+	return false
 }
 
 // Discard removes a session that was registered in memory but whose persistence failed. Without it

@@ -57,12 +57,13 @@ type Conn struct {
 	reasonOnce sync.Once
 	reason     atomic.Value // string
 
-	clientName     atomic.Value // string
-	tenantID       atomic.Value // string
-	loginTime      atomic.Int64
-	recordID       atomic.Int64
-	sessionID      atomic.Int64
-	connectionRole atomic.Value // string
+	clientName       atomic.Value // string
+	tenantID         atomic.Value // string
+	loginTime        atomic.Int64
+	recordID         atomic.Int64
+	sessionID        atomic.Int64
+	runtimeReference atomic.Pointer[store.RuntimeClientReference]
+	connectionRole   atomic.Value // string
 	// httpRouteCapability is clientHttpRouteCapabilities.version of the login session.
 	httpRouteCapability atomic.Int32
 
@@ -133,6 +134,24 @@ func (c *Conn) ConnectionRecordID() int64 { return c.recordID.Load() }
 
 // ClientSessionID returns the authenticated HTTP login session id, or 0 before login.
 func (c *Conn) ClientSessionID() int64 { return c.sessionID.Load() }
+
+// BindRuntimeReference publishes the original login identity only once. Later SQL/name
+// lookups and an attempted second login cannot silently rebind an existing transport.
+func (c *Conn) BindRuntimeReference(ref store.RuntimeClientReference) bool {
+	if ref.SessionID <= 0 || ref.ClientID <= 0 || ref.TenantID == "" || ref.ClientName == "" || ref.TokenHash == "" {
+		return false
+	}
+	ref.ChannelID = c.channelID
+	return c.runtimeReference.CompareAndSwap(nil, &ref)
+}
+
+func (c *Conn) RuntimeReference() (store.RuntimeClientReference, bool) {
+	ref := c.runtimeReference.Load()
+	if ref == nil {
+		return store.RuntimeClientReference{}, false
+	}
+	return *ref, true
+}
 
 // ConnectionRole is the authenticated mandatory v2 role.
 func (c *Conn) ConnectionRole() string {

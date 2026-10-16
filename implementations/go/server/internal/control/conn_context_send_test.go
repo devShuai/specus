@@ -13,6 +13,30 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
+func TestOriginalRuntimeReferenceIsImmutableAndReturnedByValue(t *testing.T) {
+	conn, _, _ := contextConnFixture(t)
+	if _, ok := conn.RuntimeReference(); ok {
+		t.Fatal("unauthenticated transport has runtime authority")
+	}
+	original := store.RuntimeClientReference{ClientID: 71, SessionID: 81, CredentialID: 91, IdentityID: 101, TenantID: "default", ClientName: "original", TokenHash: "fixture-hash", ChannelID: "untrusted-input", ExpiresAt: time.Now().Add(time.Hour)}
+	if !conn.BindRuntimeReference(original) {
+		t.Fatal("original runtime not captured")
+	}
+	original.ChannelID = conn.ChannelID()
+	copy, ok := conn.RuntimeReference()
+	if !ok || copy != original {
+		t.Fatal("runtime reference not bound to the physical channel")
+	}
+	copy.ClientID = 72
+	if conn.BindRuntimeReference(copy) {
+		t.Fatal("second binding replaced original transport identity")
+	}
+	current, _ := conn.RuntimeReference()
+	if current != original {
+		t.Fatal("returned value mutated live runtime identity")
+	}
+}
+
 type observedContextConn struct {
 	net.Conn
 	entered  chan struct{}

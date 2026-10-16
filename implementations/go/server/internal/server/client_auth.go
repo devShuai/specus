@@ -171,8 +171,10 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// Every read below can fail, and a session created before them would linger in the database
 	// holding an online-instance slot while the client never receives its token. Load the
 	// configuration first, then mint the session as the last fallible step.
-	machineFingerprint := limit(strings.TrimSpace(request.Environment.MachineFingerprint), 160)
-	osUser := limit(strings.TrimSpace(request.Environment.OSUser), 120)
+	// Bind the runtime to the resolved identity, not request spelling: native
+	// database collations may resolve case variants to an existing identity.
+	machineFingerprint := identity.MachineFingerprint
+	osUser := identity.OSUser
 	if _, err := a.db.CloseHTTPAuthenticatedClientSessions(r.Context(), credential.ID,
 		machineFingerprint, osUser, auth.StatusHTTPAuthenticated, auth.StatusDisconnected, time.Now()); err != nil {
 		a.failClientAuthInternal(w, "close-stale-sessions", "清理旧客户端会话失败", err)
@@ -184,6 +186,11 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		osUser,
 		ttl)
 	a.clientAuth.SetHTTPRouteCapability(session.ID, request.Environment.ClientHTTPRouteCapabilities.Version)
+	if !a.clientAuth.BindIdentityID(session.ID, identity.ID) {
+		a.clientAuth.Discard(session.ID)
+		a.failClientAuthInternal(w, "bind-identity", "保存客户端会话身份失败", errors.New("runtime identity binding failed"))
+		return
+	}
 	now := time.Now()
 	if err := a.db.InsertClientSession(r.Context(), store.ClientSession{
 		ID:                          session.ID,
