@@ -687,7 +687,7 @@ func (a *API) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	user, err := a.db.InsertManagementUser(r.Context(), store.ManagementUser{
+	user, err := a.db.CreateManagedUser(r.Context(), ownerWriteActor(principal), store.ManagementUser{
 		Username:     username,
 		TenantID:     principal.TenantID,
 		PasswordHash: auth.HashPassword(password),
@@ -744,40 +744,38 @@ func (a *API) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, store.ErrNotFound)
 		return
 	}
-	wasEnabled, previousRole := user.Enabled, normalizeRole(user.Role)
+	patch := store.ManagementUserPatch{Enabled: req.Enabled}
 	if strings.TrimSpace(req.Password) != "" {
 		password, err := requirePassword(req.Password)
 		if err != nil {
 			a.fail(w, err)
 			return
 		}
-		user.PasswordHash = auth.HashPassword(password)
+		hash := auth.HashPassword(password)
+		patch.PasswordHash = &hash
 	}
 	if strings.TrimSpace(req.Role) != "" {
-		user.Role = normalizeRole(req.Role)
+		role := normalizeRole(req.Role)
+		patch.Role = &role
 	}
-	if req.Enabled != nil {
-		user.Enabled = *req.Enabled
-	}
-	user.UpdatedAt = time.Now()
 	// Disabling the account or changing its role ends its management WebSockets: they carry the rights
 	// they were opened with (management-accounts.md 7.2). A new password does not, as it does not end
 	// the account's tokens either.
-	accessRevoked := ""
-	if wasEnabled && !user.Enabled {
-		accessRevoked = AccessRevokedDisabled
-	} else if wasEnabled && normalizeRole(user.Role) != previousRole {
-		accessRevoked = AccessRevokedRoleChanged
-	}
 	// Disabling the user or changing its role ends the shares it may no longer manage, and the unused
 	// WebSocket tickets, in the same transaction.
-	revoked, err := a.db.UpdateManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
-		a.shares.LapseReason, accessRevoked != "")
+	outcome, err := a.db.PatchManagedUser(r.Context(), ownerWriteActor(principal), *user, patch, time.Now(), a.shareNow(), a.shares.LapseReason)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	a.shares.CutStreams(revoked)
+	user = &outcome.User
+	a.shares.CutStreams(outcome.RevokedShares)
+	accessRevoked := ""
+	if outcome.Disabled {
+		accessRevoked = AccessRevokedDisabled
+	} else if outcome.RoleChanged {
+		accessRevoked = AccessRevokedRoleChanged
+	}
 	if accessRevoked != "" && a.accessRevoked != nil {
 		a.accessRevoked(normalizeTenant(user.TenantID), user.Username, accessRevoked)
 	}
@@ -812,8 +810,7 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, store.ErrNotFound)
 		return
 	}
-	revoked, err := a.db.DeleteManagementUserAudited(r.Context(), *user, principal.Username, a.shareNow(),
-		a.shares.LapseReason)
+	outcome, err := a.db.DeleteManagedUser(r.Context(), ownerWriteActor(principal), *user, a.shareNow(), a.shares.LapseReason)
 	var owned *store.AccountStillOwnsError
 	if errors.As(err, &owned) {
 		a.logger.Warn("management user delete refused: the account still owns clients or credentials",
@@ -828,7 +825,8 @@ func (a *API) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	a.shares.CutStreams(revoked)
+	user = &outcome.Before
+	a.shares.CutStreams(outcome.RevokedShares)
 	// Committed: the identity's open management WebSockets end (management-accounts.md 7.2).
 	if a.accessRevoked != nil {
 		a.accessRevoked(normalizeTenant(user.TenantID), user.Username, AccessRevokedDeleted)
@@ -1055,13 +1053,6 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if existing, err := a.db.FindClientByName(r.Context(), name); err != nil {
-		a.fail(w, err)
-		return
-	} else if existing != nil {
-		a.fail(w, conflict("客户端名称已存在"))
-		return
-	}
 	now := time.Now()
 	account := store.ClientAccount{
 		ID:                           auth.NewClientID(),
@@ -1074,11 +1065,12 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:                    now,
 		UpdatedAt:                    now,
 	}
-	if err := a.db.InsertClient(r.Context(), account); err != nil {
+	created, err := a.db.CreateManagedClient(r.Context(), ownerWriteActor(principal), account)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, ClientResult{Client: a.clientView(r.Context(), account)})
+	writeJSON(w, http.StatusCreated, ClientResult{Client: a.clientView(r.Context(), *created)})
 }
 
 func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
@@ -1097,57 +1089,30 @@ func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	account, err := a.db.GetClient(r.Context(), id)
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	if !principal.canAccessClient(*account) {
-		a.fail(w, forbidden("无权访问客户端"))
-		return
-	}
-
-	oldName := account.ClientName
-	wasEnabled := account.Enabled
+	patch := store.ManagementClientPatch{Enabled: req.Enabled}
 	if name := strings.TrimSpace(req.ClientName); name != "" {
 		validatedName, validationErr := requireClientName(name)
 		if validationErr != nil {
 			a.fail(w, validationErr)
 			return
 		}
-		account.ClientName = validatedName
-	}
-	if account.ClientName != oldName {
-		existing, lookupErr := a.db.FindClientByName(r.Context(), account.ClientName)
-		if lookupErr != nil {
-			a.fail(w, lookupErr)
-			return
-		}
-		if existing != nil && existing.ID != account.ID {
-			a.fail(w, conflict("客户端名称已存在"))
-			return
-		}
-	}
-	if req.Enabled != nil {
-		account.Enabled = *req.Enabled
+		patch.ClientName = &validatedName
 	}
 	if req.ConnectionRateLimitPerMinute != nil {
-		rateLimit, validationErr := normalizeConnectionRateLimit(req.ConnectionRateLimitPerMinute,
-			account.ConnectionRateLimitPerMinute)
+		rateLimit, validationErr := normalizeConnectionRateLimit(req.ConnectionRateLimitPerMinute, 30)
 		if validationErr != nil {
 			a.fail(w, validationErr)
 			return
 		}
-		account.ConnectionRateLimitPerMinute = rateLimit
+		patch.ConnectionRateLimitPerMinute = &rateLimit
 	}
-	account.UpdatedAt = time.Now()
-	revoked, err := a.db.UpdateClientAudited(r.Context(), *account, oldName, wasEnabled, principal.Username,
-		a.shareNow())
+	outcome, err := a.db.PatchManagedClient(r.Context(), ownerWriteActor(principal), id, patch, time.Now(), a.shareNow())
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	a.shares.CutStreams(revoked)
+	a.shares.CutStreams(outcome.RevokedShares)
+	account, oldName, wasEnabled := &outcome.Client, outcome.Before.ClientName, outcome.Before.Enabled
 
 	if oldName != account.ClientName && a.clientTokens != nil {
 		a.clientTokens.RenameClient(account.ID, account.ClientName)
@@ -1173,22 +1138,14 @@ func (a *API) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	account, err := a.db.GetClient(r.Context(), id)
+	outcome, err := a.db.DeleteManagedClient(r.Context(), ownerWriteActor(principal), id, time.Now(), a.shareNow(), routeExposure)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	if !principal.canAccessClient(*account) {
-		a.fail(w, forbidden("无权访问客户端"))
-		return
-	}
-	revoked, closed, err := a.db.DeleteClientAuditedWithPeerSessions(r.Context(), id, principal.Username, a.shareNow(), routeExposure)
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	a.shares.CutStreams(revoked)
-	a.peerMesh.OnClientDeleted(r.Context(), *account, closed)
+	account := &outcome.Before
+	a.shares.CutStreams(outcome.RevokedShares)
+	a.peerMesh.OnClientDeleted(r.Context(), *account, outcome.ClosedPeerSessions)
 	a.revokeClientTokens(r.Context(), account.ID)
 	a.kick(account.ClientName, store.ReasonAdminDeleted)
 	w.WriteHeader(http.StatusNoContent)
@@ -1230,13 +1187,6 @@ func (a *API) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 	if apiKey == "" {
 		apiKey = "ck_" + strconv.FormatInt(auth.NewClientID(), 10)
 	}
-	if existing, err := a.db.FindCredentialByAPIKey(r.Context(), apiKey); err != nil {
-		a.fail(w, err)
-		return
-	} else if existing != nil {
-		a.fail(w, conflict("apiKey already exists"))
-		return
-	}
 	secret := strings.TrimSpace(req.Secret)
 	if secret == "" {
 		secret = auth.GeneratePassword()
@@ -1258,12 +1208,13 @@ func (a *API) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
-	if err := a.db.InsertCredential(r.Context(), credential); err != nil {
+	created, err := a.db.CreateManagedCredential(r.Context(), ownerWriteActor(principal), credential)
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	a.recordMilestone(r.Context(), credential.TenantID, credential.OwnerUsername, productmetrics.StepCredentialCreated)
-	writeJSON(w, http.StatusCreated, CredentialResult{Credential: credentialView(credential), Secret: secret})
+	a.recordMilestone(r.Context(), created.TenantID, created.OwnerUsername, productmetrics.StepCredentialCreated)
+	writeJSON(w, http.StatusCreated, CredentialResult{Credential: credentialView(*created), Secret: secret})
 }
 
 func (a *API) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
@@ -1282,32 +1233,15 @@ func (a *API) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	credential, err := a.db.GetCredential(r.Context(), id)
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	if !principal.canAccessCredential(*credential) {
-		a.fail(w, forbidden("无权访问客户端凭证"))
-		return
-	}
-	if apiKey := strings.TrimSpace(req.APIKey); apiKey != "" && apiKey != credential.APIKey {
-		if existing, err := a.db.FindCredentialByAPIKey(r.Context(), apiKey); err != nil {
-			a.fail(w, err)
-			return
-		} else if existing != nil {
-			a.fail(w, conflict("apiKey already exists"))
-			return
-		}
-		credential.APIKey = apiKey
+	patch := store.ManagementCredentialPatch{Enabled: req.Enabled}
+	if apiKey := strings.TrimSpace(req.APIKey); apiKey != "" {
+		patch.APIKey = &apiKey
 	}
 	var revealed string
 	if secret := strings.TrimSpace(req.Secret); secret != "" {
 		revealed = secret
-		credential.SecretHash = auth.HashToken(secret)
-	}
-	if req.Enabled != nil {
-		credential.Enabled = *req.Enabled
+		hash := auth.HashToken(secret)
+		patch.SecretHash = &hash
 	}
 	if req.MaxOnlineInstances != nil {
 		maxOnlineInstances, err := normalizeMaxOnline(req.MaxOnlineInstances, a.clientAuth.DefaultMaxOnlineInstances)
@@ -1315,10 +1249,10 @@ func (a *API) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
 			a.fail(w, err)
 			return
 		}
-		credential.MaxOnlineInstances = maxOnlineInstances
+		patch.MaxOnlineInstances = &maxOnlineInstances
 	}
-	credential.UpdatedAt = time.Now()
-	if err := a.db.UpdateCredential(r.Context(), *credential); err != nil {
+	credential, err := a.db.PatchManagedCredential(r.Context(), ownerWriteActor(principal), id, patch, time.Now())
+	if err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1336,16 +1270,7 @@ func (a *API) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	credential, err := a.db.GetCredential(r.Context(), id)
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	if !principal.canAccessCredential(*credential) {
-		a.fail(w, forbidden("无权访问客户端凭证"))
-		return
-	}
-	if err := a.db.DeleteCredential(r.Context(), id); err != nil {
+	if err := a.db.DeleteManagedCredential(r.Context(), ownerWriteActor(principal), id); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -2910,6 +2835,10 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrManagementActorChanged):
 		writeError(w, http.StatusUnauthorized, "登录状态已变更，请重新登录")
+	case errors.Is(err, store.ErrManagementResourceForbidden):
+		writeError(w, http.StatusForbidden, "无权访问资源")
+	case errors.Is(err, store.ErrManagementResourceConflict):
+		writeError(w, http.StatusConflict, "客户端名称或凭证标识已存在")
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrConflict):
