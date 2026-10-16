@@ -55,10 +55,11 @@ public sealed partial class PeerMeshService
     private readonly TurnCredentialService _turnCredentials;
     private readonly ILogger<PeerMeshService> _logger;
     private readonly PeerMeshServiceState _state;
+    private readonly AuthOptions _managementAuth;
 
     public PeerMeshService(SpecusDbContext db, SessionRegistry sessions, IOptions<PeerMeshOptions> options,
         ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null,
-        PeerMeshServiceState? state = null)
+        PeerMeshServiceState? state = null, IOptions<AuthOptions>? managementAuth = null)
     {
         _db = db;
         _sessions = sessions;
@@ -67,6 +68,7 @@ public sealed partial class PeerMeshService
         _logger = logger;
         state ??= new PeerMeshServiceState();
         _state = state;
+        _managementAuth = managementAuth?.Value ?? new AuthOptions();
         _serviceCatalogs = state.ServiceCatalogs;
         _serviceCatalogRevisions = state.ServiceCatalogRevisions;
         _serviceReportRevisions = state.ServiceReportRevisions;
@@ -556,13 +558,29 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshDeviceView> UpdateDeviceAsync(ManagementContext context, long clientId,
         PeerMeshDeviceMutation request, CancellationToken cancellationToken)
     {
-        var device = await FindAccessibleDeviceAsync(context, clientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
+        var clients = await LockPeerClientsAsync(context, [clientId], cancellationToken).ConfigureAwait(false);
+        var account = RequirePeerClient(clients, clientId);
+        if (!context.CanAccess(account)) throw new UnauthorizedAccessException("无权访问客户端");
+        var hint = await _db.PeerMeshDevices.AsNoTracking().SingleOrDefaultAsync(d => d.TenantId == context.TenantId && d.ClientId == clientId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException("peer device not found");
+        if (hint.TenantId != context.TenantId) throw new ArgumentException("peer device not found");
+        await LockPeerRowAsync<PeerMeshDevice>(hint.Id, context, cancellationToken).ConfigureAwait(false);
+        var current = await _db.PeerMeshDevices.AsNoTracking().SingleOrDefaultAsync(d => d.Id == hint.Id && d.TenantId == context.TenantId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException("peer device not found");
+        if (current.TenantId != context.TenantId) throw new ArgumentException("peer device not found");
+        if (current.ClientId != clientId) throw new InvalidOperationException("Peer 设备关联已变更，请刷新后重试");
+        if (!context.IsAdmin && current.OwnerUsername != context.Username) throw new UnauthorizedAccessException("无权访问客户端");
+        var device = TrackPeerCurrent(current, current.Id);
         if (request.Enabled is not null)
         {
             device.Enabled = request.Enabled.Value;
         }
         device.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         if (request.Enabled is not null)
         {
             await RefreshDeviceAsync(context, clientId, request.Enabled.Value, cancellationToken).ConfigureAwait(false);
@@ -586,6 +604,8 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshAclView> CreateAclAsync(ManagementContext context, PeerMeshAclMutation request,
         CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         if (request.SourceClientId is null or <= 0)
         {
             throw new ArgumentException("sourceClientId is required");
@@ -594,10 +614,10 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("targetClientId is required");
         }
-        var source = await FindAccessibleClientAsync(context, request.SourceClientId.Value, cancellationToken)
-            .ConfigureAwait(false);
-        var target = await FindTenantClientAsync(context.TenantId, request.TargetClientId.Value, cancellationToken)
-            .ConfigureAwait(false);
+        var clients = await LockPeerClientsAsync(context, [request.SourceClientId.Value, request.TargetClientId.Value], cancellationToken).ConfigureAwait(false);
+        var source = RequirePeerClient(clients, request.SourceClientId.Value);
+        var target = RequirePeerClient(clients, request.TargetClientId.Value);
+        if (!context.CanAccess(source)) throw new UnauthorizedAccessException("无权访问客户端");
         if (source.Id == target.Id)
         {
             throw new ArgumentException("source and target cannot be the same client");
@@ -607,7 +627,7 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("普通用户不能创建跨用户 peer ACL");
         }
-        var acl = await _db.PeerMeshAcls.FirstOrDefaultAsync(a =>
+        var acl = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a =>
                 a.TenantId == context.TenantId
                 && a.SourceClientId == source.Id
                 && a.TargetClientId == target.Id, cancellationToken)
@@ -622,6 +642,20 @@ public sealed partial class PeerMeshService
                 CreatedAt = now,
             };
             _db.PeerMeshAcls.Add(acl);
+        }
+        else
+        {
+            if (acl.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+            await LockPeerRowAsync<PeerMeshAcl>(acl.Id, context, cancellationToken).ConfigureAwait(false);
+            var current = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a => a.Id == acl.Id && a.TenantId == context.TenantId, cancellationToken)
+                .ConfigureAwait(false) ?? throw new ArgumentException("peer ACL not found");
+            if (current.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+            if (current.SourceClientId != source.Id || current.TargetClientId != target.Id)
+                throw new InvalidOperationException("Peer ACL 关联已变更，请刷新后重试");
+            // Policy ownership is independent of device ownership. A transfer must not let
+            // the new device owner take over an existing third-party policy via upsert.
+            if (!context.IsAdmin && current.OwnerUsername != context.Username) throw new ArgumentException("peer ACL not found");
+            acl = TrackPeerCurrent(current, current.Id);
         }
         acl.OwnerUsername = context.Username;
         acl.SourceClientId = source.Id;
@@ -640,21 +674,38 @@ public sealed partial class PeerMeshService
         }
         acl.UpdatedAt = now;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
         return AclView(acl);
     }
 
     public async Task DeleteAclAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
-        var acl = await _db.PeerMeshAcls.FirstOrDefaultAsync(a => a.Id == id, cancellationToken)
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
+        var hint = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a => a.Id == id && a.TenantId == context.TenantId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException("peer ACL not found");
+        if (hint.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+        // Ordered parent locks also coordinate with client deletion. Legacy orphan ACLs
+        // remain deletable by their own manager; device ownership does not grant this right.
+        _ = await LockPeerClientsAsync(context, [hint.SourceClientId, hint.TargetClientId], cancellationToken).ConfigureAwait(false);
+        await LockPeerRowAsync<PeerMeshAcl>(id, context, cancellationToken).ConfigureAwait(false);
+        var current = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a => a.Id == id && a.TenantId == context.TenantId, cancellationToken)
             .ConfigureAwait(false)
             ?? throw new ArgumentException("peer ACL not found");
-        if (acl.TenantId != context.TenantId || (!context.IsAdmin && acl.OwnerUsername != context.Username))
+        if (current.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+        if (current.SourceClientId != hint.SourceClientId || current.TargetClientId != hint.TargetClientId)
+            throw new InvalidOperationException("Peer ACL 关联已变更，请刷新后重试");
+        if (!context.IsAdmin && current.OwnerUsername != context.Username)
         {
             throw new ArgumentException("peer ACL not found");
         }
+        var acl = TrackPeerCurrent(current, id);
         _db.PeerMeshAcls.Remove(acl);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
     }
 

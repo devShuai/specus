@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -15,6 +16,7 @@ using Specus.Server.Management;
 using Specus.Server.Networking;
 using Specus.Server.PeerMesh;
 using Specus.Server.Sessions;
+using Specus.Server.Security;
 
 namespace Specus.IntegrationTests;
 
@@ -524,7 +526,7 @@ public sealed class PeerMeshServiceTests
         Assert.False(await fixture.Service.CanPeerAsync(source, normalizedTenantMismatch,
             CancellationToken.None));
 
-        var admin = new ManagementContext("tenant-a", "admin", ManagementRole.Admin, false);
+        var admin = await fixture.ActorAsync("admin", ManagementRole.Admin);
         var inbound = await fixture.Service.CreateAclAsync(admin,
             new PeerMeshAclMutation(source.Id, target.Id, true, "inbound"), CancellationToken.None);
         Assert.Equal(PeerMeshService.DirectionInbound, inbound.Direction);
@@ -575,7 +577,7 @@ public sealed class PeerMeshServiceTests
         fixture.Db.ClientSessions.Add(CurrentPublisherSession(11521, peerB, now));
         fixture.Db.ClientSessions.Add(CurrentPublisherSession(11531, peerC, now));
         await fixture.SaveChangesAsync();
-        var admin = new ManagementContext("tenant-a", "admin", ManagementRole.Admin, true);
+        var admin = await fixture.ActorAsync("admin", ManagementRole.Admin);
         var aclB = await fixture.Service.CreateAclAsync(admin,
             new PeerMeshAclMutation(publisher.Id, peerB.Id, true, "BOTH"), CancellationToken.None);
         await fixture.Service.CreateAclAsync(admin,
@@ -865,7 +867,7 @@ public sealed class PeerMeshServiceTests
         var targetWriter = fixture.Bind(target);
 
         await fixture.Service.UpdateDeviceAsync(
-            new ManagementContext("tenant-a", "alice", ManagementRole.User, false),
+            await fixture.ActorAsync("alice"),
             source.Id,
             new PeerMeshDeviceMutation(false),
             CancellationToken.None);
@@ -1364,6 +1366,10 @@ public sealed class PeerMeshServiceTests
 
     private sealed class PeerMeshFixture : IAsyncDisposable
     {
+        private static readonly IOptions<AuthOptions> ManagementAuth = Options.Create(new AuthOptions
+        {
+            TenantId = "tenant-a", Username = "unused-fixture-built-in", JwtSecret = "peer-management-fixture-signing-key-2026-private",
+        });
         private readonly SqliteConnection _connection;
         private readonly IOptions<PeerMeshOptions> _options;
 
@@ -1387,7 +1393,22 @@ public sealed class PeerMeshServiceTests
         public PeerMeshServiceState State { get; }
 
         public PeerMeshService CreateSiblingService() => new(Db, Registry, _options,
-            NullLogger<PeerMeshService>.Instance, null, State);
+            NullLogger<PeerMeshService>.Instance, null, State, ManagementAuth);
+
+        public async Task<ManagementContext> ActorAsync(string username, ManagementRole role = ManagementRole.User)
+        {
+            var key = "peer-fixture-" + username;
+            if (!await Db.ManagementUsers.AnyAsync(u => u.Username == key))
+            {
+                Db.ManagementUsers.Add(new ManagementUser { Username = key, LoginName = username,
+                    TenantId = "tenant-a", Role = role, Enabled = true });
+                await Db.SaveChangesAsync();
+            }
+            var tokens = new LocalTokenService(ManagementAuth);
+            var principal = tokens.Validate(tokens.IssueToken(username, "tenant-a", role, key));
+            Assert.NotNull(principal);
+            return ManagementContext.From(new DefaultHttpContext { User = principal }, ManagementAuth.Value);
+        }
 
         public static async Task<PeerMeshFixture> CreateAsync(
             string publicAddress = "203.0.113.10",
@@ -1426,7 +1447,7 @@ public sealed class PeerMeshServiceTests
             });
             var state = new PeerMeshServiceState();
             var service = new PeerMeshService(db, registry, peerOptions,
-                NullLogger<PeerMeshService>.Instance, null, state);
+                NullLogger<PeerMeshService>.Instance, null, state, ManagementAuth);
             return new PeerMeshFixture(connection, db, registry, service, peerOptions, state);
         }
 

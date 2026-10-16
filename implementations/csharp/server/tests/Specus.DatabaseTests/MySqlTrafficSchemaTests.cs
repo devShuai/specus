@@ -14,6 +14,14 @@ namespace Specus.IntegrationTests;
 public sealed class MySqlTrafficSchemaTests
 {
     [Fact]
+    public async Task NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await PeerManagementProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
     public async Task NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents()
     {
         await using var database = await OwnedDatabase.CreateAsync();
