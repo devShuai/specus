@@ -24,6 +24,76 @@ namespace Specus.IntegrationTests;
 // Same actual bearer + write/readback assertions, compiled into all mandatory provider projects.
 internal static class OwnerTransferWriterProof
 {
+    internal static async Task VerifyNativeTargetDeletionOrderingAsync(TestServerFixture server)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        var ct = timeout.Token;
+        await using var writerScope = server.HostServices.CreateAsyncScope();
+        await using var holderScope = server.HostServices.CreateAsyncScope();
+        await using var deletionScope = server.HostServices.CreateAsyncScope();
+        await using var observerScope = server.HostServices.CreateAsyncScope();
+        var services = writerScope.ServiceProvider;
+        var db = services.GetRequiredService<SpecusDbContext>();
+        var holder = holderScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var deletion = deletionScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var observer = observerScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var actor = await ActorAsync(server, services);
+        await SeedAsync(db, actor.Context.TenantId);
+        var preview = await PreviewAsync(services, actor, PathScope.CredentialGroup, 501);
+        var postgres = db.Database.ProviderName == "Npgsql.EntityFrameworkCore.PostgreSQL";
+        foreach (var connection in new[] { db, holder, deletion, observer }) await connection.Database.OpenConnectionAsync(ct);
+        var pidQuery = postgres ? "SELECT pg_backend_pid()" : "SELECT CONNECTION_ID()";
+        var writerPid = Convert.ToInt64(await ScalarAsync(db, pidQuery, ct));
+        var holderPid = Convert.ToInt64(await ScalarAsync(holder, pidQuery, ct));
+        var deletionPid = Convert.ToInt64(await ScalarAsync(deletion, pidQuery, ct));
+        var maria = Convert.ToString(await ScalarAsync(observer, "SELECT VERSION()", ct))!.Contains("MariaDB", StringComparison.OrdinalIgnoreCase);
+        Task<OwnerTransferWriteOutcome>? transfer = null;
+        Task<(string TenantId, string Username)>? pendingDeletion = null;
+        await using var hold = await holder.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        var released = false;
+        try
+        {
+            var entity = holder.Model.FindEntityType(typeof(ClientCredential))!;
+            var table = StoreObjectIdentifier.Table(entity.GetTableName()!, entity.GetSchema());
+            var sql = holder.GetService<ISqlGenerationHelper>();
+            var key = sql.DelimitIdentifier(entity.FindProperty("Id")!.GetColumnName(table)!);
+            _ = await ScalarAsync(holder, $"SELECT {key} FROM {sql.DelimitIdentifier(table.Name, table.Schema)} WHERE {key}=501 FOR UPDATE", ct);
+            // The transfer owns Bob's account row but cannot yet update its credential.
+            transfer = services.GetRequiredService<ClientOwnerTransferWriter>().CommitAsync(actor, PathScope.CredentialGroup,
+                "501", Body(PathScope.CredentialGroup, "bob", preview.Revision!), ct);
+            await WaitForBlockerAsync(observer, writerPid, holderPid, postgres, maria, transfer, ct);
+            pendingDeletion = deletionScope.ServiceProvider.GetRequiredService<ManagementUserService>()
+                .DeleteUserAsync(actor.Context, "bob", ct);
+            await WaitForBlockerAsync(observer, deletionPid, writerPid, postgres, maria, pendingDeletion, ct);
+            await hold.CommitAsync(ct);
+            released = true;
+            Assert.True((await transfer).Response.Changed);
+            // The former implementation waited only at its final DELETE, after counting zero
+            // resources. It deleted Bob after the transfer committed, orphaning all new owners.
+            var denied = await Assert.ThrowsAsync<AccountStillOwnsResourcesException>(() => pendingDeletion);
+            Assert.Equal(2, denied.Clients); Assert.Equal(1, denied.Credentials);
+            Assert.True(await db.ManagementUsers.AsNoTracking().AnyAsync(u => u.Username == "bob-key", ct));
+            Assert.Equal(2, await db.ClientAccounts.AsNoTracking().CountAsync(c => c.OwnerUsername == "bob", ct));
+            var credential = await db.ClientCredentials.AsNoTracking().SingleAsync(c => c.Id == 501, ct);
+            Assert.Equal("bob", credential.OwnerUsername); Assert.Equal("retained-api", credential.ApiKey);
+            Assert.Equal("retained-secret", credential.SecretHash); Assert.False(credential.Enabled);
+            var peer = await db.PeerMeshDevices.AsNoTracking().SingleAsync(p => p.Id == 801, ct);
+            Assert.Equal("bob", peer.OwnerUsername); Assert.Equal("retained-public-key", peer.PublicKey);
+            Assert.Equal(1, await db.ClientOwnerTransferAudits.CountAsync(ct));
+            Assert.Equal("NETTY_ONLINE", (await db.ClientSessions.AsNoTracking().SingleAsync(s => s.Id == 901, ct)).Status);
+        }
+        finally
+        {
+            if (!released) await hold.RollbackAsync(CancellationToken.None);
+            if (transfer is { IsCompleted: false } || pendingDeletion is { IsCompleted: false })
+            {
+                timeout.Cancel();
+                if (transfer is not null) try { await transfer; } catch (Exception) { }
+                if (pendingDeletion is not null) try { await pendingDeletion; } catch (Exception) { }
+            }
+        }
+    }
+
     internal static async Task VerifyNativeTargetOrderingAsync(TestServerFixture server)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
