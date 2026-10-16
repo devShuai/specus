@@ -245,7 +245,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 18), ('executed', 18), ('passed', 18), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 20), ('executed', 20), ('passed', 20), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -254,11 +254,13 @@ jobs:
               'NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial',
               'NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview',
               'NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer',
+              'NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits',
+              'NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 18 real PostgreSQL cases, including channel, ownership, signed startup and target deletion coordination; zero skipped.')
+          print('Verified all 20 real PostgreSQL cases, including ownership, startup, resource mutation and password storage safety; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -282,7 +284,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 13), ('executed', 13), ('passed', 13), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 15), ('executed', 15), ('passed', 15), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -291,12 +293,14 @@ jobs:
               'NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial',
               'NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview',
               'NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer',
+              'NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits',
+              'NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade',
               'UnsafeDowngradeIsRefusedBeforeChangingDataOrHistory',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 13 real MySQL cases, including channel, ownership, signed startup and target deletion coordination; zero skipped.')
+          print('Verified all 15 real MySQL cases, including ownership, startup, resource mutation and password storage safety; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -320,7 +324,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 18), ('executed', 18), ('passed', 18), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 20), ('executed', 20), ('passed', 20), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -329,11 +333,13 @@ jobs:
               'NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial',
               'NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview',
               'NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer',
+              'NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits',
+              'NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 18 real MariaDB cases, including channel, ownership, signed startup and target deletion coordination; zero skipped.')
+          print('Verified all 20 real MariaDB cases, including ownership, startup, resource mutation and password storage safety; zero skipped.')
           PY
 
       - name: Keep real MariaDB results

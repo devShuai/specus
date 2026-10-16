@@ -290,7 +290,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.LoginName).HasColumnName("login_name").HasMaxLength(80);
             b.Property(x => x.LoginNameNormalized).HasColumnName("login_name_normalized").HasMaxLength(80);
             b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
-            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(256).IsRequired();
             b.Property(x => x.OidcIssuer).HasColumnName("oidc_issuer").HasMaxLength(255);
             b.Property(x => x.OidcSubject).HasColumnName("oidc_subject").HasMaxLength(255);
             b.Property(x => x.OidcIdentityKey).HasColumnName("oidc_identity_key").HasMaxLength(64);
@@ -334,7 +334,7 @@ public sealed class SpecusDbContext : DbContext
                 .IsRequired();
             b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
             b.Property(x => x.Email).HasColumnName("email").HasMaxLength(254).IsRequired();
-            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64)
+            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(256)
                 .IsRequired();
             b.Property(x => x.CodeHash).HasColumnName("code_hash").HasMaxLength(64).IsRequired();
             b.Property(x => x.AttemptsRemaining).HasColumnName("attempts_remaining").IsRequired();

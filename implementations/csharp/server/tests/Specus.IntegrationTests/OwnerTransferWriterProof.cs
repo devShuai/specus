@@ -24,6 +24,142 @@ namespace Specus.IntegrationTests;
 // Same actual bearer + write/readback assertions, compiled into all mandatory provider projects.
 internal static class OwnerTransferWriterProof
 {
+    internal static async Task VerifyPasswordHashUpgradeAsync(SpecusDbContext db)
+    {
+        var migrator = db.GetService<IMigrator>();
+        var previous = db.Database.GetMigrations().TakeWhile(m => !m.EndsWith("_WidenManagementPasswordHashes", StringComparison.Ordinal)).Last();
+        await migrator.MigrateAsync(previous);
+        var legacy = Specus.Server.Authentication.PasswordHasher.HashToken("legacy-password-fixture");
+        var now = DateTimeOffset.UtcNow;
+        db.ManagementUsers.Add(new ManagementUser { Username = "password-upgrade-key", LoginName = "password-upgrade", TenantId = "default", PasswordHash = legacy, Enabled = true, CreatedAt = now, UpdatedAt = now });
+        db.ManagementRegistrationChallenges.Add(new ManagementRegistrationChallenge { RegistrationId = "password-upgrade-registration", Username = "pending-upgrade", Email = "pending@example.invalid",
+            PasswordHash = legacy, CodeHash = legacy, AttemptsRemaining = 3, ExpiresAt = now.AddHours(1), ResendAvailableAt = now, CreatedAt = now, UpdatedAt = now });
+        await db.SaveChangesAsync();
+        await migrator.MigrateAsync();
+        db.ChangeTracker.Clear();
+        var user = await db.ManagementUsers.SingleAsync(u => u.Username == "password-upgrade-key");
+        var registration = await db.ManagementRegistrationChallenges.SingleAsync(r => r.RegistrationId == "password-upgrade-registration");
+        Assert.Equal(legacy, user.PasswordHash); Assert.Equal(legacy, registration.PasswordHash);
+        var current = Specus.Server.Authentication.PasswordHasher.Hash("current-password-fixture");
+        Assert.True(current.Length > 64);
+        user.PasswordHash = current; registration.PasswordHash = current;
+        await db.SaveChangesAsync();
+        var history = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
+        await Assert.ThrowsAsync<NotSupportedException>(() => migrator.MigrateAsync(previous));
+        Assert.Equal(history, await db.Database.GetAppliedMigrationsAsync());
+        Assert.Equal(current, (await db.ManagementUsers.AsNoTracking().SingleAsync(u => u.Username == "password-upgrade-key")).PasswordHash);
+        Assert.Equal(current, (await db.ManagementRegistrationChallenges.AsNoTracking().SingleAsync(r => r.RegistrationId == "password-upgrade-registration")).PasswordHash);
+        Assert.False(db.Database.HasPendingModelChanges());
+    }
+
+    internal static async Task VerifyNativeResourceWriteOrderingAsync(TestServerFixture server)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        var ct = timeout.Token;
+        await using var writerScope = server.HostServices.CreateAsyncScope();
+        await using var holderScope = server.HostServices.CreateAsyncScope();
+        await using var mutationScope = server.HostServices.CreateAsyncScope();
+        await using var deletionScope = server.HostServices.CreateAsyncScope();
+        await using var observerScope = server.HostServices.CreateAsyncScope();
+        var services = writerScope.ServiceProvider;
+        var db = services.GetRequiredService<SpecusDbContext>();
+        var holder = holderScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var mutationDb = mutationScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var deletionDb = deletionScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var observer = observerScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        await SeedAsync(db, "default");
+        db.ManagementUsers.Add(new ManagementUser { Username = "native-resource-alice", LoginName = "alice", TenantId = "default", Enabled = true,
+            PasswordHash = Specus.Server.Authentication.PasswordHasher.Hash("alice-password") });
+        await db.SaveChangesAsync(ct);
+        var admin = await ActorAsync(server, services);
+        var alice = await ActorAsync(server, services, "alice", "alice-password");
+        foreach (var connection in new[] { db, holder, mutationDb, deletionDb, observer }) await connection.Database.OpenConnectionAsync(ct);
+        var postgres = db.Database.ProviderName == "Npgsql.EntityFrameworkCore.PostgreSQL";
+        var query = postgres ? "SELECT pg_backend_pid()" : "SELECT CONNECTION_ID()";
+        var writerPid = Convert.ToInt64(await ScalarAsync(db, query, ct));
+        var holderPid = Convert.ToInt64(await ScalarAsync(holder, query, ct));
+        var mutationPid = Convert.ToInt64(await ScalarAsync(mutationDb, query, ct));
+        var deletionPid = Convert.ToInt64(await ScalarAsync(deletionDb, query, ct));
+        var maria = Convert.ToString(await ScalarAsync(observer, "SELECT VERSION()", ct))!.Contains("MariaDB", StringComparison.OrdinalIgnoreCase);
+        var preview = await PreviewAsync(services, admin, PathScope.CredentialGroup, 501);
+        Task<OwnerTransferWriteOutcome>? transfer = null;
+        Task<CredentialResult>? update = null;
+        await using (var hold = await holder.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct))
+        {
+            var released = false;
+            try
+            {
+                var entity = holder.Model.FindEntityType(typeof(PeerMeshDevice))!;
+                var table = StoreObjectIdentifier.Table(entity.GetTableName()!, entity.GetSchema());
+                var sql = holder.GetService<ISqlGenerationHelper>();
+                var key = sql.DelimitIdentifier(entity.FindProperty("Id")!.GetColumnName(table)!);
+                _ = await ScalarAsync(holder, $"SELECT {key} FROM {sql.DelimitIdentifier(table.Name, table.Schema)} WHERE {key}=801 FOR UPDATE", ct);
+                transfer = services.GetRequiredService<ClientOwnerTransferWriter>().CommitAsync(admin, PathScope.CredentialGroup, "501",
+                    Body(PathScope.CredentialGroup, "bob", preview.Revision!), ct);
+                await WaitForBlockerAsync(observer, writerPid, holderPid, postgres, maria, transfer, ct);
+                update = mutationScope.ServiceProvider.GetRequiredService<ManagementMutationService>().UpdateCredentialAsync(alice.Context,
+                    501, new CredentialMutation(null, null, true, 19), ct);
+                await WaitForBlockerAsync(observer, mutationPid, writerPid, postgres, maria, update, ct);
+                await hold.CommitAsync(ct); released = true;
+                Assert.True((await transfer).Response.Changed);
+                await Assert.ThrowsAsync<UnauthorizedAccessException>(() => update);
+                var credential = await db.ClientCredentials.AsNoTracking().SingleAsync(c => c.Id == 501, ct);
+                Assert.Equal("bob", credential.OwnerUsername); Assert.False(credential.Enabled);
+                Assert.Equal("retained-api", credential.ApiKey); Assert.Equal("retained-secret", credential.SecretHash);
+            }
+            finally
+            {
+                if (!released) await hold.RollbackAsync(CancellationToken.None);
+                if (transfer is { IsCompleted: false } || update is { IsCompleted: false })
+                {
+                    timeout.Cancel();
+                    if (transfer is not null) try { await transfer; } catch (Exception) { }
+                    if (update is not null) try { await update; } catch (Exception) { }
+                }
+            }
+        }
+        db.WebSocketTickets.Add(new WebSocketTicket { TokenHash = "native-resource-delete-ticket", Scope = WebSocketTicketService.ConnectionsScope,
+            Username = "alice", TenantId = "default", CreatedAt = DateTimeOffset.UtcNow, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1) });
+        await db.SaveChangesAsync(ct);
+        Task<(string TenantId, string Username)>? deletion = null;
+        Task<CredentialResult>? creation = null;
+        await using (var hold = await holder.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct))
+        {
+            var released = false;
+            try
+            {
+                _ = await ScalarAsync(holder, "SELECT token_hash FROM specus_websocket_ticket WHERE token_hash=@hash FOR UPDATE", ct,
+                    ("@hash", "native-resource-delete-ticket"));
+                // Real ordinary deletion has removed Alice in its uncommitted transaction and
+                // is waiting only on ticket revocation; its original account row remains locked.
+                deletion = deletionScope.ServiceProvider.GetRequiredService<ManagementUserService>().DeleteUserAsync(admin.Context, "alice", ct);
+                await WaitForBlockerAsync(observer, deletionPid, holderPid, postgres, maria, deletion, ct);
+                creation = mutationScope.ServiceProvider.GetRequiredService<ManagementMutationService>().CreateCredentialAsync(alice.Context,
+                    new CredentialMutation("must-not-be-created", "retained-private-fixture", true, 3), ct);
+                await WaitForBlockerAsync(observer, mutationPid, deletionPid, postgres, maria, creation, ct);
+                await hold.CommitAsync(ct); released = true;
+                Assert.Equal(("default", "alice"), await deletion);
+                await Assert.ThrowsAsync<UnauthorizedAccessException>(() => creation);
+                Assert.False(await db.ManagementUsers.AsNoTracking().AnyAsync(u => u.Username == "native-resource-alice", ct));
+                Assert.False(await db.ClientCredentials.AsNoTracking().AnyAsync(c => c.ApiKey == "must-not-be-created", ct));
+                Assert.False(await db.ClientAccounts.AsNoTracking().AnyAsync(c => c.OwnerUsername == "alice", ct));
+                Assert.False(await db.ClientCredentials.AsNoTracking().AnyAsync(c => c.OwnerUsername == "alice", ct));
+                Assert.Equal(1, await db.ClientOwnerTransferAudits.CountAsync(ct));
+                Assert.Equal("NETTY_ONLINE", (await db.ClientSessions.AsNoTracking().SingleAsync(s => s.Id == 901, ct)).Status);
+            }
+            finally
+            {
+                if (!released) await hold.RollbackAsync(CancellationToken.None);
+                if (deletion is { IsCompleted: false } || creation is { IsCompleted: false })
+                {
+                    timeout.Cancel();
+                    if (deletion is not null) try { await deletion; } catch (Exception) { }
+                    if (creation is not null) try { await creation; } catch (Exception) { }
+                }
+            }
+        }
+    }
+
     internal static async Task VerifyNativeTargetDeletionOrderingAsync(TestServerFixture server)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
@@ -252,11 +388,11 @@ internal static class OwnerTransferWriterProof
         return command;
     }
 
-    internal static async Task<OwnerTransferActor> ActorAsync(TestServerFixture server, IServiceProvider services)
+    internal static async Task<OwnerTransferActor> ActorAsync(TestServerFixture server, IServiceProvider services, string? username = null, string? password = null)
     {
         var auth = services.GetRequiredService<IOptions<AuthOptions>>().Value;
         using var client = server.CreateClient();
-        using var response = await client.PostAsJsonAsync("/auth/login", new AdminLoginRequest(auth.Username, auth.Password, TenantId: auth.TenantId));
+        using var response = await client.PostAsJsonAsync("/auth/login", new AdminLoginRequest(username ?? auth.Username, password ?? auth.Password, TenantId: auth.TenantId));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var token = (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("accessToken").GetString();
         var principal = await services.GetRequiredService<AdminBearerTokenValidator>().ValidateAsync(token);

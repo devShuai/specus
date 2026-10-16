@@ -1,9 +1,13 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
+using Specus.Server.Security;
 
 namespace Specus.IntegrationTests;
 
@@ -30,14 +34,21 @@ public sealed class PeerClientDeletionVectorTests
             var db = seed.ServiceProvider.GetRequiredService<SpecusDbContext>();
             foreach (var sql in data.GetProperty("setup").EnumerateArray())
                 await db.Database.ExecuteSqlRawAsync(SqlFor(sql.GetString()!));
+            db.ManagementUsers.Add(new ManagementUser { Username = "vector-actor-key", LoginName = data.GetProperty("actor").GetString(),
+                TenantId = data.GetProperty("tenantId").GetString()!, Role = ManagementRole.Admin, Enabled = true });
+            await db.SaveChangesAsync();
             if (rollback)
                 await db.Database.ExecuteSqlRawAsync("CREATE TRIGGER fail_vector_delete BEFORE DELETE ON specus_client_account WHEN OLD.id=1001 BEGIN SELECT RAISE(ABORT,'injected failure'); END");
         }
         await using (var change = server.HostServices.CreateAsyncScope())
         {
             var mutation = change.ServiceProvider.GetRequiredService<ManagementMutationService>();
-            var context = new ManagementContext(data.GetProperty("tenantId").GetString()!,
-                data.GetProperty("actor").GetString()!, ManagementRole.Admin, false);
+            var services = change.ServiceProvider;
+            var token = services.GetRequiredService<LocalTokenService>().IssueToken(data.GetProperty("actor").GetString()!,
+                data.GetProperty("tenantId").GetString()!, ManagementRole.Admin, "vector-actor-key");
+            var principal = await services.GetRequiredService<AdminBearerTokenValidator>().ValidateAsync(token);
+            Assert.NotNull(principal);
+            var context = ManagementContext.From(new DefaultHttpContext { User = principal }, services.GetRequiredService<IOptions<AuthOptions>>().Value);
             if (rollback)
                 await Assert.ThrowsAsync<DbUpdateException>(() => mutation.DeleteClientAsync(context,
                     data.GetProperty("clientId").GetInt64(), CancellationToken.None));

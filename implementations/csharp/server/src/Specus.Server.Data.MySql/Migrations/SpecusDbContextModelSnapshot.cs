@@ -1406,8 +1406,8 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("varchar(64)")
+                        .HasMaxLength(256)
+                        .HasColumnType("varchar(256)")
                         .HasColumnName("password_hash");
 
                     b.Property<string>("ResendAvailableAt")
@@ -1488,8 +1488,8 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("varchar(64)")
+                        .HasMaxLength(256)
+                        .HasColumnType("varchar(256)")
                         .HasColumnName("password_hash");
 
                     b.Property<string>("Role")

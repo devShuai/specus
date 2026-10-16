@@ -16,6 +16,22 @@ namespace Specus.IntegrationTests;
 public sealed class MariaDbCompatibilityTests
 {
     [Fact]
+    public async Task NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var db = database.Context();
+        await OwnerTransferWriterProof.VerifyPasswordHashUpgradeAsync(db);
+    }
+
+    [Fact]
+    public async Task NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyNativeResourceWriteOrderingAsync(server);
+    }
+
+    [Fact]
     public async Task NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer()
     {
         await using var database = await OwnedDatabase.CreateAsync();

@@ -408,9 +408,8 @@ public sealed class WorkbenchService
     /// </summary>
     public static Task<int> DeleteIdentityAsync(SpecusDbContext db, string tenantId, string username,
         CancellationToken cancellationToken) =>
-        db.ManagementWorkbenchItems
-            .Where(row => row.TenantId == tenantId && row.Username == username)
-            .ExecuteDeleteAsync(cancellationToken);
+        db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM management_workbench_item WHERE tenant_id={tenantId} AND username={username}",
+            cancellationToken);
 
     private IQueryable<ManagementWorkbenchItem> IdentityRows(ManagementContext context, string list) =>
         _db.ManagementWorkbenchItems.Where(row =>

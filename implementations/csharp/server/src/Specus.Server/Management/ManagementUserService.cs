@@ -541,10 +541,8 @@ public sealed class ManagementUserService
         // The registered email points at the account key and goes with the account, so the address
         // can register again once the transaction commits.
         var accountKey = user.Username;
-        await _db.ManagementUserEmails
-            .Where(email => email.Username == accountKey)
-            .ExecuteDeleteAsync(cancellationToken)
-            .ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM specus_management_user_email WHERE username={accountKey}",
+            cancellationToken).ConfigureAwait(false);
         _db.ManagementUsers.Remove(user);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await ManagementAccessRevocations.RevokeTicketsAsync(_db, tenantId, loginName, cancellationToken)
@@ -572,9 +570,10 @@ public sealed class ManagementUserService
     private async Task ForgetOwnedDataAsync(string tenantId, string loginName, string actor,
         CancellationToken cancellationToken)
     {
-        await _db.UserDiagramDocuments
-            .Where(document => document.TenantId == tenantId && document.OwnerUsername == loginName)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        // Portable parameterized single-table DELETEs: Oracle EF emits a DELETE alias form
+        // rejected by supported MariaDB. All statements still join this owned transaction.
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM user_diagram_document WHERE tenant_id={tenantId} AND owner_username={loginName}",
+            cancellationToken).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         await _db.TransferAttachments
             .Where(attachment => attachment.TenantId == tenantId && attachment.OwnerUsername == loginName
@@ -584,16 +583,15 @@ public sealed class ManagementUserService
                 .SetProperty(attachment => attachment.UploadExpiresAt, now)
                 .SetProperty(attachment => attachment.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
-        await _db.TransferAttachmentDownloadGrants
-            .Where(grant => grant.TenantId == tenantId && grant.Username == loginName)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.TransferAttachmentDownloadUsages
-            .Where(usage => usage.TenantId == tenantId && usage.Username == loginName)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.PeerMeshDevices
-            .Where(device => device.TenantId == tenantId && device.OwnerUsername == loginName
-                && !_db.ClientAccounts.Any(client => client.Id == device.ClientId))
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM transfer_attachment_download_grant WHERE tenant_id={tenantId} AND username={loginName}",
+            cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM transfer_attachment_download_usage WHERE tenant_id={tenantId} AND username={loginName}",
+            cancellationToken).ConfigureAwait(false);
+        var (clientTable, clientKey) = ClientOwnershipWrite.Identifiers<ClientAccount>(_db, nameof(ClientAccount.Id));
+        await using (var orphanDevices = ClientOwnershipWrite.Command(_db,
+            $"DELETE FROM peer_mesh_device WHERE tenant_id=@tenant AND owner_username=@owner AND NOT EXISTS (SELECT 1 FROM {clientTable} AS c WHERE c.{clientKey}=peer_mesh_device.client_id)",
+            ("@tenant", tenantId), ("@owner", loginName)))
+            await orphanDevices.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await _db.PeerMeshAcls
             .Where(acl => acl.TenantId == tenantId && acl.OwnerUsername == loginName)
             .ExecuteUpdateAsync(setters => setters.SetProperty(acl => acl.OwnerUsername, actor), cancellationToken)

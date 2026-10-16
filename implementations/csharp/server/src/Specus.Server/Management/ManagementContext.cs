@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using Specus.Server.Configuration;
 using Specus.Server.Data.Entities;
+using Specus.Server.Security;
 
 namespace Specus.Server.Management;
 
@@ -10,6 +11,7 @@ public sealed record ManagementContext(
     ManagementRole Role,
     bool BuiltInAdmin)
 {
+    internal ManagementPrincipalBinding? Principal { get; init; }
     public bool IsAdmin => Role == ManagementRole.Admin;
 
     public static ManagementContext From(HttpContext httpContext, AuthOptions auth)
@@ -33,7 +35,12 @@ public sealed record ManagementContext(
         {
             role = ManagementRole.Admin;
         }
-        return new ManagementContext(tenantId, username, role, builtIn);
+        var externalSubject = httpContext.User.FindFirstValue("oidc_sub");
+        return new ManagementContext(tenantId, username, role, builtIn)
+        {
+            Principal = new ManagementPrincipalBinding(httpContext.User.FindFirstValue(LocalTokenService.AccountKeyClaim),
+                externalSubject is null ? null : httpContext.User.FindFirstValue("iss"), externalSubject),
+        };
     }
 
     public bool CanAccess(ClientAccount account) =>

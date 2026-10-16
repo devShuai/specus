@@ -1404,7 +1404,7 @@ namespace Specus.Server.Data.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
+                        .HasMaxLength(256)
                         .HasColumnType("TEXT")
                         .HasColumnName("password_hash");
 
@@ -1486,7 +1486,7 @@ namespace Specus.Server.Data.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
+                        .HasMaxLength(256)
                         .HasColumnType("TEXT")
                         .HasColumnName("password_hash");
 

@@ -1,7 +1,5 @@
 using System.Data.Common;
 using System.Security.Claims;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -181,13 +179,8 @@ internal sealed class ClientOwnerTransferWriter(SpecusDbContext db, IOptions<Aut
 
     private static bool ExternalIdentityMatches(OwnerTransferActor original, ManagementUser current)
     {
-        if (original.ExternalSubject is null) return true; // Local token: OIDC binding is not its authority.
-        if (original.ExternalIssuer is null || current.OidcIssuer != original.ExternalIssuer
-            || current.OidcSubject != original.ExternalSubject) return false;
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        hash.AppendData(Encoding.UTF8.GetBytes(original.ExternalIssuer)); hash.AppendData([0]);
-        hash.AppendData(Encoding.UTF8.GetBytes(original.ExternalSubject));
-        return current.OidcIdentityKey == Convert.ToHexStringLower(hash.GetHashAndReset());
+        return new ManagementPrincipalBinding(original.AccountKey, original.ExternalIssuer, original.ExternalSubject)
+            .MatchesExternalIdentity(current);
     }
 
     private bool IsReservedBuiltInName(string tenant, string name) => tenant == ManagementContext.NormalizeTenant(auth.Value.TenantId)
