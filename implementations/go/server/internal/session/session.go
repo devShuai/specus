@@ -4,6 +4,7 @@ package session
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -53,18 +54,54 @@ func NewRegistry() *Registry {
 // attachment and teardown for one canonical client name. Waiting is cancellable/bounded by
 // the caller; unlike mu, this lease may span DB work. Release is idempotent.
 func (r *Registry) AcquireControlLease(ctx context.Context, name string) (func(), error) {
+	return r.AcquireControlLeases(ctx, name)
+}
+
+func controlLeaseIndex(name string) int {
 	hash := uint32(2166136261)
 	for i := 0; i < len(name); i++ {
 		hash = (hash ^ uint32(name[i])) * 16777619
 	}
-	gate := r.controlLeases[hash%uint32(len(r.controlLeases))]
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-gate:
+	return int(hash % 256)
+}
+
+// AcquireControlLeases obtains the distinct stripes in one global order. Callers must not
+// already hold a control lease: acquiring a second endpoint after holding the first would
+// deadlock opposite-direction signals, and two different names can share one stripe.
+// No registry mutex is held during waiting, DB work or socket writes.
+func (r *Registry) AcquireControlLeases(ctx context.Context, names ...string) (func(), error) {
+	seen := make(map[int]bool, len(names))
+	indices := make([]int, 0, len(names))
+	for _, name := range names {
+		index := controlLeaseIndex(name)
+		if !seen[index] {
+			seen[index] = true
+			indices = append(indices, index)
+		}
 	}
+	sort.Ints(indices)
+	held := make([]int, 0, len(indices))
 	var once sync.Once
-	release := func() { once.Do(func() { gate <- struct{}{} }) }
+	release := func() {
+		once.Do(func() {
+			for i := len(held) - 1; i >= 0; i-- {
+				r.controlLeases[held[i]] <- struct{}{}
+			}
+		})
+	}
+	for _, index := range indices {
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			release()
+			return nil, ctx.Err()
+		case <-r.controlLeases[index]:
+			held = append(held, index)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		release()
 		return nil, err

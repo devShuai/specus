@@ -948,6 +948,9 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	if err != nil || source == nil {
 		return fmt.Errorf("source client not found: %s", sourceClientName)
 	}
+	if source.ClientName != sourceClientName {
+		return fmt.Errorf("%w: source canonical identity changed", ErrUndeliverable)
+	}
 	var signal ControlMessage
 	if err := json.Unmarshal([]byte(request.Message), &signal); err != nil || strings.TrimSpace(signal.Type) == "" {
 		return errors.New("invalid peer signal")
@@ -999,6 +1002,9 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	}
 	if target == nil {
 		return fmt.Errorf("%w: target client not found: %s", ErrUndeliverable, targetName)
+	}
+	if target.ClientName != targetName {
+		return fmt.Errorf("%w: target canonical identity changed", ErrUndeliverable)
 	}
 	if ok, err := s.CanPeer(ctx, *source, *target); err != nil || !ok {
 		if err != nil {

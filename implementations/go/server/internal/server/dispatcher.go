@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
@@ -121,9 +122,22 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 	case protocol.HeartbeatResponse:
 		return nil
 	case protocol.LogoutRequest:
-		if name := conn.ClientName(); name != "" {
-			d.sessions.Unbind(name, conn)
+		leaseCtx, cancel := context.WithTimeout(conn.Context(), 5*time.Second)
+		release, err := d.sessions.AcquireControlLease(leaseCtx, conn.ClientName())
+		cancel()
+		if err != nil {
+			return err
 		}
+		defer release()
+		current := d.sessions.IsBound(conn)
+		if conn.ConnectionRole() == protocol.ConnectionRoleData {
+			data, found := d.sessions.FindData(conn.ClientName())
+			current = found && data == conn
+		}
+		if !current {
+			return errUnauthenticated
+		}
+		d.sessions.Unbind(conn.ClientName(), conn)
 		return conn.Send(protocol.LogoutResponse{Success: true})
 	case protocol.NatMessage:
 		controlSession, controlBound := d.sessions.CurrentDataControl(conn)
@@ -140,17 +154,49 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 		}
 		return nil
 	case protocol.MessageRequest:
+		if conn.Context().Err() != nil || !d.sessions.IsBound(conn) {
+			return errUnauthenticated
+		}
+		peerControl := p.MessageType == protocol.MessageTypePeerControl
+		names := []string{conn.ClientName()}
+		var targetName string
+		var originalTarget session.Session
+		if requested := strings.TrimSpace(p.ToClientName); peerControl && requested != "" {
+			// Resolve the canonical SQL name BEFORE taking any lifecycle stripe. Native
+			// collations can match aliases with a different case. Protect the actual name,
+			// and fence the later lookup rather than acquiring an unprotected extra stripe.
+			target, err := d.db.FindClientByName(conn.Context(), requested)
+			if err != nil || target == nil {
+				d.logger.Debug("dropped unresolved Peer target", "client", conn.ClientName(), "err", err)
+				return nil
+			}
+			targetName = target.ClientName
+			p.ToClientName = targetName
+			names = append(names, targetName)
+			originalTarget, _ = d.sessions.Find(targetName)
+		}
 		leaseCtx, cancel := context.WithTimeout(conn.Context(), 5*time.Second)
-		release, err := d.sessions.AcquireControlLease(leaseCtx, conn.ClientName())
+		release, err := d.sessions.AcquireControlLeases(leaseCtx, names...)
 		cancel()
 		if err != nil {
+			if peerControl {
+				d.logger.Debug("dropped Peer signal waiting for lifecycle leases", "client", conn.ClientName(), "err", err)
+				return nil
+			}
 			return err
 		}
 		defer release()
 		if !d.sessions.IsBound(conn) {
 			return errUnauthenticated
 		}
-		if p.MessageType == protocol.MessageTypePeerControl {
+		if peerControl {
+			if targetName != "" {
+				currentTarget, _ := d.sessions.Find(targetName)
+				if currentTarget != originalTarget {
+					d.logger.Debug("dropped Peer signal for superseded target control", "client", conn.ClientName(), "to", targetName)
+					return nil
+				}
+			}
 			if d.peerControl == nil {
 				d.logger.Info("dropped PEER_CONTROL: peer mesh handler is not configured",
 					"channel", conn.ChannelID(), "client", conn.ClientName(), "bytes", len(p.Message))
