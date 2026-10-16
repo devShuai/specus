@@ -14,6 +14,32 @@ namespace Specus.IntegrationTests;
 public sealed class PostgresBootstrapTests
 {
     [Fact]
+    public async Task NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new ClientStartupProviderProof.StartupGate(false);
+        await using var server = await StartStartupAsync(database, gate);
+        await ClientStartupProviderProof.VerifyTransferBeforeStartupAsync(server, gate);
+    }
+
+    [Fact]
+    public async Task NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new ClientStartupProviderProof.StartupGate(true);
+        await using var server = await StartStartupAsync(database, gate);
+        await ClientStartupProviderProof.VerifyStartupBeforeTransferAsync(server, gate);
+    }
+
+    private static Task<TestServerFixture> StartStartupAsync(OwnedDatabase database, ClientStartupProviderProof.StartupGate gate) =>
+        TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Specus:Database:Provider"] = "postgres", ["ConnectionStrings:Specus"] = database.ConnectionString,
+            ["Specus:Database:SeedDemoClient"] = "false", ["Specus:PeerMesh:Enabled"] = "true",
+            ["Specus:PeerMesh:StunTurnPort"] = "0", ["Specus:PeerMesh:NatProbeAlternatePort"] = "0",
+        }, services => services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(gate)));
+
+    [Fact]
     public async Task NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder()
     {
         await using var database = await OwnedDatabase.CreateAsync();

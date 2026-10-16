@@ -9,8 +9,19 @@ public sealed class ClientAuthSessionStore
 {
     private readonly ConcurrentDictionary<string, ClientAuthSession> _byTokenHash = new();
     private readonly ConcurrentDictionary<long, string> _tokenHashBySessionId = new();
+    private readonly object _publicationGate = new();
 
     public ClientAuthSession Create(ClientCredential credential, ClientIdentity identity,
+        ClientAccount account, TimeSpan ttl, ClientEnvironmentInfo environment)
+    {
+        var session = Prepare(credential, identity, account, ttl, environment);
+        Publish(session);
+        return session;
+    }
+
+    // HTTP login prepares a token without making it an authentication authority. Publish only
+    // after the complete SQL startup transaction has committed successfully.
+    internal ClientAuthSession Prepare(ClientCredential credential, ClientIdentity identity,
         ClientAccount account, TimeSpan ttl, ClientEnvironmentInfo environment)
     {
         var accessToken = "cs_" + Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
@@ -32,9 +43,21 @@ public sealed class ClientAuthSessionStore
             HttpRouteCapabilityVersion = Math.Max(0, environment.ClientHttpRouteCapabilities?.Version ?? 0),
             Status = ClientAuthSessionStatus.HttpAuthenticated,
         };
-        _byTokenHash[session.TokenHash] = session;
-        _tokenHashBySessionId[session.Id] = session.TokenHash;
         return session;
+    }
+
+    internal void Publish(ClientAuthSession session)
+    {
+        lock (_publicationGate)
+        {
+            if (_tokenHashBySessionId.ContainsKey(session.Id) || !_byTokenHash.TryAdd(session.TokenHash, session))
+                throw new InvalidOperationException("client session publication conflict");
+            if (!_tokenHashBySessionId.TryAdd(session.Id, session.TokenHash))
+            {
+                _byTokenHash.TryRemove(new KeyValuePair<string, ClientAuthSession>(session.TokenHash, session));
+                throw new InvalidOperationException("client session publication conflict");
+            }
+        }
     }
 
     public ClientAuthSession? Find(long? sessionId, string? accessToken)

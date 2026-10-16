@@ -1,19 +1,16 @@
-using System.Data;
 using System.Data.Common;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Infrastructure;
-using Microsoft.EntityFrameworkCore.Metadata;
-using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Options;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Security;
+using Specus.Server.Persistence;
 using static Specus.Server.Management.ClientOwnerTransferPlan;
 
 namespace Specus.Server.Management;
@@ -63,11 +60,9 @@ internal sealed class ClientOwnerTransferWriter(SpecusDbContext db, IOptions<Aut
     private async Task<OwnerTransferWriteOutcome> CommitOnceAsync(OwnerTransferActor original, PathScope scope,
         string path, JsonElement request, TargetBinding binding, CancellationToken ct)
     {
-        var native = IsNativeProvider();
         // ReadCommitted matters on MySQL: a discovery read before a lock must not pin an old
         // RR snapshot. SQLite's non-deferred Serializable transaction owns the write reservation.
-        await using var transaction = await db.Database.BeginTransactionAsync(
-            native ? IsolationLevel.ReadCommitted : IsolationLevel.Serializable, ct).ConfigureAwait(false);
+        await using var transaction = await ClientOwnershipWrite.BeginAsync(db, ct).ConfigureAwait(false);
         var hint = request.ValueKind == JsonValueKind.Object
                    && request.TryGetProperty("targetUsername", out var field) && field.ValueKind == JsonValueKind.String
             ? field.GetString() : null;
@@ -200,26 +195,13 @@ internal sealed class ClientOwnerTransferWriter(SpecusDbContext db, IOptions<Aut
     private bool IsBuiltInTarget(string tenant, string name) => IsReservedBuiltInName(tenant, name)
         && auth.Value.PasswordLoginEnabled && !string.IsNullOrWhiteSpace(auth.Value.Password);
 
-    private bool IsNativeProvider()
-    {
-        var provider = db.Database.ProviderName;
-        if (provider == "Microsoft.EntityFrameworkCore.Sqlite") return false;
-        if (provider is "MySql.EntityFrameworkCore" or "Npgsql.EntityFrameworkCore.PostgreSQL") return true;
-        throw new NotSupportedException("unsupported ownership transaction provider");
-    }
-
     private async Task LockIdsAsync<T>(IEnumerable<long> ids, string tenant, CancellationToken ct)
     {
         foreach (var id in ids.Distinct().Order()) await LockKeyAsync<T>("Id", id, tenant, ct).ConfigureAwait(false);
     }
 
-    private async Task LockKeyAsync<T>(string keyProperty, object id, string tenant, CancellationToken ct)
-    {
-        var (table, key) = Identifiers<T>(keyProperty);
-        await using var command = Command($"SELECT {key} FROM {table} WHERE {key}=@id AND tenant_id=@tenant" + (IsNativeProvider() ? " FOR UPDATE" : ""),
-            ("@id", id), ("@tenant", tenant));
-        _ = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-    }
+    private Task LockKeyAsync<T>(string keyProperty, object id, string tenant, CancellationToken ct) =>
+        ClientOwnershipWrite.LockAsync<T>(db, id, tenant, ct, keyProperty);
 
     private async Task WriteOwnerAsync<T>(long id, string tenant, string target, DateTimeOffset now, CancellationToken ct)
     {
@@ -234,26 +216,10 @@ internal sealed class ClientOwnerTransferWriter(SpecusDbContext db, IOptions<Aut
             || reader.GetString(1) != target) throw new InvalidOperationException("ownership write postcondition failed");
     }
 
-    private (string Table, string Key) Identifiers<T>(string property)
-    {
-        var entity = db.Model.FindEntityType(typeof(T)) ?? throw new InvalidOperationException("unmapped ownership entity");
-        var store = StoreObjectIdentifier.Table(entity.GetTableName()!, entity.GetSchema());
-        var sql = db.GetService<ISqlGenerationHelper>();
-        return (sql.DelimitIdentifier(store.Name, store.Schema), sql.DelimitIdentifier(entity.FindProperty(property)!.GetColumnName(store)!));
-    }
+    private (string Table, string Key) Identifiers<T>(string property) => ClientOwnershipWrite.Identifiers<T>(db, property);
 
     private DbCommand Command(string text, params (string Name, object? Value)[] parameters)
-    {
-        var command = db.Database.GetDbConnection().CreateCommand();
-        command.Transaction = db.Database.CurrentTransaction!.GetDbTransaction();
-        command.CommandText = text;
-        foreach (var (name, value) in parameters)
-        {
-            var parameter = command.CreateParameter(); parameter.ParameterName = name;
-            parameter.Value = value ?? DBNull.Value; command.Parameters.Add(parameter);
-        }
-        return command;
-    }
+        => ClientOwnershipWrite.Command(db, text, parameters);
 
     private static string Stamp(DateTimeOffset value) => value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", System.Globalization.CultureInfo.InvariantCulture);
     private static ClientOwnerTransferException Invalid() => new(400, "INVALID_TRANSFER_REQUEST");

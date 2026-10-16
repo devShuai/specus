@@ -119,7 +119,7 @@ internal static class OwnerTransferWriterProof
         }
     }
 
-    private static async Task WaitForBlockerAsync(SpecusDbContext observer, long waiter, long holder, bool postgres, bool maria, Task operation, CancellationToken ct)
+    internal static async Task WaitForBlockerAsync(SpecusDbContext observer, long waiter, long holder, bool postgres, bool maria, Task operation, CancellationToken ct)
     {
         var query = postgres ? "SELECT COUNT(*) FROM pg_stat_activity WHERE pid=@waiter AND @holder=ANY(pg_blocking_pids(pid))"
             : maria ? "SELECT COUNT(*) FROM information_schema.INNODB_LOCK_WAITS w JOIN information_schema.INNODB_TRX r ON r.trx_id=w.requesting_trx_id JOIN information_schema.INNODB_TRX b ON b.trx_id=w.blocking_trx_id WHERE r.trx_mysql_thread_id=@waiter AND b.trx_mysql_thread_id=@holder"
@@ -162,7 +162,7 @@ internal static class OwnerTransferWriterProof
         Assert.Fail($"did not observe the expected real database blocking edge; engine={engine}; waiter={waiter}; holder={holder}; processState={state}; waitRows={waits}; operation={operation.Status}; {diagnostic}");
     }
 
-    private static async Task<object?> ScalarAsync(SpecusDbContext db, string text, CancellationToken ct, params (string, object)[] parameters)
+    internal static async Task<object?> ScalarAsync(SpecusDbContext db, string text, CancellationToken ct, params (string, object)[] parameters)
     {
         await using var command = CreateCommand(db, text, parameters);
         return await command.ExecuteScalarAsync(ct);
