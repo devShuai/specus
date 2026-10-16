@@ -89,6 +89,10 @@ st_buffer st_protocol_encode_message_response(const char *client_name,
                                                const char *to_client_name,
                                                int message_type,
                                                const char *message);
+/* Pure bounded encoding into caller-owned memory: no allocation or I/O. Same wire bytes and
+ * message-body limit as the allocating encoder. length is zero on failure. */
+int st_protocol_encode_message_response_into(const char *client_name, const char *to_client_name,
+    int message_type, const char *message, uint8_t *data, size_t capacity, size_t *length);
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json);
 st_buffer st_protocol_encode_nat_message(int type, uint8_t flags, uint32_t stream_id, uint32_t value,
                                          const char *meta_json, const uint8_t *data, size_t data_len);

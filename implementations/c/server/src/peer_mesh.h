@@ -17,17 +17,28 @@ typedef struct {
     void *handle; /* Owned physical reference; never a name to look up again. */
 } st_peer_mesh_catalog_binding;
 typedef struct {
-    /* Called BEFORE native SQL, with no cache/CID/registry lock retained. 0 owns a non-NULL
+    /* Called BEFORE native SQL, without taking an additional CID or retaining cache/registry
+     * locks. The business caller may already own its original source CID lifecycle. 0 owns a non-NULL
      * reference, 1 means no matching original connection, -1 is a resource/transport error.
      * expected_session/source constrain a publisher; a recipient is captured exactly once. */
     int (*capture)(void *ctx, const char *path, const st_storage_client *hint,
         long long expected_session, const st_storage_peer_catalog_source *expected,
         st_peer_mesh_catalog_binding *binding);
-    /* Called AFTER SQL closes. Never redirect either handle to a successor connection.
+    /* Explicit synthetic legacy transport only. Called AFTER SQL closes. Never redirect either handle to a successor connection.
      * publisher is NULL for an empty withdrawal. 1 means retired before socket acceptance. */
     int (*send)(void *ctx, const st_peer_mesh_catalog_binding *publisher,
         const st_peer_mesh_catalog_binding *recipient, const char *message);
     void (*release)(void *ctx, st_peer_mesh_catalog_binding *binding);
+    /* Reserve ordered invisible bounded storage BEFORE SQL; 1 means physically cancelled.
+     * On success finish consumes the reservation exactly once, even after native failure. */
+    int (*prepare)(void *ctx, const st_peer_mesh_catalog_binding *publisher,
+        const st_peer_mesh_catalog_binding *recipient, size_t message_capacity, void **reservation);
+    /* Pure private-memory stage inside the native writer: no allocation, application locks or
+     * I/O. nonempty binds the retained original publisher's cancellation guard, not its name. */
+    int (*stage)(void *ctx, void *reservation, const char *message, int nonempty);
+    /* AFTER SQL CLOSES: commit=1 only following successful native COMMIT; otherwise abort.
+     * Never redirect to a successor. 1 means physically cancelled, -1 resource failure. */
+    int (*finish)(void *ctx, void *reservation, int commit);
 } st_peer_mesh_catalog_transport;
 
 typedef struct {

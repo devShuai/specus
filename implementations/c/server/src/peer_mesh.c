@@ -156,11 +156,14 @@ typedef struct {
     char *data;
     size_t len;
     size_t cap;
+    int fixed;
 } pm_builder;
 
 static int pm_reserve(pm_builder *builder, size_t more)
 {
+    if (builder->len == SIZE_MAX || more > SIZE_MAX - builder->len - 1U) return -1;
     if (builder->len + more + 1U <= builder->cap) return 0;
+    if (builder->fixed) return -1;
     size_t next = builder->cap == 0U ? 256U : builder->cap;
     while (next < builder->len + more + 1U) {
         if (next > SIZE_MAX / 2U) return -1;
@@ -202,11 +205,17 @@ static int pm_appendf(pm_builder *builder, const char *format, ...)
 
 static int pm_append_json_string(pm_builder *builder, const char *value)
 {
-    char *escaped = st_json_escape(value == NULL ? "" : value);
-    if (escaped == NULL) return -1;
-    int rc = pm_appendf(builder, "\"%s\"", escaped);
-    free(escaped);
-    return rc;
+    /* Byte-identical to st_json_escape, without an auxiliary allocation. */
+    static const char hex[]="0123456789abcdef";
+    if (pm_append(builder,"\"") != 0) return -1;
+    for (const unsigned char *p=(const unsigned char *)(value?value:""); *p; ++p) {
+        char escaped[7]={0};
+        if (*p=='"' || *p=='\\') { escaped[0]='\\'; escaped[1]=(char)*p; }
+        else if (*p<0x20U) { memcpy(escaped,"\\u00",4); escaped[4]=hex[*p>>4]; escaped[5]=hex[*p&15]; }
+        else escaped[0]=(char)*p;
+        if (pm_append(builder,escaped) != 0) return -1;
+    }
+    return pm_append(builder,"\"");
 }
 
 static int pm_env_bool(const char *name, int default_value)
@@ -1184,6 +1193,41 @@ static void pm_format_instant(time_t value, char out[32])
         || strftime(out, 32U, "%Y-%m-%dT%H:%M:%SZ", &utc) == 0U) out[0] = '\0';
 }
 
+/* 32 definitions, each field escaped at worst six bytes per input byte, plus generous
+ * fixed JSON/numeric syntax and publisher identity. Derived from actual storage field sizes. */
+#define PM_CATALOG_FIELD(name) (sizeof(((st_storage_peer_mesh_service *)0)->name)-1U)
+#define PM_CATALOG_CAPACITY (4096U + 32U * (256U + 6U * (PM_CATALOG_FIELD(service_id) \
+    + PM_CATALOG_FIELD(name) + PM_CATALOG_FIELD(description) + PM_CATALOG_FIELD(transport) \
+    + PM_CATALOG_FIELD(application) + PM_CATALOG_FIELD(path))))
+
+static int pm_format_catalog(const pm_catalog *catalog, const st_storage_peer_catalog_view *view,
+    int visible, const char *expires_at, pm_builder *builder, int *nonempty)
+{
+    if (nonempty) *nonempty=0;
+    if (pm_appendf(builder,
+                   "{\"type\":\"service-catalog\",\"publisherClientId\":%lld,\"publisherClientName\":",
+                   catalog->publisher_client_id) != 0
+        || pm_append_json_string(builder, visible && view->publisher.id ? view->publisher.client_name : catalog->publisher_client_name) != 0
+        || pm_appendf(builder, ",\"publisherSessionId\":%lld,\"revision\":%lld,\"expiresAt\":",
+                      catalog->publisher_session_id, catalog->catalog_revision) != 0
+        || pm_append_json_string(builder, expires_at) != 0
+        || pm_append(builder, ",\"services\":[") != 0) return -1;
+    int first=1;
+    for (size_t i=0; visible && i<view->service_count; ++i) {
+        const st_storage_peer_mesh_service *service=&view->services[i];
+        size_t offered=0;
+        while (offered<catalog->service_count && strcmp(catalog->service_ids[offered],service->service_id)) ++offered;
+        if (offered==catalog->service_count) continue;
+        const pm_reported_endpoint *endpoint=&catalog->endpoints[offered];
+        const char *path=!*service->path && (!strcmp(service->application,"http") || !strcmp(service->application,"https")) ? "/" : service->path;
+        if (strcmp(endpoint->transport,service->transport) || strcmp(endpoint->application,service->application)
+            || strcmp(endpoint->path,path) || endpoint->published_port!=service->published_port) continue;
+        if ((!first && pm_append(builder,",") != 0) || pm_append_advertised_service(builder,service) != 0) return -1;
+        first=0; if (nonempty) *nonempty=1;
+    }
+    return pm_appendf(builder,"],\"createdAtMillis\":%lld}",catalog->created_at_millis);
+}
+
 static char *pm_build_bound_catalog_message(const st_peer_mesh_runtime *runtime,
                                       const pm_catalog *catalog,
                                       const st_storage_client *publisher,
@@ -1212,31 +1256,7 @@ static char *pm_build_bound_catalog_message(const st_peer_mesh_runtime *runtime,
     char expires_at[32];
     pm_format_instant(catalog->expires_at, expires_at);
     pm_builder builder = {0};
-    if (pm_appendf(&builder,
-                   "{\"type\":\"service-catalog\",\"publisherClientId\":%lld,\"publisherClientName\":",
-                   catalog->publisher_client_id) != 0
-        || pm_append_json_string(&builder, visible && view.publisher.id ? view.publisher.client_name : catalog->publisher_client_name) != 0
-        || pm_appendf(&builder, ",\"publisherSessionId\":%lld,\"revision\":%lld,\"expiresAt\":",
-                      catalog->publisher_session_id, catalog->catalog_revision) != 0
-        || pm_append_json_string(&builder, expires_at) != 0
-        || pm_append(&builder, ",\"services\":[") != 0) goto failed;
-    int first = 1;
-    for (size_t i = 0; visible && i < view.service_count; ++i) {
-        st_storage_peer_mesh_service *service = &view.services[i];
-        size_t offered = 0;
-        while (offered < catalog->service_count && strcmp(catalog->service_ids[offered], service->service_id)) ++offered;
-        if (offered == catalog->service_count) continue;
-        const pm_reported_endpoint *endpoint = &catalog->endpoints[offered];
-        const char *definition_path = !*service->path && (!strcmp(service->application, "http") || !strcmp(service->application, "https")) ? "/" : service->path;
-        if (strcmp(endpoint->transport, service->transport) || strcmp(endpoint->application, service->application)
-            || strcmp(endpoint->path, definition_path) || endpoint->published_port != service->published_port) continue;
-        if ((!first && pm_append(&builder, ",") != 0)
-            || pm_append_advertised_service(&builder, service) != 0) goto failed;
-        first = 0;
-        if (nonempty) *nonempty = 1;
-    }
-    if (pm_appendf(&builder, "],\"createdAtMillis\":%lld}",
-                   catalog->created_at_millis) != 0) goto failed;
+    if (pm_format_catalog(catalog,&view,visible,expires_at,&builder,nonempty) != 0) goto failed;
     st_storage_peer_catalog_view_free(&view);
     return builder.data;
 failed:
@@ -1251,6 +1271,51 @@ static char *pm_build_catalog_message(const st_peer_mesh_runtime *runtime, const
     return pm_build_bound_catalog_message(runtime,catalog,publisher,recipient,authorized,NULL,NULL,NULL);
 }
 
+typedef struct {
+    const st_peer_mesh_runtime *runtime;
+    const pm_catalog *catalog;
+    const st_storage_client *recipient;
+    pm_builder builder;
+    char expires_at[32];
+    void *reservation;
+} pm_catalog_delivery;
+
+static int pm_stage_catalog_delivery(void *context, const st_storage_peer_catalog_view *view, int visible)
+{
+    pm_catalog_delivery *delivery=context;
+    if (strcmp(view->recipient.client_name,delivery->recipient->client_name)) return 1;
+    int nonempty=0;
+    if (pm_format_catalog(delivery->catalog,view,visible && delivery->catalog->expires_at>time(NULL),
+            delivery->expires_at,&delivery->builder,&nonempty) != 0) return -1;
+    return delivery->runtime->catalog_transport->stage(delivery->runtime->ctx,delivery->reservation,
+        delivery->builder.data,nonempty);
+}
+
+static int pm_accept_catalog_delivery(const st_peer_mesh_runtime *runtime, const pm_catalog *catalog,
+    const st_storage_client *recipient, int authorized,
+    const st_peer_mesh_catalog_binding *publisher_binding, const st_peer_mesh_catalog_binding *recipient_binding)
+{
+    const st_peer_mesh_catalog_transport *transport=runtime->catalog_transport;
+    pm_catalog_delivery delivery={.runtime=runtime,.catalog=catalog,.recipient=recipient};
+    delivery.builder=(pm_builder){.data=malloc(PM_CATALOG_CAPACITY),.cap=PM_CATALOG_CAPACITY,.fixed=1};
+    if (!delivery.builder.data) return -1;
+    pm_format_instant(catalog->expires_at,delivery.expires_at);
+    int rc=transport->prepare(runtime->ctx,publisher_binding,recipient_binding,PM_CATALOG_CAPACITY,&delivery.reservation);
+    if (rc==0 && !delivery.reservation) rc=-1;
+    if (rc==0) {
+        int data=authorized && catalog->active && catalog->expires_at>time(NULL)
+            && !strcmp(catalog->database_path,runtime->database_path);
+        st_storage_peer_catalog_source source={.guarded=catalog->has_control_source,.control=catalog->control_source};
+        rc=st_storage_commit_peer_catalog_delivery(runtime->database_path,catalog->tenant_id,catalog->publisher_client_id,
+            data?&source:NULL,recipient->id,&recipient_binding->authority,data?catalog->service_ids:NULL,
+            data?catalog->service_count:0U,pm_stage_catalog_delivery,&delivery);
+        int finished=transport->finish(runtime->ctx,delivery.reservation,rc==0);
+        if (rc>=0) rc=finished<0?-1:0;
+    } else if (rc==1) rc=0;
+    free(delivery.builder.data);
+    return rc;
+}
+
 static int pm_deliver_catalog(const st_peer_mesh_runtime *runtime, const pm_catalog *catalog,
     const st_storage_client *publisher, const st_storage_client *recipient, int authorized)
 {
@@ -1262,7 +1327,9 @@ static int pm_deliver_catalog(const st_peer_mesh_runtime *runtime, const pm_cata
         int rc=message && runtime->send(runtime->ctx,recipient->client_name,"server",message)==0 ? 0:-1;
         free(message);return rc;
     }
-    if (!transport->capture || !transport->send || !transport->release) return -1;
+    if (!transport->capture || !transport->release) return -1;
+    int accepting=transport->prepare && transport->stage && transport->finish;
+    if (!accepting && (runtime->catalog_transport_required || !runtime->trusted_catalog_transport || !transport->send)) return -1;
     st_peer_mesh_catalog_binding from={0}, to={0}; char *message=NULL; int rc=0;
     int captured=transport->capture(runtime->ctx,runtime->database_path,recipient,0,NULL,&to);
     if (captured != 0 || to.handle == NULL) { rc=captured==1?0:-1;goto done; }
@@ -1274,6 +1341,10 @@ static int pm_deliver_catalog(const st_peer_mesh_runtime *runtime, const pm_cata
         captured=transport->capture(runtime->ctx,runtime->database_path,&hint,catalog->publisher_session_id,&expected,&from);
         if (captured<0 || (captured==0 && from.handle==NULL)) { rc=-1;goto done; }
         if (captured!=0) authorized=0; /* Withdraw, never rebind the original publisher. */
+    }
+    if (accepting) {
+        rc=pm_accept_catalog_delivery(runtime,catalog,recipient,authorized,from.handle?&from:NULL,&to);
+        goto done;
     }
     int deliverable=1, nonempty=0;
     message=pm_build_bound_catalog_message(runtime,catalog,publisher,recipient,authorized,&to.authority,&deliverable,&nonempty);

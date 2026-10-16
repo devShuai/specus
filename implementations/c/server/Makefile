@@ -23,6 +23,7 @@ CORE_OBJS += $(BUILD_DIR)/control_presence.o
 CORE_OBJS += $(BUILD_DIR)/owner_transfer.o
 CORE_OBJS += $(BUILD_DIR)/control_lifecycle.o
 CORE_OBJS += $(BUILD_DIR)/control_outbox.o
+PEER_OUTPUT_TESTS := $(BUILD_DIR)/specus_c_peer_output_tests
 OWNER_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_tests
 OWNER_RUNTIME_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_runtime_tests
 IDENTITY_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_client_identity_coordination_tests
@@ -118,6 +119,7 @@ ALL_TESTS += $(CATALOG_BINDING_TESTS)
 CONTROL_OUTBOX_TESTS := $(BUILD_DIR)/specus_c_control_outbox_tests
 CATALOG_ACCEPTANCE_TESTS := $(BUILD_DIR)/specus_c_catalog_acceptance_tests
 ALL_TESTS += $(CONTROL_OUTBOX_TESTS) $(CATALOG_ACCEPTANCE_TESTS)
+ALL_TESTS += $(PEER_OUTPUT_TESTS)
 CATALOG_SOURCE_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_source_e2e_tests
 CATALOG_SOURCE_BARRIER := $(BUILD_DIR)/libspecus_c_catalog_source_barrier.so
 ALL_TESTS += $(CATALOG_SOURCE_E2E_TESTS) $(CATALOG_SOURCE_BARRIER)
@@ -135,9 +137,11 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/storage.o $(BUILD_DIR)/owner_transfer.o: src/owner_transfer_internal.h src/owner_transfer.h src/storage.h
 $(BUILD_DIR)/peer_mesh.o: src/peer_mesh.h src/storage.h
 $(BUILD_DIR)/control_outbox.o: src/control_outbox.h
+$(BUILD_DIR)/protocol.o: src/protocol.h
+$(CONTROL_QUEUE_TESTS) $(CONTROL_SOURCE_WATCH_TESTS): src/control_outbox.h src/peer_mesh.h src/protocol.h
 $(BUILD_DIR)/control_presence.o $(BUILD_DIR)/storage.o: src/control_presence.h
 
-$(SERVER): $(CORE_OBJS) src/main.c src/peer_mesh.h src/storage.h src/control_presence.h | $(BUILD_DIR)
+$(SERVER): $(CORE_OBJS) src/main.c src/peer_mesh.h src/storage.h src/control_presence.h src/control_outbox.h src/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
@@ -161,11 +165,14 @@ $(CATALOG_READ_TESTS): $(CORE_OBJS) tests/catalog_read_tests.c tests/catalog_sou
 $(CONTROL_OUTBOX_TESTS): $(CORE_OBJS) tests/control_outbox_tests.c src/control_outbox.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/control_outbox_tests.c $(CORE_OBJS) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -o $@
 
+$(PEER_OUTPUT_TESTS): $(CORE_OBJS) tests/peer_output_tests.c src/main.c src/peer_mesh.h src/protocol.h src/control_outbox.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/peer_output_tests.c $(CORE_OBJS) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -o $@
+
 $(CATALOG_ACCEPTANCE_TESTS): $(CORE_OBJS) tests/catalog_acceptance_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h src/control_outbox.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_acceptance_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -Wl,--wrap=sqlite3_exec -o $@
 
 $(CATALOG_BINDING_TESTS): $(CORE_OBJS) tests/catalog_binding_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_binding_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_binding_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -o $@
 
 $(CATALOG_SOURCE_E2E_TESTS): $(CORE_OBJS) tests/catalog_source_e2e_tests.c tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_source_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
@@ -374,6 +381,7 @@ $(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 test: all
+	$(PEER_OUTPUT_TESTS)
 	$(CONTROL_OUTBOX_TESTS)
 	$(CATALOG_ACCEPTANCE_TESTS)
 	$(CATALOG_BINDING_TESTS)

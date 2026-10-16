@@ -104,24 +104,41 @@ in one native read snapshot. They copy no mDNS heap pointer across the unlocked 
 recheck the committed cache version before copying output. A retired/temporarily hidden cohort
 is omitted without deleting it; a database error fails the read rather than reporting false success.
 
-Nonempty catalog payloads, including replay, use one fresh native read snapshot for the original
-publisher source, current publisher/recipient ownership, consumer-to-publisher ACL, sharing and
+Catalog deliveries, including replay, reserve an invisible position in the original receiver's
+bounded FIFO before SQL. One native `BEGIN IMMEDIATE` projection checks the original publisher
+source, current publisher/recipient ownership, consumer-to-publisher ACL, sharing and
 the reported service definitions. Unknown visibility and malformed recipient lists do not grant
 access. A new port/protocol/path is not advertised until it matches the publisher's accepted report.
-Network, management and maintenance catalog sends capture retained physical publisher/recipient
+Network, management and maintenance catalog sends capture physical publisher/recipient
 references before SQL. Recipient authority uses that original session's current discovery capability,
-not a sibling session's latest capability. The send uses only the captured descriptor/object and
-checks local cancellation after waiting for its write lock; it never redirects a pending payload by
-name onto a reconnect. Empty withdrawals need no surviving publisher, but still require an
+not a sibling session's latest capability. Serialization into preallocated private buffers is pure
+memory staging, without queue/registry/CID/cache locks or socket I/O. Only successful native COMMIT,
+after SQL closes, makes the reserved entry deliverable; a read/stage/commit failure aborts it.
+The worker uses only the captured receiver object/descriptor, checks cancellation after waiting
+for its write lock, and never redirects a pending payload by name onto a reconnect. A nonempty
+entry owns an independent publisher cancellation guard, not a reference to its session or CID,
+so a slow receiver cannot pin publisher teardown/reconnect. Empty withdrawals need no surviving publisher, but still require an
 authenticated original recipient. Missing required transport is an error, not a trusted fallback.
 Source report admission also checks its own original session's discovery capability inside the
 native writer and after audit triggers; rejection releases the private stage without consuming
 raw/rate/output state or permanently retiring an otherwise live CONTROL.
 
-These reads release SQLite before socket I/O. Consequently a native takeover after the read
-snapshot but before blocking send acceptance is not yet fenced across instances; retained local
-references do not make that interval atomic. Distributed output ordering also remains separate
-alignment work. The online-peer hint is
+All Peer control/config/roster/signalling and ordinary CONTROL client messages share the same
+per-receiver reservation order. Heartbeats, login ACK and NAT frames do not wait behind invisible
+reservations. A target already blocked in an actual frame write still serializes other writes on
+that same socket. There are eight output workers, with at most one delivery per channel; entries
+and reserved bytes (including staged/in-flight buffers) are bounded to 64/64 MiB per channel and
+1,024/256 MiB globally. Admission failure is reported rather than waiting for quota or writing
+inside SQL. The existing 1 MiB message-body limit is unchanged. Channel teardown cancels queued
+entries, interrupts its socket, and waits for captured producers and in-flight delivery before
+freeing their physical resources. A reserved producer's buffer is never freed while it stages.
+
+Native queue acceptance is not a remote acknowledgement, nor a promise to retract a frame whose
+write already started. Messages accepted before a later policy write can still be pending on the
+wire. Distributed output/revision ordering remains separate alignment work, and other message
+types sharing the FIFO have not thereby gained native guarded authorization acceptance.
+There is no latency guarantee for all recipients when all eight writers are backpressured.
+The online-peer hint is
 still obtained before the report writer. Shared SQLite does not currently provide atomic
 distributed catalog publication.
 

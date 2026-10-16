@@ -9,12 +9,15 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 static int (*real_step)(sqlite3_stmt *);
 static int (*real_close)(sqlite3 *);
 static int (*real_exec)(sqlite3 *, const char *, int (*)(void *, int, char **, char **), void *, char **);
+static ssize_t (*real_send)(int,const void *,size_t,int);
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static atomic_int fired;
+static atomic_int sends;
 static _Thread_local sqlite3 *selected;
 static void symbols(void)
 {
@@ -23,7 +26,9 @@ static void symbols(void)
     _Static_assert(sizeof(close) == sizeof(real_close), "POSIX pointers");
     _Static_assert(sizeof(exec) == sizeof(real_exec), "POSIX pointers");
     memcpy(&real_step, &step, sizeof(step)); memcpy(&real_close, &close, sizeof(close)); memcpy(&real_exec, &exec, sizeof(exec));
-    if (!real_step || !real_close || !real_exec) _exit(91);
+    void *send_symbol=dlsym(RTLD_NEXT,"send"); _Static_assert(sizeof(send_symbol)==sizeof(real_send),"POSIX send pointer");
+    memcpy(&real_send,&send_symbol,sizeof(real_send));
+    if (!real_step || !real_close || !real_exec || !real_send) _exit(91);
 }
 static int armed(void)
 {
@@ -63,8 +68,14 @@ int sqlite3_step(sqlite3_stmt *stmt)
         && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_WRITE) pause_once();
     if (!strcmp(mode, "read") && rc == SQLITE_ROW && strstr(sql, "SELECT c.enabled,k.enabled FROM specus_client_session s")
         && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_READ) pause_once();
+    if (!strcmp(mode, "publication") && rc == SQLITE_ROW
+        && strstr(sql,"WHERE s.tenant_id COLLATE BINARY=? AND s.client_id=? AND s.service_id COLLATE BINARY=?")
+        && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db,"main")==SQLITE_TXN_WRITE) pause_once();
     if (!strcmp(mode, "delivery") && rc == SQLITE_ROW && strstr(sql, "SELECT c.enabled,k.enabled FROM specus_client_session s")
-        && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db, "main") == SQLITE_TXN_READ) selected = db;
+        && !sqlite3_get_autocommit(db)) selected = db;
+    if (!strcmp(mode,"accept-commit-fail") && rc==SQLITE_ROW
+        && strstr(sql,"WHERE s.tenant_id COLLATE BINARY=? AND s.client_id=? AND s.service_id COLLATE BINARY=?")
+        && !sqlite3_get_autocommit(db) && sqlite3_txn_state(db,"main")==SQLITE_TXN_WRITE) selected=db;
     return rc;
 }
 int sqlite3_close(sqlite3 *db)
@@ -79,7 +90,30 @@ int sqlite3_exec(sqlite3 *db, const char *sql, int (*callback)(void *, int, char
 {
     pthread_once(&once, symbols);
     const char *mode = getenv("SPECUS_TEST_CATALOG_SOURCE_MODE");
+    if (mode && !strcmp(mode,"accept-commit-fail") && db==selected && armed() && sql && !strcmp(sql,"COMMIT")) {
+        int expected=0;
+        if (atomic_compare_exchange_strong(&fired,&expected,1)) { selected=NULL;mark("ready");return SQLITE_IOERR; }
+    }
     if (mode && !strcmp(mode, "observer") && armed() && sql && strstr(sql, "CREATE TABLE IF NOT EXISTS"))
         mark("native-write-attempt");
     return real_exec(db, sql, callback, context, error);
+}
+
+static void mark_send(const char *name,int value)
+{
+    const char *dir=getenv("SPECUS_TEST_CONTROL_BARRIER_DIR");char path[512];
+    snprintf(path,sizeof(path),"%s/%s",dir,name);FILE *file=fopen(path,"w");if(!file) _exit(94);
+    fprintf(file,"%d\n",value);fclose(file);
+}
+ssize_t send(int fd,const void *data,size_t length,int flags)
+{
+    pthread_once(&once,symbols);
+    const char *mode=getenv("SPECUS_TEST_CATALOG_SOURCE_MODE");
+    int observe=mode && !strcmp(mode,"slow-output") && length>=65536U && armed();
+    int number=observe?atomic_fetch_add(&sends,1)+1:0;
+    if(observe) mark_send("slow-entered",number);
+    /* Observation ONLY: no injected delay or shortened timeout. The actual socket blocks. */
+    ssize_t rc=real_send(fd,data,length,flags);
+    if(observe) mark_send("slow-returned",number);
+    return rc;
 }

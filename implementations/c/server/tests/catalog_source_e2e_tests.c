@@ -2,6 +2,7 @@
 #include "catalog_reconnect_e2e_tests.c"
 #undef main
 #include <poll.h>
+#include <sys/socket.h>
 
 typedef struct {
     test_server a, b;
@@ -80,8 +81,8 @@ static int source_cleanup(source_fixture *f, int failed)
     free(f->token); free(f->other_token);
     if (f->prepared_b) server_cleanup(&f->b, failed);
     if (f->prepared_a) {
-        const char *names[] = {"arm", "ready", "resume", "native-write-attempt"};
-        for (size_t i = 0; i < 4; ++i) { char path[512]; snprintf(path, sizeof(path), "%s/%s", f->a.dir, names[i]); unlink(path); }
+        const char *names[] = {"arm", "ready", "resume", "native-write-attempt", "slow-entered", "slow-returned"};
+        for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); ++i) { char path[512]; snprintf(path, sizeof(path), "%s/%s", f->a.dir, names[i]); unlink(path); }
         server_cleanup(&f->a, failed);
     }
     return failed;
@@ -267,19 +268,26 @@ static int consistent_read(const char *library)
 {
     source_fixture f; int failed=1; long long revision=0;
 #define REQUIRE(c, text) do { if (!(c)) { fprintf(stderr,"FAIL real catalog single-read: %s\n",text); goto done; } } while(0)
-    REQUIRE(source_setup(&f,library,"read") == 0,"signed v2 publisher/recipient and accepted native fixture");
+    REQUIRE(source_setup(&f,library,"publication") == 0,"signed v2 publisher/recipient and accepted native fixture");
     REQUIRE(sql(&f.a,"PRAGMA journal_mode=WAL") == 0 && marker(&f.a,"arm") == 0
         && send_report(f.control,&f.publisher,2,"read-snapshot",0) == 0 && wait_marker(&f.a) == 0,
-        "actual original-source check paused inside native READ transaction");
+        "actual definition projection paused inside native publication writer");
     REQUIRE(expect_channel_alive(f.control) == 0 && expect_channel_alive(f.recipient) == 0,
-        "independent heartbeats while catalog reader is paused");
+        "independent heartbeats while catalog publication writer is paused");
+    sqlite3 *observer=NULL;
+    REQUIRE(sqlite3_open(f.a.db_path,&observer)==SQLITE_OK && sqlite3_busy_timeout(observer,0)==SQLITE_OK,
+        "independent native writer observer");
+    int busy=sqlite3_exec(observer,"BEGIN IMMEDIATE",NULL,NULL,NULL);
+    if(busy==SQLITE_OK) (void)sqlite3_exec(observer,"ROLLBACK",NULL,NULL,NULL);
+    sqlite3_close(observer);
+    REQUIRE(busy==SQLITE_BUSY,"native publication, not another read-before-send, excludes a policy writer");
     char mutation[1024]; snprintf(mutation,sizeof(mutation),
         "BEGIN IMMEDIATE; UPDATE client_account SET owner_username='changed-owner' WHERE rowid=%lld; "
         "UPDATE peer_mesh_device SET owner_username='changed-owner' WHERE client_id=%lld; "
         "UPDATE peer_mesh_shared_service SET name='After Snapshot' WHERE client_id=%lld; COMMIT;",
         f.publisher.client_id,f.publisher.client_id,f.publisher.client_id);
-    REQUIRE(sql(&f.a,mutation) == 0,"independent WAL writer commits parent/device/definition changes during native read");
     REQUIRE(marker(&f.a,"resume") == 0,"resume the same reader, not a rebuilt/fake view");
+    REQUIRE(sql(&f.a,mutation) == 0,"independent WAL writer commits only after native publication acceptance");
     int observed=0; long long deadline=monotonic_ms()+IO_TIMEOUT_MS;
     while(!observed && monotonic_ms()<deadline) {
         st_frame_header header; uint8_t *body=NULL; st_message_response message={0};
@@ -299,7 +307,7 @@ static int consistent_read(const char *library)
     REQUIRE(expect_channel_alive(f.control)==0 && expect_channel_alive(f.recipient)==0,"management-only transfer preserves both physical connections");
     failed=0;
 done:
-    failed=source_cleanup(&f,failed); printf("%s real catalog single native READ snapshot across actual WAL writer, independent heartbeat and next-view revocation\n",failed?"FAIL":"PASS"); return failed;
+    failed=source_cleanup(&f,failed); printf("%s real catalog native publication excludes WAL writer, independent heartbeat and next-view revocation\n",failed?"FAIL":"PASS"); return failed;
 #undef REQUIRE
 }
 static int recipient_replaced(const char *library)
@@ -383,11 +391,83 @@ done:
     printf("%s real catalog exact %s session capability, no sibling inheritance and recovery\n",failed?"FAIL":"PASS",publisher?"publisher":"recipient");return failed;
 #undef REQUIRE
 }
+static int acceptance_rollback(const char *library)
+{
+    source_fixture f;int failed=1,nonempty=0;long long revision=0;char reason[512],count[32];
+#define REQUIRE(c,text) do {if(!(c)){fprintf(stderr,"FAIL real publication rollback: %s\n",text);goto done;}}while(0)
+    REQUIRE(source_setup(&f,library,"accept-commit-fail")==0 && marker(&f.a,"arm")==0
+        && send_report(f.control,&f.publisher,2,"pending-publication",0)==0 && wait_marker(&f.a)==0,
+        "actual delivery writer COMMIT fails after private payload staging");
+    REQUIRE(source_fence(&f,&nonempty)==0 && nonempty==0,"later ordered business frame fences aborted catalog, not a timer");
+    REQUIRE(expect_channel_alive(f.control)==0 && expect_channel_alive(f.recipient)==0,
+        "publication SQL failure does not retire either physical endpoint");
+    REQUIRE(db_scalar(f.a.db_path,"SELECT COUNT(*) FROM peer_mesh_service_audit WHERE action='service-report' AND tenant_id=?",
+            f.tenant,0,count,sizeof(count))==0 && !strcmp(count,"2")
+        && instances(&f.a,f.token,1,"pending-publication")==0,"already committed report/cache survives failed delivery only");
+    REQUIRE(channel_login(f.a.control_port,&f.peer,ST_CONNECTION_ROLE_CONTROL,&f.other_recipient,reason,sizeof(reason))==1
+        && wait_peer(f.other_recipient,"peer-config",NULL,0,NULL)==0
+        && wait_peer(f.other_recipient,"service-catalog",&f.publisher,0,&revision)==0 && revision==f.first_revision+1,
+        "same accepted report replays after original recipient reconnect, with retained revision");
+    REQUIRE(db_scalar(f.a.db_path,"SELECT COUNT(*) FROM peer_mesh_service_audit WHERE action='service-report' AND tenant_id=?",
+        f.tenant,0,count,sizeof(count))==0 && !strcmp(count,"2"),"retry never invents another report audit");
+    failed=0;
+done:
+    failed=source_cleanup(&f,failed);printf("%s real catalog publication COMMIT rollback / ordered abort / retained replay\n",failed?"FAIL":"PASS");return failed;
+#undef REQUIRE
+}
+static int send_counter(test_server *server,const char *name)
+{
+    char path[512];snprintf(path,sizeof(path),"%s/%s",server->dir,name);FILE *file=fopen(path,"r");int value=0;
+    if(file) {if(fscanf(file,"%d",&value)!=1)value=0;fclose(file);}return value;
+}
+static int slow_receiver(const char *library)
+{
+    source_fixture f;int failed=1;long long revision=0;char reason[512];char *payload=NULL;
+#define REQUIRE(c,text) do {if(!(c)){fprintf(stderr,"FAIL real slow receiver: %s\n",text);goto done;}}while(0)
+    REQUIRE(source_setup(&f,library,"slow-output")==0,"signed publisher/recipient accepted original report");
+    harness_login_environment_extra=caps;
+    int login=http_client_login(&f.a,"ck_catalog_source","catalog-source-secret","slow-witness","user",&f.other);
+    harness_login_environment_extra="";
+    REQUIRE(login==0 && source_enable(&f,&f.other)==0
+        && channel_login(f.a.control_port,&f.other,ST_CONNECTION_ROLE_CONTROL,&f.other_recipient,reason,sizeof(reason))==1
+        && wait_peer(f.other_recipient,"peer-config",NULL,0,NULL)==0
+        && wait_peer(f.other_recipient,"service-catalog",&f.publisher,0,&revision)==0,"independent actual witness CONTROL");
+    REQUIRE(db_scalar(f.a.db_path,"SELECT channel_id FROM specus_client_session WHERE id=?",NULL,f.publisher.session_id,
+        f.old_channel,sizeof(f.old_channel))==0,"exact original source channel");
+    int window=4096;
+    REQUIRE(setsockopt(f.recipient,SOL_SOCKET,SO_RCVBUF,&window,sizeof(window))==0 && marker(&f.a,"arm")==0,
+        "actual non-reading receiver with small kernel receive window");
+    size_t size=512U*1024U;payload=malloc(size+1U);REQUIRE(payload!=NULL,"bounded flood buffer");memset(payload,'x',size);payload[size]='\0';
+    for(int i=0;i<16;++i) {
+        st_buffer packet=st_protocol_encode_message_response(f.publisher.client_name,f.peer.client_name,ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,payload);
+        REQUIRE(packet.data!=NULL,"bounded actual 512KiB business frame");packet.data[6]=ST_CMD_MESSAGE_REQUEST;
+        REQUIRE(send_buffer(f.control,&packet)==0,"actual publisher sends 8MiB behind non-reading peer");
+    }
+    REQUIRE(send_report(f.control,&f.publisher,2,"behind-slow-peer",0)==0
+        && wait_peer(f.other_recipient,"service-catalog",&f.publisher,0,&revision)==0 && revision==f.first_revision+1,
+        "same publisher business/CID completes report while peer socket is actually backpressured");
+    int entered=send_counter(&f.a,"slow-entered"),returned=send_counter(&f.a,"slow-returned");
+    fprintf(stderr,"OBSERVATION actual slow socket entered=%d returned=%d\n",entered,returned);
+    REQUIRE(entered>returned && expect_channel_alive(f.control)==0 && expect_channel_alive(f.other_recipient)==0,
+        "observed real send still blocked; unrelated and publisher heartbeats independent");
+    close_fd(&f.control);
+    REQUIRE(wait_native_closed(&f)==0,"original source cleanup is not pinned by target output or queued catalog refs");
+    REQUIRE(channel_login(f.a.control_port,&f.publisher,ST_CONNECTION_ROLE_CONTROL,&f.replacement,reason,sizeof(reason))==1
+        && expect_channel_alive(f.replacement)==0 && expect_channel_alive(f.other_recipient)==0,
+        "original SID can reconnect before slow receiver drains");
+    REQUIRE(send_counter(&f.a,"slow-entered")>send_counter(&f.a,"slow-returned"),"actual old socket remains blocked across source cleanup/reconnect");
+    failed=0;
+done:
+    free(payload);failed=source_cleanup(&f,failed);printf("%s real kernel-backpressured receiver / source business+heartbeat+cleanup+sameSID reconnect\n",failed?"FAIL":"PASS");return failed;
+#undef REQUIRE
+}
 int main(int argc, char **argv)
 {
     if (argc != 3 && argc != 4) return 2;
     signal(SIGPIPE, SIG_IGN); server_binary = argv[1];
     if (argc == 4) {
+        if (!strcmp(argv[3], "acceptance-rollback")) return acceptance_rollback(argv[2]);
+        if (!strcmp(argv[3], "slow-receiver")) return slow_receiver(argv[2]);
         if (!strcmp(argv[3], "recipient-replaced")) return recipient_replaced(argv[2]);
         if (!strcmp(argv[3], "publisher-detached")) return publisher_detached(argv[2]);
         if (!strcmp(argv[3], "recipient-capability")) return endpoint_capability(argv[2],0);
@@ -400,5 +480,6 @@ int main(int argc, char **argv)
     }
     return audit_failure(argv[2], "audit-insert") + audit_failure(argv[2], "audit-prune") + audit_failure(argv[2], "trigger")
         + takeover(argv[2], 0) + takeover(argv[2], 1) + consistent_read(argv[2])
-        + recipient_replaced(argv[2]) + publisher_detached(argv[2]) + endpoint_capability(argv[2],0) + endpoint_capability(argv[2],1) ? 1 : 0;
+        + recipient_replaced(argv[2]) + publisher_detached(argv[2]) + endpoint_capability(argv[2],0) + endpoint_capability(argv[2],1)
+        + acceptance_rollback(argv[2]) + slow_receiver(argv[2]) ? 1 : 0;
 }

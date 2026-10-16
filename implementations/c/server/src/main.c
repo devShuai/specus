@@ -3,6 +3,7 @@
 #include "admin_http.h"
 #include "crypto.h"
 #include "control_lifecycle.h"
+#include "control_outbox.h"
 #include "control_presence.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
@@ -220,6 +221,11 @@ typedef struct ws_conn {
     struct ws_conn *next;
 } ws_conn;
 
+typedef struct {
+    atomic_size_t references;
+    atomic_int cancelled;
+} peer_delivery_guard;
+
 struct specus_session {
     int control_fd;
     st_tls_connection *tls_connection;
@@ -231,6 +237,8 @@ struct specus_session {
     specus_session *source_watch_next;
     int source_watch_queued; /* Intrusive fair queue, active_session_lock; no extra owner ref. */
     atomic_int control_cancelled;
+    peer_delivery_guard *delivery_guard; /* Independent lifetime: queued peers never pin this session. */
+    st_control_outbox_channel *peer_outbox;
     pthread_cond_t control_work_cond;
     int control_work_busy;
     int control_work_queued;
@@ -291,6 +299,26 @@ struct specus_session {
     struct specus_session *live_next;
 };
 
+static peer_delivery_guard *peer_guard_create(void)
+{
+    peer_delivery_guard *guard=malloc(sizeof(*guard));
+    if (guard) { atomic_init(&guard->references,1U); atomic_init(&guard->cancelled,0); }
+    return guard;
+}
+static void peer_guard_retain(peer_delivery_guard *guard)
+{
+    if (guard) atomic_fetch_add(&guard->references,1U);
+}
+static void peer_guard_release(peer_delivery_guard *guard)
+{
+    if (guard && atomic_fetch_sub(&guard->references,1U)==1U) free(guard);
+}
+static void control_cancel(specus_session *session)
+{
+    atomic_store(&session->control_cancelled,1);
+    if (session->delivery_guard) atomic_store(&session->delivery_guard->cancelled,1);
+}
+
 /* The connections a login took out of service, each still referenced by that login. */
 typedef struct {
     specus_session *sessions[ST_MAX_DISPLACED_SESSIONS];
@@ -333,6 +361,8 @@ static specus_session *control_ready_head;
 static specus_session *control_ready_tail;
 #define ST_CONTROL_POOL_SIZE 4U
 static pthread_t control_pool[ST_CONTROL_POOL_SIZE];
+static st_control_outbox *peer_outbox;
+static int peer_outbox_enqueue(specus_session *target, const st_buffer *packet);
 static size_t control_pool_count;
 static int control_pool_stopping;
 #define ST_CONTROL_WORK_ITEMS 32U
@@ -1394,14 +1424,14 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
  * socket down here, under send_lock, is safe, since session_shutdown closes the descriptor under
  * the same lock and its number cannot have been reused yet.
  */
-static int session_send_packet_locked(specus_session *session, st_buffer *packet)
+static int session_send_bytes_locked(specus_session *session, const uint8_t *data, size_t length)
 {
     int rc = -1;
-    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed
+    if (data != NULL && session->control_fd >= 0 && !session->write_failed
         && !atomic_load(&session->nat_retired)) {
         rc = session->tls_connection == NULL
-            ? send_all(session->control_fd, packet->data, packet->len)
-            : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
+            ? send_all(session->control_fd, data, length)
+            : st_tls_connection_write_all(session->tls_connection, data, length);
         if (rc != 0) {
             int write_errno = errno;
             session->write_failed = 1;
@@ -1411,6 +1441,12 @@ static int session_send_packet_locked(specus_session *session, st_buffer *packet
                     session->config.client_name, write_errno);
         }
     }
+    return rc;
+}
+
+static int session_send_packet_locked(specus_session *session, st_buffer *packet)
+{
+    int rc=session_send_bytes_locked(session,packet->data,packet->len);
     st_buffer_free(packet);
     return rc;
 }
@@ -1784,7 +1820,7 @@ static void active_session_remove_locked(specus_session *session)
     source_watch_remove_locked(session);
     /* A retained catalog reference must observe local detach before it can write, even while
      * the owning reader is still draining its worker and has not closed the native row yet. */
-    if (session->bound && !session->is_data_connection) atomic_store(&session->control_cancelled, 1);
+    if (session->bound && !session->is_data_connection) control_cancel(session);
     session->bound = 0;
     specus_session **cursor = &active_sessions;
     while (*cursor != NULL) {
@@ -1942,7 +1978,7 @@ static void displace_session_locked(specus_session *session, const char *reason)
 {
     session->displaced_reason = reason;
     ++session->references;
-    atomic_store(&session->control_cancelled, 1);
+    control_cancel(session);
     shutdown(session->control_fd, SHUT_RDWR);
     active_session_remove_locked(session);
     retire_data_namespace(session);
@@ -3035,7 +3071,8 @@ static int push_runtime_client_message(void *ctx,
                                                            client_name,
                                                            ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,
                                                            message);
-    int result = packet.data != NULL && session_send_packet(control, &packet) == 0 ? 0 : -2;
+    int result=peer_outbox_enqueue(control,&packet)==0?0:-2;
+    st_buffer_free(&packet);
     session_reference_release(control);
     return result;
 }
@@ -3158,7 +3195,8 @@ static int forward_runtime_client_message(specus_session *source_session,
                                                            target.client_name,
                                                            ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,
                                                            request->message);
-    int result = packet.data != NULL && session_send_packet(target_control, &packet) == 0 ? 0 : -2;
+    int result=peer_outbox_enqueue(target_control,&packet)==0?0:-2;
+    st_buffer_free(&packet);
     session_reference_release(target_control);
     return result;
 }
@@ -3176,6 +3214,50 @@ static int peer_mesh_runtime_online(void *ctx,
             || control->config.client_id == client_id)) online = 1;
     pthread_mutex_unlock(&active_session_lock);
     return online;
+}
+
+typedef struct {
+    peer_delivery_guard *publisher;
+    int needs_publisher;
+} peer_delivery_item;
+
+static void peer_outbox_release(void *context)
+{
+    peer_delivery_item *item=context;
+    if (item) { peer_guard_release(item->publisher); free(item); }
+}
+static void peer_outbox_deliver(void *context, void *item_context, const unsigned char *data, size_t length)
+{
+    specus_session *target=context; peer_delivery_item *item=item_context;
+    /* Channel owner waits for this callback before destroying send_lock/TLS/descriptor. No
+     * publisher session is retained across this potentially blocking write. */
+    pthread_mutex_lock(&target->send_lock);
+    int cancelled=atomic_load(&target->control_cancelled) || atomic_load(&target->nat_retired)
+        || (item && item->needs_publisher && (!item->publisher || atomic_load(&item->publisher->cancelled)));
+    if (!cancelled) (void)session_send_bytes_locked(target,data,length);
+    pthread_mutex_unlock(&target->send_lock);
+}
+static int peer_outbox_start(void)
+{
+    st_control_outbox_limits limits={1024U,8U*ST_MAX_FRAME_SIZE,64U,2U*ST_MAX_FRAME_SIZE,8U};
+    peer_outbox=st_control_outbox_create(&limits,peer_outbox_deliver,peer_outbox_release);
+    return peer_outbox?0:-1;
+}
+static int peer_outbox_enqueue(specus_session *target, const st_buffer *packet)
+{
+    if (!target->peer_outbox || !packet->data) return -1;
+    if (atomic_load(&target->control_cancelled)) return 1;
+    st_control_outbox_ticket *ticket=NULL;
+    if (st_control_outbox_reserve(target->peer_outbox,packet->len,NULL,&ticket) != 0)
+        return atomic_load(&target->control_cancelled)?1:-1;
+    int rc=st_control_outbox_stage(ticket,packet->data,packet->len);
+    if (rc!=0) { st_control_outbox_abort(ticket); return rc; }
+    return st_control_outbox_commit(ticket);
+}
+static void session_outbox_dispose(specus_session *session)
+{
+    st_control_outbox_channel_destroy(session->peer_outbox); session->peer_outbox=NULL;
+    peer_guard_release(session->delivery_guard); session->delivery_guard=NULL;
 }
 
 static int peer_mesh_runtime_send(void *ctx,
@@ -3196,9 +3278,10 @@ static int peer_mesh_runtime_send(void *ctx,
                                                            target_client_name,
                                                            ST_MESSAGE_TYPE_PEER_CONTROL,
                                                            message);
-    int rc = packet.data != NULL && session_send_packet(target, &packet) == 0 ? 0 : -1;
+    int rc=peer_outbox_enqueue(target,&packet);
+    st_buffer_free(&packet);
     session_reference_release(target);
-    return rc;
+    return rc==1?0:rc;
 }
 
 static int catalog_control_source_equal(const st_storage_control_source *a, const st_storage_control_source *b)
@@ -3235,24 +3318,64 @@ static int peer_catalog_capture(void *ctx, const char *path, const st_storage_cl
     return matches?0:1;
 }
 
-static int peer_catalog_send(void *ctx, const st_peer_mesh_catalog_binding *publisher,
-    const st_peer_mesh_catalog_binding *recipient, const char *message)
+typedef struct {
+    specus_session *target; /* Borrowed until finish; caller still owns its capture reference. */
+    st_control_outbox_ticket *ticket;
+    peer_delivery_item *item; /* Ticket-owned; only inspect BEFORE consuming the ticket. */
+    uint8_t *frame;
+    size_t capacity;
+} peer_catalog_pending;
+
+static int peer_catalog_prepare(void *ctx, const st_peer_mesh_catalog_binding *publisher,
+    const st_peer_mesh_catalog_binding *recipient, size_t message_capacity, void **reservation)
 {
     (void)ctx;
+    if (!reservation) return -1;
+    *reservation=NULL;
     specus_session *target=recipient?recipient->handle:NULL;
     specus_session *source=publisher?publisher->handle:NULL;
-    if (target==NULL || (publisher && source==NULL) || message==NULL) return -1;
-    st_buffer packet=st_protocol_encode_message_response("server",target->config.client_name,ST_MESSAGE_TYPE_PEER_CONTROL,message);
-    if (packet.data==NULL) return -1;
-    /* No SQLite/CID/registry lock here. The retained object pins its descriptor lifetime.
-     * Recheck cancellation AFTER any wait for send_lock; never look up a replacement by name. */
-    pthread_mutex_lock(&target->send_lock);
-    int retired=atomic_load(&target->control_cancelled) || atomic_load(&target->nat_retired)
-        || (source && (atomic_load(&source->control_cancelled) || atomic_load(&source->nat_retired)));
-    int rc;
-    if (retired) { st_buffer_free(&packet); rc=1; }
-    else rc=session_send_packet_locked(target,&packet);
-    pthread_mutex_unlock(&target->send_lock);
+    if (!target || !target->peer_outbox || !target->delivery_guard || (publisher && (!source || !source->delivery_guard))
+        || message_capacity > SIZE_MAX-1024U) return -1;
+    if (atomic_load(&target->control_cancelled)) return 1;
+    peer_catalog_pending *pending=calloc(1,sizeof(*pending));
+    peer_delivery_item *item=calloc(1,sizeof(*item));
+    if (!pending || !item) { free(pending); free(item); return -1; }
+    pending->target=target; pending->item=item; pending->capacity=message_capacity+1024U;
+    pending->frame=malloc(pending->capacity);
+    if (!pending->frame) { free(item); free(pending); return -1; }
+    if (source) { item->publisher=source->delivery_guard; peer_guard_retain(item->publisher); }
+    int rc=st_control_outbox_reserve(target->peer_outbox,pending->capacity,item,&pending->ticket);
+    if (rc!=0) {
+        peer_outbox_release(item); free(pending->frame); free(pending);
+        return atomic_load(&target->control_cancelled)?1:-1;
+    }
+    *reservation=pending;
+    return 0;
+}
+
+static int peer_catalog_stage(void *ctx, void *reservation, const char *message, int nonempty)
+{
+    (void)ctx; peer_catalog_pending *pending=reservation;
+    if (!pending || !message) return -1;
+    if (atomic_load(&pending->target->control_cancelled) || atomic_load(&pending->target->nat_retired)
+        || (nonempty && (!pending->item->publisher || atomic_load(&pending->item->publisher->cancelled)))) return 1;
+    size_t length=0;
+    if (st_protocol_encode_message_response_into("server",pending->target->config.client_name,
+            ST_MESSAGE_TYPE_PEER_CONTROL,message,pending->frame,pending->capacity,&length) != 0) return -1;
+    pending->item->needs_publisher=nonempty;
+    return st_control_outbox_stage(pending->ticket,pending->frame,length);
+}
+
+static int peer_catalog_finish(void *ctx, void *reservation, int commit)
+{
+    (void)ctx; peer_catalog_pending *pending=reservation;
+    if (!pending) return -1;
+    int cancelled=atomic_load(&pending->target->control_cancelled) || atomic_load(&pending->target->nat_retired)
+        || (pending->item->needs_publisher && (!pending->item->publisher || atomic_load(&pending->item->publisher->cancelled)));
+    int rc=0;
+    if (!commit || cancelled) { st_control_outbox_abort(pending->ticket); rc=cancelled?1:0; }
+    else rc=st_control_outbox_commit(pending->ticket);
+    free(pending->frame); free(pending);
     return rc;
 }
 
@@ -3265,7 +3388,8 @@ static void peer_catalog_release(void *ctx, st_peer_mesh_catalog_binding *bindin
 }
 
 static const st_peer_mesh_catalog_transport peer_catalog_transport={
-    .capture=peer_catalog_capture,.send=peer_catalog_send,.release=peer_catalog_release
+    .capture=peer_catalog_capture,.release=peer_catalog_release,
+    .prepare=peer_catalog_prepare,.stage=peer_catalog_stage,.finish=peer_catalog_finish
 };
 
 static int control_source_active(void *ctx)
@@ -3282,7 +3406,7 @@ static int control_source_active(void *ctx)
  * closed before this returns or the caller waits for another lock. A name alone is not identity. */
 static void control_retire_native_source(specus_session *session)
 {
-    atomic_store(&session->control_cancelled, 1);
+    control_cancel(session);
     pthread_mutex_lock(&active_session_lock);
     if (session->displaced_reason == NULL) session->displaced_reason = "AUTH_SOURCE_RETIRED";
     active_session_close_data_locked(session);
@@ -3631,7 +3755,7 @@ static int control_message_enqueue(specus_session *session, st_message_response 
 
 static void control_worker_stop(specus_session *session)
 {
-    atomic_store(&session->control_cancelled, 1);
+    control_cancel(session);
     pthread_mutex_lock(&control_queue_lock);
     session->control_work_stopping = 1;
     control_work_item *item = session->control_work_head;
@@ -5699,8 +5823,20 @@ static void *client_thread(void *arg)
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
+    session->delivery_guard=peer_guard_create();
+    session->peer_outbox=st_control_outbox_channel_create(peer_outbox,session);
+    if (!session->delivery_guard || !session->peer_outbox) {
+        session_outbox_dispose(session);
+        close(session->control_fd);
+        pthread_mutex_destroy(&session->send_lock); pthread_mutex_destroy(&session->map_lock);
+        pthread_mutex_destroy(&session->direct_lock); pthread_cond_destroy(&session->reference_cond);
+        pthread_cond_destroy(&session->control_work_cond); free(session);
+        return NULL;
+    }
+
     if (connection_register(session) != 0) {
         /* Accepted just as the server began to stop: nothing was read, so nothing to record. */
+        session_outbox_dispose(session);
         close(session->control_fd);
         pthread_mutex_destroy(&session->send_lock);
         pthread_mutex_destroy(&session->map_lock);
@@ -5714,6 +5850,7 @@ static void *client_thread(void *arg)
      * reader before process-global crypto cleanup. An accept/probe can race immediate SIGTERM. */
     uint8_t physical_random[16];
     if (RAND_bytes(physical_random, sizeof(physical_random)) != 1) {
+        session_outbox_dispose(session);
         session_shutdown(session);
         connection_unregister(session);
         pthread_mutex_destroy(&session->send_lock);
@@ -5736,6 +5873,7 @@ static void *client_thread(void *arg)
                                      tls_error,
                                      sizeof(tls_error)) != 0) {
             fprintf(stderr, "[tls] handshake rejected remote=%s: %s\n", session->remote, tls_error);
+            session_outbox_dispose(session);
             session_shutdown(session);
             connection_unregister(session);
             pthread_mutex_destroy(&session->send_lock);
@@ -6099,12 +6237,21 @@ static void *client_thread(void *arg)
     active_session_remove_locked(session);
     retire_data_namespace(session);
     pthread_mutex_unlock(&active_session_lock);
+    st_control_outbox_channel_close(session->peer_outbox);
+    /* Interrupt a blocked writer without waiting for send_lock. Only this owning reader closes
+     * the descriptor; registry shutdown uses the same lifetime fence against descriptor reuse. */
+    pthread_mutex_lock(&connection_registry_lock);
+    if (session->control_fd>=0) shutdown(session->control_fd,SHUT_RDWR);
+    pthread_mutex_unlock(&connection_registry_lock);
     control_worker_stop(session);
     pthread_mutex_lock(&active_session_lock);
     while (session->references > 1U) {
         pthread_cond_wait(&session->reference_cond, &active_session_lock);
     }
     pthread_mutex_unlock(&active_session_lock);
+    /* Captured producers have finished. Keep the channel allocated until here: a producer
+     * captured before detach may still reserve on the now-closed channel. */
+    st_control_outbox_channel_destroy(session->peer_outbox); session->peer_outbox=NULL;
     if (displaced_reason != NULL) {
         disconnect_reason = displaced_reason;
     } else if (connection_registry_stopping()) {
@@ -6167,6 +6314,7 @@ static void *client_thread(void *arg)
         session->control_presence = NULL;
     }
     connection_unregister(session);
+    session_outbox_dispose(session);
     pthread_mutex_destroy(&session->send_lock);
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
@@ -6396,8 +6544,9 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
-    if (peer_mesh_maintenance_start(config.database_path) != 0) {
-        fprintf(stderr, "Peer Mesh catalog maintenance failed to start\n");
+    if (peer_outbox_start() != 0 || peer_mesh_maintenance_start(config.database_path) != 0) {
+        fprintf(stderr, "Peer Mesh outbox/catalog maintenance failed to start\n");
+        (void)st_control_outbox_destroy(peer_outbox); peer_outbox=NULL;
         st_admin_set_nat_control_handler(NULL, NULL);
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
@@ -6421,6 +6570,7 @@ int main(void)
         perror("control listener");
         shutdown_wake_close(shutdown_pipe);
         peer_mesh_maintenance_stop();
+        (void)st_control_outbox_destroy(peer_outbox); peer_outbox=NULL;
         st_admin_set_nat_control_handler(NULL, NULL);
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
@@ -6529,6 +6679,7 @@ int main(void)
     st_elasticsearch_traffic_shutdown();
     shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
+    if (unfinished==0U && st_control_outbox_destroy(peer_outbox)==0) peer_outbox=NULL;
     st_admin_set_nat_control_handler(NULL, NULL);
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);
