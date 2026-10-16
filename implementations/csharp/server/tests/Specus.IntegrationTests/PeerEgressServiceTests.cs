@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
@@ -14,6 +15,7 @@ using Specus.Server.Data.Entities;
 using Specus.Server.Management;
 using Specus.Server.PeerMesh;
 using Specus.Server.Sessions;
+using Specus.Server.Security;
 
 namespace Specus.IntegrationTests;
 
@@ -903,18 +905,19 @@ public sealed class PeerEgressServiceTests
     {
         private readonly SqliteConnection _connection;
 
-        private EgressFixture(SqliteConnection connection, SpecusDbContext db, PeerMeshService service)
+        private EgressFixture(SqliteConnection connection, SpecusDbContext db, PeerMeshService service, ManagementContext admin)
         {
             _connection = connection;
             Db = db;
             Service = service;
+            Admin = admin;
         }
 
         public SpecusDbContext Db { get; }
 
         public PeerMeshService Service { get; }
 
-        public ManagementContext Admin { get; } = new("default", "admin", ManagementRole.Admin, true);
+        public ManagementContext Admin { get; }
 
         public static async Task<EgressFixture> CreateAsync()
         {
@@ -924,6 +927,11 @@ public sealed class PeerEgressServiceTests
                 .UseSqlite(connection)
                 .Options);
             await db.Database.EnsureCreatedAsync();
+            var managementAuth = Options.Create(new AuthOptions { Password = "egress-fixture-private-password", JwtSecret = "egress-fixture-private-signing-key-2026" });
+            var tokens = new LocalTokenService(managementAuth);
+            var principal = tokens.Validate(tokens.IssueToken("admin"));
+            Assert.NotNull(principal);
+            var admin = ManagementContext.From(new DefaultHttpContext { User = principal }, managementAuth.Value);
             var service = new PeerMeshService(db,
                 new SessionRegistry(NullLogger<SessionRegistry>.Instance),
                 Options.Create(new PeerMeshOptions
@@ -935,8 +943,8 @@ public sealed class PeerEgressServiceTests
                 }),
                 NullLogger<PeerMeshService>.Instance,
                 null,
-                new PeerMeshServiceState());
-            return new EgressFixture(connection, db, service);
+                new PeerMeshServiceState(), managementAuth);
+            return new EgressFixture(connection, db, service, admin);
         }
 
         public ClientAccount AddClient(long id, string owner, string clientName)

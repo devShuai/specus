@@ -447,6 +447,8 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshEgressSwitchView> SetEgressSwitchAsync(ManagementContext context,
         bool? enabled, CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireEgressAdmin(context);
         if (enabled is null)
         {
@@ -456,18 +458,16 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("部署端未启用 Peer Mesh，不能开启出口分流");
         }
-        var row = await _db.PeerMeshEgressSwitches
-            .FirstOrDefaultAsync(x => x.TenantId == context.TenantId, cancellationToken)
-            .ConfigureAwait(false);
-        if (row is null)
-        {
-            row = new PeerMeshEgressSwitch { TenantId = context.TenantId };
-            _db.PeerMeshEgressSwitches.Add(row);
-        }
+        await EnsurePeerTenantSettingAsync(new PeerMeshEgressSwitch { TenantId = context.TenantId, UpdatedAt = DateTimeOffset.UtcNow }, context, cancellationToken).ConfigureAwait(false);
+        var current = await _db.PeerMeshEgressSwitches.AsNoTracking().SingleAsync(x => x.TenantId == context.TenantId, cancellationToken).ConfigureAwait(false);
+        if (current.TenantId != context.TenantId) throw new InvalidOperationException("出口策略租户不匹配");
+        var row = TrackPeerCurrent(current, context.TenantId, nameof(PeerMeshEgressSwitch.TenantId));
         row.Enabled = enabled.Value;
         row.UpdatedBy = context.Username;
         row.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         // Turning the tenant off has to reach the peers now, like any other authorization change.
         await PushTenantEgressAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
         return await EgressSwitchStatusAsync(context, cancellationToken).ConfigureAwait(false);
@@ -499,12 +499,13 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshEgressPolicyView> UpsertEgressPolicyAsync(ManagementContext context,
         PeerEgressPolicyMutation mutation, CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireEgressAdmin(context);
         var egressClientId = mutation.EgressClientId
             ?? throw new ArgumentException("egressClientId is required");
-        var egress = await FindEgressClientOrNullAsync(context.TenantId, egressClientId, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ResourceNotFoundException($"client not found: {egressClientId}");
+        var parents = await LockPeerClientsAsync(context, [egressClientId], cancellationToken).ConfigureAwait(false);
+        var egress = parents.GetValueOrDefault(egressClientId) ?? throw new ResourceNotFoundException($"client not found: {egressClientId}");
 
         string? scope = null;
         if (mutation.Scope is not null)
@@ -534,8 +535,8 @@ public sealed partial class PeerMeshService
             ? (int?)null
             : RequirePositive(mutation.IdleTimeoutSeconds.Value, "idleTimeoutSeconds");
 
-        var policy = await _db.PeerMeshEgressPolicies
-            .FirstOrDefaultAsync(row => row.TenantId == context.TenantId && row.EgressClientId == egress.Id,
+        var policy = await _db.PeerMeshEgressPolicies.AsNoTracking()
+            .SingleOrDefaultAsync(row => row.TenantId == context.TenantId && row.EgressClientId == egress.Id,
                 cancellationToken)
             .ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
@@ -549,6 +550,15 @@ public sealed partial class PeerMeshService
                 CreatedAt = now,
             };
             _db.PeerMeshEgressPolicies.Add(policy);
+        }
+        else
+        {
+            if (policy.TenantId != context.TenantId) throw new ResourceNotFoundException("egress policy not found");
+            await LockPeerRowAsync<PeerMeshEgressPolicy>(policy.Id, context, cancellationToken).ConfigureAwait(false);
+            var current = await _db.PeerMeshEgressPolicies.AsNoTracking().SingleOrDefaultAsync(row => row.Id == policy.Id && row.TenantId == context.TenantId, cancellationToken).ConfigureAwait(false);
+            if (current is null || current.TenantId != context.TenantId) throw new ResourceNotFoundException("egress policy not found");
+            if (current.EgressClientId != egressClientId) throw new InvalidOperationException("出口策略关联已变更，请刷新后重试");
+            policy = TrackPeerCurrent(current, current.Id);
         }
         policy.OwnerUsername = context.Username;
         policy.EgressClientId = egress.Id;
@@ -589,6 +599,8 @@ public sealed partial class PeerMeshService
         policy.UpdatedAt = now;
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         Audit("egress-policy", context.TenantId, egress.Id, null, null, creating ? "created" : "updated");
         // Revoking or narrowing a grant has to take effect now, not at the peer next login.
         await PushTenantEgressAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
@@ -602,13 +614,21 @@ public sealed partial class PeerMeshService
     public async Task DeleteEgressPolicyAsync(ManagementContext context, long id,
         CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireEgressAdmin(context);
-        var policy = await _db.PeerMeshEgressPolicies
-                .FirstOrDefaultAsync(row => row.TenantId == context.TenantId && row.Id == id, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ResourceNotFoundException($"egress policy not found: {id}");
+        var hint = await _db.PeerMeshEgressPolicies.AsNoTracking().SingleOrDefaultAsync(row => row.TenantId == context.TenantId && row.Id == id, cancellationToken).ConfigureAwait(false);
+        if (hint is null || hint.TenantId != context.TenantId) throw new ResourceNotFoundException($"egress policy not found: {id}");
+        _ = await LockPeerClientsAsync(context, [hint.EgressClientId], cancellationToken).ConfigureAwait(false);
+        await LockPeerRowAsync<PeerMeshEgressPolicy>(id, context, cancellationToken).ConfigureAwait(false);
+        var current = await _db.PeerMeshEgressPolicies.AsNoTracking().SingleOrDefaultAsync(row => row.TenantId == context.TenantId && row.Id == id, cancellationToken).ConfigureAwait(false);
+        if (current is null || current.TenantId != context.TenantId) throw new ResourceNotFoundException($"egress policy not found: {id}");
+        if (current.EgressClientId != hint.EgressClientId) throw new InvalidOperationException("出口策略关联已变更，请刷新后重试");
+        var policy = TrackPeerCurrent(current, id);
         _db.PeerMeshEgressPolicies.Remove(policy);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         Audit("egress-policy", context.TenantId, policy.EgressClientId, null, null, "deleted");
         await PushTenantEgressAsync(context.TenantId, cancellationToken).ConfigureAwait(false);
     }

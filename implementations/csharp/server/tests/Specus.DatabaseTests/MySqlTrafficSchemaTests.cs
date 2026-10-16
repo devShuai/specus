@@ -14,6 +14,15 @@ namespace Specus.IntegrationTests;
 public sealed class MySqlTrafficSchemaTests
 {
     [Fact]
+    public async Task NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var server = await StartAsync(database, gate);
+        await PeerDefinitionProviderProof.VerifyAsync(server, gate);
+    }
+
+    [Fact]
     public async Task NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents()
     {
         await using var database = await OwnedDatabase.CreateAsync();
@@ -247,12 +256,18 @@ public sealed class MySqlTrafficSchemaTests
         Assert.Equal(before, await ReadAsync(db, id));
     }
 
-    private static Task<TestServerFixture> StartAsync(OwnedDatabase database) => TestServerFixture.StartAsync(new Dictionary<string, string?>
+    private static Task<TestServerFixture> StartAsync(OwnedDatabase database, PeerDefinitionProviderProof.CommitGate? gate = null)
     {
-        ["Specus:Database:Provider"] = "mysql",
-        ["ConnectionStrings:Specus"] = database.ConnectionString,
-        ["Specus:Database:SeedDemoClient"] = "false",
-    });
+        var settings = new Dictionary<string, string?>
+        {
+            ["Specus:Database:Provider"] = "mysql",
+            ["ConnectionStrings:Specus"] = database.ConnectionString,
+            ["Specus:Database:SeedDemoClient"] = "false",
+        };
+        if (gate is not null) settings["Specus:PeerMesh:Enabled"] = "true";
+        return TestServerFixture.StartAsync(settings, gate is null ? null : services =>
+            services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(gate)));
+    }
 
     private static async Task<(long Id, string Json)> InsertAndReadMaximumAsync(SpecusDbContext db)
     {

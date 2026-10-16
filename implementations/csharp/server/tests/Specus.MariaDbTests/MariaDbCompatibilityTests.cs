@@ -16,6 +16,15 @@ namespace Specus.IntegrationTests;
 public sealed class MariaDbCompatibilityTests
 {
     [Fact]
+    public async Task NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var server = await StartAsync(database, gate);
+        await PeerDefinitionProviderProof.VerifyAsync(server, gate);
+    }
+
+    [Fact]
     public async Task NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents()
     {
         await using var database = await OwnedDatabase.CreateAsync();
@@ -387,12 +396,18 @@ public sealed class MariaDbCompatibilityTests
         Assert.Equal(1, Convert.ToInt64(await command.ExecuteScalarAsync()));
     }
 
-    private static Task<TestServerFixture> StartAsync(OwnedDatabase database) => TestServerFixture.StartAsync(new Dictionary<string, string?>
+    private static Task<TestServerFixture> StartAsync(OwnedDatabase database, PeerDefinitionProviderProof.CommitGate? gate = null)
     {
-        ["Specus:Database:Provider"] = "mariadb",
-        ["ConnectionStrings:Specus"] = database.ConnectionString,
-        ["Specus:Database:SeedDemoClient"] = "false",
-    });
+        var settings = new Dictionary<string, string?>
+        {
+            ["Specus:Database:Provider"] = "mariadb",
+            ["ConnectionStrings:Specus"] = database.ConnectionString,
+            ["Specus:Database:SeedDemoClient"] = "false",
+        };
+        if (gate is not null) settings["Specus:PeerMesh:Enabled"] = "true";
+        return TestServerFixture.StartAsync(settings, gate is null ? null : services =>
+            services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(gate)));
+    }
 
     private static async Task<int> NullCollationsAsync(MySqlConnection connection)
     {

@@ -245,7 +245,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 23), ('executed', 23), ('passed', 23), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 25), ('executed', 25), ('passed', 25), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -259,11 +259,13 @@ jobs:
               'NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder',
               'NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents',
               'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
+              'NativePeerBootstrapNormalizesAndValidatesBooleanShape',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 23 real PostgreSQL cases, including current Peer management ownership and deleted parent coordination; zero skipped.')
+          print('Verified all 25 real PostgreSQL cases, including validated legacy Peer booleans, atomic first settings, current import policy and deleted parent coordination; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -287,7 +289,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 18), ('executed', 18), ('passed', 18), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 19), ('executed', 19), ('passed', 19), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -301,12 +303,13 @@ jobs:
               'NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder',
               'NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents',
               'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
               'UnsafeDowngradeIsRefusedBeforeChangingDataOrHistory',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 18 real MySQL cases, including current Peer management ownership and deleted parent coordination; zero skipped.')
+          print('Verified all 19 real MySQL cases, including atomic first settings, current import policy and deleted parent coordination; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -330,7 +333,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 23), ('executed', 23), ('passed', 23), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 24), ('executed', 24), ('passed', 24), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -344,11 +347,12 @@ jobs:
               'NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder',
               'NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents',
               'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 23 real MariaDB cases, including current Peer management ownership and deleted parent coordination; zero skipped.')
+          print('Verified all 24 real MariaDB cases, including atomic first settings, current import policy and deleted parent coordination; zero skipped.')
           PY
 
       - name: Keep real MariaDB results

@@ -11,8 +11,17 @@ using Specus.Server.Hosting;
 
 namespace Specus.IntegrationTests;
 
-public sealed class PostgresBootstrapTests
+public sealed partial class PostgresBootstrapTests
 {
+    [Fact]
+    public async Task NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var server = await StartAsync(database, gate);
+        await PeerDefinitionProviderProof.VerifyAsync(server, gate);
+    }
+
     [Fact]
     public async Task NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents()
     {
@@ -324,12 +333,18 @@ public sealed class PostgresBootstrapTests
         Assert.Equal(conflict == "default" ? "2" : "1", await ScalarAsync(db, "SELECT pg_get_expr(d.adbin,d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE a.attrelid='client_download_link'::regclass AND a.attname='enabled'"));
     }
 
-    private static Task<TestServerFixture> StartAsync(OwnedDatabase database) => TestServerFixture.StartAsync(new Dictionary<string, string?>
+    private static Task<TestServerFixture> StartAsync(OwnedDatabase database, PeerDefinitionProviderProof.CommitGate? gate = null)
     {
-        ["Specus:Database:Provider"] = "postgres",
-        ["ConnectionStrings:Specus"] = database.ConnectionString,
-        ["Specus:Database:SeedDemoClient"] = "false",
-    });
+        var settings = new Dictionary<string, string?>
+        {
+            ["Specus:Database:Provider"] = "postgres",
+            ["ConnectionStrings:Specus"] = database.ConnectionString,
+            ["Specus:Database:SeedDemoClient"] = "false",
+        };
+        if (gate is not null) settings["Specus:PeerMesh:Enabled"] = "true";
+        return TestServerFixture.StartAsync(settings, gate is null ? null : services =>
+            services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(gate)));
+    }
 
     private static Task LegacyTableAsync(SpecusDbContext db, bool smallint)
     {

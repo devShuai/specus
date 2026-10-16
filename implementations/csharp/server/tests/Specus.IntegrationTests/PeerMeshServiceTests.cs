@@ -129,7 +129,7 @@ public sealed class PeerMeshServiceTests
         var sibling = fixture.CreateSiblingService();
         await sibling.HandleServiceReportAsync(publisher,
             ServiceReport(3, "stale-instance", "svc-http01"), 77, CancellationToken.None);
-        var admin = new ManagementContext("tenant-a", "admin", ManagementRole.Admin, true);
+        var admin = await fixture.ActorAsync("admin", ManagementRole.Admin);
         var services = await sibling.ListSharedServicesAsync(admin, CancellationToken.None);
 
         Assert.Single(services);
@@ -188,7 +188,7 @@ public sealed class PeerMeshServiceTests
 
         await scopeA.HandleServiceReportAsync(publisher, ServiceReport(5, "instance-5", "svc-race001"),
             79, CancellationToken.None);
-        var admin = new ManagementContext(publisher.TenantId, "admin", ManagementRole.Admin, true);
+        var admin = await fixture.ActorAsync("admin", ManagementRole.Admin);
         var beforeDisable = fixture.State.ServiceCatalogRevisions[key];
         await scopeB.UpdateSharedServiceAsync(admin, 9011,
             new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null,
@@ -243,7 +243,7 @@ public sealed class PeerMeshServiceTests
             Name="revision-service",Transport="tcp",Application="http",TargetHost="127.0.0.1",TargetPort=8080,PublishedPort=18080,
             Path="/",Enabled=true,Visibility="OWNER",CreatedAt=now,UpdatedAt=now });
         var session=CurrentPublisherSession(7381,publisher,now);fixture.Db.ClientSessions.Add(session);await fixture.SaveChangesAsync();
-        var writer=fixture.Bind(recipient);var admin=new ManagementContext(publisher.TenantId,"admin",ManagementRole.Admin,true);
+        var writer=fixture.Bind(recipient);var admin=await fixture.ActorAsync("admin",ManagementRole.Admin,publisher.TenantId);
         var wire=new List<string>();
         void Capture(long revision,int count) {
             var catalogs=writer.RawPeerMessages().Where(raw=>JsonSerializer.Deserialize<PeerControlMessage>(raw)!.Type=="service-catalog").ToArray();
@@ -292,7 +292,7 @@ public sealed class PeerMeshServiceTests
         fixture.State.ServiceCatalogs[("tenant-b", publisher.Id, 81)] = Catalog(4, "other-tenant", service, now);
 
         var views = await fixture.CreateSiblingService().ListSharedServicesAsync(
-            new ManagementContext(publisher.TenantId, "admin", ManagementRole.Admin, true),
+            await fixture.ActorAsync("admin", ManagementRole.Admin),
             CancellationToken.None);
 
         var view = Assert.Single(views);
@@ -500,7 +500,7 @@ public sealed class PeerMeshServiceTests
         fixture.Db.ChangeTracker.Clear();
         var stored = await fixture.Db.PeerMeshDevices.SingleAsync(d => d.ClientId == account.Id);
         var view = Assert.Single(await fixture.Service.ListDevicesAsync(
-            new ManagementContext("tenant-a", "alice", ManagementRole.User, false),
+            await fixture.ActorAsync("alice"),
             CancellationToken.None));
         Assert.Equal("ENDPOINT_INDEPENDENT", stored.NatMappingBehavior);
         Assert.Equal("ADDRESS_AND_PORT_DEPENDENT", stored.NatFilteringBehavior);
@@ -1046,7 +1046,7 @@ public sealed class PeerMeshServiceTests
         await fixture.SaveChangesAsync();
 
         var stats = await fixture.Service.PathStatsAsync(
-            new ManagementContext("tenant-a", "alice", ManagementRole.Admin, true),
+            await fixture.ActorAsync("alice", ManagementRole.Admin),
             CancellationToken.None);
 
         Assert.Equal(3, stats.TotalSessions);
@@ -1158,7 +1158,7 @@ public sealed class PeerMeshServiceTests
         Assert.Equal(PeerMeshService.PathRelay, stored.PathType);
 
         var sessions = await fixture.Service.ListSessionsAsync(
-            new ManagementContext("tenant-a", "alice", ManagementRole.Admin, true),
+            await fixture.ActorAsync("alice", ManagementRole.Admin),
             10,
             CancellationToken.None);
         var view = Assert.Single(sessions);
@@ -1167,7 +1167,7 @@ public sealed class PeerMeshServiceTests
         Assert.Equal(5_800_000, view.RelayBytes);
 
         var stats = await fixture.Service.PathStatsAsync(
-            new ManagementContext("tenant-a", "alice", ManagementRole.Admin, true),
+            await fixture.ActorAsync("alice", ManagementRole.Admin),
             CancellationToken.None);
         Assert.Equal(1, stats.ActiveSessions);
         Assert.Equal(0, stats.ActiveDirectSessions);
@@ -1395,17 +1395,17 @@ public sealed class PeerMeshServiceTests
         public PeerMeshService CreateSiblingService() => new(Db, Registry, _options,
             NullLogger<PeerMeshService>.Instance, null, State, ManagementAuth);
 
-        public async Task<ManagementContext> ActorAsync(string username, ManagementRole role = ManagementRole.User)
+        public async Task<ManagementContext> ActorAsync(string username, ManagementRole role = ManagementRole.User, string tenant = "tenant-a")
         {
-            var key = "peer-fixture-" + username;
+            var key = "peer-fixture-" + tenant + "-" + username;
             if (!await Db.ManagementUsers.AnyAsync(u => u.Username == key))
             {
                 Db.ManagementUsers.Add(new ManagementUser { Username = key, LoginName = username,
-                    TenantId = "tenant-a", Role = role, Enabled = true });
+                    TenantId = tenant, Role = role, Enabled = true });
                 await Db.SaveChangesAsync();
             }
             var tokens = new LocalTokenService(ManagementAuth);
-            var principal = tokens.Validate(tokens.IssueToken(username, "tenant-a", role, key));
+            var principal = tokens.Validate(tokens.IssueToken(username, tenant, role, key));
             Assert.NotNull(principal);
             return ManagementContext.From(new DefaultHttpContext { User = principal }, ManagementAuth.Value);
         }

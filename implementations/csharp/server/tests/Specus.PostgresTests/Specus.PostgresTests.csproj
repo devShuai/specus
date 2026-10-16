@@ -19,6 +19,7 @@
     <Compile Include="../Specus.IntegrationTests/OwnerTransferWriterProof.cs" Link="OwnerTransferWriterProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ClientConfigurationProviderProof.cs" Link="ClientConfigurationProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/PeerManagementProviderProof.cs" Link="PeerManagementProviderProof.cs" />
+    <Compile Include="../Specus.IntegrationTests/PeerDefinitionProviderProof.cs" Link="PeerDefinitionProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ManagementUserActorProviderProof.cs" Link="ManagementUserActorProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ClientStartupProviderProof.cs" Link="ClientStartupProviderProof.cs" />
     <Using Include="Xunit" />

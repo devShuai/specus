@@ -928,7 +928,7 @@ public sealed partial class DatabaseInitializer
         CancellationToken cancellationToken)
     {
         var dialect = DatabaseDialect(db.Database.ProviderName);
-        var boolType = BooleanColumnType(db.Database.ProviderName).Replace(" DEFAULT 0", string.Empty);
+        var boolType = dialect == "postgresql" ? "BOOLEAN NOT NULL" : BooleanColumnType(db.Database.ProviderName).Replace(" DEFAULT 0", string.Empty);
         var idType = dialect switch
         {
             "mysql" => "BIGINT NOT NULL PRIMARY KEY",
@@ -1062,9 +1062,11 @@ public sealed partial class DatabaseInitializer
         await EnsureColumnAsync(db, "specus_client_session", "peer_service_applications",
             "VARCHAR(160)", cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "peer_mesh_service_sharing", "mdns_import_enabled",
-            boolType, cancellationToken).ConfigureAwait(false);
+            dialect == "postgresql" ? "BOOLEAN NOT NULL DEFAULT FALSE" : BooleanColumnType(db.Database.ProviderName), cancellationToken).ConfigureAwait(false);
         await EnsureColumnAsync(db, "peer_mesh_shared_service", "allowed_client_ids",
             "VARCHAR(512) NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
+        if (dialect == "postgresql")
+            await EnsurePostgresPeerBooleanShapeAsync(db, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
