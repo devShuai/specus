@@ -227,12 +227,16 @@ func (db *DB) GetPeerMeshACL(ctx context.Context, id int64) (*PeerMeshACL, error
 // ---- peer mesh sessions --------------------------------------------------------------
 
 func (db *DB) InsertPeerMeshSession(ctx context.Context, session PeerMeshSession) error {
+	return db.insertPeerMeshSessionOn(ctx, db.sql, session)
+}
+
+func (db *DB) insertPeerMeshSessionOn(ctx context.Context, runner sqlRunner, session PeerMeshSession) error {
 	query := db.rebind(`INSERT INTO peer_mesh_session
 		(id, tenant_id, source_client_id, source_client_name, target_client_id, target_client_name,
 		 path_type, status, token_hash, started_at, updated_at, expires_at, closed_at,
 		 rtt_millis, local_endpoint, remote_endpoint, direct_bytes, relay_bytes, last_traffic_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query,
+	_, err := runner.ExecContext(ctx, query,
 		session.ID, defaultTenant(session.TenantID), session.SourceClientID, session.SourceClientName,
 		session.TargetClientID, session.TargetClientName, session.PathType, session.Status,
 		session.TokenHash, formatTime(session.StartedAt), formatTime(session.UpdatedAt),

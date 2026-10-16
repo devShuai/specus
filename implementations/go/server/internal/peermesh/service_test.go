@@ -559,6 +559,12 @@ func TestRefreshDeviceDisableClosesOpenSessionsAndNotifiesBothPeers(t *testing.T
 	service.catalogRevisions[catalogKey{"tenant-a", source.ID, 9002}] = 3
 	service.catalogMu.Unlock()
 
+	// Refresh is a post-commit hook, not the disable command. Model the committed toggle
+	// first; all existing closure, notification and catalog-withdrawal assertions stay intact.
+	off := false
+	if _, err := db.SetPeerMeshDeviceEnabled(ctx, store.ManagementWriteActor{Username: "admin", TenantID: "tenant-a", Admin: true, BuiltIn: true}, source.ID, &off, now); err != nil {
+		t.Fatal(err)
+	}
 	closed, err := service.RefreshDevice(ctx, AccessContext{Username: "alice", TenantID: "tenant-a"}, source.ID, false)
 	if err != nil {
 		t.Fatalf("refresh disabled device: %v", err)

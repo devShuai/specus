@@ -473,7 +473,7 @@ type Service struct {
 	relayAuthorizations map[int64]relayAuthorization
 	pendingRelayBytes   map[int64]int64
 	turnCredentials     *turnCredentialService
-	// sessionTokenCache 缓存明文 token（按 sessionID），供 reusableSessionGrant 复用。
+	// sessionTokenCache caches plaintext by ID; database admission validates its hash before reuse.
 	// 与 Java PeerMeshService.sessionTokenCache 对齐：create 时 put、close 时 remove。
 	sessionTokenCache   map[int64]string
 	sessionTokenCacheMu sync.RWMutex
@@ -675,8 +675,12 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 func (s *Service) BuildLoginConfig(ctx context.Context, account store.ClientAccount, peerPublicKey, requestHost string, clientProtocolVersion int) (LoginConfig, error) {
+	current, err := s.currentConfigAccount(ctx, account)
+	if err != nil {
+		return LoginConfig{}, err
+	}
+	account = *current
 	var device *store.PeerMeshDevice
-	var err error
 	if s.Enabled() {
 		device, err = s.EnsureDevice(ctx, account, peerPublicKey)
 		if err != nil {
@@ -687,8 +691,12 @@ func (s *Service) BuildLoginConfig(ctx context.Context, account store.ClientAcco
 }
 
 func (s *Service) BuildRuntimeConfig(ctx context.Context, account store.ClientAccount) (LoginConfig, error) {
+	current, err := s.currentConfigAccount(ctx, account)
+	if err != nil {
+		return LoginConfig{}, err
+	}
+	account = *current
 	var device *store.PeerMeshDevice
-	var err error
 	if s.Enabled() {
 		device, err = s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, account.ID)
 		if err != nil {
@@ -710,6 +718,17 @@ func (s *Service) BuildRuntimeConfig(ctx context.Context, account store.ClientAc
 	return s.buildConfig(ctx, account, device, "", clientProtocolVersion), nil
 }
 
+func (s *Service) currentConfigAccount(ctx context.Context, expected store.ClientAccount) (*store.ClientAccount, error) {
+	current, err := s.db.GetClient(ctx, expected.ID)
+	if err != nil {
+		return nil, err
+	}
+	if current.TenantID != expected.TenantID || current.ClientName != expected.ClientName {
+		return nil, store.ErrNotFound
+	}
+	return current, nil
+}
+
 func (s *Service) buildConfig(ctx context.Context, account store.ClientAccount, device *store.PeerMeshDevice, requestHost string, clientProtocolVersion int) LoginConfig {
 	cfg := LoginConfig{
 		Enabled:           false,
@@ -724,7 +743,7 @@ func (s *Service) buildConfig(ctx context.Context, account store.ClientAccount, 
 	if !s.Enabled() || device == nil {
 		return cfg
 	}
-	cfg.Enabled = device.Enabled
+	cfg.Enabled = account.Enabled && device.Enabled
 	cfg.VirtualIP = device.VirtualIP
 	cfg.StunHost = s.resolveStunHost(requestHost)
 	cfg.TurnHost = s.resolvePeerHost(requestHost)
@@ -997,7 +1016,10 @@ func (s *Service) HandleSignalSession(ctx context.Context, request protocol.Mess
 	if signal.SessionID == nil && (signal.Type == TypeCandidates || signal.Type == "offer") {
 		grant, err := s.CreateSession(ctx, *source, *target, PathDirect)
 		if err != nil {
-			return err
+			// This stage uses server-resolved refs and a server-generated seed. A concurrent
+			// authorization change or storage failure isn't a malformed client signal and
+			// must not kick the sender's original CONTROL connection.
+			return fmt.Errorf("%w: peer session admission failed: %w", ErrUndeliverable, err)
 		}
 		id := grant.session.ID
 		signal.SessionID = &id
@@ -1119,21 +1141,31 @@ func (s *Service) PushOnLogout(ctx context.Context, clientName string) {
 	s.pushTenantEgress(ctx, account.TenantID)
 }
 
-func (s *Service) RefreshDevice(ctx context.Context, access AccessContext, clientID int64, enabled bool) ([]SessionView, error) {
+func (s *Service) RefreshDevice(ctx context.Context, access AccessContext, clientID int64, _ bool) ([]SessionView, error) {
 	account, err := s.findClient(ctx, access, clientID, true)
 	if err != nil {
 		return nil, err
 	}
 	s.PushConfig(ctx, *account)
-	var closed []SessionView
-	if !enabled {
-		closed, err = s.CloseOpenSessionsForDevice(ctx, access, clientID)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range closed {
-			s.sendClose(item)
-		}
+	// The callback argument can describe a superseded commit. Close only under the current
+	// database parent/device boundary; a fresh grant after re-enable must survive this callback.
+	items, err := s.db.CloseDisabledPeerMeshSessions(ctx, account.TenantID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	closed := make([]SessionView, 0, len(items))
+	for _, item := range items {
+		s.removeRelaySession(item.ID)
+		s.removeCachedSessionToken(item.ID)
+		view := sessionView(item)
+		closed = append(closed, view)
+		s.sendClose(view)
+	}
+	device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, clientID)
+	if err != nil {
+		return nil, err
+	}
+	if !account.Enabled || device == nil || device.TenantID != account.TenantID || !device.Enabled {
 		s.withdrawClient(ctx, account.TenantID, account.ID)
 	}
 	for _, target := range s.rosterRefreshTargets(ctx, *account) {
@@ -1611,91 +1643,49 @@ func (s *Service) CloseOpenSessionsForDevice(ctx context.Context, access AccessC
 }
 
 func (s *Service) CanPeer(ctx context.Context, source, target store.ClientAccount) (bool, error) {
-	if source.TenantID != target.TenantID {
-		return false, nil
-	}
-	sourceDevice, err := s.db.FindPeerMeshDeviceByClientID(ctx, source.TenantID, source.ID)
-	if err != nil || sourceDevice == nil || !sourceDevice.Enabled {
-		return false, err
-	}
-	targetDevice, err := s.db.FindPeerMeshDeviceByClientID(ctx, target.TenantID, target.ID)
-	if err != nil || targetDevice == nil || !targetDevice.Enabled {
-		return false, err
-	}
-	if normalizeOwner(source.OwnerUsername) == normalizeOwner(target.OwnerUsername) {
-		return true, nil
-	}
-	forward, err := s.db.FindPeerMeshACL(ctx, source.TenantID, source.ID, target.ID)
-	if err != nil {
-		return false, err
-	}
-	if forward != nil && forward.Allowed && (forward.Direction == "OUTBOUND" || forward.Direction == "BOTH") {
-		return true, nil
-	}
-	reverse, err := s.db.FindPeerMeshACL(ctx, source.TenantID, target.ID, source.ID)
-	if err != nil {
-		return false, err
-	}
-	return reverse != nil && reverse.Allowed && (reverse.Direction == "INBOUND" || reverse.Direction == "BOTH"), nil
+	return s.db.CheckPeerAccessCurrent(ctx, peerClientReference(source), peerClientReference(target))
+}
+
+func peerClientReference(account store.ClientAccount) store.PeerClientReference {
+	return store.PeerClientReference{ID: account.ID, TenantID: account.TenantID, ClientName: account.ClientName}
 }
 
 func (s *Service) CreateSession(ctx context.Context, source, target store.ClientAccount, pathType string) (sessionGrant, error) {
-	ok, err := s.CanPeer(ctx, source, target)
-	if err != nil || !ok {
-		if err != nil {
-			return sessionGrant{}, err
-		}
-		return sessionGrant{}, errors.New("peer access denied")
-	}
 	now := time.Now()
-	// S-9：复用已存在的 open session（与 Java reusableSessionGrant 对齐），避免重复创建。
-	if grant, found := s.reusableSessionGrant(ctx, source, target, now); found {
-		return grant, nil
+	// Cache inspection is only a reuse hint, never authorization. The store rechecks current
+	// parents/devices/ACLs and the SQL token hash before creating OR reusing a grant.
+	candidates := make(map[int64]string)
+	hashes := make(map[int64]string)
+	open, err := s.db.FindOpenSessionBetweenClients(ctx, source.TenantID, source.ID, target.ID, StatusClosed)
+	if err != nil {
+		return sessionGrant{}, err
+	}
+	for _, item := range open {
+		if token, ok := s.getCachedSessionToken(item.ID); ok && token != "" {
+			candidates[item.ID] = token
+			hash := sha256.Sum256([]byte(token))
+			hashes[item.ID] = hex.EncodeToString(hash[:])
+		}
 	}
 	token := s.shortToken(source.ClientName, target.ClientName, strconv.FormatInt(now.UnixMilli(), 10), randomSuffix())
 	hash := sha256.Sum256([]byte(token))
-	item := store.PeerMeshSession{
-		ID:               auth.NewClientID(),
-		TenantID:         source.TenantID,
-		SourceClientID:   source.ID,
-		SourceClientName: source.ClientName,
-		TargetClientID:   target.ID,
-		TargetClientName: target.ClientName,
-		PathType:         firstText(pathType, PathDirect),
-		Status:           StatusNegotiating,
-		TokenHash:        stringPtr(hex.EncodeToString(hash[:])),
-		StartedAt:        now,
-		UpdatedAt:        now,
-		ExpiresAt:        now.Add(time.Duration(s.cfg.SessionTTLSeconds) * time.Second),
-	}
-	if err := s.db.InsertPeerMeshSession(ctx, item); err != nil {
+	out, err := s.db.AdmitPeerMeshSession(ctx, peerClientReference(source), peerClientReference(target), store.PeerSessionSeed{
+		ID: auth.NewClientID(), PathType: firstText(pathType, PathDirect), TokenHash: hex.EncodeToString(hash[:]),
+		TTL: time.Duration(s.cfg.SessionTTLSeconds) * time.Second, ReusableTokenHashes: hashes,
+	})
+	if err != nil {
 		return sessionGrant{}, err
 	}
-	s.cacheSessionToken(item.ID, token)
-	return sessionGrant{session: sessionView(item), token: token}, nil
-}
-
-// reusableSessionGrant 查找两个 client 之间未关闭且未过期的 session，返回缓存的明文 token。
-// 与 Java PeerMeshService.reusableSessionGrant 对齐。过期 session 会被关闭并跳过。
-func (s *Service) reusableSessionGrant(ctx context.Context, source, target store.ClientAccount, now time.Time) (sessionGrant, bool) {
-	sessions, err := s.db.FindOpenSessionBetweenClients(ctx, source.TenantID, source.ID, target.ID, StatusClosed)
-	if err != nil {
-		return sessionGrant{}, false
+	for _, id := range out.ClosedIDs {
+		s.removeRelaySession(id)
+		s.removeCachedSessionToken(id)
 	}
-	for i := range sessions {
-		item := &sessions[i]
-		if now.After(item.ExpiresAt) {
-			s.markClosed(item, now)
-			_ = s.db.UpdatePeerMeshSession(ctx, *item)
-			continue
-		}
-		token, ok := s.getCachedSessionToken(item.ID)
-		if !ok || token == "" {
-			continue
-		}
-		return sessionGrant{session: sessionView(*item), token: token}, true
+	if out.Created {
+		s.cacheSessionToken(out.Session.ID, token)
+	} else {
+		token = candidates[out.Session.ID]
 	}
-	return sessionGrant{}, false
+	return sessionGrant{session: sessionView(out.Session), token: token}, nil
 }
 
 func (s *Service) cacheSessionToken(sessionID int64, token string) {
@@ -1840,24 +1830,13 @@ func (s *Service) AllowedRoster(ctx context.Context, account store.ClientAccount
 	if !s.Enabled() {
 		return nil, nil
 	}
-	devices, err := s.db.ListEnabledPeerMeshDevicesByOwner(ctx, account.TenantID, normalizeOwner(account.OwnerUsername))
+	devices, err := s.db.ListCurrentPeerRoster(ctx, peerClientReference(account))
 	if err != nil {
 		return nil, err
 	}
 	byID := make(map[int64]store.PeerMeshDevice, len(devices))
 	for _, device := range devices {
 		byID[device.ClientID] = device
-	}
-	acls, err := s.db.ListPeerMeshACLsByTenant(ctx, account.TenantID)
-	if err != nil {
-		return nil, err
-	}
-	for _, acl := range acls {
-		if acl.Allowed && acl.SourceClientID == account.ID {
-			if device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, acl.TargetClientID); err == nil && device != nil && device.Enabled {
-				byID[device.ClientID] = *device
-			}
-		}
 	}
 	delete(byID, account.ID)
 	clientIDs := make([]int64, 0, len(byID))

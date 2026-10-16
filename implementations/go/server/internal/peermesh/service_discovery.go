@@ -843,7 +843,7 @@ func (s *Service) sharingStatusFor(account store.ClientAccount, device *store.Pe
 			mdns = row.MdnsImportEnabled
 		}
 	}
-	deviceEnabled := s.Enabled() && device != nil && device.Enabled
+	deviceEnabled := s.Enabled() && account.Enabled && device != nil && device.Enabled
 	effective := s.Enabled() && configured && deviceEnabled
 	return ServiceSharingStatus{
 		DeploymentEnabled: s.Enabled(),
