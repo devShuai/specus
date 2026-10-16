@@ -479,17 +479,39 @@ func (a *API) authenticatePassword(ctx context.Context, username, password,
 	if user == nil || !user.Enabled {
 		return managementPrincipal{}, false, nil
 	}
-	verification := auth.VerifyPassword(password, user.PasswordHash)
-	if !verification.Matches {
+	var verification auth.PasswordVerification
+	completed := false
+	for range 3 {
+		// The KDF can be slow; never hold a database/account lock while computing it.
+		verification = auth.VerifyPassword(password, user.PasswordHash)
+		if !verification.Matches {
+			return managementPrincipal{}, false, nil
+		}
+		current, currentErr := a.db.CompleteManagementPasswordLogin(ctx, *user)
+		if errors.Is(currentErr, store.ErrManagementPasswordHashChanged) && current != nil {
+			// A concurrent legitimate upgrade still permits this password; a password reset
+			// does not. Reverify the immutable account's current hash, never relookup by name.
+			user = current
+			continue
+		}
+		if errors.Is(currentErr, store.ErrManagementPasswordLoginChanged) {
+			return managementPrincipal{}, false, nil
+		}
+		if currentErr != nil {
+			return managementPrincipal{}, false, currentErr
+		}
+		user = current
+		completed = true
+		break
+	}
+	if !completed {
 		return managementPrincipal{}, false, nil
 	}
 	// A successful login is the only moment the plaintext exists, so it is the only chance to
 	// replace a legacy or under-cost hash. A failure here must not fail the login: the user is
 	// authenticated either way, and the old hash still works next time.
 	if verification.NeedsUpgrade {
-		upgraded := *user
-		upgraded.PasswordHash = verification.UpgradedHash
-		if err := a.db.UpdateManagementUser(ctx, upgraded); err != nil {
+		if err := a.db.UpgradeManagementPasswordHash(ctx, *user, verification.UpgradedHash); err != nil {
 			a.logger.Warn("password hash upgrade failed", "user", user.Username, "err", err)
 		}
 	}
