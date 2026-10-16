@@ -54,15 +54,14 @@ func (db *DB) ResolveClientStartup(ctx context.Context, expected ClientCredentia
 		return nil, nil, nil, err
 	}
 	defer tx.Rollback()
-	credential, err := scanCredential(tx.QueryRowContext(ctx, db.rebind(`SELECT id, tenant_id,
-		COALESCE(owner_username, ''), api_key, secret_hash, enabled, max_online_instances,
-		created_at, updated_at FROM specus_client_credential WHERE id = ?`+db.ownershipLockSuffix()), expected.ID))
+	currentCredential, err := db.lockCredentialForOwnership(ctx, tx, expected.TenantID, expected.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil, ErrClientStartupChanged
 	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	credential := *currentCredential
 	if !credential.Enabled || credential.APIKey != expected.APIKey ||
 		defaultTenant(credential.TenantID) != defaultTenant(expected.TenantID) ||
 		subtle.ConstantTimeCompare([]byte(credential.SecretHash), []byte(expected.SecretHash)) != 1 {
@@ -76,7 +75,7 @@ func (db *DB) ResolveClientStartup(ctx context.Context, expected ClientCredentia
 	if identity != nil {
 		// Read the binding without a child lock, then lock the parent first. Renames/deletions
 		// also lock the client before its identity, so taking the identity first would deadlock.
-		account, err = db.startupClientOn(ctx, tx, identity.ClientID)
+		account, err = db.lockClientForOwnership(ctx, tx, credential.TenantID, identity.ClientID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, nil, ErrClientStartupChanged
 		}
@@ -164,14 +163,20 @@ func (db *DB) startupIdentityOn(ctx context.Context, tx *sql.Tx, credentialID in
 	return &identity, nil
 }
 
-func (db *DB) startupClientOn(ctx context.Context, tx *sql.Tx, id int64) (*ClientAccount, error) {
+func (db *DB) lockClientForOwnership(ctx context.Context, tx *sql.Tx, tenant string, id int64) (*ClientAccount, error) {
+	// Runtime device creation must invalidate older PostgreSQL RR snapshots of the parent
+	// just as credential-derived identity creation invalidates its credential snapshot.
+	if _, err := tx.ExecContext(ctx, db.rebind(`UPDATE specus_client_account SET enabled = enabled
+		WHERE id = ? AND COALESCE(tenant_id, 'default') = ?`), id, defaultTenant(tenant)); err != nil {
+		return nil, err
+	}
 	var account ClientAccount
 	var enabled databaseBoolean
 	var created, updated string
 	err := tx.QueryRowContext(ctx, db.rebind(`SELECT id, COALESCE(tenant_id, 'default'),
 		COALESCE(owner_username, ''), client_name, password_hash, enabled,
 		connection_rate_limit_per_minute, created_at, updated_at FROM specus_client_account
-		WHERE id = ?`+db.ownershipLockSuffix()), id).Scan(&account.ID, &account.TenantID,
+		WHERE id = ? AND COALESCE(tenant_id, 'default') = ?`+db.ownershipLockSuffix()), id, defaultTenant(tenant)).Scan(&account.ID, &account.TenantID,
 		&account.OwnerUsername, &account.ClientName, &account.PasswordHash, &enabled,
 		&account.ConnectionRateLimitPerMinute, &created, &updated)
 	if err != nil {
@@ -180,4 +185,18 @@ func (db *DB) startupClientOn(ctx context.Context, tx *sql.Tx, id int64) (*Clien
 	account.Enabled = bool(enabled)
 	account.CreatedAt, account.UpdatedAt = parseTime(created), parseTime(updated)
 	return &account, nil
+}
+
+func (db *DB) lockCredentialForOwnership(ctx context.Context, tx *sql.Tx, tenant string, id int64) (*ClientCredential, error) {
+	if _, err := tx.ExecContext(ctx, db.rebind(`UPDATE specus_client_credential SET enabled = enabled
+		WHERE id = ? AND tenant_id = ?`), id, defaultTenant(tenant)); err != nil {
+		return nil, err
+	}
+	credential, err := scanCredential(tx.QueryRowContext(ctx, db.rebind(`SELECT id, tenant_id,
+		COALESCE(owner_username, ''), api_key, secret_hash, enabled, max_online_instances,
+		created_at, updated_at FROM specus_client_credential WHERE id = ? AND tenant_id = ?`+db.ownershipLockSuffix()), id, defaultTenant(tenant)))
+	if err != nil {
+		return nil, err
+	}
+	return &credential, nil
 }

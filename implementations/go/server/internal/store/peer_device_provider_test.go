@@ -28,7 +28,7 @@ func TestPeerDeviceExternalProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if _, err := db.startupClientOn(ctx, tx, parent.ID); err != nil {
+	if _, err := db.lockClientForOwnership(ctx, tx, parent.TenantID, parent.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.ExecContext(ctx, db.rebind(`UPDATE specus_client_account SET owner_username = ?, client_name = ? WHERE id = ?`),

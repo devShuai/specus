@@ -51,8 +51,12 @@ type OwnerTransferSnapshot struct {
 // PostgreSQL READ COMMITTED. There is no page/IN-parameter limit or per-client follow-up query.
 // This is NOT a write coordination boundary; a future writer must reload under database locks.
 func (db *DB) LoadOwnerTransferSnapshot(ctx context.Context, tenant, scope string, id int64) (OwnerTransferSnapshot, error) {
+	return db.loadOwnerTransferSnapshotOn(ctx, db.sql, tenant, scope, id)
+}
+
+func (db *DB) loadOwnerTransferSnapshotOn(ctx context.Context, runner sqlRunner, tenant, scope string, id int64) (OwnerTransferSnapshot, error) {
 	var result OwnerTransferSnapshot
-	rows, err := db.sql.QueryContext(ctx, db.rebind(ownerTransferSnapshotSQL), id, tenant, scope, id, tenant, scope, tenant)
+	rows, err := runner.QueryContext(ctx, db.rebind(ownerTransferSnapshotSQL), id, tenant, scope, id, tenant, scope, tenant)
 	if err != nil {
 		return result, err
 	}
@@ -61,10 +65,16 @@ func (db *DB) LoadOwnerTransferSnapshot(ctx context.Context, tenant, scope strin
 		var kind, tenantID string
 		var rowID int64
 		var name, owner sql.NullString
-		var enabled sql.NullBool
+		var rawEnabled any
+		var enabled databaseBoolean
 		var credentialID, clientID sql.NullInt64
-		if err := rows.Scan(&kind, &rowID, &tenantID, &name, &owner, &enabled, &credentialID, &clientID); err != nil {
+		if err := rows.Scan(&kind, &rowID, &tenantID, &name, &owner, &rawEnabled, &credentialID, &clientID); err != nil {
 			return OwnerTransferSnapshot{}, err
+		}
+		if rawEnabled != nil {
+			if err := enabled.Scan(rawEnabled); err != nil {
+				return OwnerTransferSnapshot{}, err
+			}
 		}
 		var nameValue, ownerValue *string
 		if name.Valid {
@@ -75,13 +85,13 @@ func (db *DB) LoadOwnerTransferSnapshot(ctx context.Context, tenant, scope strin
 		}
 		switch kind {
 		case "client":
-			result.Clients = append(result.Clients, OwnerTransferClient{rowID, tenantID, nameValue, ownerValue, enabled.Bool})
+			result.Clients = append(result.Clients, OwnerTransferClient{rowID, tenantID, nameValue, ownerValue, bool(enabled)})
 		case "credential":
-			result.Credentials = append(result.Credentials, OwnerTransferCredential{rowID, tenantID, ownerValue, enabled.Bool})
+			result.Credentials = append(result.Credentials, OwnerTransferCredential{rowID, tenantID, ownerValue, bool(enabled)})
 		case "identity":
 			result.Identities = append(result.Identities, OwnerTransferIdentity{rowID, tenantID, credentialID.Int64, clientID.Int64})
 		case "peer":
-			result.Peers = append(result.Peers, OwnerTransferPeer{rowID, tenantID, clientID.Int64, nameValue, ownerValue, enabled.Bool})
+			result.Peers = append(result.Peers, OwnerTransferPeer{rowID, tenantID, clientID.Int64, nameValue, ownerValue, bool(enabled)})
 		default:
 			return OwnerTransferSnapshot{}, fmt.Errorf("unknown ownership snapshot row type")
 		}

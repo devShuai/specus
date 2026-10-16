@@ -64,7 +64,7 @@ func (db *DB) observePeerMeshDeviceOnce(ctx context.Context, tenant string, clie
 		return nil, err
 	}
 	defer tx.Rollback()
-	parent, err := db.startupClientOn(ctx, tx, clientID)
+	parent, err := db.lockClientForOwnership(ctx, tx, tenant, clientID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -146,7 +146,7 @@ func (db *DB) SetPeerMeshDeviceEnabled(ctx context.Context, actor ManagementWrit
 	if err != nil {
 		return nil, err
 	}
-	parent, err := db.startupClientOn(ctx, tx, clientID)
+	parent, err := db.lockClientForOwnership(ctx, tx, actor.TenantID, clientID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

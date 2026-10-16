@@ -761,3 +761,16 @@ CREATE TABLE IF NOT EXISTS http_access_audit (
   KEY idx_http_access_audit_route (tenant_id, route_id, id),
   KEY idx_http_access_audit_at (occurred_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_audit (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  occurred_at VARCHAR(40) NOT NULL,
+  actor VARCHAR(120) NOT NULL,
+  scope VARCHAR(32) NOT NULL,
+  path_id BIGINT NOT NULL,
+  target_username VARCHAR(120) NOT NULL,
+  credential_id BIGINT,
+  detail_json LONGTEXT NOT NULL,
+  KEY idx_owner_transfer_tenant_at (tenant_id, occurred_at, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
