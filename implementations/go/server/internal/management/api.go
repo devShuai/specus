@@ -2325,6 +2325,8 @@ func (a *API) peerAccess(principal managementPrincipal) peermesh.AccessContext {
 		Username: principal.Username,
 		TenantID: normalizeTenant(principal.TenantID),
 		Admin:    principal.Admin,
+		BuiltIn:  principal.BuiltIn, AccountKey: principal.AccountKey,
+		OIDCIdentityKey: principal.OIDCIdentityKey, OIDCIssuer: principal.OIDCIssuer, OIDCSubject: principal.OIDCSubject,
 	}
 }
 
@@ -2906,6 +2908,8 @@ func clientDownloadLinkView(link store.ClientDownloadLink) ClientDownloadLinkVie
 
 func (a *API) fail(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, store.ErrManagementActorChanged):
+		writeError(w, http.StatusUnauthorized, "登录状态已变更，请重新登录")
 	case errors.Is(err, ErrValidation):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrConflict):
@@ -2950,7 +2954,8 @@ type managementPrincipal struct {
 	Issuer   string
 	// AccountKey is the key of the account row the principal resolved to; empty for the built-in
 	// admin. Tokens issued for the principal carry it as uid.
-	AccountKey string
+	AccountKey                               string
+	OIDCIdentityKey, OIDCIssuer, OIDCSubject string
 }
 
 func (p managementPrincipal) canAccessClient(account store.ClientAccount) bool {
@@ -3000,13 +3005,14 @@ func (a *API) authenticate(ctx context.Context, token string) (managementPrincip
 			}
 			role := normalizeRole(user.Role)
 			return managementPrincipal{
-				Username:   user.Username,
-				TenantID:   normalizeTenant(user.TenantID),
-				Role:       role,
-				Admin:      role == store.ManagementRoleAdmin,
-				BuiltIn:    false,
-				Issuer:     identity.Issuer,
-				AccountKey: user.AccountKey,
+				Username:        user.Username,
+				TenantID:        normalizeTenant(user.TenantID),
+				Role:            role,
+				Admin:           role == store.ManagementRoleAdmin,
+				BuiltIn:         false,
+				Issuer:          identity.Issuer,
+				AccountKey:      user.AccountKey,
+				OIDCIdentityKey: identityKey, OIDCIssuer: identity.Issuer, OIDCSubject: identity.Subject,
 			}, true
 		}
 	}

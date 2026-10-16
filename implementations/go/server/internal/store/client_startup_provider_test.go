@@ -12,7 +12,8 @@ import (
 
 // Explicitly opt in with an owned, disposable database. Validate its name before Open runs
 // migrations; never point this at a deployment database. Ordinary tests exercise SQLite.
-func TestResolveClientStartupExternalProvider(t *testing.T) {
+func openOwnedStartupProviderDB(t *testing.T) (*DB, context.Context) {
+	t.Helper()
 	provider, dsn := os.Getenv("SPECUS_TEST_STARTUP_PROVIDER"), os.Getenv("SPECUS_TEST_STARTUP_DSN")
 	if provider == "" && dsn == "" {
 		t.Skip("requires an explicitly owned MySQL/PostgreSQL startup fixture")
@@ -30,7 +31,7 @@ func TestResolveClientStartupExternalProvider(t *testing.T) {
 	}
 	defer raw.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	query := "SELECT DATABASE()"
 	if dialect == DialectPostgres {
 		query = "SELECT current_database()"
@@ -46,7 +47,12 @@ func TestResolveClientStartupExternalProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
+	return db, ctx
+}
+
+func TestResolveClientStartupExternalProvider(t *testing.T) {
+	db, ctx := openOwnedStartupProviderDB(t)
 	credential, candidate, identity := startupFixture(t, db)
 	// A concurrent transaction changes the owner after authentication has already read the
 	// credential. Native FOR UPDATE must wait, then return the committed row, not an RR snapshot.
@@ -106,5 +112,5 @@ func TestResolveClientStartupExternalProvider(t *testing.T) {
 	if _, _, _, err := db.ResolveClientStartup(ctx, credential, candidate, identity); !errors.Is(err, ErrClientStartupChanged) {
 		t.Fatalf("native stale secret was not rejected: %v", err)
 	}
-	t.Logf("native startup boundary PASS: dialect=%s owner/current-limit/reconnect/stale-secret", dialect)
+	t.Logf("native startup boundary PASS: dialect=%s owner/current-limit/reconnect/stale-secret", db.dialect)
 }

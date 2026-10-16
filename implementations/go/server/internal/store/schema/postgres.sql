@@ -696,7 +696,7 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity (
 
 CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
   tenant_id TEXT NOT NULL PRIMARY KEY,
-  enabled BOOLEAN NOT NULL DEFAULT 0,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
   updated_by TEXT,
   updated_at TEXT NOT NULL
 );

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -20,5 +21,16 @@ func TestEmbeddedSchemaTablesAreSeparateStatements(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPostgresBooleanDefaultsUseBooleanLiterals(t *testing.T) {
+	data, err := schemaFS.ReadFile("schema/postgres.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := regexp.MustCompile(`(?i)\bBOOLEAN\s+(?:NOT\s+NULL\s+)?DEFAULT\s+[01]\b`)
+	if invalid.Match(data) {
+		t.Fatal("PostgreSQL boolean columns must not use integer default expressions")
 	}
 }

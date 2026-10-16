@@ -47,7 +47,7 @@ func newGenerationFixture(t *testing.T, machineLimit int, beforeStart ...func(*A
 	f.pub = clientAuthLoginWithEnvironmentForTest(t, ts.URL, "ck_generation", "generation-secret", "generation-publisher", "admin", environment)
 	f.recipient = clientAuthLoginWithEnvironmentForTest(t, ts.URL, "ck_generation", "generation-secret", "generation-recipient", "admin", environment)
 	ctx := context.Background()
-	access := peermesh.AccessContext{TenantID: "default", Username: "admin", Admin: true}
+	access := peermesh.AccessContext{TenantID: "default", Username: "admin", Admin: true, BuiltIn: true}
 	for _, login := range []clientAuthLoginForTestResponse{f.pub, f.recipient} {
 		account, err := app.db.FindClientByName(ctx, login.ClientName)
 		if err != nil || account == nil {

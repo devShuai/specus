@@ -55,9 +55,12 @@ const (
 
 // AccessContext is the tiny management-auth shape needed by Peer Mesh.
 type AccessContext struct {
-	Username string
-	TenantID string
-	Admin    bool
+	Username                                 string
+	TenantID                                 string
+	Admin                                    bool
+	BuiltIn                                  bool
+	AccountKey                               string
+	OIDCIdentityKey, OIDCIssuer, OIDCSubject string
 }
 
 // LoginConfig is the client-auth peerMesh object.
@@ -903,26 +906,15 @@ func discoveryMethod(rfc5780 bool) string {
 }
 
 func (s *Service) EnsureDevice(ctx context.Context, account store.ClientAccount, peerPublicKey string) (*store.PeerMeshDevice, error) {
-	device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, account.ID)
-	if err != nil {
-		return nil, err
-	}
-	if device == nil {
-		device, err = s.createDevice(ctx, account)
-		if err != nil {
-			return nil, err
-		}
-	}
 	now := time.Now()
-	device.ClientName = account.ClientName
-	device.OwnerUsername = normalizeOwner(account.OwnerUsername)
-	if strings.TrimSpace(peerPublicKey) != "" {
-		value := capString(strings.TrimSpace(peerPublicKey), 256)
-		device.PublicKey = &value
-	}
-	device.LastSeenAt = &now
-	device.UpdatedAt = now
-	return device, s.db.UpdatePeerMeshDevice(ctx, *device)
+	return s.db.ObservePeerMeshDevice(ctx, account.TenantID, account.ID, s.deviceSeed(now), func(device *store.PeerMeshDevice) {
+		if strings.TrimSpace(peerPublicKey) != "" {
+			value := capString(strings.TrimSpace(peerPublicKey), 256)
+			device.PublicKey = &value
+		}
+		device.LastSeenAt = &now
+		device.UpdatedAt = now
+	})
 }
 
 func (s *Service) HandleSignal(ctx context.Context, request protocol.MessageRequest, sourceClientName string) error {
@@ -1170,15 +1162,12 @@ func (s *Service) ListDevices(ctx context.Context, access AccessContext) ([]Devi
 }
 
 func (s *Service) UpdateDevice(ctx context.Context, access AccessContext, clientID int64, mutation DeviceMutation) (DeviceView, error) {
-	device, err := s.findAccessibleDevice(ctx, access, clientID)
+	device, err := s.db.SetPeerMeshDeviceEnabled(ctx, store.ManagementWriteActor{
+		Username: access.Username, TenantID: access.TenantID, Admin: access.Admin,
+		BuiltIn: access.BuiltIn, AccountKey: access.AccountKey,
+		OIDCIdentityKey: access.OIDCIdentityKey, OIDCIssuer: access.OIDCIssuer, OIDCSubject: access.OIDCSubject,
+	}, clientID, mutation.Enabled, time.Now())
 	if err != nil {
-		return DeviceView{}, err
-	}
-	if mutation.Enabled != nil {
-		device.Enabled = *mutation.Enabled
-	}
-	device.UpdatedAt = time.Now()
-	if err := s.db.UpdatePeerMeshDevice(ctx, *device); err != nil {
 		return DeviceView{}, err
 	}
 	if mutation.Enabled != nil {
@@ -1743,7 +1732,11 @@ func (s *Service) ReportPath(ctx context.Context, reporter store.ClientAccount, 
 			}
 		}
 		if strings.TrimSpace(report.Status) != "" {
-			item.Status = capString(report.Status, 40)
+			if strings.EqualFold(strings.TrimSpace(report.Status), StatusClosed) {
+				s.markClosed(item, now)
+			} else {
+				item.Status = capString(report.Status, 40)
+			}
 		} else {
 			item.Status = StatusActive
 		}
@@ -1753,6 +1746,9 @@ func (s *Service) ReportPath(ctx context.Context, reporter store.ClientAccount, 
 		item.UpdatedAt = now
 	}
 	if err := s.db.UpdatePeerMeshSession(ctx, *item); err != nil {
+		if errors.Is(err, store.ErrPeerMeshSessionClosed) {
+			return s.closedSessionAfterWrite(ctx, item.ID)
+		}
 		return SessionView{}, err
 	}
 	return sessionView(*item), nil
@@ -1768,58 +1764,61 @@ func (s *Service) ReportTraffic(ctx context.Context, reporter store.ClientAccoun
 		s.applyTraffic(item, maxZero(report.DirectBytes), maxZero(report.RelayBytes), now)
 	}
 	if err := s.db.UpdatePeerMeshSession(ctx, *item); err != nil {
+		if errors.Is(err, store.ErrPeerMeshSessionClosed) {
+			return s.closedSessionAfterWrite(ctx, item.ID)
+		}
 		return SessionView{}, err
 	}
 	return sessionView(*item), nil
 }
 
-func (s *Service) ReportDevice(ctx context.Context, reporter store.ClientAccount, report ControlMessage) (DeviceView, error) {
-	device, err := s.db.FindPeerMeshDeviceByClientID(ctx, reporter.TenantID, reporter.ID)
+func (s *Service) closedSessionAfterWrite(ctx context.Context, id int64) (SessionView, error) {
+	s.removeRelaySession(id)
+	s.removeCachedSessionToken(id)
+	current, err := s.db.GetPeerMeshSession(ctx, id)
 	if err != nil {
-		return DeviceView{}, err
+		return SessionView{}, err
 	}
-	if device == nil {
-		device, err = s.createDevice(ctx, reporter)
-		if err != nil {
-			return DeviceView{}, err
-		}
-	}
+	return sessionView(*current), nil
+}
+
+func (s *Service) ReportDevice(ctx context.Context, reporter store.ClientAccount, report ControlMessage) (DeviceView, error) {
 	now := time.Now()
-	device.ClientName = reporter.ClientName
-	device.OwnerUsername = normalizeOwner(reporter.OwnerUsername)
-	if report.VirtualDeviceMode != nil {
-		device.VirtualDeviceMode = capStringPtr(report.VirtualDeviceMode, 80)
-	}
-	if report.VirtualDeviceName != nil {
-		device.VirtualDeviceName = capStringPtr(report.VirtualDeviceName, 80)
-	}
-	if report.VirtualDeviceStatus != nil {
-		device.VirtualDeviceStatus = capStringPtr(report.VirtualDeviceStatus, 80)
-	}
-	if report.VirtualDeviceError != nil {
-		device.VirtualDeviceError = capStringPtr(report.VirtualDeviceError, 512)
-	}
-	if report.VirtualDeviceMode != nil || report.VirtualDeviceName != nil || report.VirtualDeviceStatus != nil || report.VirtualDeviceError != nil {
-		device.VirtualDeviceUpdatedAt = &now
-	}
-	if report.NatType != nil {
-		device.NatType = capStringPtr(report.NatType, 80)
-	}
-	if report.NatMappingBehavior != nil {
-		device.NatMappingBehavior = capStringPtr(report.NatMappingBehavior, 80)
-	}
-	if report.NatFilteringBehavior != nil {
-		device.NatFilteringBehavior = capStringPtr(report.NatFilteringBehavior, 80)
-	}
-	if report.NatBehaviorDiscovery != nil {
-		device.NatBehaviorDiscovery = capStringPtr(report.NatBehaviorDiscovery, 40)
-	}
-	if report.LastEndpoint != nil {
-		device.LastEndpoint = capStringPtr(report.LastEndpoint, 255)
-	}
-	device.LastSeenAt = &now
-	device.UpdatedAt = now
-	if err := s.db.UpdatePeerMeshDevice(ctx, *device); err != nil {
+	device, err := s.db.ObservePeerMeshDevice(ctx, reporter.TenantID, reporter.ID, s.deviceSeed(now), func(device *store.PeerMeshDevice) {
+		if report.VirtualDeviceMode != nil {
+			device.VirtualDeviceMode = capStringPtr(report.VirtualDeviceMode, 80)
+		}
+		if report.VirtualDeviceName != nil {
+			device.VirtualDeviceName = capStringPtr(report.VirtualDeviceName, 80)
+		}
+		if report.VirtualDeviceStatus != nil {
+			device.VirtualDeviceStatus = capStringPtr(report.VirtualDeviceStatus, 80)
+		}
+		if report.VirtualDeviceError != nil {
+			device.VirtualDeviceError = capStringPtr(report.VirtualDeviceError, 512)
+		}
+		if report.VirtualDeviceMode != nil || report.VirtualDeviceName != nil || report.VirtualDeviceStatus != nil || report.VirtualDeviceError != nil {
+			device.VirtualDeviceUpdatedAt = &now
+		}
+		if report.NatType != nil {
+			device.NatType = capStringPtr(report.NatType, 80)
+		}
+		if report.NatMappingBehavior != nil {
+			device.NatMappingBehavior = capStringPtr(report.NatMappingBehavior, 80)
+		}
+		if report.NatFilteringBehavior != nil {
+			device.NatFilteringBehavior = capStringPtr(report.NatFilteringBehavior, 80)
+		}
+		if report.NatBehaviorDiscovery != nil {
+			device.NatBehaviorDiscovery = capStringPtr(report.NatBehaviorDiscovery, 40)
+		}
+		if report.LastEndpoint != nil {
+			device.LastEndpoint = capStringPtr(report.LastEndpoint, 255)
+		}
+		device.LastSeenAt = &now
+		device.UpdatedAt = now
+	})
+	if err != nil {
 		return DeviceView{}, err
 	}
 	return s.deviceView(*device), nil
@@ -1900,29 +1899,16 @@ func (s *Service) AllowedRoster(ctx context.Context, account store.ClientAccount
 
 func (s *Service) createDevice(ctx context.Context, account store.ClientAccount) (*store.PeerMeshDevice, error) {
 	now := time.Now()
-	device := store.PeerMeshDevice{
-		ID:            auth.NewClientID(),
-		TenantID:      account.TenantID,
-		OwnerUsername: normalizeOwner(account.OwnerUsername),
-		ClientID:      account.ID,
-		ClientName:    account.ClientName,
-		CIDR:          s.cfg.CIDR,
-		Enabled:       false,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}
-	ip, err := s.allocateVirtualIP(ctx, account)
-	if err != nil {
-		return nil, err
-	}
-	device.VirtualIP = ip
-	if err := s.db.InsertPeerMeshDevice(ctx, device); err != nil {
-		return nil, err
-	}
-	return &device, nil
+	return s.db.ObservePeerMeshDevice(ctx, account.TenantID, account.ID, s.deviceSeed(now), func(*store.PeerMeshDevice) {})
 }
 
-func (s *Service) allocateVirtualIP(ctx context.Context, account store.ClientAccount) (string, error) {
+func (s *Service) deviceSeed(now time.Time) store.PeerDeviceSeed {
+	return store.PeerDeviceSeed{ID: auth.NewClientID(), CIDR: s.cfg.CIDR, Now: now, CandidateIP: s.virtualIPCandidate}
+}
+
+// Pure, zero-based probing. The store invokes this with the locked current parent and checks
+// occupancy in the same transaction, so allocation cannot inherit a stale owner/name snapshot.
+func (s *Service) virtualIPCandidate(account store.ClientAccount, probe uint64) (string, error) {
 	prefix, err := netip.ParsePrefix(s.cfg.CIDR)
 	if err != nil || !prefix.Addr().Is4() {
 		return "", fmt.Errorf("invalid peer mesh cidr: %s", s.cfg.CIDR)
@@ -1938,18 +1924,11 @@ func (s *Service) allocateVirtualIP(ctx context.Context, account store.ClientAcc
 	hash := javaStringHashCode(account.TenantID + ":" + account.OwnerUsername + ":" + strconv.FormatInt(account.ID, 10))
 	seed := uint64(javaMathAbsInt32(hash))
 	usable := capacity - 2
-	for i := uint64(1); i <= usable; i++ {
-		host := ((seed + i) % usable) + 1
-		ip := uint32ToIPv4(base + uint32(host))
-		existing, err := s.db.FindPeerMeshDeviceByVirtualIP(ctx, account.TenantID, ip)
-		if err != nil {
-			return "", err
-		}
-		if existing == nil {
-			return ip, nil
-		}
+	if probe >= usable {
+		return "", fmt.Errorf("peer mesh address pool exhausted: %s", s.cfg.CIDR)
 	}
-	return "", fmt.Errorf("peer mesh address pool exhausted: %s", s.cfg.CIDR)
+	host := ((seed + probe + 1) % usable) + 1
+	return uint32ToIPv4(base + uint32(host)), nil
 }
 
 // javaStringHashCode 复现 Java String.hashCode()：h = 31*h + char，int32 有符号溢出。
@@ -2210,6 +2189,10 @@ func (s *Service) FlushRelayTraffic(ctx context.Context) error {
 			s.applyTraffic(item, 0, bytes, now)
 		}
 		if err := s.db.UpdatePeerMeshSession(ctx, *item); err != nil {
+			if errors.Is(err, store.ErrPeerMeshSessionClosed) {
+				s.removeRelaySession(sessionID)
+				continue
+			}
 			s.addPendingRelayBytes(sessionID, bytes)
 			return err
 		}
@@ -2218,7 +2201,10 @@ func (s *Service) FlushRelayTraffic(ctx context.Context) error {
 }
 
 func (s *Service) closeIfExpired(item *store.PeerMeshSession, now time.Time) bool {
-	if item.Status == StatusClosed {
+	if strings.EqualFold(item.Status, StatusClosed) {
+		item.Status = StatusClosed
+		s.removeRelaySession(item.ID)
+		s.removeCachedSessionToken(item.ID)
 		return true
 	}
 	if item.ExpiresAt.IsZero() || item.ExpiresAt.After(now) {
