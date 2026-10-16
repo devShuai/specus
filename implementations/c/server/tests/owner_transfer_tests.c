@@ -216,6 +216,10 @@ int main(int argc,char **argv)
     base=st_json_get_top_level_raw(vector,"base");snapshots=st_json_get_top_level_raw(vector,"snapshots");CHECK(base!=NULL&&snapshots!=NULL&&st_json_get_raw_array(vector,"cases",&cases,&case_count)==0,"vector decode");
     int failed=shared_vectors()|revisions();if(!failed)failed=ownership_writer_tests();
     if(!failed)failed=run_on_fresh_server("owner-transfer-preview",http_scenario,NULL);
-    if(!failed)failed=run_on_fresh_server("owner-transfer-http-write",http_write_scenario,NULL);
+    /* This scenario replaces ALL client rows between requests. Keep real maintenance running,
+     * but do not let its schema initialization reinsert Demo client into a before/after
+     * ownership snapshot. server_prepare already supplies the environment client's startup row. */
+    const char *write_env[]={"SPECUS_DB_SEED_DEMO_CLIENT=false",NULL};
+    if(!failed)failed=run_on_fresh_server("owner-transfer-http-write",http_write_scenario,write_env);
     st_json_free_string_array(cases,case_count);free(snapshots);free(base);free(vector);return failed?1:0;
 }

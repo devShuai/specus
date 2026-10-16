@@ -21,6 +21,7 @@ add_library(specus_c_core
     src/client_package.c
     src/connectivity_check.c
     src/control_lifecycle.c
+    src/control_outbox.c
     src/control_presence.c
     src/crypto.c
     src/decompression_limits.c
@@ -80,6 +81,18 @@ target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(specus_c_control_outbox_tests tests/control_outbox_tests.c)
+target_link_libraries(specus_c_control_outbox_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_control_outbox_tests PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=calloc")
+target_compile_options(specus_c_control_outbox_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME control_outbox_tests COMMAND specus_c_control_outbox_tests)
+set_tests_properties(control_outbox_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_catalog_acceptance_tests tests/catalog_acceptance_tests.c)
+target_link_libraries(specus_c_catalog_acceptance_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_catalog_acceptance_tests PRIVATE "-Wl,--wrap=sqlite3_exec")
+target_compile_options(specus_c_catalog_acceptance_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME catalog_acceptance_tests COMMAND specus_c_catalog_acceptance_tests)
+set_tests_properties(catalog_acceptance_tests PROPERTIES TIMEOUT 60)
 add_executable(specus_c_catalog_binding_tests tests/catalog_binding_tests.c)
 target_link_libraries(specus_c_catalog_binding_tests PRIVATE specus_c_core pthread)
 target_compile_options(specus_c_catalog_binding_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)

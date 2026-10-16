@@ -22,6 +22,7 @@ SERVER := $(BUILD_DIR)/specus-server-c
 CORE_OBJS += $(BUILD_DIR)/control_presence.o
 CORE_OBJS += $(BUILD_DIR)/owner_transfer.o
 CORE_OBJS += $(BUILD_DIR)/control_lifecycle.o
+CORE_OBJS += $(BUILD_DIR)/control_outbox.o
 OWNER_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_tests
 OWNER_RUNTIME_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_runtime_tests
 IDENTITY_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_client_identity_coordination_tests
@@ -114,6 +115,9 @@ CATALOG_READ_TESTS := $(BUILD_DIR)/specus_c_catalog_read_tests
 ALL_TESTS += $(CATALOG_READ_TESTS)
 CATALOG_BINDING_TESTS := $(BUILD_DIR)/specus_c_catalog_binding_tests
 ALL_TESTS += $(CATALOG_BINDING_TESTS)
+CONTROL_OUTBOX_TESTS := $(BUILD_DIR)/specus_c_control_outbox_tests
+CATALOG_ACCEPTANCE_TESTS := $(BUILD_DIR)/specus_c_catalog_acceptance_tests
+ALL_TESTS += $(CONTROL_OUTBOX_TESTS) $(CATALOG_ACCEPTANCE_TESTS)
 CATALOG_SOURCE_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_source_e2e_tests
 CATALOG_SOURCE_BARRIER := $(BUILD_DIR)/libspecus_c_catalog_source_barrier.so
 ALL_TESTS += $(CATALOG_SOURCE_E2E_TESTS) $(CATALOG_SOURCE_BARRIER)
@@ -130,6 +134,7 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/storage.o $(BUILD_DIR)/owner_transfer.o: src/owner_transfer_internal.h src/owner_transfer.h src/storage.h
 $(BUILD_DIR)/peer_mesh.o: src/peer_mesh.h src/storage.h
+$(BUILD_DIR)/control_outbox.o: src/control_outbox.h
 $(BUILD_DIR)/control_presence.o $(BUILD_DIR)/storage.o: src/control_presence.h
 
 $(SERVER): $(CORE_OBJS) src/main.c src/peer_mesh.h src/storage.h src/control_presence.h | $(BUILD_DIR)
@@ -152,6 +157,12 @@ $(CATALOG_SOURCE_TESTS): $(CORE_OBJS) tests/catalog_source_tests.c src/peer_mesh
 
 $(CATALOG_READ_TESTS): $(CORE_OBJS) tests/catalog_read_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_read_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CONTROL_OUTBOX_TESTS): $(CORE_OBJS) tests/control_outbox_tests.c src/control_outbox.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/control_outbox_tests.c $(CORE_OBJS) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -o $@
+
+$(CATALOG_ACCEPTANCE_TESTS): $(CORE_OBJS) tests/catalog_acceptance_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h src/control_outbox.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_acceptance_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -Wl,--wrap=sqlite3_exec -o $@
 
 $(CATALOG_BINDING_TESTS): $(CORE_OBJS) tests/catalog_binding_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_binding_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
@@ -363,6 +374,8 @@ $(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 test: all
+	$(CONTROL_OUTBOX_TESTS)
+	$(CATALOG_ACCEPTANCE_TESTS)
 	$(CATALOG_BINDING_TESTS)
 	$(CATALOG_READ_TESTS)
 	$(CATALOG_SOURCE_TESTS)

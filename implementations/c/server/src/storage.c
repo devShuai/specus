@@ -10404,11 +10404,11 @@ static int catalog_source_discovery_on_db(sqlite3 *db, const st_storage_control_
     sqlite3_finalize(stmt); return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
 }
 
-int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
+static int read_peer_catalog_impl(const char *path, const char *tenant_id, long long publisher_id,
     const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
     long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
     const char (*service_ids)[65], size_t service_count,
-    st_storage_peer_catalog_view *view)
+    st_storage_peer_catalog_view *view, st_storage_peer_catalog_delivery_stage_fn stage, void *context)
 {
     if (view == NULL) return -1;
     memset(view, 0, sizeof(*view));
@@ -10419,7 +10419,7 @@ int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long l
     if (source_count && visible == NULL) return -1;
     st_storage_peer_catalog_view staged = {0}; st_storage_peer_mesh_service_sharing sharing = {0};
     sqlite3 *db = NULL; int rc = open_db(path, &db);
-    if (rc == 0) rc = exec_sql(db, "BEGIN");
+    if (rc == 0) rc = exec_sql(db, stage ? "BEGIN IMMEDIATE" : "BEGIN");
     int present = 1, device = 0;
     if (rc == 0) { present = catalog_client_on_db(db, tenant_id, publisher_id, &staged.publisher); if (present < 0) rc = -1; }
     if (rc == 0 && present == 0) {
@@ -10475,11 +10475,42 @@ int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long l
         }
         sqlite3_finalize(stmt);
     }
+    if (rc == 0 && stage) {
+        if (!staged.recipient_authenticated) rc = 1;
+        else {
+            int result = stage(context, &staged, source_count ? visible[0] : 0);
+            rc = result == 0 ? 0 : result == 1 ? 1 : -1;
+        }
+    }
     if (rc == 0) rc = exec_sql(db, "COMMIT");
     if (rc != 0 && db != NULL) (void)exec_sql(db, "ROLLBACK");
     if (db != NULL) sqlite3_close(db);
     if (rc == 0) { *view = staged; memset(&staged, 0, sizeof(staged)); if (source_count) memcpy(source_visible, visible, source_count * sizeof(*visible)); }
     free(visible); st_storage_peer_catalog_view_free(&staged); return rc;
+}
+
+int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
+    const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count, st_storage_peer_catalog_view *view)
+{
+    return read_peer_catalog_impl(path, tenant_id, publisher_id, sources, source_count, source_visible,
+        recipient_id, recipient_source, service_ids, service_count, view, NULL, NULL);
+}
+
+int st_storage_commit_peer_catalog_delivery(const char *path, const char *tenant_id,
+    long long publisher_id, const st_storage_peer_catalog_source *publisher_source,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_delivery_stage_fn stage, void *context)
+{
+    if (!stage || !recipient_source || recipient_id <= 0 || (!publisher_source && service_count)) return -1;
+    st_storage_peer_catalog_view view = {0}; int visible = 0;
+    int rc = read_peer_catalog_impl(path, tenant_id, publisher_id, publisher_source,
+        publisher_source ? 1U : 0U, &visible, recipient_id, recipient_source,
+        service_ids, service_count, &view, stage, context);
+    st_storage_peer_catalog_view_free(&view);
+    return rc;
 }
 
 int st_storage_list_peer_mesh_service_audits(const char *path,

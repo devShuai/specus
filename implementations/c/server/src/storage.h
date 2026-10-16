@@ -1548,6 +1548,23 @@ int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long l
     const char (*service_ids)[65], size_t service_count,
     st_storage_peer_catalog_view *view);
 void st_storage_peer_catalog_view_free(st_storage_peer_catalog_view *view);
+/* Publication acceptance, NOT socket I/O. Reserve a bounded invisible transport ticket BEFORE
+ * calling. The same projection is evaluated under BEGIN IMMEDIATE; the pure callback may only
+ * stage private memory, without allocation waits, registry/CID/cache/queue locks or I/O. The
+ * view is borrowed for the callback only; publisher_visible identifies the original source,
+ * while view->allowed and services additionally apply recipient/definition policy. A NULL
+ * publisher_source requests an empty withdrawal.
+ * After 0 (native commit), make the staged ticket ready OUTSIDE SQL; after any other result,
+ * abort it. 1 means recipient no longer authenticates or callback cancelled, -1 is SQL/stage
+ * failure. An invisible publisher/policy is a successful empty projection, not retirement.
+ * No callback runs on a failed read or unavailable original recipient. */
+typedef int (*st_storage_peer_catalog_delivery_stage_fn)(void *context,
+    const st_storage_peer_catalog_view *view, int publisher_visible);
+int st_storage_commit_peer_catalog_delivery(const char *path, const char *tenant_id,
+    long long publisher_id, const st_storage_peer_catalog_source *publisher_source,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_delivery_stage_fn stage, void *context);
 int st_storage_list_peer_mesh_service_audits(const char *path,
                                              const char *tenant_id,
                                              st_storage_peer_mesh_service_audit *events,
