@@ -60,24 +60,37 @@ public sealed class ConnectionEventsHub
             return;
         }
         var principal = claims.ToPrincipal();
-
-        using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
         var id = Guid.NewGuid();
-        _sockets[id] = new ConnectionEventSubscription(socket, SubscriptionPrincipal.From(principal));
+        var subscriber = SubscriptionPrincipal.From(principal);
+        await using var delivery = new ConnectionEventDelivery(async (connectionEvent, ct) =>
+        {
+            if (!await _identity.CurrentAsync(claims, ct).ConfigureAwait(false)) return ConnectionEventAccess.Revoked;
+            return await CanReceiveAsync(subscriber, connectionEvent, ct).ConfigureAwait(false)
+                ? ConnectionEventAccess.Allowed : ConnectionEventAccess.Filtered;
+        }, () => _sockets.TryRemove(id, out _), exception =>
+            _logger.LogWarning("connection event delivery stopped: socket={SocketId} error={ErrorType}", id, exception.GetType().Name),
+            context.Abort);
+        // Reserve before Accept: the client may publish an event as soon as HTTP upgrade
+        // completes, before this continuation has a chance to register the live socket.
+        _sockets[id] = new ConnectionEventSubscription(subscriber, delivery);
+        WebSocket? socket = null;
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, delivery.ReceiveLifetime);
         try
         {
+            socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
+            delivery.Bind(socket);
             // A revocation can commit after the first check but before registration.
             if (!await _identity.CurrentAsync(claims, context.RequestAborted).ConfigureAwait(false))
             {
-                await socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
-                    ManagementWebSocketIdentity.Revoked, context.RequestAborted).ConfigureAwait(false);
+                await delivery.CloseAsync(WebSocketCloseStatus.PolicyViolation, ManagementWebSocketIdentity.Revoked).ConfigureAwait(false);
                 return;
             }
+            if (!delivery.Activate()) return;
             var buffer = new byte[1024];
             while (!context.RequestAborted.IsCancellationRequested
                 && socket.State is WebSocketState.Open or WebSocketState.CloseSent)
             {
-                var result = await socket.ReceiveAsync(buffer, context.RequestAborted).ConfigureAwait(false);
+                var result = await socket.ReceiveAsync(buffer, lifetime.Token).ConfigureAwait(false);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     break;
@@ -88,21 +101,15 @@ public sealed class ConnectionEventsHub
         {
             // normal shutdown/client disconnect
         }
+        catch (WebSocketException exception)
+        {
+            _logger.LogDebug(exception, "connection events websocket disconnected: {SocketId}", id);
+        }
         finally
         {
             _sockets.TryRemove(id, out _);
-            if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
-            {
-                try
-                {
-                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye",
-                        CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (WebSocketException)
-                {
-                    // peer already gone
-                }
-            }
+            await delivery.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye").ConfigureAwait(false);
+            socket?.Dispose();
         }
     }
 
@@ -133,6 +140,7 @@ public sealed class ConnectionEventsHub
     /// </summary>
     public async Task CloseIdentityAsync(string tenantId, string username, string reason = "account deleted")
     {
+        var closes = new List<Task>();
         foreach (var (id, subscription) in _sockets.ToArray())
         {
             if (!ManagementContext.SameTenant(subscription.Principal.TenantId, tenantId)
@@ -141,20 +149,9 @@ public sealed class ConnectionEventsHub
                 continue;
             }
             _sockets.TryRemove(id, out _);
-            try
-            {
-                if (subscription.Socket.State == WebSocketState.Open)
-                {
-                    await subscription.Socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation,
-                        reason, CancellationToken.None).ConfigureAwait(false);
-                }
-            }
-            catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException
-                or InvalidOperationException)
-            {
-                subscription.Socket.Abort();
-            }
+            closes.Add(subscription.Delivery.CloseAsync(WebSocketCloseStatus.PolicyViolation, reason));
         }
+        await Task.WhenAll(closes).ConfigureAwait(false);
     }
 
     private async Task HandleClusterEventAsync(PublicTransferClusterEvent clusterEvent)
@@ -184,41 +181,17 @@ public sealed class ConnectionEventsHub
         }
     }
 
-    private async Task BroadcastLocalAsync(ConnectionEvent connectionEvent, byte[] payload)
+    private Task BroadcastLocalAsync(ConnectionEvent connectionEvent, byte[] payload)
     {
-        if (_sockets.IsEmpty)
-        {
-            return;
-        }
-        foreach (var (id, subscription) in _sockets.ToArray())
-        {
-            var socket = subscription.Socket;
-            if (socket.State != WebSocketState.Open)
-            {
-                _sockets.TryRemove(id, out _);
-                continue;
-            }
-            if (!await CanReceiveAsync(subscription.Principal, connectionEvent).ConfigureAwait(false))
-            {
-                continue;
-            }
-
-            try
-            {
-                await socket.SendAsync(payload, WebSocketMessageType.Text, endOfMessage: true,
-                    CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException
-                or OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "dropping connection event websocket {SocketId}", id);
-                _sockets.TryRemove(id, out _);
-            }
-        }
+        var deliveries = _sockets.Values.ToArray()
+            .Where(subscription => string.IsNullOrWhiteSpace(connectionEvent.TenantId)
+                || ManagementContext.SameTenant(subscription.Principal.TenantId, connectionEvent.TenantId))
+            .Select(subscription => subscription.Delivery.SendAsync(connectionEvent, payload));
+        return Task.WhenAll(deliveries);
     }
 
     private async ValueTask<bool> CanReceiveAsync(SubscriptionPrincipal principal,
-        ConnectionEvent connectionEvent)
+        ConnectionEvent connectionEvent, CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(connectionEvent.TenantId)
             && !ManagementContext.SameTenant(principal.TenantId, connectionEvent.TenantId))
@@ -240,11 +213,11 @@ public sealed class ConnectionEventsHub
         return await db.ClientAccounts.AsNoTracking()
             .AnyAsync(c => c.Id == clientId
                            && c.TenantId == principal.TenantId
-                           && c.OwnerUsername == principal.Username)
+                           && c.OwnerUsername == principal.Username, cancellationToken)
             .ConfigureAwait(false);
     }
 
-    private sealed record ConnectionEventSubscription(WebSocket Socket, SubscriptionPrincipal Principal);
+    private sealed record ConnectionEventSubscription(SubscriptionPrincipal Principal, ConnectionEventDelivery Delivery);
 
     private sealed record SubscriptionPrincipal(string Username, string TenantId, bool Admin)
     {

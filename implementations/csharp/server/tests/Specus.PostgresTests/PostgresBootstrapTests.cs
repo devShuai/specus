@@ -14,6 +14,14 @@ namespace Specus.IntegrationTests;
 public sealed partial class PostgresBootstrapTests
 {
     [Fact]
+    public async Task NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ConnectionEventProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
     public async Task NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait()
     {
         await using var database = await OwnedDatabase.CreateAsync();

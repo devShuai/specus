@@ -250,7 +250,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 33), ('executed', 33), ('passed', 33), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 34), ('executed', 34), ('passed', 34), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -278,7 +278,10 @@ jobs:
           for name in ['NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait', 'NativeInboundReportCannotRestorePreTransferOwner', 'NativeInboundReportCannotRecreateClientDeletedOnIndependentHost']:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native inbound authority regression', name)
-          print('Verified all 33 real PostgreSQL cases, including inbound report lock waits, current owner and independent-host deletion; zero skipped.')
+          name = 'NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native connection-event identity regression', name)
+          print('Verified all 34 real PostgreSQL cases, including current identity checks for live connection-event delivery; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -306,7 +309,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 32), ('executed', 32), ('passed', 32), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 33), ('executed', 33), ('passed', 33), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -337,7 +340,10 @@ jobs:
           for name in ['NativeCancellationStopsHostDuringAnActuallyStalledTlsHandshake', 'ActualDriverIsIdentifiableLocalSourceBuildNotOracleSignedBinary', 'TrustedCaStillConnectsAndUntrustedCaIsRejected', 'VerifyFullStillRejectsTrustedCertificateForWrongHost', 'AlreadyCanceledOpenKeepsOriginalCallerToken']:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending TLS cancellation or certificate regression', name)
-          print('Verified all 32 real MySQL cases, including original-deadline stalled TLS cancellation and certificate validation; zero skipped.')
+          name = 'NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native connection-event identity regression', name)
+          print('Verified all 33 real MySQL cases, including stalled TLS cancellation, certificates and current connection-event identity; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -361,7 +367,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 32), ('executed', 32), ('passed', 32), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 33), ('executed', 33), ('passed', 33), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -398,7 +404,10 @@ jobs:
           for name in ['NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait', 'NativeInboundReportCannotRestorePreTransferOwner', 'NativeInboundReportCannotRecreateClientDeletedOnIndependentHost']:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native inbound authority regression', name)
-          print('Verified all 32 real MariaDB cases, including inbound report lock waits, current owner and independent-host deletion; zero skipped.')
+          name = 'NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native connection-event identity regression', name)
+          print('Verified all 33 real MariaDB cases, including current identity checks for live connection-event delivery; zero skipped.')
           PY
 
       - name: Keep real MariaDB results
