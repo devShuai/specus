@@ -286,13 +286,14 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 		return
 	}
 	if d.onConnectionEvent != nil {
-		now := time.Now()
-		channelID := conn.ChannelID()
-		reasonCopy := reason
-		d.onConnectionEvent("updated", store.ConnectionRecord{
-			ID: recordID, TenantID: conn.TenantID(), ClientName: conn.ClientName(), ChannelID: &channelID,
-			ConnectedAt: now, DisconnectedAt: &now, Success: true, DisconnectReason: &reasonCopy,
-		})
+		record, err := d.db.GetConnectionRecord(ctx, recordID)
+		if err != nil {
+			d.logger.Error("read disconnected connection record failed", "channel", conn.ChannelID(), "err", err)
+			return
+		}
+		if record != nil {
+			d.onConnectionEvent("updated", *record)
+		}
 	}
 }
 

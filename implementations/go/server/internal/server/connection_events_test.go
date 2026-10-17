@@ -70,6 +70,18 @@ func TestConnectionEventsWebSocketAuthAndLifecycleBroadcast(t *testing.T) {
 	if updated.Connection.DisconnectedAt == nil || updated.Connection.DisconnectReason == nil {
 		t.Fatalf("updated event missing disconnect fields: %+v", updated)
 	}
+	if updated.Connection.ClientID == nil || *updated.Connection.ClientID != *created.Connection.ClientID {
+		t.Fatalf("updated event lost client identity needed by current-owner filtering: %+v", updated)
+	}
+	createdAt, createdErr := time.Parse(time.RFC3339Nano, created.Connection.ConnectedAt)
+	updatedAt, updatedErr := time.Parse(time.RFC3339Nano, updated.Connection.ConnectedAt)
+	if createdErr != nil || updatedErr != nil || !createdAt.Equal(updatedAt) {
+		t.Fatalf("updated event rewrote original connection time: created=%+v updated=%+v", created, updated)
+	}
+	if updated.Connection.RemoteAddress == nil || created.Connection.RemoteAddress == nil ||
+		*updated.Connection.RemoteAddress != *created.Connection.RemoteAddress {
+		t.Fatalf("updated event lost original remote address: created=%+v updated=%+v", created, updated)
+	}
 }
 
 func readConnectionEvent(t *testing.T, conn *websocket.Conn) connectionEventPayload {
@@ -98,6 +110,7 @@ type connectionEventPayload struct {
 		ClientID         *int64  `json:"clientId"`
 		ClientName       string  `json:"clientName"`
 		ChannelID        *string `json:"channelId"`
+		RemoteAddress    *string `json:"remoteAddress"`
 		ConnectedAt      string  `json:"connectedAt"`
 		DisconnectedAt   *string `json:"disconnectedAt"`
 		Success          bool    `json:"success"`
