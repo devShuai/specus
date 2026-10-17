@@ -30,6 +30,7 @@ public sealed class PeerCatalogDeliveryAuthorityTests
     public async Task QueuedCatalogUsesCurrentPublisherReceiverAndServiceAuthority(string mutation)
     {
         await using var fixture = await CatalogFixture.StartAsync();
+        using var background = fixture.Observer.PauseBackgroundWrites();
         var firstPacket = new MessageResponsePacket { Message = "hold-catalog-writer" };
         var first = fixture.Pair.Connection.WriteAsync(firstPacket).AsTask();
         await fixture.Pair.Stream.HalfWritten.WaitAsync(TimeSpan.FromSeconds(10));
@@ -82,8 +83,37 @@ public sealed class PeerCatalogDeliveryAuthorityTests
             Assert.Equal("service-catalog", catalog.Type); Assert.Equal(fixture.Publisher.ClientSessionId, catalog.PublisherSessionId);
             if (mutation == "definition-port") Assert.Equal(24002, Assert.Single(catalog.Services!).PublishedPort);
             else Assert.Empty(catalog.Services!);
+            background.Dispose();
+            if (mutation == "receiver-owner-transferred") await AssertOwnershipBackgroundAsync(fixture, bytes.Length);
         }
         finally { fixture.Pair.Stream.Release(); try { await first; } catch (Exception) { } try { await pending; } catch (Exception) { } }
+    }
+
+    internal static async Task AssertOwnershipBackgroundAsync(CatalogFixture fixture, int afterBytes)
+    {
+        // The ownership poller is an independent producer on this physical stream.
+        // Verify it after the original queued-message assertions, not instead of them.
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var node = fixture.Server.HostServices.GetRequiredService<OwnerTransferNotifications>().NodeId;
+        await using var scope = fixture.Server.HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var audit = await db.ClientOwnerTransferAudits.AsNoTracking().SingleAsync(timeout.Token);
+        while (!await db.ClientOwnerTransferReceipts.AsNoTracking().AnyAsync(r => r.NodeId == node && r.EventId == audit.Id, timeout.Token))
+            await Task.Delay(20, timeout.Token);
+        Assert.Equal("bob", (await db.ClientAccounts.AsNoTracking().SingleAsync(a => a.Id == 1001, timeout.Token)).OwnerUsername);
+        var bytes = fixture.Pair.Stream.Wire();
+        var frames = new List<PeerControlMessage>();
+        while (afterBytes < bytes.Length)
+        {
+            Assert.True(PacketCodec.TryDecode(bytes.AsSpan(afterBytes), out var packet, out var consumed));
+            var message = Assert.IsType<MessageResponsePacket>(packet);
+            Assert.Equal("server", message.ClientName);
+            var control = JsonSerializer.Deserialize<PeerControlMessage>(message.Message!)!;
+            Assert.Contains(control.Type, new[] { "close", "peer-config", "roster", "egress-config", "egress-catalog", "service-catalog" });
+            frames.Add(control); afterBytes += consumed;
+        }
+        Assert.Contains(frames, frame => frame.Type == "peer-config" && frame.SourceClientId == 1001 && frame.TargetClientId == 1001);
+        Assert.Contains(frames, frame => frame.Type == "roster");
     }
 
     internal static SpecusConnectionContext NewContext(string channel, IFrameWriter writer) => new(channel, "127.0.0.1", writer,
@@ -145,9 +175,31 @@ public sealed class PeerCatalogDeliveryAuthorityTests
     {
         internal AsyncLocal<bool> OwnCall { get; } = new();
         internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
-        { if (OwnCall.Value) Entered.TrySetResult(); return inner.WriteAsync(packet, cancellationToken); }
-        public ValueTask<bool> WritePreparedAsync(Func<CancellationToken, ValueTask<Packet?>> prepare, CancellationToken cancellationToken = default)
-        { if (OwnCall.Value) Entered.TrySetResult(); return inner.WritePreparedAsync(prepare, cancellationToken); }
+        private TaskCompletionSource? _backgroundPause;
+        internal IDisposable PauseBackgroundWrites()
+        {
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (Interlocked.CompareExchange(ref _backgroundPause, gate, null) is not null)
+                throw new InvalidOperationException("background writes already paused");
+            return new BackgroundPause(this, gate);
+        }
+        private async ValueTask BeforeWriteAsync(CancellationToken ct)
+        {
+            if (OwnCall.Value) { Entered.TrySetResult(); return; }
+            var gate = Volatile.Read(ref _backgroundPause);
+            if (gate is not null) await gate.Task.WaitAsync(ct);
+        }
+        public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        { await BeforeWriteAsync(cancellationToken); await inner.WriteAsync(packet, cancellationToken); }
+        public async ValueTask<bool> WritePreparedAsync(Func<CancellationToken, ValueTask<Packet?>> prepare, CancellationToken cancellationToken = default)
+        { await BeforeWriteAsync(cancellationToken); return await inner.WritePreparedAsync(prepare, cancellationToken); }
+        private sealed class BackgroundPause(ObservingWriter owner, TaskCompletionSource gate) : IDisposable
+        {
+            public void Dispose()
+            {
+                if (ReferenceEquals(Interlocked.CompareExchange(ref owner._backgroundPause, null, gate), gate))
+                    gate.TrySetResult();
+            }
+        }
     }
 }

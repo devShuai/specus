@@ -32,6 +32,7 @@ public sealed class PeerSignalDeliveryAuthorityTests
     public async Task SignalAndGrantRecheckOriginalPeersAtTheActualWireTurn(bool grantQueued, string mutation)
     {
         await using var fixture = await PeerCatalogDeliveryAuthorityTests.CatalogFixture.StartAsync();
+        using var background = fixture.Observer.PauseBackgroundWrites();
         var registry = fixture.Server.HostServices.GetRequiredService<SessionRegistry>();
         var source = grantQueued ? registry.Find("laptop")! : fixture.Publisher;
         var target = grantQueued ? fixture.Publisher : registry.Find("laptop")!;
@@ -114,6 +115,9 @@ public sealed class PeerSignalDeliveryAuthorityTests
                 Assert.NotNull(session.ClosedAt);
                 if (grantQueued) Assert.Empty(((PeerControlDeliveryAuthorityTests.RecordingWriter)fixture.Publisher.Writer).Messages);
             }
+            background.Dispose();
+            if (mutation is "receiver-owner" or "receiver-owner-retained-acl")
+                await PeerCatalogDeliveryAuthorityTests.AssertOwnershipBackgroundAsync(fixture, bytes.Length);
         }
         finally { fixture.Pair.Stream.Release(); try { await first; } catch (Exception) { } try { await pending; } catch (Exception) { } }
     }
