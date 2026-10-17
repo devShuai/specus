@@ -32,15 +32,18 @@ public sealed partial class ClientAccountService
             var account = await _db.ClientAccounts.AsNoTracking().SingleOrDefaultAsync(c => c.Id == hint.ClientId && c.TenantId == credential.TenantId, ct).ConfigureAwait(false);
             var identity = await _db.ClientIdentities.AsNoTracking().SingleOrDefaultAsync(i => i.Id == hint.Id, ct).ConfigureAwait(false);
             if (account is null || identity is null || account.TenantId != credential.TenantId || identity.TenantId != credential.TenantId
-                || identity.CredentialId != credential.Id || identity.ClientId != account.Id || identity.ClientName != account.ClientName
+                || identity.CredentialId != credential.Id || identity.ClientId != account.Id
                 || identity.MachineFingerprint != hint.MachineFingerprint || identity.OsUser != hint.OsUser
                 || string.IsNullOrWhiteSpace(identity.MachineFingerprint) || string.IsNullOrWhiteSpace(identity.OsUser)) throw StartupChanged();
             if (!account.Enabled) throw new ArgumentException("客户端已停用");
+            // Names are mutable display metadata. Authenticate the immutable ID binding,
+            // then repair legacy cached names from the locked current account.
+            identity.ClientName = account.ClientName;
             identity.Hostname = Limit(environment.Hostname, 160); identity.LastSeenAt = DateTimeOffset.UtcNow;
             var (_, key) = ClientOwnershipWrite.Identifiers<ClientIdentity>(_db, "Id");
             await using var update = ClientOwnershipWrite.Command(_db,
-                $"UPDATE specus_client_identity SET hostname=@host,last_seen_at=@seen WHERE {key}=@id AND tenant_id=@tenant",
-                ("@host", identity.Hostname), ("@seen", IsoDateTimeOffsetConverter.Format(identity.LastSeenAt)), ("@id", identity.Id), ("@tenant", credential.TenantId));
+                $"UPDATE specus_client_identity SET client_name=@name,hostname=@host,last_seen_at=@seen WHERE {key}=@id AND tenant_id=@tenant",
+                ("@name", identity.ClientName), ("@host", identity.Hostname), ("@seen", IsoDateTimeOffsetConverter.Format(identity.LastSeenAt)), ("@id", identity.Id), ("@tenant", credential.TenantId));
             if (await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 1) throw StartupChanged();
             return (credential, account, identity);
         }

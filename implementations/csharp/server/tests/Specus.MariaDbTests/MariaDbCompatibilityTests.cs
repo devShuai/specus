@@ -16,6 +16,15 @@ namespace Specus.IntegrationTests;
 public sealed class MariaDbCompatibilityTests
 {
     [Fact]
+    public async Task NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var server = await StartAsync(database, gate);
+        await ClientNameProviderProof.VerifyAsync(server, gate);
+    }
+
+    [Fact]
     public async Task NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion()
     {
         await using var database = await OwnedDatabase.CreateAsync();

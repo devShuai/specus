@@ -12,7 +12,7 @@ using Specus.Server.Sessions;
 
 namespace Specus.Server.Management;
 
-public sealed class ManagementMutationService
+public sealed partial class ManagementMutationService
 {
     private readonly SpecusDbContext _db;
     private readonly SessionRegistry _sessions;
@@ -66,7 +66,7 @@ public sealed class ManagementMutationService
     {
         await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
         context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
-        var account = await LockClientForWriteAsync(context, id, cancellationToken).ConfigureAwait(false);
+        var account = await LockClientWithIdentityLinksAsync(context, id, cancellationToken).ConfigureAwait(false);
         var oldName = account.ClientName;
         var wasEnabled = account.Enabled;
 
@@ -85,9 +85,12 @@ public sealed class ManagementMutationService
         // Disabling a client ends the shares of all its routes in the same transaction.
         List<string> revokedShares = [];
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(oldName, account.ClientName, StringComparison.Ordinal))
+            await RenameClientReferencesAsync(account, cancellationToken).ConfigureAwait(false);
         if (wasEnabled && !account.Enabled)
             revokedShares = await _shares.OnClientDisabledAsync(context.Username, account.Id, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
         if (!account.Enabled || !string.Equals(oldName, account.ClientName, StringComparison.Ordinal))
         {
@@ -102,7 +105,7 @@ public sealed class ManagementMutationService
     {
         await using var transaction = await BeginResourceWriteAsync(cancellationToken).ConfigureAwait(false);
         context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
-        var account = await LockClientForWriteAsync(context, id, cancellationToken).ConfigureAwait(false);
+        var account = await LockClientWithIdentityLinksAsync(context, id, cancellationToken).ConfigureAwait(false);
         // The client's route rows go with it (no orphans), each audited as route.deleted, and the
         // shares of those routes end, all in one transaction.
         // Remove workbench references while the client's service rows still exist.
@@ -112,9 +115,13 @@ public sealed class ManagementMutationService
             .ConfigureAwait(false);
         var peerDeletion = await _peerMesh.ForgetClientReferencesAsync(account, cancellationToken)
             .ConfigureAwait(false);
+        // Remove the current binding, not its historical sessions/audit. A valid credential
+        // may subsequently register the same machine/user as an entirely new client ID.
+        await DeleteCurrentIdentityLinksAsync(account, cancellationToken).ConfigureAwait(false);
         _db.ClientAccounts.Remove(account);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         _peerMesh.QueueClientDeletion(peerDeletion);
         CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
         _shares.CutStreams(revokedShares);
