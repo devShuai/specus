@@ -128,6 +128,24 @@ public sealed partial class PeerMeshService : IOwnerTransferReconciler
         long fromClientId, long toClientId, long bytes, bool account,
 		CancellationToken cancellationToken)
 	{
+        // A concurrent ownership replay can invalidate the cache without revoking
+        // this explicitly authorized session. Re-read SQL instead of dropping its
+        // first business frame. Never reuse the old snapshot or account bytes twice;
+        // continuous invalidation remains bounded and fails closed.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = await AuthorizeRelaySnapshotAsync(header, fromClientId, toClientId,
+                bytes, account, cancellationToken).ConfigureAwait(false);
+            if (result is { } allowed) return allowed;
+        }
+        return false;
+    }
+
+    private async Task<bool?> AuthorizeRelaySnapshotAsync(PeerDataFrameHeader header,
+        long fromClientId, long toClientId, long bytes, bool account,
+        CancellationToken cancellationToken)
+	{
         var now = DateTimeOffset.UtcNow;
         var generation = Volatile.Read(ref _state.RelayGeneration);
         if (AuthorizeRelayFrameCached(header, fromClientId, toClientId, bytes, now, account))
@@ -174,7 +192,7 @@ public sealed partial class PeerMeshService : IOwnerTransferReconciler
             session.UpdatedAt = now;
             session.LastKeepaliveAt = now;
         }
-        if (generation != Volatile.Read(ref _state.RelayGeneration)) return false;
+        if (generation != Volatile.Read(ref _state.RelayGeneration)) return null;
         CacheRelayAuthorization(session, now, generation);
 		if (account)
 		{

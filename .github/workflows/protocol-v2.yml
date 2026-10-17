@@ -233,9 +233,21 @@ jobs:
       - name: Test .NET server
         env:
           SPECUS_REQUIRE_JAVA_CLIENT: "1"
+          SPECUS_PROCESS_TEST_ARTIFACT_DIR: ${{ runner.temp }}/dotnet-owner-process
         run: >-
           dotnet test implementations/csharp/server/Specus.slnx
           -p:SpecusServerWebSkip=true
+          --logger trx --results-directory "$RUNNER_TEMP/dotnet-full-results"
+
+      - name: Keep .NET full-suite results and owned-process logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-full-suite-and-owner-process
+          path: |
+            ${{ runner.temp }}/dotnet-full-results/*.trx
+            ${{ runner.temp }}/dotnet-owner-process/**/*.log
+          if-no-files-found: warn
 
       - name: Test real PostgreSQL native bootstrap, compatibility and catalogue data
         env:
