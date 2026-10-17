@@ -22,6 +22,222 @@ public class PeerEgressRuntimeTests
 {
     private const long Epoch = 1_800_000_000_000L;
 
+    private static Segment FinishForPortReuse(Harness harness, Segment opening)
+    {
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening)), Epoch);
+        harness.CompleteHandshake(7, opening);
+        harness.ClearFrames();
+        harness.Socket(0).EndOfStreamNow();
+        WaitFor("the original flow FIN", harness.SawFin);
+        var fin = harness.Segments().First(s => s.Has(PeerEgressSegment.FlagFin));
+        harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with {
+            Seq = unchecked(opening.Seq + 1), Ack = unchecked(fin.Seq + 1),
+            Flags = PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin, Payload = [] })), Epoch + 1);
+        Assert.Equal(0, harness.Runtime.FlowCount);
+        Assert.True(harness.Socket(0).IsClosed);
+        harness.ClearFrames();
+        return fin;
+    }
+
+    private static PeerEgressFlowTable TimeWaitTable(Harness harness) => (PeerEgressFlowTable)typeof(PeerEgressRuntime)
+        .GetField("_flows", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+        .GetValue(harness.Runtime)!;
+
+    [Theory]
+    [InlineData(-1L)]
+    [InlineData(0L)]
+    [InlineData(65535L)]
+    [InlineData(2147483648L)]
+    [InlineData(2147483649L)]
+    public void TimeWaitAmbiguousSynCannotRecycleSequenceSpace(long offset)
+    {
+        var harness = new Harness();
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            FinishForPortReuse(harness, opening);
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with {
+                Seq = unchecked((uint)(opening.Seq + 2L + offset)) })), Epoch + 2);
+            Assert.Equal(1, harness.DialCount); Assert.False(harness.SawReset());
+            Assert.NotNull(TimeWaitTable(harness).Lookup(new PeerEgressFlowTable.Key(6,
+                opening.SourceIp, opening.SourcePort, opening.DestinationIp, opening.DestinationPort)));
+        }
+        finally { harness.Runtime.Shutdown(Epoch + 3); }
+    }
+
+    [Theory]
+    [InlineData(1000L)]
+    [InlineData(4294967196L)]
+    public void TimeWaitFreshSynReopensOnItsFirstAttempt(long initial)
+    {
+        var harness = new Harness();
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443) with { Seq = (uint)initial };
+            var oldFin = FinishForPortReuse(harness, opening);
+            var next = opening with { Seq = unchecked(opening.Seq + 1_000_000) };
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(next)), Epoch + 2);
+            Assert.Equal(2, harness.DialCount);
+            Assert.Equal(1, harness.Runtime.FlowCount);
+            Assert.False(harness.SawReset());
+            var response = harness.Segments()[0];
+            Assert.Equal(PeerEgressSegment.FlagSyn | PeerEgressSegment.FlagAck, response.Flags);
+            Assert.Equal(unchecked(next.Seq + 1), response.Ack);
+            Assert.True(PeerEgressSegment.SeqLess(oldFin.Seq, response.Seq), "new ISS overlaps old send sequence");
+            harness.CompleteHandshake(7, next);
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(next with {
+                Seq = unchecked(next.Seq + 1), Ack = unchecked(response.Seq + 1),
+                Flags = PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, Payload = [42] })), Epoch + 3);
+            Assert.Equal(new byte[] {42}, Assert.Single(harness.Socket(1).Written));
+        }
+        finally { harness.Runtime.Shutdown(Epoch + 4); }
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(17)]
+    public void TimeWaitOldTrafficKeepsTheTombstone(int flags)
+    {
+        var harness = new Harness();
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            var fin = FinishForPortReuse(harness, opening);
+            var offset = flags == PeerEgressSegment.FlagSyn ? 0u : flags == PeerEgressSegment.FlagRst ? 2u : 1u;
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with {
+                Seq = opening.Seq + offset, Ack = fin.Seq + 1, Flags = flags })), Epoch + 2);
+            Assert.NotNull(TimeWaitTable(harness).Lookup(new PeerEgressFlowTable.Key(6,
+                opening.SourceIp, opening.SourcePort, opening.DestinationIp, opening.DestinationPort)));
+            Assert.False(harness.SawReset());
+            Assert.Equal(1, harness.DialCount);
+            Assert.Equal(0, harness.Runtime.FlowCount);
+            if (flags == (PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin))
+            {
+                Assert.Equal(opening.Seq + 2, Assert.Single(harness.Segments()).Ack);
+            }
+        }
+        finally { harness.Runtime.Shutdown(Epoch + 3); }
+    }
+
+    [Fact]
+    public void TimeWaitReuseRejectsOldPacketsBeforeAndAfterTheNewHandshake()
+    {
+        var harness = new Harness();
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            var oldFin = FinishForPortReuse(harness, opening);
+            var next = opening with { Seq = opening.Seq + 1_000_000 };
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(next)), Epoch + 2);
+            Assert.Equal(2, harness.DialCount);
+            var response = harness.Segments()[0];
+            foreach (var established in new[] {false, true})
+            {
+                if (established) { harness.CompleteHandshake(7, next); }
+                foreach (var flags in new[] {PeerEgressSegment.FlagAck, PeerEgressSegment.FlagRst,
+                    PeerEgressSegment.FlagAck | PeerEgressSegment.FlagFin,
+                    PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, PeerEgressSegment.FlagSyn})
+                {
+                    harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with {
+                        Seq = opening.Seq + (flags == PeerEgressSegment.FlagSyn ? 0u : 1u), Ack = oldFin.Seq + 1,
+                        Flags = flags, Payload = flags == (PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh) ? [99] : [] })), Epoch + 3);
+                }
+                Assert.False(harness.Socket(1).IsClosed);
+                Assert.False(harness.Socket(1).IsHalfClosed);
+                Assert.Empty(harness.Socket(1).Written);
+            }
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(next with {
+                Seq = next.Seq + 1, Ack = response.Seq + 1,
+                Flags = PeerEgressSegment.FlagAck | PeerEgressSegment.FlagPsh, Payload = [42] })), Epoch + 4);
+            Assert.Equal(new byte[] {42}, Assert.Single(harness.Socket(1).Written));
+        }
+        finally { harness.Runtime.Shutdown(Epoch + 5); }
+    }
+
+    [Theory]
+    [InlineData("current-permission")]
+    [InlineData("current-cap")]
+    [InlineData("new-rate-token")]
+    public void TimeWaitReuseRechecksCurrentLimits(string mode)
+    {
+        var harness = new Harness(() => Epoch, null);
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            FinishForPortReuse(harness, opening);
+            var expectedDials = 1;
+            var expectedCode = PeerEgressCodes.LimitExceeded;
+            if (mode == "current-permission")
+            {
+                harness.Runtime.SetPeerAclAllows(_ => false);
+                expectedCode = PeerEgressCodes.PeerAclDenied;
+            }
+            else if (mode == "current-cap")
+            {
+                var capped = Policy() with { Limits = new PeerEgressLimits { MaxFlowsPerConsumer = 1 } };
+                harness.Runtime.ApplyPolicy(capped, PeerEgressContext.Default, Epoch + 2);
+                harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with { SourcePort = 40001 })), Epoch + 2);
+                expectedDials = 2; harness.ClearFrames();
+            }
+            else
+            {
+                var rate = (PeerEgressFlowRate)typeof(PeerEgressRuntime)
+                    .GetField("_rate", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                    .GetValue(harness.Runtime)!;
+                for (var i = 1; i < PeerEgressFlowRate.Capacity; i++) { Assert.True(rate.TryTake(7, Epoch)); }
+            }
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with { Seq = opening.Seq + 1_000_000 })), Epoch + 3);
+            Assert.Equal(expectedDials, harness.DialCount);
+            Assert.Equal(new[] {expectedCode}, harness.RejectCodes());
+        }
+        finally { harness.Runtime.Shutdown(Epoch + 4); }
+    }
+
+    [Fact]
+    public void TimeWaitRacingSynDoesNotResetTheOnlyReservedSlot()
+    {
+        var harness = new Harness();
+        Thread? worker = null;
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            FinishForPortReuse(harness, opening);
+            var capped = Policy() with { Limits = new PeerEgressLimits { MaxFlowsPerConsumer = 1 } };
+            harness.Runtime.ApplyPolicy(capped, PeerEgressContext.Default, Epoch + 2);
+            var next = opening with { Seq = opening.Seq + 1_000_000 };
+            harness.Gate = new ManualResetEventSlim(false);
+            worker = StartBlocking(() => harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(next)), Epoch + 2));
+            WaitFor("the replacement reservation", () => harness.DialCount == 2);
+            harness.Runtime.OpenTcpFlow(7, new PeerEgressFlowTable.Key(6, next.SourceIp, next.SourcePort,
+                next.DestinationIp, next.DestinationPort), next, Epoch + 3);
+            Assert.False(harness.SawReset()); Assert.Empty(harness.RejectCodes()); Assert.Equal(2, harness.DialCount);
+            harness.Gate.Set(); Assert.True(worker.Join(5000));
+            Assert.Equal(1, harness.Runtime.FlowCount);
+            Assert.Single(harness.Segments(), s => s.Has(PeerEgressSegment.FlagSyn));
+        }
+        finally
+        {
+            harness.Gate?.Set(); if (worker is not null) { Assert.True(worker.Join(5000)); }
+            harness.Runtime.Shutdown(Epoch + 4); harness.Gate?.Dispose();
+        }
+    }
+
+    [Fact]
+    public void TimeWaitControlFreshSynNeverReplacesALiveFlow()
+    {
+        var harness = new Harness();
+        try
+        {
+            var opening = Syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening)), Epoch);
+            harness.CompleteHandshake(7, opening);
+            harness.Runtime.HandleFrame(7, FrameFor(PeerEgressSegment.Build(opening with { Seq = opening.Seq + 1_000_000 })), Epoch + 1);
+            Assert.Equal(1, harness.DialCount);
+        }
+        finally { harness.Runtime.Shutdown(Epoch + 2); }
+    }
+
     private static readonly object EndOfStream = new();
 
     [Fact]

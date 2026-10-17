@@ -313,6 +313,11 @@ func (r *egressRuntime) handleSegment(consumer int64, segment tcpSegment, now ti
 	}
 
 	handle, ok := flow.Handle.(*egressTCPFlow)
+	if ok && flow.Consumer == consumer && handle.conn.canReopen(segment) {
+		r.mu.Unlock()
+		r.openTCPFlow(consumer, key, segment, now)
+		return
+	}
 	if !ok {
 		// The reservation exists but its connect has not returned, so there is no state machine
 		// to drive yet. Dropping is correct rather than merely tolerable: the consumer's own
@@ -351,7 +356,7 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		r.mu.Unlock()
 		return
 	}
-	flow, code, opened := r.reserveTo(consumer, key, destination, name, now)
+	flow, code, opened := r.reserveTo(consumer, key, destination, name, now, syn)
 	if code != egressCodeAllowed {
 		r.mu.Unlock()
 		r.refuse(consumer, key, code, now)
@@ -391,7 +396,11 @@ func (r *egressRuntime) openTCPFlow(consumer int64, key egressFlowKey, syn tcpSe
 		return
 	}
 
-	conn, output := acceptTCPSynWithTransmit(syn, newEgressISS(), mtu, r.flows.idleTimeout, now, func(packet []byte) bool {
+	iss := newEgressISS()
+	if flow.initialSendSequence != nil {
+		iss = *flow.initialSendSequence
+	}
+	conn, output := acceptTCPSynWithTransmit(syn, iss, mtu, r.flows.idleTimeout, now, func(packet []byte) bool {
 		return r.send == nil || r.send(consumer, encodePeerEgressFrame(peerEgressTypeIPPacket, false, packet)) == nil
 	})
 	handle := &egressTCPFlow{conn: conn, socket: socket, wake: make(chan struct{}, 1)}
@@ -691,19 +700,38 @@ func (r *egressRuntime) reserve(consumer int64, key egressFlowKey, now time.Time
 // name, "" for a flow to the address itself. The entry this call creates keeps both, so a later
 // policy change judges the flow the way it was opened.
 func (r *egressRuntime) reserveTo(consumer int64, key egressFlowKey, destination netip.Addr, name string,
-	now time.Time) (*egressFlow, string, bool) {
-	if code := r.authorizeTo(consumer, key, destination, name); code != egressCodeAllowed {
-		return nil, code, false
-	}
+	now time.Time, opening ...tcpSegment) (*egressFlow, string, bool) {
 	// The rate token comes last, so a flow any other check refused costs nothing, and only for an
 	// entry this call creates: a retransmitted SYN or a second datagram racing the first finds the
 	// reservation already there and is not a new flow.
-	if _, exists := r.flows.lookup(key); !exists && !r.flowRate.take(consumer) {
+	previous, exists := r.flows.lookup(key)
+	var retired *egressTCPFlow
+	if exists && previous.Consumer == consumer && len(opening) == 1 {
+		if tcp, ok := previous.Handle.(*egressTCPFlow); ok && tcp.conn.canReopen(opening[0]) {
+			retired = tcp
+		}
+	}
+	// A duplicate does no I/O and owns no additional slot; do not reject its existing reservation.
+	if exists && retired == nil {
+		return previous, egressCodeAllowed, false
+	}
+	if code := r.authorizeTo(consumer, key, destination, name); code != egressCodeAllowed {
+		return nil, code, false
+	}
+	if (!exists || retired != nil) && !r.flowRate.take(consumer) {
 		return nil, egressCodeLimitExceeded, false
+	}
+	var replacementSequence *uint32
+	if retired != nil {
+		sequence := retired.conn.nextIncarnationSequence(newEgressISS())
+		replacementSequence = &sequence
+		r.flows.close(key)
+		closeEgressHandle(retired)
 	}
 	flow, opened := r.flows.open(key, consumer, now)
 	if opened {
 		flow.Name, flow.Destination = name, destination
+		flow.initialSendSequence = replacementSequence
 	}
 	return flow, egressCodeAllowed, opened
 }
