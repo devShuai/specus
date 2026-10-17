@@ -160,6 +160,9 @@ int st_egress_normalize_version(int version);
  */
 int st_egress_declares_domain_targets(const char *capabilities_json, int version);
 
+/* Egress-side IPv6 socket support; does not enable IPv6 consumer packets. */
+int st_egress_declares_ipv6_targets(const char *capabilities_json, int version);
+
 /*
  * One consumer-side split-routing rule.
  *

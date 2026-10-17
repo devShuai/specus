@@ -110,6 +110,11 @@ public class ClientSession {
     @Column(name = "client_egress_domain_targets", nullable = false)
     private boolean clientEgressDomainTargets;
 
+    /** IPv6 sockets on the egress, not IPv6 packets on the consumer's TUN. */
+    @ColumnDefault("false")
+    @Column(name = "client_egress_ipv6_targets", nullable = false)
+    private boolean clientEgressIpv6Targets;
+
     @Column(name = "http_login_at", nullable = false, length = 40)
     private String httpLoginAt;
 

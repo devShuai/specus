@@ -255,12 +255,15 @@ type ClientSession struct {
 	// ClientEgressDomainTargets is whether the client, as an egress, resolves domain targets itself
 	// (clientEgressCapabilities.domainTargetCapable). The catalogue passes it on to consumers.
 	ClientEgressDomainTargets bool
-	HTTPLoginAt               time.Time
-	NettyConnectedAt          *time.Time
-	DisconnectedAt            *time.Time
-	ExpiresAt                 time.Time
-	ChannelID                 *string
-	RemoteAddress             *string
+	// ClientEgressIPv6Targets reports the egress's IPv6 target socket support,
+	// not IPv6 packets on the consumer TUN. Missing declarations remain false.
+	ClientEgressIPv6Targets bool
+	HTTPLoginAt             time.Time
+	NettyConnectedAt        *time.Time
+	DisconnectedAt          *time.Time
+	ExpiresAt               time.Time
+	ChannelID               *string
+	RemoteAddress           *string
 }
 
 // PeerMeshDevice mirrors peer_mesh_device.

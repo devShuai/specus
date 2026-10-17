@@ -1,0 +1,26 @@
+{
+  "description": "Existing egress-side IPv6 target sockets, not IPv6 consumer packets. Persist on the authenticated session and forward the newest online session's declaration; never infer a grant or enable IPv6 routes from this flag.",
+  "sessionColumn": "client_egress_ipv6_targets",
+  "legacyDefault": false,
+  "consumerIpv6DataPlaneEnabled": false,
+  "login": [
+    { "name": "explicit-true", "capabilities": { "version": 1, "egressCapable": true, "ipv6TargetCapable": true }, "normalizedVersion": 1, "stored": true },
+    { "name": "missing-flag", "capabilities": { "version": 1, "egressCapable": true }, "normalizedVersion": 1, "stored": false },
+    { "name": "explicit-false", "capabilities": { "version": 1, "ipv6TargetCapable": false }, "normalizedVersion": 1, "stored": false },
+    { "name": "zero-version", "capabilities": { "version": 0, "ipv6TargetCapable": true }, "normalizedVersion": 0, "stored": false },
+    { "name": "negative-version", "capabilities": { "version": -1, "ipv6TargetCapable": true }, "normalizedVersion": 0, "stored": false },
+    { "name": "future-version-normalized", "capabilities": { "version": 2, "egressCapable": true, "ipv6TargetCapable": true }, "normalizedVersion": 1, "stored": true },
+    { "name": "legacy-no-object", "capabilities": null, "normalizedVersion": 0, "stored": false }
+  ],
+  "catalog": [
+    { "name": "online-true", "sessions": [{ "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": true }], "expected": true },
+    { "name": "online-false", "sessions": [{ "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": false }], "expected": false },
+    { "name": "disconnected", "sessions": [{ "id": 92, "tenantId": "tenant-a", "status": "DISCONNECTED", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": true }], "expected": false },
+    { "name": "http-only", "sessions": [{ "id": 92, "tenantId": "tenant-a", "status": "HTTP_AUTHENTICATED", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": true }], "expected": false },
+    { "name": "zero-version", "sessions": [{ "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 0, "ipv6TargetCapable": true }], "expected": false },
+    { "name": "new-false-no-old-true", "sessions": [{ "id": 91, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:00:00Z", "version": 1, "ipv6TargetCapable": true }, { "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": false }], "expected": false },
+    { "name": "new-old-client-no-old-true", "sessions": [{ "id": 91, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:00:00Z", "version": 1, "ipv6TargetCapable": true }, { "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 0, "ipv6TargetCapable": false }], "expected": false },
+    { "name": "other-tenant-no-capability-borrow", "sessions": [{ "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": false }, { "id": 93, "tenantId": "tenant-b", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:02:00Z", "version": 1, "ipv6TargetCapable": true }], "expected": false },
+    { "name": "newest-connection-not-newest-http-id", "sessions": [{ "id": 93, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:00:00Z", "version": 1, "ipv6TargetCapable": true }, { "id": 92, "tenantId": "tenant-a", "status": "NETTY_ONLINE", "connectedAt": "2026-10-18T00:01:00Z", "version": 1, "ipv6TargetCapable": false }], "expected": false }
+  ]
+}

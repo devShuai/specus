@@ -13,6 +13,8 @@ on:
       - "protocol/**"
       - "tools/loadtest/**"
       - "pom.xml"
+      - "scripts/verify_go_session_database_tests.py"
+      - "scripts/test_verify_go_session_database_tests.py"
   push:
     branches: [main]
     paths:
@@ -26,6 +28,8 @@ on:
       - "protocol/**"
       - "tools/loadtest/**"
       - "pom.xml"
+      - "scripts/verify_go_session_database_tests.py"
+      - "scripts/test_verify_go_session_database_tests.py"
   workflow_dispatch:
 
 permissions:
@@ -248,9 +252,9 @@ jobs:
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'postgres-results/postgres-bootstrap.trx'
           counters = ET.parse(path).getroot().find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 15), ('executed', 15), ('passed', 15), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all twelve real PostgreSQL cases executed and passed; zero skipped.')
+          print('Verified all fifteen real PostgreSQL cases executed and passed; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -274,9 +278,9 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 7), ('executed', 7), ('passed', 7), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 10), ('executed', 10), ('passed', 10), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all seven real MySQL schema cases executed and passed; zero skipped.')
+          print('Verified all ten real MySQL schema cases executed and passed; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -299,9 +303,9 @@ jobs:
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mariadb-results/mariadb-compatibility.trx'
           counters = ET.parse(path).getroot().find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 15), ('executed', 15), ('passed', 15), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all twelve real MariaDB cases executed and passed; zero skipped.')
+          print('Verified all fifteen real MariaDB cases executed and passed; zero skipped.')
           PY
 
       - name: Keep real MariaDB results
@@ -310,6 +314,57 @@ jobs:
         with:
           name: dotnet-mariadb-compatibility
           path: ${{ runner.temp }}/mariadb-results
+          if-no-files-found: error
+
+      # Reuse the mandatory, pinned database services. SQLite-only Go tests did
+      # not catch an unterminated MySQL CREATE or collation-broadened identities.
+      - name: Set up Go for real database regressions
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/server/go.mod
+          cache-dependency-path: implementations/go/server/go.sum
+
+      - name: Test the native Go evidence verifier
+        run: python3 -B -m unittest discover -s scripts -p test_verify_go_session_database_tests.py
+
+      - name: Test real Go MySQL bootstrap and session vectors
+        working-directory: implementations/go/server
+        env:
+          SPECUS_TEST_SESSION_ORDER_MYSQL_DSN: "root:specus-ci-mysql-276@tcp(127.0.0.1:${{ job.services.mysql.ports[3306] }})/specus_go_order_ci?charset=utf8mb4"
+          SPECUS_TEST_SESSION_SCOPE_MYSQL_DSN: "root:specus-ci-mysql-276@tcp(127.0.0.1:${{ job.services.mysql.ports[3306] }})/specus_go_scope_ci?charset=utf8mb4"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/go-native"
+          docker exec -e MYSQL_PWD=specus-ci-mysql-276 ${{ job.services.mysql.id }} mysql -uroot \
+            -e 'CREATE DATABASE specus_go_order_ci CHARACTER SET utf8mb4; CREATE DATABASE specus_go_scope_ci CHARACTER SET utf8mb4;'
+          go test -json ./internal/store \
+            -run '^(TestOnlineEgressSessionOrderingVector|TestOnlineSessionScopeDoesNotUseDatabaseCollation|TestMySQLWorkbenchDDLIsTerminatedBeforeProductMetrics)$' \
+            -count=1 | tee "$RUNNER_TEMP/go-native/mysql.jsonl"
+
+      - name: Test real Go MariaDB bootstrap and session vectors
+        working-directory: implementations/go/server
+        env:
+          SPECUS_TEST_SESSION_ORDER_MYSQL_DSN: "root:specus-ci-maria-277@tcp(127.0.0.1:${{ job.services.mariadb.ports[3306] }})/specus_go_order_ci?charset=utf8mb4"
+          SPECUS_TEST_SESSION_SCOPE_MYSQL_DSN: "root:specus-ci-maria-277@tcp(127.0.0.1:${{ job.services.mariadb.ports[3306] }})/specus_go_scope_ci?charset=utf8mb4"
+        run: |
+          set -euo pipefail
+          docker exec -e MYSQL_PWD=specus-ci-maria-277 ${{ job.services.mariadb.id }} mariadb -uroot \
+            -e 'CREATE DATABASE specus_go_order_ci CHARACTER SET utf8mb4; CREATE DATABASE specus_go_scope_ci CHARACTER SET utf8mb4;'
+          go test -json ./internal/store \
+            -run '^(TestOnlineEgressSessionOrderingVector|TestOnlineSessionScopeDoesNotUseDatabaseCollation|TestMySQLWorkbenchDDLIsTerminatedBeforeProductMetrics)$' \
+            -count=1 | tee "$RUNNER_TEMP/go-native/mariadb.jsonl"
+
+      - name: Verify all native Go vectors executed with zero skipped
+        run: >-
+          python3 -B scripts/verify_go_session_database_tests.py
+          "$RUNNER_TEMP/go-native/mysql.jsonl" "$RUNNER_TEMP/go-native/mariadb.jsonl"
+
+      - name: Keep native Go database results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-native-session-databases
+          path: ${{ runner.temp }}/go-native
           if-no-files-found: error
 
   c-linux:

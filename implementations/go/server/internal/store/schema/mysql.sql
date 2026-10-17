@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS specus_client_session (
   peer_service_applications VARCHAR(160),
   client_egress_version INT NOT NULL DEFAULT 0,
   client_egress_domain_targets TINYINT(1) NOT NULL DEFAULT 0,
+  client_egress_ipv6_targets TINYINT(1) NOT NULL DEFAULT 0,
   http_login_at VARCHAR(40) NOT NULL,
   netty_connected_at VARCHAR(40),
   disconnected_at VARCHAR(40),
@@ -685,6 +686,7 @@ CREATE TABLE IF NOT EXISTS management_workbench_item (
   PRIMARY KEY (tenant_id, username, list, kind, object_id),
   KEY idx_mwi_object (tenant_id, kind, object_id),
   KEY idx_mwi_list_at (list, at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Opt-in product metrics (protocol/spec/product-metrics.md): a per-tenant switch, per-account
 -- onboarding progress kept only for the 14-day window, and two daily counter tables without any

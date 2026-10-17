@@ -78,6 +78,9 @@ public sealed class ClientSession
     /// </remarks>
     public bool ClientEgressDomainTargets { get; set; }
 
+    /// <summary>IPv6 sockets on the egress, not IPv6 packets on the consumer TUN.</summary>
+    public bool ClientEgressIpv6Targets { get; set; }
+
     public DateTimeOffset HttpLoginAt { get; set; }
     public DateTimeOffset? NettyConnectedAt { get; set; }
     public DateTimeOffset? DisconnectedAt { get; set; }

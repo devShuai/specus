@@ -13,6 +13,67 @@ namespace Specus.IntegrationTests;
 
 public sealed class MySqlTrafficSchemaTests
 {
+    [Fact]
+    public async Task NativeCatalogueIgnoresCollationEquivalentForeignSessionScope()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var db = database.Context();
+        await db.Database.MigrateAsync();
+        await PeerEgressSessionOrderDatabaseContract.AssertScopeAsync(db);
+    }
+
+    [Fact]
+    public async Task NativeCatalogueUsesEverySharedRawSessionOrderingVector()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var db = database.Context();
+        await db.Database.MigrateAsync();
+        await PeerEgressSessionOrderDatabaseContract.AssertAsync(db);
+    }
+
+
+    [Fact]
+    public async Task Ipv6AnnouncementUpgradeDefaultsFalseAndRollbackPreservesSessionHistory()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var db = database.Context();
+        await db.GetService<IMigrator>().MigrateAsync("20261014023000_WidenHttpTrafficText");
+        // A genuine pre-column row must acquire false, not an inferred declaration.
+        var legacySql = string.Concat("INSERT INTO specus_client_session (", "`Id`", """
+            , tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status,
+            machine_fingerprint, os_user, message_send_capable, message_receive_capable,
+            message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
+            peer_service_discovery_version, client_egress_version, client_egress_domain_targets,
+            http_login_at, expires_at)
+            VALUES (901, 'ipv6-upgrade', 1, 1, 1, 'legacy', 'ipv6-legacy-token', 'NETTY_ONLINE',
+            'fixture-machine', 'fixture-user', FALSE, FALSE, FALSE, FALSE, 0, 0, 1, FALSE,
+            '2026-10-18T00:00:00Z', '2026-10-19T00:00:00Z')
+            """);
+        await db.Database.ExecuteSqlRawAsync(legacySql);
+        await db.Database.MigrateAsync();
+        var legacy = await db.ClientSessions.AsNoTracking().SingleAsync(row => row.Id == 901);
+        Assert.False(legacy.ClientEgressIpv6Targets);
+        Assert.Equal("ipv6-legacy-token", legacy.TokenHash);
+        db.ClientSessions.Add(new ClientSession
+        {
+            Id = 902, TenantId = "ipv6-upgrade", CredentialId = 1, IdentityId = 1, ClientId = 1,
+            ClientName = "current", TokenHash = "ipv6-current-token", Status = "NETTY_ONLINE",
+            MachineFingerprint = "fixture-machine", OsUser = "fixture-user",
+            ClientEgressVersion = 1, ClientEgressIpv6Targets = true,
+            HttpLoginAt = DateTimeOffset.Parse("2026-10-18T00:01:00Z"),
+            ExpiresAt = DateTimeOffset.Parse("2026-10-19T00:00:00Z"),
+        });
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+        Assert.True((await db.ClientSessions.AsNoTracking().SingleAsync(row => row.Id == 902)).ClientEgressIpv6Targets);
+        var history = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
+        await Assert.ThrowsAsync<NotSupportedException>(() => db.GetService<IMigrator>().MigrateAsync("20261014023000_WidenHttpTrafficText"));
+        Assert.Equal(history, await db.Database.GetAppliedMigrationsAsync());
+        Assert.False((await db.ClientSessions.AsNoTracking().SingleAsync(row => row.Id == 901)).ClientEgressIpv6Targets);
+        Assert.True((await db.ClientSessions.AsNoTracking().SingleAsync(row => row.Id == 902)).ClientEgressIpv6Targets);
+        await db.Database.MigrateAsync();
+        Assert.False(db.Database.HasPendingModelChanges());
+    }
     private const string Previous = "20261013031423_BindManagementWebSocketAccount";
     private const string Repair = "20261014023000_WidenHttpTrafficText";
     private static readonly string[] WideColumns = ["request_headers", "response_headers", "request_preview_hex", "response_preview_hex"];

@@ -135,6 +135,26 @@ public sealed class ClientAuthOptionsTests
         Assert.False(absent.ClientEgressDomainTargets);
     }
 
+    [Theory]
+    [InlineData(1, true, true)]
+    [InlineData(1, null, false)]
+    [InlineData(1, false, false)]
+    [InlineData(0, true, false)]
+    [InlineData(-1, true, false)]
+    [InlineData(2, true, true)]
+    public async Task ClientAuthLoginStoresAnnouncedIpv6TargetSocketSupport(int version, bool? declared, bool expected)
+    {
+        await using var server = await TestServerFixture.StartAsync();
+        using var client = server.CreateClient();
+        var capabilities = new Dictionary<string, object?> { ["version"] = version, ["egressCapable"] = true };
+        if (declared.HasValue) capabilities["ipv6TargetCapable"] = declared.Value;
+        var stored = await LoginWithEgressCapabilitiesAsync(server, client, "machine-egress-ipv6", capabilities);
+        // Missing on the legacy model is observed as false, so this regression
+        // executes before the persistence field exists as well as after it is added.
+        var value = stored.GetType().GetProperty("ClientEgressIpv6Targets")?.GetValue(stored);
+        Assert.Equal(expected, value is bool capable && capable);
+    }
+
     /// <summary>
     /// The connectivity check trusts RST metadata.failure only from a session that announced
     /// clientHttpRouteCapabilities.version >= 1, so the login keeps that version with the session.

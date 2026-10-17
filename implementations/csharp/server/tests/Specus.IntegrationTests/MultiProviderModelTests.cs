@@ -1,6 +1,9 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
+using Specus.Server.Data.Migrations;
 
 namespace Specus.IntegrationTests;
 
@@ -32,6 +35,16 @@ public sealed class MultiProviderModelTests
     };
 
     public static TheoryData<string> Providers => new() { "sqlite", "postgres", "mysql" };
+
+    [Theory]
+    [MemberData(nameof(Providers))]
+    public void SqliteLockRecoveryDoesNotReplaceOtherProvidersHistoryServices(string provider)
+    {
+        using var context = CreateContext(provider);
+        var history = context.GetService<IHistoryRepository>();
+        if (provider == "sqlite") Assert.IsType<SpecusSqliteHistoryRepository>(history);
+        else Assert.IsNotType<SpecusSqliteHistoryRepository>(history);
+    }
 
     [Theory]
     [MemberData(nameof(Providers))]

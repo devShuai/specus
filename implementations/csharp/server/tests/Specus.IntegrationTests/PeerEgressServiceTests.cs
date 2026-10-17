@@ -228,6 +228,113 @@ public sealed class PeerEgressServiceTests
         Assert.All(entries.Values, entry => Assert.False(entry.Ipv6TargetCapable));
     }
 
+    [Theory]
+    [InlineData("NETTY_ONLINE", 1, true, false, true)]
+    [InlineData("NETTY_ONLINE", 1, false, false, false)]
+    [InlineData("DISCONNECTED", 1, true, false, false)]
+    [InlineData("HTTP_AUTHENTICATED", 1, true, false, false)]
+    [InlineData("NETTY_ONLINE", 0, true, false, false)]
+    [InlineData("NETTY_ONLINE", 1, false, true, false)]
+    [InlineData("NETTY_ONLINE", 0, false, true, false)]
+    public async Task TheCatalogCarriesTheNewestIpv6TargetSocketAnnouncement(
+        string status, int version, bool declared, bool olderTrue, bool expected)
+    {
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "consumer-owner", "laptop");
+        var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
+        fixture.AllowPeering(consumer, egress);
+        var now = DateTimeOffset.UtcNow;
+        void AddAnnouncement(long id, string state, int announcedVersion, bool ipv6, DateTimeOffset connected)
+        {
+            // Unknown on the legacy model means false, allowing this regression
+            // to execute before adding the persisted field as well as after it.
+            var session = JsonSerializer.Deserialize<ClientSession>(
+                "{\"ClientEgressIpv6Targets\":" + (ipv6 ? "true" : "false") + "}")!;
+            session.Id = id;
+            session.TenantId = egress.TenantId;
+            session.ClientId = egress.Id;
+            session.ClientName = egress.ClientName;
+            session.TokenHash = $"ipv6-announcement-{id}";
+            session.Status = state;
+            session.MachineFingerprint = "fixture-machine";
+            session.OsUser = "fixture-user";
+            session.ClientEgressVersion = announcedVersion;
+            session.HttpLoginAt = connected;
+            session.NettyConnectedAt = connected;
+            session.ExpiresAt = now.AddHours(1);
+            fixture.Db.ClientSessions.Add(session);
+        }
+        if (olderTrue) AddAnnouncement(4591, "NETTY_ONLINE", 1, true, now.AddMinutes(-1));
+        AddAnnouncement(4592, status, version, declared, now);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+        Assert.Equal(expected, Assert.Single(catalog!.Egresses!).Ipv6TargetCapable);
+    }
+
+    public static IEnumerable<object[]> SessionOrderVectorCases()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var path = Path.Combine(directory.FullName, "protocol", "test-vectors", "peer-egress-session-order-v1.json");
+            if (!File.Exists(path)) continue;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            Assert.False(document.RootElement.GetProperty("consumerIpv6DataPlaneEnabled").GetBoolean());
+            var cases = document.RootElement.GetProperty("cases");
+            Assert.Equal(26, cases.GetArrayLength());
+            foreach (var example in cases.EnumerateArray())
+                yield return [example.GetProperty("name").GetString()!, example.GetRawText()];
+            yield break;
+        }
+        throw new InvalidOperationException("Shared session ordering vector not found");
+    }
+
+    [Theory]
+    [MemberData(nameof(SessionOrderVectorCases))]
+    public async Task CatalogueUsesSharedPersistedSessionOrder(string caseName, string caseJson)
+    {
+        using var document = JsonDocument.Parse(caseJson);
+        var example = document.RootElement;
+        await using var fixture = await EgressFixture.CreateAsync();
+        var consumer = fixture.AddClient(ConsumerId, "owner", "order-consumer");
+        var egress = fixture.AddClient(EgressId, "owner", "order-egress");
+        fixture.AllowPeering(consumer, egress);
+        await fixture.SaveChangesAsync();
+        await fixture.UpsertAsync(EgressId, enabled: true, consumers: [ConsumerId]);
+        foreach (var declaration in example.GetProperty("sessions").EnumerateArray())
+        {
+            var id = declaration.GetProperty("id").GetInt64();
+            fixture.Db.ClientSessions.Add(new ClientSession
+            {
+                Id = id,
+                TenantId = declaration.GetProperty("tenantId").GetString() == "tenant-a" ? "default" : "tenant-b",
+                ClientId = declaration.GetProperty("clientId").GetInt64() == 1002 ? EgressId : OutsiderId,
+                ClientName = "order-egress", TokenHash = $"session-order-{id}",
+                Status = declaration.GetProperty("status").GetString()!,
+                MachineFingerprint = "fixture-machine", OsUser = "fixture-user",
+                HttpLoginAt = DateTimeOffset.UtcNow, NettyConnectedAt = DateTimeOffset.UtcNow,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                ClientEgressVersion = declaration.GetProperty("version").GetInt32(),
+                ClientEgressDomainTargets = declaration.GetProperty("domainTargetCapable").GetBoolean(),
+                ClientEgressIpv6Targets = declaration.GetProperty("ipv6TargetCapable").GetBoolean(),
+            });
+            await fixture.SaveChangesAsync();
+            string? connected = declaration.GetProperty("connectedAt").GetString();
+            var http = declaration.GetProperty("httpLoginAt").GetString()!;
+            // Use the exact historical database strings. Saving DateTimeOffset would
+            // silently canonicalize or round them and hide the cross-implementation bug.
+            await fixture.Db.Database.ExecuteSqlInterpolatedAsync($"""
+                UPDATE specus_client_session SET netty_connected_at={connected}, http_login_at={http} WHERE Id={id}
+                """);
+        }
+        var catalog = await fixture.Service.BuildEgressCatalogAsync(consumer, Capable(), default);
+        var entry = Assert.Single(catalog!.Egresses!);
+        var expected = example.GetProperty("expected");
+        Assert.True(expected.GetProperty("version").GetInt32() == entry.EgressVersion, $"{caseName}: wrong version");
+        Assert.True(expected.GetProperty("domainTargetCapable").GetBoolean() == entry.DomainTargetCapable, $"{caseName}: wrong domain capability");
+        Assert.True(expected.GetProperty("ipv6TargetCapable").GetBoolean() == entry.Ipv6TargetCapable, $"{caseName}: wrong IPv6 capability");
+    }
+
     /// <summary>
     /// Only the newest online session speaks for the egress: one that reconnected with a build that
     /// cannot resolve names stops being advertised as able to, even while an older session row has

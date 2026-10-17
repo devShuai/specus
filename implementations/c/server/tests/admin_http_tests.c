@@ -6192,7 +6192,7 @@ int main(void)
              "\"attachments\":true,\"mediaPreview\":true,"
              "\"maxAttachmentBytes\":16777216},"
              "\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,"
-             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":false},"
+             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":true},"
              "\"clientPeerServiceCapabilities\":{\"version\":2,"
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
@@ -6261,6 +6261,23 @@ int main(void)
         || !negotiated_session.client_egress_domain_targets) {
         fprintf(stderr, "client egress capability negotiation mismatch\n");
         return 1;
+    }
+    {
+        sqlite3 *ipv6_db = NULL;
+        sqlite3_stmt *ipv6_statement = NULL;
+        int ipv6_stored = sqlite3_open(auth_db_path, &ipv6_db) == SQLITE_OK
+            && sqlite3_prepare_v2(ipv6_db,
+                "SELECT client_egress_ipv6_targets FROM specus_client_session WHERE id = ?",
+                -1, &ipv6_statement, NULL) == SQLITE_OK
+            && sqlite3_bind_int64(ipv6_statement, 1, runtime_client_session_id) == SQLITE_OK
+            && sqlite3_step(ipv6_statement) == SQLITE_ROW
+            && sqlite3_column_int(ipv6_statement, 0) == 1;
+        sqlite3_finalize(ipv6_statement);
+        sqlite3_close(ipv6_db);
+        if (!ipv6_stored) {
+            fprintf(stderr, "HTTP login lost the declared IPv6 target socket capability\n");
+            return 1;
+        }
     }
     if (st_storage_mark_client_session_online(auth_db_path,
                                               runtime_client_session_id,

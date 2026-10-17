@@ -558,8 +558,7 @@ public class PeerEgressService {
                     ? announcementOf(egress.get())
                     : EgressAnnouncement.NONE;
             entry.setDomainTargetCapable(announced.domainTargets());
-            // No client announces IPv6 targets yet.
-            entry.setIpv6TargetCapable(false);
+            entry.setIpv6TargetCapable(announced.ipv6Targets());
             entry.setEgressVersion(announced.version());
             entries.add(entry);
         }
@@ -568,8 +567,8 @@ public class PeerEgressService {
     }
 
     /** What an egress's current online session announced at login, as the catalogue passes it on. */
-    private record EgressAnnouncement(int version, boolean domainTargets) {
-        static final EgressAnnouncement NONE = new EgressAnnouncement(0, false);
+    private record EgressAnnouncement(int version, boolean domainTargets, boolean ipv6Targets) {
+        static final EgressAnnouncement NONE = new EgressAnnouncement(0, false, false);
     }
 
     /**
@@ -579,21 +578,40 @@ public class PeerEgressService {
      * than from anything remembered about the device: an egress that went offline, or came back on
      * an older client, must not keep advertising what it no longer offers. Consumers rely on the
      * version to tell an egress that cannot take a flow at all (an old client, {@code 0}) and on
-     * domain targets to tell which egress can take a domain rule. Both come from one read so the two
-     * catalogue fields always describe the same sessions.
+     * domain targets to tell which egress can take a domain rule. All three values must describe
+     * the same newest online session, never an OR/MAX across old and current declarations.
      */
     private EgressAnnouncement announcementOf(ClientAccount egress) {
         List<ClientSession> online = clientSessionRepository
                 .findByTenantIdAndClientIdInAndStatus(egress.getTenantId(), List.of(egress.getId()),
                         ClientAuthService.STATUS_NETTY_ONLINE);
-        int version = online.stream()
-                .mapToInt(ClientSession::getClientEgressVersion)
-                .max()
-                .orElse(0);
-        boolean domainTargets = online.stream()
-                .anyMatch(session -> session.getClientEgressVersion() >= 1
-                        && session.isClientEgressDomainTargets());
-        return new EgressAnnouncement(Math.max(version, 0), domainTargets);
+        ClientSession newest = null;
+        Instant newestAt = Instant.MIN;
+        long newestId = Long.MIN_VALUE;
+        for (ClientSession session : online) {
+            // Database collations must not broaden tenant/status identity.
+            if (!Objects.equals(session.getTenantId(), egress.getTenantId())
+                    || !Objects.equals(session.getClientId(), egress.getId())
+                    || !ClientAuthService.STATUS_NETTY_ONLINE.equals(session.getStatus())) continue;
+            String timestamp = session.getNettyConnectedAt() != null && !session.getNettyConnectedAt().isEmpty()
+                    ? session.getNettyConnectedAt() : session.getHttpLoginAt();
+            Instant at = PersistedClientSessionInstant.parse(timestamp);
+            if (at == null || session.getId() == null) {
+                // An ordering we cannot establish must not borrow a capability
+                // from another session. A fresh login restores a valid timestamp.
+                log.warn("Cannot order egress announcements with an invalid session timestamp");
+                return EgressAnnouncement.NONE;
+            }
+            long id = session.getId();
+            if (newest == null || at.isAfter(newestAt) || (at.equals(newestAt) && id > newestId)) {
+                newest = session;
+                newestAt = at;
+                newestId = id;
+            }
+        }
+        if (newest == null || newest.getClientEgressVersion() < 1) return EgressAnnouncement.NONE;
+        return new EgressAnnouncement(newest.getClientEgressVersion(), newest.isClientEgressDomainTargets(),
+                newest.isClientEgressIpv6Targets());
     }
 
     /**
