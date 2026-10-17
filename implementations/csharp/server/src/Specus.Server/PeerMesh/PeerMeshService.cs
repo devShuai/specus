@@ -377,7 +377,7 @@ public sealed partial class PeerMeshService
         if (string.Equals(signal.Type, TypeEgressReport, StringComparison.Ordinal))
         {
             ValidateEgressReportEnvelope(request);
-            await HandleEgressReportAsync(source, signal, publisherSessionId, cancellationToken)
+            await HandleEgressReportAsync(source, signal, publisherSessionId, cancellationToken, publisherTransport)
                 .ConfigureAwait(false);
             return;
         }
@@ -386,16 +386,12 @@ public sealed partial class PeerMeshService
         switch (signal.Type)
         {
             case TypePathReport:
-                await ReportPathAsync(source, signal, cancellationToken).ConfigureAwait(false);
-                return;
             case TypeTrafficReport:
-                await ReportTrafficAsync(source, signal, cancellationToken).ConfigureAwait(false);
-                return;
             case TypeDeviceReport:
-                await ReportDeviceAsync(source, signal, cancellationToken).ConfigureAwait(false);
+                await ApplyAuthorizedPeerReportAsync(source, signal, publisherSessionId, publisherTransport, cancellationToken).ConfigureAwait(false);
                 return;
             case TypeClose:
-                await CloseSessionFromClientAsync(source, signal, cancellationToken).ConfigureAwait(false);
+                await ApplyAuthorizedPeerReportAsync(source, signal, publisherSessionId, publisherTransport, cancellationToken).ConfigureAwait(false);
                 if (string.IsNullOrWhiteSpace(request.ToClientName))
                 {
                     return;
@@ -1347,11 +1343,9 @@ public sealed partial class PeerMeshService
         return new PeerSessionGrant(SessionView(session), token);
     }
 
-    private async Task ReportPathAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task ReportPathAsync(PeerMeshSession session, PeerControlMessage report,
         CancellationToken cancellationToken)
     {
-        var session = await FindReportableSessionAsync(reporter, report.SessionId, cancellationToken)
-            .ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         if (!CloseIfExpired(session, now))
         {
@@ -1371,11 +1365,9 @@ public sealed partial class PeerMeshService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task ReportTrafficAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task ReportTrafficAsync(PeerMeshSession session, PeerControlMessage report,
         CancellationToken cancellationToken)
     {
-        var session = await FindReportableSessionAsync(reporter, report.SessionId, cancellationToken)
-            .ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         if (!CloseIfExpired(session, now))
         {
@@ -1384,13 +1376,9 @@ public sealed partial class PeerMeshService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task ReportDeviceAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task ReportDeviceAsync(ClientAccount reporter, PeerMeshDevice device, PeerControlMessage report,
         CancellationToken cancellationToken)
     {
-        var device = await _db.PeerMeshDevices.FirstOrDefaultAsync(
-                d => d.TenantId == reporter.TenantId && d.ClientId == reporter.Id, cancellationToken)
-            .ConfigureAwait(false)
-            ?? await CreateDeviceAsync(reporter, cancellationToken).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         device.ClientName = reporter.ClientName;
         device.OwnerUsername = NormalizeOwner(reporter.OwnerUsername);
@@ -1416,11 +1404,10 @@ public sealed partial class PeerMeshService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task CloseSessionFromClientAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task CloseSessionFromClientAsync(PeerMeshSession session,
         CancellationToken cancellationToken)
     {
-        var session = await FindReportableSessionAsync(reporter, report.SessionId, cancellationToken)
-            .ConfigureAwait(false);
+        if (session.Status == StatusClosed) return;
         MarkClosed(session, DateTimeOffset.UtcNow);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -1649,25 +1636,6 @@ public sealed partial class PeerMeshService
             return session;
         }
         throw new ArgumentException("peer session not found");
-    }
-
-    private async Task<PeerMeshSession> FindReportableSessionAsync(ClientAccount reporter, long? sessionId,
-        CancellationToken cancellationToken)
-    {
-        if (sessionId is null or <= 0)
-        {
-            throw new ArgumentException("sessionId is required");
-        }
-        var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(s => s.Id == sessionId.Value,
-                cancellationToken)
-            .ConfigureAwait(false)
-            ?? throw new ArgumentException("peer session not found");
-        if (session.TenantId != reporter.TenantId
-            || (session.SourceClientId != reporter.Id && session.TargetClientId != reporter.Id))
-        {
-            throw new ArgumentException("peer session report source mismatch");
-        }
-        return session;
     }
 
     private async Task<List<long>> VisibleClientIdsAsync(ManagementContext context, CancellationToken cancellationToken)

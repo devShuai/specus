@@ -14,6 +14,33 @@ namespace Specus.IntegrationTests;
 public sealed class MySqlTrafficSchemaTests
 {
     [Fact]
+    public async Task NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerInboundReportProviderProof.VerifyCredentialWaitAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeInboundReportCannotRestorePreTransferOwner()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerInboundReportProviderProof.SourceHintGate();
+        await using var server = await StartAsync(database, gate);
+        await PeerInboundReportProviderProof.VerifyStaleSourceHintAsync(server, gate);
+    }
+
+    [Fact]
+    public async Task NativeInboundReportCannotRecreateClientDeletedOnIndependentHost()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerInboundReportProviderProof.SourceHintGate();
+        await using var server = await StartAsync(database, gate);
+        await using var otherHost = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerInboundReportProviderProof.VerifyStaleSourceHintAsync(server, gate, otherHost);
+    }
+
+    [Fact]
     public async Task NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant()
     {
         await using var database = await OwnedDatabase.CreateAsync();
@@ -299,7 +326,7 @@ public sealed class MySqlTrafficSchemaTests
         Assert.Equal(before, await ReadAsync(db, id));
     }
 
-    private static Task<TestServerFixture> StartAsync(OwnedDatabase database, PeerDefinitionProviderProof.CommitGate? gate = null)
+    private static Task<TestServerFixture> StartAsync(OwnedDatabase database, Microsoft.EntityFrameworkCore.Diagnostics.IInterceptor? gate = null)
     {
         var settings = new Dictionary<string, string?>
         {

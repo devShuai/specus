@@ -40,9 +40,22 @@ public sealed partial class PeerMeshService
         if (!PeerReceiverIsCurrent(receiver)) return null;
         if (_db.ChangeTracker.HasChanges()) throw new InvalidOperationException("peer control delivery requires a clean pending-write scope");
         await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, ct).ConfigureAwait(false);
+        var current = await LockAndReadPeerReceiverAsync(receiver, ct).ConfigureAwait(false);
+        if (current is null) return null;
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
+        return current;
+    }
+
+    private async Task<CurrentPeerReceiver?> LockAndReadPeerReceiverAsync(PeerReceiver receiver, CancellationToken ct,
+        IEnumerable<long>? peerClientIds = null)
+    {
+        if (_db.Database.CurrentTransaction is null) throw new InvalidOperationException("peer authority requires a caller-owned SQL transaction");
+        if (!PeerReceiverIsCurrent(receiver)) return null;
         var binding = receiver.Binding;
         await ClientOwnershipWrite.LockAsync<ClientCredential>(_db, binding.CredentialId, receiver.Tenant, ct).ConfigureAwait(false);
-        await ClientOwnershipWrite.LockAsync<ClientAccount>(_db, receiver.ClientId, receiver.Tenant, ct).ConfigureAwait(false);
+        foreach (var id in (peerClientIds ?? []).Append(receiver.ClientId).Distinct().Order())
+            await ClientOwnershipWrite.LockAsync<ClientAccount>(_db, id, receiver.Tenant, ct).ConfigureAwait(false);
         await ClientOwnershipWrite.LockAsync<ClientIdentity>(_db, binding.IdentityId, receiver.Tenant, ct).ConfigureAwait(false);
         await ClientOwnershipWrite.LockAsync<ClientSession>(_db, receiver.SessionId, receiver.Tenant, ct).ConfigureAwait(false);
         var credential = await _db.ClientCredentials.AsNoTracking().SingleOrDefaultAsync(c => c.Id == binding.CredentialId, ct).ConfigureAwait(false);
@@ -57,8 +70,6 @@ public sealed partial class PeerMeshService
             || session.TokenHash != binding.TokenHash || session.ExpiresAt != binding.ExpiresAt || session.ExpiresAt <= DateTimeOffset.UtcNow
             || session.MachineFingerprint != binding.MachineFingerprint || session.OsUser != binding.OsUser
             || session.Status != ClientAccountService.StatusNettyOnline || session.ChannelId != receiver.Channel || !PeerReceiverIsCurrent(receiver)) return null;
-        await transaction.CommitAsync(ct).ConfigureAwait(false);
-        await transaction.DisposeAsync().ConfigureAwait(false);
         return new CurrentPeerReceiver(account, session);
     }
 

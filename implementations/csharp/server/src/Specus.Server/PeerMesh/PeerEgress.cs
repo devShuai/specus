@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
+using Specus.Server.ControlChannel;
 using Specus.Protocol.PeerEgress;
 using Specus.Server.Authentication;
 using Specus.Protocol.Packets;
@@ -240,40 +241,34 @@ public sealed partial class PeerMeshService
     /// this build defines.
     /// </remarks>
     internal async Task HandleEgressReportAsync(ClientAccount source, PeerControlMessage report,
-        long? reporterSessionId, CancellationToken cancellationToken)
+        long? reporterSessionId, CancellationToken cancellationToken, SpecusConnectionContext? reporterTransport = null)
     {
-        var sessionId = reporterSessionId ?? 0;
-        if (sessionId <= 0)
-        {
-            sessionId = await _db.ClientSessions.AsNoTracking()
-                .Where(row => row.TenantId == source.TenantId && row.ClientId == source.Id
-                    && row.Status == "NETTY_ONLINE")
-                .Select(row => row.Id)
-                .FirstOrDefaultAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-        var session = sessionId <= 0
-            ? null
-            : await _db.ClientSessions.AsNoTracking()
-                .FirstOrDefaultAsync(row => row.Id == sessionId, cancellationToken)
-                .ConfigureAwait(false);
-        if (session is null || session.ClientId != source.Id
-            || !string.Equals(session.TenantId, source.TenantId, StringComparison.Ordinal)
-            || session.Status != "NETTY_ONLINE")
-        {
-            throw new ArgumentException("egress session is not current");
-        }
+        var origin = RequireOriginalPeerReporter(source, reporterSessionId, reporterTransport);
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        var reporter = await LockAndReadPeerReceiverAsync(origin, cancellationToken).ConfigureAwait(false)
+            ?? throw new ArgumentException("egress session is not current");
+        source = reporter.Account;
+        var session = reporter.Session;
+        var sessionId = session.Id;
         if (session.ClientEgressVersion < 1)
         {
             throw new ArgumentException("client did not announce egress capability");
         }
-        EnforceEgressReportRate(sessionId);
-
         var revision = report.Revision ?? 0;
-        var activity = await _db.PeerMeshEgressActivities
+        var activity = await _db.PeerMeshEgressActivities.AsNoTracking()
             .FirstOrDefaultAsync(row => row.TenantId == source.TenantId && row.EgressClientId == source.Id,
                 cancellationToken)
             .ConfigureAwait(false);
+        if (activity is not null)
+        {
+            await Specus.Server.Persistence.ClientOwnershipWrite.LockAsync<PeerMeshEgressActivity>(_db, activity.Id, source.TenantId, cancellationToken).ConfigureAwait(false);
+            activity = await _db.PeerMeshEgressActivities.AsNoTracking().SingleOrDefaultAsync(row => row.Id == activity.Id, cancellationToken).ConfigureAwait(false);
+            if (activity is null || activity.TenantId != source.TenantId || activity.EgressClientId != source.Id)
+                throw new ArgumentException("egress activity changed");
+            activity = TrackPeerCurrent(activity, activity.Id);
+        }
+        if (!PeerReceiverIsCurrent(origin)) throw new ArgumentException("egress session is not current");
+        EnforceEgressReportRate(sessionId);
         var now = DateTimeOffset.UtcNow;
         if (activity is null)
         {
@@ -303,6 +298,8 @@ public sealed partial class PeerMeshService
         activity.ReportedAt = now;
         activity.UpdatedAt = now;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (!PeerReceiverIsCurrent(origin)) throw new ArgumentException("egress session is not current");
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Latest counters each egress device reported about itself.</summary>

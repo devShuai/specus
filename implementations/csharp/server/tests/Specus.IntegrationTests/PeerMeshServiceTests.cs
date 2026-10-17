@@ -509,6 +509,7 @@ public sealed class PeerMeshServiceTests
         var account = fixture.AddClient(1002, "tenant-a", "alice", "alice-phone");
         fixture.AddDevice(account, "100.96.0.11", "public-key");
         await fixture.SaveChangesAsync();
+        await fixture.BindAsync(account);
 
         await fixture.Service.HandleSignalAsync(new MessageRequestPacket
         {
@@ -1166,8 +1167,11 @@ public sealed class PeerMeshServiceTests
         await using var fixture = await PeerMeshFixture.CreateAsync();
         var source = fixture.AddClient(3401, "tenant-a", "alice", "alice-laptop");
         var target = fixture.AddClient(3402, "tenant-a", "alice", "alice-nas");
+        fixture.AddDevice(source, "100.96.0.10", "source-fixture-key");
+        fixture.AddDevice(target, "100.96.0.11", "target-fixture-key");
         fixture.AddSession(9401, source, target, PeerMeshService.StatusActive, DateTimeOffset.UtcNow.AddHours(1));
         await fixture.SaveChangesAsync();
+        await fixture.BindAsync(source);
 
         await fixture.Service.HandleSignalAsync(new MessageRequestPacket
         {
