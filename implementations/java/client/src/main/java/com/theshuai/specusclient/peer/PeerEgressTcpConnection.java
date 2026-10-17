@@ -219,6 +219,19 @@ final class PeerEgressTcpConnection {
         return state == State.CLOSED;
     }
 
+    /** Conservative RFC 1122 4.2.2.13 reuse, without relying on TCP timestamps. */
+    boolean canReopen(Segment syn) {
+        long distance = Integer.toUnsignedLong(syn.seq() - rcvNxt);
+        return state == State.TIME_WAIT && syn.has(PeerEgressSegment.FLAG_SYN)
+                && (syn.flags() & (PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_RST | PeerEgressSegment.FLAG_FIN)) == 0
+                && syn.payload().length == 0 && distance > RECEIVE_WINDOW && distance < 0x8000_0000L;
+    }
+
+    int nextIncarnationSequence(int entropy) {
+        // Forward in serial space, beyond the old send window; retain unpredictable entropy.
+        return sndNxt + RECEIVE_WINDOW + 1 + (entropy & 0x3fff_ffff);
+    }
+
     int sendMss() {
         return sndMss;
     }
@@ -309,6 +322,17 @@ final class PeerEgressTcpConnection {
             return output;
         }
 
+        if (state == State.TIME_WAIT) {
+            // A qualifying new SYN is reopened by the runtime after current policy/rate checks.
+            // Old traffic must neither destroy its tombstone (RFC 1337) nor enter a new socket.
+            if (!segment.has(PeerEgressSegment.FLAG_RST)
+                    && (segment.has(PeerEgressSegment.FLAG_SYN) || segment.has(PeerEgressSegment.FLAG_FIN)
+                            || segment.payload().length != 0)) {
+                ack(output, nowMs);
+            }
+            return output;
+        }
+
         // Any segment proves the consumer is still there, so the probe run restarts. The idle clock
         // is different: it measures data, not liveness. Letting a keepalive exchange refresh it
         // would mean two stacks could hold a socket and a quota slot open indefinitely by pinging
@@ -334,6 +358,11 @@ final class PeerEgressTcpConnection {
         }
 
         if (segment.has(PeerEgressSegment.FLAG_SYN) && state != State.SYN_RECEIVED) {
+            if (!PeerEgressSegment.seqInWindow(segment.seq(), rcvNxt, rcvWnd)) {
+                // A delayed SYN from an older incarnation cannot abort the replacement flow.
+                ack(output, nowMs);
+                return output;
+            }
             // A SYN inside an established flow is either a stale duplicate or an attack; RFC 793
             // says answer with a reset rather than silently re-handshaking.
             reset(output);

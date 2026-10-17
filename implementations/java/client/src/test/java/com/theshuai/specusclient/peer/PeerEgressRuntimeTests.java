@@ -34,6 +34,254 @@ import org.junit.jupiter.api.Test;
 class PeerEgressRuntimeTests {
 
     private static final long EPOCH = 1_800_000_000_000L;
+
+    private PeerEgressSegment.Segment finishForPortReuse(Harness harness, PeerEgressSegment.Segment opening) {
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+        harness.completeHandshake(7, opening);
+        harness.clearFrames();
+        harness.socket(0).endOfStream();
+        waitFor("the original flow FIN", harness::sawFin);
+        var fin = harness.segments().stream().filter(s -> s.has(PeerEgressSegment.FLAG_FIN)).findFirst().orElseThrow();
+        harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                opening.sourceIp(), opening.destinationIp(), opening.sourcePort(), opening.destinationPort(),
+                opening.seq() + 1, fin.seq() + 1, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
+                65535, 0, new byte[0]))), EPOCH + 1);
+        assertEquals(0, harness.runtime.flowCount());
+        assertTrue(harness.socket(0).isClosed());
+        harness.clearFrames();
+        return fin;
+    }
+
+    private static PeerEgressSegment.Segment nextPortIncarnation(PeerEgressSegment.Segment old, int sequence) {
+        return new PeerEgressSegment.Segment(old.sourceIp(), old.destinationIp(), old.sourcePort(), old.destinationPort(),
+                sequence, 0, PeerEgressSegment.FLAG_SYN, 65535, 1360, new byte[0]);
+    }
+
+    @Test
+    void timeWaitControlRetransmittedFinIsStillAcknowledged() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            var oldFin = finishForPortReuse(harness, opening);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                    opening.sourceIp(), opening.destinationIp(), opening.sourcePort(), opening.destinationPort(),
+                    opening.seq() + 1, oldFin.seq() + 1, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
+                    65535, 0, new byte[0]))), EPOCH + 2);
+            assertEquals(1, harness.dialCount());
+            assertFalse(harness.sawReset());
+            assertTrue(harness.segments().stream().anyMatch(s -> s.flags() == PeerEgressSegment.FLAG_ACK
+                    && s.ack() == opening.seq() + 2));
+        } finally { harness.runtime.shutdown(EPOCH + 3); }
+    }
+
+    @Test
+    void timeWaitControlFreshSynNeverReplacesALiveFlow() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH);
+            harness.completeHandshake(7, opening);
+            harness.clearFrames();
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(nextPortIncarnation(opening, 1_001_000))), EPOCH + 1);
+            assertEquals(1, harness.dialCount());
+        } finally { harness.runtime.shutdown(EPOCH + 2); }
+    }
+
+    @Test
+    void timeWaitFreshSynReopensOnItsFirstAttempt() {
+        verifyTimeWaitFreshSyn(1000);
+    }
+
+    @Test
+    void timeWaitAmbiguousSynCannotRecycleSequenceSpace() {
+        for (long offset : new long[] {-1, 0, 65535, 0x8000_0000L, 0x8000_0001L}) {
+            Harness harness = new Harness();
+            try {
+                var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+                finishForPortReuse(harness, opening);
+                harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(
+                        nextPortIncarnation(opening, (int)(opening.seq() + 2L + offset)))), EPOCH + 2);
+                assertEquals(1, harness.dialCount(), "ambiguous/window-overlapping SYN reopened: " + offset);
+                assertFalse(harness.sawReset(), "ambiguous SYN destroyed the old tombstone: " + offset);
+                assertTrue(harness.runtime.hasFlow(new PeerEgressFlowTable.Key(6, opening.sourceIp(), opening.sourcePort(),
+                        opening.destinationIp(), opening.destinationPort())));
+            } finally { harness.runtime.shutdown(EPOCH + 3); }
+        }
+    }
+
+    @Test
+    void timeWaitFreshSynSupportsConsumerSequenceWrap() {
+        verifyTimeWaitFreshSyn(-100);
+    }
+
+    private void verifyTimeWaitFreshSyn(int oldSequence) {
+        Harness harness = new Harness();
+        try {
+            var opening = nextPortIncarnation(syn("100.96.0.1", 40000, "203.0.113.10", 443), oldSequence);
+            var oldFin = finishForPortReuse(harness, opening);
+            var next = nextPortIncarnation(opening, oldSequence + 1_000_000);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(next)), EPOCH + 2);
+            assertEquals(2, harness.dialCount(), "a fresh SYN was answered by the old TIME_WAIT flow");
+            assertEquals(1, harness.runtime.flowCount());
+            assertFalse(harness.sawReset(), "the first SYN must not require a retransmission after an old reset");
+            var response = harness.segments().get(0);
+            assertEquals(PeerEgressSegment.FLAG_SYN | PeerEgressSegment.FLAG_ACK, response.flags());
+            assertEquals(next.seq() + 1, response.ack());
+            assertTrue(PeerEgressSegment.seqLess(oldFin.seq(), response.seq()), "new ISS overlaps the old send sequence");
+            harness.completeHandshake(7, next);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                    next.sourceIp(), next.destinationIp(), next.sourcePort(), next.destinationPort(),
+                    next.seq() + 1, response.seq() + 1, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH,
+                    65535, 0, new byte[] {42}))), EPOCH + 3);
+            assertEquals(1, harness.socket(1).written().size());
+            assertEquals(42, harness.socket(1).written().get(0)[0]);
+        } finally { harness.runtime.shutdown(EPOCH + 4); }
+    }
+
+    @Test
+    void timeWaitOldDuplicateSynKeepsTheTombstone() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            finishForPortReuse(harness, opening);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(opening)), EPOCH + 2);
+            assertFalse(harness.sawReset(), "an old duplicate SYN destroyed TIME_WAIT");
+            assertEquals(1, harness.dialCount());
+            assertTrue(harness.runtime.hasFlow(new PeerEgressFlowTable.Key(6, opening.sourceIp(), opening.sourcePort(),
+                    opening.destinationIp(), opening.destinationPort())));
+            assertEquals(0, harness.runtime.flowCount());
+        } finally { harness.runtime.shutdown(EPOCH + 3); }
+    }
+
+    @Test
+    void timeWaitInWindowOldResetKeepsTheTombstone() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            finishForPortReuse(harness, opening);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                    opening.sourceIp(), opening.destinationIp(), opening.sourcePort(), opening.destinationPort(),
+                    opening.seq() + 2, 0, PeerEgressSegment.FLAG_RST, 0, 0, new byte[0]))), EPOCH + 2);
+            assertTrue(harness.runtime.hasFlow(new PeerEgressFlowTable.Key(6, opening.sourceIp(), opening.sourcePort(),
+                    opening.destinationIp(), opening.destinationPort())), "a late old RST assassinated TIME_WAIT");
+            assertEquals(1, harness.dialCount());
+        } finally { harness.runtime.shutdown(EPOCH + 3); }
+    }
+
+    @Test
+    void timeWaitReuseRejectsOldPacketsBeforeAndAfterTheNewHandshake() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            var oldFin = finishForPortReuse(harness, opening);
+            var next = nextPortIncarnation(opening, 1_001_000);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(next)), EPOCH + 2);
+            assertEquals(2, harness.dialCount());
+            var nextResponse = harness.segments().get(0);
+            for (boolean established : new boolean[] {false, true}) {
+                if (established) { harness.completeHandshake(7, next); }
+                for (int flags : new int[] {PeerEgressSegment.FLAG_ACK, PeerEgressSegment.FLAG_RST,
+                        PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_FIN,
+                        PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH, PeerEgressSegment.FLAG_SYN}) {
+                    harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                            opening.sourceIp(), opening.destinationIp(), opening.sourcePort(), opening.destinationPort(),
+                            opening.seq() + (flags == PeerEgressSegment.FLAG_SYN ? 0 : 1), oldFin.seq() + 1, flags,
+                            65535, 0, flags == (PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH)
+                                    ? new byte[] {99} : new byte[0]))), EPOCH + 3);
+                }
+                assertFalse(harness.socket(1).isClosed(), "old incarnation closed the new socket");
+                assertTrue(harness.socket(1).written().isEmpty(), "old payload reached the new socket");
+                assertFalse(harness.socket(1).isHalfClosed(), "old FIN half-closed the new socket");
+            }
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(new PeerEgressSegment.Segment(
+                    next.sourceIp(), next.destinationIp(), next.sourcePort(), next.destinationPort(),
+                    next.seq() + 1, nextResponse.seq() + 1, PeerEgressSegment.FLAG_ACK | PeerEgressSegment.FLAG_PSH,
+                    65535, 0, new byte[] {42}))), EPOCH + 4);
+            assertEquals(1, harness.socket(1).written().size(), "new handshake or payload was poisoned by old packets");
+        } finally { harness.runtime.shutdown(EPOCH + 5); }
+    }
+
+    @Test
+    void timeWaitReusePaysANewFlowToken() throws Exception {
+        Harness harness = new Harness();
+        harness.runtime.flowRateClock = () -> EPOCH;
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            finishForPortReuse(harness, opening);
+            var field = PeerEgressRuntime.class.getDeclaredField("flowRate");
+            field.setAccessible(true);
+            var rate = (PeerEgressFlowRate) field.get(harness.runtime);
+            for (int i = 1; i < PeerEgressFlowRate.CAPACITY; i++) { assertTrue(rate.tryTake(7, EPOCH)); }
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(nextPortIncarnation(opening, 1_001_000))), EPOCH + 2);
+            assertEquals(1, harness.dialCount());
+            assertEquals(List.of(PeerEgressCodes.LIMIT_EXCEEDED), harness.rejectCodes(), "reused tuple bypassed the new-flow bucket");
+        } finally { harness.runtime.shutdown(EPOCH + 3); }
+    }
+
+    @Test
+    void timeWaitReuseRechecksCurrentConcurrencyCap() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            finishForPortReuse(harness, opening);
+            var capped = policy();
+            capped.getLimits().setMaxFlowsPerConsumer(1);
+            harness.runtime.applyPolicy(capped, PeerEgressAuthorization.Context.defaults(), EPOCH + 2);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(syn("100.96.0.1", 40001, "203.0.113.10", 443))), EPOCH + 2);
+            harness.clearFrames();
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(nextPortIncarnation(opening, 1_001_000))), EPOCH + 3);
+            assertEquals(2, harness.dialCount());
+            assertEquals(List.of(PeerEgressCodes.LIMIT_EXCEEDED), harness.rejectCodes(), "reused tuple bypassed current concurrency cap");
+            assertEquals(1, harness.runtime.flowCount());
+            assertFalse(harness.socket(1).isClosed());
+        } finally { harness.runtime.shutdown(EPOCH + 4); }
+    }
+
+    @Test
+    void timeWaitReuseRechecksCurrentPeerPermission() {
+        Harness harness = new Harness();
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            finishForPortReuse(harness, opening);
+            harness.runtime.setPeerAclAllows(consumer -> false);
+            harness.runtime.handleFrame(7, frameFor(PeerEgressSegment.build(nextPortIncarnation(opening, 1_001_000))), EPOCH + 2);
+            assertEquals(1, harness.dialCount());
+            assertEquals(List.of(PeerEgressCodes.PEER_ACL_DENIED), harness.rejectCodes(), "reused tuple retained old permission");
+        } finally { harness.runtime.shutdown(EPOCH + 3); }
+    }
+
+    @Test
+    void timeWaitRacingSynDoesNotResetTheOnlyReservedSlot() throws Exception {
+        Harness harness = new Harness();
+        Thread openingThread = null;
+        try {
+            var opening = syn("100.96.0.1", 40000, "203.0.113.10", 443);
+            finishForPortReuse(harness, opening);
+            var capped = policy();
+            capped.getLimits().setMaxFlowsPerConsumer(1);
+            harness.runtime.applyPolicy(capped, PeerEgressAuthorization.Context.defaults(), EPOCH + 2);
+            var next = nextPortIncarnation(opening, 1_001_000);
+            harness.gate = new CountDownLatch(1);
+            openingThread = Thread.ofVirtual().start(() -> harness.runtime.handleFrame(
+                    7, frameFor(PeerEgressSegment.build(next)), EPOCH + 2));
+            waitFor("the replacement to reserve its only slot", () -> harness.dialCount() == 2);
+            // A second SYN already passed the outer lookup before the first reserved its slot.
+            harness.runtime.openTcpFlow(7, new PeerEgressFlowTable.Key(6, next.sourceIp(), next.sourcePort(),
+                    next.destinationIp(), next.destinationPort()), next, EPOCH + 3);
+            assertFalse(harness.sawReset(), "a racing SYN reset the authorized pending connect at its cap");
+            assertTrue(harness.rejectCodes().isEmpty());
+            assertEquals(2, harness.dialCount());
+            harness.gate.countDown();
+            openingThread.join(5000);
+            assertFalse(openingThread.isAlive());
+            assertEquals(1, harness.runtime.flowCount());
+            assertEquals(1, harness.segments().stream().filter(s -> s.has(PeerEgressSegment.FLAG_SYN)).count());
+        } finally {
+            if (harness.gate != null) { harness.gate.countDown(); }
+            if (openingThread != null) { openingThread.join(5000); }
+            harness.runtime.shutdown(EPOCH + 4);
+        }
+    }
     private static final Object END_OF_STREAM = new Object();
 
     @Test

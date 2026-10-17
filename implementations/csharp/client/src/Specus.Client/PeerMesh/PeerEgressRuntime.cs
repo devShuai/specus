@@ -471,6 +471,13 @@ internal sealed class PeerEgressRuntime
             return;
         }
 
+        if (flow.Consumer == consumer && flow.Handle is TcpFlow previous && previous.Connection.CanReopen(segment))
+        {
+            Monitor.Exit(_lock);
+            OpenTcpFlow(consumer, key, segment, nowMs);
+            return;
+        }
+
         try
         {
             if (flow.Handle is not TcpFlow handle)
@@ -537,7 +544,7 @@ internal sealed class PeerEgressRuntime
             Monitor.Exit(_lock);
             return;
         }
-        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address!, nowMs, destination.Value.Name);
+        var (reserved, code, opened) = ReserveTo(consumer, key, destination.Value.Address!, nowMs, destination.Value.Name, syn);
         if (code is not null)
         {
             Monitor.Exit(_lock);
@@ -607,7 +614,7 @@ internal sealed class PeerEgressRuntime
                 };
             }
             var connection = PeerEgressTcpConnection.Accept(
-                syn, NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output, transmit);
+                syn, flow.InitialSendSequence ?? NewInitialSendSequence(), mtu, _flows.IdleTimeoutMs, nowMs, output, transmit);
             var handle = new TcpFlow(connection, socket);
             flow.Handle = handle;
             _totalFlows++;
@@ -1000,17 +1007,32 @@ internal sealed class PeerEgressRuntime
     /// back from it, and the authorization is of the address actually dialled.
     /// </summary>
     private (PeerEgressFlowTable.Flow? Flow, string? Code, bool Opened) ReserveTo(
-        long consumer, PeerEgressFlowTable.Key key, IPAddress destination, long nowMs, string? name = null)
+        long consumer, PeerEgressFlowTable.Key key, IPAddress destination, long nowMs, string? name = null,
+        PeerEgressSegment.Segment? syn = null)
     {
+        // Only a new flow takes a token, and only once everything else admitted it: a retransmitted
+        // SYN, or a frame racing the one that is opening the flow, finds the reservation already here.
+        var previous = _flows.Lookup(key);
+        var retired = previous?.Consumer == consumer && previous.Handle is TcpFlow tcp
+            && syn is not null && tcp.Connection.CanReopen(syn) ? tcp : null;
+        if (previous is not null && retired is null)
+        {
+            return (previous, null, false); // No I/O: the duplicate owns no additional slot.
+        }
         if (AuthorizeTo(consumer, key, destination, name) is { } code)
         {
             return (null, code, false);
         }
-        // Only a new flow takes a token, and only once everything else admitted it: a retransmitted
-        // SYN, or a frame racing the one that is opening the flow, finds the reservation already here.
-        if (_flows.Lookup(key) is null && !_rate.TryTake(consumer, _rateClock()))
+        if ((previous is null || retired is not null) && !_rate.TryTake(consumer, _rateClock()))
         {
             return (null, PeerEgressCodes.LimitExceeded, false);
+        }
+        uint? replacementSequence = null;
+        if (retired is not null)
+        {
+            replacementSequence = retired.Connection.NextIncarnationSequence(NewInitialSendSequence());
+            _flows.Close(key);
+            CloseHandle(retired);
         }
         var opened = _flows.Open(key, consumer, nowMs);
         if (opened is not null)
@@ -1020,6 +1042,7 @@ internal sealed class PeerEgressRuntime
             // the address actually dialled.
             opened.Name = name;
             opened.Dialed = destination;
+            opened.InitialSendSequence = replacementSequence;
             return (opened, null, true);
         }
         return (_flows.Lookup(key), null, false);

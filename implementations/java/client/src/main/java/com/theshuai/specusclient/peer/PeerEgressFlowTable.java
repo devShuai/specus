@@ -114,6 +114,9 @@ final class PeerEgressFlowTable {
          */
         Object handle;
 
+        /** Fixed while reserving a replacement for TIME_WAIT, so racing SYNs cannot choose it again. */
+        Integer initialSendSequence;
+
         Flow(Key key, long consumer, long nowMs) {
             this.key = key;
             this.consumer = consumer;

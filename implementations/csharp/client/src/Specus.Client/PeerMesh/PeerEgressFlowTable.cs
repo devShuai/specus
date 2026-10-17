@@ -113,6 +113,9 @@ internal sealed class PeerEgressFlowTable
         /// and never read here.
         /// </summary>
         public object? Handle { get; set; }
+
+        // Chosen under the reservation lock, never recomputed by racing SYNs.
+        public uint? InitialSendSequence { get; set; }
     }
 
     /// <summary>
