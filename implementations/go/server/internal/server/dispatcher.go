@@ -285,15 +285,23 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 		d.logger.Error("record disconnect failed", "channel", conn.ChannelID(), "err", err)
 		return
 	}
-	if d.onConnectionEvent != nil {
-		record, err := d.db.GetConnectionRecord(ctx, recordID)
-		if err != nil {
-			d.logger.Error("read disconnected connection record failed", "channel", conn.ChannelID(), "err", err)
-			return
-		}
-		if record != nil {
-			d.onConnectionEvent("updated", *record)
-		}
+	d.publishConnectionRecord(ctx, "updated", recordID, conn.ChannelID())
+}
+
+// Both lifecycle events use the same persisted identity, timestamps and precision.
+// Publishing a pre-insert time.Now for "created" would expose nanoseconds that the
+// canonical seven-fractional-digit audit format cannot retain on "updated".
+func (d *Dispatcher) publishConnectionRecord(ctx context.Context, eventType string, recordID int64, channelID string) {
+	if d.onConnectionEvent == nil {
+		return
+	}
+	record, err := d.db.GetConnectionRecord(ctx, recordID)
+	if err != nil {
+		d.logger.Error("read connection event snapshot failed", "channel", channelID, "err", err)
+		return
+	}
+	if record != nil {
+		d.onConnectionEvent(eventType, *record)
 	}
 }
 
@@ -444,10 +452,7 @@ func (d *Dispatcher) finishLogin(conn *control.Conn, request protocol.LoginReque
 			conn.Close(store.ReasonIOError)
 			return
 		}
-		if d.onConnectionEvent != nil {
-			record.ID = recordID
-			d.onConnectionEvent("created", record)
-		}
+		d.publishConnectionRecord(ctx, "created", recordID, conn.ChannelID())
 	}
 
 	if result.Success && !dataConnection {
