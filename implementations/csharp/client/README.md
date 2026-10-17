@@ -37,6 +37,9 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
 
 CLI 支持 `--help`、`--version`、`--config PATH` 和 `config validate --config PATH`；帮助/版本不依赖配置，预检不联网。普通更新检查只提示，不再等待终端输入；自动安装需要 `--auto-update` 或配置中的明确授权。完整三端命令、退出码及待完成项目见 [CLI 使用与验收矩阵](../../../docs/cli-usage.md)。
 
+运行时只按上述 JSONC 配置与 CLI 参数启动，不自动加载或监听当前目录的 `appsettings*.json`、
+`specus-client.settings*.json`。相对配置路径仍相对当前目录解析；日志详细程度由 `--debug` 控制。
+
 与 Java/Go/Android 客户端共享同一 JSONC 结构(可直接互换，支持注释和尾逗号):
 
 ```jsonc

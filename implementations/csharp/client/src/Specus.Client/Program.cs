@@ -79,7 +79,15 @@ try { cliState = new CliState(configPath); }
 catch (Exception error) when (error is IOException or UnauthorizedAccessException)
 { Console.Error.WriteLine("Cannot create private CLI state. Check SPECUS_CLI_STATE_DIR permissions."); return 2; }
 using var stateLifetime = cliState;
-var builder = Host.CreateApplicationBuilder();
+// The CLI already loaded its explicit JSONC. Default host JSON providers would read and watch
+// unrelated files under the caller's working directory, potentially blocking startup entirely.
+var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+{
+    DisableDefaults = true,
+    ContentRootPath = AppContext.BaseDirectory,
+    EnvironmentName = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT")
+});
+builder.Services.AddLogging();
 builder.Logging.ClearProviders();
 builder.Logging.SetMinimumLevel(options.Debug ? LogLevel.Debug : LogLevel.Information);
 builder.Services.Configure<ConsoleLoggerOptions>(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
