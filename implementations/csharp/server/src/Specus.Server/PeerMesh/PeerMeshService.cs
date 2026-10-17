@@ -347,13 +347,14 @@ public sealed partial class PeerMeshService
         id, $"stun:{BracketIpv6(host)}:{port}", host, port, addressSlot, portSlot);
 
     public async Task HandleSignalAsync(MessageRequestPacket request, string sourceClientName,
-        CancellationToken cancellationToken, long? publisherSessionId = null)
+        CancellationToken cancellationToken, long? publisherSessionId = null,
+        SpecusConnectionContext? publisherTransport = null)
     {
         if (!Enabled)
         {
             throw new InvalidOperationException("peer mesh is disabled");
         }
-        var source = await _db.ClientAccounts.FirstOrDefaultAsync(c => c.ClientName == sourceClientName,
+        var source = await _db.ClientAccounts.AsNoTracking().FirstOrDefaultAsync(c => c.ClientName == sourceClientName,
                 cancellationToken)
             .ConfigureAwait(false)
             ?? throw new ArgumentException($"source client not found: {sourceClientName}");
@@ -369,7 +370,7 @@ public sealed partial class PeerMeshService
         if (string.Equals(signal.Type, TypeServiceReport, StringComparison.Ordinal))
         {
             ValidateServiceReportEnvelope(request);
-            await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken)
+            await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken, publisherTransport)
                 .ConfigureAwait(false);
             return;
         }

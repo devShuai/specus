@@ -25,6 +25,115 @@ namespace Specus.IntegrationTests;
 // SpecusConnection with a gated real loopback TCP stream. Not separate OS process coverage.
 internal static class PeerControlDeliveryProviderProof
 {
+    internal static async Task VerifyCatalogAsync(TestServerFixture server)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60)); var ct = timeout.Token;
+        await using var scope = server.HostServices.CreateAsyncScope();
+        var services = scope.ServiceProvider; var db = services.GetRequiredService<SpecusDbContext>();
+        await OwnerTransferWriterProof.SeedAsync(db, "default");
+        const string secret = "native-catalog-fixture-secret";
+        var receiverCredential = await db.ClientCredentials.SingleAsync(c => c.Id == 501, ct);
+        receiverCredential.Enabled = true; receiverCredential.MaxOnlineInstances = 7; receiverCredential.SecretHash = Hash(secret);
+        (await db.ClientSessions.SingleAsync(s => s.Id == 901, ct)).ExpiresAt = DateTimeOffset.UtcNow.AddDays(-1);
+        var publisher = await db.ClientAccounts.SingleAsync(a => a.Id == 1002, ct);
+        publisher.Enabled = true; publisher.OwnerUsername = "alice";
+        (await db.ClientIdentities.SingleAsync(i => i.Id == 702, ct)).CredentialId = 502;
+        db.ClientCredentials.Add(new Specus.Server.Data.Entities.ClientCredential { Id = 502, TenantId = "default", OwnerUsername = "alice",
+            ApiKey = "native-catalog-api", SecretHash = Hash(secret), Enabled = true, MaxOnlineInstances = 7 });
+        db.PeerMeshDevices.Add(new Specus.Server.Data.Entities.PeerMeshDevice { Id = 802, TenantId = "default", ClientId = 1002,
+            ClientName = publisher.ClientName, OwnerUsername = "alice", Enabled = true, VirtualIp = "10.66.0.4", Cidr = "10.66.0.0/16" });
+        db.PeerMeshServiceSharings.Add(new Specus.Server.Data.Entities.PeerMeshServiceSharing { TenantId = "default", Enabled = true });
+        db.PeerMeshSharedServices.Add(new Specus.Server.Data.Entities.PeerMeshSharedService { Id = 6501, TenantId = "default", ClientId = 1002,
+            ClientName = publisher.ClientName, ServiceId = "catalog-service", Name = "catalog-service", Enabled = true,
+            Visibility = "OWNER", TargetPort = 8080, PublishedPort = 24001 });
+        await db.SaveChangesAsync(ct);
+        using var http = server.CreateClient();
+        async Task<ClientAuthLoginResponse> Login(string api, string machine)
+        {
+            using var response = await http.PostAsJsonAsync("/api/client/auth/login", Signed(api, secret, machine, "retained-user"), ct);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            return (await response.Content.ReadFromJsonAsync<ClientAuthLoginResponse>(ct))!;
+        }
+        var recipientLogin = await Login(receiverCredential.ApiKey, "retained-machine1");
+        var publisherLogin = await Login("native-catalog-api", "retained-machine2");
+        var source = new SpecusConnectionContext("native-catalog-source", "127.0.0.1", new CatalogSink(), CancellationToken.None,
+            () => { }, new Specus.Server.Networking.ReadGate(CancellationToken.None), new Specus.Server.Networking.WriteBackpressureGate(65536, 1048576));
+        Assert.True((await services.GetRequiredService<ClientAccountService>().AuthenticateAsync(new LoginRequestPacket
+            { ClientSessionId = publisherLogin.ClientSessionId, AccessToken = publisherLogin.AccessToken }, source.ChannelId, "127.0.0.1", ct)).Success);
+        source.OnLoginSuccess(publisherLogin.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), publisherLogin.ClientSessionId,
+            tenantId: "default", clientId: 1002);
+        var registry = services.GetRequiredService<SessionRegistry>(); registry.Replace(publisherLogin.ClientName, source);
+        await using var pair = await BoundWriter.OpenAsync(server, recipientLogin, ct);
+        var observer = new CatalogObserver(pair.Connection); var physical = pair.Connection.Context;
+        var alias = new SpecusConnectionContext(physical.ChannelId, physical.RemoteAddress, observer, physical.Lifetime,
+            physical.CloseAsync, physical.ReadGate, physical.WriteBackpressure);
+        alias.OnLoginSuccess(recipientLogin.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), recipientLogin.ClientSessionId,
+            tenantId: "default", clientId: 1001);
+        registry.Unbind(recipientLogin.ClientName, physical); registry.Replace(recipientLogin.ClientName, alias);
+        var firstPacket = new MessageResponsePacket { Message = "holds-native-catalog-writer" };
+        var first = pair.Connection.WriteAsync(firstPacket, ct).AsTask();
+        await pair.Stream.HalfWritten.WaitAsync(TimeSpan.FromSeconds(10), ct);
+        observer.OwnCall.Value = true;
+        var pending = services.GetRequiredService<IControlChannelDispatcher>().DispatchAsync(source, new MessageRequestPacket
+            { MessageType = Specus.Protocol.MessageType.PeerControl, Message = "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[{\"serviceId\":\"catalog-service\"}]}" });
+        observer.OwnCall.Value = false;
+        try
+        {
+            await Task.WhenAny(pending, observer.Entered.Task).WaitAsync(TimeSpan.FromSeconds(10), ct);
+            if (!observer.Entered.Task.IsCompleted) { await pending; Assert.Fail("native catalog did not reach actual wire queue"); }
+            Assert.False(pending.IsCompleted);
+            await using (var change = server.HostServices.CreateAsyncScope())
+            {
+                var current = change.ServiceProvider.GetRequiredService<SpecusDbContext>();
+                (await current.PeerMeshSharedServices.SingleAsync(s => s.Id == 6501, ct)).PublishedPort = 24002;
+                await current.SaveChangesAsync(ct);
+            }
+            pair.Stream.Release(); await first.WaitAsync(ct); await pending.WaitAsync(ct);
+            var prefix = PacketCodec.Encode(firstPacket).Length;
+            var packet = Assert.IsType<MessageResponsePacket>(PacketCodec.DecodeExact(pair.Stream.Wire().AsSpan(prefix)));
+            var catalog = JsonSerializer.Deserialize<PeerControlMessage>(packet.Message!)!;
+            Assert.Equal(publisherLogin.ClientSessionId, catalog.PublisherSessionId);
+            Assert.Equal(24002, Assert.Single(catalog.Services!).PublishedPort);
+            var wire = pair.Stream.Wire(); var received = new byte[wire.Length];
+            await pair.Client.GetStream().ReadExactlyAsync(received, ct); Assert.Equal(wire, received);
+        }
+        finally { pair.Stream.Release(); try { await first; } catch (Exception) { } try { await pending; } catch (Exception) { } }
+        await using (var change = server.HostServices.CreateAsyncScope())
+        {
+            var current = change.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            (await current.ClientCredentials.SingleAsync(c => c.Id == 502, ct)).Enabled = false;
+            await current.SaveChangesAsync(ct);
+        }
+        var peer = services.GetRequiredService<PeerMeshService>();
+        var recipient = await db.ClientAccounts.AsNoTracking().SingleAsync(a => a.Id == 1001, ct);
+        var before = pair.Stream.Wire().Length; await peer.PushOnLoginAsync(recipient, ct);
+        var tail = pair.Stream.Wire().AsMemory(before);
+        var sawWithdrawal = false;
+        while (!tail.IsEmpty)
+        {
+            Assert.True(PacketCodec.TryDecode(tail.Span, out var decoded, out var length));
+            var packet = Assert.IsType<MessageResponsePacket>(decoded);
+            var message = JsonSerializer.Deserialize<PeerControlMessage>(packet.Message!)!;
+            if (message.Type == "service-catalog" && message.PublisherSessionId == publisherLogin.ClientSessionId)
+            { Assert.Empty(message.Services!); sawWithdrawal = true; }
+            tail = tail[length..];
+        }
+        Assert.True(sawWithdrawal); Assert.Null(db.Database.CurrentTransaction);
+    }
+
+    private sealed class CatalogSink : IFrameWriter
+    { public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default) => ValueTask.CompletedTask; }
+
+    private sealed class CatalogObserver(IFrameWriter inner) : IFrameWriter
+    {
+        internal AsyncLocal<bool> OwnCall { get; } = new();
+        internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        { if (OwnCall.Value) Entered.TrySetResult(); return inner.WriteAsync(packet, cancellationToken); }
+        public ValueTask<bool> WritePreparedAsync(Func<CancellationToken, ValueTask<Packet?>> prepare, CancellationToken cancellationToken = default)
+        { if (OwnCall.Value) Entered.TrySetResult(); return inner.WritePreparedAsync(prepare, cancellationToken); }
+    }
+
     internal static async Task VerifyAsync(TestServerFixture server)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60)); var ct = timeout.Token;

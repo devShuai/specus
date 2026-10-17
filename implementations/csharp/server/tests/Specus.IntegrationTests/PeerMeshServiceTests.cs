@@ -121,6 +121,7 @@ public sealed class PeerMeshServiceTests
         });
         fixture.Db.ClientSessions.Add(CurrentPublisherSession(77, publisher, now));
         await fixture.SaveChangesAsync();
+        await fixture.BindAsync(publisher, 77);
         await fixture.BindAsync(recipient);
 
         await fixture.Service.HandleServiceReportAsync(publisher,
@@ -161,6 +162,7 @@ public sealed class PeerMeshServiceTests
         });
         fixture.Db.ClientSessions.Add(CurrentPublisherSession(79, publisher, now));
         await fixture.SaveChangesAsync();
+        await fixture.BindAsync(publisher, 79);
         await fixture.BindAsync(recipient);
 
         var scopeA = fixture.CreateSiblingService();
@@ -243,6 +245,7 @@ public sealed class PeerMeshServiceTests
             Name="revision-service",Transport="tcp",Application="http",TargetHost="127.0.0.1",TargetPort=8080,PublishedPort=18080,
             Path="/",Enabled=true,Visibility="OWNER",CreatedAt=now,UpdatedAt=now });
         var session=CurrentPublisherSession(7381,publisher,now);fixture.Db.ClientSessions.Add(session);await fixture.SaveChangesAsync();
+        await fixture.BindAsync(publisher,7381);
         var writer=await fixture.BindAsync(recipient);var admin=await fixture.ActorAsync("admin",ManagementRole.Admin,publisher.TenantId);
         var wire=new List<string>();
         void Capture(long revision,int count) {
@@ -258,6 +261,7 @@ public sealed class PeerMeshServiceTests
         session.Status="DISCONNECTED";await fixture.SaveChangesAsync();await fixture.Service.OnClientDisconnectedAsync(7381,CancellationToken.None);Capture(4,0);
         Assert.Empty(fixture.State.ServiceCatalogRevisions);Assert.Empty(fixture.State.ServiceReportRevisions);
         session.Status=ClientAccountService.StatusNettyOnline;session.ChannelId="new-control";await fixture.SaveChangesAsync();
+        await fixture.BindAsync(publisher,7381);
         await fixture.CreateSiblingService().SetSharingAsync(admin,true,CancellationToken.None);writer.Clear();
         await fixture.CreateSiblingService().HandleServiceReportAsync(publisher,ServiceReport(1,"reconnected","svc-revision"),7381,CancellationToken.None);Capture(5,1);
         typeof(PeerMeshServiceState).GetField("_serviceCatalogSequence",BindingFlags.Instance|BindingFlags.NonPublic)!.SetValue(fixture.State,long.MaxValue);
@@ -595,27 +599,30 @@ public sealed class PeerMeshServiceTests
         fixture.State.ServiceCatalogRevisions[(publisher.TenantId, publisher.Id, 11512)] = 4;
         fixture.State.ServiceReportRevisions[(publisher.TenantId, publisher.Id, 11511)] = 4;
         fixture.State.ServiceReportRevisions[(publisher.TenantId, publisher.Id, 11512)] = 4;
+        await fixture.BindAsync(publisher, 11511);
+        fixture.State.ServiceCatalogs[(publisher.TenantId, publisher.Id, 11511)] =
+            fixture.State.ServiceCatalogs[(publisher.TenantId, publisher.Id, 11511)] with { PublisherChannelId = $"channel-{publisher.Id}" };
         var writerB = await fixture.BindAsync(peerB);
         var writerC = await fixture.BindAsync(peerC);
 
         await fixture.Service.UpdateSharedServiceAsync(admin, 91151,
             new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null, null,
                 "ACL", [peerB.Id]), CancellationToken.None);
-        AssertCatalogs(writerB.PeerMessages(), publisher.Id, 2, 1);
+        AssertActiveCatalogAndStaleWithdrawal(writerB.PeerMessages(), publisher.Id, 11511, 11512);
         AssertCatalogs(writerC.PeerMessages(), publisher.Id, 2, 0);
         writerB.Clear();
         writerC.Clear();
         await fixture.Service.UpdateSharedServiceAsync(admin, 91151,
             new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null, null,
                 "ACL", [peerB.Id, peerC.Id]), CancellationToken.None);
-        AssertCatalogs(writerB.PeerMessages(), publisher.Id, 2, 1);
-        AssertCatalogs(writerC.PeerMessages(), publisher.Id, 2, 1);
+        AssertActiveCatalogAndStaleWithdrawal(writerB.PeerMessages(), publisher.Id, 11511, 11512);
+        AssertActiveCatalogAndStaleWithdrawal(writerC.PeerMessages(), publisher.Id, 11511, 11512);
         writerB.Clear();
         writerC.Clear();
 
         await fixture.Service.DeleteAclAsync(admin, aclB.Id, CancellationToken.None);
         AssertCatalogs(writerB.PeerMessages(), publisher.Id, 2, 0);
-        AssertCatalogs(writerC.PeerMessages(), publisher.Id, 2, 1);
+        AssertActiveCatalogAndStaleWithdrawal(writerC.PeerMessages(), publisher.Id, 11511, 11512);
         writerB.Clear();
         await fixture.Service.PushOnLoginAsync(peerB, CancellationToken.None);
         AssertCatalogs(writerB.PeerMessages(), publisher.Id, 2, 0);
@@ -623,11 +630,11 @@ public sealed class PeerMeshServiceTests
         writerB.Clear();
         await fixture.Service.CreateAclAsync(admin,
             new PeerMeshAclMutation(publisher.Id, peerB.Id, true, "BOTH"), CancellationToken.None);
-        AssertCatalogs(writerB.PeerMessages(), publisher.Id, 2, 1);
+        AssertActiveCatalogAndStaleWithdrawal(writerB.PeerMessages(), publisher.Id, 11511, 11512);
 
         writerB.Clear();
         await fixture.Service.PushOnLoginAsync(peerB, CancellationToken.None);
-        AssertCatalogs(writerB.PeerMessages(), publisher.Id, 2, 1);
+        AssertActiveCatalogAndStaleWithdrawal(writerB.PeerMessages(), publisher.Id, 11511, 11512);
 
         var key = (publisher.TenantId, publisher.Id, SessionId: 11511L);
         var authorizationRevision = fixture.State.ServiceCatalogs[key].Revision;
@@ -644,6 +651,15 @@ public sealed class PeerMeshServiceTests
         Assert.False(fixture.State.ServiceCatalogs.ContainsKey((publisher.TenantId, publisher.Id, 11511)));
         Assert.True(fixture.State.ServiceCatalogs.ContainsKey((publisher.TenantId, publisher.Id, 11512)));
         AssertCatalogs(writerB.PeerMessages(), publisher.Id, 1, 0);
+    }
+
+    private static void AssertActiveCatalogAndStaleWithdrawal(IReadOnlyList<PeerControlMessage> messages,
+        long publisherId, long activeSession, long staleSession)
+    {
+        var catalogs = messages.Where(message => message.Type == "service-catalog" && message.PublisherClientId == publisherId).ToArray();
+        Assert.Equal(2, catalogs.Length);
+        Assert.Single(Assert.Single(catalogs, message => message.PublisherSessionId == activeSession).Services!);
+        Assert.Empty(Assert.Single(catalogs, message => message.PublisherSessionId == staleSession).Services!);
     }
 
     private static void AssertCatalogs(IReadOnlyList<PeerControlMessage> messages, long publisherId,
@@ -894,6 +910,7 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(source, "100.96.0.22", "source-key");
         fixture.AddDevice(target, "100.96.0.23", "target-key");
         var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshServiceSharings.Add(new PeerMeshServiceSharing { TenantId = "tenant-a", Enabled = true });
         fixture.Db.PeerMeshSharedServices.Add(new PeerMeshSharedService
         {
             Id = 92101,
@@ -919,7 +936,7 @@ public sealed class PeerMeshServiceTests
             {
                 ServiceId = "svc-login01", Name = "login-service", Transport = "tcp",
                 Application = "http", PublishedPort = 18080, Path = "/",
-            }], target.ClientName, [], []);
+            }], target.ClientName, [], [], $"channel-{target.Id}");
         fixture.State.ServiceCatalogRevisions[("tenant-a", target.Id, 21021)] = 7;
         fixture.Db.ClientSessions.AddRange(
             new ClientSession
@@ -954,7 +971,7 @@ public sealed class PeerMeshServiceTests
         await fixture.SaveChangesAsync();
 
         var sourceWriter = await fixture.BindAsync(source);
-        var targetWriter = await fixture.BindAsync(target);
+        var targetWriter = await fixture.BindAsync(target, 21021);
 
         await fixture.Service.PushOnLoginAsync(source, CancellationToken.None);
 
@@ -1513,7 +1530,7 @@ public sealed class PeerMeshServiceTests
             });
         }
 
-        public async Task<CapturingFrameWriter> BindAsync(ClientAccount account)
+        public async Task<CapturingFrameWriter> BindAsync(ClientAccount account, long? sessionId = null)
         {
             var writer = new CapturingFrameWriter();
             var context = new SpecusConnectionContext(
@@ -1524,7 +1541,7 @@ public sealed class PeerMeshServiceTests
                 static () => { },
                 new ReadGate(CancellationToken.None),
                 new WriteBackpressureGate(32 * 1024, 64 * 1024));
-            await TestBoundPeerControl.PublishAsync(Db, _authSessions, account, context);
+            await TestBoundPeerControl.PublishAsync(Db, _authSessions, account, context, sessionId);
             Registry.Replace(account.ClientName, context);
             return writer;
         }

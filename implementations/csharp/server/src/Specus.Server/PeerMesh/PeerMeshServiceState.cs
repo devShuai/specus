@@ -60,4 +60,5 @@ public sealed class PeerMeshServiceState
 
 internal sealed record PeerMeshServiceCatalogSnapshot(long Revision, string InstanceId,
     DateTimeOffset GeneratedAt, DateTimeOffset ExpiresAt, IReadOnlyList<AdvertisedService> Services,
-    string PublisherClientName, IReadOnlyList<PeerServiceStats> Stats, IReadOnlyList<PeerMdnsCandidate> Mdns);
+    string PublisherClientName, IReadOnlyList<PeerServiceStats> Stats, IReadOnlyList<PeerMdnsCandidate> Mdns,
+    string? PublisherChannelId = null);

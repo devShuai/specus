@@ -128,14 +128,14 @@ public sealed partial class PeerMeshService
         }
         foreach (var recipient in recipients)
         {
-            var connection = _sessions.Find(recipient.ClientName);
-            if (connection is not null && !connection.Lifetime.IsCancellationRequested)
+            var receiver = CapturePeerReceiver(recipient);
+            if (recipient.TenantId == deletion.TenantId && receiver is not null)
             {
                 foreach (var session in deletion.ClosedSessions.Where(row =>
                              row.SourceClientId == recipient.Id || row.TargetClientId == recipient.Id))
                 {
-                    await Attempt(async () => await SendSignalAsync(connection, "server", recipient.ClientName,
-                        new PeerControlMessage
+                    await Attempt(() => SendPreparedPeerPushAsync(receiver, (_, _) =>
+                        Task.FromResult<PeerControlMessage?>(new PeerControlMessage
                         {
                             Type = TypeClose,
                             SessionId = session.Id,
@@ -146,12 +146,12 @@ public sealed partial class PeerMeshService
                             Status = StatusClosed,
                             Reason = "client-deleted",
                             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                        }, cancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
+                        }), cancellationToken)).ConfigureAwait(false);
                 }
                 foreach (var withdrawal in deletion.Withdrawals)
                 {
-                    await Attempt(async () => await SendSignalAsync(connection, "server", recipient.ClientName,
-                        new PeerControlMessage
+                    await Attempt(() => SendPreparedPeerPushAsync(receiver, (_, _) =>
+                        Task.FromResult<PeerControlMessage?>(new PeerControlMessage
                         {
                             Type = TypeServiceCatalog,
                             PublisherClientId = deletion.ClientId,
@@ -161,7 +161,7 @@ public sealed partial class PeerMeshService
                             Services = [],
                             ExpiresAt = DateTimeOffset.UtcNow.ToString("O"),
                             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                        }, cancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
+                        }), cancellationToken)).ConfigureAwait(false);
                 }
             }
             await Attempt(() => PushConfigAsync(recipient, cancellationToken)).ConfigureAwait(false);

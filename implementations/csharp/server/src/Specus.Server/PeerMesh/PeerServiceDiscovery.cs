@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Specus.Server.Authentication;
+using Specus.Server.ControlChannel;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
 
@@ -211,21 +212,27 @@ public sealed partial class PeerMeshService
     }
 
     internal async Task HandleServiceReportAsync(ClientAccount source, PeerControlMessage report,
-        long? publisherSessionId, CancellationToken cancellationToken)
+        long? publisherSessionId, CancellationToken cancellationToken, SpecusConnectionContext? publisherTransport = null)
     {
         ValidateReportCollections(report);
         var sessionId = publisherSessionId is > 0
             ? publisherSessionId.Value
             : throw new ArgumentException("publisher session is required");
         var key = (source.TenantId, source.Id, sessionId);
+        var origin = CapturePeerReceiver(source);
+        if (origin is null || origin.SessionId != sessionId
+            || (publisherTransport is not null && !ReferenceEquals(origin.Transport, publisherTransport)))
+            throw new ArgumentException("publisher session is not current");
         var gate = CatalogMutationGate(key);
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var publisherSession = await _db.ClientSessions.AsNoTracking()
-                    .FirstOrDefaultAsync(session => session.Id == sessionId, cancellationToken)
-                    .ConfigureAwait(false)
+            // The original physical publisher must still own its SQL session after the
+            // catalog gate wait. Invalid reports must not consume a revision or rate slot.
+            var currentPublisher = await ReadPeerReceiverAsync(origin, cancellationToken).ConfigureAwait(false)
                 ?? throw new ArgumentException("publisher session is not current");
+            source = currentPublisher.Account;
+            var publisherSession = currentPublisher.Session;
             if (!ManagementContext.SameTenant(publisherSession.TenantId, source.TenantId)
                 || publisherSession.ClientId != source.Id
                 || !string.Equals(publisherSession.Status, ClientAccountService.StatusNettyOnline,
@@ -269,7 +276,7 @@ public sealed partial class PeerMeshService
             var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
             _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(catalogRevision, NormalizeInstanceId(report.InstanceId), DateTimeOffset.UtcNow,
                 expiresAt, advertised, source.ClientName, CopyStats(report.Stats, advertised),
-                SanitizeMdns(report.MdnsCandidates));
+                SanitizeMdns(report.MdnsCandidates), origin.Channel);
             Audit("service-report", source.TenantId, source.Id, sessionId, null,
                 advertised.Count == 0 ? "empty" : "published");
             await FanoutAsync(source, sessionId, catalogRevision, advertised, expiresAt, cancellationToken)
@@ -370,37 +377,17 @@ public sealed partial class PeerMeshService
             .Where(account => account.TenantId == publisher.TenantId && account.Id != publisher.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        var key = (publisher.TenantId, publisher.Id, publisherSessionId);
+        _serviceCatalogs.TryGetValue(key, out var snapshot);
+        var origin = CaptureCatalogPublisher(publisher, publisherSessionId, snapshot?.PublisherChannelId);
         foreach (var recipient in recipients)
         {
-            var canPeer = await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false);
-            if (!canPeer && !includeDenied)
-            {
-                continue;
-            }
-            var session = _sessions.Find(recipient.ClientName);
-            if (session is null)
-            {
-                continue;
-            }
-            var visible = new List<AdvertisedService>();
-            foreach (var service in services)
-            {
-                if (canPeer && await VisibleToAsync(publisher, recipient, service, cancellationToken).ConfigureAwait(false))
-                {
-                    visible.Add(service);
-                }
-            }
-            await SendSignalAsync(session, "server", recipient.ClientName, new PeerControlMessage
-            {
-                Type = TypeServiceCatalog,
-                PublisherClientId = publisher.Id,
-                PublisherClientName = publisher.ClientName,
-                PublisherSessionId = publisherSessionId,
-                Revision = revision,
-                ExpiresAt = expiresAt.ToString("O"),
-                Services = visible,
-                CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            }, cancellationToken).ConfigureAwait(false);
+            if (recipient.TenantId != publisher.TenantId) continue;
+            if (!includeDenied && !await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false)) continue;
+            var receiver = CapturePeerReceiver(recipient);
+            if (receiver is null) continue;
+            await SendPreparedCatalogAsync(receiver, publisher, publisherSessionId, revision, services,
+                expiresAt, origin, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -440,8 +427,8 @@ public sealed partial class PeerMeshService
 
     private async Task PushCurrentCatalogsAsync(ClientAccount recipient, CancellationToken cancellationToken)
     {
-        var session = _sessions.Find(recipient.ClientName);
-        if (session is null)
+        var receiver = CapturePeerReceiver(recipient);
+        if (receiver is null)
         {
             return;
         }
@@ -462,28 +449,9 @@ public sealed partial class PeerMeshService
             {
                 continue;
             }
-            var visible = new List<AdvertisedService>();
-            if (await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false))
-            {
-                foreach (var service in snapshot.Services)
-                {
-                    if (await VisibleToAsync(publisher, recipient, service, cancellationToken).ConfigureAwait(false))
-                    {
-                        visible.Add(service);
-                    }
-                }
-            }
-            await SendSignalAsync(session, "server", recipient.ClientName, new PeerControlMessage
-            {
-                Type = TypeServiceCatalog,
-                PublisherClientId = publisher.Id,
-                PublisherClientName = publisher.ClientName,
-                PublisherSessionId = key.SessionId,
-                Revision = snapshot.Revision,
-                ExpiresAt = snapshot.ExpiresAt.ToString("O"),
-                Services = visible,
-                CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            }, cancellationToken).ConfigureAwait(false);
+            var origin = CaptureCatalogPublisher(publisher, key.SessionId, snapshot.PublisherChannelId);
+            await SendPreparedCatalogAsync(receiver, publisher, key.SessionId, snapshot.Revision,
+                snapshot.Services, snapshot.ExpiresAt, origin, cancellationToken).ConfigureAwait(false);
         }
     }
 
