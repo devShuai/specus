@@ -474,6 +474,9 @@ static int registration_address_part(const char *start, const char *end, int dom
         unsigned char c = (unsigned char)*p;
         if (c <= 0x20U || c == 0x7fU || (domain && c > 0x7fU) || strchr("()<>,;:\\\"[]@", c) != NULL
             || (c == '.' && p + 1 < end && p[1] == '.')) return 0;
+        /* Jakarta Mail applies the domain grammar, not the local-part atom grammar. */
+        if (domain && !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '-' || c == '.')) return 0;
     }
     return 1;
 }
