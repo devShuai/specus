@@ -174,11 +174,20 @@ static int test_registration(void)
         || register_with("fresh", " ", "pw", "ok", 400, "\"error\":\"邮箱不能为空\"") != 0;
     static const char *const bad_emails[] = {
         "a@b@example.com", "a@.example.com", "a@example.", "a..b@example.com", ".a@example.com",
-        "a@exam ple.com", "a<b>@example.com", "a@example", "@example.com"
+        "a@exam ple.com", "a<b>@example.com", "a@example", "@example.com",
+        /* Actual Java RegistrationService + Jakarta Mail reject these domain characters. */
+        "alice@bad_domain.example", "alice@bad+domain.example", "alice@bad!domain.example",
+        "alice@bad{domain.example", "alice@bad/domain.example", "alice@bad%domain.example",
+        "alice@bad=domain.example", "alice@bad*domain.example"
     };
     for (size_t i = 0; !failed && i < sizeof(bad_emails) / sizeof(bad_emails[0]); ++i) {
         failed = register_with("fresh", bad_emails[i], "pw", "ok", 400, "\"error\":\"邮箱格式无效\"") != 0;
     }
+    /* The stricter domain grammar must not reject punctuation in the local part or punycode. */
+    failed = failed || register_with("local-punctuation", "a_b+tag@mx-1.example.test", "pw", "ok", 202,
+                                     "\"emailMasked\":\"a_***@mx-1.example.test\"") != 0;
+    failed = failed || register_with("punycode", "alice@xn--fsqu00a.example", "pw", "ok", 202,
+                                     "\"emailMasked\":\"al***@xn--fsqu00a.example\"") != 0;
     /*
      * 80 two-byte characters are within Java's 80 UTF-16 code units, but C stores a login name in
      * 80 bytes (as POST /api/admin/users does): refused here, not after the email went out. 40 of
