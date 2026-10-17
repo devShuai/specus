@@ -26,14 +26,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 C_DIR="$ROOT_DIR/implementations/c/server"
 SCRIPT_PATH="$C_DIR/scripts/peer_mesh_e2e.sh"
 JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/specus-client-exec.jar"
+source "$C_DIR/scripts/smoke_server.sh"
 
 if [[ "${SPECUS_PEER_MESH_E2E_ISOLATED:-}" != 1 ]]; then
   # Built as the invoking user, before anything runs as root or as a namespace's fake root.
   # SPECUS_SMOKE_REUSE_BUILD=1 reuses a server an earlier run built and unit-tested.
-  if [[ "${SPECUS_SMOKE_REUSE_BUILD:-}" != 1 || ! -x "$C_DIR/build/specus-server-c" ]]; then
-    make -C "$C_DIR" test
-  fi
+  specus_smoke_prepare_server "$C_DIR"
   forwarded=("SPECUS_PEER_MESH_E2E_ISOLATED=1" "PATH=$PATH" "HOME=$HOME")
+  forwarded+=("SPECUS_SMOKE_REUSE_BUILD=1" "SPECUS_SMOKE_SERVER_BINARY=$SPECUS_SMOKE_RESOLVED_SERVER")
   for name in SPECUS_CLIENT_COMMAND SPECUS_CLIENT_LABEL JAVA_COMMAND JAVA_HOME DOTNET_ROOT TMPDIR \
       CONTROL_PORT ADMIN_PORT STUN_TURN_PORT; do
     if [[ -n "${!name:-}" ]]; then forwarded+=("$name=${!name}"); fi
@@ -62,6 +62,7 @@ if [[ -n "$(ip -4 route show table main)" || "$(ip -o link show | awk -F': ' '{p
 fi
 
 CONTROL_PORT="${CONTROL_PORT:-17410}"
+SPECUS_SMOKE_REUSE_BUILD=1 specus_smoke_prepare_server "$C_DIR"
 ADMIN_PORT="${ADMIN_PORT:-17411}"
 STUN_TURN_PORT="${STUN_TURN_PORT:-3478}"
 RELAY_MIN_PORT=40000
@@ -334,7 +335,7 @@ SPECUS_PEER_MESH_STUN_TURN_PORT="$STUN_TURN_PORT" \
 SPECUS_PEER_MESH_TURN_SHARED_SECRET="$TURN_SECRET" \
 SPECUS_PEER_MESH_RELAY_MIN_PORT="$RELAY_MIN_PORT" \
 SPECUS_PEER_MESH_RELAY_MAX_PORT="$RELAY_MAX_PORT" \
-stdbuf -oL -eL "$C_DIR/build/specus-server-c" >"$TMP_DIR/server.log" 2>&1 &
+stdbuf -oL -eL "$SPECUS_SMOKE_RESOLVED_SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 ADMIN_TOKEN="$(check provision "$ADMIN_PORT" "$ADMIN_USERNAME" "$ADMIN_PASSWORD" \

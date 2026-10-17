@@ -430,6 +430,10 @@ jobs:
   c-linux:
     name: C server (Linux)
     runs-on: ubuntu-latest
+    env:
+      # Reuse the exact CMake artifact even after an earlier test fails.
+      # The independent Makefile suite below retains its own deadline.
+      SPECUS_SMOKE_SERVER_BINARY: ${{ github.workspace }}/build/c-server/specus-server-c
     steps:
       - uses: actions/checkout@v4
       - name: Set up Java 21 for cross-language E2E
@@ -487,6 +491,7 @@ jobs:
       # The Makefile build is checked on its own: its unit tests take minutes, and the E2E steps below
       # each have a few minutes for the end-to-end part alone.
       - name: Makefile build and unit tests
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           ulimit -c unlimited
           timeout --preserve-status 600s make -C implementations/c/server test \

@@ -87,9 +87,8 @@ fi
 
 # SPECUS_SMOKE_REUSE_BUILD=1 skips the build and unit tests when an earlier run already did them,
 # so the same server can be smoke-tested with each client in turn.
-if [[ "${SPECUS_SMOKE_REUSE_BUILD:-}" != 1 || ! -x "$C_DIR/build/specus-server-c" ]]; then
-  make -C "$C_DIR" test
-fi
+source "$C_DIR/scripts/smoke_server.sh"
+specus_smoke_prepare_server "$C_DIR"
 
 python3 - "$ECHO_PORT" <<'PY' &
 import socket
@@ -220,7 +219,7 @@ SPECUS_CONTROL_READ_IDLE_SECONDS="$CONTROL_READ_IDLE_SECONDS" \
 SPECUS_ADMIN_PORT="$ADMIN_PORT" \
 SPECUS_TCP_MAPPINGS="$PUBLIC_PORT=$UPSTREAM_HOST:$ECHO_PORT" \
 SPECUS_HTTP_ROUTES="api=http://$UPSTREAM_HOST:$HTTP_UPSTREAM_PORT,ws=ws://$UPSTREAM_HOST:$WS_UPSTREAM_PORT" \
-stdbuf -oL -eL "$C_DIR/build/specus-server-c" >"$TMP_DIR/server.log" 2>&1 &
+stdbuf -oL -eL "$SPECUS_SMOKE_RESOLVED_SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 cat >"$TMP_DIR/client.jsonc" <<JSON

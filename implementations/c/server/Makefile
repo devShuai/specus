@@ -401,6 +401,8 @@ test: all
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
 	python3 tests/fixture_isolation_tests.py
+	python3 tests/smoke_build_tests.py
+	python3 tests/smoke_server_selection_tests.py
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)
 	python3 scripts/management_cluster_e2e.py $(SERVER)
 	SPECUS_TEST_OSS_START_DELAY_SECONDS=0.5 bash scripts/object_storage_e2e.sh $(SERVER)

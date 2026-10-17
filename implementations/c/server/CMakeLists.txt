@@ -402,6 +402,10 @@ add_test(NAME public_coordination_tests
 add_test(NAME fixture_isolation_tests
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_isolation_tests.py)
 set_tests_properties(fixture_isolation_tests PROPERTIES TIMEOUT 30)
+add_test(NAME smoke_build_tests COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_build_tests.py)
+set_tests_properties(smoke_build_tests PROPERTIES TIMEOUT 30)
+add_test(NAME smoke_server_selection_tests COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_server_selection_tests.py)
+set_tests_properties(smoke_server_selection_tests PROPERTIES TIMEOUT 30)
 add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)

@@ -78,9 +78,8 @@ if [[ -z "${SPECUS_CLIENT_COMMAND:-}" && ! -f "$JAVA_CLIENT_JAR" ]]; then
 fi
 
 # SPECUS_SMOKE_REUSE_BUILD=1 reuses a server an earlier run built and unit-tested.
-if [[ "${SPECUS_SMOKE_REUSE_BUILD:-}" != 1 || ! -x "$C_DIR/build/specus-server-c" ]]; then
-  make -C "$C_DIR" test
-fi
+source "$C_DIR/scripts/smoke_server.sh"
+specus_smoke_prepare_server "$C_DIR"
 
 # The local web app the route publishes. Plain HTTP answers describe what arrived, so a check can
 # tell the request reached it unchanged; GET with "Upgrade: websocket" becomes a WebSocket that
@@ -254,7 +253,7 @@ SPECUS_CLIENT_SESSION_ID="1" \
 SPECUS_CLIENT_ACCESS_TOKEN="$ACCESS_TOKEN" \
 SPECUS_ADMIN_PORT="$ADMIN_PORT" \
 SPECUS_HTTP_ROUTES="app=http://$UPSTREAM_HOST:$APP_PORT" \
-stdbuf -oL -eL "$C_DIR/build/specus-server-c" >"$TMP_DIR/server.log" 2>&1 &
+stdbuf -oL -eL "$SPECUS_SMOKE_RESOLVED_SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 cat >"$TMP_DIR/client.jsonc" <<JSON

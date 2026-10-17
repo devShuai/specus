@@ -1587,12 +1587,16 @@ static int test_service_report_bounds(void)
      * has one keeps reporting.
      */
     (void)st_peer_mesh_catalogs_occupy_for_testing(4096U);
-    if (!failed && (service_report(path, &ctx, 8104, "bounds-publisher",
-                                   "{\"type\":\"service-report\",\"enabled\":false,\"revision\":1,\"services\":[]}") == 0
-                    || service_report(path, &ctx, 8102, "bounds-publisher",
-                                      "{\"type\":\"service-report\",\"enabled\":false,\"revision\":2,\"services\":[]}") != 0)) {
-        fprintf(stderr, "a full catalogue table admitted a new session or refused a tracked one\n");
-        failed = 1;
+    if (!failed) {
+        int new_session = service_report(path, &ctx, 8104, "bounds-publisher",
+            "{\"type\":\"service-report\",\"enabled\":false,\"revision\":1,\"services\":[]}");
+        int tracked_session = new_session == 0 ? INT_MIN : service_report(path, &ctx, 8102, "bounds-publisher",
+            "{\"type\":\"service-report\",\"enabled\":false,\"revision\":2,\"services\":[]}");
+        if (new_session == 0 || tracked_session != 0) {
+            fprintf(stderr, "a full catalogue table admitted a new session or refused a tracked one: new=%d tracked=%d\n",
+                new_session, tracked_session);
+            failed = 1;
+        }
     }
     st_peer_mesh_catalogs_release_for_testing();
     if (!failed && service_report(path, &ctx, 8104, "bounds-publisher",
