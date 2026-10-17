@@ -5,6 +5,8 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
+import org.hibernate.Session;
 
 import java.time.Instant;
 
@@ -20,13 +22,15 @@ public class AccountOwnedData {
     private EntityManager entityManager;
 
     /** The clients and access credentials an account still owns: while any remain it is not deleted. */
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public Owned owned(String tenantId, String loginName) {
-        return new Owned(
-                count("select count(c) from ClientAccount c"
-                        + " where c.tenantId = :tenantId and c.ownerUsername = :owner", tenantId, loginName),
-                count("select count(c) from ClientCredential c"
-                        + " where c.tenantId = :tenantId and c.ownerUsername = :owner", tenantId, loginName));
+        // Caller holds the immutable target account row: no new owned resources can be created.
+        // COUNT under MySQL RR can still see an older snapshot established before that row lock.
+        // Use current locking reads (PG forbids FOR UPDATE on aggregate COUNT). Credentials first,
+        // then clients, matching authentication and the resource writers' lock order.
+        long credentials = countCurrent("specus_client_credential", tenantId, loginName);
+        long clients = countCurrent("specus_client_account", tenantId, loginName);
+        return new Owned(clients, credentials);
     }
 
     /**
@@ -58,20 +62,23 @@ public class AccountOwnedData {
                 tenantId, loginName);
         update("delete from TransferAttachmentDownloadUsage u where u.tenantId = :tenantId and u.username = :owner",
                 tenantId, loginName);
-        update("""
-                        delete from PeerMeshDevice d
-                         where d.tenantId = :tenantId and d.ownerUsername = :owner
-                           and not exists (select c.id from ClientAccount c where c.id = d.clientId)
-                        """, tenantId, loginName);
+        // The subquery reads a different table: no MySQL target-table wrapper is needed.
+        // Hibernate's MySQLDialect adds a derived table around this correlated JPQL delete,
+        // which MariaDB rejects because the outer alias is not visible inside that wrapper.
+        entityManager.createNativeQuery("""
+                delete from peer_mesh_device where tenant_id=?1 and owner_username=?2
+                  and not exists (select 1 from specus_client_account c where c.id=peer_mesh_device.client_id)
+                """).setParameter(1, tenantId).setParameter(2, loginName).executeUpdate();
         reassign("PeerMeshAcl", tenantId, loginName, actor);
         reassign("PeerMeshEgressPolicy", tenantId, loginName, actor);
     }
 
-    private long count(String query, String tenantId, String owner) {
-        return entityManager.createQuery(query, Long.class)
-                .setParameter("tenantId", tenantId)
-                .setParameter("owner", owner)
-                .getSingleResult();
+    private long countCurrent(String table, String tenantId, String owner) {
+        String lock = entityManager.unwrap(Session.class).doReturningWork(connection ->
+                connection.getMetaData().supportsSelectForUpdate() ? " for update" : "");
+        return entityManager.createNativeQuery("select id from " + table
+                        + " where tenant_id=?1 and owner_username=?2 order by id" + lock)
+                .setParameter(1, tenantId).setParameter(2, owner).getResultList().size();
     }
 
     private void update(String query, String tenantId, String owner) {

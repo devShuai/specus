@@ -11,6 +11,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -35,9 +36,10 @@ class StandaloneStunServerTests {
         StandaloneStunServerConfig config =
                 new StandaloneStunServerConfig(topology, "integration-test", false);
 
-        try (StandaloneStunServer server = new StandaloneStunServer(config);
-             DatagramSocket client = new DatagramSocket(new InetSocketAddress(primary, 0))) {
-            server.start();
+        try (StunTestNetwork network = StunTestNetwork.start(
+                List.of(new StandaloneStunServer(config)),
+                () -> new DatagramSocket(new InetSocketAddress(primary, 0)))) {
+            DatagramSocket client = network.client();
             client.setSoTimeout(2_000);
             StunMessage request = StunMessage.of(
                     StunMessage.BINDING_REQUEST,
@@ -111,12 +113,10 @@ class StandaloneStunServerTests {
                 primary,
                 secret);
 
-        try (StandaloneStunServer primaryServer = new StandaloneStunServer(primaryConfig);
-             StandaloneStunServer alternateServer = new StandaloneStunServer(alternateConfig);
-             DatagramSocket client =
-                     new DatagramSocket(new InetSocketAddress(primary, 0))) {
-            alternateServer.start();
-            primaryServer.start();
+        try (StunTestNetwork network = StunTestNetwork.start(
+                List.of(new StandaloneStunServer(alternateConfig), new StandaloneStunServer(primaryConfig)),
+                () -> new DatagramSocket(new InetSocketAddress(primary, 0)))) {
+            DatagramSocket client = network.client();
             client.setSoTimeout(2_000);
 
             StunMessage primaryResponse = exchange(

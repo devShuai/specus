@@ -759,8 +759,8 @@ public sealed class AdminApiTests : IAsyncLifetime
             new ReadGate(lifetime.Token),
             new WriteBackpressureGate(64 * 1024, 1024 * 1024));
         failingContext.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            clientSessionId: 1);
-        registry.Replace(demo.ClientName, failingContext);
+            clientSessionId: 1, connectionRole: ConnectionRole.Data);
+        SyntheticDataBinding.Bind(registry, failingContext);
         nat.Attach(failingContext);
         try
         {
@@ -789,7 +789,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         }
         finally
         {
-            registry.Unbind(demo.ClientName, failingContext);
+            SyntheticDataBinding.Unbind(registry, failingContext);
             await nat.OnConnectionClosedAsync(failingContext);
         }
     }
@@ -822,9 +822,10 @@ public sealed class AdminApiTests : IAsyncLifetime
             () => { },
             new ReadGate(lifetime.Token),
             new WriteBackpressureGate(64 * 1024, 1024 * 1024));
-        context.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), clientSessionId: 1);
+        context.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            clientSessionId: 1, connectionRole: ConnectionRole.Data);
         writer.Context = context;
-        registry.Replace(demo.ClientName, context);
+        SyntheticDataBinding.Bind(registry, context);
         nat.Attach(context);
 
         try
@@ -863,7 +864,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         }
         finally
         {
-            registry.Unbind(demo.ClientName, context);
+            SyntheticDataBinding.Unbind(registry, context);
             await nat.OnConnectionClosedAsync(context);
         }
     }
@@ -895,9 +896,10 @@ public sealed class AdminApiTests : IAsyncLifetime
             () => { },
             new ReadGate(lifetime.Token),
             new WriteBackpressureGate(64 * 1024, 1024 * 1024));
-        context.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), clientSessionId: 1);
+        context.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            clientSessionId: 1, connectionRole: ConnectionRole.Data);
         writer.Context = context;
-        registry.Replace(demo.ClientName, context);
+        SyntheticDataBinding.Bind(registry, context);
         nat.Attach(context);
 
         try
@@ -932,7 +934,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         }
         finally
         {
-            registry.Unbind(demo.ClientName, context);
+            SyntheticDataBinding.Unbind(registry, context);
             await nat.OnConnectionClosedAsync(context);
         }
     }

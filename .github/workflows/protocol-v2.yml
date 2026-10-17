@@ -225,12 +225,29 @@ jobs:
           npm --prefix apps/admin-web ci
           npm --prefix apps/admin-web run deploy:csharp
 
+      - name: Verify local MySQL driver provenance and upstream advisories
+        run: |
+          python3 implementations/csharp/server/third_party/mysql-connector-net/verify_source.py
+          dotnet restore implementations/csharp/server/third_party/mysql-connector-net/audit/UpstreamAudit.csproj
+
       - name: Test .NET server
         env:
           SPECUS_REQUIRE_JAVA_CLIENT: "1"
+          SPECUS_PROCESS_TEST_ARTIFACT_DIR: ${{ runner.temp }}/dotnet-owner-process
         run: >-
           dotnet test implementations/csharp/server/Specus.slnx
           -p:SpecusServerWebSkip=true
+          --logger trx --results-directory "$RUNNER_TEMP/dotnet-full-results"
+
+      - name: Keep .NET full-suite results and owned-process logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-full-suite-and-owner-process
+          path: |
+            ${{ runner.temp }}/dotnet-full-results/*.trx
+            ${{ runner.temp }}/dotnet-owner-process/**/*.log
+          if-no-files-found: warn
 
       - name: Test real PostgreSQL native bootstrap, compatibility and catalogue data
         env:
@@ -242,11 +259,45 @@ jobs:
           python3 - <<'PY'
           import os, pathlib, xml.etree.ElementTree as ET
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'postgres-results/postgres-bootstrap.trx'
-          counters = ET.parse(path).getroot().find('.//{*}Counters')
+          root = ET.parse(path).getroot()
+          counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 36), ('executed', 36), ('passed', 36), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all twelve real PostgreSQL cases executed and passed; zero skipped.')
+          required = [
+              'NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows',
+              'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
+              'NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial',
+              'NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder',
+              'NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial',
+              'NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview',
+              'NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer',
+              'NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits',
+              'NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade',
+              'NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder',
+              'NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
+              'NativePeerBootstrapNormalizesAndValidatesBooleanShape',
+              'NativePeerControlDeliveryUsesOriginalCurrentAuthorityAtTheWriteTurn',
+              'NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn',
+              'NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant',
+              'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion',
+              'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup',
+          ]
+          for name in required:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          for name in ['NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait', 'NativeInboundReportCannotRestorePreTransferOwner', 'NativeInboundReportCannotRecreateClientDeletedOnIndependentHost']:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native inbound authority regression', name)
+          name = 'NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native connection-event identity regression', name)
+          name = 'NativePublicOwnerTransferCommitsAndEachConsumerReplaysTheJournal'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending public owner-transfer journal regression', name)
+          print('Verified all 35 real PostgreSQL cases, including public ownership POST and durable per-consumer receipts; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -257,8 +308,12 @@ jobs:
           path: ${{ runner.temp }}/postgres-results
           if-no-files-found: error
 
+      - name: Read the owned MySQL service CA for TLS validation regressions
+        run: docker cp '${{ job.services.mysql.id }}:/var/lib/mysql/ca.pem' "$RUNNER_TEMP/specus-mysql-ca.pem"
+
       - name: Test real MySQL bootstrap, upgrades and maximum traffic rows
         env:
+          SPECUS_TEST_MYSQL_CA_FILE: ${{ runner.temp }}/specus-mysql-ca.pem
           SPECUS_TEST_MYSQL_CONNECTION: "server=127.0.0.1;port=${{ job.services.mysql.ports[3306] }};user=root;password=specus-ci-mysql-276;Pooling=false"
         run: |
           dotnet test implementations/csharp/server/tests/Specus.DatabaseTests/Specus.DatabaseTests.csproj \
@@ -270,9 +325,45 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 7), ('executed', 7), ('passed', 7), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 35), ('executed', 35), ('passed', 35), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all seven real MySQL schema cases executed and passed; zero skipped.')
+          required = [
+              'NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows',
+              'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
+              'NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial',
+              'NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder',
+              'NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial',
+              'NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview',
+              'NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer',
+              'NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits',
+              'NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade',
+              'NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder',
+              'NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
+              'UnsafeDowngradeIsRefusedBeforeChangingDataOrHistory',
+              'NativePeerControlDeliveryUsesOriginalCurrentAuthorityAtTheWriteTurn',
+              'NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn',
+              'NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant',
+              'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion',
+              'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup',
+          ]
+          for name in required:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          for name in ['NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait', 'NativeInboundReportCannotRestorePreTransferOwner', 'NativeInboundReportCannotRecreateClientDeletedOnIndependentHost']:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native inbound authority regression', name)
+          for name in ['NativeCancellationStopsHostDuringAnActuallyStalledTlsHandshake', 'ActualDriverIsIdentifiableLocalSourceBuildNotOracleSignedBinary', 'TrustedCaStillConnectsAndUntrustedCaIsRejected', 'VerifyFullStillRejectsTrustedCertificateForWrongHost', 'AlreadyCanceledOpenKeepsOriginalCallerToken']:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending TLS cancellation or certificate regression', name)
+          name = 'NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native connection-event identity regression', name)
+          name = 'NativePublicOwnerTransferCommitsAndEachConsumerReplaysTheJournal'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending public owner-transfer journal regression', name)
+          print('Verified all 34 real MySQL cases, including TLS cancellation/certificates and public ownership POST/journal; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -293,11 +384,54 @@ jobs:
           python3 - <<'PY'
           import os, pathlib, xml.etree.ElementTree as ET
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'mariadb-results/mariadb-compatibility.trx'
-          counters = ET.parse(path).getroot().find('.//{*}Counters')
+          root = ET.parse(path).getroot()
+          counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 12), ('executed', 12), ('passed', 12), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 35), ('executed', 35), ('passed', 35), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
-          print('Verified all twelve real MariaDB cases executed and passed; zero skipped.')
+          required = [
+              'NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows',
+              'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
+              'NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial',
+              'NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder',
+              'NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial',
+              'NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview',
+              'NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer',
+              'NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits',
+              'NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade',
+              'NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder',
+              'NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
+              'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
+          ]
+          for name in required:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          name = 'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          name = 'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          name = 'NativePeerControlDeliveryUsesOriginalCurrentAuthorityAtTheWriteTurn'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          name = 'NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          name = 'NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          for name in ['NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait', 'NativeInboundReportCannotRestorePreTransferOwner', 'NativeInboundReportCannotRecreateClientDeletedOnIndependentHost']:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native inbound authority regression', name)
+          name = 'NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native connection-event identity regression', name)
+          name = 'NativePublicOwnerTransferCommitsAndEachConsumerReplaysTheJournal'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending public owner-transfer journal regression', name)
+          print('Verified all 34 real MariaDB cases, including public ownership POST and durable per-consumer receipts; zero skipped.')
           PY
 
       - name: Keep real MariaDB results
@@ -311,6 +445,10 @@ jobs:
   c-linux:
     name: C server (Linux)
     runs-on: ubuntu-latest
+    env:
+      # Reuse the exact CMake artifact even after an earlier test fails.
+      # The independent Makefile suite below retains its own deadline.
+      SPECUS_SMOKE_SERVER_BINARY: ${{ github.workspace }}/build/c-server/specus-server-c
     steps:
       - uses: actions/checkout@v4
       - name: Set up Java 21 for cross-language E2E
@@ -368,6 +506,7 @@ jobs:
       # The Makefile build is checked on its own: its unit tests take minutes, and the E2E steps below
       # each have a few minutes for the end-to-end part alone.
       - name: Makefile build and unit tests
+        if: ${{ !cancelled() && steps.c-build.outcome == 'success' }}
         run: |
           ulimit -c unlimited
           timeout --preserve-status 600s make -C implementations/c/server test \

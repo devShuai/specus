@@ -6,6 +6,7 @@ import com.theshuai.common.session.Session;
 import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.handler.NatServerHandler;
 import com.theshuai.specusserver.session.SessionUtil;
+import com.theshuai.specusserver.testsupport.PairedDataFixture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
@@ -31,6 +32,7 @@ final class FakeShareDevice implements AutoCloseable {
     }
 
     private final EmbeddedChannel channel;
+    private final PairedDataFixture pair;
     private final List<NatMessagePacket> written = new CopyOnWriteArrayList<>();
     private volatile Response response = Response.ok();
 
@@ -38,7 +40,7 @@ final class FakeShareDevice implements AutoCloseable {
         NatServerHandler natHandler = new NatServerHandler(null, null, null, null, registry, webSocketHandler);
         channel = new EmbeddedChannel(new Device(), natHandler);
         channel.attr(ServerAttributes.TENANT_ID).set("t1");
-        SessionUtil.bindDataSession(new Session(clientName), channel);
+        pair=new PairedDataFixture(clientName,channel);
     }
 
     FakeShareDevice respondWith(Response next) {
@@ -74,6 +76,7 @@ final class FakeShareDevice implements AutoCloseable {
     public void close() {
         SessionUtil.unBindSession(channel);
         channel.finishAndReleaseAll();
+        pair.close();
     }
 
     private final class Device extends ChannelOutboundHandlerAdapter {

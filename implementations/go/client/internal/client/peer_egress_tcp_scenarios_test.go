@@ -52,6 +52,25 @@ type tcpScenario struct {
 func tcpVectorScenarios() []tcpScenario {
 	return []tcpScenario{
 		{
+			Name:        "time-wait-old-traffic-preserves-tombstone",
+			Description: "旧 SYN/RST/FIN/数据不销毁 TIME_WAIT，重传 FIN 得到 ACK；原有十秒期限不被无关包延长",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(), {Do: "appClose"},
+				{Do: "segment", Seq: 1001, Ack: 5002, Flags: []string{"ACK", "FIN"}, Window: 65535},
+				{Do: "segment", Seq: 1000, Flags: []string{"SYN"}, Window: 65535},
+				{Do: "segment", Seq: 1002, Flags: []string{"RST"}},
+				{Do: "segment", Seq: 1001, Ack: 5002, Flags: []string{"ACK", "FIN"}, Window: 65535},
+				{Do: "segment", Seq: 1001, Ack: 5002, Flags: []string{"ACK", "PSH"}, PayloadHex: "01", Window: 65535},
+				{Do: "segment", Seq: 1002, Ack: 5002, Flags: []string{"ACK"}, Window: 65535},
+				{Do: "tick", AdvanceMs: 9999}, {Do: "tick", AdvanceMs: 1}},
+		},
+		{
+			Name:        "old-out-of-window-syn-cannot-reset-new-incarnation",
+			Description: "同步态的窗口外旧 SYN 只获当前 ACK，不复位或重建活跃连接",
+			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),
+				{Do: "segment", Seq: 999, Flags: []string{"SYN"}, Window: 65535},
+				{Do: "segment", Seq: 1001, Ack: 5001, Flags: []string{"ACK", "PSH"}, PayloadHex: "2a", Window: 65535}},
+		},
+		{
 			Name:        "same-tick-clean-ack-collapses-backoff",
 			Description: "同一时钟刻度内的干净 ACK 仍为有效 RTT 样本；恢复丢包退避且不提前重传",
 			Steps: []tcpVectorStep{synStep(), handshakeAckStep(),

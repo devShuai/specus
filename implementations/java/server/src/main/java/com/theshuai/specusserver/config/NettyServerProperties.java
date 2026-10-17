@@ -13,6 +13,8 @@ public class NettyServerProperties {
     private String bindAddress = "0.0.0.0";
     private int bossThreads = 1;
     private int workerThreads = 0;
+    private int controlMessageThreads = 8;
+    private int controlMessageQueueCapacity = 4096;
     private int remoteBossThreads = 1;
     private int remoteWorkerThreads = 0;
     private int soBacklog = 8192;

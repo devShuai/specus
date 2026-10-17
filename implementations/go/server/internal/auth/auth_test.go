@@ -110,6 +110,37 @@ func TestAuthenticateKeepsLiveOnlineSessions(t *testing.T) {
 	}
 }
 
+func TestAuthenticateReplacingSameSessionRespectsCredentialZeroAndOtherInstances(t *testing.T) {
+	authenticator, sessions, registry, account, credential := newTestAuthenticator(t)
+	ctx := context.Background()
+	current := sessions.CreateForClient(account, credential.ID, "machine-1", "alice", time.Hour)
+	sessions.MarkOnline(current.ID)
+	registry.Replace(&stubControlSession{name: account.ClientName})
+	request := protocol.LoginRequest{ClientSessionID: current.ID, AccessToken: current.AccessToken}
+	credential.MaxOnlineInstances = 1
+	if err := authenticator.db.UpdateCredential(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := authenticator.Authenticate(ctx, request); err != nil || !result.Success {
+		t.Fatalf("same authenticated instance consumes no extra slot: %+v %v", result, err)
+	}
+	credential.MaxOnlineInstances = 0
+	if err := authenticator.db.UpdateCredential(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := authenticator.Authenticate(ctx, request); err != nil || result.Success {
+		t.Fatalf("zero credential limit was bypassed: %+v %v", result, err)
+	}
+	credential.MaxOnlineInstances = 1
+	if err := authenticator.db.UpdateCredential(ctx, credential); err != nil {
+		t.Fatal(err)
+	}
+	other := sessions.CreateForClient(account, credential.ID, "machine-1", "alice", time.Hour)
+	if result, err := authenticator.Authenticate(ctx, protocol.LoginRequest{ClientSessionID: other.ID, AccessToken: other.AccessToken}); err != nil || result.Success {
+		t.Fatalf("another authenticated instance bypassed machine limit: %+v %v", result, err)
+	}
+}
+
 // A token belongs to the account it was issued for: renaming the account keeps it valid under the
 // new name, and an account created later under the old name is never what it logs in as.
 func TestAuthenticateResolvesTheTokenAccountByIDNotByName(t *testing.T) {

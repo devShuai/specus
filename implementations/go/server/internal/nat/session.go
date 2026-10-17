@@ -54,19 +54,29 @@ func NewCoordinator(manager *RemotePortManager, traffic *TrafficService, detail 
 		byName: make(map[string]*clientSession)}
 }
 
-// Attach creates the per-client stream namespace immediately after authentication.
-func (c *Coordinator) Attach(conn *control.Conn) {
-	if conn == nil || conn.ClientName() == "" {
-		return
+// Attach publishes an authenticated data namespace and irreversibly retires its predecessor.
+// Returned browser cleanup must run after the login reply, outside its socket/lifecycle locks.
+// No inbound frame is permitted to call Attach or create a namespace on demand.
+func (c *Coordinator) Attach(conn *control.Conn) func() {
+	if conn == nil || conn.ClientName() == "" || conn.Context().Err() != nil {
+		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, exists := c.sessions[conn]; exists {
-		return
+		c.mu.Unlock()
+		return nil
+	}
+	var finish func()
+	if previous := c.byName[conn.ClientName()]; previous != nil {
+		previous.conn.Close(store.ReasonReplacedByNewLogin)
+		finish = previous.retire()
+		delete(c.sessions, previous.conn)
 	}
 	session := newClientSession(conn, c.manager, c.traffic, c.detail, c.detailOpts, c.limits, c.logger)
 	c.sessions[conn] = session
 	c.byName[conn.ClientName()] = session
+	c.mu.Unlock()
+	return finish
 }
 
 // OpenHTTPStream allocates one stream in the authenticated client's NAT v2 namespace.
@@ -94,12 +104,14 @@ func (c *Coordinator) OpenWSStream(clientName string, metadata map[string]any,
 
 // Handle processes one NAT message for a control connection.
 func (c *Coordinator) Handle(conn *control.Conn, message protocol.NatMessage) error {
-	c.Attach(conn)
+	if conn == nil || conn.Context().Err() != nil {
+		return errNamespaceRetired
+	}
 	c.mu.Lock()
 	session, ok := c.sessions[conn]
-	if !ok {
-		session = newClientSession(conn, c.manager, c.traffic, c.detail, c.detailOpts, c.limits, c.logger)
-		c.sessions[conn] = session
+	if !ok || c.byName[conn.ClientName()] != session {
+		c.mu.Unlock()
+		return errNamespaceRetired
 	}
 	c.mu.Unlock()
 	return session.handle(message)
@@ -109,17 +121,22 @@ func (c *Coordinator) Handle(conn *control.Conn, message protocol.NatMessage) er
 func (c *Coordinator) Close(conn *control.Conn) {
 	c.mu.Lock()
 	session, ok := c.sessions[conn]
+	var finish func()
 	if ok {
+		conn.Close("")
+		finish = session.retire()
 		delete(c.sessions, conn)
 		if c.byName[conn.ClientName()] == session {
 			delete(c.byName, conn.ClientName())
 		}
 	}
 	c.mu.Unlock()
-	if ok {
-		session.dispose()
+	if finish != nil {
+		finish()
 	}
 }
+
+var errNamespaceRetired = errors.New("data channel namespace is retired or not attached")
 
 type clientSession struct {
 	conn       *control.Conn
@@ -131,6 +148,7 @@ type clientSession struct {
 	logger     *slog.Logger
 
 	mu                    sync.Mutex
+	retired               bool // monotonic; all new resource admission checks hold mu
 	bindings              map[int]*portListener
 	externals             map[uint32]*externalConn
 	httpStreams           map[uint32]*HTTPStream
@@ -169,6 +187,12 @@ func newClientSession(conn *control.Conn, manager *RemotePortManager, traffic *T
 }
 
 func (s *clientSession) handle(message protocol.NatMessage) error {
+	s.mu.Lock()
+	retired := s.retired
+	s.mu.Unlock()
+	if retired {
+		return errNamespaceRetired
+	}
 	switch message.Type {
 	case protocol.NatRegister:
 		return s.handleRegister(message)
@@ -246,9 +270,13 @@ func (s *clientSession) handleRegister(message protocol.NatMessage) error {
 	}
 
 	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		return errNamespaceRetired
+	}
 	_, bound := s.bindings[port]
-	s.mu.Unlock()
 	if bound {
+		s.mu.Unlock()
 		result["success"] = false
 		result["reason"] = "port " + strconv.Itoa(port) + " already in use"
 		return s.sendRegisterResult(result)
@@ -256,12 +284,12 @@ func (s *clientSession) handleRegister(message protocol.NatMessage) error {
 
 	listener, err := s.manager.Bind(port, func(conn net.Conn) { s.acceptExternal(port, conn) })
 	if err != nil {
+		s.mu.Unlock()
 		result["success"] = false
 		result["reason"] = err.Error()
 		return s.sendRegisterResult(result)
 	}
 
-	s.mu.Lock()
 	s.bindings[port] = listener
 	s.mu.Unlock()
 
@@ -380,6 +408,11 @@ func (s *clientSession) openHTTPStream(metadata map[string]any) (*HTTPStream, er
 	s.markStreamOpened(streamID)
 	stream := newHTTPStream(s.conn, streamID, s.removeHTTPStream)
 	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		stream.Close()
+		return nil, errNamespaceRetired
+	}
 	if s.natStreamLimitReachedLocked() {
 		s.mu.Unlock()
 		stream.Close()
@@ -508,6 +541,12 @@ func (s *clientSession) removeHTTPStream(streamID uint32, expected *HTTPStream) 
 // （对齐 Java WebSocketSpecusHandler.afterConnectionEstablished 的 CONNECTED）。
 func (s *clientSession) openWSStream(metadata map[string]any,
 	wsConn *websocket.Conn) (*directhttp.WebSocketSpecus, error) {
+	s.mu.Lock()
+	retired := s.retired
+	s.mu.Unlock()
+	if retired {
+		return nil, errNamespaceRetired
+	}
 	streamID := s.allocateStreamID()
 	s.markStreamOpened(streamID)
 	specus := directhttp.NewWebSocketSpecus(wsConn, streamID, s.conn.ClientName(),
@@ -521,6 +560,11 @@ func (s *clientSession) openWSStream(metadata map[string]any,
 		},
 		func(specus *directhttp.WebSocketSpecus) { s.removeWSStream(streamID, specus) })
 	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		specus.Close()
+		return nil, errNamespaceRetired
+	}
 	if s.natStreamLimitReachedLocked() {
 		s.mu.Unlock()
 		return nil, ErrTooManyNatStreams
@@ -617,6 +661,11 @@ func (s *clientSession) acceptExternal(port int, netConn net.Conn) {
 		external.readGate.Pause()
 	}
 	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		s.cleanupExternal(external)
+		return
+	}
 	s.externals[external.streamID] = external
 	s.mu.Unlock()
 	s.updateControlReadForWritability()
@@ -733,7 +782,7 @@ func (s *clientSession) acquire(port int) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if reached(s.activeExternal, s.limits.PerClient) || reached(s.portCounts[port], s.limits.PerPort) {
+	if s.retired || reached(s.activeExternal, s.limits.PerClient) || reached(s.portCounts[port], s.limits.PerPort) {
 		s.manager.ReleaseExternal(tenantID)
 		s.manager.RecordRejected(tenantID)
 		return false
@@ -764,11 +813,22 @@ func (s *clientSession) release(port int) {
 }
 
 func (s *clientSession) dispose() {
-	if s.controlBackpressureUnsubscribe != nil {
-		s.controlBackpressureUnsubscribe()
-		s.controlBackpressureUnsubscribe = nil
+	if finish := s.retire(); finish != nil {
+		finish()
 	}
+}
+
+// Retire admission, listeners, stream maps and TCP budgets synchronously. Only potentially
+// slow browser close handshakes are deferred; they never delay a successor's login reply.
+func (s *clientSession) retire() func() {
 	s.mu.Lock()
+	if s.retired {
+		s.mu.Unlock()
+		return nil
+	}
+	s.retired = true
+	unsubscribe := s.controlBackpressureUnsubscribe
+	s.controlBackpressureUnsubscribe = nil
 	bindings := s.bindings
 	externals := s.externals
 	httpStreams := s.httpStreams
@@ -778,20 +838,24 @@ func (s *clientSession) dispose() {
 	s.httpStreams = make(map[uint32]*HTTPStream)
 	s.wsStreams = make(map[uint32]*directhttp.WebSocketSpecus)
 	s.mu.Unlock()
+	if unsubscribe != nil {
+		unsubscribe()
+	}
 
 	for _, listener := range bindings {
 		s.manager.Release(listener)
 	}
 	for _, external := range externals {
-		external.stopBackpressureListener()
-		external.close()
+		s.cleanupExternal(external)
 	}
 	for _, stream := range httpStreams {
 		stream.onReset(errors.New("control channel closed"))
 	}
 	// 对齐 Java onControlChannelInactive -> WebSocketStreamRegistry.closeAll。
-	for _, specus := range wsStreams {
-		specus.Close()
+	return func() {
+		for _, specus := range wsStreams {
+			specus.Close()
+		}
 	}
 }
 

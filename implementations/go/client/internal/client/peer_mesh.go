@@ -2503,10 +2503,7 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 }
 
 func (mesh *peerMeshClient) closeSession(message peerControlMessage) {
-	// The plane cannot ask the mesh whether a peer is still authorised without reaching for the
-	// mesh lock from under its own, so a closing session pushes the revocation instead.
-	defer mesh.revokeEgressConsumer(mesh.peerIDFromControl(message))
-	if message.SessionID == nil {
+	if message.SessionID == nil || *message.SessionID <= 0 {
 		return
 	}
 	mesh.mu.Lock()
@@ -2515,6 +2512,12 @@ func (mesh *peerMeshClient) closeSession(message peerControlMessage) {
 		if session.ID == *message.SessionID {
 			delete(mesh.sessions, peerID)
 			delete(mesh.sessionsByID, session.ID)
+			// Scope revocation to the matched session, not optional endpoint hints. Keep the
+			// session lock until release so a replacement cannot acquire flows in between.
+			// The plane's sender only queues frames; it never re-enters the mesh lock.
+			if mesh.egress != nil {
+				mesh.egress.revokeConsumer(peerID, time.Now())
+			}
 		}
 	}
 }

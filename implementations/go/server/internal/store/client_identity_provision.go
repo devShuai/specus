@@ -22,7 +22,20 @@ func (db *DB) InsertClientWithIdentity(ctx context.Context, account ClientAccoun
 			_ = tx.Rollback()
 		}
 	}()
+	if err := db.insertClientWithIdentityOn(ctx, tx, account, identity); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
 
+// The caller owns the transaction and its authorization/locking boundary. The public insertion
+// helper above is for trusted provisioning; startup authentication uses ResolveClientStartup.
+func (db *DB) insertClientWithIdentityOn(ctx context.Context, tx sqlRunner, account ClientAccount,
+	identity ClientIdentity) error {
 	accountQuery := db.rebind(`INSERT INTO specus_client_account
 		(id, tenant_id, owner_username, client_name, password_hash, enabled,
 		 connection_rate_limit_per_minute, created_at, updated_at)
@@ -45,9 +58,5 @@ func (db *DB) InsertClientWithIdentity(ctx context.Context, account ClientAccoun
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
 	return nil
 }

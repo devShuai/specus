@@ -31,7 +31,7 @@ public class WorkbenchReferences {
 
     /**
      * A client is deleted: every identity's reference to any route, mapping or Peer service it
-     * carries goes, although those rows themselves stay behind. Call before the services' rows
+     * carries goes, whether the object rows are deleted or retained. Call before the services' rows
      * would ever be removed, as the lookup goes through them.
      */
     @Transactional

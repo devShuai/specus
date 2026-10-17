@@ -1,0 +1,137 @@
+diff --git a/Driver.cs b/Driver.cs
+index 25a9b37..51e7dfe 100644
+--- a/Driver.cs
++++ b/Driver.cs
+@@ -145,7 +145,8 @@ namespace MySql.Data.MySqlClient
+     public static Driver Create(MySqlConnectionStringBuilder settings, CancellationToken cancellationToken)
+     {
+       Driver d = InitializeDriver(settings);
+-      var connToken = PrepareCancellationToken(settings, cancellationToken);
++      using var cancellationSource = PrepareCancellationSource(settings, cancellationToken);
++      var connToken = cancellationSource.Token;
+ 
+       //this try was added as suggested fix submitted on MySql Bug 72025, socket connections are left in CLOSE_WAIT status when connector fails to open a new connection.
+       //the bug is present when the client try to get more connections that the server support or has configured in the max_connections variable.
+@@ -153,9 +154,11 @@ namespace MySql.Data.MySqlClient
+       {
+         d.Open(connToken);
+       }
+-      catch
++      catch (Exception error)
+       {
+         d.Close();
++        if (error is OperationCanceledException && cancellationToken.IsCancellationRequested)
++          throw new OperationCanceledException(error.Message, error, cancellationToken);
+         throw;
+       }
+       return d;
+@@ -170,7 +173,8 @@ namespace MySql.Data.MySqlClient
+     public static async Task<Driver> CreateAsync(MySqlConnectionStringBuilder settings, CancellationToken cancellationToken)
+     {
+       Driver d = InitializeDriver(settings);
+-      var connToken = PrepareCancellationToken(settings, cancellationToken);
++      using var cancellationSource = PrepareCancellationSource(settings, cancellationToken);
++      var connToken = cancellationSource.Token;
+ 
+       //this try was added as suggested fix submitted on MySql Bug 72025, socket connections are left in CLOSE_WAIT status when connector fails to open a new connection.
+       //the bug is present when the client try to get more connections that the server support or has configured in the max_connections variable.
+@@ -178,9 +182,11 @@ namespace MySql.Data.MySqlClient
+       {
+         await d.OpenAsync(connToken).ConfigureAwait(false);
+       }
+-      catch
++      catch (Exception error)
+       {
+         await d.CloseAsync().ConfigureAwait(false);
++        if (error is OperationCanceledException && cancellationToken.IsCancellationRequested)
++          throw new OperationCanceledException(error.Message, error, cancellationToken);
+         throw;
+       }
+       return d;
+@@ -216,18 +222,14 @@ namespace MySql.Data.MySqlClient
+     /// <param name="settings">The connection string settings.</param>
+     /// <param name="cancellationToken">The provided cancellation token.</param>
+     /// <returns>The prepared CancellationToken, combining timeout and provided token if applicable.</returns>
+-    private static CancellationToken PrepareCancellationToken(MySqlConnectionStringBuilder settings, CancellationToken cancellationToken)
++    private static CancellationTokenSource PrepareCancellationSource(MySqlConnectionStringBuilder settings, CancellationToken cancellationToken)
+     {
+-      CancellationTokenSource connTimeoutSource = null;
+-      CancellationTokenSource linkedSource = null;
+-
++      // Specus local patch: own and dispose the timeout/forwarding registration with
++      // the open operation, and expose the original caller token on caller cancellation.
++      var source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+       if (settings.ConnectionTimeout != 0)
+-        connTimeoutSource = new CancellationTokenSource((int)settings.ConnectionTimeout * 1000);
+-
+-      if (cancellationToken.CanBeCanceled && connTimeoutSource is not null)
+-        linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, connTimeoutSource.Token);
+-
+-      return linkedSource?.Token ?? connTimeoutSource?.Token ?? cancellationToken;
++        source.CancelAfter((int)settings.ConnectionTimeout * 1000);
++      return source;
+     }
+ 
+     public bool HasStatus(ServerStatusFlags flag)
+@@ -1195,4 +1197,4 @@ namespace MySql.Data.MySqlClient
+     void ResetTimeout(int timeout);
+     int WarningCount { get; }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/common/Ssl.cs b/common/Ssl.cs
+index 4f40c38..dee113e 100644
+--- a/common/Ssl.cs
++++ b/common/Ssl.cs
+@@ -278,8 +278,7 @@ namespace MySql.Data.Common
+       {
+         tlsProtocol = (tlsProtocol == SslProtocols.None) ? SslProtocols.Tls12 : tlsProtocol;
+ 
+-        using (cancellationToken.Register(() => throw new AggregateException($"Authentication to host '{_settings.Server}' failed.", new IOException())))
+-          sslStream.AuthenticateAsClient(_settings.Server, certs, tlsProtocol, false);
++        AuthenticateCancellableAsync(sslStream, certs, tlsProtocol, cancellationToken).GetAwaiter().GetResult();
+ 
+         lock (tlsConnectionRef)
+         {
+@@ -390,8 +389,7 @@ namespace MySql.Data.Common
+       {
+         tlsProtocol = (tlsProtocol == SslProtocols.None) ? SslProtocols.Tls12 : tlsProtocol;
+ 
+-        using (cancellationToken.Register(() => throw new AggregateException($"Authentication to host '{_settings.Server}' failed.", new IOException())))
+-          await sslStream.AuthenticateAsClientAsync(_settings.Server, certs, tlsProtocol, false).ConfigureAwait(false);
++        await AuthenticateCancellableAsync(sslStream, certs, tlsProtocol, cancellationToken).ConfigureAwait(false);
+ 
+         lock (tlsConnectionRef)
+         {
+@@ -421,6 +419,30 @@ namespace MySql.Data.Common
+       return new Tuple<MySqlStream, Stream>(stream, baseStream);
+     }
+ 
++    // Specus local patch: cancellation must abort the pending handshake itself, not
++    // throw on the thread calling CancellationTokenSource.Cancel. The constructor's
++    // original certificate validation callback remains in force for every SSL mode.
++    private async Task AuthenticateCancellableAsync(SslStream stream, X509CertificateCollection certs,
++      SslProtocols protocols, CancellationToken cancellationToken)
++    {
++      try
++      {
++        await stream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
++        {
++          TargetHost = _settings.Server,
++          ClientCertificates = certs,
++          EnabledSslProtocols = protocols,
++          CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
++        }, cancellationToken).ConfigureAwait(false);
++        cancellationToken.ThrowIfCancellationRequested();
++      }
++      catch
++      {
++        stream.Dispose();
++        throw;
++      }
++    }
++
+     /// <summary>
+     /// Verifies the SSL certificates used for authentication.
+     /// </summary>

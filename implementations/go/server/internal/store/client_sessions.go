@@ -159,6 +159,23 @@ func (db *DB) MarkClientSessionDisconnected(ctx context.Context, id int64, statu
 	return err
 }
 
+// MarkClientSessionDisconnectedForChannel cannot retire a newer physical connection that
+// reused the authenticated session ID. The predicate and update are one native DB statement.
+func (db *DB) MarkClientSessionDisconnectedForChannel(ctx context.Context, id int64, channelID, status string, when time.Time) (bool, error) {
+	if id <= 0 || strings.TrimSpace(channelID) == "" {
+		return false, nil
+	}
+	query := db.rebind(`UPDATE specus_client_session
+		SET status = ?, disconnected_at = COALESCE(disconnected_at, ?)
+		WHERE id = ? AND channel_id = ? AND status = 'NETTY_ONLINE'`)
+	result, err := db.sql.ExecContext(ctx, query, status, formatTime(when), id, channelID)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
+}
+
 // CloseHTTPAuthenticatedClientSessions closes stale startup-login sessions for the same machine user.
 func (db *DB) CloseHTTPAuthenticatedClientSessions(ctx context.Context, credentialID int64,
 	machineFingerprint, osUser, fromStatus, toStatus string, when time.Time) (int64, error) {

@@ -169,15 +169,31 @@ static int expect_activity(const test_server *server, const char *token, const c
     return -1;
 }
 
+static const test_server *report_server;
 static int report_and_sync(int fd, const char *client_name, const char *to, const char *message)
 {
-    /* The control connection handles its frames in order: once the heartbeat is answered, the
-     * report before it has been handled. */
-    return send_peer_control(fd, client_name, to, message) == 0 && expect_channel_alive(fd) == 0 ? 0 : -1;
+    /* A following real device-report is a FIFO business fence, independent of egress activity.
+     * Unlike a heartbeat it proves prior accepted AND rejected envelopes finished processing. */
+    static unsigned int sequence;
+    char fence[96], json[192], value[128];
+    snprintf(fence, sizeof(fence), "egress-business-fence-%u", ++sequence);
+    snprintf(json, sizeof(json), "{\"type\":\"device-report\",\"virtualDeviceName\":\"%s\"}", fence);
+    if (send_peer_control(fd, client_name, to, message) != 0
+        || send_peer_control(fd, client_name, NULL, json) != 0 || expect_channel_alive(fd) != 0) return -1;
+    long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    do {
+        if (db_scalar(report_server->db_path,
+                      "SELECT virtual_device_name FROM peer_mesh_device WHERE client_name=?", client_name, 0,
+                      value, sizeof(value)) == 0 && strcmp(value, fence) == 0) return 0;
+        sleep_ms(1);
+    } while (monotonic_ms() < deadline);
+    fprintf(stderr, "business fence %s never reached native storage\n", fence);
+    return -1;
 }
 
 static int scenario_egress_report(test_server *server)
 {
+    report_server = server;
     CHECK(create_credential(server->db_path, "ck_egress", "egress-secret", 2) == 0, "egress credential not stored");
     CHECK(create_credential(server->db_path, "ck_legacy", "legacy-secret", 2) == 0, "legacy credential not stored");
     runtime_session egress;

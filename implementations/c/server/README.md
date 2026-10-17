@@ -61,6 +61,87 @@ The login response carries `nettyTls`, derived as Java and Go derive it: `true` 
 `SPECUS_TLS_MODE` is `file` or `self-signed`, or `SPECUS_TLS_TERMINATED_UPSTREAM=true`. Clients
 whose `controlTls.enabled` is unset follow it.
 
+## Shared SQLite CONTROL ownership
+
+Current C instances sharing the same SQLite file register each physical CONTROL before writing
+`NETTY_ONLINE`. Registration uses a private `<database>.control-c-<random-id>.lock` sidecar with a
+nonblocking [advisory file lock](https://man7.org/linux/man-pages/man2/flock.2.html), held through that connection's socket and audit cleanup. The database
+directory must be writable and its filesystem must provide working cross-process advisory locks;
+keep these sidecars with the database and do not remove them while an instance is running. Normal
+teardown removes an unused sidecar; after a killed process, startup/re-login can recover the exact
+dead channel and its audit without marking another instance's live sessions offline. A missing or
+unreadable modern sidecar is **unknown**, not proof of death (including channels from an older C
+instance during an upgrade); those rows are preserved and may require explicit administrative
+revocation if the old owner cannot be recovered. Historical unattributed channel rows retain the
+legacy startup-recovery behavior. This does not make network-filesystem SQLite deployments safe.
+All instances must use ownership-aware cleanup: an older binary's global cleanup can still
+overwrite shared state, which a newer instance cannot prevent.
+
+A separate monotonic background worker checks up to 64 native CONTROL sources per round, in fair
+FIFO order. It retires a permanently replaced/expired source and its DATA/streams without waiting
+for another business packet. The check does not add SQL to heartbeat processing; temporarily
+disabled policy or a database error does not by itself permanently revoke the physical connection.
+Successful rounds use a one-second cadence. Failed native reads retry after 50ms, with exponential
+backoff capped at one second during a sustained outage; a successful round resets that backoff.
+Every attempt retains the 64-source bound and 25ms SQLite busy budget. Database contention can
+still delay detection: neither the cadence nor retries promise a global retirement deadline.
+This is bounded periodic detection, not an atomic cross-instance catalog-publication fence.
+
+Service reports reserve an invisible, bounded cache stage before opening the native writer.
+The report's physical CONTROL identity, current account/device/sharing policy, audit insertion,
+and audit retention are checked in one SQLite transaction. Only a successful commit publishes
+the staged raw revision, rate window, statistics, mDNS candidates, and output revision; rejection
+discards the stage without changing the last committed cohort. A policy/source change caused by
+an audit trigger is rolled back as a failed operation, not treated as permanent CONTROL loss.
+No cache mutex or socket I/O is held across that transaction. Conflicting cache mutations fail
+or remain queued for retry rather than clearing a reserved cell.
+Each output revision also owns its `createdAtMillis`; withdrawal retries retain that timestamp
+and the complete wire payload, including when a retry crosses a wall-clock second.
+
+Management instance/mDNS reads require an explicit database path and validate each cached
+original CONTROL (including its discovery capability), current account/device and sharing policy
+in one native read snapshot. They copy no mDNS heap pointer across the unlocked native read and
+recheck the committed cache version before copying output. A retired/temporarily hidden cohort
+is omitted without deleting it; a database error fails the read rather than reporting false success.
+
+Catalog deliveries, including replay, reserve an invisible position in the original receiver's
+bounded FIFO before SQL. One native `BEGIN IMMEDIATE` projection checks the original publisher
+source, current publisher/recipient ownership, consumer-to-publisher ACL, sharing and
+the reported service definitions. Unknown visibility and malformed recipient lists do not grant
+access. A new port/protocol/path is not advertised until it matches the publisher's accepted report.
+Network, management and maintenance catalog sends capture physical publisher/recipient
+references before SQL. Recipient authority uses that original session's current discovery capability,
+not a sibling session's latest capability. Serialization into preallocated private buffers is pure
+memory staging, without queue/registry/CID/cache locks or socket I/O. Only successful native COMMIT,
+after SQL closes, makes the reserved entry deliverable; a read/stage/commit failure aborts it.
+The worker uses only the captured receiver object/descriptor, checks cancellation after waiting
+for its write lock, and never redirects a pending payload by name onto a reconnect. A nonempty
+entry owns an independent publisher cancellation guard, not a reference to its session or CID,
+so a slow receiver cannot pin publisher teardown/reconnect. Empty withdrawals need no surviving publisher, but still require an
+authenticated original recipient. Missing required transport is an error, not a trusted fallback.
+Source report admission also checks its own original session's discovery capability inside the
+native writer and after audit triggers; rejection releases the private stage without consuming
+raw/rate/output state or permanently retiring an otherwise live CONTROL.
+
+All Peer control/config/roster/signalling and ordinary CONTROL client messages share the same
+per-receiver reservation order. Heartbeats, login ACK and NAT frames do not wait behind invisible
+reservations. A target already blocked in an actual frame write still serializes other writes on
+that same socket. There are eight output workers, with at most one delivery per channel; entries
+and reserved bytes (including staged/in-flight buffers) are bounded to 64/64 MiB per channel and
+1,024/256 MiB globally. Admission failure is reported rather than waiting for quota or writing
+inside SQL. The existing 1 MiB message-body limit is unchanged. Channel teardown cancels queued
+entries, interrupts its socket, and waits for captured producers and in-flight delivery before
+freeing their physical resources. A reserved producer's buffer is never freed while it stages.
+
+Native queue acceptance is not a remote acknowledgement, nor a promise to retract a frame whose
+write already started. Messages accepted before a later policy write can still be pending on the
+wire. Distributed output/revision ordering remains separate alignment work, and other message
+types sharing the FIFO have not thereby gained native guarded authorization acceptance.
+There is no latency guarantee for all recipients when all eight writers are backpressured.
+The online-peer hint is
+still obtained before the report writer. Shared SQLite does not currently provide atomic
+distributed catalog publication.
+
 ## Build
 
 ```bash

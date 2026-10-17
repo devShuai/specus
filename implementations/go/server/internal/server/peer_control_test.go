@@ -10,11 +10,12 @@ import (
 
 	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
 	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 type fakeSignalMesh struct{ err error }
 
-func (m fakeSignalMesh) HandleSignalSession(context.Context, protocol.MessageRequest, string, int64) error {
+func (m fakeSignalMesh) HandleSignalBound(context.Context, protocol.MessageRequest, store.RuntimeClientReference) error {
 	return m.err
 }
 
@@ -25,12 +26,12 @@ func TestUndeliverablePeerSignalDoesNotCloseTheSender(t *testing.T) {
 	request := protocol.MessageRequest{ToClientName: "gone", MessageType: protocol.MessageTypePeerControl}
 
 	offline := fmt.Errorf("%w: target peer is offline: gone", peermesh.ErrUndeliverable)
-	if err := routePeerSignal(fakeSignalMesh{offline}, logger, context.Background(), request, "sender", 1); err != nil {
+	if err := routePeerSignal(fakeSignalMesh{offline}, logger, context.Background(), request, store.RuntimeClientReference{ClientName: "sender", SessionID: 1}); err != nil {
 		t.Errorf("an undeliverable signal returned %v, which would close the sender's connection", err)
 	}
 
 	violation := errors.New("toClientName is required")
-	if err := routePeerSignal(fakeSignalMesh{violation}, logger, context.Background(), request, "sender", 1); !errors.Is(err, violation) {
+	if err := routePeerSignal(fakeSignalMesh{violation}, logger, context.Background(), request, store.RuntimeClientReference{ClientName: "sender", SessionID: 1}); !errors.Is(err, violation) {
 		t.Errorf("a protocol violation returned %v, want it passed on so the connection closes", err)
 	}
 }

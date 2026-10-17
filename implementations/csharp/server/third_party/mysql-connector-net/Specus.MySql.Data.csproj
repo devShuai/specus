@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>MySql.Data</AssemblyName>
+    <RootNamespace>MySql.Data</RootNamespace>
+    <Version>26.7.0</Version>
+    <!-- Local project dependency override only; no NuGet publication. -->
+    <PackageId>MySql.Data</PackageId>
+    <AssemblyVersion>26.7.0.0</AssemblyVersion>
+    <FileVersion>26.7.0.1</FileVersion>
+    <InformationalVersion>26.7.0+specus.tls-cancel.1</InformationalVersion>
+    <SignAssembly>false</SignAssembly>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+    <LangVersion>latest</LangVersion>
+    <NoWarn>CS1591;CS1587;CS1574;CS1570;SYSLIB0003;CA1416;CS8981</NoWarn>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>high</NuGetAuditLevel>
+    <WarningsAsErrors>NU1903;NU1904</WarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Carry the corresponding source, build recipe and licenses with every local
+         output/publish artifact, not just in the checkout. No source download at build. -->
+    <Content Include="LICENSE;INFO_SRC;README.md;provenance.json;tls-cancel.patch;verify_source.py;Specus.MySql.Data.csproj;PatchVersionInfo.cs;upstream/**/*;MITLibs/*.dll;audit/*.csproj"
+             Exclude="upstream/**/bin/**;upstream/**/obj/**"
+             Link="third-party/mysql-connector-net/%(Identity)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Compile Include="upstream/**/*.cs" Exclude="upstream/Framework/net462/**/*.cs;upstream/Properties/VersionInfo.cs" />
+    <Compile Include="PatchVersionInfo.cs" />
+    <EmbeddedResource Include="upstream/Resources.resx" LogicalName="MySql.Data.Resources.resources" />
+    <EmbeddedResource Include="upstream/ResourcesX.resx" LogicalName="MySql.Data.ResourcesX.resources" />
+    <EmbeddedResource Include="upstream/Properties/ReservedWords.txt" LogicalName="MySql.Data.Properties.ReservedWords.txt" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+    <PackageReference Include="Google.Protobuf" Version="3.35.0" />
+    <PackageReference Include="K4os.Compression.LZ4.Streams" Version="1.3.8" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="10.0.8" />
+    <PackageReference Include="System.Security.Permissions" Version="10.0.8" />
+  </ItemGroup>
+</Project>

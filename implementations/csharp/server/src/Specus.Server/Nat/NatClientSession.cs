@@ -32,11 +32,18 @@ internal sealed class NatClientSession : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, byte> _closedStreamIds = new();
     private readonly ConcurrentQueue<uint> _closedStreamOrder = new();
     private readonly object _admissionLock = new();
+    private readonly SemaphoreSlim _namespaceGate = new(1, 1);
+    private readonly ConcurrentDictionary<uint, ExternalAdmission> _externalAdmissions = new();
+    private volatile bool _retired;
+    private TaskCompletionSource? _retirement;
     private readonly Dictionary<int, int> _portExternalCounts = new();
 
     private int _activeClientExternalChannels;
     private int _nextStreamId;
     private volatile bool _registered;
+    internal SpecusConnectionContext Context => _context;
+    internal Func<Task>? BeforeExternalReleaseForTests { get; set; }
+    internal Action? ExternalReleasedForTests { get; set; }
 
     public NatClientSession(SpecusConnectionContext context,
         RemotePortServerManager remotePorts,
@@ -58,6 +65,8 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     public async Task HandleAsync(NatMessagePacket packet)
     {
+        if (_retired || _context.Lifetime.IsCancellationRequested
+            || _context.PairedControl?.Lifetime.IsCancellationRequested == true) return;
         switch (packet.NatMessageType)
         {
             case NatMessageType.Register:
@@ -204,13 +213,18 @@ internal sealed class NatClientSession : IAsyncDisposable
         Dictionary<string, object?> metadata, CancellationToken cancellationToken,
         bool discardResponseBody = false)
     {
-        var streamId = AllocateStreamId();
-        var stream = new HttpSpecusStream(_context, streamId, RemoveHttpStream, discardResponseBody);
-        if (!_httpStreams.TryAdd(streamId, stream))
+        HttpSpecusStream stream;
+        uint streamId;
+        await _namespaceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            await stream.DisposeAsync().ConfigureAwait(false);
-            throw new InvalidOperationException("HTTP stream id collision");
+            RequireActive();
+            streamId = AllocateStreamId();
+            stream = new HttpSpecusStream(_context, streamId, RemoveHttpStream, discardResponseBody);
+            if (!_httpStreams.TryAdd(streamId, stream))
+                throw new InvalidOperationException("HTTP stream id collision");
         }
+        finally { _namespaceGate.Release(); }
         try
         {
             await _context.Writer.WriteAsync(new NatMessagePacket
@@ -231,13 +245,18 @@ internal sealed class NatClientSession : IAsyncDisposable
     internal async Task<WebSocketSpecusStream> OpenWebSocketStreamAsync(
         Dictionary<string, object?> metadata, CancellationToken cancellationToken)
     {
-        var streamId = AllocateStreamId();
-        var stream = new WebSocketSpecusStream(_context, streamId, RemoveWebSocketStream);
-        if (!_webSocketStreams.TryAdd(streamId, stream))
+        WebSocketSpecusStream stream;
+        uint streamId;
+        await _namespaceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            await stream.DisposeAsync().ConfigureAwait(false);
-            throw new InvalidOperationException("WebSocket stream id collision");
+            RequireActive();
+            streamId = AllocateStreamId();
+            stream = new WebSocketSpecusStream(_context, streamId, RemoveWebSocketStream);
+            if (!_webSocketStreams.TryAdd(streamId, stream))
+                throw new InvalidOperationException("WebSocket stream id collision");
         }
+        finally { _namespaceGate.Release(); }
         try
         {
             await _context.Writer.WriteAsync(new NatMessagePacket
@@ -257,6 +276,34 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        TaskCompletionSource completion;
+        bool ownsRetirement;
+        await _namespaceGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            ownsRetirement = _retirement is null;
+            completion = _retirement ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _retired = true;
+            _registered = false;
+        }
+        finally { _namespaceGate.Release(); }
+        if (ownsRetirement)
+        {
+            try { await DisposeResourcesAsync().ConfigureAwait(false); completion.TrySetResult(); }
+            catch (Exception ex) { completion.TrySetException(ex); }
+        }
+        await completion.Task.ConfigureAwait(false);
+    }
+
+    private void RequireActive()
+    {
+        if (_retired || _context.Lifetime.IsCancellationRequested
+            || _context.PairedControl?.Lifetime.IsCancellationRequested == true)
+            throw new InvalidOperationException("data namespace is retired");
+    }
+
+    private async Task DisposeResourcesAsync()
+    {
         _context.WriteBackpressure.BackpressureChanged -= OnControlWriteBackpressureChanged;
 
         foreach (var (_, binding) in _bindings.ToArray())
@@ -274,6 +321,8 @@ internal sealed class NatClientSession : IAsyncDisposable
             }
         }
         _externalChannels.Clear();
+        foreach (var admission in _externalAdmissions.Values) admission.Dispose();
+        _externalAdmissions.Clear();
         foreach (var stream in _httpStreams.Values)
         {
             stream.OnLinkLost();
@@ -324,16 +373,12 @@ internal sealed class NatClientSession : IAsyncDisposable
             return;
         }
 
-        if (_bindings.ContainsKey(port.Value))
-        {
-            result["success"] = false;
-            result["reason"] = $"port {port.Value} already in use";
-            await WriteRegisterResultAsync(result).ConfigureAwait(false);
-            return;
-        }
-
+        await _namespaceGate.WaitAsync(_context.Lifetime).ConfigureAwait(false);
         try
         {
+            if (_retired || _context.Lifetime.IsCancellationRequested) return;
+            if (_bindings.ContainsKey(port.Value))
+                throw new InvalidOperationException($"port {port.Value} already in use");
             var binding = await _remotePorts.BindAsync(port.Value,
                     (socket, ct) => AcceptExternalAsync(port.Value, socket, ct),
                     _context.Lifetime)
@@ -355,6 +400,7 @@ internal sealed class NatClientSession : IAsyncDisposable
             result["reason"] = ex.Message;
             _logger.LogError(ex, "REGISTER failed on port {Port} [{Client}]", port.Value, _context.ClientName);
         }
+        finally { _namespaceGate.Release(); }
 
         await WriteRegisterResultAsync(result).ConfigureAwait(false);
     }
@@ -367,10 +413,14 @@ internal sealed class NatClientSession : IAsyncDisposable
             return;
         }
 
-        if (_bindings.TryRemove(port.Value, out var binding))
+        await _namespaceGate.WaitAsync(_context.Lifetime).ConfigureAwait(false);
+        try
         {
-            await binding.DisposeAsync().ConfigureAwait(false);
+            if (_retired) return;
+            if (_bindings.TryRemove(port.Value, out var binding))
+                await binding.DisposeAsync().ConfigureAwait(false);
         }
+        finally { _namespaceGate.Release(); }
     }
 
     private async Task ProcessDataAsync(NatMessagePacket packet)
@@ -457,44 +507,55 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     private async Task AcceptExternalAsync(int port, Socket socket, CancellationToken cancellationToken)
     {
-        if (!TryAcquireExternalChannel(port))
-        {
-            try { socket.Close(); } catch { /* already closed */ }
-            return;
-        }
-
         ExternalConnection? external = null;
+        ExternalAdmission? admission = null;
         try
         {
-            var streamId = AllocateStreamId();
-            external = new ExternalConnection(socket, streamId, port, _context.ClientName!,
-                _context, _traffic, _inspection, _options, _loggerFactory.CreateLogger<ExternalConnection>());
-            external.WriteBackpressure.BackpressureChanged += OnExternalWriteBackpressureChanged;
-
-            // Mirror Java's `syncExternalReadWithControl`: a fresh external inherits the
-            // control channel's read state so a paused control immediately throttles a new
-            // external too.
-            if (_context.WriteBackpressure.IsBackpressured)
+            await _namespaceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                external.ReadGate.Pause();
-            }
+                if (_retired || _context.Lifetime.IsCancellationRequested || !TryAcquireExternalChannel(port))
+                    return;
+                admission = new ExternalAdmission(this, port);
+                var streamId = AllocateStreamId();
+                external = new ExternalConnection(socket, streamId, port, _context.ClientName!,
+                    _context, _traffic, _inspection, _options, _loggerFactory.CreateLogger<ExternalConnection>());
+                external.WriteBackpressure.BackpressureChanged += OnExternalWriteBackpressureChanged;
 
-            _externalChannels[external.StreamId] = external;
+                // A fresh external inherits the data channel's current backpressure state.
+                if (_context.WriteBackpressure.IsBackpressured) external.ReadGate.Pause();
+
+                _externalChannels[external.StreamId] = external;
+                _externalAdmissions[external.StreamId] = admission;
+            }
+            finally { _namespaceGate.Release(); }
             UpdateControlReadForWritability();
             await external.RunAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
+            if (BeforeExternalReleaseForTests is { } releasing)
+                await releasing().ConfigureAwait(false);
             if (external is not null)
             {
                 external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
                 _externalChannels.TryRemove(external.StreamId, out _);
+                admission?.Dispose();
+                _externalAdmissions.TryRemove(external.StreamId, out _);
                 RememberClosedStream(external.StreamId);
                 _inspection.ReleaseTcpStream(external.ChannelId);
                 UpdateControlReadForWritability();
             }
-            ReleaseExternalChannel(port);
+            admission?.Dispose();
+            socket.Dispose();
+            ExternalReleasedForTests?.Invoke();
         }
+    }
+
+    private sealed class ExternalAdmission(NatClientSession owner, int port) : IDisposable
+    {
+        private NatClientSession? _owner = owner;
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseExternalChannel(port);
     }
 
     private void OnControlWriteBackpressureChanged(bool _)
@@ -680,6 +741,7 @@ internal sealed class NatClientSession : IAsyncDisposable
 
     private void RememberClosedStream(uint streamId)
     {
+        if (_retired) return;
         if (!_closedStreamIds.TryAdd(streamId, 0))
         {
             return;

@@ -53,6 +53,8 @@ public sealed class SpecusConnectionContext
     public long? LoginTimeMs { get; private set; }
 
     public long? ClientSessionId { get; private set; }
+    public long? ClientId { get; private set; }
+    internal SpecusConnectionContext? PairedControl { get; set; }
 
     public string? ConnectionRole { get; private set; }
 
@@ -76,11 +78,13 @@ public sealed class SpecusConnectionContext
     }
 
     public void OnLoginSuccess(string clientName, long loginTimeMs, long? clientSessionId = null,
-        string connectionRole = Specus.Protocol.ConnectionRole.Control, string? tenantId = null)
+        string connectionRole = Specus.Protocol.ConnectionRole.Control, string? tenantId = null,
+        long? clientId = null)
     {
         ClientName = clientName;
         LoginTimeMs = loginTimeMs;
         ClientSessionId = clientSessionId;
+        ClientId = clientId;
         ConnectionRole = connectionRole;
         TenantId = string.IsNullOrWhiteSpace(tenantId) ? "default" : tenantId.Trim();
     }

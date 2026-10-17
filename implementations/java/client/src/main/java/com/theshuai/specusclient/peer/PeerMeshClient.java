@@ -836,17 +836,6 @@ public class PeerMeshClient implements AutoCloseable {
         sessionsById.put(next.sessionId(), next);
     }
 
-    private PeerSession removeSession(long peerId) {
-        PeerSession removed = sessions.remove(peerId);
-        if (removed != null) {
-            sessionsById.remove(removed.sessionId(), removed);
-            // Delivered as an event rather than polled: asking the mesh whether a peer is still
-            // authorised would mean taking this lock from under the plane's own.
-            egress.revokeConsumer(peerId);
-        }
-        return removed;
-    }
-
     private boolean removeSession(long peerId, PeerSession expected) {
         boolean removed = sessions.remove(peerId, expected);
         if (removed) {
@@ -857,9 +846,28 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void closeSession(PeerControlMessage control) {
-        long peerId = peerId(control);
-        if (peerId > 0) {
-            removeSession(peerId);
+        Long sessionId = control.getSessionId();
+        if (sessionId == null || sessionId <= 0) {
+            return;
+        }
+        PeerSession indexed = sessionsById.get(sessionId);
+        if (indexed == null) {
+            return;
+        }
+        long peerId = indexed.peerId();
+        AtomicBoolean removed = new AtomicBoolean();
+        // The per-peer map operation orders release before a replacement can be installed.
+        // Endpoint fields are optional hints, not authority to close a different session.
+        sessions.computeIfPresent(peerId, (id, current) -> {
+            if (!sessionId.equals(current.sessionId())) {
+                return current;
+            }
+            sessionsById.remove(sessionId, current);
+            egress.revokeConsumer(peerId);
+            removed.set(true);
+            return null;
+        });
+        if (removed.get()) {
             PeerInfo peer = peerIndex.byId().get(peerId);
             if (peer != null && peer.online()) {
                 pathPrepareMillis.remove(peerId);

@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Specus.Server.Data\Specus.Server.Data.csproj" />
+    <ProjectReference Include="..\..\third_party\mysql-connector-net\Specus.MySql.Data.csproj" />
   </ItemGroup>
 
   <ItemGroup>

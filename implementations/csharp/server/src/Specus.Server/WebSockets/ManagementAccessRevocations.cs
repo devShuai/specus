@@ -32,11 +32,13 @@ public sealed class ManagementAccessRevocations : IHostedService
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public static Task RevokeTicketsAsync(SpecusDbContext db, string tenantId, string username,
-        CancellationToken cancellationToken) => db.WebSocketTickets
-        .Where(ticket => (ticket.Scope == WebSocketTicketService.ConnectionsScope
-            || ticket.Scope == WebSocketTicketService.ClientMessagesScope)
-            && ticket.TenantId == tenantId && ticket.Username == username)
-        .ExecuteDeleteAsync(cancellationToken);
+        CancellationToken cancellationToken) => db.Database.ExecuteSqlInterpolatedAsync($"""
+        DELETE FROM specus_websocket_ticket
+        WHERE (scope={WebSocketTicketService.ConnectionsScope} OR scope={WebSocketTicketService.ClientMessagesScope})
+          AND tenant_id={tenantId} AND username={username}
+        """, cancellationToken);
+    // An unaliased, parameterized single-table DELETE joins the existing transaction on all
+    // providers. Oracle EF's aliased DELETE is rejected by supported MariaDB 11.4 builds.
 
     public async Task CommittedAsync(string tenantId, string username, string reason)
     {

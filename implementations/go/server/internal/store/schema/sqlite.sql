@@ -792,3 +792,24 @@ CREATE TABLE IF NOT EXISTS http_access_audit (
 
 CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit (tenant_id, route_id, id);
 CREATE INDEX IF NOT EXISTS idx_http_access_audit_at ON http_access_audit (occurred_at);
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_audit (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  path_id INTEGER NOT NULL,
+  target_username TEXT NOT NULL,
+  credential_id INTEGER,
+  detail_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_owner_transfer_tenant_at ON client_owner_transfer_audit (tenant_id, occurred_at, id);
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_receipt (
+  id TEXT PRIMARY KEY,
+  node_id TEXT NOT NULL,
+  event_id INTEGER NOT NULL,
+  processed_at TEXT NOT NULL,
+  UNIQUE (node_id, event_id)
+);

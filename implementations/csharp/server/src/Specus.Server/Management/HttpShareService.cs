@@ -1036,8 +1036,8 @@ public sealed class HttpShareService
                 HttpShareProtocol.ActionRouteDeleted, route.Id, null,
                 new JsonObject { ["exposure"] = Exposure(route) }, cancellationToken).ConfigureAwait(false);
         }
-        await _db.HttpRouteMappings.Where(r => r.ClientId == clientId)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM http_route_mapping WHERE client_id={clientId}",
+            cancellationToken).ConfigureAwait(false);
         return await RevokeActiveOfRoutesAsync(routes.Select(static r => r.Id).ToList(), actor,
             HttpShareProtocol.ReasonClientDeleted, cancellationToken).ConfigureAwait(false);
     }

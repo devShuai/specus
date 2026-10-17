@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -56,12 +57,13 @@ type Conn struct {
 	reasonOnce sync.Once
 	reason     atomic.Value // string
 
-	clientName     atomic.Value // string
-	tenantID       atomic.Value // string
-	loginTime      atomic.Int64
-	recordID       atomic.Int64
-	sessionID      atomic.Int64
-	connectionRole atomic.Value // string
+	clientName       atomic.Value // string
+	tenantID         atomic.Value // string
+	loginTime        atomic.Int64
+	recordID         atomic.Int64
+	sessionID        atomic.Int64
+	runtimeReference atomic.Pointer[store.RuntimeClientReference]
+	connectionRole   atomic.Value // string
 	// httpRouteCapability is clientHttpRouteCapabilities.version of the login session.
 	httpRouteCapability atomic.Int32
 
@@ -133,6 +135,24 @@ func (c *Conn) ConnectionRecordID() int64 { return c.recordID.Load() }
 // ClientSessionID returns the authenticated HTTP login session id, or 0 before login.
 func (c *Conn) ClientSessionID() int64 { return c.sessionID.Load() }
 
+// BindRuntimeReference publishes the original login identity only once. Later SQL/name
+// lookups and an attempted second login cannot silently rebind an existing transport.
+func (c *Conn) BindRuntimeReference(ref store.RuntimeClientReference) bool {
+	if ref.SessionID <= 0 || ref.ClientID <= 0 || ref.TenantID == "" || ref.ClientName == "" || ref.TokenHash == "" {
+		return false
+	}
+	ref.ChannelID = c.channelID
+	return c.runtimeReference.CompareAndSwap(nil, &ref)
+}
+
+func (c *Conn) RuntimeReference() (store.RuntimeClientReference, bool) {
+	ref := c.runtimeReference.Load()
+	if ref == nil {
+		return store.RuntimeClientReference{}, false
+	}
+	return *ref, true
+}
+
 // ConnectionRole is the authenticated mandatory v2 role.
 func (c *Conn) ConnectionRole() string {
 	if value, ok := c.connectionRole.Load().(string); ok {
@@ -196,6 +216,72 @@ func (c *Conn) Close(reason string) {
 // writeFrame); a packet that cannot be encoded writes nothing and leaves it open.
 func (c *Conn) Send(packet protocol.Packet) error {
 	return c.send(nil, packet, store.ReasonIOError)
+}
+
+// SendContext bounds background delivery without an unjoined sending goroutine. Waiting for
+// writeMu is cancellable and does not touch the current writer's deadline. Once acquired, a
+// context cancellation interrupts the actual socket write; an incomplete frame closes the
+// failed transport with the ordinary IO_ERROR rule, never an ownership-revocation reason.
+func (c *Conn) SendContext(ctx context.Context, packet protocol.Packet) error {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return errors.New("bounded control send requires a deadline")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
+	if err != nil {
+		return err
+	}
+	tracked := c.WriteBackpressure.AddPending(len(frame))
+	defer c.WriteBackpressure.ReleasePending(tracked)
+	if !c.writeMu.TryLock() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.ctx.Done():
+				return c.ctx.Err()
+			case <-ticker.C:
+			}
+			if c.writeMu.TryLock() {
+				break
+			}
+		}
+	}
+	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.netConn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = c.netConn.SetWriteDeadline(time.Now()); close(interrupted) })
+	err = c.writeFrameLocked(frame, store.ReasonIOError)
+	if !stop() {
+		<-interrupted
+	}
+	// The callback is finished before resetting the deadline and releasing the write lock.
+	// Otherwise a late cancellation could poison a subsequent ordinary business write.
+	resetErr := c.netConn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if resetErr != nil {
+		c.Close(store.ReasonIOError)
+		return resetErr
+	}
+	return nil
 }
 
 // CommitAndSend runs commit and then writes packet while holding the write lock across both,

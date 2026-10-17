@@ -136,11 +136,19 @@ func EgressDomainTargets(version int, declared bool) bool {
 // a consumer must neither count on an egress that cannot take a flow nor send a name to one that
 // cannot resolve it. Both come from the same session so the two catalogue fields never disagree.
 func (s *Service) egressAnnouncementOf(ctx context.Context, tenantID string, egressClientID int64) (version int, domainTargets bool) {
+	version, domainTargets, _ = s.egressAnnouncementCurrent(ctx, tenantID, egressClientID)
+	return
+}
+
+func (s *Service) egressAnnouncementCurrent(ctx context.Context, tenantID string, egressClientID int64) (int, bool, error) {
 	online, err := s.db.GetOnlineClientSession(ctx, tenantID, egressClientID, auth.StatusNettyOnline)
-	if err != nil || online == nil || online.ClientEgressVersion < 1 {
-		return 0, false
+	if err != nil {
+		return 0, false, err
 	}
-	return online.ClientEgressVersion, online.ClientEgressDomainTargets
+	if online == nil || online.ClientEgressVersion < 1 {
+		return 0, false, nil
+	}
+	return online.ClientEgressVersion, online.ClientEgressDomainTargets, nil
 }
 
 // egressCapabilitiesFor reads what the client announced at login. A client with no online session,
@@ -529,8 +537,14 @@ func (s *Service) BuildEgressConfig(ctx context.Context, account store.ClientAcc
 	if err != nil {
 		return nil, err
 	}
-	if policy == nil || !policy.Enabled || !s.Enabled() ||
-		!s.egressEnabledFor(ctx, account.TenantID) {
+	switchEnabled := false
+	if policy != nil && policy.Enabled && s.Enabled() {
+		switchEnabled, err = s.egressEnabledCurrent(ctx, account.TenantID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !switchEnabled {
 		message.Enabled = &disabled
 		message.AllowedConsumerClientIDs = []int64{}
 		message.DestinationRules = []peeregress.DestinationRule{}
@@ -563,7 +577,14 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 	}
 	revision := egressRevisions.Add(1)
 	message := &ControlMessage{Type: ControlTypeEgressCatalog, Revision: &revision, Egresses: []EgressCatalogEntry{}}
-	if !s.Enabled() || !s.egressEnabledFor(ctx, account.TenantID) {
+	if !s.Enabled() {
+		return message, nil
+	}
+	switchEnabled, err := s.egressEnabledCurrent(ctx, account.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	if !switchEnabled {
 		return message, nil
 	}
 	policies, err := s.db.ListPeerMeshEgressPolicies(ctx, account.TenantID, true)
@@ -575,11 +596,17 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 			continue
 		}
 		egress, err := s.findTenantClient(ctx, account.TenantID, policy.EgressClientID)
-		if err != nil || egress == nil {
+		if errors.Is(err, store.ErrNotFound) || (err == nil && egress == nil) {
 			continue
 		}
+		if err != nil {
+			return nil, err
+		}
 		allowed, err := s.CanPeer(ctx, account, *egress)
-		if err != nil || !allowed {
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
 			continue
 		}
 		consumers, err := s.allowedEgressConsumerIDs(ctx, *egress, policy)
@@ -590,8 +617,14 @@ func (s *Service) BuildEgressCatalog(ctx context.Context, account store.ClientAc
 			continue
 		}
 		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, policy.EgressClientID)
-		online := err == nil && device != nil && device.Enabled
-		egressVersion, domainTargets := s.egressAnnouncementOf(ctx, account.TenantID, policy.EgressClientID)
+		if err != nil {
+			return nil, err
+		}
+		online := device != nil && device.Enabled
+		egressVersion, domainTargets, err := s.egressAnnouncementCurrent(ctx, account.TenantID, policy.EgressClientID)
+		if err != nil {
+			return nil, err
+		}
 		message.Egresses = append(message.Egresses, EgressCatalogEntry{
 			ClientID:            policy.EgressClientID,
 			ClientName:          policy.EgressClientName,
@@ -642,7 +675,10 @@ func (s *Service) allowedEgressConsumerIDs(ctx context.Context, egress store.Cli
 			continue
 		}
 		ok, err := s.CanPeer(ctx, candidate, egress)
-		if err != nil || !ok {
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
 			continue
 		}
 		seen[candidate.ID] = struct{}{}
@@ -1023,8 +1059,13 @@ type EgressSwitchMutation struct {
 
 // egressEnabledFor reports the tenant switch. Off by default: egress is opt-in for the tenant too.
 func (s *Service) egressEnabledFor(ctx context.Context, tenantID string) bool {
+	enabled, _ := s.egressEnabledCurrent(ctx, tenantID)
+	return enabled
+}
+
+func (s *Service) egressEnabledCurrent(ctx context.Context, tenantID string) (bool, error) {
 	row, err := s.db.GetPeerMeshEgressSwitch(ctx, tenantID)
-	return err == nil && row != nil && row.Enabled
+	return row != nil && row.Enabled, err
 }
 
 // EgressSwitchStatus returns the tenant-wide switch.

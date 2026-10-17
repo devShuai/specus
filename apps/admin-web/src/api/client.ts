@@ -27,6 +27,10 @@ import type {
   HttpTrafficSearchField,
   ManagementUser,
   ManagementUserMutation,
+  OwnedResourceCounts,
+  OwnerTransferPreview,
+  OwnerTransferRequest,
+  OwnerTransferResult,
   NatControlResult,
   OidcConfig,
   Overview,
@@ -153,7 +157,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 export class ApiError extends Error {
   readonly code?: string;
 
-  constructor(message: string, readonly status = 0, code?: string) {
+  constructor(message: string, readonly status = 0, code?: string, readonly ownedResources?: OwnedResourceCounts) {
     super(message);
     this.code = code;
   }
@@ -182,14 +186,17 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
     // An error page from a proxy or an older server is not JSON; keep the status either way.
-    let body: { error?: string; code?: string; message?: string } | null = null;
+    let body: { error?: string; code?: string; message?: string; clients?: unknown; credentials?: unknown } | null = null;
     try {
       body = text ? JSON.parse(text) : null;
     } catch {
       body = null;
     }
+    const counts = Number.isSafeInteger(body?.clients) && Number(body?.clients) >= 0
+      && Number.isSafeInteger(body?.credentials) && Number(body?.credentials) >= 0
+      ? { clients: Number(body?.clients), credentials: Number(body?.credentials) } : undefined;
     throw new ApiError(body?.error || shareManagementMessage(body?.code) || body?.message || response.statusText,
-      response.status, body?.code);
+      response.status, body?.code, counts);
   }
   return (text ? JSON.parse(text) : null) as T;
 }
@@ -373,6 +380,15 @@ export interface PeerMeshSessionQuery {
   openOnly?: boolean;
 }
 
+// A write may already have committed when its response stalls. Bound the wait, but never retry:
+// OwnerTransferController treats an aborted POST as unknown and requires a fresh read/confirmation.
+async function ownerTransferRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 30_000);
+  try { return await request<T>(path, { ...init, signal: controller.signal }); }
+  finally { clearTimeout(deadline); }
+}
+
 export const adminApi = {
   createWebSocketTicket: (endpoint: "connections" | "client-messages") =>
     request<WebSocketTicket>("/ws-tickets", {
@@ -388,6 +404,12 @@ export const adminApi = {
   updateUser: (username: string, body: ManagementUserMutation) =>
     request<ManagementUser>(`/users/${encodeURIComponent(username)}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteUser: (username: string) => request<null>(`/users/${encodeURIComponent(username)}`, { method: "DELETE" }),
+  previewClientOwnerTransfer: (id: number) => ownerTransferRequest<OwnerTransferPreview>(`/clients/${id}/owner-transfer`, { cache: "no-store" }),
+  previewCredentialOwnerTransfer: (id: number) => ownerTransferRequest<OwnerTransferPreview>(`/client-credentials/${id}/owner-transfer`, { cache: "no-store" }),
+  transferClientOwner: (id: number, body: OwnerTransferRequest) =>
+    ownerTransferRequest<OwnerTransferResult>(`/clients/${id}/owner-transfer`, { method: "POST", body: JSON.stringify(body) }),
+  transferCredentialOwner: (id: number, body: OwnerTransferRequest) =>
+    ownerTransferRequest<OwnerTransferResult>(`/client-credentials/${id}/owner-transfer`, { method: "POST", body: JSON.stringify(body) }),
 
   // Service workbench: the caller's own favourites and recent opens. Every write answers the whole
   // document. Recording an open is not here: it goes through recordWorkbenchOpen (keepalive).

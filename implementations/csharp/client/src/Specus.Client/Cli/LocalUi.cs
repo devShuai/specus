@@ -56,8 +56,8 @@ internal sealed class LocalUi(ClientCliOptions options, string configPath)
             if (++count > 256) throw new Failure(409, "本地状态文件过多，请检查状态目录");
             try
             {
-                CliState.CheckPrivate(path); if (new FileInfo(path).Length > 1024 * 1024) continue;
-                var data = JsonNode.Parse(File.ReadAllText(path))!;
+                using var snapshot = CliState.OpenSnapshot(path); if (snapshot.Length > 1024 * 1024) continue;
+                var data = JsonNode.Parse(snapshot)!;
                 int pid = data["pid"]!.GetValue<int>(); long age = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data["updatedAtUnixMs"]!.GetValue<long>();
                 if (pid == Environment.ProcessId || age is < 0 or > 5000 || data["schemaVersion"]!.GetValue<int>() != 1 || !string.Equals(data["configPath"]!.GetValue<string>(), configPath,
                     OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)) continue;

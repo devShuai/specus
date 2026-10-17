@@ -1,0 +1,347 @@
+// Copyright © 2004, 2026, Oracle and/or its affiliates.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License, version 2.0, as
+// published by the Free Software Foundation.
+//
+// This program is designed to work with certain software (including
+// but not limited to OpenSSL) that is licensed under separate terms, as
+// designated in a particular file or component or in included license
+// documentation. The authors of MySQL hereby grant you an additional
+// permission to link the program and your derivative works with the
+// separately licensed software that they have either included with
+// the program or referenced in the documentation.
+//
+// Without limiting anything contained in the foregoing, this file,
+// which is part of MySQL Connector/NET, is also subject to the
+// Universal FOSS Exception, version 1.0, a copy of which can be found at
+// http://oss.oracle.com/licenses/universal-foss-exception.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU General Public License, version 2.0, for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace MySql.Data.MySqlClient
+{
+  internal class ProcedureCacheEntry
+  {
+    public MySqlSchemaCollection procedure;
+    public MySqlSchemaCollection parameters;
+  }
+
+  internal class ProcedureCache
+  {
+    private readonly Dictionary<int, ProcedureCacheEntry> _procHash;
+    private readonly Queue<int> _hashQueue;
+    private readonly int _maxSize;
+
+    public ProcedureCache(int size)
+    {
+      _maxSize = size;
+      _hashQueue = new Queue<int>(_maxSize);
+      _procHash = new Dictionary<int, ProcedureCacheEntry>(_maxSize);
+    }
+
+    /// <summary>
+    /// Retrieves a ProcedureCacheEntry for the specified stored procedure, using the cache if available.
+    /// </summary>
+    /// <param name="conn">The MySqlConnection to use for querying if not in cache.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    /// <param name="cacheKey">The key for cache lookup.</param>
+    /// <returns>The ProcedureCacheEntry for the stored procedure.</returns>
+    public ProcedureCacheEntry GetProcedure(MySqlConnection conn, string spName, string cacheKey)
+    {
+      ProcedureCacheEntry proc = null;
+
+      if (cacheKey != null)
+      {
+        int hash = cacheKey.GetHashCode();
+
+        lock (_procHash)
+        {
+          _procHash.TryGetValue(hash, out proc);
+        }
+      }
+      if (proc == null)
+      {
+        proc = AddNew(conn, spName);
+        conn.PerfMonitor.AddHardProcedureQuery();
+        if (conn.Settings.Logging)
+          MySqlTrace.LogInformation(conn.ServerThread,
+            String.Format(Resources.HardProcQuery, spName));
+      }
+      else
+      {
+        conn.PerfMonitor.AddSoftProcedureQuery();
+        if (conn.Settings.Logging)
+          MySqlTrace.LogInformation(conn.ServerThread,
+            String.Format(Resources.SoftProcQuery, spName));
+      }
+      return proc;
+    }
+
+    /// <summary>
+    /// Asynchronously retrieves a ProcedureCacheEntry for the specified stored procedure, using the cache if available.
+    /// </summary>
+    /// <param name="conn">The MySqlConnection to use for querying if not in cache.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    /// <param name="cacheKey">The key for cache lookup.</param>
+    /// <returns>A task that resolves to the ProcedureCacheEntry for the stored procedure.</returns>
+    public async Task<ProcedureCacheEntry> GetProcedureAsync(MySqlConnection conn, string spName, string cacheKey)
+    {
+      ProcedureCacheEntry proc = null;
+
+      if (cacheKey != null)
+      {
+        int hash = cacheKey.GetHashCode();
+
+        lock (_procHash)
+        {
+          _procHash.TryGetValue(hash, out proc);
+        }
+      }
+      if (proc == null)
+      {
+        proc = await AddNewAsync(conn, spName).ConfigureAwait(false);
+        conn.PerfMonitor.AddHardProcedureQuery();
+        if (conn.Settings.Logging)
+          MySqlTrace.LogInformation(conn.ServerThread,
+            String.Format(Resources.HardProcQuery, spName));
+      }
+      else
+      {
+        conn.PerfMonitor.AddSoftProcedureQuery();
+        if (conn.Settings.Logging)
+          MySqlTrace.LogInformation(conn.ServerThread,
+            String.Format(Resources.SoftProcQuery, spName));
+      }
+      return proc;
+    }
+
+    internal string GetCacheKey(string spName, ProcedureCacheEntry proc)
+    {
+      string retValue = String.Empty;
+      StringBuilder key = new StringBuilder(spName);
+      key.Append("(");
+      string delimiter = "";
+      if (proc.parameters != null)
+      {
+        foreach (MySqlSchemaRow row in proc.parameters.Rows)
+        {
+          if (row["ORDINAL_POSITION"].Equals(0))
+            retValue = "?=";
+          else
+          {
+            key.AppendFormat(CultureInfo.InvariantCulture, "{0}?", delimiter);
+            delimiter = ",";
+          }
+        }
+      }
+      key.Append(")");
+      return retValue + key.ToString();
+    }
+
+    /// <summary>
+    /// Adds the ProcedureCacheEntry to the cache if the cache is enabled and the entry is not already present.
+    /// Handles trimming the cache if it exceeds the maximum size.
+    /// </summary>
+    /// <param name="procData">The ProcedureCacheEntry to add.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    private void AddToCache(ProcedureCacheEntry procData, string spName)
+    {
+      if (_maxSize <= 0) return;
+
+      string cacheKey = GetCacheKey(spName, procData);
+      int hash = cacheKey.GetHashCode();
+      lock (_procHash)
+      {
+        if (_procHash.Keys.Count >= _maxSize)
+          TrimHash();
+        if (!_procHash.ContainsKey(hash))
+        {
+          _procHash[hash] = procData;
+          _hashQueue.Enqueue(hash);
+        }
+      }
+    }
+
+    /// <summary>
+    /// Adds a new ProcedureCacheEntry to the cache for the specified stored procedure.
+    /// </summary>
+    /// <param name="connection">The MySqlConnection to use for retrieving procedure data.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    /// <returns>The ProcedureCacheEntry for the stored procedure.</returns>
+    private ProcedureCacheEntry AddNew(MySqlConnection connection, string spName)
+    {
+      ProcedureCacheEntry procData = GetProcData(connection, spName);
+      AddToCache(procData, spName);
+      return procData;
+    }
+
+    /// <summary>
+    /// Asynchronously adds a new ProcedureCacheEntry to the cache for the specified stored procedure.
+    /// </summary>
+    /// <param name="connection">The MySqlConnection to use for retrieving procedure data.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    /// <returns>A task that resolves to the ProcedureCacheEntry for the stored procedure.</returns>
+    private async Task<ProcedureCacheEntry> AddNewAsync(MySqlConnection connection, string spName)
+    {
+      ProcedureCacheEntry procData = await GetProcDataAsync(connection, spName).ConfigureAwait(false);
+      AddToCache(procData, spName);
+      return procData;
+    }
+
+    private void TrimHash()
+    {
+      int oldestHash = _hashQueue.Dequeue();
+      _procHash.Remove(oldestHash);
+    }
+
+    /// <summary>
+    /// Retrieves procedure data including parameters for the specified stored procedure.
+    /// </summary>
+    /// <param name="connection">The MySqlConnection to query schema information.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    /// <returns>The ProcedureCacheEntry containing procedure and parameter information.</returns>
+    private static ProcedureCacheEntry GetProcData(MySqlConnection connection, string spName)
+    {
+      SplitSchemaAndEntity(spName, out string schema, out string entity);
+
+      string[] restrictions = new string[4];
+      restrictions[1] = string.IsNullOrEmpty(schema) ? connection.CurrentDatabase() : Utils.UnquoteString(schema);
+      restrictions[2] = Utils.UnquoteString(entity);
+      MySqlSchemaCollection proc = connection.GetSchemaCollection("procedures", restrictions);
+      if (proc.Rows.Count > 1)
+        throw new MySqlException(Resources.ProcAndFuncSameName);
+      if (proc.Rows.Count == 0)
+      {
+        string msg = string.Format(Resources.InvalidProcName, entity, schema) + " " +
+        string.Format(Resources.ExecuteProcedureUnauthorized, connection.Settings.UserID, connection.Settings.Server);
+        throw new MySqlException(msg);
+      }
+
+      ProcedureCacheEntry entry = new ProcedureCacheEntry();
+      entry.procedure = proc;
+
+      // we don't use GetSchema here because that would cause another
+      // query of procedures and we don't need that since we already
+      // know the procedure we care about.
+      ISSchemaProvider isp = new ISSchemaProvider(connection);
+      string[] rest = isp.CleanRestrictions(restrictions);
+      MySqlSchemaCollection parameters = isp.GetProcedureParameters(rest, proc);
+      entry.parameters = parameters;
+
+      return entry;
+    }
+
+    /// <summary>
+    /// Asynchronously retrieves procedure data including parameters for the specified stored procedure.
+    /// </summary>
+    /// <param name="connection">The MySqlConnection to query schema information.</param>
+    /// <param name="spName">The name of the stored procedure.</param>
+    /// <returns>A task that resolves to the ProcedureCacheEntry containing procedure and parameter information.</returns>
+    private static async Task<ProcedureCacheEntry> GetProcDataAsync(MySqlConnection connection, string spName)
+    {
+      SplitSchemaAndEntity(spName, out string schema, out string entity);
+
+      string[] restrictions = new string[4];
+      restrictions[1] = string.IsNullOrEmpty(schema) ? connection.CurrentDatabase() : Utils.UnquoteString(schema);
+      restrictions[2] = Utils.UnquoteString(entity);
+      MySqlSchemaCollection proc = connection.GetSchemaCollection("procedures", restrictions);
+      if (proc.Rows.Count > 1)
+        throw new MySqlException(Resources.ProcAndFuncSameName);
+      if (proc.Rows.Count == 0)
+      {
+        string msg = string.Format(Resources.InvalidProcName, entity, schema) + " " +
+        string.Format(Resources.ExecuteProcedureUnauthorized, connection.Settings.UserID, connection.Settings.Server);
+        throw new MySqlException(msg);
+      }
+
+      ProcedureCacheEntry entry = new ProcedureCacheEntry();
+      entry.procedure = proc;
+
+      // we don't use GetSchema here because that would cause another
+      // query of procedures and we don't need that since we already
+      // know the procedure we care about.
+      ISSchemaProvider isp = new ISSchemaProvider(connection);
+      string[] rest = isp.CleanRestrictions(restrictions);
+      MySqlSchemaCollection parameters = await isp.GetProcedureParametersAsync(rest, proc).ConfigureAwait(false);
+      entry.parameters = parameters;
+
+      return entry;
+    }
+
+    /// <summary>
+    /// Splits the schema and the entity from a syntactically correct "spName"; 
+    /// if there's no schema, then schema will be an empty string.
+    /// </summary>
+    /// <param name="spName">string to inspect.</param>
+    /// <param name="schema">The schema.</param>
+    /// <param name="entity">The entity.</param>
+    private static void SplitSchemaAndEntity(string spName, out string schema, out string entity)
+    {
+      int dotIndex = ExtractDotIndex(spName);
+
+      if (dotIndex != -1)
+      {
+        schema = spName.Substring(0, dotIndex);
+        entity = spName.Substring(dotIndex + 1);
+      }
+      else
+      {
+        schema = string.Empty;
+        entity = spName;
+      }
+    }
+
+    /// <summary>
+    /// Obtains the dot index that separates the schema from the entity if there's one; 
+    /// otherwise, returns -1. It expects a syntactically correct "spName".
+    /// </summary>
+    /// <param name="spName">string to inspect.</param>
+    /// <param name="dotIndex">Value of the dot index.</param>
+    /// <returns>The dot index.</returns>
+    private static int ExtractDotIndex(string spName, int dotIndex = -1)
+    {
+      int backticks, _dotIndexTemp;
+      _dotIndexTemp = spName.IndexOf('.'); // looks for a '.' in the string passed as argument
+      string subString;
+
+      if (_dotIndexTemp != -1)
+      {
+        subString = spName.Substring(_dotIndexTemp + 1);  // gets a substring from the found '.' to the end of the string
+        backticks = subString.Count(c => c == '`'); // counts backticks in the substring
+
+        // if the count of backticks in the substring is an odd number,
+        // that means that this '.' is part of the schema or entity and will continue looking;
+        // otherwise, returns the index.
+        if (backticks % 2 == 0)
+          dotIndex = dotIndex == -1 ? _dotIndexTemp : dotIndex + _dotIndexTemp;
+        else
+          dotIndex = ExtractDotIndex(subString, _dotIndexTemp + 1);
+      }
+      else if (_dotIndexTemp == -1 && dotIndex != -1)
+        dotIndex = -1;
+
+      return dotIndex;
+    }
+
+    internal void Clear()
+    {
+      _procHash.Clear();
+      _hashQueue.Clear();
+    }
+  }
+}

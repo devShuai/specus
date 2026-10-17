@@ -12,7 +12,7 @@ import org.springframework.data.repository.query.Param;
 import java.util.List;
 
 public interface ConnectionRecordRepository extends JpaRepository<ConnectionRecord, Long>,
-        JpaSpecificationExecutor<ConnectionRecord> {
+        JpaSpecificationExecutor<ConnectionRecord>, ConnectionRecordRepositoryCustom {
     List<ConnectionRecord> findAllByOrderByIdDesc(Pageable pageable);
 
     List<ConnectionRecord> findByClientIdOrderByIdDesc(Long clientId, Pageable pageable);

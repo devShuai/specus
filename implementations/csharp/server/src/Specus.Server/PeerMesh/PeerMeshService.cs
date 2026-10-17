@@ -20,7 +20,7 @@ using Specus.Server.Sessions;
 
 namespace Specus.Server.PeerMesh;
 
-public sealed partial class PeerMeshService
+public sealed partial class PeerMeshService : IOwnerTransferReconciler
 {
     public const string PathDirect = "DIRECT";
     public const string PathRelay = "RELAY";
@@ -46,8 +46,8 @@ public sealed partial class PeerMeshService
     internal const string TypeEgressReport = "egress-report";
     internal const int PeerServiceDiscoveryVersion = 2;
     private static readonly TimeSpan RelayAuthorizationCacheTtl = TimeSpan.FromSeconds(30);
-    private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations = new();
-    private readonly ConcurrentDictionary<long, long> _pendingRelayBytes = new();
+    private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations;
+    private readonly ConcurrentDictionary<long, long> _pendingRelayBytes;
 
     private readonly SpecusDbContext _db;
     private readonly SessionRegistry _sessions;
@@ -55,10 +55,13 @@ public sealed partial class PeerMeshService
     private readonly TurnCredentialService _turnCredentials;
     private readonly ILogger<PeerMeshService> _logger;
     private readonly PeerMeshServiceState _state;
+    private readonly AuthOptions _managementAuth;
+    private readonly ClientAuthSessionStore? _clientAuthSessions;
 
     public PeerMeshService(SpecusDbContext db, SessionRegistry sessions, IOptions<PeerMeshOptions> options,
         ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null,
-        PeerMeshServiceState? state = null)
+        PeerMeshServiceState? state = null, IOptions<AuthOptions>? managementAuth = null,
+        ClientAuthSessionStore? clientAuthSessions = null)
     {
         _db = db;
         _sessions = sessions;
@@ -67,6 +70,10 @@ public sealed partial class PeerMeshService
         _logger = logger;
         state ??= new PeerMeshServiceState();
         _state = state;
+        _relayAuthorizations = state.RelayAuthorizations;
+        _pendingRelayBytes = state.PendingRelayBytes;
+        _managementAuth = managementAuth?.Value ?? new AuthOptions();
+        _clientAuthSessions = clientAuthSessions;
         _serviceCatalogs = state.ServiceCatalogs;
         _serviceCatalogRevisions = state.ServiceCatalogRevisions;
         _serviceReportRevisions = state.ServiceReportRevisions;
@@ -121,12 +128,31 @@ public sealed partial class PeerMeshService
         long fromClientId, long toClientId, long bytes, bool account,
 		CancellationToken cancellationToken)
 	{
+        // A concurrent ownership replay can invalidate the cache without revoking
+        // this explicitly authorized session. Re-read SQL instead of dropping its
+        // first business frame. Never reuse the old snapshot or account bytes twice;
+        // continuous invalidation remains bounded and fails closed.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = await AuthorizeRelaySnapshotAsync(header, fromClientId, toClientId,
+                bytes, account, cancellationToken).ConfigureAwait(false);
+            if (result is { } allowed) return allowed;
+        }
+        return false;
+    }
+
+    private async Task<bool?> AuthorizeRelaySnapshotAsync(PeerDataFrameHeader header,
+        long fromClientId, long toClientId, long bytes, bool account,
+        CancellationToken cancellationToken)
+	{
         var now = DateTimeOffset.UtcNow;
+        var generation = Volatile.Read(ref _state.RelayGeneration);
         if (AuthorizeRelayFrameCached(header, fromClientId, toClientId, bytes, now, account))
         {
             return true;
         }
-        var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(s => s.Id == header.SessionId,
+        var session = await _db.PeerMeshSessions.AsNoTracking().FirstOrDefaultAsync(s => s.Id == header.SessionId,
                 cancellationToken)
             .ConfigureAwait(false);
         if (session is null)
@@ -135,7 +161,8 @@ public sealed partial class PeerMeshService
         }
         if (CloseIfExpired(session, now))
         {
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            var stamp = Specus.Server.Data.Conversion.IsoDateTimeOffsetConverter.Format(now);
+            await _db.Database.ExecuteSqlInterpolatedAsync($"UPDATE peer_mesh_session SET status={StatusClosed},closed_at=COALESCE(closed_at,{stamp}),updated_at={stamp} WHERE id={session.Id} AND tenant_id={session.TenantId} AND expires_at<={stamp} AND status<>{StatusClosed}", cancellationToken).ConfigureAwait(false);
             return false;
         }
         if (string.Equals(session.Status, StatusClosed, StringComparison.Ordinal))
@@ -157,13 +184,16 @@ public sealed partial class PeerMeshService
         // report adds no security, only a race.
         if (!string.Equals(session.Status, StatusActive, StringComparison.Ordinal))
         {
+            var stamp = Specus.Server.Data.Conversion.IsoDateTimeOffsetConverter.Format(now);
+            var activated = await _db.Database.ExecuteSqlInterpolatedAsync($"UPDATE peer_mesh_session SET status={StatusActive},path_type={PathRelay},updated_at={stamp},last_keepalive_at={stamp} WHERE id={session.Id} AND tenant_id={session.TenantId} AND source_client_id={session.SourceClientId} AND target_client_id={session.TargetClientId} AND status={StatusNegotiating} AND expires_at>{stamp}", cancellationToken).ConfigureAwait(false);
+            if (activated != 1) return false;
             session.Status = StatusActive;
             session.PathType = PathRelay;
             session.UpdatedAt = now;
             session.LastKeepaliveAt = now;
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
-        CacheRelayAuthorization(session, now);
+        if (generation != Volatile.Read(ref _state.RelayGeneration)) return null;
+        CacheRelayAuthorization(session, now, generation);
 		if (account)
 		{
 			AddPendingRelayBytes(header.SessionId, bytes);
@@ -179,7 +209,7 @@ public sealed partial class PeerMeshService
 		{
 			return false;
 		}
-		var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(item => item.Id == sessionId, cancellationToken)
+		var session = await _db.PeerMeshSessions.AsNoTracking().FirstOrDefaultAsync(item => item.Id == sessionId, cancellationToken)
 			.ConfigureAwait(false);
 		if (session is null)
 		{
@@ -188,7 +218,9 @@ public sealed partial class PeerMeshService
 		var now = DateTimeOffset.UtcNow;
 		if (CloseIfExpired(session, now))
 		{
-			await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+			RemoveRelaySession(sessionId);
+            var stamp = Specus.Server.Data.Conversion.IsoDateTimeOffsetConverter.Format(now);
+            await _db.Database.ExecuteSqlInterpolatedAsync($"UPDATE peer_mesh_session SET status={StatusClosed},closed_at=COALESCE(closed_at,{stamp}),updated_at={stamp} WHERE id={session.Id} AND tenant_id={session.TenantId} AND expires_at<={stamp} AND status<>{StatusClosed}", cancellationToken).ConfigureAwait(false);
 			return false;
 		}
 		var forward = fromClientId == session.SourceClientId && toClientId == session.TargetClientId;
@@ -227,23 +259,11 @@ public sealed partial class PeerMeshService
 
     public async Task<PeerMeshConfig> BuildRuntimeConfigAsync(ClientAccount account, CancellationToken cancellationToken)
     {
-        PeerMeshDevice? device = null;
-        if (Enabled)
-        {
-            device = await _db.PeerMeshDevices
-                .FirstOrDefaultAsync(d => d.TenantId == account.TenantId && d.ClientId == account.Id,
-                    cancellationToken)
-                .ConfigureAwait(false)
-                ?? await CreateDeviceAsync(account, cancellationToken).ConfigureAwait(false);
-        }
-        var clientProtocolVersion = await _db.ClientSessions.AsNoTracking()
-            .Where(session => session.TenantId == account.TenantId && session.ClientId == account.Id
-                && session.Status == ClientAccountService.StatusNettyOnline)
-            .Select(session => (int?)session.PeerServiceDiscoveryVersion)
-            .MaxAsync(cancellationToken)
-            .ConfigureAwait(false) ?? 0;
-        return await BuildConfigAsync(account, device, null, clientProtocolVersion, cancellationToken)
-            .ConfigureAwait(false);
+        var captured = CapturePeerReceiver(account);
+        var current = captured is null ? null : await ReadPeerReceiverAsync(captured, cancellationToken).ConfigureAwait(false);
+        var canonical = current?.Account ?? await _db.ClientAccounts.AsNoTracking().SingleOrDefaultAsync(a => a.Id == account.Id, cancellationToken).ConfigureAwait(false);
+        if (canonical is null || canonical.TenantId != account.TenantId) throw new ArgumentException("client not found");
+        return await BuildRuntimeConfigForReceiverAsync(canonical, current?.Session.PeerServiceDiscoveryVersion ?? 0, cancellationToken).ConfigureAwait(false);
     }
 
     public PublicStunConfig PublicStunConfig(string? requestHost)
@@ -354,13 +374,14 @@ public sealed partial class PeerMeshService
         id, $"stun:{BracketIpv6(host)}:{port}", host, port, addressSlot, portSlot);
 
     public async Task HandleSignalAsync(MessageRequestPacket request, string sourceClientName,
-        CancellationToken cancellationToken, long? publisherSessionId = null)
+        CancellationToken cancellationToken, long? publisherSessionId = null,
+        SpecusConnectionContext? publisherTransport = null)
     {
         if (!Enabled)
         {
             throw new InvalidOperationException("peer mesh is disabled");
         }
-        var source = await _db.ClientAccounts.FirstOrDefaultAsync(c => c.ClientName == sourceClientName,
+        var source = await _db.ClientAccounts.AsNoTracking().FirstOrDefaultAsync(c => c.ClientName == sourceClientName,
                 cancellationToken)
             .ConfigureAwait(false)
             ?? throw new ArgumentException($"source client not found: {sourceClientName}");
@@ -376,14 +397,14 @@ public sealed partial class PeerMeshService
         if (string.Equals(signal.Type, TypeServiceReport, StringComparison.Ordinal))
         {
             ValidateServiceReportEnvelope(request);
-            await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken)
+            await HandleServiceReportAsync(source, signal, publisherSessionId, cancellationToken, publisherTransport)
                 .ConfigureAwait(false);
             return;
         }
         if (string.Equals(signal.Type, TypeEgressReport, StringComparison.Ordinal))
         {
             ValidateEgressReportEnvelope(request);
-            await HandleEgressReportAsync(source, signal, publisherSessionId, cancellationToken)
+            await HandleEgressReportAsync(source, signal, publisherSessionId, cancellationToken, publisherTransport)
                 .ConfigureAwait(false);
             return;
         }
@@ -392,23 +413,22 @@ public sealed partial class PeerMeshService
         switch (signal.Type)
         {
             case TypePathReport:
-                await ReportPathAsync(source, signal, cancellationToken).ConfigureAwait(false);
-                return;
             case TypeTrafficReport:
-                await ReportTrafficAsync(source, signal, cancellationToken).ConfigureAwait(false);
-                return;
             case TypeDeviceReport:
-                await ReportDeviceAsync(source, signal, cancellationToken).ConfigureAwait(false);
+                await ApplyAuthorizedPeerReportAsync(source, signal, publisherSessionId, publisherTransport, cancellationToken).ConfigureAwait(false);
                 return;
             case TypeClose:
-                await CloseSessionFromClientAsync(source, signal, cancellationToken).ConfigureAwait(false);
+                await ApplyAuthorizedPeerReportAsync(source, signal, publisherSessionId, publisherTransport, cancellationToken).ConfigureAwait(false);
                 if (string.IsNullOrWhiteSpace(request.ToClientName))
                 {
                     return;
                 }
                 break;
             case TypeServiceCatalog:
-                throw new ArgumentException("service-catalog is server-only");
+            case TypeSessionGrant:
+            case TypeConfig:
+            case TypeRoster:
+                throw new ArgumentException($"{signal.Type} is server-only");
             case TypeEgressConfig:
             case TypeEgressCatalog:
                 throw new ArgumentException($"{signal.Type} is server-only");
@@ -418,7 +438,14 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("toClientName is required");
         }
-        var target = await _db.ClientAccounts.FirstOrDefaultAsync(c => c.ClientName == request.ToClientName,
+        var sourceBinding = CapturePeerReceiver(source);
+        if (sourceBinding is null || (publisherSessionId is not null && sourceBinding.SessionId != publisherSessionId)
+            || (publisherTransport is not null && !ReferenceEquals(sourceBinding.Transport, publisherTransport)))
+            throw new PeerSignalUndeliverableException("source peer connection is not current");
+        var currentSource = await ReadPeerReceiverAsync(sourceBinding, cancellationToken).ConfigureAwait(false)
+            ?? throw new PeerSignalUndeliverableException("source peer session is not current");
+        source = currentSource.Account;
+        var target = await _db.ClientAccounts.AsNoTracking().FirstOrDefaultAsync(c => c.ClientName == request.ToClientName,
                 cancellationToken)
             .ConfigureAwait(false)
             ?? throw new PeerSignalUndeliverableException($"target client not found: {request.ToClientName}");
@@ -426,45 +453,43 @@ public sealed partial class PeerMeshService
         {
             throw new PeerSignalUndeliverableException("peer access denied");
         }
-        var targetSession = _sessions.Find(target.ClientName)
+        var targetBinding = CapturePeerReceiver(target)
             ?? throw new PeerSignalUndeliverableException($"target peer is offline: {target.ClientName}");
-        await EnrichTargetAsync(signal, target, cancellationToken).ConfigureAwait(false);
-        if (signal.SessionId is null && (signal.Type == TypeCandidates || signal.Type == "offer"))
-        {
-            var grant = await CreateSessionAsync(source, target, PathDirect, cancellationToken).ConfigureAwait(false);
-            signal.SessionId = grant.Session.Id;
-            signal.Token = grant.Token;
-            signal.ExpiresAt = grant.Session.ExpiresAt;
-            await SendSessionGrantAsync(source, target, grant, cancellationToken).ConfigureAwait(false);
-        }
+        PeerSessionGrant? created = null;
         try
         {
-            await SendSignalAsync(targetSession, source.ClientName, target.ClientName, signal, cancellationToken)
-                .ConfigureAwait(false);
+            if (signal.SessionId is null && (signal.Type == TypeCandidates || signal.Type == "offer"))
+            {
+                created = await CreateSessionAsync(source, target, PathDirect, cancellationToken).ConfigureAwait(false);
+                signal.SessionId = created.Session.Id;
+                signal.Token = created.Token;
+                signal.ExpiresAt = created.Session.ExpiresAt;
+                if (!await SendSessionGrantAsync(sourceBinding, targetBinding, created, cancellationToken).ConfigureAwait(false))
+                    throw new PeerSignalUndeliverableException("peer grant authorization changed before delivery");
+            }
+            if (!await SendPreparedPeerExchangeAsync(sourceBinding, targetBinding, signal, false, cancellationToken).ConfigureAwait(false))
+                throw new PeerSignalUndeliverableException("peer signal authorization changed before delivery");
         }
-        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+        catch (Exception ex)
         {
-            // The target's connection went away between the lookup and the write.
-            throw new PeerSignalUndeliverableException($"target peer connection closed: {target.ClientName}", ex);
+            if (created is not null)
+                await CloseUndeliveredGrantAsync(created.Session.Id, source.TenantId, CancellationToken.None).ConfigureAwait(false);
+            if (ex is IOException or SocketException or ObjectDisposedException)
+                throw new PeerSignalUndeliverableException($"target peer connection closed: {target.ClientName}", ex);
+            throw;
         }
     }
 
     public async Task PushConfigAsync(ClientAccount account, CancellationToken cancellationToken)
     {
-        var session = _sessions.Find(account.ClientName);
-        if (session is null)
-        {
-            return;
-        }
-        var config = await BuildRuntimeConfigAsync(account, cancellationToken).ConfigureAwait(false);
-        await SendSignalAsync(session, "server", account.ClientName, new PeerControlMessage
+        var captured = CapturePeerReceiver(account);
+        if (captured is null) return;
+        await SendPreparedPeerPushAsync(captured, async (current, ct) => new PeerControlMessage
         {
             Type = TypeConfig,
-            SourceClientId = account.Id,
-            SourceClientName = account.ClientName,
-            TargetClientId = account.Id,
-            TargetClientName = account.ClientName,
-            PeerMesh = config,
+            SourceClientId = current.Account.Id, SourceClientName = current.Account.ClientName,
+            TargetClientId = current.Account.Id, TargetClientName = current.Account.ClientName,
+            PeerMesh = await BuildRuntimeConfigForReceiverAsync(current.Account, current.Session.PeerServiceDiscoveryVersion, ct).ConfigureAwait(false),
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, cancellationToken).ConfigureAwait(false);
     }
@@ -475,18 +500,14 @@ public sealed partial class PeerMeshService
         {
             return;
         }
-        var session = _sessions.Find(account.ClientName);
-        if (session is null)
-        {
-            return;
-        }
-        var peers = await AllowedRosterAsync(account, cancellationToken).ConfigureAwait(false);
-        await SendSignalAsync(session, "server", account.ClientName, new PeerControlMessage
+        var captured = CapturePeerReceiver(account);
+        if (captured is null) return;
+        await SendPreparedPeerPushAsync(captured, async (current, ct) => new PeerControlMessage
         {
             Type = TypeRoster,
-            SourceClientId = account.Id,
-            SourceClientName = account.ClientName,
-            Peers = peers,
+            SourceClientId = current.Account.Id,
+            SourceClientName = current.Account.ClientName,
+            Peers = await AllowedRosterAsync(current.Account, ct).ConfigureAwait(false),
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, cancellationToken).ConfigureAwait(false);
     }
@@ -556,13 +577,29 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshDeviceView> UpdateDeviceAsync(ManagementContext context, long clientId,
         PeerMeshDeviceMutation request, CancellationToken cancellationToken)
     {
-        var device = await FindAccessibleDeviceAsync(context, clientId, cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
+        var clients = await LockPeerClientsAsync(context, [clientId], cancellationToken).ConfigureAwait(false);
+        var account = RequirePeerClient(clients, clientId);
+        if (!context.CanAccess(account)) throw new UnauthorizedAccessException("无权访问客户端");
+        var hint = await _db.PeerMeshDevices.AsNoTracking().SingleOrDefaultAsync(d => d.TenantId == context.TenantId && d.ClientId == clientId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException("peer device not found");
+        if (hint.TenantId != context.TenantId) throw new ArgumentException("peer device not found");
+        await LockPeerRowAsync<PeerMeshDevice>(hint.Id, context, cancellationToken).ConfigureAwait(false);
+        var current = await _db.PeerMeshDevices.AsNoTracking().SingleOrDefaultAsync(d => d.Id == hint.Id && d.TenantId == context.TenantId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException("peer device not found");
+        if (current.TenantId != context.TenantId) throw new ArgumentException("peer device not found");
+        if (current.ClientId != clientId) throw new InvalidOperationException("Peer 设备关联已变更，请刷新后重试");
+        if (!context.IsAdmin && current.OwnerUsername != context.Username) throw new UnauthorizedAccessException("无权访问客户端");
+        var device = TrackPeerCurrent(current, current.Id);
         if (request.Enabled is not null)
         {
             device.Enabled = request.Enabled.Value;
         }
         device.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         if (request.Enabled is not null)
         {
             await RefreshDeviceAsync(context, clientId, request.Enabled.Value, cancellationToken).ConfigureAwait(false);
@@ -586,6 +623,8 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshAclView> CreateAclAsync(ManagementContext context, PeerMeshAclMutation request,
         CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         if (request.SourceClientId is null or <= 0)
         {
             throw new ArgumentException("sourceClientId is required");
@@ -594,10 +633,10 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("targetClientId is required");
         }
-        var source = await FindAccessibleClientAsync(context, request.SourceClientId.Value, cancellationToken)
-            .ConfigureAwait(false);
-        var target = await FindTenantClientAsync(context.TenantId, request.TargetClientId.Value, cancellationToken)
-            .ConfigureAwait(false);
+        var clients = await LockPeerClientsAsync(context, [request.SourceClientId.Value, request.TargetClientId.Value], cancellationToken).ConfigureAwait(false);
+        var source = RequirePeerClient(clients, request.SourceClientId.Value);
+        var target = RequirePeerClient(clients, request.TargetClientId.Value);
+        if (!context.CanAccess(source)) throw new UnauthorizedAccessException("无权访问客户端");
         if (source.Id == target.Id)
         {
             throw new ArgumentException("source and target cannot be the same client");
@@ -607,7 +646,7 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("普通用户不能创建跨用户 peer ACL");
         }
-        var acl = await _db.PeerMeshAcls.FirstOrDefaultAsync(a =>
+        var acl = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a =>
                 a.TenantId == context.TenantId
                 && a.SourceClientId == source.Id
                 && a.TargetClientId == target.Id, cancellationToken)
@@ -622,6 +661,20 @@ public sealed partial class PeerMeshService
                 CreatedAt = now,
             };
             _db.PeerMeshAcls.Add(acl);
+        }
+        else
+        {
+            if (acl.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+            await LockPeerRowAsync<PeerMeshAcl>(acl.Id, context, cancellationToken).ConfigureAwait(false);
+            var current = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a => a.Id == acl.Id && a.TenantId == context.TenantId, cancellationToken)
+                .ConfigureAwait(false) ?? throw new ArgumentException("peer ACL not found");
+            if (current.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+            if (current.SourceClientId != source.Id || current.TargetClientId != target.Id)
+                throw new InvalidOperationException("Peer ACL 关联已变更，请刷新后重试");
+            // Policy ownership is independent of device ownership. A transfer must not let
+            // the new device owner take over an existing third-party policy via upsert.
+            if (!context.IsAdmin && current.OwnerUsername != context.Username) throw new ArgumentException("peer ACL not found");
+            acl = TrackPeerCurrent(current, current.Id);
         }
         acl.OwnerUsername = context.Username;
         acl.SourceClientId = source.Id;
@@ -640,21 +693,38 @@ public sealed partial class PeerMeshService
         }
         acl.UpdatedAt = now;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
         return AclView(acl);
     }
 
     public async Task DeleteAclAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
-        var acl = await _db.PeerMeshAcls.FirstOrDefaultAsync(a => a.Id == id, cancellationToken)
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
+        var hint = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a => a.Id == id && a.TenantId == context.TenantId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException("peer ACL not found");
+        if (hint.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+        // Ordered parent locks also coordinate with client deletion. Legacy orphan ACLs
+        // remain deletable by their own manager; device ownership does not grant this right.
+        _ = await LockPeerClientsAsync(context, [hint.SourceClientId, hint.TargetClientId], cancellationToken).ConfigureAwait(false);
+        await LockPeerRowAsync<PeerMeshAcl>(id, context, cancellationToken).ConfigureAwait(false);
+        var current = await _db.PeerMeshAcls.AsNoTracking().SingleOrDefaultAsync(a => a.Id == id && a.TenantId == context.TenantId, cancellationToken)
             .ConfigureAwait(false)
             ?? throw new ArgumentException("peer ACL not found");
-        if (acl.TenantId != context.TenantId || (!context.IsAdmin && acl.OwnerUsername != context.Username))
+        if (current.TenantId != context.TenantId) throw new ArgumentException("peer ACL not found");
+        if (current.SourceClientId != hint.SourceClientId || current.TargetClientId != hint.TargetClientId)
+            throw new InvalidOperationException("Peer ACL 关联已变更，请刷新后重试");
+        if (!context.IsAdmin && current.OwnerUsername != context.Username)
         {
             throw new ArgumentException("peer ACL not found");
         }
+        var acl = TrackPeerCurrent(current, id);
         _db.PeerMeshAcls.Remove(acl);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         await RefreshAuthorizationAsync(context, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1300,11 +1370,9 @@ public sealed partial class PeerMeshService
         return new PeerSessionGrant(SessionView(session), token);
     }
 
-    private async Task ReportPathAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task ReportPathAsync(PeerMeshSession session, PeerControlMessage report,
         CancellationToken cancellationToken)
     {
-        var session = await FindReportableSessionAsync(reporter, report.SessionId, cancellationToken)
-            .ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         if (!CloseIfExpired(session, now))
         {
@@ -1324,11 +1392,9 @@ public sealed partial class PeerMeshService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task ReportTrafficAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task ReportTrafficAsync(PeerMeshSession session, PeerControlMessage report,
         CancellationToken cancellationToken)
     {
-        var session = await FindReportableSessionAsync(reporter, report.SessionId, cancellationToken)
-            .ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         if (!CloseIfExpired(session, now))
         {
@@ -1337,13 +1403,9 @@ public sealed partial class PeerMeshService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task ReportDeviceAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task ReportDeviceAsync(ClientAccount reporter, PeerMeshDevice device, PeerControlMessage report,
         CancellationToken cancellationToken)
     {
-        var device = await _db.PeerMeshDevices.FirstOrDefaultAsync(
-                d => d.TenantId == reporter.TenantId && d.ClientId == reporter.Id, cancellationToken)
-            .ConfigureAwait(false)
-            ?? await CreateDeviceAsync(reporter, cancellationToken).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         device.ClientName = reporter.ClientName;
         device.OwnerUsername = NormalizeOwner(reporter.OwnerUsername);
@@ -1369,11 +1431,10 @@ public sealed partial class PeerMeshService
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task CloseSessionFromClientAsync(ClientAccount reporter, PeerControlMessage report,
+    private async Task CloseSessionFromClientAsync(PeerMeshSession session,
         CancellationToken cancellationToken)
     {
-        var session = await FindReportableSessionAsync(reporter, report.SessionId, cancellationToken)
-            .ConfigureAwait(false);
+        if (session.Status == StatusClosed) return;
         MarkClosed(session, DateTimeOffset.UtcNow);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -1495,22 +1556,17 @@ public sealed partial class PeerMeshService
         return right.MessageMaxAttachmentBytes > left.MessageMaxAttachmentBytes ? right : left;
     }
 
-    private async Task SendSessionGrantAsync(ClientAccount source, ClientAccount target, PeerSessionGrant grant,
+    private Task<bool> SendSessionGrantAsync(PeerReceiver source, PeerReceiver target, PeerSessionGrant grant,
         CancellationToken cancellationToken)
     {
-        var session = _sessions.Find(source.ClientName);
-        if (session is null)
-        {
-            return;
-        }
         var message = new PeerControlMessage
         {
             Type = TypeSessionGrant,
             SessionId = grant.Session.Id,
-            SourceClientId = source.Id,
-            SourceClientName = source.ClientName,
-            TargetClientId = target.Id,
-            TargetClientName = target.ClientName,
+            SourceClientId = source.ClientId,
+            SourceClientName = source.Name,
+            TargetClientId = target.ClientId,
+            TargetClientName = target.Name,
             Token = grant.Token,
             ExpiresAt = grant.Session.ExpiresAt,
             PathType = grant.Session.PathType,
@@ -1518,13 +1574,14 @@ public sealed partial class PeerMeshService
             DataFrameVersion = 2,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
-        await FillSourceAsync(message, source, cancellationToken).ConfigureAwait(false);
-        await EnrichTargetAsync(message, target, cancellationToken).ConfigureAwait(false);
-        await SendSignalAsync(session, "server", source.ClientName, message, cancellationToken).ConfigureAwait(false);
+        return SendPreparedPeerExchangeAsync(source, target, message, true, cancellationToken);
     }
 
-    private async Task SendCloseAsync(PeerMeshSessionView closed, CancellationToken cancellationToken)
+    private async Task SendCloseAsync(PeerMeshSessionView closed, CancellationToken cancellationToken, string reason = "admin-force-close")
     {
+        var persisted = await _db.PeerMeshSessions.AsNoTracking().SingleOrDefaultAsync(s => s.Id == closed.Id, cancellationToken).ConfigureAwait(false);
+        if (persisted is null || persisted.SourceClientId != closed.SourceClientId
+            || persisted.TargetClientId != closed.TargetClientId || persisted.Status != StatusClosed) return;
         var message = new PeerControlMessage
         {
             Type = TypeClose,
@@ -1534,29 +1591,19 @@ public sealed partial class PeerMeshService
             TargetClientId = closed.TargetClientId,
             TargetClientName = closed.TargetClientName,
             Status = closed.Status,
-            Reason = "admin-force-close",
+            Reason = reason,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
-        foreach (var name in new[] { closed.SourceClientName, closed.TargetClientName })
+        foreach (var id in new[] { closed.SourceClientId, closed.TargetClientId }.Distinct())
         {
-            var session = _sessions.Find(name);
-            if (session is not null)
+            var account = await _db.ClientAccounts.AsNoTracking().SingleOrDefaultAsync(a => a.Id == id
+                && a.TenantId == persisted.TenantId, cancellationToken).ConfigureAwait(false);
+            var receiver = account is null ? null : CapturePeerReceiver(account);
+            if (receiver is not null)
             {
-                await SendSignalAsync(session, "server", name, message, cancellationToken).ConfigureAwait(false);
+                await SendPreparedPeerPushAsync(receiver, (_, _) => Task.FromResult<PeerControlMessage?>(message), cancellationToken).ConfigureAwait(false);
             }
         }
-    }
-
-    private static ValueTask SendSignalAsync(SpecusConnectionContext session, string sourceClientName,
-        string targetClientName, PeerControlMessage signal, CancellationToken cancellationToken)
-    {
-        return session.Writer.WriteAsync(new MessageResponsePacket
-        {
-            ClientName = sourceClientName,
-            ToClientName = targetClientName,
-            MessageType = MessageType.PeerControl,
-            Message = JsonSerializer.Serialize(signal),
-        }, cancellationToken);
     }
 
     private async Task<ClientAccount> FindAccessibleClientAsync(ManagementContext context, long clientId,
@@ -1616,25 +1663,6 @@ public sealed partial class PeerMeshService
             return session;
         }
         throw new ArgumentException("peer session not found");
-    }
-
-    private async Task<PeerMeshSession> FindReportableSessionAsync(ClientAccount reporter, long? sessionId,
-        CancellationToken cancellationToken)
-    {
-        if (sessionId is null or <= 0)
-        {
-            throw new ArgumentException("sessionId is required");
-        }
-        var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(s => s.Id == sessionId.Value,
-                cancellationToken)
-            .ConfigureAwait(false)
-            ?? throw new ArgumentException("peer session not found");
-        if (session.TenantId != reporter.TenantId
-            || (session.SourceClientId != reporter.Id && session.TargetClientId != reporter.Id))
-        {
-            throw new ArgumentException("peer session report source mismatch");
-        }
-        return session;
     }
 
     private async Task<List<long>> VisibleClientIdsAsync(ManagementContext context, CancellationToken cancellationToken)
@@ -1743,6 +1771,11 @@ public sealed partial class PeerMeshService
             RemoveRelaySession(header.SessionId);
             return false;
         }
+        if (authorization.Generation != Volatile.Read(ref _state.RelayGeneration))
+        {
+            _relayAuthorizations.TryRemove(header.SessionId, out _);
+            return false;
+        }
         // 0/0 means identity unknown (TURN auth disabled), consistent with the slow path.
         if (!authorization.Matches(fromClientId, toClientId))
         {
@@ -1755,14 +1788,14 @@ public sealed partial class PeerMeshService
         return true;
     }
 
-    private void CacheRelayAuthorization(PeerMeshSession session, DateTimeOffset now)
+    private void CacheRelayAuthorization(PeerMeshSession session, DateTimeOffset now, long generation)
     {
         _relayAuthorizations[session.Id] = new RelayAuthorization(
             session.SourceClientId,
             session.TargetClientId,
             string.Equals(session.Status, StatusActive, StringComparison.Ordinal),
             session.ExpiresAt,
-            now.Add(RelayAuthorizationCacheTtl));
+            now.Add(RelayAuthorizationCacheTtl), generation);
     }
 
     private void AddPendingRelayBytes(long sessionId, long bytes)
@@ -1977,12 +2010,12 @@ public sealed partial class PeerMeshService
         return long.MaxValue - current < delta ? long.MaxValue : current + delta;
     }
 
-    private sealed record RelayAuthorization(
+    internal sealed record RelayAuthorization(
         long SourceClientId,
         long TargetClientId,
         bool Active,
         DateTimeOffset SessionExpiresAt,
-        DateTimeOffset CacheExpiresAt)
+        DateTimeOffset CacheExpiresAt, long Generation)
     {
         public bool ValidAt(DateTimeOffset now) =>
             Active && CacheExpiresAt > now && SessionExpiresAt > now;

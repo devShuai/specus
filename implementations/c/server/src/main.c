@@ -2,6 +2,9 @@
 
 #include "admin_http.h"
 #include "crypto.h"
+#include "control_lifecycle.h"
+#include "control_outbox.h"
+#include "control_presence.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
@@ -27,6 +30,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -53,8 +57,6 @@
 #define ST_HTTP_MAX_RESPONSE_BODY (64U * 1024U * 1024U)
 /* How long a graceful shutdown waits for closed channels to finish their bookkeeping. */
 #define ST_SHUTDOWN_DRAIN_SECONDS 10
-/* Upper bound on NETTY_ONLINE rows one control login inspects for stale-session cleanup. */
-#define ST_MAX_STALE_SESSION_SCAN 256U
 /* A displaced client has at most one control and one data connection; slack covers a race. */
 #define ST_MAX_DISPLACED_SESSIONS 8U
 
@@ -116,6 +118,12 @@ typedef struct {
 
 typedef struct specus_session specus_session;
 
+typedef struct control_work_item {
+    st_message_response message;
+    size_t charge;
+    struct control_work_item *next;
+} control_work_item;
+
 typedef struct external_write_chunk {
     uint8_t *data;
     size_t len;
@@ -124,6 +132,9 @@ typedef struct external_write_chunk {
 
 typedef struct external_conn {
     int fd;
+    int owned_fd; /* Closed only after both workers finish; snapshots cannot name a reused fd. */
+    int reader_finished; /* map_lock */
+    int writer_finished; /* map_lock */
     int port;
     uint32_t stream_id;
     char channel_id[ST_CHANNEL_ID_SIZE];
@@ -178,6 +189,9 @@ typedef struct direct_http_event {
 typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
+    int link_lost; /* Terminal independently of allocating an error string. */
+    int callback_active; /* direct_lock: abort only an in-flight sink write; otherwise return 502. */
+    const st_admin_direct_http_sink *sink; /* Valid until pending removal under direct_lock. */
     int response_started;
     /* Either side reset the stream; frames the client sent before it saw an RST are dropped. */
     int reset;
@@ -207,10 +221,40 @@ typedef struct ws_conn {
     struct ws_conn *next;
 } ws_conn;
 
+typedef struct {
+    atomic_size_t references;
+    atomic_int cancelled;
+} peer_delivery_guard;
+
 struct specus_session {
     int control_fd;
     st_tls_connection *tls_connection;
     int is_data_connection;
+    char physical_channel_id[35];
+    st_storage_control_source control_source_guard; /* Immutable after native authentication. */
+    st_control_presence *control_presence; /* Held before native ONLINE until final local teardown. */
+    specus_session *source_watch_prev;
+    specus_session *source_watch_next;
+    int source_watch_queued; /* Intrusive fair queue, active_session_lock; no extra owner ref. */
+    atomic_int control_cancelled;
+    peer_delivery_guard *delivery_guard; /* Independent lifetime: queued peers never pin this session. */
+    st_control_outbox_channel *peer_outbox;
+    pthread_cond_t control_work_cond;
+    int control_work_busy;
+    int control_work_queued;
+    specus_session *control_ready_prev;
+    specus_session *control_ready_next;
+    int control_work_stopping; /* control_queue_lock, including queued login audit on shutdown. */
+    int login_audit_pending;
+    unsigned long login_route_generation;
+    control_work_item *control_work_head;
+    control_work_item *control_work_tail;
+    size_t control_work_count;
+    size_t control_work_bytes;
+    int bound; /* Routing-list membership, read/written only under active_session_lock. */
+    /* Original physical CONTROL, retained under active_session_lock through DATA teardown.
+     * A reusable HTTP token/SID does not make a replacement CONTROL interchangeable. */
+    specus_session *data_control;
     /*
      * Settled by the login before the connection is published, and fixed from then on but for the
      * route set a runtime NAT_CONTROL push replaces (apply_runtime_route_config): mappings,
@@ -232,6 +276,9 @@ struct specus_session {
     ws_conn *ws_conns;
     specus_listener *listeners;
     direct_http_pending *direct_pending;
+    /* Irreversible namespace retirement: map admissions use map_lock, writers a snapshot. */
+    atomic_int nat_retired;
+    int direct_retired; /* direct_lock: registration and fail-all share one admission fence. */
     int active;
     /*
      * Set, under active_session_lock, when the connection was taken out of service: by a newer
@@ -251,6 +298,26 @@ struct specus_session {
     struct specus_session *active_next;
     struct specus_session *live_next;
 };
+
+static peer_delivery_guard *peer_guard_create(void)
+{
+    peer_delivery_guard *guard=malloc(sizeof(*guard));
+    if (guard) { atomic_init(&guard->references,1U); atomic_init(&guard->cancelled,0); }
+    return guard;
+}
+static void peer_guard_retain(peer_delivery_guard *guard)
+{
+    if (guard) atomic_fetch_add(&guard->references,1U);
+}
+static void peer_guard_release(peer_delivery_guard *guard)
+{
+    if (guard && atomic_fetch_sub(&guard->references,1U)==1U) free(guard);
+}
+static void control_cancel(specus_session *session)
+{
+    atomic_store(&session->control_cancelled,1);
+    if (session->delivery_guard) atomic_store(&session->delivery_guard->cancelled,1);
+}
 
 /* The connections a login took out of service, each still referenced by that login. */
 typedef struct {
@@ -275,6 +342,9 @@ static pthread_mutex_t global_external_lock = PTHREAD_MUTEX_INITIALIZER;
 static int global_external_connections = 0;
 static pthread_mutex_t active_session_lock = PTHREAD_MUTEX_INITIALIZER;
 static specus_session *active_sessions = NULL;
+static specus_session *source_watch_head;
+static specus_session *source_watch_tail;
+static size_t source_watch_count;
 /*
  * Serialises control-login admission (stale-session cleanup, the online-instance counts and the
  * NETTY_ONLINE write) with the DISCONNECTED write of a control connection that is going away.
@@ -282,6 +352,22 @@ static specus_session *active_sessions = NULL;
  * departing connection, leaving a live control whose session the database reports as offline.
  */
 static pthread_mutex_t control_admission_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Includes queued AND executing work. Metadata only: never held across SQL, a lifecycle wait or I/O.
+ * One legal 32-MiB MESSAGE still fits; an idle physical CONTROL consumes no lifecycle-table slot. */
+static pthread_mutex_t control_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t control_work_bytes;
+static pthread_cond_t control_ready_cond = PTHREAD_COND_INITIALIZER;
+static specus_session *control_ready_head;
+static specus_session *control_ready_tail;
+#define ST_CONTROL_POOL_SIZE 4U
+static pthread_t control_pool[ST_CONTROL_POOL_SIZE];
+static st_control_outbox *peer_outbox;
+static int peer_outbox_enqueue(specus_session *target, const st_buffer *packet);
+static size_t control_pool_count;
+static int control_pool_stopping;
+#define ST_CONTROL_WORK_ITEMS 32U
+#define ST_CONTROL_WORK_BYTES (2U * ST_MAX_FRAME_SIZE)
+#define ST_CONTROL_GLOBAL_WORK_BYTES (8U * ST_MAX_FRAME_SIZE)
 /*
  * Every accepted connection, logged in or not, so a graceful shutdown can close each of them and
  * wait for its bookkeeping. A session's socket is closed only while holding this lock, which lets
@@ -294,6 +380,8 @@ static size_t live_connection_count = 0U;
 static int server_stopping = 0;
 
 static char *json_http_request(const st_direct_http_request *request);
+static void retire_data_namespace(specus_session *session);
+static void direct_pending_free_events(direct_http_pending *pending);
 static char *json_http_request_fin(const st_direct_http_request *request, int *failed);
 static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason);
@@ -900,10 +988,9 @@ static int load_config(server_config *config)
         }
         char startup_time[64];
         if (current_utc_timestamp(startup_time) == 0) {
-            /* Nothing is connected yet, so every online session and open connection record was
-             * left behind by a previous process that never ran its disconnect handlers. */
-            (void)st_storage_close_client_sessions_by_status(database_path, "NETTY_ONLINE", startup_time);
-            (void)st_storage_close_open_connections(database_path, "SERVER_RESTARTED", startup_time, NULL);
+            /* Another instance may already own live channels in this SQLite database. */
+            if (st_storage_reap_dead_control_channels(database_path, 0, 0, startup_time, "SERVER_RESTARTED", NULL) != 0)
+                return -1;
         }
     }
     if (access_token_hash != NULL && *access_token_hash != '\0') {
@@ -938,6 +1025,13 @@ static int64_t now_ms(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (int64_t)tv.tv_sec * 1000LL + (int64_t)tv.tv_usec / 1000LL;
+}
+
+static long long control_monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
 }
 
 static int current_utc_date(char out[11])
@@ -1078,7 +1172,7 @@ static void record_login_success_event(specus_session *session)
     if (session->config.database_path[0] == '\0') {
         return;
     }
-    if (current_utc_timestamp(session->connected_at) != 0) {
+    if (session->connected_at[0] == '\0' && current_utc_timestamp(session->connected_at) != 0) {
         return;
     }
     long long record_id = 0;
@@ -1086,7 +1180,7 @@ static void record_login_success_event(specus_session *session)
                                                                session->config.tenant_id,
                                                                session->config.client_id,
                                                                session->config.client_name,
-                                                               NULL,
+                                                               session->physical_channel_id,
                                                                session->remote,
                                                                1,
                                                                NULL,
@@ -1330,13 +1424,14 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
  * socket down here, under send_lock, is safe, since session_shutdown closes the descriptor under
  * the same lock and its number cannot have been reused yet.
  */
-static int session_send_packet_locked(specus_session *session, st_buffer *packet)
+static int session_send_bytes_locked(specus_session *session, const uint8_t *data, size_t length)
 {
     int rc = -1;
-    if (packet->data != NULL && session->control_fd >= 0 && !session->write_failed) {
+    if (data != NULL && session->control_fd >= 0 && !session->write_failed
+        && !atomic_load(&session->nat_retired)) {
         rc = session->tls_connection == NULL
-            ? send_all(session->control_fd, packet->data, packet->len)
-            : st_tls_connection_write_all(session->tls_connection, packet->data, packet->len);
+            ? send_all(session->control_fd, data, length)
+            : st_tls_connection_write_all(session->tls_connection, data, length);
         if (rc != 0) {
             int write_errno = errno;
             session->write_failed = 1;
@@ -1346,6 +1441,12 @@ static int session_send_packet_locked(specus_session *session, st_buffer *packet
                     session->config.client_name, write_errno);
         }
     }
+    return rc;
+}
+
+static int session_send_packet_locked(specus_session *session, st_buffer *packet)
+{
+    int rc=session_send_bytes_locked(session,packet->data,packet->len);
     st_buffer_free(packet);
     return rc;
 }
@@ -1374,11 +1475,16 @@ static int session_send_packet(specus_session *session, st_buffer *packet)
 static void direct_pending_fail_all(specus_session *session, const char *message)
 {
     pthread_mutex_lock(&session->direct_lock);
+    session->direct_retired = 1;
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
         if (!pending->done) {
+            pending->link_lost = 1;
+            direct_pending_free_events(pending);
             free(pending->error);
             pending->error = dup_string(message);
             pending->done = 1;
+            if (pending->callback_active && pending->sink != NULL && pending->sink->on_link_lost != NULL)
+                pending->sink->on_link_lost(pending->sink->ctx);
             pthread_cond_broadcast(&pending->cond);
         }
     }
@@ -1535,6 +1641,10 @@ static direct_http_event *direct_pending_pop(direct_http_pending *pending)
 static int process_direct_http_message(specus_session *session, const st_nat_message *message)
 {
     pthread_mutex_lock(&session->direct_lock);
+    if (session->direct_retired) {
+        pthread_mutex_unlock(&session->direct_lock);
+        return 1; /* A frame admitted before detach cannot re-populate a retired namespace. */
+    }
     direct_http_pending *pending = find_direct_pending_locked(session, message->stream_id);
     if (pending == NULL) {
         pthread_mutex_unlock(&session->direct_lock);
@@ -1669,17 +1779,49 @@ static int config_has_http_route(const server_config *config, const char *route)
     return 0;
 }
 
+static void source_watch_remove_locked(specus_session *session)
+{
+    if (!session->source_watch_queued) return;
+    if (session->source_watch_prev) session->source_watch_prev->source_watch_next = session->source_watch_next;
+    else source_watch_head = session->source_watch_next;
+    if (session->source_watch_next) session->source_watch_next->source_watch_prev = session->source_watch_prev;
+    else source_watch_tail = session->source_watch_prev;
+    session->source_watch_prev = session->source_watch_next = NULL;
+    session->source_watch_queued = 0;
+    --source_watch_count;
+}
+
+static void source_watch_append_locked(specus_session *session)
+{
+    session->source_watch_prev = source_watch_tail;
+    session->source_watch_next = NULL;
+    if (source_watch_tail) source_watch_tail->source_watch_next = session;
+    else source_watch_head = session;
+    source_watch_tail = session;
+    session->source_watch_queued = 1;
+    ++source_watch_count;
+}
+
 static void active_session_add_locked(specus_session *session)
 {
     if (session == NULL) {
         return;
     }
     session->active_next = active_sessions;
+    session->bound = 1;
     active_sessions = session;
+    if (!session->is_data_connection && session->config.client_session_db_backed)
+        source_watch_append_locked(session);
 }
 
 static void active_session_remove_locked(specus_session *session)
 {
+    if (session == NULL) return;
+    source_watch_remove_locked(session);
+    /* A retained catalog reference must observe local detach before it can write, even while
+     * the owning reader is still draining its worker and has not closed the native row yet. */
+    if (session->bound && !session->is_data_connection) control_cancel(session);
+    session->bound = 0;
     specus_session **cursor = &active_sessions;
     while (*cursor != NULL) {
         if (*cursor == session) {
@@ -1703,9 +1845,27 @@ static specus_session *active_session_find_role_locked(const char *client_name, 
     return NULL;
 }
 
+static int data_control_matches_locked(const specus_session *data)
+{
+    return data != NULL && data->is_data_connection && data->data_control != NULL
+        && data->data_control->bound && !data->data_control->is_data_connection
+        && strcmp(data->data_control->config.client_name, data->config.client_name) == 0
+        && data->data_control->config.client_session_id == data->config.client_session_id;
+}
+
 static specus_session *active_data_session_find_locked(const char *client_name)
 {
-    return active_session_find_role_locked(client_name, 1);
+    specus_session *data = active_session_find_role_locked(client_name, 1);
+    return data_control_matches_locked(data) ? data : NULL;
+}
+
+/* Registry-only snapshot. Never retain active_session_lock while writing a socket or doing SQL. */
+static int data_session_is_current(specus_session *session)
+{
+    pthread_mutex_lock(&active_session_lock);
+    int current = session->bound && data_control_matches_locked(session);
+    pthread_mutex_unlock(&active_session_lock);
+    return current;
 }
 
 static specus_session *active_data_session_acquire_locked(const char *client_name)
@@ -1753,8 +1913,8 @@ static void session_reference_release(specus_session *session)
 
 /*
  * A control connection going away takes its data connection with it (protocol/spec/control-
- * protocol.md). Only the data connection of the same runtime session qualifies: one that belongs to
- * a newer session of the same client is that client's current pair and must survive. A data
+ * protocol.md). Only DATA that captured this exact physical CONTROL qualifies: a replacement
+ * CONTROL can reuse the same runtime SID, but its DATA is a different pair and must survive. A data
  * connection already marked inactive by a protocol violation is still in the list and is closed
  * too, so it cannot linger holding its listeners. The reverse is deliberately not done, as in Java
  * and Go: a data connection that goes away leaves its control alone, the client rebuilds the pair,
@@ -1765,11 +1925,12 @@ static void active_session_close_data_locked(specus_session *control)
     if (control == NULL || control->is_data_connection) {
         return;
     }
-    for (specus_session *data = active_sessions; data != NULL; data = data->active_next) {
-        if (data->is_data_connection
-            && data->config.client_session_id == control->config.client_session_id
-            && strcmp(data->config.client_name, control->config.client_name) == 0) {
+    for (specus_session *data = active_sessions, *next; data != NULL; data = next) {
+        next = data->active_next;
+        if (data->is_data_connection && data->data_control == control) {
             shutdown(data->control_fd, SHUT_RDWR);
+            active_session_remove_locked(data);
+            retire_data_namespace(data);
         }
     }
 }
@@ -1817,27 +1978,10 @@ static void displace_session_locked(specus_session *session, const char *reason)
 {
     session->displaced_reason = reason;
     ++session->references;
+    control_cancel(session);
     shutdown(session->control_fd, SHUT_RDWR);
     active_session_remove_locked(session);
-}
-
-/*
- * Releases the public TCP ports of a displaced data connection before the replacing login is
- * answered. Its own thread would close them too, but only after it notices the shutdown; the
- * client's next REGISTER for the same port would otherwise race that and fail to bind. Shutting a
- * listening socket down takes it out of LISTEN, which with SO_REUSEADDR already frees the port;
- * the descriptor itself is left to the listener thread, which closes it once accept() fails, so
- * no descriptor is closed under a thread still blocked on it.
- */
-static void release_session_listeners(specus_session *session)
-{
-    pthread_mutex_lock(&session->map_lock);
-    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
-        if (listener->fd >= 0) {
-            shutdown(listener->fd, SHUT_RDWR);
-        }
-    }
-    pthread_mutex_unlock(&session->map_lock);
+    retire_data_namespace(session);
 }
 
 /*
@@ -1860,10 +2004,9 @@ static int activate_session(specus_session *session, displaced_sessions *displac
     displaced->count = 0U;
     pthread_mutex_lock(&active_session_lock);
     if (session->is_data_connection) {
-        specus_session *control = active_session_find_role_locked(session->config.client_name, 0);
-        if (control == NULL || control->config.client_session_id != session->config.client_session_id) {
+        if (!data_control_matches_locked(session)) {
             pthread_mutex_unlock(&active_session_lock);
-            *reason = "数据连接未找到匹配的控制连接";
+            *reason = "数据连接要求控制连接先登录：原控制连接已改变，请重新建立数据连接";
             return -1;
         }
     }
@@ -1891,11 +2034,6 @@ static int activate_session(specus_session *session, displaced_sessions *displac
                old->is_data_connection ? "data" : "control",
                old->config.client_name,
                old->remote);
-        /* Under the new connection's send_lock, which is fine: no thread sends while holding a
-         * map_lock, so none can hold this one and wait for that send_lock. */
-        if (old->is_data_connection) {
-            release_session_listeners(old);
-        }
     }
     *reason = NULL;
     return 0;
@@ -1952,9 +2090,6 @@ static int close_client_connections(void *ctx, const char *client_name, const ch
                closed[i]->config.client_name,
                closed[i]->remote,
                reason);
-        if (closed[i]->is_data_connection) {
-            release_session_listeners(closed[i]);
-        }
         session_reference_release(closed[i]);
     }
     return (int)closed_count;
@@ -2111,6 +2246,7 @@ static int direct_http_forward(void *ctx,
 
     direct_http_pending pending;
     memset(&pending, 0, sizeof(pending));
+    pending.sink = sink;
     pending.send_credit = ST_STREAM_INITIAL_WINDOW;
     pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
     pthread_cond_init(&pending.cond, NULL);
@@ -2124,6 +2260,12 @@ static int direct_http_forward(void *ctx,
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
+    if (session->direct_retired) {
+        pthread_mutex_unlock(&session->direct_lock);
+        pthread_cond_destroy(&pending.cond);
+        session_reference_release(session);
+        return -1;
+    }
     if (direct_pending_count_locked(session) >= ST_MAX_PENDING_DIRECT_STREAMS) {
         pthread_mutex_unlock(&session->direct_lock);
         pthread_cond_destroy(&pending.cond);
@@ -2199,7 +2341,7 @@ static int direct_http_forward(void *ctx,
     int delivered_head = 0;
     for (;;) {
         pthread_mutex_lock(&session->direct_lock);
-        while (pending.events_head == NULL && pending.error == NULL && !pending.cancelled
+        while (pending.events_head == NULL && pending.error == NULL && !pending.cancelled && !pending.link_lost
                && !(pending.done && pending.response_started)) {
             int rc = delivered_head
                 ? pthread_cond_wait(&pending.cond, &session->direct_lock)
@@ -2210,14 +2352,22 @@ static int direct_http_forward(void *ctx,
             }
         }
         int cancelled = pending.cancelled;
+        int link_lost = pending.link_lost;
         int already_reset = pending.reset;
-        direct_http_event *event = result == 0 && !cancelled ? direct_pending_pop(&pending) : NULL;
+        direct_http_event *event = result == 0 && !cancelled && !link_lost
+            ? direct_pending_pop(&pending) : NULL;
+        pending.callback_active = event != NULL;
         char *pending_error = !cancelled && event == NULL && pending.error != NULL
             ? dup_string(pending.error) : NULL;
         int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
 
+        if (link_lost) {
+            free(pending_error);
+            result = -1;
+            break;
+        }
         if (cancelled) {
             if (!already_reset) {
                 send_reset(session, pending.stream_id, ST_ADMIN_HTTP_SHARE_RESET_CODE,
@@ -2276,7 +2426,13 @@ static int direct_http_forward(void *ctx,
                 pthread_mutex_unlock(&session->direct_lock);
                 if (result == 0
                     && send_window_update(session, pending.stream_id, event->data_len) != 0) {
-                    result = -1;
+                    pthread_mutex_lock(&session->direct_lock);
+                    /* A complete response received before detach may drain its already-admitted
+                     * events. Its retired transport no longer needs replenished receive credit. */
+                    int completed_before_detach = pending.done && !pending.reset && !pending.link_lost
+                        && atomic_load(&session->nat_retired);
+                    pthread_mutex_unlock(&session->direct_lock);
+                    if (!completed_before_detach) result = -1;
                 }
             }
         } else if (event->type == ST_NAT_FIN) {
@@ -2295,6 +2451,10 @@ static int direct_http_forward(void *ctx,
             break;
         }
         direct_event_free(event);
+        pthread_mutex_lock(&session->direct_lock);
+        pending.callback_active = 0;
+        if (pending.link_lost && result == 0) result = -1;
+        pthread_mutex_unlock(&session->direct_lock);
         if (result != 0) {
             send_reset(session, pending.stream_id, 31U, "HTTP downstream closed");
             break;
@@ -2403,6 +2563,13 @@ static void connectivity_probe(void *ctx,
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
+    if (session->direct_retired) {
+        pthread_mutex_unlock(&session->direct_lock);
+        pthread_cond_destroy(&pending.cond);
+        session_reference_release(session);
+        answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
+        return;
+    }
     if (direct_pending_count_locked(session) >= ST_MAX_PENDING_DIRECT_STREAMS) {
         pthread_mutex_unlock(&session->direct_lock);
         pthread_cond_destroy(&pending.cond);
@@ -2434,7 +2601,7 @@ static void connectivity_probe(void *ctx,
             deadline.tv_nsec -= 1000000000L;
         }
         pthread_mutex_lock(&session->direct_lock);
-        while (pending.events_head == NULL && pending.error == NULL) {
+        while (pending.events_head == NULL && pending.error == NULL && !pending.link_lost) {
             if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
                 break;
             }
@@ -2455,7 +2622,7 @@ static void connectivity_probe(void *ctx,
         } else if (pending.error != NULL && pending.client_reset) {
             answer->kind = ST_CONNECTIVITY_PROBE_RESET;
             snprintf(answer->failure, sizeof(answer->failure), "%s", pending.failure);
-        } else if (pending.error != NULL) {
+        } else if (pending.error != NULL || pending.link_lost) {
             /* The data connection closed or was replaced, which fails every pending stream. */
             answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;
         } else {
@@ -2518,6 +2685,12 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     st_admin_direct_ws_retain(conn->stream);
 
     pthread_mutex_lock(&session->map_lock);
+    if (atomic_load(&session->nat_retired)) {
+        pthread_mutex_unlock(&session->map_lock);
+        free_ws_conn(conn);
+        session_reference_release(session);
+        return -1;
+    }
     conn->stream_id = session->next_stream_id++;
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
@@ -2898,7 +3071,8 @@ static int push_runtime_client_message(void *ctx,
                                                            client_name,
                                                            ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,
                                                            message);
-    int result = packet.data != NULL && session_send_packet(control, &packet) == 0 ? 0 : -2;
+    int result=peer_outbox_enqueue(control,&packet)==0?0:-2;
+    st_buffer_free(&packet);
     session_reference_release(control);
     return result;
 }
@@ -2956,7 +3130,8 @@ static int deliver_runtime_client_message_to_admin(specus_session *source_sessio
     if (st_storage_get_client_by_name(source_session->config.database_path,
                                       source_session->config.client_name,
                                       &source) != 0
-        || !source.enabled) {
+        || !source.enabled || source.id != source_session->config.client_id
+        || strcmp(source.tenant_id, source_session->config.tenant_id) != 0) {
         return -1;
     }
     return st_admin_deliver_client_message_to_admin(source.tenant_id,
@@ -2994,7 +3169,7 @@ static int forward_runtime_client_message(specus_session *source_session,
         || st_storage_get_client_by_name(source_session->config.database_path,
                                          canonical_input,
                                          &target) != 0
-        || !source.enabled || !target.enabled
+        || !source.enabled || !target.enabled || source.id != source_session->config.client_id
         || strcmp(source.tenant_id, source_session->config.tenant_id) != 0) {
         return -1;
     }
@@ -3020,7 +3195,8 @@ static int forward_runtime_client_message(specus_session *source_session,
                                                            target.client_name,
                                                            ST_MESSAGE_TYPE_CLIENT_TO_CLIENT,
                                                            request->message);
-    int result = packet.data != NULL && session_send_packet(target_control, &packet) == 0 ? 0 : -2;
+    int result=peer_outbox_enqueue(target_control,&packet)==0?0:-2;
+    st_buffer_free(&packet);
     session_reference_release(target_control);
     return result;
 }
@@ -3038,6 +3214,50 @@ static int peer_mesh_runtime_online(void *ctx,
             || control->config.client_id == client_id)) online = 1;
     pthread_mutex_unlock(&active_session_lock);
     return online;
+}
+
+typedef struct {
+    peer_delivery_guard *publisher;
+    int needs_publisher;
+} peer_delivery_item;
+
+static void peer_outbox_release(void *context)
+{
+    peer_delivery_item *item=context;
+    if (item) { peer_guard_release(item->publisher); free(item); }
+}
+static void peer_outbox_deliver(void *context, void *item_context, const unsigned char *data, size_t length)
+{
+    specus_session *target=context; peer_delivery_item *item=item_context;
+    /* Channel owner waits for this callback before destroying send_lock/TLS/descriptor. No
+     * publisher session is retained across this potentially blocking write. */
+    pthread_mutex_lock(&target->send_lock);
+    int cancelled=atomic_load(&target->control_cancelled) || atomic_load(&target->nat_retired)
+        || (item && item->needs_publisher && (!item->publisher || atomic_load(&item->publisher->cancelled)));
+    if (!cancelled) (void)session_send_bytes_locked(target,data,length);
+    pthread_mutex_unlock(&target->send_lock);
+}
+static int peer_outbox_start(void)
+{
+    st_control_outbox_limits limits={1024U,8U*ST_MAX_FRAME_SIZE,64U,2U*ST_MAX_FRAME_SIZE,8U};
+    peer_outbox=st_control_outbox_create(&limits,peer_outbox_deliver,peer_outbox_release);
+    return peer_outbox?0:-1;
+}
+static int peer_outbox_enqueue(specus_session *target, const st_buffer *packet)
+{
+    if (!target->peer_outbox || !packet->data) return -1;
+    if (atomic_load(&target->control_cancelled)) return 1;
+    st_control_outbox_ticket *ticket=NULL;
+    if (st_control_outbox_reserve(target->peer_outbox,packet->len,NULL,&ticket) != 0)
+        return atomic_load(&target->control_cancelled)?1:-1;
+    int rc=st_control_outbox_stage(ticket,packet->data,packet->len);
+    if (rc!=0) { st_control_outbox_abort(ticket); return rc; }
+    return st_control_outbox_commit(ticket);
+}
+static void session_outbox_dispose(specus_session *session)
+{
+    st_control_outbox_channel_destroy(session->peer_outbox); session->peer_outbox=NULL;
+    peer_guard_release(session->delivery_guard); session->delivery_guard=NULL;
 }
 
 static int peer_mesh_runtime_send(void *ctx,
@@ -3058,21 +3278,503 @@ static int peer_mesh_runtime_send(void *ctx,
                                                            target_client_name,
                                                            ST_MESSAGE_TYPE_PEER_CONTROL,
                                                            message);
-    int rc = packet.data != NULL && session_send_packet(target, &packet) == 0 ? 0 : -1;
+    int rc=peer_outbox_enqueue(target,&packet);
+    st_buffer_free(&packet);
     session_reference_release(target);
+    return rc==1?0:rc;
+}
+
+static int catalog_control_source_equal(const st_storage_control_source *a, const st_storage_control_source *b)
+{
+    return a->client_id==b->client_id && a->session_id==b->session_id
+        && !strncmp(a->tenant_id,b->tenant_id,sizeof(a->tenant_id))
+        && !strncmp(a->client_name,b->client_name,sizeof(a->client_name))
+        && !strncmp(a->channel_id,b->channel_id,sizeof(a->channel_id))
+        && !strncmp(a->token_hash,b->token_hash,sizeof(a->token_hash));
+}
+
+static int peer_catalog_capture(void *ctx, const char *path, const st_storage_client *hint,
+    long long expected_session, const st_storage_peer_catalog_source *expected, st_peer_mesh_catalog_binding *binding)
+{
+    (void)ctx;
+    if (binding==NULL) return -1;
+    memset(binding,0,sizeof(*binding));
+    if (path==NULL || hint==NULL || hint->id<=0) return -1;
+    pthread_mutex_lock(&active_session_lock);
+    specus_session *session=active_session_find_role_locked(hint->client_name,0);
+    int matches=session && session->bound && !atomic_load(&session->control_cancelled)
+        && !atomic_load(&session->nat_retired) && session->config.peer_service_discovery_version>=2
+        && session->config.client_id==hint->id && !strcmp(session->config.tenant_id,hint->tenant_id)
+        && !strcmp(session->config.database_path,path)
+        && (expected_session<=0 || session->config.client_session_id==expected_session);
+    if (matches && expected) matches=expected->guarded==session->config.client_session_db_backed
+        && (!expected->guarded || catalog_control_source_equal(&expected->control,&session->control_source_guard));
+    if (matches) {
+        ++session->references; binding->handle=session;
+        binding->authority.guarded=session->config.client_session_db_backed;
+        if (binding->authority.guarded) binding->authority.control=session->control_source_guard;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    return matches?0:1;
+}
+
+typedef struct {
+    specus_session *target; /* Borrowed until finish; caller still owns its capture reference. */
+    st_control_outbox_ticket *ticket;
+    peer_delivery_item *item; /* Ticket-owned; only inspect BEFORE consuming the ticket. */
+    uint8_t *frame;
+    size_t capacity;
+} peer_catalog_pending;
+
+static int peer_catalog_prepare(void *ctx, const st_peer_mesh_catalog_binding *publisher,
+    const st_peer_mesh_catalog_binding *recipient, size_t message_capacity, void **reservation)
+{
+    (void)ctx;
+    if (!reservation) return -1;
+    *reservation=NULL;
+    specus_session *target=recipient?recipient->handle:NULL;
+    specus_session *source=publisher?publisher->handle:NULL;
+    if (!target || !target->peer_outbox || !target->delivery_guard || (publisher && (!source || !source->delivery_guard))
+        || message_capacity > SIZE_MAX-1024U) return -1;
+    if (atomic_load(&target->control_cancelled)) return 1;
+    peer_catalog_pending *pending=calloc(1,sizeof(*pending));
+    peer_delivery_item *item=calloc(1,sizeof(*item));
+    if (!pending || !item) { free(pending); free(item); return -1; }
+    pending->target=target; pending->item=item; pending->capacity=message_capacity+1024U;
+    pending->frame=malloc(pending->capacity);
+    if (!pending->frame) { free(item); free(pending); return -1; }
+    if (source) { item->publisher=source->delivery_guard; peer_guard_retain(item->publisher); }
+    int rc=st_control_outbox_reserve(target->peer_outbox,pending->capacity,item,&pending->ticket);
+    if (rc!=0) {
+        peer_outbox_release(item); free(pending->frame); free(pending);
+        return atomic_load(&target->control_cancelled)?1:-1;
+    }
+    *reservation=pending;
+    return 0;
+}
+
+static int peer_catalog_stage(void *ctx, void *reservation, const char *message, int nonempty)
+{
+    (void)ctx; peer_catalog_pending *pending=reservation;
+    if (!pending || !message) return -1;
+    if (atomic_load(&pending->target->control_cancelled) || atomic_load(&pending->target->nat_retired)
+        || (nonempty && (!pending->item->publisher || atomic_load(&pending->item->publisher->cancelled)))) return 1;
+    size_t length=0;
+    if (st_protocol_encode_message_response_into("server",pending->target->config.client_name,
+            ST_MESSAGE_TYPE_PEER_CONTROL,message,pending->frame,pending->capacity,&length) != 0) return -1;
+    pending->item->needs_publisher=nonempty;
+    return st_control_outbox_stage(pending->ticket,pending->frame,length);
+}
+
+static int peer_catalog_finish(void *ctx, void *reservation, int commit)
+{
+    (void)ctx; peer_catalog_pending *pending=reservation;
+    if (!pending) return -1;
+    int cancelled=atomic_load(&pending->target->control_cancelled) || atomic_load(&pending->target->nat_retired)
+        || (pending->item->needs_publisher && (!pending->item->publisher || atomic_load(&pending->item->publisher->cancelled)));
+    int rc=0;
+    if (!commit || cancelled) { st_control_outbox_abort(pending->ticket); rc=cancelled?1:0; }
+    else rc=st_control_outbox_commit(pending->ticket);
+    free(pending->frame); free(pending);
     return rc;
+}
+
+static void peer_catalog_release(void *ctx, st_peer_mesh_catalog_binding *binding)
+{
+    (void)ctx;
+    if (binding==NULL) return;
+    session_reference_release(binding->handle);
+    memset(binding,0,sizeof(*binding));
+}
+
+static const st_peer_mesh_catalog_transport peer_catalog_transport={
+    .capture=peer_catalog_capture,.release=peer_catalog_release,
+    .prepare=peer_catalog_prepare,.stage=peer_catalog_stage,.finish=peer_catalog_finish
+};
+
+static int control_source_active(void *ctx)
+{
+    specus_session *session = ctx;
+    pthread_mutex_lock(&active_session_lock);
+    int current = session != NULL && session->bound && !session->is_data_connection
+        && !atomic_load(&session->control_cancelled);
+    pthread_mutex_unlock(&active_session_lock);
+    return current;
+}
+
+/* The lifecycle is held by the business worker, never by a heartbeat. Every database handle is
+ * closed before this returns or the caller waits for another lock. A name alone is not identity. */
+static void control_retire_native_source(specus_session *session)
+{
+    control_cancel(session);
+    pthread_mutex_lock(&active_session_lock);
+    if (session->displaced_reason == NULL) session->displaced_reason = "AUTH_SOURCE_RETIRED";
+    active_session_close_data_locked(session);
+    active_session_remove_locked(session);
+    retire_data_namespace(session);
+    pthread_mutex_unlock(&active_session_lock);
+    /* Interrupt only. The owning reader drains its worker and TLS/NAT resources before close;
+     * registry protection prevents shutting down a numeric descriptor already reused elsewhere. */
+    pthread_mutex_lock(&connection_registry_lock);
+    if (session->control_fd >= 0) shutdown(session->control_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&connection_registry_lock);
+}
+
+static int control_source_current(void *ctx)
+{
+    specus_session *session = ctx;
+    if (!control_source_active(session)) return 0;
+    if (!session->config.client_session_db_backed) return 1; /* Explicit trusted environment token. */
+    int rc = st_storage_control_source_validate(session->config.database_path, &session->control_source_guard);
+    if (rc == ST_STORAGE_CONTROL_SOURCE_RETIRED) control_retire_native_source(session);
+    return rc == 0 && control_source_active(session);
+}
+
+/* Rotate before releasing the registry. New arrivals append behind existing waiters, so even
+ * continuous admission cannot starve an old idle source. Selected objects remain referenced
+ * through validation and retirement, without retaining any registry/CID lock across SQLite. */
+static size_t control_source_watch_take(specus_session **selected)
+{
+    pthread_mutex_lock(&active_session_lock);
+    size_t count = source_watch_count < ST_STORAGE_CONTROL_SOURCE_BATCH
+        ? source_watch_count : ST_STORAGE_CONTROL_SOURCE_BATCH;
+    for (size_t i = 0; i < count; ++i) {
+        specus_session *session = source_watch_head;
+        source_watch_remove_locked(session);
+        source_watch_append_locked(session);
+        ++session->references;
+        selected[i] = session;
+    }
+    pthread_mutex_unlock(&active_session_lock);
+    return count;
+}
+
+static int control_source_watch_tick(const char *database_path)
+{
+    if (connection_registry_stopping()) return 0;
+    specus_session *selected[ST_STORAGE_CONTROL_SOURCE_BATCH];
+    st_storage_control_source guards[ST_STORAGE_CONTROL_SOURCE_BATCH];
+    int results[ST_STORAGE_CONTROL_SOURCE_BATCH];
+    size_t count = control_source_watch_take(selected);
+    for (size_t i = 0; i < count; ++i) guards[i] = selected[i]->control_source_guard;
+    int rc = st_storage_control_sources_validate(database_path, guards, count, results);
+    for (size_t i = 0; i < count; ++i) {
+        /* Disabled policy and database failure are not permanent epoch loss. No native query
+         * or lifecycle wait occurs here; exact referenced physical objects cannot alias a new FD. */
+        if (rc == 0 && results[i] == ST_STORAGE_CONTROL_SOURCE_RETIRED
+            && control_source_active(selected[i])) control_retire_native_source(selected[i]);
+        session_reference_release(selected[i]);
+    }
+    return rc;
+}
+
+/* A transient native read failure is not epoch loss. Retry promptly after a short outage,
+ * but back off to the ordinary cadence during a sustained one. Each attempt still pins at
+ * most 64 sources and keeps the same 25ms SQLite busy budget; no registry/CID lock spans SQL. */
+static unsigned int control_source_watch_wait_ms(int result, unsigned int *retry_ms)
+{
+    if (result == 0) { *retry_ms = 50U; return 1000U; }
+    unsigned int delay = *retry_ms;
+    *retry_ms = delay >= 500U ? 1000U : delay * 2U;
+    return delay;
+}
+
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t condition;
+    pthread_t thread;
+    int started;
+    int stop;
+    char database_path[512];
+} control_source_watch = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+static void *control_source_watch_thread(void *unused)
+{
+    (void)unused;
+    unsigned int delay_ms = 1000U, retry_ms = 50U;
+    pthread_mutex_lock(&control_source_watch.lock);
+    while (!control_source_watch.stop) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) break;
+        deadline.tv_sec += delay_ms / 1000U;
+        deadline.tv_nsec += (long)(delay_ms % 1000U) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000L; }
+        int rc = pthread_cond_timedwait(&control_source_watch.condition, &control_source_watch.lock, &deadline);
+        if (control_source_watch.stop) break;
+        if (rc != ETIMEDOUT) continue;
+        pthread_mutex_unlock(&control_source_watch.lock);
+        int result = control_source_watch_tick(control_source_watch.database_path);
+        pthread_mutex_lock(&control_source_watch.lock);
+        delay_ms = control_source_watch_wait_ms(result, &retry_ms);
+    }
+    pthread_mutex_unlock(&control_source_watch.lock);
+    return NULL;
+}
+
+static int control_source_watch_start(const char *database_path)
+{
+    pthread_mutex_lock(&control_source_watch.lock);
+    if (control_source_watch.started) { pthread_mutex_unlock(&control_source_watch.lock); return 0; }
+    pthread_condattr_t attributes;
+    int rc = pthread_condattr_init(&attributes);
+    if (rc == 0) {
+        rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+        if (rc == 0) rc = pthread_cond_init(&control_source_watch.condition, &attributes);
+        pthread_condattr_destroy(&attributes);
+    }
+    if (rc != 0) { pthread_mutex_unlock(&control_source_watch.lock); return -1; }
+    control_source_watch.stop = 0;
+    snprintf(control_source_watch.database_path, sizeof(control_source_watch.database_path), "%s", database_path);
+    rc = pthread_create(&control_source_watch.thread, NULL, control_source_watch_thread, NULL);
+    if (rc == 0) control_source_watch.started = 1;
+    else pthread_cond_destroy(&control_source_watch.condition);
+    pthread_mutex_unlock(&control_source_watch.lock);
+    return rc == 0 ? 0 : -1;
+}
+
+static void control_source_watch_stop(void)
+{
+    pthread_mutex_lock(&control_source_watch.lock);
+    int started = control_source_watch.started;
+    if (started) {
+        control_source_watch.stop = 1;
+        pthread_cond_broadcast(&control_source_watch.condition);
+    }
+    pthread_mutex_unlock(&control_source_watch.lock);
+    if (!started) return;
+    pthread_join(control_source_watch.thread, NULL);
+    pthread_mutex_lock(&control_source_watch.lock);
+    control_source_watch.started = 0;
+    control_source_watch.database_path[0] = '\0';
+    pthread_cond_destroy(&control_source_watch.condition);
+    pthread_mutex_unlock(&control_source_watch.lock);
 }
 
 static st_peer_mesh_runtime peer_mesh_runtime_for_session(specus_session *session)
 {
-    st_peer_mesh_runtime runtime;
+    st_peer_mesh_runtime runtime = {0};
     runtime.database_path = session->config.database_path;
     runtime.send = peer_mesh_runtime_send;
     runtime.online = peer_mesh_runtime_online;
     runtime.ctx = session;
     runtime.publisher_session_id = session->config.client_session_id;
     runtime.peer_service_discovery_version = session->config.peer_service_discovery_version;
+    runtime.authenticated_client_id = session->config.client_id;
+    runtime.authenticated_tenant = session->config.tenant_id;
+    runtime.source_active = control_source_active;
+    runtime.source_current = control_source_current;
+    runtime.control_source = session->config.client_session_db_backed ? &session->control_source_guard : NULL;
+    runtime.catalog_transport=&peer_catalog_transport;
+    runtime.catalog_transport_required=1;
     return runtime;
+}
+
+/* Reservations exist only for callers that are executing/waiting, not every idle connection.
+ * Saturation/OOM cannot make a caller run without a gate; cancelled queued work leaves promptly. */
+static st_control_lifecycle *control_lifecycle_wait(long long client_id, const atomic_int *cancelled,
+                                                   long long deadline_ms)
+{
+    for (;;) {
+        if ((cancelled != NULL && atomic_load(cancelled)) || (deadline_ms > 0 && control_monotonic_ms() >= deadline_ms)) return NULL;
+        st_control_lifecycle *gate = st_control_lifecycle_retain(client_id);
+        if (gate != NULL) {
+            if (st_control_lifecycle_lock(gate, cancelled, deadline_ms) == 0) return gate;
+            st_control_lifecycle_release(gate);
+            return NULL;
+        }
+        struct timespec delay = {0, 25L * 1000000L};
+        nanosleep(&delay, NULL);
+    }
+}
+
+static void control_lifecycle_done(st_control_lifecycle *gate)
+{
+    if (gate != NULL) { st_control_lifecycle_unlock(gate); st_control_lifecycle_release(gate); }
+}
+
+static void control_process_message(specus_session *session, st_message_response *message)
+{
+    if (message->message_type == ST_MESSAGE_TYPE_CLIENT_TO_CLIENT
+        && message->to_client_name != NULL && message->message != NULL) {
+        int admin = message_target_is_admin(message->to_client_name);
+        int rc = admin ? deliver_runtime_client_message_to_admin(session, message)
+            : forward_runtime_client_message(session, message);
+        printf("[message] client->%s %s source=%s target=%s\n", admin ? "admin" : "client",
+            rc == 0 ? "delivered" : "not-delivered", session->config.client_name, message->to_client_name);
+    } else if (message->message_type == ST_MESSAGE_TYPE_CLIENT_TO_SERVER) {
+        printf("[message] client->server source=%s bytes=%zu\n", session->config.client_name,
+            message->message == NULL ? 0U : strlen(message->message));
+    } else if (message->message_type == ST_MESSAGE_TYPE_PEER_CONTROL && message->message != NULL
+        && session->config.database_path[0] != '\0') {
+        st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
+        int rc = st_peer_mesh_handle_control(&runtime, session->config.client_name,
+            message->to_client_name, message->message);
+        if (rc == ST_STORAGE_CONTROL_SOURCE_RETIRED) control_retire_native_source(session);
+        else if (rc != 0) (void)control_source_current(session); /* Retire only a definitive lost native authority. */
+        printf("[peer-mesh] signal %s source=%s target=%s\n", rc == 0 ? "accepted" : "rejected",
+            session->config.client_name, message->to_client_name == NULL ? "" : message->to_client_name);
+    } else fprintf(stderr, "[message] unsupported type=%d source=%s target=%s\n", message->message_type,
+        session->config.client_name, message->to_client_name == NULL ? "" : message->to_client_name);
+}
+
+/* Called under control_queue_lock, including when discarding work on detach. */
+static void control_work_free_locked(specus_session *session, control_work_item *item)
+{
+    --session->control_work_count;
+    session->control_work_bytes -= item->charge;
+    control_work_bytes -= item->charge;
+    st_message_response_free(&item->message);
+    free(item);
+}
+
+/* Ready-list ownership, busy state and session lifetime are all protected by the queue mutex. */
+static void control_ready_remove_locked(specus_session *session)
+{
+    if (!session->control_work_queued) return;
+    if (session->control_ready_prev != NULL) session->control_ready_prev->control_ready_next = session->control_ready_next;
+    else control_ready_head = session->control_ready_next;
+    if (session->control_ready_next != NULL) session->control_ready_next->control_ready_prev = session->control_ready_prev;
+    else control_ready_tail = session->control_ready_prev;
+    session->control_ready_prev = session->control_ready_next = NULL;
+    session->control_work_queued = 0;
+}
+
+static void control_ready_schedule_locked(specus_session *session)
+{
+    if (session->control_work_busy || session->control_work_queued
+        || (!session->login_audit_pending && session->control_work_head == NULL)) return;
+    session->control_ready_prev = control_ready_tail;
+    if (control_ready_tail != NULL) control_ready_tail->control_ready_next = session;
+    else control_ready_head = session;
+    control_ready_tail = session;
+    session->control_work_queued = 1;
+    pthread_cond_signal(&control_ready_cond);
+}
+
+static void *control_business_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&control_queue_lock);
+        while (control_ready_head == NULL && !control_pool_stopping)
+            pthread_cond_wait(&control_ready_cond, &control_queue_lock);
+        if (control_ready_head == NULL && control_pool_stopping) {
+            pthread_mutex_unlock(&control_queue_lock);
+            break;
+        }
+        specus_session *session = control_ready_head;
+        control_ready_remove_locked(session);
+        session->control_work_busy = 1;
+        int login = session->login_audit_pending;
+        session->login_audit_pending = 0;
+        control_work_item *item = NULL;
+        if (!login && session->control_work_head != NULL) {
+            item = session->control_work_head;
+            session->control_work_head = item->next;
+            if (session->control_work_head == NULL) session->control_work_tail = NULL;
+        }
+        pthread_mutex_unlock(&control_queue_lock);
+        /* An actual accepted login is an audit event even if replaced before its worker runs.
+         * Cleanup waits for this job before stamping that record; no acceptance is silently lost. */
+        if (login) { record_login_success_event(session); record_client_online_milestone(session); }
+        st_control_lifecycle *gate = control_lifecycle_wait(session->config.client_id,
+            &session->control_cancelled, 0);
+        if (gate != NULL) {
+            if (control_source_current(session)) {
+                if (login) {
+                    push_routes_changed_during_login(session, session->login_route_generation);
+                    if (session->config.database_path[0] != '\0') {
+                        st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
+                        if (st_peer_mesh_push_on_login(&runtime, session->config.client_name) != 0)
+                            fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n", session->config.client_name);
+                    }
+                } else if (item != NULL) control_process_message(session, &item->message);
+            }
+            control_lifecycle_done(gate);
+        }
+        pthread_mutex_lock(&control_queue_lock);
+        if (item != NULL) control_work_free_locked(session, item);
+        session->control_work_busy = 0;
+        control_ready_schedule_locked(session);
+        pthread_cond_broadcast(&session->control_work_cond);
+        pthread_mutex_unlock(&control_queue_lock);
+    }
+    return NULL;
+}
+
+static int control_worker_start(specus_session *session)
+{
+    (void)session;
+    pthread_mutex_lock(&control_queue_lock);
+    while (!control_pool_stopping && control_pool_count < ST_CONTROL_POOL_SIZE) {
+        if (pthread_create(&control_pool[control_pool_count], NULL, control_business_worker, NULL) != 0) break;
+        ++control_pool_count;
+    }
+    int ready = !control_pool_stopping && control_pool_count > 0U;
+    pthread_mutex_unlock(&control_queue_lock);
+    return ready ? 0 : -1;
+}
+
+static void control_login_audit_enqueue(specus_session *session, unsigned long route_generation)
+{
+    pthread_mutex_lock(&control_queue_lock);
+    session->login_route_generation = route_generation;
+    session->login_audit_pending = 1;
+    control_ready_schedule_locked(session);
+    pthread_mutex_unlock(&control_queue_lock);
+}
+
+/* Takes ownership only on success. A queue includes its in-flight item in both slot and byte
+ * budgets; a blocked worker cannot replenish its budget by simply dequeuing more packets. */
+static int control_message_enqueue(specus_session *session, st_message_response *message)
+{
+    size_t charge = sizeof(control_work_item) + (message->client_name == NULL ? 0U : strlen(message->client_name) + 1U)
+        + (message->to_client_name == NULL ? 0U : strlen(message->to_client_name) + 1U)
+        + (message->message == NULL ? 0U : strlen(message->message) + 1U);
+    control_work_item *item = calloc(1, sizeof(*item));
+    if (item == NULL) return -1;
+    pthread_mutex_lock(&control_queue_lock);
+    if (session->control_work_stopping || session->control_work_count >= ST_CONTROL_WORK_ITEMS
+        || charge > ST_CONTROL_WORK_BYTES - session->control_work_bytes
+        || charge > ST_CONTROL_GLOBAL_WORK_BYTES - control_work_bytes) {
+        pthread_mutex_unlock(&control_queue_lock); free(item); return -1;
+    }
+    item->message = *message;
+    memset(message, 0, sizeof(*message));
+    item->charge = charge;
+    if (session->control_work_tail != NULL) session->control_work_tail->next = item;
+    else session->control_work_head = item;
+    session->control_work_tail = item;
+    ++session->control_work_count;
+    session->control_work_bytes += charge;
+    control_work_bytes += charge;
+    control_ready_schedule_locked(session);
+    pthread_mutex_unlock(&control_queue_lock);
+    return 0;
+}
+
+static void control_worker_stop(specus_session *session)
+{
+    control_cancel(session);
+    pthread_mutex_lock(&control_queue_lock);
+    session->control_work_stopping = 1;
+    control_work_item *item = session->control_work_head;
+    session->control_work_head = session->control_work_tail = NULL;
+    while (item != NULL) { control_work_item *next = item->next; control_work_free_locked(session, item); item = next; }
+    if (!session->login_audit_pending) control_ready_remove_locked(session);
+    else control_ready_schedule_locked(session);
+    while (session->control_work_busy || session->login_audit_pending || session->control_work_queued)
+        pthread_cond_wait(&session->control_work_cond, &control_queue_lock);
+    pthread_mutex_unlock(&control_queue_lock);
+}
+
+static void control_pool_stop(void)
+{
+    pthread_mutex_lock(&control_queue_lock);
+    control_pool_stopping = 1;
+    pthread_cond_broadcast(&control_ready_cond);
+    pthread_mutex_unlock(&control_queue_lock);
+    for (size_t i = 0; i < control_pool_count; ++i) pthread_join(control_pool[i], NULL);
 }
 
 /* The management API's PEER_CONTROL messages (a session it closed) go out like the runtime's own. */
@@ -3088,14 +3790,21 @@ static int push_runtime_peer_mesh_refresh(void *ctx, const char *tenant_id)
     if (config == NULL || config->database_path[0] == '\0'
         || tenant_id == NULL || *tenant_id == '\0') return -1;
     st_peer_mesh_runtime runtime = {
-        config->database_path,
-        peer_mesh_runtime_send,
-        peer_mesh_runtime_online,
-        NULL,
-        0,
-        2
+        .database_path = config->database_path,
+        .send = peer_mesh_runtime_send,
+        .online = peer_mesh_runtime_online,
+        .peer_service_discovery_version = 2,
+        .catalog_transport=&peer_catalog_transport,
+        .catalog_transport_required=1
     };
     return st_peer_mesh_refresh_tenant(&runtime, tenant_id);
+}
+
+static int queue_runtime_peer_client_deleted(void *ctx, const st_storage_client *client,
+                                             const st_storage_peer_close *closed, size_t closed_count)
+{
+    (void)ctx;
+    return st_peer_mesh_queue_client_deleted(client, closed, closed_count);
 }
 
 typedef struct {
@@ -3122,6 +3831,7 @@ static peer_mesh_maintenance_state peer_mesh_maintenance = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .condition = PTHREAD_COND_INITIALIZER
 };
+static st_peer_mesh_owner_cursor peer_owner_cursor;
 
 static time_t maintenance_interval_seconds(const char *name, long long fallback_ms)
 {
@@ -3173,14 +3883,20 @@ static void *peer_mesh_maintenance_thread(void *unused)
         if (peer_mesh_maintenance.stop) break;
         if (wait_rc != ETIMEDOUT) continue;
         st_peer_mesh_runtime runtime = {
-            peer_mesh_maintenance.database_path,
-            peer_mesh_runtime_send,
-            peer_mesh_runtime_online,
-            NULL,
-            0,
-            2
+            .database_path = peer_mesh_maintenance.database_path,
+            .send = peer_mesh_runtime_send,
+            .online = peer_mesh_runtime_online,
+            .peer_service_discovery_version = 2,
+            .catalog_transport=&peer_catalog_transport,
+            .catalog_transport_required=1
         };
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+        if (st_peer_mesh_drain_client_deletions(&runtime) != 0)
+            fprintf(stderr, "[peer-mesh] deleted client notification failed; retrying\n");
+        if (st_peer_mesh_drain_control_withdrawals(&runtime) != 0)
+            fprintf(stderr, "[peer-mesh] reconnect withdrawal failed; retained for retry\n");
+        if (peer_owner_cursor.initialized && st_peer_mesh_owner_changes_drain(&runtime, &peer_owner_cursor) != 0)
+            fprintf(stderr, "[peer-mesh] ownership-change notification failed; cursor retained for retry\n");
         st_admin_http_share_tick();
         time_t now = time(NULL);
         if (now >= peer_mesh_maintenance.next_catalog_expiry) {
@@ -3245,6 +3961,7 @@ static void *peer_mesh_maintenance_thread(void *unused)
 static int peer_mesh_maintenance_start(const char *database_path)
 {
     if (database_path == NULL || database_path[0] == '\0') return 0;
+    if (control_source_watch_start(database_path) != 0) return -1;
     pthread_mutex_lock(&peer_mesh_maintenance.lock);
     peer_mesh_maintenance.stop = 0;
     time_t now = time(NULL);
@@ -3266,6 +3983,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
     if (pthread_create(&peer_mesh_maintenance.thread, NULL,
                        peer_mesh_maintenance_thread, NULL) != 0) {
         pthread_mutex_unlock(&peer_mesh_maintenance.lock);
+        control_source_watch_stop();
         return -1;
     }
     peer_mesh_maintenance.started = 1;
@@ -3275,6 +3993,7 @@ static int peer_mesh_maintenance_start(const char *database_path)
 
 static void peer_mesh_maintenance_stop(void)
 {
+    control_source_watch_stop();
     pthread_mutex_lock(&peer_mesh_maintenance.lock);
     int started = peer_mesh_maintenance.started;
     peer_mesh_maintenance.stop = 1;
@@ -3296,34 +4015,17 @@ static void peer_mesh_maintenance_stop(void)
 }
 
 /*
- * Java ClientAuthService.closeStaleOnlineSessions: before the online-instance limits are counted,
- * a NETTY_ONLINE row of this credential whose session no bound control connection carries is
- * marked DISCONNECTED. Such a row is left by a disconnect whose DISCONNECTED write failed, and
- * would otherwise lock the machine user out until the next restart. Runs under
- * control_admission_lock, so a control that is still being admitted cannot be mistaken for stale.
+ * Before quota counts, recover positively dead physical owners. Local registry absence is not
+ * evidence of global death; another process may own this credential's other devices. Presence
+ * is held even between native ONLINE and local publication/audit, so admission gaps are protected.
  */
-static void close_stale_online_sessions(const char *database_path,
+static int close_stale_online_sessions(const char *database_path,
                                         long long credential_id,
                                         long long current_session_id,
                                         const char *now_text)
 {
-    long long ids[ST_MAX_STALE_SESSION_SCAN];
-    size_t id_count = 0U;
-    if (st_storage_list_online_session_ids_by_credential(database_path,
-                                                         credential_id,
-                                                         ids,
-                                                         ST_MAX_STALE_SESSION_SCAN,
-                                                         &id_count) != 0) {
-        return;
-    }
-    for (size_t i = 0; i < id_count; ++i) {
-        if (ids[i] == current_session_id || control_session_live(ids[i])) {
-            continue;
-        }
-        if (st_storage_mark_client_session_disconnected(database_path, ids[i], now_text) == 0) {
-            printf("[control] closed stale online session=%lld credential=%lld\n", ids[i], credential_id);
-        }
-    }
+    return st_storage_reap_dead_control_channels(database_path, credential_id, current_session_id,
+        now_text, "SOURCE_PROCESS_GONE", NULL);
 }
 
 static int verify_database_login(specus_session *session, const st_login_request *request, const char **reason)
@@ -3371,10 +4073,15 @@ static int verify_database_login(specus_session *session, const st_login_request
         pthread_mutex_lock(&active_session_lock);
         specus_session *control = active_session_find_role_locked(client.client_name, 0);
         int matching_control = control != NULL
-            && control->config.client_session_id == client_session.id;
+            && control->config.client_session_id == client_session.id
+            && control->config.client_id == client.id;
+        if (matching_control) {
+            session->data_control = control;
+            ++control->references;
+        }
         pthread_mutex_unlock(&active_session_lock);
         if (!matching_control) {
-            *reason = "数据连接未找到匹配的控制连接";
+            *reason = "数据连接要求控制连接先登录：未找到匹配的控制连接";
             return 0;
         }
     }
@@ -3423,8 +4130,10 @@ static int verify_database_login(specus_session *session, const st_login_request
     }
 
     int online_count = 0;
-    if (!session->is_data_connection) {
-        close_stale_online_sessions(config->database_path, client_session.credential_id, client_session.id, now_text);
+    if (!session->is_data_connection
+        && close_stale_online_sessions(config->database_path, client_session.credential_id, client_session.id, now_text) != 0) {
+        *reason = "客户端在线状态不可用";
+        return 0;
     }
     /* Both counts leave this session out: a re-login of the same session is the same instance
      * coming back, not "another" one, and activate_session() replaces its old connections. */
@@ -3456,20 +4165,7 @@ static int verify_database_login(specus_session *session, const st_login_request
         *reason = "在线实例数已达上限";
         return 0;
     }
-    if (!session->is_data_connection
-        && st_storage_mark_client_session_online(config->database_path,
-                                              client_session.id,
-                                              session->remote,
-                                              session->remote,
-                                              now_text) != 0) {
-        *reason = "客户端会话状态更新失败";
-        return 0;
-    }
     if (reload_config_for_client_session(config, &client_session, &client) != 0) {
-        /* A failed re-login must not take a session offline that an older control still carries. */
-        if (!session->is_data_connection && !control_session_live(client_session.id)) {
-            (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
-        }
         *reason = "客户端配置加载失败";
         return 0;
     }
@@ -3517,15 +4213,36 @@ static int verify_login(specus_session *session, const st_login_request *request
         specus_session *control = active_session_find_role_locked(request->client_name, 0);
         int matching_control = control != NULL
             && control->config.client_session_id == request->client_session_id;
+        if (matching_control) {
+            session->data_control = control;
+            ++control->references;
+        }
         pthread_mutex_unlock(&active_session_lock);
         if (!matching_control) {
-            *reason = "数据连接未找到匹配的控制连接";
+            *reason = "数据连接要求控制连接先登录：未找到匹配的控制连接";
             return 0;
         }
     }
 
     *reason = NULL;
     return 1;
+}
+
+/* Resolve a trusted immutable key with a CLOSED native read before waiting for its lifecycle.
+ * A second full login read below revalidates this result after acquisition. */
+static int control_login_key(specus_session *session, const st_login_request *request, long long *client_id)
+{
+    *client_id = session->config.client_id;
+    if (session->config.database_path[0] == '\0' || request->access_token == NULL
+        || *request->access_token == '\0' || request->client_session_id <= 0) return 0;
+    uint8_t hash[ST_SHA256_LEN]; char token_hash[65];
+    st_sha256((const uint8_t *)request->access_token, strlen(request->access_token), hash);
+    st_hex_encode(hash, sizeof(hash), token_hash);
+    st_storage_client_session native;
+    int rc = st_storage_get_client_session_for_login(session->config.database_path, request->client_session_id,
+        token_hash, &native);
+    if (rc == 0) *client_id = native.client_id;
+    return rc < 0 ? -1 : 0;
 }
 
 static void remote_text(const struct sockaddr_storage *remote, socklen_t remote_len, char *out, size_t out_len)
@@ -3611,11 +4328,6 @@ static int create_listener_on(const char *bind_address, int port)
         perror("bind/listen");
     }
     return fd;
-}
-
-static int create_listener(int port)
-{
-    return create_listener_on("0.0.0.0", port);
 }
 
 static void configure_control_socket(int fd, const server_config *config)
@@ -3982,7 +4694,7 @@ static void free_ws_conn(ws_conn *conn)
 static st_admin_direct_ws_stream *acquire_ws_stream(specus_session *session, uint32_t stream_id)
 {
     pthread_mutex_lock(&session->map_lock);
-    ws_conn *ws = find_ws_stream_locked(session, stream_id);
+    ws_conn *ws = atomic_load(&session->nat_retired) ? NULL : find_ws_stream_locked(session, stream_id);
     st_admin_direct_ws_stream *stream = ws == NULL ? NULL : ws->stream;
     st_admin_direct_ws_retain(stream);
     pthread_mutex_unlock(&session->map_lock);
@@ -4148,11 +4860,58 @@ static void close_conn_locked(external_conn *conn)
     pthread_mutex_unlock(&conn->write_lock);
     if (conn->fd >= 0) {
         shutdown(conn->fd, SHUT_RDWR);
-        close(conn->fd);
         conn->fd = -1;
     }
     release_external_count(conn);
     conn->done = 1;
+    if (conn->reader_finished && conn->writer_finished && conn->owned_fd >= 0) {
+        close(conn->owned_fd);
+        conn->owned_fd = -1;
+    }
+}
+
+/* The final worker releases the actual descriptor promptly, not at session teardown. Until then
+ * shutdown has made the socket unusable, but its number cannot be reused under another worker's
+ * already-captured fd. No registry/send/SQL work after acquiring this local map lock. */
+static void external_worker_finished(external_conn *conn, int writer)
+{
+    pthread_mutex_lock(&conn->session->map_lock);
+    if (writer) conn->writer_finished = 1;
+    else conn->reader_finished = 1;
+    if (conn->done && conn->reader_finished && conn->writer_finished && conn->owned_fd >= 0) {
+        close(conn->owned_fd);
+        conn->owned_fd = -1;
+    }
+    pthread_mutex_unlock(&conn->session->map_lock);
+}
+
+/* Called before a successor is published, and before teardown waits for retained HTTP callers.
+ * No blocking socket writes, SQL or thread joins under the registry lock. A listener's descriptor remains
+ * owned by its binder/accept thread: shutdown releases LISTEN without fd-reuse races. A binder
+ * already outside map_lock can finish bind, but the same lock forbids its subsequent listen.
+ * Closing each stream returns its quota exactly once, even if an old worker finally runs later. */
+static void retire_data_namespace(specus_session *session)
+{
+    if (!session->is_data_connection) return;
+    pthread_mutex_lock(&session->map_lock);
+    atomic_store(&session->nat_retired, 1);
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+        if (listener->fd >= 0) shutdown(listener->fd, SHUT_RDWR);
+    }
+    for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
+        close_conn_locked(conn);
+    }
+    ws_conn *ws = session->ws_conns;
+    session->ws_conns = NULL;
+    while (ws != NULL) {
+        ws_conn *next = ws->next;
+        st_stream_tombstones_add(&session->closed_streams, ws->stream_id);
+        st_admin_direct_ws_retire(ws->stream);
+        free_ws_conn(ws);
+        ws = next;
+    }
+    pthread_mutex_unlock(&session->map_lock);
+    direct_pending_fail_all(session, "data connection retired");
 }
 
 static void free_external_write_queue(external_conn *conn)
@@ -4395,6 +5154,7 @@ static void *external_writer_thread(void *arg)
         pthread_mutex_unlock(&session->map_lock);
         break;
     }
+    external_worker_finished(conn, 1);
     return NULL;
 }
 
@@ -4407,6 +5167,7 @@ static void *external_conn_thread(void *arg)
 
     if (send_open(session, conn->stream_id, conn->channel_id, conn->port) != 0) {
         mark_conn_done(conn);
+        external_worker_finished(conn, 0);
         return NULL;
     }
 
@@ -4454,6 +5215,7 @@ static void *external_conn_thread(void *arg)
     pthread_mutex_unlock(&session->map_lock);
     printf("[nat] external read side closed channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
+    external_worker_finished(conn, 0);
     return NULL;
 }
 
@@ -4468,6 +5230,7 @@ static int start_external_conn(specus_session *session,
         return -1;
     }
     conn->fd = fd;
+    conn->owned_fd = fd;
     conn->port = port;
     conn->session = session;
     conn->send_credit = ST_STREAM_INITIAL_WINDOW;
@@ -4485,7 +5248,7 @@ static int start_external_conn(specus_session *session,
     }
 
     pthread_mutex_lock(&session->map_lock);
-    if (try_count_external_connection(conn) != 0) {
+    if (atomic_load(&session->nat_retired) || try_count_external_connection(conn) != 0) {
         pthread_mutex_unlock(&session->map_lock);
         fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
                 port, session->config.client_name);
@@ -4510,6 +5273,8 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->writer_thread, NULL, external_writer_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        conn->reader_finished = 1;
+        conn->writer_finished = 1;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         return -1;
@@ -4518,6 +5283,7 @@ static int start_external_conn(specus_session *session,
     if (pthread_create(&conn->thread, NULL, external_conn_thread, conn) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
+        conn->reader_finished = 1;
         close_conn_locked(conn);
         pthread_mutex_unlock(&session->map_lock);
         pthread_join(conn->writer_thread, NULL);
@@ -4572,9 +5338,23 @@ static int listener_exists_locked(specus_session *session, int port)
     return 0;
 }
 
+/* Only for a candidate that never started an accept thread. Retirement visits the same list under
+ * map_lock, so removing it here transfers sole ownership back to the binder for immediate free. */
+static void remove_listener_candidate_locked(specus_session *session, specus_listener *candidate)
+{
+    specus_listener **cursor = &session->listeners;
+    while (*cursor != NULL) {
+        if (*cursor == candidate) {
+            *cursor = candidate->next;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
 static int start_specus_listener(specus_session *session, int port, char *reason, size_t reason_len)
 {
-    int fd = create_listener(port);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         snprintf(reason, reason_len, "port %d bind failed", port);
         return -1;
@@ -4591,7 +5371,7 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     listener->session = session;
 
     pthread_mutex_lock(&session->map_lock);
-    if (listener_exists_locked(session, port)) {
+    if (atomic_load(&session->nat_retired) || listener_exists_locked(session, port)) {
         pthread_mutex_unlock(&session->map_lock);
         close(fd);
         free(listener);
@@ -4602,13 +5382,32 @@ static int start_specus_listener(specus_session *session, int port, char *reason
     session->listeners = listener;
     pthread_mutex_unlock(&session->map_lock);
 
+    /* Publish ownership BEFORE bind, but never enter LISTEN after retirement. bind may finish
+     * late; SO_REUSEADDR permits the successor to bind/listen while this old candidate is paused
+     * before listen. Never close a descriptor under an in-flight bind or accept. */
+    int one = 1;
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
+                                  .sin_addr.s_addr = htonl(INADDR_ANY)};
+    int configured = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int bound = configured == 0 ? bind(fd, (struct sockaddr *)&address, sizeof(address)) : -1;
+    pthread_mutex_lock(&session->map_lock);
+    if (bound != 0 || atomic_load(&session->nat_retired) || listen(fd, 128) != 0) {
+        close(fd);
+        remove_listener_candidate_locked(session, listener);
+        pthread_mutex_unlock(&session->map_lock);
+        free(listener);
+        snprintf(reason, reason_len, "port %d bind failed or data connection retired", port);
+        return -1;
+    }
+    pthread_mutex_unlock(&session->map_lock);
+
     if (pthread_create(&listener->thread, NULL, listener_thread, listener) != 0) {
         perror("pthread_create");
         pthread_mutex_lock(&session->map_lock);
         close(listener->fd);
-        listener->fd = -1;
-        listener->done = 1;
+        remove_listener_candidate_locked(session, listener);
         pthread_mutex_unlock(&session->map_lock);
+        free(listener);
         snprintf(reason, reason_len, "failed to start listener thread");
         return -1;
     }
@@ -4623,8 +5422,6 @@ static void stop_specus_listener(specus_session *session, int port)
         if (!listener->done && listener->port == port) {
             if (listener->fd >= 0) {
                 shutdown(listener->fd, SHUT_RDWR);
-                close(listener->fd);
-                listener->fd = -1;
             }
             listener->done = 1;
         }
@@ -4874,6 +5671,7 @@ static int process_nat_message(specus_session *session, const st_nat_message *me
 
 static void session_shutdown(specus_session *session)
 {
+    retire_data_namespace(session);
     direct_pending_fail_all(session, "control connection closed");
 
     pthread_mutex_lock(&session->send_lock);
@@ -4895,8 +5693,6 @@ static void session_shutdown(specus_session *session)
     for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
-            close(listener->fd);
-            listener->fd = -1;
         }
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
@@ -4930,6 +5726,7 @@ static void session_shutdown(specus_session *session)
     external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
+        if (conn->owned_fd >= 0) close(conn->owned_fd);
         free_external_write_queue(conn);
         pthread_cond_destroy(&conn->flow_cond);
         pthread_mutex_destroy(&conn->flow_lock);
@@ -5012,6 +5809,8 @@ static void *client_thread(void *arg)
         return NULL;
     }
     session->control_fd = args->fd;
+    atomic_init(&session->nat_retired, 0);
+    atomic_init(&session->control_cancelled, 0);
     session->config = args->config;
     session->active = 1;
     session->references = 1U;
@@ -5020,19 +5819,50 @@ static void *client_thread(void *arg)
     pthread_mutex_init(&session->map_lock, NULL);
     pthread_mutex_init(&session->direct_lock, NULL);
     pthread_cond_init(&session->reference_cond, NULL);
+    pthread_cond_init(&session->control_work_cond, NULL);
     remote_text(&args->remote, args->remote_len, session->remote, sizeof(session->remote));
     free(args);
 
+    session->delivery_guard=peer_guard_create();
+    session->peer_outbox=st_control_outbox_channel_create(peer_outbox,session);
+    if (!session->delivery_guard || !session->peer_outbox) {
+        session_outbox_dispose(session);
+        close(session->control_fd);
+        pthread_mutex_destroy(&session->send_lock); pthread_mutex_destroy(&session->map_lock);
+        pthread_mutex_destroy(&session->direct_lock); pthread_cond_destroy(&session->reference_cond);
+        pthread_cond_destroy(&session->control_work_cond); free(session);
+        return NULL;
+    }
+
     if (connection_register(session) != 0) {
         /* Accepted just as the server began to stop: nothing was read, so nothing to record. */
+        session_outbox_dispose(session);
         close(session->control_fd);
         pthread_mutex_destroy(&session->send_lock);
         pthread_mutex_destroy(&session->map_lock);
         pthread_mutex_destroy(&session->direct_lock);
         pthread_cond_destroy(&session->reference_cond);
+        pthread_cond_destroy(&session->control_work_cond);
         free(session);
         return NULL;
     }
+    /* Register BEFORE entering OpenSSL: shutdown must await even a not-yet-authenticated
+     * reader before process-global crypto cleanup. An accept/probe can race immediate SIGTERM. */
+    uint8_t physical_random[16];
+    if (RAND_bytes(physical_random, sizeof(physical_random)) != 1) {
+        session_outbox_dispose(session);
+        session_shutdown(session);
+        connection_unregister(session);
+        pthread_mutex_destroy(&session->send_lock);
+        pthread_mutex_destroy(&session->map_lock);
+        pthread_mutex_destroy(&session->direct_lock);
+        pthread_cond_destroy(&session->reference_cond);
+        pthread_cond_destroy(&session->control_work_cond);
+        free(session);
+        return NULL;
+    }
+    memcpy(session->physical_channel_id, "c-", 2);
+    st_hex_encode(physical_random, sizeof(physical_random), session->physical_channel_id + 2);
     printf("[control] accepted %s\n", session->remote);
 
     if (st_tls_server_context_enabled(session->config.tls_context)) {
@@ -5043,12 +5873,14 @@ static void *client_thread(void *arg)
                                      tls_error,
                                      sizeof(tls_error)) != 0) {
             fprintf(stderr, "[tls] handshake rejected remote=%s: %s\n", session->remote, tls_error);
+            session_outbox_dispose(session);
             session_shutdown(session);
             connection_unregister(session);
             pthread_mutex_destroy(&session->send_lock);
             pthread_mutex_destroy(&session->map_lock);
             pthread_mutex_destroy(&session->direct_lock);
             pthread_cond_destroy(&session->reference_cond);
+            pthread_cond_destroy(&session->control_work_cond);
             free(session);
             return NULL;
         }
@@ -5133,11 +5965,67 @@ static void *client_thread(void *arg)
             size_t nat_control_tcp_routes = 0U;
             size_t nat_control_http_routes = 0U;
             size_t nat_control_json_bytes = 0U;
+            st_control_lifecycle *login_gate = NULL;
+            st_peer_mesh_control_transition *catalog_transition = NULL;
+            long long login_client_id = session->config.client_id;
+            int admission_allowed = 1;
             if (control_login) {
+                if (control_login_key(session, &request, &login_client_id) != 0
+                    || (login_gate = control_lifecycle_wait(login_client_id, &session->control_cancelled,
+                        control_monotonic_ms() + (long long)session->config.control_read_idle_seconds * 1000LL)) == NULL) {
+                    admission_allowed = 0;
+                    reason = "服务器繁忙：控制连接生命周期暂不可用，请稍后重试";
+                }
                 pthread_mutex_lock(&control_admission_lock);
             }
             unsigned long route_generation = atomic_load(&runtime_nat_control_generation);
-            logged_in = verify_login(session, &request, &reason);
+            logged_in = admission_allowed && verify_login(session, &request, &reason);
+            if (logged_in && control_login && session->config.client_id != login_client_id) {
+                logged_in = 0; reason = "客户端访问令牌无效";
+            }
+            if (logged_in && control_login && session->config.database_path[0] != '\0'
+                && st_control_presence_acquire(session->config.database_path, session->physical_channel_id,
+                    &session->control_presence) != 0) {
+                logged_in = 0; reason = "服务器暂不可用：控制连接归属登记失败";
+            }
+            if (logged_in && control_login && session->config.client_session_db_backed) {
+                st_storage_control_source *guard = &session->control_source_guard;
+                guard->client_id = session->config.client_id;
+                guard->session_id = session->config.client_session_id;
+                snprintf(guard->tenant_id, sizeof(guard->tenant_id), "%s", session->config.tenant_id);
+                snprintf(guard->client_name, sizeof(guard->client_name), "%s", session->config.client_name);
+                snprintf(guard->channel_id, sizeof(guard->channel_id), "%s", session->physical_channel_id);
+                st_hex_encode(session->config.access_token_hash, ST_SHA256_LEN, guard->token_hash);
+            }
+            if (logged_in && control_login && control_worker_start(session) != 0) {
+                logged_in = 0; reason = "服务器繁忙：控制连接处理器暂不可用，请稍后重试";
+            }
+            if (logged_in && control_login && session->config.client_session_db_backed) {
+                st_peer_mesh_runtime runtime = peer_mesh_runtime_for_session(session);
+                if (st_peer_mesh_control_connected_prepare(&runtime, session->config.client_name, &catalog_transition) != 0) {
+                    logged_in = 0; reason = "服务器繁忙：服务目录重连状态暂不可用，请稍后重试";
+                }
+            }
+            if (logged_in && control_login && session->config.client_session_db_backed) {
+                char connected_at[64];
+                if (current_utc_timestamp(connected_at) != 0
+                    || st_storage_mark_client_session_online(session->config.database_path,
+                        session->config.client_session_id, session->physical_channel_id,
+                        session->remote, connected_at) != 0) {
+                    logged_in = 0; reason = "服务器繁忙：客户端会话状态更新失败，请稍后重试";
+                }
+            }
+            if (logged_in && control_login) {
+                if (st_peer_mesh_control_connected_commit(catalog_transition) != 0) {
+                    logged_in = 0; reason = "服务器繁忙：服务目录重连状态提交失败，请稍后重试";
+                    if (session->config.client_session_db_backed) {
+                        char disconnected_at[64];
+                        if (current_utc_timestamp(disconnected_at) == 0)
+                            (void)st_storage_mark_client_session_disconnected_if_channel(session->config.database_path,
+                                session->config.client_session_id, session->physical_channel_id, disconnected_at, NULL);
+                    }
+                }
+            } else st_peer_mesh_control_connected_abort(catalog_transition);
             if (logged_in && control_login) {
                 nat_control = st_protocol_encode_nat_control(session->config.client_name,
                                                              session->config.nat_control_json);
@@ -5159,6 +6047,7 @@ static void *client_thread(void *arg)
             if (control_login) {
                 pthread_mutex_unlock(&control_admission_lock);
             }
+            control_lifecycle_done(login_gate);
             if (logged_in) {
                 login_test_gate_wait(session, "published");
             }
@@ -5198,8 +6087,8 @@ static void *client_thread(void *arg)
                    session->is_data_connection ? "data" : "control",
                    session->config.client_name, session->remote);
             if (!session->is_data_connection) {
-                record_login_success_event(session);
-                record_client_online_milestone(session);
+                (void)current_utc_timestamp(session->connected_at);
+                control_login_audit_enqueue(session, route_generation);
                 if (nat_control_rc != 0) {
                     /*
                      * The control socket has a write timeout, so a failed write may have left half a
@@ -5227,17 +6116,16 @@ static void *client_thread(void *arg)
                                              nat_control_http_routes, nat_control_json_bytes);
                 }
             }
-            push_routes_changed_during_login(session, route_generation);
-            if (!session->is_data_connection && session->config.database_path[0] != '\0') {
-                st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
-                if (st_peer_mesh_push_on_login(&peer_runtime, session->config.client_name) != 0) {
-                    fprintf(stderr, "[peer-mesh] login configuration push failed client=%s\n",
-                            session->config.client_name);
-                }
-            }
+            if (session->is_data_connection) push_routes_changed_during_login(session, route_generation);
             st_login_request_free(&request);
             continue;
         }
+
+        if (session->is_data_connection && !data_session_is_current(session)) {
+            free(body);
+            break;
+        }
+        if (!session->is_data_connection && !control_source_active(session)) { free(body); break; }
 
         if (header.command == ST_CMD_HEARTBEAT_REQUEST) {
             free(body);
@@ -5287,42 +6175,13 @@ static void *client_thread(void *arg)
                 break;
             }
             free(body);
-            if (message_request.message_type == ST_MESSAGE_TYPE_CLIENT_TO_CLIENT
-                && message_request.to_client_name != NULL
-                && message_request.message != NULL) {
-                int admin_target = message_target_is_admin(message_request.to_client_name);
-                int delivery_rc = admin_target
-                    ? deliver_runtime_client_message_to_admin(session, &message_request)
-                    : forward_runtime_client_message(session, &message_request);
-                printf("[message] client->%s %s source=%s target=%s\n",
-                       admin_target ? "admin" : "client",
-                       delivery_rc == 0 ? "delivered" : "not-delivered",
-                       session->config.client_name,
-                       message_request.to_client_name);
-            } else if (message_request.message_type == ST_MESSAGE_TYPE_CLIENT_TO_SERVER) {
-                printf("[message] client->server source=%s bytes=%zu\n",
-                       session->config.client_name,
-                       message_request.message == NULL ? 0U : strlen(message_request.message));
-            } else if (message_request.message_type == ST_MESSAGE_TYPE_PEER_CONTROL
-                       && message_request.message != NULL
-                       && session->config.database_path[0] != '\0') {
-                st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
-                int delivery_rc = st_peer_mesh_handle_control(&peer_runtime,
-                                                              session->config.client_name,
-                                                              message_request.to_client_name,
-                                                              message_request.message);
-                printf("[peer-mesh] signal %s source=%s target=%s\n",
-                       delivery_rc == 0 ? "accepted" : "rejected",
-                       session->config.client_name,
-                       message_request.to_client_name == NULL ? "" : message_request.to_client_name);
-            } else {
-                fprintf(stderr,
-                        "[message] unsupported type=%d source=%s target=%s\n",
-                        message_request.message_type,
-                        session->config.client_name,
-                        message_request.to_client_name == NULL ? "" : message_request.to_client_name);
-            }
+            int enqueued = control_message_enqueue(session, &message_request);
             st_message_response_free(&message_request);
+            if (enqueued != 0) {
+                fprintf(stderr, "[control] bounded business queue exceeded client=%s\n", session->config.client_name);
+                disconnect_reason = "IO_ERROR";
+                break;
+            }
             continue;
         }
 
@@ -5362,6 +6221,12 @@ static void *client_thread(void *arg)
 
     pthread_mutex_lock(&active_session_lock);
     const char *displaced_reason = session->displaced_reason;
+    if (session->data_control != NULL) {
+        specus_session *original_control = session->data_control;
+        session->data_control = NULL;
+        if (original_control->references > 1U) --original_control->references;
+        pthread_cond_broadcast(&original_control->reference_cond);
+    }
     /* A displaced control's data connection was retired with it, by the login that replaced it or
      * the admin who closed the client, and whatever of this client is still bound belongs to a
      * newer pair. A connection that never logged in owns no pair: its config still names the
@@ -5370,16 +6235,32 @@ static void *client_thread(void *arg)
         active_session_close_data_locked(session);
     }
     active_session_remove_locked(session);
+    retire_data_namespace(session);
+    pthread_mutex_unlock(&active_session_lock);
+    st_control_outbox_channel_close(session->peer_outbox);
+    /* Interrupt a blocked writer without waiting for send_lock. Only this owning reader closes
+     * the descriptor; registry shutdown uses the same lifetime fence against descriptor reuse. */
+    pthread_mutex_lock(&connection_registry_lock);
+    if (session->control_fd>=0) shutdown(session->control_fd,SHUT_RDWR);
+    pthread_mutex_unlock(&connection_registry_lock);
+    control_worker_stop(session);
+    pthread_mutex_lock(&active_session_lock);
     while (session->references > 1U) {
         pthread_cond_wait(&session->reference_cond, &active_session_lock);
     }
     pthread_mutex_unlock(&active_session_lock);
+    /* Captured producers have finished. Keep the channel allocated until here: a producer
+     * captured before detach may still reserve on the now-closed channel. */
+    st_control_outbox_channel_destroy(session->peer_outbox); session->peer_outbox=NULL;
     if (displaced_reason != NULL) {
         disconnect_reason = displaced_reason;
     } else if (connection_registry_stopping()) {
         disconnect_reason = "SERVER_SHUTDOWN";
     }
     if (logged_in && !session->is_data_connection) {
+        /* Acquire BEFORE admission: waiting for this client's prior business/cleanup must never
+         * serialize unrelated clients' authentication. Keep it through catalog withdrawal too. */
+        st_control_lifecycle *cleanup_gate = control_lifecycle_wait(session->config.client_id, NULL, 0);
         /*
          * The runtime session goes offline only if no other control carries it: after a re-login
          * of the same session the newer control does, and writing DISCONNECTED here would leave
@@ -5395,36 +6276,50 @@ static void *client_thread(void *arg)
             && session->config.client_session_id > 0) {
             char disconnected_at[64];
             if (current_utc_timestamp(disconnected_at) == 0) {
-                (void)st_storage_mark_client_session_disconnected(session->config.database_path,
-                                                                  session->config.client_session_id,
-                                                                  disconnected_at);
+                (void)st_storage_mark_client_session_disconnected_if_channel(session->config.database_path,
+                    session->config.client_session_id, session->physical_channel_id, disconnected_at, NULL);
             }
         }
         pthread_mutex_unlock(&control_admission_lock);
         if (session->config.database_path[0] != '\0') {
             st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+            int client_deleted = disconnect_reason != NULL && strcmp(disconnect_reason, "ADMIN_DELETED") == 0;
             /* The catalog is keyed by runtime session; a newer control of the same session owns it now. */
-            if (!session_still_live
+            if (!session_still_live && !client_deleted
                 && st_peer_mesh_handle_disconnect(&peer_runtime,
                                                   session->config.client_name) != 0) {
                 fprintf(stderr, "[peer-mesh] service catalog withdrawal failed client=%s\n",
                         session->config.client_name);
             }
-            /* After active_session_remove_locked above, so the rosters count it as offline; a
-             * client already back on a newer control is still online and is left alone. */
-            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0) {
-                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n",
-                        session->config.client_name);
-            }
         }
         record_session_disconnected_event(session, disconnect_reason);
+        control_lifecycle_done(cleanup_gate);
+        /* Roster-only publication takes the global Peer dispatcher, not this CID's lifecycle.
+         * It rechecks online after acquiring that dispatcher. A replacement already published is
+         * left alone; one published later queues its own current roster after this broadcast.
+         * Holding the CID here would turn unrelated slow publication into a reconnect outage. */
+        if (session->config.database_path[0] != '\0'
+            && (disconnect_reason == NULL || strcmp(disconnect_reason, "ADMIN_DELETED") != 0)) {
+            st_peer_mesh_runtime peer_runtime = peer_mesh_runtime_for_session(session);
+            if (st_peer_mesh_push_on_logout(&peer_runtime, session->config.client_name) != 0)
+                fprintf(stderr, "[peer-mesh] departure announcement failed client=%s\n", session->config.client_name);
+        }
     }
     session_shutdown(session);
+    if (session->control_presence) {
+        int unused = 0;
+        int forget = st_storage_control_channel_unused(session->config.database_path,
+            session->physical_channel_id, &unused) == 0 && unused;
+        st_control_presence_release(session->control_presence, forget);
+        session->control_presence = NULL;
+    }
     connection_unregister(session);
+    session_outbox_dispose(session);
     pthread_mutex_destroy(&session->send_lock);
     pthread_mutex_destroy(&session->map_lock);
     pthread_mutex_destroy(&session->direct_lock);
     pthread_cond_destroy(&session->reference_cond);
+    pthread_cond_destroy(&session->control_work_cond);
     free(session);
     return NULL;
 }
@@ -5541,6 +6436,15 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
+    /* Bookmark before any listener can accept a local client: every later committed
+     * event is consumed independently by this instance, even if another instance wrote it. */
+    /* DB-less Redis discovery/TLS and disabled Peer Mesh must not acquire a new
+     * storage dependency just because ownership transfers now have a journal. */
+    if (config.database_path[0] != '\0' && env_bool("SPECUS_PEER_MESH_ENABLED", 0)
+        && st_peer_mesh_owner_changes_init(config.database_path, &peer_owner_cursor) != 0) {
+        fprintf(stderr, "ownership-change journal initialization failed\n");
+        config_release_routes(&config); st_public_discovery_shutdown(); return 1;
+    }
     st_stun_turn_server *stun_turn_server = NULL;
     if (env_bool("SPECUS_PEER_MESH_ENABLED", 0)) {
         if (st_stun_turn_server_start(&stun_turn_server) != 0) {
@@ -5602,6 +6506,7 @@ int main(void)
     st_admin_set_client_runtime_status_handler(get_client_runtime_status, NULL);
     st_admin_set_client_message_handler(push_runtime_client_message, NULL);
     st_admin_set_peer_mesh_refresh_handler(push_runtime_peer_mesh_refresh, &config);
+    st_admin_set_peer_client_deleted_handler(queue_runtime_peer_client_deleted, NULL);
     st_admin_set_peer_control_send_handler(push_runtime_peer_control, NULL);
     st_admin_set_client_disconnect_handler(close_client_connections, NULL);
     st_admin_set_external_connection_stats_handler(external_connection_stats, NULL);
@@ -5639,8 +6544,9 @@ int main(void)
         st_public_discovery_shutdown();
         return 1;
     }
-    if (peer_mesh_maintenance_start(config.database_path) != 0) {
-        fprintf(stderr, "Peer Mesh catalog maintenance failed to start\n");
+    if (peer_outbox_start() != 0 || peer_mesh_maintenance_start(config.database_path) != 0) {
+        fprintf(stderr, "Peer Mesh outbox/catalog maintenance failed to start\n");
+        (void)st_control_outbox_destroy(peer_outbox); peer_outbox=NULL;
         st_admin_set_nat_control_handler(NULL, NULL);
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
@@ -5664,6 +6570,7 @@ int main(void)
         perror("control listener");
         shutdown_wake_close(shutdown_pipe);
         peer_mesh_maintenance_stop();
+        (void)st_control_outbox_destroy(peer_outbox); peer_outbox=NULL;
         st_admin_set_nat_control_handler(NULL, NULL);
         st_admin_set_client_runtime_status_handler(NULL, NULL);
         st_admin_set_client_message_handler(NULL, NULL);
@@ -5752,6 +6659,7 @@ int main(void)
     fflush(stdout);
     close(listener);
     size_t unfinished = close_live_connections_and_wait(ST_SHUTDOWN_DRAIN_SECONDS);
+    if (unfinished == 0U) control_pool_stop();
     if (unfinished > 0U) {
         fprintf(stderr, "[server] %zu connection(s) did not finish within %d s\n",
                 unfinished, ST_SHUTDOWN_DRAIN_SECONDS);
@@ -5760,10 +6668,8 @@ int main(void)
         char stopped_at[64];
         if (current_utc_timestamp(stopped_at) == 0) {
             int swept = 0;
-            (void)st_storage_close_open_connections(config.database_path, "SERVER_SHUTDOWN", stopped_at, &swept);
-            if (unfinished > 0U) {
-                (void)st_storage_close_client_sessions_by_status(config.database_path, "NETTY_ONLINE", stopped_at);
-            }
+            (void)st_storage_reap_dead_control_channels(config.database_path, 0, 0,
+                stopped_at, "SERVER_SHUTDOWN", &swept);
             printf("[server] stopped: %zu connection(s) unfinished, %d open connection record(s) swept\n",
                    unfinished, swept);
         }
@@ -5773,6 +6679,7 @@ int main(void)
     st_elasticsearch_traffic_shutdown();
     shutdown_wake_close(shutdown_pipe);
     peer_mesh_maintenance_stop();
+    if (unfinished==0U && st_control_outbox_destroy(peer_outbox)==0) peer_outbox=NULL;
     st_admin_set_nat_control_handler(NULL, NULL);
     st_admin_set_client_runtime_status_handler(NULL, NULL);
     st_admin_set_client_message_handler(NULL, NULL);

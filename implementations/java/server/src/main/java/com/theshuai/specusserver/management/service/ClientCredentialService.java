@@ -4,6 +4,7 @@ import com.theshuai.specusserver.config.ClientAuthProperties;
 import com.theshuai.specusserver.management.model.ClientCredential;
 import com.theshuai.specusserver.management.repository.ClientCredentialRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import org.springframework.stereotype.Service;
@@ -18,11 +19,14 @@ import java.util.UUID;
 public class ClientCredentialService {
     private final ClientCredentialRepository repository;
     private final ClientAuthProperties properties;
+    private final ManagementWriteAuthority authority;
 
     public ClientCredentialService(ClientCredentialRepository repository,
-                                   ClientAuthProperties properties) {
+                                   ClientAuthProperties properties,
+                                   ManagementWriteAuthority authority) {
         this.repository = repository;
         this.properties = properties;
+        this.authority = authority;
     }
 
     @Transactional(readOnly = true)
@@ -42,6 +46,7 @@ public class ClientCredentialService {
 
     @Transactional
     public CredentialResult create(TenantContext tenant, CredentialMutation request) {
+        authority.reserveWriter();
         String apiKey = StringUtils.hasText(request.apiKey())
                 ? normalizeApiKey(request.apiKey())
                 : "ck_" + UUID.randomUUID().toString().replace("-", "");
@@ -66,6 +71,7 @@ public class ClientCredentialService {
 
     @Transactional
     public CredentialResult create(ManagementContext context, CredentialMutation request) {
+        context = authority.current(context);
         String apiKey = StringUtils.hasText(request.apiKey())
                 ? normalizeApiKey(request.apiKey())
                 : "ck_" + UUID.randomUUID().toString().replace("-", "");
@@ -91,13 +97,14 @@ public class ClientCredentialService {
 
     @Transactional
     public CredentialResult update(TenantContext tenant, long id, CredentialMutation request) {
-        ClientCredential credential = repository.findByIdAndTenantId(id, tenant.tenantId())
+        ClientCredential credential = repository.lockCurrent(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("credential not found: " + id));
         return updateCredential(credential, request);
     }
 
     @Transactional
     public CredentialResult update(ManagementContext context, long id, CredentialMutation request) {
+        context = authority.current(context);
         ClientCredential credential = findCredential(context, id);
         return updateCredential(credential, request);
     }
@@ -129,21 +136,20 @@ public class ClientCredentialService {
 
     @Transactional
     public void delete(TenantContext tenant, long id) {
-        ClientCredential credential = repository.findByIdAndTenantId(id, tenant.tenantId())
+        ClientCredential credential = repository.lockCurrent(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("credential not found: " + id));
         repository.delete(credential);
     }
 
     @Transactional
     public void delete(ManagementContext context, long id) {
+        context = authority.current(context);
         repository.delete(findCredential(context, id));
     }
 
     private ClientCredential findCredential(ManagementContext context, long id) {
-        return (context.isAdmin()
-                ? repository.findByIdAndTenantId(id, context.tenant().tenantId())
-                : repository.findByIdAndTenantIdAndOwnerUsername(
-                        id, context.tenant().tenantId(), context.username()))
+        return repository.lockCurrent(id, context.tenant().tenantId())
+                .filter(credential -> context.isAdmin() || context.username().equals(credential.getOwnerUsername()))
                 .orElseThrow(() -> new IllegalArgumentException("credential not found: " + id));
     }
 

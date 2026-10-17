@@ -9,7 +9,7 @@ import org.springframework.data.repository.query.Param;
 import java.util.List;
 import java.util.Optional;
 
-public interface ClientSessionRepository extends JpaRepository<ClientSession, Long> {
+public interface ClientSessionRepository extends JpaRepository<ClientSession, Long>, ClientSessionRepositoryCustom {
     Optional<ClientSession> findByTokenHash(String tokenHash);
 
     long countByCredentialIdAndStatus(Long credentialId, String status);

@@ -4,6 +4,7 @@ package session
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,16 +30,83 @@ type Registry struct {
 	data     map[string]Session
 	closedAt map[string]time.Time
 	changed  chan struct{}
+	// Fixed stripes bound memory independently of attacker-controlled client names. These
+	// leases never hold mu: lifecycle work may query storage and send to other sessions.
+	controlLeases [256]chan struct{}
 }
 
 // NewRegistry builds an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{
+	registry := &Registry{
 		controls: make(map[string]Session),
 		data:     make(map[string]Session),
 		closedAt: make(map[string]time.Time),
 		changed:  make(chan struct{}),
 	}
+	for i := range registry.controlLeases {
+		registry.controlLeases[i] = make(chan struct{}, 1)
+		registry.controlLeases[i] <- struct{}{}
+	}
+	return registry
+}
+
+// AcquireControlLease serializes control replacement, report admission, companion data
+// attachment and teardown for one canonical client name. Waiting is cancellable/bounded by
+// the caller; unlike mu, this lease may span DB work. Release is idempotent.
+func (r *Registry) AcquireControlLease(ctx context.Context, name string) (func(), error) {
+	return r.AcquireControlLeases(ctx, name)
+}
+
+func controlLeaseIndex(name string) int {
+	hash := uint32(2166136261)
+	for i := 0; i < len(name); i++ {
+		hash = (hash ^ uint32(name[i])) * 16777619
+	}
+	return int(hash % 256)
+}
+
+// AcquireControlLeases obtains the distinct stripes in one global order. Callers must not
+// already hold a control lease: acquiring a second endpoint after holding the first would
+// deadlock opposite-direction signals, and two different names can share one stripe.
+// No registry mutex is held during waiting, DB work or socket writes.
+func (r *Registry) AcquireControlLeases(ctx context.Context, names ...string) (func(), error) {
+	seen := make(map[int]bool, len(names))
+	indices := make([]int, 0, len(names))
+	for _, name := range names {
+		index := controlLeaseIndex(name)
+		if !seen[index] {
+			seen[index] = true
+			indices = append(indices, index)
+		}
+	}
+	sort.Ints(indices)
+	held := make([]int, 0, len(indices))
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			for i := len(held) - 1; i >= 0; i-- {
+				r.controlLeases[held[i]] <- struct{}{}
+			}
+		})
+	}
+	for _, index := range indices {
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			release()
+			return nil, ctx.Err()
+		case <-r.controlLeases[index]:
+			held = append(held, index)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 // Replace binds session under its client name, returning any previously bound session that
@@ -109,6 +177,23 @@ func (r *Registry) FindData(name string) (Session, bool) {
 	defer r.mu.Unlock()
 	session, ok := r.data[name]
 	return session, ok
+}
+
+// CurrentDataControl snapshots the pairing under the short registry mutex, without
+// waiting on control lifecycle work or holding that mutex across any stream I/O.
+// Namespace retirement must still guard work that outlives this admission snapshot.
+func (r *Registry) CurrentDataControl(data Session) (Session, bool) {
+	if data == nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name := data.ClientName()
+	if r.data[name] != data {
+		return nil, false
+	}
+	control, ok := r.controls[name]
+	return control, ok
 }
 
 // WaitForDataReconnect blocks until the named data connection is registered or the

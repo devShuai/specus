@@ -94,6 +94,10 @@ func (db *DB) listPeerMeshDevices(ctx context.Context, query string, args ...any
 }
 
 func (db *DB) InsertPeerMeshDevice(ctx context.Context, device PeerMeshDevice) error {
+	return db.insertPeerMeshDeviceOn(ctx, db.sql, device)
+}
+
+func (db *DB) insertPeerMeshDeviceOn(ctx context.Context, runner sqlRunner, device PeerMeshDevice) error {
 	query := db.rebind(`INSERT INTO peer_mesh_device
 		(id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
 		 public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
@@ -101,7 +105,7 @@ func (db *DB) InsertPeerMeshDevice(ctx context.Context, device PeerMeshDevice) e
 		 virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		 last_seen_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query,
+	_, err := runner.ExecContext(ctx, query,
 		device.ID, defaultTenant(device.TenantID), defaultOwner(device.OwnerUsername),
 		device.ClientID, device.ClientName, device.VirtualIP, device.CIDR,
 		device.PublicKey, device.NatType, device.NatMappingBehavior, device.NatFilteringBehavior,
@@ -113,13 +117,17 @@ func (db *DB) InsertPeerMeshDevice(ctx context.Context, device PeerMeshDevice) e
 }
 
 func (db *DB) UpdatePeerMeshDevice(ctx context.Context, device PeerMeshDevice) error {
+	return db.updatePeerMeshDeviceOn(ctx, db.sql, device)
+}
+
+func (db *DB) updatePeerMeshDeviceOn(ctx context.Context, runner sqlRunner, device PeerMeshDevice) error {
 	query := db.rebind(`UPDATE peer_mesh_device SET owner_username = ?, client_name = ?, virtual_ip = ?,
 		cidr = ?, public_key = ?, nat_type = ?, nat_mapping_behavior = ?,
 		nat_filtering_behavior = ?, nat_behavior_discovery = ?, last_endpoint = ?, virtual_device_mode = ?,
 		virtual_device_name = ?, virtual_device_status = ?, virtual_device_error = ?,
 		virtual_device_updated_at = ?, enabled = ?, last_seen_at = ?, updated_at = ?
 		WHERE id = ?`)
-	_, err := db.sql.ExecContext(ctx, query,
+	_, err := runner.ExecContext(ctx, query,
 		defaultOwner(device.OwnerUsername), device.ClientName, device.VirtualIP, device.CIDR,
 		device.PublicKey, device.NatType, device.NatMappingBehavior, device.NatFilteringBehavior,
 		device.NatBehaviorDiscovery, device.LastEndpoint, device.VirtualDeviceMode,
@@ -219,12 +227,16 @@ func (db *DB) GetPeerMeshACL(ctx context.Context, id int64) (*PeerMeshACL, error
 // ---- peer mesh sessions --------------------------------------------------------------
 
 func (db *DB) InsertPeerMeshSession(ctx context.Context, session PeerMeshSession) error {
+	return db.insertPeerMeshSessionOn(ctx, db.sql, session)
+}
+
+func (db *DB) insertPeerMeshSessionOn(ctx context.Context, runner sqlRunner, session PeerMeshSession) error {
 	query := db.rebind(`INSERT INTO peer_mesh_session
 		(id, tenant_id, source_client_id, source_client_name, target_client_id, target_client_name,
 		 path_type, status, token_hash, started_at, updated_at, expires_at, closed_at,
 		 rtt_millis, local_endpoint, remote_endpoint, direct_bytes, relay_bytes, last_traffic_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query,
+	_, err := runner.ExecContext(ctx, query,
 		session.ID, defaultTenant(session.TenantID), session.SourceClientID, session.SourceClientName,
 		session.TargetClientID, session.TargetClientName, session.PathType, session.Status,
 		session.TokenHash, formatTime(session.StartedAt), formatTime(session.UpdatedAt),
@@ -234,15 +246,39 @@ func (db *DB) InsertPeerMeshSession(ctx context.Context, session PeerMeshSession
 	return err
 }
 
+// ErrPeerMeshSessionClosed prevents late path/traffic/relay activation snapshots from reviving
+// a grant closed by another transaction. A repeated close remains idempotent.
+var ErrPeerMeshSessionClosed = errors.New("peer session is already closed")
+
 func (db *DB) UpdatePeerMeshSession(ctx context.Context, session PeerMeshSession) error {
 	query := db.rebind(`UPDATE peer_mesh_session SET path_type = ?, status = ?, updated_at = ?,
 		expires_at = ?, closed_at = ?, rtt_millis = ?, local_endpoint = ?, remote_endpoint = ?,
-		direct_bytes = ?, relay_bytes = ?, last_traffic_at = ? WHERE id = ?`)
-	_, err := db.sql.ExecContext(ctx, query,
+		direct_bytes = ?, relay_bytes = ?, last_traffic_at = ? WHERE id = ? AND UPPER(status) <> 'CLOSED'`)
+	result, err := db.sql.ExecContext(ctx, query,
 		session.PathType, session.Status, formatTime(session.UpdatedAt), formatTime(session.ExpiresAt),
 		nullableTime(session.ClosedAt), session.RTTMillis, session.LocalEndpoint, session.RemoteEndpoint,
 		session.DirectBytes, session.RelayBytes, nullableTime(session.LastTrafficAt), session.ID)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 0 {
+		return err
+	}
+	// MySQL can report zero for an unchanged OPEN row. Do not mistake changed-rows=0 for
+	// absence/closure. A current CLOSED row, however, must never accept a stale update.
+	var status string
+	err = db.sql.QueryRowContext(ctx, db.rebind(`SELECT status FROM peer_mesh_session WHERE id = ?`), session.ID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(status, "CLOSED") && !strings.EqualFold(session.Status, "CLOSED") {
+		return ErrPeerMeshSessionClosed
+	}
+	return nil
 }
 
 func (db *DB) GetPeerMeshSession(ctx context.Context, id int64) (*PeerMeshSession, error) {

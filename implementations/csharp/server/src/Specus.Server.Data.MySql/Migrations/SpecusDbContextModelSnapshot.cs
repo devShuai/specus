@@ -359,6 +359,95 @@ namespace Specus.Server.Data.MySql.Migrations
                     b.ToTable("specus_client_identity", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.ClientOwnerTransferAudit", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<string>("Actor")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("actor");
+
+                    b.Property<long?>("CredentialId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("credential_id");
+
+                    b.Property<string>("DetailJson")
+                        .IsRequired()
+                        .HasColumnType("longtext")
+                        .HasColumnName("detail_json");
+
+                    b.Property<string>("OccurredAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("occurred_at");
+
+                    b.Property<long>("PathId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("path_id");
+
+                    b.Property<string>("Scope")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("varchar(32)")
+                        .HasColumnName("scope");
+
+                    b.Property<string>("TargetUsername")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("target_username");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "Id")
+                        .HasDatabaseName("idx_owner_transfer_audit_tenant");
+
+                    b.ToTable("client_owner_transfer_audit", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ClientOwnerTransferReceipt", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("id");
+
+                    b.Property<long>("EventId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("event_id");
+
+                    b.Property<string>("NodeId")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("varchar(32)")
+                        .HasColumnName("node_id");
+
+                    b.Property<string>("ProcessedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("processed_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NodeId", "EventId")
+                        .IsUnique()
+                        .HasDatabaseName("idx_owner_transfer_receipt_node_event");
+
+                    b.ToTable("client_owner_transfer_receipt", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.ClientSession", b =>
                 {
                     b.Property<long>("Id")
@@ -1349,8 +1438,8 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("varchar(64)")
+                        .HasMaxLength(256)
+                        .HasColumnType("varchar(256)")
                         .HasColumnName("password_hash");
 
                     b.Property<string>("ResendAvailableAt")
@@ -1431,8 +1520,8 @@ namespace Specus.Server.Data.MySql.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("varchar(64)")
+                        .HasMaxLength(256)
+                        .HasColumnType("varchar(256)")
                         .HasColumnName("password_hash");
 
                     b.Property<string>("Role")

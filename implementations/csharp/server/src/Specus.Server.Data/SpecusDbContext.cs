@@ -17,6 +17,8 @@ public sealed class SpecusDbContext : DbContext
 
     public DbSet<ClientAccount> ClientAccounts => Set<ClientAccount>();
     public DbSet<ClientCredential> ClientCredentials => Set<ClientCredential>();
+    public DbSet<ClientOwnerTransferAudit> ClientOwnerTransferAudits => Set<ClientOwnerTransferAudit>();
+    public DbSet<ClientOwnerTransferReceipt> ClientOwnerTransferReceipts => Set<ClientOwnerTransferReceipt>();
     public DbSet<ClientAuthNonce> ClientAuthNonces => Set<ClientAuthNonce>();
     public DbSet<WebSocketTicket> WebSocketTickets => Set<WebSocketTicket>();
     public DbSet<ClientIdentity> ClientIdentities => Set<ClientIdentity>();
@@ -132,6 +134,35 @@ public sealed class SpecusDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_specus_client_tenant");
             b.HasIndex(x => new { x.TenantId, x.OwnerUsername }).HasDatabaseName("idx_specus_client_owner");
+        });
+
+        modelBuilder.Entity<ClientOwnerTransferAudit>(b =>
+        {
+            b.ToTable("client_owner_transfer_audit");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").HasMaxLength(40).HasConversion(iso).IsRequired();
+            b.Property(x => x.Actor).HasColumnName("actor").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(32).IsRequired();
+            b.Property(x => x.PathId).HasColumnName("path_id").IsRequired();
+            b.Property(x => x.TargetUsername).HasColumnName("target_username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.CredentialId).HasColumnName("credential_id");
+            b.Property(x => x.DetailJson).HasColumnName("detail_json").IsRequired();
+            if (Database.ProviderName == "MySql.EntityFrameworkCore")
+                b.Property(x => x.DetailJson).HasColumnType("longtext");
+            b.HasIndex(x => new { x.TenantId, x.Id }).HasDatabaseName("idx_owner_transfer_audit_tenant");
+        });
+
+        modelBuilder.Entity<ClientOwnerTransferReceipt>(b =>
+        {
+            b.ToTable("client_owner_transfer_receipt");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasMaxLength(80).ValueGeneratedNever();
+            b.Property(x => x.NodeId).HasColumnName("node_id").HasMaxLength(32).IsRequired();
+            b.Property(x => x.EventId).HasColumnName("event_id").IsRequired();
+            b.Property(x => x.ProcessedAt).HasColumnName("processed_at").HasMaxLength(40).HasConversion(iso).IsRequired();
+            b.HasIndex(x => new { x.NodeId, x.EventId }).IsUnique().HasDatabaseName("idx_owner_transfer_receipt_node_event");
         });
 
         modelBuilder.Entity<ClientCredential>(b =>
@@ -271,7 +302,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.LoginName).HasColumnName("login_name").HasMaxLength(80);
             b.Property(x => x.LoginNameNormalized).HasColumnName("login_name_normalized").HasMaxLength(80);
             b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
-            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(256).IsRequired();
             b.Property(x => x.OidcIssuer).HasColumnName("oidc_issuer").HasMaxLength(255);
             b.Property(x => x.OidcSubject).HasColumnName("oidc_subject").HasMaxLength(255);
             b.Property(x => x.OidcIdentityKey).HasColumnName("oidc_identity_key").HasMaxLength(64);
@@ -315,7 +346,7 @@ public sealed class SpecusDbContext : DbContext
                 .IsRequired();
             b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
             b.Property(x => x.Email).HasColumnName("email").HasMaxLength(254).IsRequired();
-            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64)
+            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(256)
                 .IsRequired();
             b.Property(x => x.CodeHash).HasColumnName("code_hash").HasMaxLength(64).IsRequired();
             b.Property(x => x.AttemptsRemaining).HasColumnName("attempts_remaining").IsRequired();

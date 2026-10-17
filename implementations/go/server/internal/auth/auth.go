@@ -39,6 +39,7 @@ type Session struct {
 	ID                 int64
 	TenantID           string
 	CredentialID       int64
+	IdentityID         int64
 	ClientID           int64
 	ClientName         string
 	MachineFingerprint string
@@ -106,6 +107,25 @@ func (s *SessionStore) SetHTTPRouteCapability(sessionID int64, version int) {
 		}
 	}
 	s.mu.Unlock()
+}
+
+// HTTP login binds the persisted identity before publishing its newly issued token.
+func (s *SessionStore) BindIdentityID(sessionID, identityID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if identityID <= 0 {
+		return false
+	}
+	if hash, ok := s.tokenHashBySessionID[sessionID]; ok {
+		item := s.byTokenHash[hash]
+		if item.IdentityID != 0 {
+			return item.IdentityID == identityID
+		}
+		item.IdentityID = identityID
+		s.byTokenHash[hash] = item
+		return true
+	}
+	return false
 }
 
 // Discard removes a session that was registered in memory but whose persistence failed. Without it
@@ -180,6 +200,23 @@ func (s *SessionStore) MarkOnline(sessionID int64) {
 
 func (s *SessionStore) MarkDisconnected(sessionID int64) {
 	s.updateStatus(sessionID, StatusDisconnected)
+}
+
+// A replacement transport for the same authenticated session is not another online instance.
+// Compute both quota counts from one snapshot, without subtracting a stale cached status.
+func (s *SessionStore) onlineCountsExcluding(current Session) (machine, credential int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, candidate := range s.byTokenHash {
+		if candidate.ID == current.ID || candidate.CredentialID != current.CredentialID || candidate.Status != StatusNettyOnline {
+			continue
+		}
+		credential++
+		if candidate.MachineFingerprint == current.MachineFingerprint && candidate.OSUser == current.OSUser {
+			machine++
+		}
+	}
+	return
 }
 
 func (s *SessionStore) CountOnlineByMachineUser(credentialID int64, machineFingerprint, osUser string) int {
@@ -378,14 +415,14 @@ func (a *Authenticator) authenticate(ctx context.Context, request protocol.Login
 		if !dataConnection {
 			a.closeStaleOnlineSessions(ctx, session)
 		}
-		if !dataConnection && a.sessions.CountOnlineByMachineUser(session.CredentialID, session.MachineFingerprint, session.OSUser) >=
-			a.perMachineUserMaxInstances {
+		machineCount, credentialCount := a.sessions.onlineCountsExcluding(session)
+		if !dataConnection && machineCount >= a.perMachineUserMaxInstances {
 			return Result{Reason: "同一台机器和用户已经有在线实例", Account: account}, nil
 		}
 		// maxOnlineInstances == 0 表示拒绝所有登录（与 Java ClientAuthService.isOnlineLimitExceeded
 		// 一致：online >= 0 恒为真）。不做 > 0 守卫，确保 0 语义为"拒绝全部"。
 		if !dataConnection &&
-			a.sessions.CountOnlineByCredential(session.CredentialID) >= credential.MaxOnlineInstances {
+			credentialCount >= credential.MaxOnlineInstances {
 			return Result{Reason: "在线实例数已达上限", Account: account}, nil
 		}
 	}
@@ -412,11 +449,22 @@ func (a *Authenticator) closeStaleOnlineSessions(ctx context.Context, current Se
 		return
 	}
 	for _, candidate := range a.sessions.FindOnlineByCredential(current.CredentialID) {
-		if _, bound := a.registry.Find(candidate.ClientName); bound {
+		// Do not classify the DB-online/registry-publication interval of a login as stale.
+		leaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		release, err := a.registry.AcquireControlLease(leaseCtx, candidate.ClientName)
+		cancel()
+		if err != nil {
 			continue
 		}
-		a.sessions.MarkDisconnected(candidate.ID)
-		_ = a.db.MarkClientSessionDisconnected(ctx, candidate.ID, StatusDisconnected, a.now())
+		bound, found := a.registry.Find(candidate.ClientName)
+		if identified, ok := bound.(interface{ ClientSessionID() int64 }); ok && identified.ClientSessionID() != candidate.ID {
+			found = false
+		}
+		if !found {
+			a.sessions.MarkDisconnected(candidate.ID)
+			_ = a.db.MarkClientSessionDisconnected(ctx, candidate.ID, StatusDisconnected, a.now())
+		}
+		release()
 	}
 }
 

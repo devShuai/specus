@@ -685,6 +685,7 @@ CREATE TABLE IF NOT EXISTS management_workbench_item (
   PRIMARY KEY (tenant_id, username, list, kind, object_id),
   KEY idx_mwi_object (tenant_id, kind, object_id),
   KEY idx_mwi_list_at (list, at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Opt-in product metrics (protocol/spec/product-metrics.md): a per-tenant switch, per-account
 -- onboarding progress kept only for the 14-day window, and two daily counter tables without any
@@ -759,4 +760,25 @@ CREATE TABLE IF NOT EXISTS http_access_audit (
   detail_json VARCHAR(512) NOT NULL,
   KEY idx_http_access_audit_route (tenant_id, route_id, id),
   KEY idx_http_access_audit_at (occurred_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_audit (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  occurred_at VARCHAR(40) NOT NULL,
+  actor VARCHAR(120) NOT NULL,
+  scope VARCHAR(32) NOT NULL,
+  path_id BIGINT NOT NULL,
+  target_username VARCHAR(120) NOT NULL,
+  credential_id BIGINT,
+  detail_json LONGTEXT NOT NULL,
+  KEY idx_owner_transfer_tenant_at (tenant_id, occurred_at, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_receipt (
+  id VARCHAR(200) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+  node_id VARCHAR(80) COLLATE utf8mb4_bin NOT NULL,
+  event_id BIGINT NOT NULL,
+  processed_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uq_owner_transfer_receipt_node_event (node_id, event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

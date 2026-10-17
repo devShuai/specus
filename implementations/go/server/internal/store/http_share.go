@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 )
 
 // Temporary HTTP shares (protocol/spec/temporary-http-share.md). Times are integer epoch seconds:
@@ -527,11 +528,37 @@ func (db *DB) UpdateClientAudited(ctx context.Context, account ClientAccount, ol
 // the routes' active shares, all in one transaction.
 func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, now int64,
 	exposure func(HTTPRouteMapping) string) ([]string, error) {
+	return db.deleteClientAudited(ctx, id, actor, now, exposure, nil)
+}
+
+// DeleteClientAuditedWithPeerSessions also returns the sessions closed in the transaction.
+// Callers must not evict caches or notify peers unless this returns without error.
+func (db *DB) DeleteClientAuditedWithPeerSessions(ctx context.Context, id int64, actor string, now int64,
+	exposure func(HTTPRouteMapping) string) ([]string, []PeerMeshSession, error) {
+	var closed []PeerMeshSession
+	revoked, err := db.deleteClientAudited(ctx, id, actor, now, exposure, &closed)
+	if err != nil {
+		return nil, nil, err
+	}
+	return revoked, closed, nil
+}
+
+func (db *DB) deleteClientAudited(ctx context.Context, id int64, actor string, now int64,
+	exposure func(HTTPRouteMapping) string, closed *[]PeerMeshSession) ([]string, error) {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	revoked, err := db.deleteClientAuditedOn(ctx, tx, id, actor, now, exposure, closed)
+	if err != nil {
+		return nil, err
+	}
+	return revoked, tx.Commit()
+}
+
+func (db *DB) deleteClientAuditedOn(ctx context.Context, tx *sql.Tx, id int64, actor string, now int64,
+	exposure func(HTTPRouteMapping) string, closed *[]PeerMeshSession) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, db.rebind(`SELECT id FROM http_route_mapping WHERE client_id = ? ORDER BY id`), id)
 	if err != nil {
 		return nil, err
@@ -578,6 +605,13 @@ func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, n
 	if err := deleteClientWorkbenchReferences(ctx, db, tx, id); err != nil {
 		return nil, err
 	}
+	closedSessions, err := db.deleteClientPeerReferences(ctx, tx, id, time.Unix(now, 0).UTC())
+	if err != nil {
+		return nil, err
+	}
+	if closed != nil {
+		*closed = closedSessions
+	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
 			return nil, err
@@ -586,7 +620,7 @@ func (db *DB) DeleteClientAudited(ctx context.Context, id int64, actor string, n
 	if _, err := tx.ExecContext(ctx, db.rebind(`DELETE FROM specus_client_account WHERE id = ?`), id); err != nil {
 		return nil, err
 	}
-	return revoked, tx.Commit()
+	return revoked, nil
 }
 
 // UpdateManagementUserAudited updates a user and, in the same transaction, revokes the user's own
@@ -622,11 +656,27 @@ func (db *DB) UpdateManagementUserAudited(ctx context.Context, user ManagementUs
 // by login name, which is unique only inside the tenant.
 func (db *DB) DeleteManagementUserAudited(ctx context.Context, user ManagementUser, actor string, now int64,
 	lapse ShareLapseFunc) ([]string, error) {
-	tx, err := db.sql.BeginTx(ctx, nil)
+	tx, err := db.beginClientOwnershipWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	current, err := db.lockManagementUserKey(ctx, tx, user.TenantID, user.AccountKey)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.Username != user.Username {
+		return nil, ErrNotFound
+	}
+	revoked, err := db.deleteManagementUserAuditedOn(ctx, tx, *current, actor, now, lapse)
+	if err != nil {
+		return nil, err
+	}
+	return revoked, tx.Commit()
+}
+
+func (db *DB) deleteManagementUserAuditedOn(ctx context.Context, tx *sql.Tx, user ManagementUser, actor string, now int64,
+	lapse ShareLapseFunc) ([]string, error) {
 	// An account that still owns clients or credentials is refused; the rest of what its identity
 	// owns goes or changes hands with it (management-accounts.md section 7.1).
 	if err := db.forgetAccountDataOn(ctx, tx, user, actor); err != nil {
@@ -645,7 +695,7 @@ func (db *DB) DeleteManagementUserAudited(ctx context.Context, user ManagementUs
 	if err != nil {
 		return nil, err
 	}
-	return revoked, tx.Commit()
+	return revoked, nil
 }
 
 // SweepHTTPShares records each expiry once (stamped with expiresAt, in expiry order), revokes

@@ -23,6 +23,7 @@ internal sealed class RemotePortServer : IAsyncDisposable
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         _listener = new TcpListener(IPAddress.Any, _port);
         _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _listener.Start(backlog: 8192);
@@ -75,7 +76,19 @@ internal sealed class RemotePortServer : IAsyncDisposable
                 // Best effort, same as the control listener.
             }
 
-            _ = Task.Run(() => _accepted(socket, token), token);
+            // Once accepted, this process owns the socket even if cancellation races with
+            // dispatch. A cancelled Task.Run(token) could silently discard its only closer.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    if (!token.IsCancellationRequested)
+                        await _accepted(socket, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch (Exception ex) { _logger.LogDebug(ex, "external connection handler stopped on port {Port}", _port); }
+                finally { socket.Dispose(); }
+            });
         }
     }
 }

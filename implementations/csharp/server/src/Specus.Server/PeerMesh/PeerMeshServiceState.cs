@@ -11,6 +11,18 @@ namespace Specus.Server.PeerMesh;
 /// </summary>
 public sealed class PeerMeshServiceState
 {
+    internal ConcurrentDictionary<long, PeerMeshService.RelayAuthorization> RelayAuthorizations { get; } = new();
+    internal ConcurrentDictionary<long, long> PendingRelayBytes { get; } = new();
+    internal long RelayGeneration;
+
+    internal void InvalidateRelayAuthorizations()
+    {
+        Interlocked.Increment(ref RelayGeneration);
+        RelayAuthorizations.Clear();
+    }
+
+    internal ConcurrentQueue<PendingPeerClientDeletion> ClientDeletions { get; } = new();
+    internal SemaphoreSlim ClientDeletionDispatchGate { get; } = new(1, 1);
     internal ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), PeerMeshServiceCatalogSnapshot>
         ServiceCatalogs { get; } = new();
 
@@ -34,6 +46,21 @@ public sealed class PeerMeshServiceState
     internal ConcurrentDictionary<long, ConcurrentQueue<long>> EgressReportWindows { get; } = new();
 
     private long _egressRevisions;
+    private long _serviceCatalogSequence;
+
+    // Shared across scoped service instances and retained after session cleanup. The client
+    // report revision is only an input dedupe cursor, never an output ordering authority.
+    internal long NextServiceCatalogRevision(long previous)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _serviceCatalogSequence);
+            var floor = Math.Max(current, previous);
+            if (floor == long.MaxValue) throw new InvalidOperationException("service catalog sequence exhausted");
+            var next = floor + 1;
+            if (Interlocked.CompareExchange(ref _serviceCatalogSequence, next, current) == current) return next;
+        }
+    }
 
     /// <summary>
     /// Bumped on every egress push so a client can ignore a snapshot it has already applied.
@@ -43,4 +70,5 @@ public sealed class PeerMeshServiceState
 
 internal sealed record PeerMeshServiceCatalogSnapshot(long Revision, string InstanceId,
     DateTimeOffset GeneratedAt, DateTimeOffset ExpiresAt, IReadOnlyList<AdvertisedService> Services,
-    string PublisherClientName, IReadOnlyList<PeerServiceStats> Stats, IReadOnlyList<PeerMdnsCandidate> Mdns);
+    string PublisherClientName, IReadOnlyList<PeerServiceStats> Stats, IReadOnlyList<PeerMdnsCandidate> Mdns,
+    string? PublisherChannelId = null);

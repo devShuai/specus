@@ -7,6 +7,22 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
+func TestRuntimeIdentityBindingCannotBeReassignedAfterTokenIssuance(t *testing.T) {
+	sessions := NewSessionStore()
+	item := sessions.CreateForClient(storeAccount(), 7, "machine", "alice", time.Hour)
+	if !sessions.BindIdentityID(item.ID, 81) || !sessions.BindIdentityID(item.ID, 81) || sessions.BindIdentityID(item.ID, 82) || sessions.BindIdentityID(item.ID, 0) {
+		t.Fatal("runtime identity can be rebound")
+	}
+	current, ok := sessions.Find(item.ID, item.AccessToken)
+	if !ok || current.IdentityID != 81 || current.CredentialID != 7 {
+		t.Fatal("original token identity was not retained")
+	}
+	sessions.Discard(item.ID)
+	if sessions.BindIdentityID(item.ID, 81) {
+		t.Fatal("discarded runtime identity resurrected")
+	}
+}
+
 // A login registers the session in memory before it can be persisted. If the row never lands, the
 // in-memory token must not stay usable — otherwise a failed login still yields working credentials.
 func TestDiscardRemovesAnUnpersistedSession(t *testing.T) {

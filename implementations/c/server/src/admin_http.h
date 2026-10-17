@@ -62,6 +62,9 @@ typedef struct {
      * ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED.
      */
     void (*bind_cancel)(void *ctx, void (*cancel)(void *cancel_ctx), void *cancel_ctx);
+    /* Optional, nonblocking and non-reentrant: abort an unfinished browser exchange when its
+     * DATA namespace retires. Called only while the forwarder still owns this sink/context. */
+    void (*on_link_lost)(void *ctx);
 } st_admin_direct_http_sink;
 
 /*
@@ -165,6 +168,8 @@ typedef int (*st_admin_client_message_handler)(void *ctx,
                                                const char *message);
 typedef int (*st_admin_peer_mesh_refresh_handler)(void *ctx,
                                                   const char *tenant_id);
+typedef int (*st_admin_peer_client_deleted_handler)(void *ctx, const st_storage_client *client,
+                                                    const st_storage_peer_close *closed, size_t closed_count);
 /*
  * Sends one PEER_CONTROL message from "server" to a client's control connection; -1 when the client
  * is not online. The management API uses it to tell both ends of a session it closed.
@@ -258,6 +263,7 @@ void st_admin_set_client_runtime_status_handler(st_admin_client_runtime_status_h
                                                 void *ctx);
 void st_admin_set_client_message_handler(st_admin_client_message_handler handler, void *ctx);
 void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler handler, void *ctx);
+void st_admin_set_peer_client_deleted_handler(st_admin_peer_client_deleted_handler handler, void *ctx);
 void st_admin_set_peer_control_send_handler(st_admin_peer_control_send_handler handler, void *ctx);
 void st_admin_set_client_disconnect_handler(st_admin_client_disconnect_handler handler, void *ctx);
 void st_admin_set_external_connection_stats_handler(st_admin_external_connection_stats_handler handler,
@@ -345,6 +351,9 @@ void st_admin_direct_ws_peer_reset(st_admin_direct_ws_stream *stream);
 int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32_t credit);
 /* The control connection is gone: the browser is closed with 1001 and the socket is dropped. */
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream);
+/* Irreversibly cut a retired DATA namespace without waiting for a blocked browser writer.
+ * Best-effort nonblocking CLOSE 1001 when uncontended; otherwise abort the transport. */
+void st_admin_direct_ws_retire(st_admin_direct_ws_stream *stream);
 void st_admin_direct_ws_retain(st_admin_direct_ws_stream *stream);
 void st_admin_direct_ws_release(st_admin_direct_ws_stream *stream);
 

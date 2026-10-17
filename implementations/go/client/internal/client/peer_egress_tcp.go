@@ -310,10 +310,29 @@ func (c *tcpConn) reset(output *tcpOutput) {
 	output.Reset = true
 }
 
+// canReopen conservatively separates incarnations without requiring TCP timestamps.
+func (c *tcpConn) canReopen(syn tcpSegment) bool {
+	distance := syn.Seq - c.rcvNxt
+	return c.state == tcpStateTimeWait && syn.has(tcpFlagSYN) &&
+		syn.Flags&(tcpFlagACK|tcpFlagRST|tcpFlagFIN) == 0 && len(syn.Payload) == 0 &&
+		distance > tcpReceiveWindow && distance < 0x80000000
+}
+
+func (c *tcpConn) nextIncarnationSequence(entropy uint32) uint32 {
+	return c.sndNxt + tcpReceiveWindow + 1 + (entropy & 0x3fffffff)
+}
+
 // onSegment feeds one inbound segment through the state machine.
 func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 	var output tcpOutput
 	if c.state == tcpStateClosed {
+		return output
+	}
+	if c.state == tcpStateTimeWait {
+		// Reopening is authorized by the runtime; old traffic must not destroy TIME_WAIT.
+		if !segment.has(tcpFlagRST) && (segment.has(tcpFlagSYN) || segment.has(tcpFlagFIN) || len(segment.Payload) != 0) {
+			c.ack(&output, now)
+		}
 		return output
 	}
 	// Any segment proves the consumer is still there, so the probe run restarts. The idle clock
@@ -340,6 +359,10 @@ func (c *tcpConn) onSegment(segment tcpSegment, now time.Time) tcpOutput {
 	}
 
 	if segment.has(tcpFlagSYN) && c.state != tcpStateSynReceived {
+		if !seqInWindow(segment.Seq, c.rcvNxt, c.rcvWnd) {
+			c.ack(&output, now)
+			return output
+		}
 		// A SYN inside an established flow is either a stale duplicate or an attack; RFC 793 says
 		// answer with a reset rather than silently re-handshaking.
 		c.reset(&output)

@@ -2,25 +2,18 @@ package com.theshuai.specusserver.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
-import com.theshuai.common.protocol.MessageType;
-import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.specusserver.management.model.ClientAccount;
-import com.theshuai.specusserver.management.model.ClientSession;
-import com.theshuai.specusserver.management.repository.ClientSessionRepository;
 import com.theshuai.specusserver.management.service.ClientAccountService;
-import com.theshuai.specusserver.management.service.ClientAuthService;
-import com.theshuai.specusserver.session.SessionUtil;
+import com.theshuai.specusserver.management.service.ManagementMessageRelayService;
+import com.theshuai.specusserver.management.service.ManagementMessageAuthority;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
-import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,22 +27,16 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
     private final ClientAccountService clientAccountService;
-    private final ClientSessionRepository clientSessionRepository;
+    private final ManagementMessageRelayService relay;
     private final Map<String, Set<WebSocketSession>> adminSessions = new ConcurrentHashMap<>();
-    /** Checks the identity again once the session is registered; absent only in isolated unit tests. */
+    /** Fast handshake check; the publisher also locks and revalidates identity for every message. */
     private final ManagementWebSocketIdentity identity;
 
     public ClientMessagesWebSocketHandler(ClientAccountService clientAccountService,
-                                          ClientSessionRepository clientSessionRepository) {
-        this(clientAccountService, clientSessionRepository, null);
-    }
-
-    @Autowired
-    public ClientMessagesWebSocketHandler(ClientAccountService clientAccountService,
-                                          ClientSessionRepository clientSessionRepository,
+                                          ManagementMessageRelayService relay,
                                           ManagementWebSocketIdentity identity) {
         this.clientAccountService = clientAccountService;
-        this.clientSessionRepository = clientSessionRepository;
+        this.relay = relay;
         this.identity = identity;
     }
 
@@ -59,10 +46,23 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         // Tomcat/Spring otherwise defaults to a much smaller text-message buffer.
         session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
         session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
+        var resolved = identity.resolve(session.getAttributes()).orElse(null);
+        if (resolved == null) {
+            session.close(CloseStatus.POLICY_VIOLATION.withReason(ManagementWebSocketIdentity.REVOKED));
+            return;
+        }
+        // Canonicalize and pin legacy UID-less tickets once, before registration. Never resolve
+        // this connection again by a reusable login name at message publication time.
+        var attributes = session.getAttributes();
+        attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_USER, resolved.username());
+        attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID, resolved.tenant().tenantId());
+        attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN, resolved.isAdmin());
+        if (resolved.accountKey() == null) attributes.remove(WebSocketTicketHandshakeInterceptor.ATTR_ACCOUNT_KEY);
+        else attributes.put(WebSocketTicketHandshakeInterceptor.ATTR_ACCOUNT_KEY, resolved.accountKey());
         adminSessions.computeIfAbsent(adminSessionKey(session), ignored -> ConcurrentHashMap.newKeySet()).add(session);
         // Registered first, checked second: a revocation that committed before this check is seen
         // here, one that commits after it finds the session (management-accounts.md 7.2).
-        if (identity != null && !identity.current(session.getAttributes())) {
+        if (!identity.current(session.getAttributes())) {
             unregister(session);
             session.close(CloseStatus.POLICY_VIOLATION.withReason(ManagementWebSocketIdentity.REVOKED));
             return;
@@ -109,50 +109,20 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         }
 
         ClientAccount target = clientAccountService.findClientByName(toClientName).orElse(null);
-        if (target == null || !target.isEnabled() || !canAccess(session, target)) {
+        if (target == null) {
             sendError(session, "target-not-found", command);
             return;
         }
-        if (!targetCanReceiveMessage(target)) {
-            sendError(session, "target-cannot-receive-message", command);
-            return;
-        }
-        Channel channel = SessionUtil.getChannel(target.getClientName());
-        if (channel == null || !SessionUtil.hasLogin(channel)) {
-            sendError(session, "target-offline", command);
-            return;
-        }
-
-        MessageResponsePacket packet = new MessageResponsePacket();
-        packet.setClientName("admin:" + attr(session, WebSocketTicketHandshakeInterceptor.ATTR_USER));
-        packet.setToClientName(target.getClientName());
-        packet.setMessageType(MessageType.CLIENT_TO_CLIENT);
-        packet.setMessage(body);
-        channel.writeAndFlush(packet).addListener(future -> {
-            try {
-                if (future.isSuccess()) {
-                    send(session, Map.of(
-                            "type", "written",
-                            "messageId", command.messageId() == null ? "" : command.messageId(),
-                            "toClientName", target.getClientName(),
-                            "message", body));
-                    return;
-                }
-                log.warn("admin client-message delivery failed: target={}, reason={}",
-                        target.getClientName(),
-                        future.cause() == null ? "unknown" : future.cause().getMessage());
-                send(session, Map.of(
-                        "type", "failed",
-                        "messageId", command.messageId() == null ? "" : command.messageId(),
-                        "error", "target-write-failed"));
-            } catch (Exception e) {
-                log.debug("admin client-message status write failed: target={}, reason={}",
-                        target.getClientName(), e.getMessage());
-            }
-        });
+        try { relay.toClient(session, target, body, command.messageId()); }
+        catch (ManagementMessageAuthority.Denied revoked) {
+            unregister(session); session.close(CloseStatus.POLICY_VIOLATION.withReason(ManagementWebSocketIdentity.REVOKED));
+        } catch (IllegalArgumentException invalid) { sendError(session, "message-too-large", command); }
+        catch (IllegalStateException busy) { sendError(session, "server-busy", command); }
     }
 
-    public boolean deliverFromClient(ClientAccount source, String targetAdminName, String body) {
+    /** Returns queue acceptance, not a delivery acknowledgement. The actual receiving identity
+     * and current resource ownership are checked independently at publication for each tab. */
+    public boolean deliverFromClient(ClientAccount source, String targetAdminName, String body, Channel incoming) {
         String username = normalizeAdminTarget(targetAdminName);
         if (source == null || username.isBlank() || body == null || body.isBlank()) {
             return false;
@@ -161,13 +131,6 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         if (sessions == null || sessions.isEmpty()) {
             return false;
         }
-        Map<String, Object> payload = Map.of(
-                "type", "message",
-                "direction", "in",
-                "fromClientName", source.getClientName(),
-                "toClientName", "admin:" + username,
-                "message", body,
-                "createdAt", Instant.now().toString());
         boolean delivered = false;
         for (WebSocketSession session : sessions) {
             if (!session.isOpen()) {
@@ -175,7 +138,7 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
                 continue;
             }
             try {
-                send(session, payload);
+                relay.fromClient(session, source, incoming, body);
                 delivered = true;
             } catch (Exception e) {
                 log.warn("client-message websocket delivery failed: source={}, admin={}, reason={}",
@@ -203,24 +166,6 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
                 log.debug("client-message websocket close failed: {}", e.getMessage());
             }
         }
-    }
-
-    private boolean targetCanReceiveMessage(ClientAccount target) {
-        List<ClientSession> sessions = clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
-                target.getTenantId(),
-                List.of(target.getId()),
-                ClientAuthService.STATUS_NETTY_ONLINE);
-        return sessions.stream().anyMatch(ClientSession::isMessageReceiveCapable);
-    }
-
-    private boolean canAccess(WebSocketSession session, ClientAccount target) {
-        String tenantId = attr(session, WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID);
-        boolean admin = Boolean.TRUE.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN));
-        String username = attr(session, WebSocketTicketHandshakeInterceptor.ATTR_USER);
-        if (!target.getTenantId().equals(tenantId)) {
-            return false;
-        }
-        return admin || username.equals(target.getOwnerUsername());
     }
 
     private void send(WebSocketSession session, Object payload) throws Exception {

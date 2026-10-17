@@ -79,6 +79,7 @@ class ClientAuthServiceEgressLoginTests {
         credential.setApiKey(API_KEY);
         credential.setSecretHash(PasswordService.hashToken(SECRET));
         when(credentialRepository.findByApiKey(API_KEY)).thenReturn(Optional.of(credential));
+        when(credentialRepository.lockCurrent(11L, TENANT)).thenReturn(Optional.of(credential));
         when(nonceService.consume(anyString(), anyString())).thenReturn(true);
 
         ClientIdentity identity = new ClientIdentity();

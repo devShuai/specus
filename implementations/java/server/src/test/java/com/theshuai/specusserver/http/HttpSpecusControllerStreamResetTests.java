@@ -67,7 +67,7 @@ class HttpSpecusControllerStreamResetTests {
                 mock(WebSocketSpecusHandler.class));
         EmbeddedChannel channel = new EmbeddedChannel(new ResetAfterRequestFin(LEAKY_REASON), natHandler);
         channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
-        SessionUtil.bindDataSession(new Session(clientName), channel);
+        var pair=new com.theshuai.specusserver.testsupport.PairedDataFixture(clientName,channel);
         Logger logger = (Logger) LoggerFactory.getLogger(HttpSpecusController.class);
         ListAppender<ILoggingEvent> logs = new ListAppender<>();
         logs.start();
@@ -84,6 +84,7 @@ class HttpSpecusControllerStreamResetTests {
         } finally {
             logger.detachAppender(logs);
             channel.finishAndReleaseAll();
+            pair.close();
         }
 
         assertThat(response.getStatus()).isEqualTo(502);

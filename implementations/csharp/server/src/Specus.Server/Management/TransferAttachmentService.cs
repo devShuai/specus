@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
+using Specus.Server.Data.Conversion;
 using Specus.Server.Data.Entities;
 using Specus.Server.WebSockets;
 
@@ -384,9 +385,12 @@ public sealed class TransferAttachmentService
 
     public async Task ExpireOldAsync(CancellationToken cancellationToken)
     {
-        await _db.TransferAttachmentDownloadGrants
-            .Where(grant => grant.ExpiresAt < DateTimeOffset.UtcNow)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        // Keep the model's UTC ISO representation while avoiding both SQLite's
+        // untranslated UtcNow expression and Oracle EF's MariaDB DELETE alias.
+        var cutoff = IsoDateTimeOffsetConverter.Format(DateTimeOffset.UtcNow);
+        await _db.Database.ExecuteSqlInterpolatedAsync(
+            $"DELETE FROM transfer_attachment_download_grant WHERE expires_at < {cutoff}",
+            cancellationToken).ConfigureAwait(false);
         while (!cancellationToken.IsCancellationRequested)
         {
             var now = DateTimeOffset.UtcNow;

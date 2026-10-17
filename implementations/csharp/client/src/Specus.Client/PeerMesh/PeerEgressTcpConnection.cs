@@ -217,6 +217,17 @@ internal sealed class PeerEgressTcpConnection
 
     public bool IsDone => _state == State.Closed;
 
+    public bool CanReopen(Segment syn)
+    {
+        var distance = unchecked(syn.Seq - _rcvNxt);
+        return _state == State.TimeWait && syn.Has(PeerEgressSegment.FlagSyn)
+            && (syn.Flags & (PeerEgressSegment.FlagAck | PeerEgressSegment.FlagRst | PeerEgressSegment.FlagFin)) == 0
+            && syn.Payload.Length == 0 && distance > ReceiveWindow && distance < 0x8000_0000;
+    }
+
+    public uint NextIncarnationSequence(uint entropy) =>
+        unchecked(_sndNxt + ReceiveWindow + 1 + (entropy & 0x3fff_ffff));
+
     public int SendMss => _sndMss;
 
     private static int AdvertisedMss(int pathMtu)
@@ -303,6 +314,17 @@ internal sealed class PeerEgressTcpConnection
             return output;
         }
 
+        if (_state == State.TimeWait)
+        {
+            // Reopening needs current runtime authorization; old traffic cannot kill TIME_WAIT.
+            if (!segment.Has(PeerEgressSegment.FlagRst)
+                && (segment.Has(PeerEgressSegment.FlagSyn) || segment.Has(PeerEgressSegment.FlagFin) || segment.Payload.Length != 0))
+            {
+                Ack(output, nowMs);
+            }
+            return output;
+        }
+
         // Any segment proves the consumer is still there, so the probe run restarts. The idle clock
         // is different: it measures data, not liveness. Letting a keepalive exchange refresh it
         // would mean two stacks could hold a socket and a quota slot open indefinitely by pinging
@@ -331,6 +353,11 @@ internal sealed class PeerEgressTcpConnection
 
         if (segment.Has(PeerEgressSegment.FlagSyn) && _state != State.SynReceived)
         {
+            if (!PeerEgressSegment.SeqInWindow(segment.Seq, _rcvNxt, _rcvWnd))
+            {
+                Ack(output, nowMs);
+                return output;
+            }
             // A SYN inside an established flow is either a stale duplicate or an attack; RFC 793
             // says answer with a reset rather than silently re-handshaking.
             ResetFlow(output);

@@ -1,0 +1,1360 @@
+{
+  "upstreamCommit": "fb441af4400e1afa8599e73c16239644e654f543",
+  "archiveSha256": "215f2f87d974c44ae5b8c0d47c6b1c81f0322f211490ded50b6c67746f2fd757",
+  "licenseSha256": "7ec2282ec5e6b8e1e5af3fd47f9be7c5a3b41581d4aafcd4b4dcc2f126dd9d39",
+  "sourceUrl": "https://cdn.mysql.com/Downloads/Connector-Net/mysql-connector-net-26.7.0-src.zip",
+  "patchedInputs": {
+    "upstream/Driver.cs": "283f7e2a3511bf5bff0b86abab6ff4ce1ce0890302215ff5ca8d70c94e6016eb",
+    "upstream/common/Ssl.cs": "25f0d7420d72fc13f504a2399972f0df486aa8b516166ad2a28ac80bcc97d303"
+  },
+  "upstreamVersion": "26.7.0",
+  "formatVersion": 1,
+  "originalInputs": [
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6409f017eb3ae3394bdb4424819111bb4b463dc124d0f19297f5b2f6fde31445",
+      "path": "upstream/BulkLoader.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8a3aa65d92f796f7b3c7a9ae32828bee344bbb9961057a7c55081399c3648c1f",
+      "path": "upstream/CharSetMap.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "895f51025eacac9707630240a716c980d3c5378897d079a927f01124940add5f",
+      "path": "upstream/CompressedStream.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d8db6beee71792471e1d8190dfe3cfa1f602e4e8ab7c2175b8a5e59c15ecebc9",
+      "path": "upstream/Crypt.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "1f646ae35827016911ff45bbda925e8bd36f5a64e10089d1a2718a8a80eb1504",
+      "path": "upstream/Driver.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4d42cfa1770c8dfeda2c4f587aade6b09f93e9c20289a0cbb6c8f3d1e8839c4d",
+      "path": "upstream/Exception.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "acb9cccb84f78eb57c77994b7d30fd53e827a4201e3d58bd16634c0b5b116e87",
+      "path": "upstream/Field.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3bff136c6dde15eab2c729bc8148930a0827ec6252f508f45ac40b05e8671204",
+      "path": "upstream/ISSchemaProvider.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ed1fd5094ac9b6a33c405412db017be2bb1149f0a71190a29a4118005b45ec89",
+      "path": "upstream/MySql.Data.csproj"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "681773be98589b948f8b182717480a254b45d0da061e70028a36cf096284eb97",
+      "path": "upstream/MySQLActivitySource.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4a2b3f0adb3ad10c8e84449eaa26045ca2c42438af4f0e89271aef4292dc170f",
+      "path": "upstream/MySqlAttribute.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "68993f5920321096adb2a3ba942235563dc30960283f9a3598e1236de73f6262",
+      "path": "upstream/MySqlAttributeCollection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "74c7093665ceeff45cbc4b92c9e60760d49af5afa1ec9820c85585d89700fa38",
+      "path": "upstream/MySqlBaseConnectionStringBuilder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ca659ea60abf66501fcae1448538fe77a6b8eeb7aa22a8216221e94c7fcfae21",
+      "path": "upstream/MySqlClientFactory.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "42a12d6dd70503c8faaa6dca07da8f0a8d425062c73f5b18f72027baf44a656b",
+      "path": "upstream/MySqlCommand.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "44b34fe9ad3d9bd76da0bdebbd2197217b0e2e56c41f40a524eb2741c893dc2b",
+      "path": "upstream/MySqlConnection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "564f70ef7daf51f20175a0b593d2f6bf00628f5fb60ad3385d6f8a42a09a5592",
+      "path": "upstream/MySqlConnectionStringBuilder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "cbe22ef12fece296cc19c8793a6ade916d4a8276547809a18a2c31e791f2a1d7",
+      "path": "upstream/MySqlDataReader.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "571dbef7cdebe4a8e16cd9d853d6c5e742f344b970500f11e6944954955eb176",
+      "path": "upstream/MysqlDefs.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "1fc25eb0d71b30e36b8bac60cce5fdb471ba90d7e8d3be3aef13274f264646d8",
+      "path": "upstream/MySqlError.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6e65ff13ad458c36b3fd031d86370bc6f816f577fe720ba42cee09830bad7c83",
+      "path": "upstream/MySqlHelper.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "bad5750abc4deb33e7108fe1f711f1b959a8e0c71e9ca971c09e3a1fe37715cb",
+      "path": "upstream/MySqlPacket.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b862bd89fc9e9c9280065bf5aec8a878ea8af794f80cbf4f5aaa29079a955e35",
+      "path": "upstream/MySqlParameter.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ca9134015d70562d4b587004c0c3f36ade8b2c60502f94ad0f896f803cce9142",
+      "path": "upstream/MySqlParameterCollection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "5cb0f6b7fe56ceeb6741d158aaceb37b96524aa06f2297190df403eecff197f8",
+      "path": "upstream/MySqlPool.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "63bfe77553b863c31158c771ca2709b484edbce6ccb1f6e13845aab27f3d4c44",
+      "path": "upstream/MySqlPoolManager.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f68fe585b873a8fd1b84772c329e9e7e7849bde1bf6c1a07f9706f88d74f99f3",
+      "path": "upstream/MySqlScript.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "78c99af766fb700afd893954ed126458a96f3ce81b0d8d9c684d67d8947e3d18",
+      "path": "upstream/MySqlStream.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a7bc381bb11a97433827f9d1f1c8fc572aa682abaf423b8c0ef35574a655f18d",
+      "path": "upstream/MySqlTrace.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "027ae5798c4a6d5125987654d78f7562f51755fa15fecd28f5120f2ce8a7c4d5",
+      "path": "upstream/MySqlTransaction.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c33c4477ba94174e97298ee430798b23a684f6b41c7a60bd7250c17b8b91147a",
+      "path": "upstream/NativeDriver.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6f49f49c7f01d4154636dc3d43fae53ae69b3420f9e9a775a6e07d6a4ad2194e",
+      "path": "upstream/OkPacket.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "94c252a9e98076a6029861f8725a48cedb11857b9e37ccb76611612f38f40ce5",
+      "path": "upstream/PacketBitConverter.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b05baa9bc4ee1e6767401dd2521d522768afafffea3babfd650192f9c6ccf6d2",
+      "path": "upstream/PerformanceMonitor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "32806865c1311d292cc47a52c8ff1981591b3ea57779b556690b9dac41e5cae7",
+      "path": "upstream/PreparableStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3355f84ac14171bdc7e45a56c9effdedeee46d6454ddbfa4b68d92e4f3f7a10a",
+      "path": "upstream/ProcedureCache.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "76211dff09733950ba1b8e832d6f8ee02183c18e3eb1ba96a3307f115104c500",
+      "path": "upstream/Resources.Designer.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0a8fea8be2a8a31b8ffdee3c29bffddf9fc351d6f2b37fe35b019ba63c7d5405",
+      "path": "upstream/Resources.resx"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "91839111f964e07cf5776ece43e2487116cfefc7e0f3a6d00a456abdf6649aff",
+      "path": "upstream/ResourcesX.Designer.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e29a02ead4b7af162e4ab6907844e95041dd15901ff83c555fd1d1a041eeeac6",
+      "path": "upstream/ResourcesX.resx"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2721c75f384ca4d71e61723d374e7e7c612ee4ec367acf6eb727b692855a646e",
+      "path": "upstream/ResultSet.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e124cd11cad10dba1537999533c152f7f02d71e956486c625c28be67cff8353e",
+      "path": "upstream/Runtime.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "9dad12f20df5a5a7b23b42a8ba0a5afbc4645f1ba882ab85f335d7bbbb7326fb",
+      "path": "upstream/Schema.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6822f152f3f86f9c1dbc833b8782819cc7077f3770f1ce7c9384c54a5a1ac293",
+      "path": "upstream/SchemaProvider.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c84c95f1f6a711a146a41582fc09fc5e2c4a93d149d008757ab9d8d0817b9f2d",
+      "path": "upstream/Statement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "84a11e1f03f79766c934052b0e7cdafe6cdbda356a61f78bc7c81c1ab70bd841",
+      "path": "upstream/StoredProcedure.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b0007bdf70bee38e98df03f48011075b6cf69cfe738ccd604f27fb06eea77055",
+      "path": "upstream/TableCache.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "43e69e65bc976f86215d2ea358ef39a43f0510d13366488206e425b84cd45080",
+      "path": "upstream/TimedStream.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "efab1d3fdcf3ac5dcdd9449af6371818f817c5dfdee9c244ae8d113a9614e99b",
+      "path": "upstream/TracingDriver.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d95812aff2c216fcfb9e741270e27c2824e4b3ca5707420d92515b1ad15d50e2",
+      "path": "upstream/Utils.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3f9995be53e91200344d16e462bbf32c511b140bcb5b2bb930a0cae3f5f5fe3c",
+      "path": "upstream/Authentication/AuthenticationManager.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a9b9a9b917f4b354d8b17c7f66fc584a93a0951a20a095c66d42d120b404a5a0",
+      "path": "upstream/Authentication/CachingSha2AuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "aef36ca50b5861e6102c37d0f331a63d1440041b94b5bd318c0166048d6c4e49",
+      "path": "upstream/Authentication/ClearPasswordPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6e242035c6ee0a20ee88b522f34d3e73b9ef3e0e086dbf2983da03d8eab5f80f",
+      "path": "upstream/Authentication/KerberosAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "dc6749951d6f85b2684d8798e120685a7b6859aee7add4e4d204a1829412c715",
+      "path": "upstream/Authentication/MySQLAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8e6a8871b1f0b885f9fbf819585b3bd40d607ea6b84c8907ca6eb1ee36d3c2b0",
+      "path": "upstream/Authentication/MySqlPemReader.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f583694571e5b19fd46142907a9fbb0c5c7294bc9ff9c393df3f6d91a6e1952f",
+      "path": "upstream/Authentication/MySqlSASLPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f72e0e4febc5c6d0b72daa6d9018bda5db722b23d692b03fa2b105389cdf3d3b",
+      "path": "upstream/Authentication/NativePasswordPlugins.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4e50cca71a83fa4888ed01aa4abba265150fe3833dcb7e4e3f1d4f1d6c781c56",
+      "path": "upstream/Authentication/OciAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "038509e9ab6d93aa2d29093652cf760ab14a5758dddc82e4b20c5643c0f70230",
+      "path": "upstream/Authentication/OpenIdConnectClientAuthentication.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d8375ae17e5dc876fbcbd17282cdecced946316244b4fff298fa6b114bdd594e",
+      "path": "upstream/Authentication/ScramBase.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "bda91dd8a5819798dc681b0d29b1556c8f4cef3bb56ffeb7d6e5415a29a9241b",
+      "path": "upstream/Authentication/ScramSha1Mechanism.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d016d9d6ff0e3f9dc4648fd4a062048f012f68ff699b10b5ff335a044391786e",
+      "path": "upstream/Authentication/ScramSha256Mechanism.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0609e76649e5a843d1d1320b3225e2acddd8cae4ee787c654509ca5f5c1ab54f",
+      "path": "upstream/Authentication/Sha256AuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6023bb26be939711bd774b058c589f2222a4518216cd0c0c7d4c586e8e0de66b",
+      "path": "upstream/Authentication/Sha256MemoryAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d5ae263c79f41738ebe5d3394386f6250ab4c8d55a77df285f4eb2162f5b2bdc",
+      "path": "upstream/Authentication/WebAuthnAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c6b300af832d3f7285517384250223cc2e0018c6493cce3d7d9a44d9cfa22c8e",
+      "path": "upstream/Authentication/WindowsAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a18e063edda60a8923ec1944138585416503da457a297785dec58cab64dfc81f",
+      "path": "upstream/Authentication/FIDO/FidoAssertion.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ee64fa3b401413731c880a1e1d1c9bde551d6b47180b2cf0b3c1882c4a33b4ad",
+      "path": "upstream/Authentication/FIDO/FidoDevice.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e5ef3dacddbc084fcfb7c9ac0d036ce30c035d2d26e3f15f5182553930c9160c",
+      "path": "upstream/Authentication/FIDO/FidoDeviceInfo.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "48a81e9107e60a3ea351019a3f6f7d5149bdef9a39ef5d20a8e65d7a2a23941e",
+      "path": "upstream/Authentication/FIDO/Native/NativeMethods.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "bd36ed42fc4243f3f88d56af140ab3b85ffe89a4497b4ec3d839e412e91da6d8",
+      "path": "upstream/Authentication/FIDO/Native/Structs.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4012065d71b5245fc369fd56d6dccb8bee0831a45562708b6412a63c9709fc72",
+      "path": "upstream/Authentication/FIDO/Utility/ConstStringMarshaler.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "778005134480ab0e2f7677024a6efaf50bcb51bfcfb02f636ed118e1ac5853b1",
+      "path": "upstream/Authentication/FIDO/Utility/Enums.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a8c76f3a09a3bc546cf093957f8eb467249da462a7e8f1849b15c85d246ed031",
+      "path": "upstream/Authentication/FIDO/Utility/Extensions.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a13cd702faee9170c1c9ea741ee022a85534aa25c06f55af5ec39936858284dd",
+      "path": "upstream/Authentication/FIDO/Utility/FidoExceptions.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e3bc7a37f429afab0b22d42fbf7c841843f499e5c68dc9a86cfb99b82c8d9173",
+      "path": "upstream/Authentication/FIDO/Utility/Init.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "edd4829e422b4df6a17e9b3891af0bb7e1e648b01dc243dfd90cd71fcddbda82",
+      "path": "upstream/Authentication/GSSAPI/Const.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2eaf7cfbd3f122063f0f77e961ff56529095f04f41bf9bb7c551c00ba500cbfd",
+      "path": "upstream/Authentication/GSSAPI/GssapiMechanism.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a5f1b371b1b1608606de86cecd494d4541a3acf9b8d44331aaa355d936e10843",
+      "path": "upstream/Authentication/GSSAPI/GssContext.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "64752e93868ddfff918d5bb3f672921fe22746322d126c92d9bbb2990dea31a8",
+      "path": "upstream/Authentication/GSSAPI/GssContextFlags.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "da76eddcde642fa4e4bdc51bd7303b45c8b2b6b7fc81d6650a7d7a23dfbf1c73",
+      "path": "upstream/Authentication/GSSAPI/GssCredentials.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d05bda6b435c87453a3257d8cf3407722edd69145eb9313f73e707fafb0c9550",
+      "path": "upstream/Authentication/GSSAPI/Native/GssBufferDescStruct.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2ef5b1ed994838f7f2ea5b1755374eba5b2597fc8f9b2738eeef4a9d18b802a8",
+      "path": "upstream/Authentication/GSSAPI/Native/GssOidStruct.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "321e388b6b40eedfd8632df800819d5d8f01b49f9c8a86c1ed991833991acdb8",
+      "path": "upstream/Authentication/GSSAPI/Native/NativeMethods.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7bc4696ef7251fce16d002d7f079b11ef6cc5305ca0a32a4373fcc5eb14091c2",
+      "path": "upstream/Authentication/GSSAPI/Native/NativeMethodsLinux.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "443d0bcd87accb5b5d34d619f197e4277c7f009649242227bf9eb1acbe1d0f15",
+      "path": "upstream/Authentication/GSSAPI/Native/NativeMethodsWin64.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "44a42b3e41be1f183614ea75747e2ded298f758849df944dc3eb8e84326a8b84",
+      "path": "upstream/Authentication/GSSAPI/Utility/Disposable.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "41c0f6093e4845dba0b0e87fa9ac2d6fc7f4757306e3d6caa62851dec1c8d870",
+      "path": "upstream/Authentication/GSSAPI/Utility/ExceptionMessages.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "767d7faae2894ed8dd2cce43925446d8c72e9128ff9fa006a1779dae20f456ee",
+      "path": "upstream/Authentication/GSSAPI/Utility/GssType.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "549aeffe25d3eb6e0f392b7cad2c2a0292f1fdd43acc76067f5e20a5406f46c6",
+      "path": "upstream/Authentication/GSSAPI/Utility/KerberosConfig.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c8807504db08485707433f1b4ea668d2235d0bb4d7a5f89150cee2b11ecc4ade",
+      "path": "upstream/Authentication/GSSAPI/Utility/Pinned.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "dcca37af6a8261b661d9e559275d8c41184863c0efa24a831b0a1e78042ed1f6",
+      "path": "upstream/Authentication/SSPI/Const.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3d80a00ee863c4cec5199a6da7f2f152139d853fd9cfa97a887bc7db7468b759",
+      "path": "upstream/Authentication/SSPI/NativeMethods.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "326a91c6e3938b0dbc4ecd51611e2bd6b741301ac75c27653dad5c89ec8faa4a",
+      "path": "upstream/Authentication/SSPI/SspiCredentials.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4fc524e7d5916fb8af20ac0023e3a43ff0771c07ace5535eee24df8a0502203e",
+      "path": "upstream/Authentication/SSPI/SspiSecurityContext.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "689a4288ef59a14d8bc3863b90d532e3ef6932d4d7e0e2a316cf429ddc04a10e",
+      "path": "upstream/Authentication/SSPI/Structs.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "5538b8c21f5b25b51cb5d2bf9f0d786aa39f0b12d5b5c0e0078bacf75dc1544d",
+      "path": "upstream/common/Cache.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6041f6cffe2f4cc9c5da672fc96558aaf2222638616c1f5246f2df758d7561c4",
+      "path": "upstream/common/ContextString.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f61aa8dd17c7992c4b2fe04c0d659916eb45dba1021dd53447777a3bc89b4b78",
+      "path": "upstream/common/DnsSrv.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "bf18e8e276753e90d6d0c7f6126e161208c7cd8aa3dc1ba32b5a6789bed5e3af",
+      "path": "upstream/common/LowResolutionStopwatch.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f7f9fdd9365ed2d6d0705a58eb530a8102f2aa77188754234004a1ad1e41440c",
+      "path": "upstream/common/MyNetworkStream.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e0861a250d50c2c5e9fb6d07cbda426e5b191e6ffefb6474532e346271c25d6f",
+      "path": "upstream/common/MySqlConnectionStringOption.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7fac10dd69b2a8349f2ccf3145af2200b9c8a6bb7873e7bf102c0861190de118",
+      "path": "upstream/common/MySqlConnectionStringOptionCollection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "98203312c6167d9b204b92f4b9cc58ef8b26fa29c9c37686284f406a3f9a7b57",
+      "path": "upstream/common/MySqlTokenizer.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6841637b19cfcdf0de33564981cb2d2ae287a26d614343178769555fa783eff5",
+      "path": "upstream/common/NativeMethods.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ff4ef47f9a9b8e8c4797cb725d8dedd617e0984215a51a002e69334699ac697d",
+      "path": "upstream/common/Platform.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "84bd4d22a5c5d30cc94a917337b392cdaad7835668d7f7109316f85a3326f8ca",
+      "path": "upstream/common/QueryNormalizer.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "66fac026a5218c6b72151d45a043726079ac3b52e6b964c6f03c8c8df97ce9d4",
+      "path": "upstream/common/Ssl.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8aa026d688d9b8d80977aff4a05360ff199273322e841d139ea128083e93f163",
+      "path": "upstream/common/SslPemCertificateValidator.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "1708bfd5bf292cc5a47bd609a40e587afe9bda3e4a07ac67688292e07e7e5300",
+      "path": "upstream/common/StreamCreator.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d10817c94c4d40af54dfc09ca5d3e4c4cc5cec643774d64df4b6fce4d9bb4761",
+      "path": "upstream/common/StringUtility.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7bdf1aefb16d9d8778e2c626c65a0c7543b7de087d6697e5796f85bab8d24240",
+      "path": "upstream/common/UnixEndPoint.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2770198a26bf07e90ef7218c412a1f70de4e2f795efa13a57625f7748a2e5118",
+      "path": "upstream/common/Version.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "499cfa45d4dc7e1a80d56717dcfbe4a8cf6939a7c8b05e0990d8c6cacd520ed3",
+      "path": "upstream/common/Dns/DnsEnums.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a0c8b1d586216b18edd671d005449a6805a8c78089230ab1532a57716806f5d5",
+      "path": "upstream/common/Dns/DnsQuestion.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "77e9277858ce6959ca030b551e8594e058eebc13ad217ba6996907c7b014287c",
+      "path": "upstream/common/Dns/DnsRecordHeader.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f217478619c6fa4835134c52ab4c9e264439dfdb2f67a597524393e5bf0cab83",
+      "path": "upstream/common/Dns/DnsRecordReader.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d8994041c3c2d6d84aaa85b63ae1a38960d82ce66601c8c878b43c2bb0d08d76",
+      "path": "upstream/common/Dns/DnsRecordUnknown.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7bad6856c75f828ebd6193eca704a4ca420be1b9b02ec1c4cc5cbaf9375d0c7b",
+      "path": "upstream/common/Dns/DnsRequest.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4b857c198bcc9f040a5a2a20552ec212ced1cdada630f88ac3b2dd92b1358b69",
+      "path": "upstream/common/Dns/DnsResolver.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0bb43e46cdda9edaa01c29fc590490a0db05f5ded5f2bbded501aefb9ca4af8e",
+      "path": "upstream/common/Dns/DnsResourceRecord.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a804ff6032409cc5f56a206adb0dc44d4846edbbad36f9b74a54b202cb13ca46",
+      "path": "upstream/common/Dns/DnsResponse.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4e146e87a158905ed133972380e3634793362d976133bb11cacb24bbc0cc5c08",
+      "path": "upstream/common/Dns/DnsSrvRecord.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d22292c001b8f6679ccbbf18a0399e90071a77b30f1f5fa481ab10d9fc1a13ef",
+      "path": "upstream/common/netstandard2_0/NamedPipeStream.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f122fd173176b9689f86cddf2c57dfcf9710434252a33d7bbc99f0d48019a026",
+      "path": "upstream/common/netstandard2_0/SharedMemoryStream.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6fe3dad3122860dbdd00e626829ae5d4138f1a9d55cbdab17bd61253730753da",
+      "path": "upstream/Failover/FailoverGroup.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4935ffba67ca174c5632539840c9085c1dfb1ea21a2309072cc0a6118331bc43",
+      "path": "upstream/Failover/FailoverManager.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "dfa859699cd7e60abf0b2d043c0c86d78c43b912df4ae962f20ed41a912155c6",
+      "path": "upstream/Failover/FailoverServer.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2b1336d27e43a5ff695d1e87f478a8ad18379b8400e54d955dccf94eeb6ab4ba",
+      "path": "upstream/Failover/RandomFailoverGroup.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2542d93d5ab6456921191f5391dfab936fa827b16feb1ab0eb692ffa87ec0ce9",
+      "path": "upstream/Failover/SequentialFailoverGroup.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "75628403f1bbc7f196e79f88be6a1bcc9dc7ab8fc860923593eb0d883cd62c23",
+      "path": "upstream/Framework/net462/SystemPerformanceMonitor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "205cc0d774b96b56fad1ac50fd6b66b2284c9a4946c203875836cc2b4be27fc4",
+      "path": "upstream/Framework/netstandard2_0/AuthenticationManager.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d7a2db5a5ab1317cf2736aa857e897d67620ba3bb622b469589b02035877d188",
+      "path": "upstream/Framework/netstandard2_0/CommandBuilder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "01ca3bd6e046ca8cb40b3eed65c93115e05cd978d186734a12a108d2fce0d603",
+      "path": "upstream/Framework/netstandard2_0/dataadapter.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4be1a7d1f97246af4fc900f0313b427f031a7b42e8011d9fa49702133d563f0b",
+      "path": "upstream/Framework/netstandard2_0/MySqlClientPermission.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4f14edcbf72db9653a4abd83a40459225175a91ee930a59dce7c0a37bc62f55c",
+      "path": "upstream/Framework/netstandard2_0/MySqlClientPermissionAttribute.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "606a6074bc16dcd9d5283a9537489316ab53b7413a096ddf7a4b001a02808ebf",
+      "path": "upstream/Framework/netstandard2_0/MySqlConfiguration.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a7de2da9d1018e1ef7abff5c481cfa284982b356a9e35e79374b33a660259f15",
+      "path": "upstream/Framework/netstandard2_0/MySqlHelper.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "63b61c4020b6c627afd745373dee988714c868efb074ff8a2991c2719c326bb3",
+      "path": "upstream/Framework/netstandard2_0/MySqlPromotableTransaction.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "bfee16bb46a3d60be9ca07f8d366e6fa02e86e20c44232baaf5210f963d80f36",
+      "path": "upstream/Framework/netstandard2_0/MySqlSecurityPermission.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6b14c54cc3c1855ce2050d92ee699b1daf0fa594a5684296c63a69dd0a7ffa86",
+      "path": "upstream/Interceptors/CommandInterceptor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "891354ebd21f3e09e2ab92b7583324d4083fec974700190ad558229a41dcc1ce",
+      "path": "upstream/Interceptors/ExceptionInterceptor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ae466774c4a6a1f09df9b6ede771eb1e02bf004168a31e2fce763577a3ab7b15",
+      "path": "upstream/Interceptors/Interceptor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d2aa366db9d1790d0cb5f5978b3a647a65b07cf7b5da052901de8af33b9286ab",
+      "path": "upstream/Properties/AssemblyInfo.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "24badceea01e4b75a37133071672ea3eddf815790fb8000ed79280205180ca3d",
+      "path": "upstream/Properties/launchSettings.json"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2ab0b99ba9b5eb964337ab4f34c93be61f7d530264bf613e0adde1b669ea66ab",
+      "path": "upstream/Properties/ReservedWords.txt"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2f7188a0eb0f065fcb8c939b594b8ec86f4ac159a1958ff3d879c5a85b589977",
+      "path": "upstream/Properties/VersionInfo.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "70165bea45c6ccbc4b247815a1baa14d987e950e9a2b8dc2e0676023d1e734d9",
+      "path": "upstream/Replication/ReplicationConfiguration.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d2f90adab60209a005d589a2cad6848555912f8adfe0bd118511108f921e6aa0",
+      "path": "upstream/Replication/ReplicationManager.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "fe9eb1c8ff042450f1aa46f575704325b479e657bb43740572d5427edb1a0807",
+      "path": "upstream/Replication/ReplicationRoundRobinServerGroup.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "859cb3591d44e88f1f8ec315ec849d73c22dd1c3fc025eb069ef86b685aa18e6",
+      "path": "upstream/Replication/ReplicationServer.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "011b211e17aa20972a9928326d8c88043154a374ad4d536d0a1b0f3990353462",
+      "path": "upstream/Replication/ReplicationServerGroup.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ad79119c355424b879abda49b48a2058f96f8f16bab94ba307724b60185e028b",
+      "path": "upstream/Types/IMySqlValue.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "05d3fb92ebdbf2c50cdb78fafb415aa62b4c5d101ae38c5d2c338141788630ae",
+      "path": "upstream/Types/MetaData.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "dccafdb5a9b7efc8f987205525b0b1adf96abceda34086486e63c70429eb8bfe",
+      "path": "upstream/Types/MySqlBinary.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3e53c298471c55b22d3ad06c0deae3cc02ba73979b32d4336d73d75ab794d448",
+      "path": "upstream/Types/MySqlBit.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "37e020a3adf9eac9326baff89a9cdfeb78847859505806dc18cb2cc8fa3d317d",
+      "path": "upstream/Types/MySqlByte.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "33382c7bce7192558f1c604685fdf39bdf73fa3ba8f942407b6992f8b41118f2",
+      "path": "upstream/Types/MySqlConversionException.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d04a820eaf3b79a14a6361bee60917dcb39219c18d15b808bd7dd907cb0d62af",
+      "path": "upstream/Types/MySqlDateTime.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d9174f291790073fa95024db9f5ad30f5f28a6e7a9190c0377eab908b29f52f9",
+      "path": "upstream/Types/MySqlDecimal.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d01ebdb937f8591e09f2b18efc73f0d879aeda9b26d855d00b58e0a73a7c4235",
+      "path": "upstream/Types/MySqlDouble.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "883bd8a1fff30d87c6bab6c2a9ce28424a332917e9a1013bdcf1416265ad0e0e",
+      "path": "upstream/Types/MySqlGeometry.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7158b8b7dd8e95697619cdbe22f7dee790f1933bc7fd42996843a55f8eacef7b",
+      "path": "upstream/Types/MySqlGuid.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "10cd159bc78a9610843a1b5f281f66122d32e8cdbd9136a838f7b1ea10017bd7",
+      "path": "upstream/Types/MySqlInt16.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3b0111303b0416a1d8fdd991f7d3782a9680ee678278a5a3da50af4679ebbae9",
+      "path": "upstream/Types/MySqlInt32.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "fd709f5349c8446b1e9b3446a720b498e99bbdf0faca3e0c11181536e565a396",
+      "path": "upstream/Types/MySqlInt64.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "51c2afd47858ffa7b84a89ae5f615cc61421476ec625477e9061eba1f9806a85",
+      "path": "upstream/Types/MySqlSingle.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2db11c5c8fc7596dd225a008e1000b7c5ee0acd25de2036d7c7ce6adf4f20989",
+      "path": "upstream/Types/MySqlString.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a1e8fe81c4234b7e675c385a2c55b45fa758ee7eb6a99d7d7f764794afb031e5",
+      "path": "upstream/Types/MySqlTime.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "bf5cd35d3e9ef7e4e0b3cd56ddb1496b64d44179fa63c95246c588aadfee2ece",
+      "path": "upstream/Types/MySqlUByte.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "56108989e3a2ab81337537b55e499d8539cfb6ec258cf81de3cdf7f67bba1f0f",
+      "path": "upstream/Types/MySqlUInt16.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "391d39625885d58e853edce145a5f9a4dbd92771adc49d46bf022c883d2e237b",
+      "path": "upstream/Types/MySqlUInt32.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "db20fc6485bacc85ac0d8bc9948f8f16e88e5cb46319a1e031c99f7ba82601c9",
+      "path": "upstream/Types/MySqlUInt64.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f4301af66bdca3deae1ca214f178d7fa650a24df38f47eec809caa13bb4141ca",
+      "path": "upstream/X/Authentication/ExternalAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3ae45abca64a0b19b0262289e2c5af5e348068ecf002308a56692bcc2599e07c",
+      "path": "upstream/X/Authentication/MySQL41AuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e56574101f2d89e4bb66a8f97de125ba265b119f0720d0bd31d8adb3ac79f2d4",
+      "path": "upstream/X/Authentication/PlainAuthenticationPlugin.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "063e1a731e88e789219159b997f3a239d84d6202797f060f5d967c3a39337382",
+      "path": "upstream/X/Common/Tools.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "40573776b257acf871e57a74f978243edb6e5c3e280549f6d2acbdfe4c26740a",
+      "path": "upstream/X/Common/UnmanagedLibraryLoader.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8f9f64d12ec3ff0676a316e664881e1065caf4d3a7d69b6b2e2f0b34259da1b5",
+      "path": "upstream/X/Communication/CommunicationPacket.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "3d3c3120ac5c836ea8e5d4ac633c33a381104eb45d752d22bbad71c1985a802e",
+      "path": "upstream/X/Communication/XCompressionController.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e064ea844d4a9b58c7403f0c2db153b5542fbb80aeafe82ee285054d511f5294",
+      "path": "upstream/X/Communication/XPacketProcessor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "1b2095217a9c9e00571ba6c504e031b170ebb7f44561eb5f28dd673d4ed1f04c",
+      "path": "upstream/X/Communication/XPacketReaderWriter.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "553b5407eaa73442d410e15dffbc633857c226f95dfcad548d096d9755f677cc",
+      "path": "upstream/X/Data/CollationMap.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e398f7acd79eac52310715ce4174339db2e0d1b1198de740152f435421040ac2",
+      "path": "upstream/X/Data/Enums.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0336d0522d5181d093504d7c240929c47705efca293c956988013f1992da24eb",
+      "path": "upstream/X/Protocol/ProtocolBase.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "1e82f6316835dcb921db36c1a2442a5c1f05dc8b6da2ec72b195018ced86ee51",
+      "path": "upstream/X/Protocol/ValueDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "29529e724f0b1499a8b72719ff276491dffc9c671432815412c724735d95fe6f",
+      "path": "upstream/X/Protocol/X/BitDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6162820b64ac130f09d9678859689c8f1b659d83cde9cac6415c905313f2d7d3",
+      "path": "upstream/X/Protocol/X/ByteDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "61233491088891749ed318a9b2e8df2b5316137fd1b4492e6a92129e126e785d",
+      "path": "upstream/X/Protocol/X/DecimalDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2501ff11843b314ccaa71ff9743a9c0f1f8d4e6718351d8e9638d4448d1a4db6",
+      "path": "upstream/X/Protocol/X/Enum.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "65907912453e46d46a2a9fb0a248d82dddde9aa9d53f00087eef6666c7bd62cc",
+      "path": "upstream/X/Protocol/X/ExprParser.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "5dcf88d43ac0e4bb3ea48be733cd3f1bed6e053c5716c481205fae556cc2ece1",
+      "path": "upstream/X/Protocol/X/ExprUtil.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "645f5397c01fd7c2fdf2d3606035594d9fe5663cb1693cdbfa2218c43a62010a",
+      "path": "upstream/X/Protocol/X/ExpUnparser.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ca7dd738969990be5a6351762ff452f85fcc3f72273722930f6301b2f139f095",
+      "path": "upstream/X/Protocol/X/FloatDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ce29516e998620d9fd946449d2dc3e32ba541942f3637b847d5cec48a52ebc58",
+      "path": "upstream/X/Protocol/X/IntegerDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d9db7ea5328bfc31d9b38955e77bcc0c198f65f8d1f02cee2f1a7f9d904cb4df",
+      "path": "upstream/X/Protocol/X/SetDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7532307b5216d160c6a3fce3cbb3bc42421603959bbd41ea5e5335af2e17cff7",
+      "path": "upstream/X/Protocol/X/XDateTimeDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "34e26becb2378d197a57550734e24459229fca1a9810daf313616cdf7c50c354",
+      "path": "upstream/X/Protocol/X/XProtocol.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "aace9ced6694a5cd0cf97ba612aea3b188e982ec5f3e6a5a74b0cfab5edf8465",
+      "path": "upstream/X/Protocol/X/XTimeDecoder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a0e41a7785ebe236da83970ddb5d1abfebd408ea9e319025334f355e85162d2a",
+      "path": "upstream/X/Protocol/X/XValueDecoderFactory.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e04659ad4cfdc5a9e53f5f3369beeaeeabb198b2d2c62688f6e498131d229368",
+      "path": "upstream/X/Protocol/X/Protobuf/Mysqlx.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c3809f2387a01770582acaa491b779395027a22c6c59e86826d585986fd5534f",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxConnection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c10c811b9004ca094234de7837f9b4d99ad7e4269fcacb978c7ab4868e8ff1de",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxCrud.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0a93159c330c70e418b8cbf4c068fb52973cd96201cbd159910c8e44fd7dc177",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxCursor.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8ba076e28c5591efaaa1d3c2cb4345b34c1115e415531bbb8986354e583cade4",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxDatatypes.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "51f8536ddb354115cd84936af520f34a17bfe6c058c76061a1fd4f6b177e8832",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxExpect.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "9ee01623f8452e27ff0b0a2f539b31c58c465721e30ee3d10d935585f0d8fdaa",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxExpr.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2c2a67622379d781c845b1dc680e31169a23330ab61fb46bbf4a98479b9be5de",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxNotice.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "41564d6dc05c62156d49fb74681bcc293d401f00291caf5fad6410aa48b7cfb1",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxPrepare.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6fd4e68f39721beb0f663a066eb5bfb765abcb57fad7727c7c8282ef211ae4a3",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxResultset.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e43f10be2127a83ff7c5511f6f2fc1aeb19f29be0f5ef7462f95d52ecf0d003c",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxSession.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "35e5283840430b321450b5981c437caed253dfe06c1859de90a9e2e7da889490",
+      "path": "upstream/X/Protocol/X/Protobuf/MysqlxSql.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "06b2690c472882c3ccbdd5d18167e522ccacf54836d3b44f93ce4d266dcc7a36",
+      "path": "upstream/X/RoutingServices/DefaultRoutingService.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "57a245231e644f07eb38837fb7adbca225ef95d6ebef95d30b7363337857c640",
+      "path": "upstream/X/RoutingServices/RoutingServiceBase.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "32bd63d482da43d79cf2064a6ddc2c3b0778c0d8adf86266cc33235095997072",
+      "path": "upstream/X/Serialization/JsonParser.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "d790234d2a6dd9524016bc34d755604eb5d6d4dcfc9a1ecdf4956d1d00e3d5ab",
+      "path": "upstream/X/Sessions/InternalSession.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b8a8ba5d19a2f16d2a8dd7e9118aecf513f915b5020d0a45658f9c75672525fe",
+      "path": "upstream/X/Sessions/QueueTaskScheduler.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "2be201276b93fa63cc942835bbc6e6ed49829b3eb6be306a03ca3f5798880e6c",
+      "path": "upstream/X/Sessions/XInternalSession.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "529cd9f44addb93833f54541c5961b62c1954048d2f6264f7e71d74e3e63716c",
+      "path": "upstream/X/XDevAPI/BaseSession.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "816ca69ad50456d92ce81620b8013376a417a43551bd8ca5ec97672655387fe9",
+      "path": "upstream/X/XDevAPI/Client.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "07ef7ed8900006cb630ef74a4c569beca342f6e57fb686799bf7153080ffedd2",
+      "path": "upstream/X/XDevAPI/Collection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b5a00bdf9bd7c5e2ab31d9a833f674d16a5fa8e0879ee2fb4a4f7a3a1764c3ae",
+      "path": "upstream/X/XDevAPI/DatabaseObject.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "a97dd83a53f4ea20b38fc014f8c399a35e0a811324ad831cf1464505e4f154f5",
+      "path": "upstream/X/XDevAPI/DbDoc.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "87986b4cb9890de186e3a43b6118017e23260d31489cdd565a92ad08214a0be5",
+      "path": "upstream/X/XDevAPI/GenericCollection.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "262b7428760aa988f67fef9f20661c6ea19d1967bca657800d9bd058bfb99d1b",
+      "path": "upstream/X/XDevAPI/Iterator.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6e113628f65e7ef956d9708df72c001ecd2494a3587866bc7d74907ece47a4b2",
+      "path": "upstream/X/XDevAPI/MySqlExpression.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f1265a3b80109a1034dd0ba54f27d82c5f4c2d03e95a6b0bea04add503eae2ef",
+      "path": "upstream/X/XDevAPI/MySqlX.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8b07402717509bd068d27862fa3eb6ffe059e5d000e56ce62355dbd7046298d4",
+      "path": "upstream/X/XDevAPI/MySqlXConnectionStringBuilder.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0f02e37131b9f7049bacb08bd2b948748dddc8d27d844b949243c3d520a878fe",
+      "path": "upstream/X/XDevAPI/Schema.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b584cdbb2744d22255690f967a00a53290e53809f229ee4a2fcb800d5908bd09",
+      "path": "upstream/X/XDevAPI/Session.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8a774950e0c722dbf5a370a119536e77e54bc789b751daea00f77957f48e5b29",
+      "path": "upstream/X/XDevAPI/Common/BaseResult.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "5848ae7324c9756cb0a41ef48740489898a50f90e44a5337aac24df68d710f54",
+      "path": "upstream/X/XDevAPI/Common/BaseStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c256ad1fcbe4146fe2ff97af192f26d571b62a53e1fd8958664de1c320689de3",
+      "path": "upstream/X/XDevAPI/Common/BufferingResult.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "5b0fc210a89e09f339c5dff3e82205e3b1d67c02e491bb6330dcd033118b2ee0",
+      "path": "upstream/X/XDevAPI/Common/CollectionOptions.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "0b079d292b278b1b983d0c1bfeb95ace2a367842ea64b7a60eff4fc2bc56654b",
+      "path": "upstream/X/XDevAPI/Common/ColumnType.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "43035e6dc803606b6dc36bb6392fc19654721920986ee7c2d27df5b43fc620c5",
+      "path": "upstream/X/XDevAPI/Common/ErrorInfo.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6972e35a9ccd474530c9148481d98a367dc0d816dc40ef10815c7a3d1ac41e2f",
+      "path": "upstream/X/XDevAPI/Common/FilterableStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "b48ef347e3d0636a05d339183b6b3f583586553b20e1f5af969f615d77d67434",
+      "path": "upstream/X/XDevAPI/Common/FilterParams.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e83b28f902457f908f1aea832f6c0e0a36b3ba5b6114fd60a5a2593cc4744d59",
+      "path": "upstream/X/XDevAPI/Common/QueryStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "592e7426b6fb3a9c9264d1f6fcc826ba3a0753b47a0fec3e7cb2bdb84342be04",
+      "path": "upstream/X/XDevAPI/Common/Result.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8bb7a44784410a6c3334b10e6c27fd3e37fd8f3b4898b4679aa0e0bb33fb84b8",
+      "path": "upstream/X/XDevAPI/Common/TargetedBaseStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7e7b82c4744e6e6f66bb9874972e195801458a287d6f810b8792820cb4d2cbb7",
+      "path": "upstream/X/XDevAPI/Common/WarningInfo.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "be806f96dc0dcbaafeffc34eedbd21258ec3bd44bf0eb441ff8b7e8b8d49e880",
+      "path": "upstream/X/XDevAPI/CRUD/AddStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "84f84af9bfe31978905d6bc31a4c59157f5f3538b3e47f92533fecb60b184cde",
+      "path": "upstream/X/XDevAPI/CRUD/CreateCollectionIndexStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "e3372ebf98809b15a68b6d5d85d0f1dd5211d149c4f1e7b0d175921a3727a316",
+      "path": "upstream/X/XDevAPI/CRUD/CreateIndexParams.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "dfb5fb722c6c07e7a8ffec53ac73e4c9f010a2121bdff7597f7056954458b0f3",
+      "path": "upstream/X/XDevAPI/CRUD/CrudStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "32440fe6e322e707248a11b6189e6da05d624448fd294cfb00da70422c1dbf16",
+      "path": "upstream/X/XDevAPI/CRUD/DocResult.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "161e04726cd12550699d2ec5d1a3b3a5192dce57dbae3547c0bc04d603a17835",
+      "path": "upstream/X/XDevAPI/CRUD/FindParams.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "50eecb996696b1c7779ee0d69b31a1e8deb95f61e22d2beca4f6ea1d288b2f32",
+      "path": "upstream/X/XDevAPI/CRUD/FindStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "661319e0f05b54689aff7efd7146b4cbf50c8aa5cf1f4605d02ceb86d98c4921",
+      "path": "upstream/X/XDevAPI/CRUD/ModifyStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7ffd9dc05cf1fbc1a8665dd7a95be5f3f7b38ebe8e4bbe717a6c15ea888ab37f",
+      "path": "upstream/X/XDevAPI/CRUD/RemoveStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "1c17dd0b136b9f97dda189ea35c4e0820bcc1f139147794fb2983e8916dc12c5",
+      "path": "upstream/X/XDevAPI/CRUD/UpdateSpec.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "46ff29e8f3e0470de07421a75b63613da30c3ddd2b305fd745a9ba2dae921ef8",
+      "path": "upstream/X/XDevAPI/Relational/Column.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "4e68c6834598a312c26df1f2f3802d479fe08e87defc553d0fb8644bbac4d25d",
+      "path": "upstream/X/XDevAPI/Relational/InternalRowResult.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "c1197a85fba588081293b5bda4ec4d3cba08c105439e2c214d3dd40622ae8884",
+      "path": "upstream/X/XDevAPI/Relational/Row.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "998abc205cfafd682bedeb98f3da38fbd834ad374fcd3628907b5e073b1b896e",
+      "path": "upstream/X/XDevAPI/Relational/RowResult.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "f9847c4739320e3a93464a091ecd47c594b824db6a3de922dd44a0590e69f363",
+      "path": "upstream/X/XDevAPI/Relational/SqlResult.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "ce8774f83bad44bc3feb0097b4d85eb813fa9c907ca96545df7802cf4dd5418a",
+      "path": "upstream/X/XDevAPI/Relational/SqlStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "6a7c7793eaea7dda629fee58e8f29a3c5f36f6619408ff1df340e52639360bac",
+      "path": "upstream/X/XDevAPI/Relational/Table.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "8842fd48b22e3e31ddb90a360fd3a2380f37ae450818220504db7696bc9a37e3",
+      "path": "upstream/X/XDevAPI/Relational/TableDeleteStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "05850786adf36cbfb559bd1bc8cd15ba9a73ec87581692c2d9f65fd23ec4e5f1",
+      "path": "upstream/X/XDevAPI/Relational/TableInsertStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "7c181523742969fd8eb6acfde353a08fb8589cceeb9f6ae60f8fdb742b1aff05",
+      "path": "upstream/X/XDevAPI/Relational/TableSelectStatement.cs"
+    },
+    {
+      "normalizeLineEndings": true,
+      "sha256": "af5a612480f7bc9c64619db28e75a6be492f8437173e89fb9a98f7b15b88f542",
+      "path": "upstream/X/XDevAPI/Relational/TableUpdateStatement.cs"
+    },
+    {
+      "normalizeLineEndings": false,
+      "sha256": "b103a050a0bd9781dc85f3b7f620c7dcc88d04e924b1ca549f24f6e0f1e48e6e",
+      "path": "MITLibs/comerr64.dll"
+    },
+    {
+      "normalizeLineEndings": false,
+      "sha256": "eb9cdced29e7f35f3228ecbc89a9f919fefc8ec53a4095599b721e89a5ee5cee",
+      "path": "MITLibs/gssapi64.dll"
+    },
+    {
+      "normalizeLineEndings": false,
+      "sha256": "ae7f6cab9e60b1696ef96d2ed8bcb35d53f0ba89c63e29d5dd8a3ca67e872046",
+      "path": "MITLibs/k5sprt64.dll"
+    },
+    {
+      "normalizeLineEndings": false,
+      "sha256": "b2fe9dfb6df4061e4286656ae481a526fe35daada2125c0d3e93a30204970925",
+      "path": "MITLibs/krb5_64.dll"
+    },
+    {
+      "normalizeLineEndings": false,
+      "sha256": "74f6b5aae310f0c89ce1f1019824048d7f53e68c3cff375235bd6fe4be3c4005",
+      "path": "MITLibs/krbcc64.dll"
+    }
+  ],
+  "profile": "net10.0 server only; unsigned local source build; no package publication"
+}
