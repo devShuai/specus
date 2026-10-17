@@ -1,4 +1,4 @@
-import { Modal, ModalBody, ModalContent, ModalHeader } from "@heroui/react";
+import { Modal } from "@heroui/react";
 import type { PeerTransportPath } from "../hooks/useDirectTransfer";
 
 /**
@@ -43,15 +43,11 @@ export function NearbyDeviceActions({
   onSelect,
 }: NearbyDeviceActionsProps) {
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      placement="center"
-      size="sm"
-      backdrop="blur"
-    >
-      <ModalContent>
-        <ModalHeader className="flex flex-col gap-1 pb-2">
+    <Modal.Root isOpen={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Modal.Backdrop>
+        <Modal.Container placement="center" size="sm">
+          <Modal.Dialog aria-label={deviceName}><Modal.CloseTrigger />
+        <Modal.Header className="flex flex-col gap-1 pb-2">
           <span className="text-medium font-semibold">{deviceName}</span>
           <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
             {transportPath === "turn"
@@ -62,8 +58,8 @@ export function NearbyDeviceActions({
                   ? "自动发现的设备（同一公网出口）"
                   : "远程设备"}
           </span>
-        </ModalHeader>
-        <ModalBody className="gap-2 pb-5">
+        </Modal.Header>
+        <Modal.Body className="gap-2 pb-5">
           {ACTIONS.map((action) => {
             const disabled = action.requiresSend && !canSend;
             return (
@@ -88,9 +84,12 @@ export function NearbyDeviceActions({
                 </span>
               </button>
             );
-          })}
-        </ModalBody>
-      </ModalContent>
-    </Modal>
+            })}
+            </Modal.Body>
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }

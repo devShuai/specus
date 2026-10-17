@@ -1,17 +1,8 @@
-import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ButtonHTMLAttributes } from "react";
+import { Button as AriaButton } from "react-aria-components/Button";
+import {type ComponentProps, useCallback, useEffect, useMemo, useRef, useState} from "react";
+
 import { createPortal } from "react-dom";
-import {
-  Button,
-  Chip,
-  Dropdown,
-  DropdownItem,
-  DropdownMenu,
-  DropdownTrigger,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@heroui/react";
+import { Button, Chip, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownTrigger, Popover, PopoverContent } from "@heroui/react";
 import {
   fitWhiteboardImageDataUrl,
 } from "../lib/whiteboardImageCompression";
@@ -1639,24 +1630,19 @@ export function SyncedWhiteboard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-950 dark:text-white">多人白板</h2>
-            <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
+            <Chip size="sm" variant={"soft"} color={isConnected ? "success" : "default"} className={"rounded-small"}>
               {isConnected ? "实时同步" : "本地绘制"}
             </Chip>
-            <Chip size="sm" radius="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {totalPeers} 台 · {boardCountLabel}
             </Chip>
-            {isReadOnly ? <Chip size="sm" radius="sm" variant="flat" color="warning">访客只读</Chip> : null}
+            {isReadOnly ? <Chip size="sm" variant="soft" color="warning">访客只读</Chip> : null}
           </div>
           <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
             可滚动画布支持文本、图片、图形和流程图，可导入导出可编辑白板文件。
           </div>
         </div>
-        <Button
-          size="sm"
-          radius="sm"
-          color={isExpanded ? "primary" : "default"}
-          variant="flat"
-          onPress={() => setIsExpanded((value) => !value)}
+        <Button size="sm" variant="secondary" onPress={() => setIsExpanded((value) => !value)}
         >
           <span className="mr-1.5"><ToolGlyph name={isExpanded ? "collapse" : "fullscreen"} /></span>
           {isExpanded ? "退出全屏" : "全屏白板"}
@@ -1678,49 +1664,54 @@ export function SyncedWhiteboard({
             <WhiteboardToolButton tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={selectTool} />
             <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
 
-            <Dropdown placement="bottom-start" shouldBlockScroll={false}>
-              <DropdownTrigger>
-                <WhiteboardMenuTrigger icon="insert" label={insertMenuLabel} active={isInsertMenuActive} />
-              </DropdownTrigger>
-              <DropdownMenu
-                aria-label="插入内容"
-                disabledKeys={isReadOnly
-                  ? ["text", "rectangle", "ellipse", "arrow", "flow", "image"]
-                  : isImportingImage
-                    ? ["image"]
-                    : []}
-                onAction={(key) => {
-                  const action = String(key);
-                  if (action === "flow") {
-                    setIsFlowchartOpen((value) => !value);
-                    return;
-                  }
-                  setIsFlowchartOpen(false);
-                  if (action === "image") {
-                    imageInputRef.current?.click();
-                    return;
-                  }
-                  selectTool(action as WhiteboardTool);
-                }}
-              >
-                <DropdownItem key="text" startContent={<ToolGlyph name="text" />}>文本</DropdownItem>
-                <DropdownItem key="rectangle" startContent={<ToolGlyph name="rectangle" />}>矩形</DropdownItem>
-                <DropdownItem key="ellipse" startContent={<ToolGlyph name="ellipse" />}>圆形</DropdownItem>
-                <DropdownItem key="arrow" startContent={<ToolGlyph name="arrow" />}>箭头</DropdownItem>
-                <DropdownItem key="flow" startContent={<ToolGlyph name="flow" />}>流程图组件</DropdownItem>
-                <DropdownItem key="image" startContent={<ToolGlyph name="image" />}>
-                  {isImportingImage ? "图片处理中" : "插入图片"}
-                </DropdownItem>
-              </DropdownMenu>
+            <Dropdown>
+              <DropdownTrigger
+                  aria-label={insertMenuLabel + "菜单"}
+                  className={whiteboardMenuTriggerClass(isInsertMenuActive)}
+                >
+                  <WhiteboardMenuTriggerContent icon="insert" label={insertMenuLabel} />
+                </DropdownTrigger>
+              <DropdownPopover placement="bottom start">
+                <DropdownMenu
+                  aria-label="插入内容"
+                  disabledKeys={isReadOnly
+                    ? ["text", "rectangle", "ellipse", "arrow", "flow", "image"]
+                    : isImportingImage
+                      ? ["image"]
+                      : []}
+                  onAction={(key) => {
+                    const action = String(key);
+                    if (action === "flow") {
+                      setIsFlowchartOpen((value) => !value);
+                      return;
+                    }
+                    setIsFlowchartOpen(false);
+                    if (action === "image") {
+                      imageInputRef.current?.click();
+                      return;
+                    }
+                    selectTool(action as WhiteboardTool);
+                  }}
+                >
+                  <DropdownItem id="text">{<ToolGlyph name="text" />}文本</DropdownItem>
+                  <DropdownItem id="rectangle">{<ToolGlyph name="rectangle" />}矩形</DropdownItem>
+                  <DropdownItem id="ellipse">{<ToolGlyph name="ellipse" />}圆形</DropdownItem>
+                  <DropdownItem id="arrow">{<ToolGlyph name="arrow" />}箭头</DropdownItem>
+                  <DropdownItem id="flow">{<ToolGlyph name="flow" />}流程图组件</DropdownItem>
+                  <DropdownItem id="image">{<ToolGlyph name="image" />}
+                    {isImportingImage ? "图片处理中" : "插入图片"}
+                  </DropdownItem>
+                </DropdownMenu>
+              </DropdownPopover>
             </Dropdown>
 
-            <Popover placement="bottom-start" shouldBlockScroll={false}>
-              <PopoverTrigger>
-                <button
+            <Popover>
+
+                <AriaButton
                   type="button"
                   className="flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
                   aria-label={`样式：${selectedBrushOption.label}，${selectedColorOption.label}，${selectedWidthOption.label}线条`}
-                  title="画笔、颜色与线条粗细"
+                  aria-description="画笔、颜色与线条粗细"
                 >
                   <span
                     className="h-4 w-4 rounded-full border border-black/15 shadow-xs dark:border-white/20"
@@ -1735,9 +1726,9 @@ export function SyncedWhiteboard({
                     />
                   </span>
                   <MenuChevronGlyph />
-                </button>
-              </PopoverTrigger>
-              <PopoverContent className="w-64 p-3">
+                </AriaButton>
+
+              <PopoverContent placement="bottom start" className="w-64 p-3"><Popover.Dialog aria-label="画笔、颜色与线条粗细">
                 <div className="w-full space-y-4">
                   <div>
                     <div className="mb-2 flex items-center justify-between text-tiny font-semibold text-zinc-800 dark:text-zinc-100">
@@ -1855,68 +1846,78 @@ export function SyncedWhiteboard({
                     </div>
                   </div>
                 </div>
-              </PopoverContent>
+              </Popover.Dialog></PopoverContent>
             </Popover>
 
             <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
 
-            <Dropdown placement="bottom-end" shouldBlockScroll={false}>
-              <DropdownTrigger>
-                <WhiteboardMenuTrigger icon="file" label="文件" />
-              </DropdownTrigger>
-              <DropdownMenu
-                aria-label="白板文件"
-                disabledKeys={[
-                  ...(isReadOnly || isImportingDocument ? ["import"] : []),
-                  ...(strokes.length === 0 && objects.length === 0 ? ["export"] : []),
-                ]}
-                onAction={(key) => {
-                  if (String(key) === "import") {
-                    documentInputRef.current?.click();
-                  } else {
-                    void exportBoardDocument();
-                  }
-                }}
-              >
-                <DropdownItem key="import" startContent={<ToolGlyph name="import" />}>
-                  {isImportingDocument ? "正在导入" : "导入白板"}
-                </DropdownItem>
-                <DropdownItem key="export" startContent={<ToolGlyph name="export" />}>导出白板</DropdownItem>
-              </DropdownMenu>
+            <Dropdown>
+              <DropdownTrigger
+                  aria-label={"文件" + "菜单"}
+                  className={whiteboardMenuTriggerClass(false)}
+                >
+                  <WhiteboardMenuTriggerContent icon="file" label="文件" />
+                </DropdownTrigger>
+              <DropdownPopover placement="bottom end">
+                <DropdownMenu
+                  aria-label="白板文件"
+                  disabledKeys={[
+                    ...(isReadOnly || isImportingDocument ? ["import"] : []),
+                    ...(strokes.length === 0 && objects.length === 0 ? ["export"] : []),
+                  ]}
+                  onAction={(key) => {
+                    if (String(key) === "import") {
+                      documentInputRef.current?.click();
+                    } else {
+                      void exportBoardDocument();
+                    }
+                  }}
+                >
+                  <DropdownItem id="import">{<ToolGlyph name="import" />}
+                    {isImportingDocument ? "正在导入" : "导入白板"}
+                  </DropdownItem>
+                  <DropdownItem id="export">{<ToolGlyph name="export" />}导出白板</DropdownItem>
+                </DropdownMenu>
+              </DropdownPopover>
             </Dropdown>
 
-            <Dropdown placement="bottom-end" shouldBlockScroll={false}>
-              <DropdownTrigger>
-                <WhiteboardMenuTrigger icon="edit" label="编辑" />
-              </DropdownTrigger>
-              <DropdownMenu
-                aria-label="编辑白板"
-                disabledKeys={[
-                  ...(!localElementExists || isReadOnly ? ["undo"] : []),
-                  ...(!selectedObjectId || isReadOnly ? ["delete"] : []),
-                  ...((strokes.length === 0 && objects.length === 0) || isReadOnly ? ["clear"] : []),
-                ]}
-                onAction={(key) => {
-                  const action = String(key);
-                  if (action === "undo") {
-                    undoLastLocalElement();
-                  } else if (action === "delete") {
-                    if (selectedObjectId) removeObject(selectedObjectId);
-                  } else {
-                    clearBoard();
-                  }
-                }}
-              >
-                <DropdownItem key="undo" startContent={<ToolGlyph name="undo" />} endContent={<span className="text-[10px] text-zinc-400">Ctrl Z</span>}>
-                  撤销
-                </DropdownItem>
-                <DropdownItem key="delete" startContent={<ToolGlyph name="delete" />} endContent={<span className="text-[10px] text-zinc-400">Delete</span>}>
-                  删除所选
-                </DropdownItem>
-                <DropdownItem key="clear" color="danger" className="text-danger" startContent={<ToolGlyph name="clear" />}>
-                  清空白板
-                </DropdownItem>
-              </DropdownMenu>
+            <Dropdown>
+              <DropdownTrigger
+                  aria-label={"编辑" + "菜单"}
+                  className={whiteboardMenuTriggerClass(false)}
+                >
+                  <WhiteboardMenuTriggerContent icon="edit" label="编辑" />
+                </DropdownTrigger>
+              <DropdownPopover placement="bottom end">
+                <DropdownMenu
+                  aria-label="编辑白板"
+                  disabledKeys={[
+                    ...(!localElementExists || isReadOnly ? ["undo"] : []),
+                    ...(!selectedObjectId || isReadOnly ? ["delete"] : []),
+                    ...((strokes.length === 0 && objects.length === 0) || isReadOnly ? ["clear"] : []),
+                  ]}
+                  onAction={(key) => {
+                    const action = String(key);
+                    if (action === "undo") {
+                      undoLastLocalElement();
+                    } else if (action === "delete") {
+                      if (selectedObjectId) removeObject(selectedObjectId);
+                    } else {
+                      clearBoard();
+                    }
+                  }}
+                >
+                  <DropdownItem id="undo">{<ToolGlyph name="undo" />}
+                    撤销
+                  {<span className="text-[10px] text-zinc-400">Ctrl Z</span>}</DropdownItem>
+                  <DropdownItem id="delete">{<ToolGlyph name="delete" />}
+                    删除所选
+                  {<span className="text-[10px] text-zinc-400">Delete</span>}</DropdownItem>
+                  <DropdownItem className="text-danger" id="clear">{<ToolGlyph name="clear" />}
+                    清空白板
+                  </DropdownItem>
+                </DropdownMenu>
+              </DropdownPopover>
             </Dropdown>
           </div>
 
@@ -2330,11 +2331,11 @@ export function SyncedWhiteboard({
                 </div>
               </div>
               <div className="mt-2 flex flex-wrap gap-1.5">
-                <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
+                <Chip size="sm" variant="soft" color={isConnected ? "success" : "default"}>
                   {isConnected ? "实时同步" : "本地绘制"}
                 </Chip>
-                <Chip size="sm" radius="sm" variant="flat">{totalPeers} 台</Chip>
-                <Chip size="sm" radius="sm" variant="flat">{boardCountLabel}</Chip>
+                <Chip size="sm" variant="soft">{totalPeers} 台</Chip>
+                <Chip size="sm" variant="soft">{boardCountLabel}</Chip>
               </div>
               <div className="mt-2 rounded-lg border border-cyan-500/15 bg-cyan-500/[0.08] px-2.5 py-2 text-[11px] leading-5 text-zinc-700 dark:text-zinc-200">
                 {boardMessage}
@@ -2344,27 +2345,14 @@ export function SyncedWhiteboard({
                 可滚动画布 · {WHITEBOARD_SURFACE_MIN_WIDTH} × {WHITEBOARD_SURFACE_HEIGHT}
               </div>
               <div className="mt-2 grid grid-cols-3 gap-1.5 border-t border-black/5 pt-2 dark:border-white/10">
-                <Button size="sm" radius="sm" variant="flat" className="min-w-0 px-1" onPress={undoLastLocalElement} isDisabled={!localElementExists}>
+                <Button size="sm" variant="secondary" className="min-w-0 px-1" onPress={undoLastLocalElement} isDisabled={!localElementExists}>
                   撤销
                 </Button>
-                <Button
-                  size="sm"
-                  radius="sm"
-                  variant="flat"
-                  className="min-w-0 px-1"
-                  isDisabled={!selectedObjectId}
-                  onPress={() => selectedObjectId && removeObject(selectedObjectId)}
+                <Button size="sm" variant="secondary" className="min-w-0 px-1" isDisabled={!selectedObjectId} onPress={() => selectedObjectId && removeObject(selectedObjectId)}
                 >
                   删除
                 </Button>
-                <Button
-                  size="sm"
-                  radius="sm"
-                  color="danger"
-                  variant="flat"
-                  className="min-w-0 px-1"
-                  onPress={clearBoard}
-                  isDisabled={strokes.length === 0 && objects.length === 0}
+                <Button size="sm" variant="danger-soft" className="min-w-0 px-1" onPress={clearBoard} isDisabled={strokes.length === 0 && objects.length === 0}
                 >
                   清空
                 </Button>
@@ -2421,39 +2409,28 @@ function WhiteboardToolButton({
   );
 }
 
-interface WhiteboardMenuTriggerProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  icon: "insert" | "file" | "edit";
+interface WhiteboardMenuTriggerProps {
+  icon: ComponentProps<typeof ToolGlyph>["name"];
   label: string;
   active?: boolean;
 }
 
-const WhiteboardMenuTrigger = forwardRef<HTMLButtonElement, WhiteboardMenuTriggerProps>(function WhiteboardMenuTrigger({
-  icon,
-  label,
-  active = false,
-  className = "",
-  ...buttonProps
-}, ref) {
+function WhiteboardMenuTriggerContent({ icon, label }: Pick<WhiteboardMenuTriggerProps, "icon" | "label">) {
+  return <><ToolGlyph name={icon} /><span className="hidden sm:inline">{label}</span><MenuChevronGlyph /></>;
+}
+
+/** Class list for a whiteboard menu trigger. HeroUI 3's DropdownTrigger renders
+ *  the <button> itself, so this contributes styling and content, not an element —
+ *  nesting a second button inside the trigger is invalid HTML. */
+export function whiteboardMenuTriggerClass(active = false, className = ""): string {
   return (
-    <button
-      {...buttonProps}
-      ref={ref}
-      type="button"
-      aria-label={label + "菜单"}
-      className={
         "flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
         + (active
           ? "bg-cyan-500 text-white shadow-xs dark:bg-cyan-300 dark:text-zinc-950"
           : "text-zinc-700 hover:bg-black/5 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white")
         + (className ? " " + className : "")
-      }
-    >
-      <ToolGlyph name={icon} />
-      <span className="hidden sm:inline">{label}</span>
-      <MenuChevronGlyph />
-    </button>
   );
-});
+}
 
 function FlowchartPanel({
   className = "",

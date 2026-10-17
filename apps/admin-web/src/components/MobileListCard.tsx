@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Card, CardBody } from "@heroui/react";
+import { Card } from "@heroui/react";
 
 /**
  * 移动端列表卡片模板。桌面端继续用 <Table>，< lg 断点下用卡片堆叠。
@@ -40,14 +40,24 @@ export function MobileListCard({
   const clickable = typeof onPress === "function";
   return (
     <Card
-      shadow="none"
-      isPressable={clickable}
-      onPress={onPress}
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      onClick={onPress}
+      onKeyDown={
+        clickable
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onPress?.();
+              }
+            }
+          : undefined
+      }
       className={`w-full rounded-md border border-default-200 bg-content1 ${
         clickable ? "cursor-pointer hover:border-primary" : ""
       }`}
     >
-      <CardBody className="gap-3 p-3">
+      <Card.Content className="gap-3 p-3">
         <div className="flex flex-col gap-1">
           <div className="min-w-0 break-words text-small font-semibold text-foreground">{title}</div>
           {subtitle ? (
@@ -64,7 +74,7 @@ export function MobileListCard({
         ) : null}
         {extra}
         {actions ? <div className="flex flex-wrap items-center gap-2 pt-1">{actions}</div> : null}
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }

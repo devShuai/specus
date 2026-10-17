@@ -1,19 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Button,
-  Checkbox,
-  Chip,
-  Input,
-  Select,
-  SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-} from "@heroui/react";
+import { Button, Checkbox, Chip, Input, Select, Switch, Table, TableBody, TableCell, TableColumn, TableHeader, TableRow, Label, Spinner, TextField, SelectTrigger, SelectValue, SelectIndicator, SelectPopover, ListBox, ListBoxItem, Description, TableContent } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { PeerEgressActivity, PeerEgressPolicy, PeerEgressSwitch, PeerMeshDevice } from "../../api/types";
 import { useAuth } from "../../auth/AuthContext";
@@ -277,7 +263,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
       {loadError && (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-danger-200 bg-danger-50 p-3 text-small text-danger-700">
           <span>出口分流状态未知：{loadError}</span>
-          <Button size="sm" color="danger" variant="flat" onPress={() => void load()}>重新加载</Button>
+          <Button size="sm" variant={"danger-soft"} onPress={() => void load()}>重新加载</Button>
         </div>
       )}
 
@@ -289,19 +275,12 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
             {egressSwitch?.updatedAt ? ` · ${formatDateTime(egressSwitch.updatedAt)}${egressSwitch.updatedBy ? ` 由 ${egressSwitch.updatedBy} 修改` : ""}` : ""}
           </p>
         </div>
-        <Switch
-          aria-label="出口分流总开关"
-          aria-describedby="peer-egress-switch-help"
-          aria-busy={updatingSwitch}
-          isSelected={switchSelected}
-          isDisabled={switchDisabled}
-          onValueChange={setSwitchEnabled}
-        />
+        <Switch aria-label="出口分流总开关" aria-describedby="peer-egress-switch-help" aria-busy={updatingSwitch} isSelected={switchSelected} isDisabled={switchDisabled} onChange={setSwitchEnabled}><Switch.Content aria-label={"出口分流总开关"}><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
       </div>
 
       {isAdmin && !draft && (
         <div className="flex justify-end">
-          <Button color="primary" variant="flat" isDisabled={loadError != null} onPress={startNew}>
+          <Button variant={"secondary"} isDisabled={loadError != null} onPress={startNew}>
             新增出口设备
           </Button>
         </div>
@@ -311,51 +290,35 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
         <div className="space-y-3 rounded-md border border-primary-200 p-3" aria-label="出口策略编辑">
           <h3 className="text-base font-semibold">{editingExisting ? `编辑 ${deviceName(Number(draft.egressClientId))} 的出口策略` : "新增出口设备"}</h3>
           <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
-            <Select
-              label="出口设备"
-              aria-label="出口设备"
-              isDisabled={editingExisting}
-              selectedKeys={draft.egressClientId ? [draft.egressClientId] : []}
-              onSelectionChange={(keys) => setDraft((current) => current && {
+            <Select aria-label="出口设备" isDisabled={editingExisting} value={(Array.from(draft.egressClientId ? [draft.egressClientId] : [])[0] ?? null)} onChange={(nativeSelectionValue) => { const keys = new Set((nativeSelectionValue == null ? [] : [nativeSelectionValue])); return (setDraft((current) => current && {
                 ...current,
                 egressClientId: String([...keys][0] ?? ""),
                 consumers: current.consumers.filter((id) => id !== String([...keys][0] ?? "")),
-              })}
-            >
+              })); }}
+            ><Label>{"出口设备"}</Label><SelectTrigger><SelectValue /><SelectIndicator /></SelectTrigger><SelectPopover><ListBox>
               {devices
                 .filter((device) => editingExisting || !takenEgresses.has(String(device.clientId)))
                 .map((device) => (
-                  <SelectItem key={String(device.clientId)} textValue={device.clientName}>
+                  <ListBoxItem key={String(device.clientId)} textValue={device.clientName} id={String(device.clientId)}>
                     {device.clientName}{device.online ? "" : "（离线）"}
-                  </SelectItem>
+                  </ListBoxItem>
                 ))}
-            </Select>
-            <Select
-              label="目标范围"
-              aria-label="目标范围"
-              description="公网与局域网互不包含"
-              selectedKeys={[draft.scope]}
-              onSelectionChange={(keys) => setDraft((current) => current && {
+            </ListBox></SelectPopover></Select>
+            <Select aria-label="目标范围" value={(Array.from([draft.scope])[0] ?? null)} onChange={(nativeSelectionValue) => { const keys = new Set((nativeSelectionValue == null ? [] : [nativeSelectionValue])); return (setDraft((current) => current && {
                 ...current, scope: String([...keys][0] ?? "PUBLIC") === "LAN" ? "LAN" : "PUBLIC",
-              })}
-            >
-              <SelectItem key="PUBLIC">公网</SelectItem>
-              <SelectItem key="LAN">局域网（10/8、172.16/12、192.168/16、100.64/10）</SelectItem>
-            </Select>
-            <Select
-              label="授权的消费设备"
-              aria-label="授权的消费设备"
-              selectionMode="multiple"
-              description="还需 Peer ACL 允许它们与出口设备通信"
-              selectedKeys={new Set(draft.consumers)}
-              onSelectionChange={(keys) => setDraft((current) => current && { ...current, consumers: [...keys].map(String) })}
-            >
+              })); }}
+            ><Label>{"目标范围"}</Label><SelectTrigger><SelectValue /><SelectIndicator /></SelectTrigger><SelectPopover><ListBox>
+              <ListBoxItem key="PUBLIC" id={"PUBLIC"} textValue={"公网"}>公网</ListBoxItem>
+              <ListBoxItem key="LAN" id={"LAN"} textValue={"局域网（10/8、172.16/12、192.168/16、100.64/10）"}>局域网（10/8、172.16/12、192.168/16、100.64/10）</ListBoxItem>
+            </ListBox></SelectPopover><Description>{"公网与局域网互不包含"}</Description></Select>
+            <Select aria-label="授权的消费设备" selectionMode="multiple" value={Array.from(new Set(draft.consumers))} onChange={(nativeSelectionValue) => { const keys = new Set(nativeSelectionValue); return (setDraft((current) => current && { ...current, consumers: [...keys].map(String) })); }}
+            ><Label>{"授权的消费设备"}</Label><SelectTrigger><SelectValue /><SelectIndicator /></SelectTrigger><SelectPopover><ListBox>
               {devices
                 .filter((device) => String(device.clientId) !== draft.egressClientId)
                 .map((device) => (
-                  <SelectItem key={String(device.clientId)} textValue={device.clientName}>{device.clientName}</SelectItem>
+                  <ListBoxItem key={String(device.clientId)} textValue={device.clientName} id={String(device.clientId)}>{device.clientName}</ListBoxItem>
                 ))}
-            </Select>
+            </ListBox></SelectPopover><Description>{"还需 Peer ACL 允许它们与出口设备通信"}</Description></Select>
           </div>
 
           <div className="space-y-2">
@@ -365,37 +328,17 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
             )}
             {draft.rules.map((rule, index) => (
               <div key={index} className="grid grid-cols-1 items-center gap-2 md:grid-cols-[2fr_auto_auto_2fr_auto]">
-                <Input
-                  size="sm"
-                  aria-label={`目的规则 ${index + 1} 网段`}
-                  placeholder="203.0.113.0/24"
-                  value={rule.cidr}
-                  onValueChange={(cidr) => updateRule(index, { cidr })}
-                />
-                <Checkbox size="sm" isSelected={rule.tcp} onValueChange={(tcp) => updateRule(index, { tcp })}>TCP</Checkbox>
-                <Checkbox size="sm" isSelected={rule.udp} onValueChange={(udp) => updateRule(index, { udp })}>UDP</Checkbox>
-                <Input
-                  size="sm"
-                  aria-label={`目的规则 ${index + 1} 端口`}
-                  placeholder="443, 8000-8100 或 全部"
-                  value={rule.ports}
-                  onValueChange={(ports) => updateRule(index, { ports })}
-                />
-                <Button
-                  size="sm"
-                  variant="light"
-                  color="danger"
-                  onPress={() => setDraft((current) => current && { ...current, rules: current.rules.filter((_, position) => position !== index) })}
+                <TextField value={rule.cidr} onChange={(cidr) => updateRule(index, { cidr })}><Input aria-label={`目的规则 ${index + 1} 网段`} placeholder="203.0.113.0/24" className={[("h-8 text-small")].filter(Boolean).join(" ")} /></TextField>
+                <Checkbox isSelected={rule.tcp} onChange={(tcp) => updateRule(index, { tcp })} className={"text-small"}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>TCP</Label></Checkbox.Content></Checkbox>
+                <Checkbox isSelected={rule.udp} onChange={(udp) => updateRule(index, { udp })} className={"text-small"}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>UDP</Label></Checkbox.Content></Checkbox>
+                <TextField value={rule.ports} onChange={(ports) => updateRule(index, { ports })}><Input aria-label={`目的规则 ${index + 1} 端口`} placeholder="443, 8000-8100 或 全部" className={[("h-8 text-small")].filter(Boolean).join(" ")} /></TextField>
+                <Button size="sm" variant={"ghost"} onPress={() => setDraft((current) => current && { ...current, rules: current.rules.filter((_, position) => position !== index) })} className={"text-danger"}
                 >
                   移除
                 </Button>
               </div>
             ))}
-            <Button
-              size="sm"
-              variant="flat"
-              isDisabled={draft.rules.length >= MAX_DESTINATION_RULES}
-              onPress={() => setDraft((current) => current && { ...current, rules: [...current.rules, emptyRuleDraft()] })}
+            <Button size="sm" variant={"secondary"} isDisabled={draft.rules.length >= MAX_DESTINATION_RULES} onPress={() => setDraft((current) => current && { ...current, rules: [...current.rules, emptyRuleDraft()] })}
             >
               添加目的规则
             </Button>
@@ -411,69 +354,35 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
             </ul>
             {draft.domainRules.map((rule, index) => (
               <div key={index} className="grid grid-cols-1 items-center gap-2 md:grid-cols-[2fr_auto_auto_2fr_auto]">
-                <Input
-                  size="sm"
-                  aria-label={`域名规则 ${index + 1} 域名`}
-                  placeholder="*.example.com"
-                  value={rule.match}
-                  onValueChange={(match) => updateDomainRule(index, { match })}
-                />
-                <Checkbox size="sm" isSelected={rule.tcp} onValueChange={(tcp) => updateDomainRule(index, { tcp })}>TCP</Checkbox>
-                <Checkbox size="sm" isSelected={rule.udp} onValueChange={(udp) => updateDomainRule(index, { udp })}>UDP</Checkbox>
-                <Input
-                  size="sm"
-                  aria-label={`域名规则 ${index + 1} 端口`}
-                  placeholder="443, 8000-8100 或 全部"
-                  value={rule.ports}
-                  onValueChange={(ports) => updateDomainRule(index, { ports })}
-                />
-                <Button
-                  size="sm"
-                  variant="light"
-                  color="danger"
-                  onPress={() => setDraft((current) => current && { ...current, domainRules: current.domainRules.filter((_, position) => position !== index) })}
+                <TextField value={rule.match} onChange={(match) => updateDomainRule(index, { match })}><Input aria-label={`域名规则 ${index + 1} 域名`} placeholder="*.example.com" className={[("h-8 text-small")].filter(Boolean).join(" ")} /></TextField>
+                <Checkbox isSelected={rule.tcp} onChange={(tcp) => updateDomainRule(index, { tcp })} className={"text-small"}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>TCP</Label></Checkbox.Content></Checkbox>
+                <Checkbox isSelected={rule.udp} onChange={(udp) => updateDomainRule(index, { udp })} className={"text-small"}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>UDP</Label></Checkbox.Content></Checkbox>
+                <TextField value={rule.ports} onChange={(ports) => updateDomainRule(index, { ports })}><Input aria-label={`域名规则 ${index + 1} 端口`} placeholder="443, 8000-8100 或 全部" className={[("h-8 text-small")].filter(Boolean).join(" ")} /></TextField>
+                <Button size="sm" variant={"ghost"} onPress={() => setDraft((current) => current && { ...current, domainRules: current.domainRules.filter((_, position) => position !== index) })} className={"text-danger"}
                 >
                   移除
                 </Button>
               </div>
             ))}
-            <Button
-              size="sm"
-              variant="flat"
-              isDisabled={draft.domainRules.length >= MAX_DOMAIN_RULES}
-              onPress={() => setDraft((current) => current && { ...current, domainRules: [...current.domainRules, emptyDomainRuleDraft()] })}
+            <Button size="sm" variant={"secondary"} isDisabled={draft.domainRules.length >= MAX_DOMAIN_RULES} onPress={() => setDraft((current) => current && { ...current, domainRules: [...current.domainRules, emptyDomainRuleDraft()] })}
             >
               添加域名规则
             </Button>
           </div>
 
           <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
-            <Input
-              label="最大并发流"
-              value={draft.maxConcurrentFlows}
-              onValueChange={(maxConcurrentFlows) => setDraft((current) => current && { ...current, maxConcurrentFlows })}
-            />
-            <Input
-              label="每台消费设备最大流数"
-              value={draft.maxFlowsPerConsumer}
-              onValueChange={(maxFlowsPerConsumer) => setDraft((current) => current && { ...current, maxFlowsPerConsumer })}
-            />
-            <Input
-              label="空闲超时（秒）"
-              value={draft.idleTimeoutSeconds}
-              onValueChange={(idleTimeoutSeconds) => setDraft((current) => current && { ...current, idleTimeoutSeconds })}
-            />
+            <TextField value={draft.maxConcurrentFlows} onChange={(maxConcurrentFlows) => setDraft((current) => current && { ...current, maxConcurrentFlows })}><Label>{"最大并发流"}</Label><Input  /></TextField>
+            <TextField value={draft.maxFlowsPerConsumer} onChange={(maxFlowsPerConsumer) => setDraft((current) => current && { ...current, maxFlowsPerConsumer })}><Label>{"每台消费设备最大流数"}</Label><Input  /></TextField>
+            <TextField value={draft.idleTimeoutSeconds} onChange={(idleTimeoutSeconds) => setDraft((current) => current && { ...current, idleTimeoutSeconds })}><Label>{"空闲超时（秒）"}</Label><Input  /></TextField>
           </div>
 
           {/* The switch is inline-level; in a block of its own, space-y's gap no longer eats its line's
               descender space, now that Tailwind 4 puts that gap in the bottom margin. */}
           <div>
-            <Switch
-              isSelected={draft.enabled}
-              onValueChange={(enabled) => setDraft((current) => current && { ...current, enabled })}
-            >
+            <Switch isSelected={draft.enabled} onChange={(enabled) => setDraft((current) => current && { ...current, enabled })}
+            ><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>
               启用这条策略
-            </Switch>
+            </Label></Switch.Content></Switch>
           </div>
 
           {check && check.errors.length > 0 && (
@@ -487,10 +396,10 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
             </ul>
           )}
           <div className="flex gap-2">
-            <Button color="primary" isLoading={saving} isDisabled={saving || !check?.mutation} onPress={() => void save()}>
+            <Button isPending={saving} isDisabled={saving || !check?.mutation} onPress={() => void save()} variant={"primary"}>{(saving) ? <Spinner size="sm" aria-hidden="true" /> : null}
               {editingExisting ? "保存更改" : "创建"}
             </Button>
-            <Button variant="light" isDisabled={saving} onPress={() => setDraft(null)}>取消</Button>
+            <Button variant={"ghost"} isDisabled={saving} onPress={() => setDraft(null)}>取消</Button>
           </div>
         </div>
       )}
@@ -503,9 +412,9 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
         />
       ) : (
         <div className="overflow-x-auto">
-          <Table aria-label="出口策略" removeWrapper>
+          <Table><Table.ScrollContainer><TableContent aria-label={"出口策略"}>
             <TableHeader>
-              <TableColumn>出口设备</TableColumn>
+              <TableColumn isRowHeader={true}>出口设备</TableColumn>
               <TableColumn>状态</TableColumn>
               <TableColumn>范围</TableColumn>
               <TableColumn>消费设备</TableColumn>
@@ -521,7 +430,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
                 const allowed = policy.allowedConsumerClientIds ?? [];
                 const busy = busyPolicies.has(policy.id);
                 return (
-                  <TableRow key={policy.id} aria-busy={busy}>
+                  <TableRow key={policy.id} aria-busy={busy} id={policy.id}>
                     <TableCell>
                       <div className="flex flex-col">
                         <span>{policy.egressClientName || deviceName(policy.egressClientId)}</span>
@@ -531,7 +440,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <Chip size="sm" variant="flat" color={state.color} className="whitespace-nowrap">{state.label}</Chip>
+                      <Chip size="sm" variant={"soft"} color={state.color} className="whitespace-nowrap">{state.label}</Chip>
                       {state.detail && <p className="mt-1 max-w-56 text-tiny text-default-500">{state.detail}</p>}
                     </TableCell>
                     <TableCell className="whitespace-nowrap">{scopeLabel(policy.scope)}</TableCell>
@@ -594,19 +503,13 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
                     <TableCell>
                       <div className="flex flex-wrap items-center gap-2">
                         {isAdmin && (
-                          <Switch
-                            size="sm"
-                            aria-label={`启用 ${policy.egressClientName} 的出口策略`}
-                            isSelected={policy.enabled}
-                            isDisabled={busy || loadError != null}
-                            onValueChange={(enabled) => void togglePolicy(policy, enabled)}
-                          />
+                          <Switch size="sm" aria-label={`启用 ${policy.egressClientName} 的出口策略`} isSelected={policy.enabled} isDisabled={busy || loadError != null} onChange={(enabled) => void togglePolicy(policy, enabled)}><Switch.Content aria-label={`启用 ${policy.egressClientName} 的出口策略`}><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
                         )}
                         {isAdmin && (
-                          <Button size="sm" variant="light" isDisabled={busy || draft != null} onPress={() => edit(policy)}>编辑</Button>
+                          <Button size="sm" variant={"ghost"} isDisabled={busy || draft != null} onPress={() => edit(policy)}>编辑</Button>
                         )}
                         {isAdmin && (
-                          <Button size="sm" variant="light" color="danger" isLoading={busy} isDisabled={busy} onPress={() => removePolicy(policy)}>删除</Button>
+                          <Button size="sm" variant={"ghost"} isPending={busy} isDisabled={busy} onPress={() => removePolicy(policy)} className={"text-danger"}>{(busy) ? <Spinner size="sm" aria-hidden="true" /> : null}删除</Button>
                         )}
                       </div>
                     </TableCell>
@@ -614,7 +517,7 @@ export function PeerMeshEgressTab({ devices }: { devices: PeerMeshDevice[] }) {
                 );
               })}
             </TableBody>
-          </Table>
+          </TableContent></Table.ScrollContainer></Table>
         </div>
       )}
 

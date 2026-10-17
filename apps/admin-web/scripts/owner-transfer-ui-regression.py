@@ -74,7 +74,7 @@ with sync_playwright() as playwright:
         page.wait_for_load_state("networkidle")
         # Mobile cards have no row role. The credential entry comes first, then this client.
         page.get_by_role("button", name="转移管理归属", exact=True).nth(1).click()
-        modal = page.locator('[role="dialog"][aria-modal="true"][data-open="true"]')
+        modal = page.get_by_role("dialog", name="转移管理归属", exact=True)
         expect(modal.get_by_role("button", name="查看凭证整组预览")).to_be_visible()
         modal.get_by_role("button", name=re.compile("目标账号")).press("Enter")
         # A body-level Select portal inside Modal was aria-hidden: this must use the accessible role.
@@ -88,7 +88,11 @@ with sync_playwright() as playwright:
         expect(modal.get_by_role("button", name=re.compile("目标账号"))).to_contain_text("Bob")
         expect(modal).to_contain_text("不是安全交接")
         expect(modal).not_to_contain_text("synthetic-fixture-key")
-        checkbox.check()
+        # The native checkbox input is visually hidden behind its labelled control.
+        # Exercise its real keyboard interaction, without forcing a pointer click.
+        checkbox.focus()
+        page.keyboard.press("Space")
+        expect(checkbox).to_be_checked()
         modal.get_by_role("button", name="转移此凭证及 2 台设备").click()
         expect(modal.get_by_role("heading", name="管理归属已转移")).to_be_visible()
         expect(modal.get_by_role("link", name="查看新归属资源")).to_have_attribute("href", "#/clients?owner=Bob&section=credentials")
@@ -98,7 +102,7 @@ with sync_playwright() as playwright:
         page.goto(base + "/#/system")
         page.wait_for_load_state("networkidle")
         page.get_by_role("row").filter(has_text=re.compile("^Bob")).get_by_role("button", name="删除", exact=True).click()
-        modal.get_by_role("button", name="删除", exact=True).click()
+        page.get_by_role("dialog").get_by_role("button", name="删除", exact=True).click()
         blocked = page.get_by_role("dialog", name="先处理名下资源，再删除账号")
         expect(blocked).to_contain_text("2 个客户端")
         expect(blocked).to_contain_text("1 个接入凭证")

@@ -1,8 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import {
-  Avatar, Button, Dropdown, DropdownItem, DropdownMenu,
-  DropdownSection, DropdownTrigger, Spinner,
-} from "@heroui/react";
+import { Avatar, AvatarFallback, Button, Dropdown, DropdownItem, DropdownMenu, DropdownPopover, DropdownSection, DropdownTrigger, Spinner, buttonVariants, cn } from "@heroui/react";
 import { useAuth } from "../auth/AuthContext";
 import { useTheme } from "../theme/ThemeContext";
 import { adminApi } from "../api/client";
@@ -149,7 +146,7 @@ function DashboardContent() {
       <div className="flex min-w-0 flex-1 flex-col lg:ml-56">
         <header className="app-apple-mobile-header sticky top-0 z-30 bg-background/80 backdrop-blur-sm lg:hidden">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
-            <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
+            <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" variant="secondary" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
             <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
@@ -210,7 +207,7 @@ function MobileNav({ open, groups, active, onSelect, onClose, triggerRef }: { op
     >
       <div className="app-apple-nav-brand flex h-14 items-center justify-between gap-2 px-3">
         <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
-        <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="sm" variant="light" onPress={onClose}><CloseIcon /></Button>
+        <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" variant="ghost" onPress={onClose}><CloseIcon /></Button>
       </div>
       <Sidebar groups={groups} active={active} onSelect={onSelect} variant="mobile" onClose={onClose} />
     </aside>
@@ -230,22 +227,37 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
   // The standing member notice of product metrics (protocol/spec/product-metrics.md section 3.1).
   const metricsCollecting = useProductMetricsCollecting(Boolean(profile));
   return (
-    <Dropdown placement={variant === "block" ? "top-start" : "bottom-end"} shouldBlockScroll={false}>
-      <DropdownTrigger>
+    <Dropdown>
+      <DropdownTrigger
+        aria-label="个人菜单"
+        className={cn(
+          buttonVariants({
+            variant: variant === "block" ? "ghost" : "secondary",
+            isIconOnly: variant !== "block",
+          }),
+          "inline-flex items-center",
+          variant === "block"
+            ? "h-auto w-full justify-start gap-2.5 rounded-full border border-default-200 px-2.5 py-2"
+            : "h-10 w-10 min-w-10 rounded-full",
+        )}
+      >
         {variant === "block" ? (
-          <Button aria-label="个人菜单" className="h-auto w-full justify-start gap-2.5 px-2.5 py-2" radius="sm" variant="light">
-            <Avatar className="h-8 w-8 shrink-0 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
+          <>
+            <Avatar className="h-8 w-8 shrink-0 bg-primary-500 text-primary-foreground">
+              <AvatarFallback className="bg-primary-500 text-primary-foreground">{initials}</AvatarFallback>
+            </Avatar>
             <span className="flex min-w-0 flex-col items-start">
               <span className="w-full truncate text-left text-small font-medium text-foreground">{name}</span>
               <span className="w-full truncate text-left text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"}</span>
             </span>
-          </Button>
+          </>
         ) : (
-          <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" radius="full" variant="flat">
-            <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
-          </Button>
+          <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground">
+            <AvatarFallback className="bg-primary-500 text-primary-foreground">{initials}</AvatarFallback>
+          </Avatar>
         )}
       </DropdownTrigger>
+      <DropdownPopover placement={variant === "block" ? "top start" : "bottom end"}>
       <DropdownMenu aria-label="个人菜单" onAction={(key) => {
         if (key === "logout") onLogout();
         else if (key === "theme-dark") setTheme("dark");
@@ -253,16 +265,16 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
         else if (key === "theme-system") resetToSystem();
         else if (key === "docs") window.location.hash = "/help";
       }}>
-        <DropdownSection aria-label="主题" showDivider>
-          <DropdownItem key="theme-dark" textValue="深色" endContent={mode === "dark" ? <CheckIcon /> : null}>{"\uD83C\uDF19"} 深色模式</DropdownItem>
-          <DropdownItem key="theme-light" textValue="浅色" endContent={mode === "light" ? <CheckIcon /> : null}>{"\u2600\uFE0F"} 浅色模式</DropdownItem>
-          <DropdownItem key="theme-system" textValue="系统" endContent={mode === "system" ? <CheckIcon /> : null}>{"\uD83D\uDDA5\uFE0F"} 跟随系统</DropdownItem>
+        <DropdownSection aria-label="主题" className="border-b border-default-200 pb-2">
+          <DropdownItem id="theme-dark" textValue="深色模式">{"\uD83C\uDF19"} 深色模式{mode === "dark" ? <CheckIcon /> : null}</DropdownItem>
+          <DropdownItem id="theme-light" textValue="浅色模式">{"\u2600\uFE0F"} 浅色模式{mode === "light" ? <CheckIcon /> : null}</DropdownItem>
+          <DropdownItem id="theme-system" textValue="跟随系统">{"\uD83D\uDDA5\uFE0F"} 跟随系统{mode === "system" ? <CheckIcon /> : null}</DropdownItem>
         </DropdownSection>
-        <DropdownSection aria-label="快捷" showDivider>
-          <DropdownItem key="docs" textValue="帮助">{"\uD83D\uDCD6"} 帮助文档</DropdownItem>
+        <DropdownSection aria-label="快捷" className="border-b border-default-200 pb-2">
+          <DropdownItem id="docs" textValue="帮助文档">{"\uD83D\uDCD6"} 帮助文档</DropdownItem>
         </DropdownSection>
         <DropdownSection aria-label="账户">
-          <DropdownItem key="profile" textValue="信息" isReadOnly>
+          <DropdownItem id="profile" textValue="当前账号信息" shouldCloseOnSelect={false}>
             <div className="min-w-48 space-y-1 py-1">
               <div className="text-small font-semibold text-foreground">{name}</div>
               <div className="text-tiny text-default-500">租户: {profile?.tenantId || "-"}</div>
@@ -270,9 +282,10 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
               {metricsCollecting ? <ProductMetricsMemberNotice className="max-w-64 whitespace-normal pt-1" /> : null}
             </div>
           </DropdownItem>
-          <DropdownItem key="logout" className="text-danger" color="danger" textValue="退出">退出登录</DropdownItem>
+          <DropdownItem id="logout" className="text-danger" textValue="退出登录">退出登录</DropdownItem>
         </DropdownSection>
       </DropdownMenu>
+      </DropdownPopover>
     </Dropdown>
   );
 }
@@ -295,4 +308,4 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
     default: return <LazyWorkbenchPanel />;
   }
 }
-function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-md border border-default-200 bg-content1" role="status"><Spinner label="加载页面…" /></div>; }
+function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-md border border-default-200 bg-content1" role="status"><span className="inline-flex items-center gap-2"><Spinner /><span className="text-sm text-default-500">加载页面…</span></span></div>; }

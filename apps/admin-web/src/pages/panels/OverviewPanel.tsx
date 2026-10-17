@@ -1,6 +1,7 @@
+import { ButtonLink } from "../../components/ButtonLink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Button, Card, CardBody, CardHeader, Spinner } from "@heroui/react";
+import { Button, Card, Spinner } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { Client, Overview, TrafficUsage } from "../../api/types";
 import { formatBytes } from "../../lib/format";
@@ -8,9 +9,9 @@ import { notifyError } from "../../components/toast";
 import { EmptyState } from "../../components/EmptyState";
 
 /** 全局面指标配色常量：趋势图与占比环保持一致。 */
-const TOTAL_COLOR = "hsl(var(--heroui-primary))";
-const DOWNLOAD_COLOR = "hsl(var(--heroui-secondary))";
-const UPLOAD_COLOR = "hsl(var(--heroui-success))";
+const TOTAL_COLOR = "var(--accent)";
+const DOWNLOAD_COLOR = "var(--muted)";
+const UPLOAD_COLOR = "var(--success)";
 
 interface MetricCard {
   label: string;
@@ -61,7 +62,7 @@ export function OverviewPanel() {
   }, [load]);
 
   if (loading && !overview) {
-    return <Spinner className="mt-6" label="加载中…" />;
+    return <span className="inline-flex items-center gap-2 mt-6"><Spinner /><span className="text-sm text-default-500">加载中…</span></span>;
   }
 
   const trafficTrend = buildTrafficTrend(traffic).slice(-10);
@@ -109,7 +110,7 @@ export function OverviewPanel() {
           <h2 className="text-lg font-semibold">运行概览</h2>
           <p className="text-small text-default-500">客户端、连接质量和流量走势</p>
         </div>
-        <Button size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button size="sm" variant="secondary" onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新
         </Button>
       </div>
@@ -119,17 +120,17 @@ export function OverviewPanel() {
           <h3 className="font-semibold">接入设备，发布第一个服务</h3>
           <p className="mt-1 text-small text-default-500">下载 → 保存接入配置 → 等待实例上线 → 发布与验证访问</p>
         </div>
-        <Button as="a" href="#/clients" color="primary" variant="flat">开始接入 / 查看设备</Button>
+        <ButtonLink href="#/clients" variant={"secondary"}>开始接入 / 查看设备</ButtonLink>
       </section>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {cards.map((card) => (
-          <Card key={card.label} radius="sm" shadow="sm">
-            <CardBody className="gap-1 p-4">
+          <Card key={card.label}>
+            <Card.Content className="gap-1 p-4">
               <span className="text-small text-default-500">{card.label}</span>
               <span className="text-2xl font-semibold">{card.value}</span>
               <span className="text-tiny text-default-400">{card.hint}</span>
-            </CardBody>
+            </Card.Content>
           </Card>
         ))}
       </div>
@@ -191,12 +192,12 @@ function ChartPanel({
   children: ReactNode;
 }) {
   return (
-    <Card radius="sm" shadow="sm">
-      <CardHeader className="flex flex-col items-start gap-0 px-4 pb-0 pt-4">
+    <Card>
+      <Card.Header className="flex flex-col items-start gap-0 px-4 pb-0 pt-4">
         <h3 className="text-small font-semibold">{title}</h3>
         <p className="text-tiny text-default-400">{subtitle}</p>
-      </CardHeader>
-      <CardBody className="p-4">{children}</CardBody>
+      </Card.Header>
+      <Card.Content className="p-4">{children}</Card.Content>
     </Card>
   );
 }
@@ -261,7 +262,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
           return (
             <g key={ratio}>
               <line
-                stroke="hsl(var(--heroui-default-200))"
+                stroke="var(--border)"
                 strokeWidth="1"
                 x1={padding.left}
                 x2={width - padding.right}
@@ -269,7 +270,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
                 y2={lineY}
               />
               <text
-                fill="hsl(var(--heroui-default-500))"
+                fill="var(--muted)"
                 fontSize={tickFontSize}
                 textAnchor="end"
                 x={padding.left - 8}
@@ -289,7 +290,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
             <circle cx={x(index)} cy={y(day.totalBytes)} fill={TOTAL_COLOR} r="4" />
             {index % xLabelEvery === 0 ? (
               <text
-                fill="hsl(var(--heroui-default-500))"
+                fill="var(--muted)"
                 fontSize={tickFontSize}
                 textAnchor="middle"
                 x={x(index)}
@@ -318,8 +319,8 @@ function DonutChart({
   primaryText,
   primaryDetail,
   secondaryDetail,
-  primaryColor = "hsl(var(--heroui-success))",
-  secondaryColor = "hsl(var(--heroui-danger))",
+  primaryColor = "var(--success)",
+  secondaryColor = "var(--danger)",
 }: {
   total: number;
   primaryValue: number;
@@ -350,7 +351,7 @@ function DonutChart({
           cy="70"
           fill="none"
           r={radius}
-          stroke={clampedTotal > 0 ? secondaryColor : "hsl(var(--heroui-default-200))"}
+          stroke={clampedTotal > 0 ? secondaryColor : "var(--border)"}
           strokeWidth="18"
         />
         {clampedTotal > 0 && (
@@ -366,10 +367,10 @@ function DonutChart({
             transform="rotate(-90 70 70)"
           />
         )}
-        <text fill="hsl(var(--heroui-foreground))" fontSize="20" fontWeight="700" textAnchor="middle" x="70" y="66">
+        <text fill="var(--foreground)" fontSize="20" fontWeight="700" textAnchor="middle" x="70" y="66">
           {primaryText}
         </text>
-        <text fill="hsl(var(--heroui-default-500))" fontSize="11" textAnchor="middle" x="70" y="84">
+        <text fill="var(--muted)" fontSize="11" textAnchor="middle" x="70" y="84">
           {primaryLabel}
         </text>
       </svg>

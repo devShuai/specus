@@ -1,13 +1,14 @@
-import { addToast } from "@heroui/react";
+import { toast } from "@heroui/react";
 
 type ToastKind = "success" | "error" | "info";
 const DEDUPE_WINDOW_MS = 5000;
 const recentToasts = new Map<string, number>();
 
-const COLOR: Record<ToastKind, "success" | "danger" | "primary"> = {
-  success: "success",
-  error: "danger",
-  info: "primary",
+// HeroUI 3 exposes one entry point per severity instead of a color prop.
+const EMIT: Record<ToastKind, (message: string, options?: { timeout?: number }) => string> = {
+  success: toast.success,
+  error: toast.danger,
+  info: toast.info,
 };
 
 // notify shows a HeroUI toast. Errors linger longer than success/info messages.
@@ -15,11 +16,7 @@ export function notify(message: string, kind: ToastKind = "success"): void {
   if (isDuplicateToast(message, kind)) {
     return;
   }
-  addToast({
-    title: message,
-    color: COLOR[kind],
-    timeout: kind === "error" ? 8000 : 4000,
-  });
+  EMIT[kind](message, { timeout: kind === "error" ? 8000 : 4000 });
 }
 
 // notifyError extracts a message from an unknown thrown value.
