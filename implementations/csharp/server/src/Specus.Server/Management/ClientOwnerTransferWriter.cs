@@ -29,8 +29,8 @@ internal sealed record OwnerTransferWriteResult(string Scope, string TargetUsern
     IReadOnlyList<long> AffectedClientIds, bool Changed, bool AccessRetained);
 internal sealed record OwnerTransferWriteOutcome(OwnerTransferWriteResult Response, long? AuditId);
 
-// Internal core only. No POST is mounted until startup/CRUD/runtime writers participate in
-// this database boundary and durable post-commit reconciliation is wired. No network/cache
+// Public POST and internal callers share this database boundary. Durable audits feed
+// process-local retryable post-commit reconciliation. No network/cache
 // callback, token revocation, or unrelated tracked EF entity flush occurs in this transaction.
 internal sealed class ClientOwnerTransferWriter(SpecusDbContext db, IOptions<AuthOptions> auth)
 {

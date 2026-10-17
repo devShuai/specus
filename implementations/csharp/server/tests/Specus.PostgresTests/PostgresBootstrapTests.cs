@@ -14,6 +14,14 @@ namespace Specus.IntegrationTests;
 public sealed partial class PostgresBootstrapTests
 {
     [Fact]
+    public async Task NativePublicOwnerTransferCommitsAndEachConsumerReplaysTheJournal()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferPostProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
     public async Task NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery()
     {
         await using var database = await OwnedDatabase.CreateAsync();

@@ -419,6 +419,38 @@ namespace Specus.Server.Data.Postgres.Migrations
                     b.ToTable("client_owner_transfer_audit", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.ClientOwnerTransferReceipt", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("id");
+
+                    b.Property<long>("EventId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("event_id");
+
+                    b.Property<string>("NodeId")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("node_id");
+
+                    b.Property<string>("ProcessedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("processed_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NodeId", "EventId")
+                        .IsUnique()
+                        .HasDatabaseName("idx_owner_transfer_receipt_node_event");
+
+                    b.ToTable("client_owner_transfer_receipt", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.ClientSession", b =>
                 {
                     b.Property<long>("Id")

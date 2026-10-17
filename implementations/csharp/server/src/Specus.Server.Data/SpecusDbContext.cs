@@ -18,6 +18,7 @@ public sealed class SpecusDbContext : DbContext
     public DbSet<ClientAccount> ClientAccounts => Set<ClientAccount>();
     public DbSet<ClientCredential> ClientCredentials => Set<ClientCredential>();
     public DbSet<ClientOwnerTransferAudit> ClientOwnerTransferAudits => Set<ClientOwnerTransferAudit>();
+    public DbSet<ClientOwnerTransferReceipt> ClientOwnerTransferReceipts => Set<ClientOwnerTransferReceipt>();
     public DbSet<ClientAuthNonce> ClientAuthNonces => Set<ClientAuthNonce>();
     public DbSet<WebSocketTicket> WebSocketTickets => Set<WebSocketTicket>();
     public DbSet<ClientIdentity> ClientIdentities => Set<ClientIdentity>();
@@ -151,6 +152,17 @@ public sealed class SpecusDbContext : DbContext
             if (Database.ProviderName == "MySql.EntityFrameworkCore")
                 b.Property(x => x.DetailJson).HasColumnType("longtext");
             b.HasIndex(x => new { x.TenantId, x.Id }).HasDatabaseName("idx_owner_transfer_audit_tenant");
+        });
+
+        modelBuilder.Entity<ClientOwnerTransferReceipt>(b =>
+        {
+            b.ToTable("client_owner_transfer_receipt");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").HasMaxLength(80).ValueGeneratedNever();
+            b.Property(x => x.NodeId).HasColumnName("node_id").HasMaxLength(32).IsRequired();
+            b.Property(x => x.EventId).HasColumnName("event_id").IsRequired();
+            b.Property(x => x.ProcessedAt).HasColumnName("processed_at").HasMaxLength(40).HasConversion(iso).IsRequired();
+            b.HasIndex(x => new { x.NodeId, x.EventId }).IsUnique().HasDatabaseName("idx_owner_transfer_receipt_node_event");
         });
 
         modelBuilder.Entity<ClientCredential>(b =>

@@ -11,6 +11,16 @@ namespace Specus.Server.PeerMesh;
 /// </summary>
 public sealed class PeerMeshServiceState
 {
+    internal ConcurrentDictionary<long, PeerMeshService.RelayAuthorization> RelayAuthorizations { get; } = new();
+    internal ConcurrentDictionary<long, long> PendingRelayBytes { get; } = new();
+    internal long RelayGeneration;
+
+    internal void InvalidateRelayAuthorizations()
+    {
+        Interlocked.Increment(ref RelayGeneration);
+        RelayAuthorizations.Clear();
+    }
+
     internal ConcurrentQueue<PendingPeerClientDeletion> ClientDeletions { get; } = new();
     internal SemaphoreSlim ClientDeletionDispatchGate { get; } = new(1, 1);
     internal ConcurrentDictionary<(string TenantId, long ClientId, long SessionId), PeerMeshServiceCatalogSnapshot>

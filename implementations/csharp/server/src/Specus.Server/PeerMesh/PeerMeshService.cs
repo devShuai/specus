@@ -20,7 +20,7 @@ using Specus.Server.Sessions;
 
 namespace Specus.Server.PeerMesh;
 
-public sealed partial class PeerMeshService
+public sealed partial class PeerMeshService : IOwnerTransferReconciler
 {
     public const string PathDirect = "DIRECT";
     public const string PathRelay = "RELAY";
@@ -46,8 +46,8 @@ public sealed partial class PeerMeshService
     internal const string TypeEgressReport = "egress-report";
     internal const int PeerServiceDiscoveryVersion = 2;
     private static readonly TimeSpan RelayAuthorizationCacheTtl = TimeSpan.FromSeconds(30);
-    private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations = new();
-    private readonly ConcurrentDictionary<long, long> _pendingRelayBytes = new();
+    private readonly ConcurrentDictionary<long, RelayAuthorization> _relayAuthorizations;
+    private readonly ConcurrentDictionary<long, long> _pendingRelayBytes;
 
     private readonly SpecusDbContext _db;
     private readonly SessionRegistry _sessions;
@@ -70,6 +70,8 @@ public sealed partial class PeerMeshService
         _logger = logger;
         state ??= new PeerMeshServiceState();
         _state = state;
+        _relayAuthorizations = state.RelayAuthorizations;
+        _pendingRelayBytes = state.PendingRelayBytes;
         _managementAuth = managementAuth?.Value ?? new AuthOptions();
         _clientAuthSessions = clientAuthSessions;
         _serviceCatalogs = state.ServiceCatalogs;
@@ -127,11 +129,12 @@ public sealed partial class PeerMeshService
 		CancellationToken cancellationToken)
 	{
         var now = DateTimeOffset.UtcNow;
+        var generation = Volatile.Read(ref _state.RelayGeneration);
         if (AuthorizeRelayFrameCached(header, fromClientId, toClientId, bytes, now, account))
         {
             return true;
         }
-        var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(s => s.Id == header.SessionId,
+        var session = await _db.PeerMeshSessions.AsNoTracking().FirstOrDefaultAsync(s => s.Id == header.SessionId,
                 cancellationToken)
             .ConfigureAwait(false);
         if (session is null)
@@ -140,7 +143,8 @@ public sealed partial class PeerMeshService
         }
         if (CloseIfExpired(session, now))
         {
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            var stamp = Specus.Server.Data.Conversion.IsoDateTimeOffsetConverter.Format(now);
+            await _db.Database.ExecuteSqlInterpolatedAsync($"UPDATE peer_mesh_session SET status={StatusClosed},closed_at=COALESCE(closed_at,{stamp}),updated_at={stamp} WHERE id={session.Id} AND tenant_id={session.TenantId} AND expires_at<={stamp} AND status<>{StatusClosed}", cancellationToken).ConfigureAwait(false);
             return false;
         }
         if (string.Equals(session.Status, StatusClosed, StringComparison.Ordinal))
@@ -162,13 +166,16 @@ public sealed partial class PeerMeshService
         // report adds no security, only a race.
         if (!string.Equals(session.Status, StatusActive, StringComparison.Ordinal))
         {
+            var stamp = Specus.Server.Data.Conversion.IsoDateTimeOffsetConverter.Format(now);
+            var activated = await _db.Database.ExecuteSqlInterpolatedAsync($"UPDATE peer_mesh_session SET status={StatusActive},path_type={PathRelay},updated_at={stamp},last_keepalive_at={stamp} WHERE id={session.Id} AND tenant_id={session.TenantId} AND source_client_id={session.SourceClientId} AND target_client_id={session.TargetClientId} AND status={StatusNegotiating} AND expires_at>{stamp}", cancellationToken).ConfigureAwait(false);
+            if (activated != 1) return false;
             session.Status = StatusActive;
             session.PathType = PathRelay;
             session.UpdatedAt = now;
             session.LastKeepaliveAt = now;
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
-        CacheRelayAuthorization(session, now);
+        if (generation != Volatile.Read(ref _state.RelayGeneration)) return false;
+        CacheRelayAuthorization(session, now, generation);
 		if (account)
 		{
 			AddPendingRelayBytes(header.SessionId, bytes);
@@ -184,7 +191,7 @@ public sealed partial class PeerMeshService
 		{
 			return false;
 		}
-		var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(item => item.Id == sessionId, cancellationToken)
+		var session = await _db.PeerMeshSessions.AsNoTracking().FirstOrDefaultAsync(item => item.Id == sessionId, cancellationToken)
 			.ConfigureAwait(false);
 		if (session is null)
 		{
@@ -193,7 +200,9 @@ public sealed partial class PeerMeshService
 		var now = DateTimeOffset.UtcNow;
 		if (CloseIfExpired(session, now))
 		{
-			await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+			RemoveRelaySession(sessionId);
+            var stamp = Specus.Server.Data.Conversion.IsoDateTimeOffsetConverter.Format(now);
+            await _db.Database.ExecuteSqlInterpolatedAsync($"UPDATE peer_mesh_session SET status={StatusClosed},closed_at=COALESCE(closed_at,{stamp}),updated_at={stamp} WHERE id={session.Id} AND tenant_id={session.TenantId} AND expires_at<={stamp} AND status<>{StatusClosed}", cancellationToken).ConfigureAwait(false);
 			return false;
 		}
 		var forward = fromClientId == session.SourceClientId && toClientId == session.TargetClientId;
@@ -1550,7 +1559,7 @@ public sealed partial class PeerMeshService
         return SendPreparedPeerExchangeAsync(source, target, message, true, cancellationToken);
     }
 
-    private async Task SendCloseAsync(PeerMeshSessionView closed, CancellationToken cancellationToken)
+    private async Task SendCloseAsync(PeerMeshSessionView closed, CancellationToken cancellationToken, string reason = "admin-force-close")
     {
         var persisted = await _db.PeerMeshSessions.AsNoTracking().SingleOrDefaultAsync(s => s.Id == closed.Id, cancellationToken).ConfigureAwait(false);
         if (persisted is null || persisted.SourceClientId != closed.SourceClientId
@@ -1564,7 +1573,7 @@ public sealed partial class PeerMeshService
             TargetClientId = closed.TargetClientId,
             TargetClientName = closed.TargetClientName,
             Status = closed.Status,
-            Reason = "admin-force-close",
+            Reason = reason,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
         foreach (var id in new[] { closed.SourceClientId, closed.TargetClientId }.Distinct())
@@ -1744,6 +1753,11 @@ public sealed partial class PeerMeshService
             RemoveRelaySession(header.SessionId);
             return false;
         }
+        if (authorization.Generation != Volatile.Read(ref _state.RelayGeneration))
+        {
+            _relayAuthorizations.TryRemove(header.SessionId, out _);
+            return false;
+        }
         // 0/0 means identity unknown (TURN auth disabled), consistent with the slow path.
         if (!authorization.Matches(fromClientId, toClientId))
         {
@@ -1756,14 +1770,14 @@ public sealed partial class PeerMeshService
         return true;
     }
 
-    private void CacheRelayAuthorization(PeerMeshSession session, DateTimeOffset now)
+    private void CacheRelayAuthorization(PeerMeshSession session, DateTimeOffset now, long generation)
     {
         _relayAuthorizations[session.Id] = new RelayAuthorization(
             session.SourceClientId,
             session.TargetClientId,
             string.Equals(session.Status, StatusActive, StringComparison.Ordinal),
             session.ExpiresAt,
-            now.Add(RelayAuthorizationCacheTtl));
+            now.Add(RelayAuthorizationCacheTtl), generation);
     }
 
     private void AddPendingRelayBytes(long sessionId, long bytes)
@@ -1978,12 +1992,12 @@ public sealed partial class PeerMeshService
         return long.MaxValue - current < delta ? long.MaxValue : current + delta;
     }
 
-    private sealed record RelayAuthorization(
+    internal sealed record RelayAuthorization(
         long SourceClientId,
         long TargetClientId,
         bool Active,
         DateTimeOffset SessionExpiresAt,
-        DateTimeOffset CacheExpiresAt)
+        DateTimeOffset CacheExpiresAt, long Generation)
     {
         public bool ValidAt(DateTimeOffset now) =>
             Active && CacheExpiresAt > now && SessionExpiresAt > now;

@@ -501,6 +501,7 @@ public static class AdminApiEndpoints
                 return Results.NoContent();
             });
 
+        app.MapOwnerTransferWrites();
         app.MapGet("/api/admin/clients/{id}/owner-transfer",
             async (HttpContext context, string id, IOptions<AuthOptions> authOptions,
                 ClientOwnerTransferService service, CancellationToken cancellationToken) =>

@@ -371,7 +371,7 @@ public sealed partial class PeerMeshService
 
     private async Task FanoutAsync(ClientAccount publisher, long publisherSessionId, long revision,
         IReadOnlyList<AdvertisedService> services, DateTimeOffset expiresAt, bool includeDenied,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, TimeSpan? deliveryBudget = null)
     {
         var recipients = await _db.ClientAccounts.AsNoTracking()
             .Where(account => account.TenantId == publisher.TenantId && account.Id != publisher.Id)
@@ -380,26 +380,43 @@ public sealed partial class PeerMeshService
         var key = (publisher.TenantId, publisher.Id, publisherSessionId);
         _serviceCatalogs.TryGetValue(key, out var snapshot);
         var origin = CaptureCatalogPublisher(publisher, publisherSessionId, snapshot?.PublisherChannelId);
+        var failures = new List<Exception>();
         foreach (var recipient in recipients)
         {
             if (recipient.TenantId != publisher.TenantId) continue;
             if (!includeDenied && !await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false)) continue;
             var receiver = CapturePeerReceiver(recipient);
             if (receiver is null) continue;
-            await SendPreparedCatalogAsync(receiver, publisher, publisherSessionId, revision, services,
-                expiresAt, origin, cancellationToken).ConfigureAwait(false);
+            if (deliveryBudget is null)
+                await SendPreparedCatalogAsync(receiver, publisher, publisherSessionId, revision, services,
+                    expiresAt, origin, cancellationToken).ConfigureAwait(false);
+            else
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(deliveryBudget.Value);
+                try { await SendPreparedCatalogAsync(receiver, publisher, publisherSessionId, revision, services,
+                    expiresAt, origin, timeout.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception error) { failures.Add(error); }
+            }
         }
+        if (failures.Count > 0) throw new AggregateException(failures);
     }
 
-    private async Task OnAuthorizationChangedAsync(string tenantId, CancellationToken cancellationToken)
+    private async Task OnAuthorizationChangedAsync(string tenantId, CancellationToken cancellationToken, TimeSpan? deliveryBudget = null)
     {
+        var failures = new List<Exception>();
         foreach (var entry in _serviceCatalogs.Where(item =>
                      ManagementContext.SameTenant(item.Key.TenantId, tenantId)).ToArray())
         {
             var gate = CatalogMutationGate(entry.Key);
-            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var acquired = false;
+            using var timeout = deliveryBudget.HasValue ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+            timeout?.CancelAfter(deliveryBudget!.Value);
             try
             {
+                await gate.WaitAsync(timeout?.Token ?? cancellationToken).ConfigureAwait(false);
+                acquired = true;
                 if (!_serviceCatalogs.TryGetValue(entry.Key, out var current))
                 {
                     continue;
@@ -416,13 +433,16 @@ public sealed partial class PeerMeshService
                 var snapshot = current with { Revision = revision };
                 _serviceCatalogs[entry.Key] = snapshot;
                 await FanoutAsync(publisher, entry.Key.SessionId, revision, snapshot.Services, snapshot.ExpiresAt,
-                    includeDenied: true, cancellationToken).ConfigureAwait(false);
+                    includeDenied: true, cancellationToken, deliveryBudget).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception error) when (deliveryBudget.HasValue) { failures.Add(error); }
             finally
             {
-                gate.Release();
+                if (acquired) gate.Release();
             }
         }
+        if (failures.Count > 0) throw new AggregateException(failures);
     }
 
     private async Task PushCurrentCatalogsAsync(ClientAccount recipient, CancellationToken cancellationToken)
