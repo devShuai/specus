@@ -52,7 +52,7 @@ public sealed class PeerManagementBoundaryTests
         await PeerManagementOwnershipTests.SeedAsync(db);
         var alice = await ManagementResourceOwnershipTests.ContextAsync(server, services, "alice", "alice-password");
         using var lifetime = new CancellationTokenSource();
-        var writer = new RecordingWriter(); var bound = Bind(server, writer, lifetime.Token);
+        var writer = new RecordingWriter(); var bound = await BindAsync(server, writer, lifetime.Token);
         fault.Armed = true;
         try
         {
@@ -85,7 +85,7 @@ public sealed class PeerManagementBoundaryTests
             else if (operation == "acl-upsert") Assert.False((await current.PeerMeshAcls.AsNoTracking().SingleAsync()).Allowed);
             else Assert.Empty(await current.PeerMeshAcls.AsNoTracking().ToListAsync());
         });
-        var bound = Bind(server, writer, lifetime.Token);
+        var bound = await BindAsync(server, writer, lifetime.Token);
         try
         {
             await ChangeAsync(services.GetRequiredService<PeerMeshService>(), alice, operation);
@@ -99,10 +99,13 @@ public sealed class PeerManagementBoundaryTests
         new Dictionary<string, string?> { ["Specus:Database:SeedDemoClient"] = "false", ["Specus:PeerMesh:Enabled"] = "true" },
         fault is null ? null : services => services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(fault)));
 
-    private static SpecusConnectionContext Bind(TestServerFixture server, IFrameWriter writer, CancellationToken lifetime)
+    private static async Task<SpecusConnectionContext> BindAsync(TestServerFixture server, IFrameWriter writer, CancellationToken lifetime)
     {
         var context = new SpecusConnectionContext("retained-control", "127.0.0.1:12345", writer, lifetime, () => { }, new ReadGate(lifetime), new WriteBackpressureGate(64 * 1024, 1024 * 1024));
-        context.OnLoginSuccess("laptop", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), clientSessionId: 901, clientId: 1001);
+        await using var scope = server.HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var account = await db.ClientAccounts.AsNoTracking().SingleAsync(a => a.Id == 1001);
+        await TestBoundPeerControl.PublishAsync(db, scope.ServiceProvider.GetRequiredService<Specus.Server.Authentication.ClientAuthSessionStore>(), account, context, 901);
         server.HostServices.GetRequiredService<SessionRegistry>().Replace("laptop", context);
         return context;
     }

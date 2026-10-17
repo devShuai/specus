@@ -121,7 +121,7 @@ public sealed class PeerMeshServiceTests
         });
         fixture.Db.ClientSessions.Add(CurrentPublisherSession(77, publisher, now));
         await fixture.SaveChangesAsync();
-        fixture.Bind(recipient);
+        await fixture.BindAsync(recipient);
 
         await fixture.Service.HandleServiceReportAsync(publisher,
             ServiceReport(4, "instance-a", "svc-http01"), 77, CancellationToken.None);
@@ -161,7 +161,7 @@ public sealed class PeerMeshServiceTests
         });
         fixture.Db.ClientSessions.Add(CurrentPublisherSession(79, publisher, now));
         await fixture.SaveChangesAsync();
-        fixture.Bind(recipient);
+        await fixture.BindAsync(recipient);
 
         var scopeA = fixture.CreateSiblingService();
         var scopeB = fixture.CreateSiblingService();
@@ -243,7 +243,7 @@ public sealed class PeerMeshServiceTests
             Name="revision-service",Transport="tcp",Application="http",TargetHost="127.0.0.1",TargetPort=8080,PublishedPort=18080,
             Path="/",Enabled=true,Visibility="OWNER",CreatedAt=now,UpdatedAt=now });
         var session=CurrentPublisherSession(7381,publisher,now);fixture.Db.ClientSessions.Add(session);await fixture.SaveChangesAsync();
-        var writer=fixture.Bind(recipient);var admin=await fixture.ActorAsync("admin",ManagementRole.Admin,publisher.TenantId);
+        var writer=await fixture.BindAsync(recipient);var admin=await fixture.ActorAsync("admin",ManagementRole.Admin,publisher.TenantId);
         var wire=new List<string>();
         void Capture(long revision,int count) {
             var catalogs=writer.RawPeerMessages().Where(raw=>JsonSerializer.Deserialize<PeerControlMessage>(raw)!.Type=="service-catalog").ToArray();
@@ -595,8 +595,8 @@ public sealed class PeerMeshServiceTests
         fixture.State.ServiceCatalogRevisions[(publisher.TenantId, publisher.Id, 11512)] = 4;
         fixture.State.ServiceReportRevisions[(publisher.TenantId, publisher.Id, 11511)] = 4;
         fixture.State.ServiceReportRevisions[(publisher.TenantId, publisher.Id, 11512)] = 4;
-        var writerB = fixture.Bind(peerB);
-        var writerC = fixture.Bind(peerC);
+        var writerB = await fixture.BindAsync(peerB);
+        var writerC = await fixture.BindAsync(peerC);
 
         await fixture.Service.UpdateSharedServiceAsync(admin, 91151,
             new PeerMeshServiceMutation(null, null, null, null, null, null, null, null, null, null, null,
@@ -667,8 +667,8 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(consumer, "100.96.0.20", "consumer-key");
         fixture.AddDevice(egress, "100.96.0.21", "egress-key");
         await fixture.SaveChangesAsync();
-        var consumerWriter = fixture.Bind(consumer);
-        fixture.Bind(egress);
+        var consumerWriter = await fixture.BindAsync(consumer);
+        await fixture.BindAsync(egress);
 
         fixture.Unbind(egress);
         await fixture.Service.PushOnLogoutAsync(egress.ClientName, CancellationToken.None);
@@ -689,8 +689,8 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(consumer, "100.96.0.22", "consumer-key");
         fixture.AddDevice(egress, "100.96.0.23", "egress-key");
         await fixture.SaveChangesAsync();
-        var consumerWriter = fixture.Bind(consumer);
-        fixture.Bind(egress);
+        var consumerWriter = await fixture.BindAsync(consumer);
+        await fixture.BindAsync(egress);
 
         await fixture.Service.PushOnLogoutAsync(egress.ClientName, CancellationToken.None);
 
@@ -709,7 +709,7 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(consumer, "100.96.0.24", "consumer-key");
         fixture.AddDevice(egress, "100.96.0.25", "egress-key");
         await fixture.SaveChangesAsync();
-        fixture.Bind(consumer);
+        await fixture.BindAsync(consumer);
 
         await Assert.ThrowsAsync<PeerSignalUndeliverableException>(() => fixture.Service.HandleSignalAsync(
             new MessageRequestPacket
@@ -730,8 +730,8 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(target, "100.96.0.11", "target-key");
         await fixture.SaveChangesAsync();
 
-        var sourceWriter = fixture.Bind(source);
-        var targetWriter = fixture.Bind(target);
+        var sourceWriter = await fixture.BindAsync(source);
+        var targetWriter = await fixture.BindAsync(target);
         var signal = JsonSerializer.Serialize(new PeerControlMessage
         {
             Type = "candidates",
@@ -800,8 +800,8 @@ public sealed class PeerMeshServiceTests
         fixture.AddDevice(target, "100.96.0.11", "target-key");
         await fixture.SaveChangesAsync();
 
-        var sourceWriter = fixture.Bind(source);
-        var targetWriter = fixture.Bind(target);
+        var sourceWriter = await fixture.BindAsync(source);
+        var targetWriter = await fixture.BindAsync(target);
         const string signal = """
             {"type":"candidates","sourceClientId":999,"sourceClientName":"spoofed",
              "sourceVirtualIp":"100.96.0.99","sourceKeyEpoch":"epoch-a","dataFrameVersion":2,
@@ -863,8 +863,8 @@ public sealed class PeerMeshServiceTests
             }, now);
         fixture.State.ServiceCatalogRevisions[(source.TenantId, source.Id, 9002)] = 3;
 
-        var sourceWriter = fixture.Bind(source);
-        var targetWriter = fixture.Bind(target);
+        var sourceWriter = await fixture.BindAsync(source);
+        var targetWriter = await fixture.BindAsync(target);
 
         await fixture.Service.UpdateDeviceAsync(
             await fixture.ActorAsync("alice"),
@@ -953,8 +953,8 @@ public sealed class PeerMeshServiceTests
             });
         await fixture.SaveChangesAsync();
 
-        var sourceWriter = fixture.Bind(source);
-        var targetWriter = fixture.Bind(target);
+        var sourceWriter = await fixture.BindAsync(source);
+        var targetWriter = await fixture.BindAsync(target);
 
         await fixture.Service.PushOnLoginAsync(source, CancellationToken.None);
 
@@ -1372,9 +1372,11 @@ public sealed class PeerMeshServiceTests
         });
         private readonly SqliteConnection _connection;
         private readonly IOptions<PeerMeshOptions> _options;
+        private readonly Specus.Server.Authentication.ClientAuthSessionStore _authSessions;
 
         private PeerMeshFixture(SqliteConnection connection, SpecusDbContext db, SessionRegistry registry,
-            PeerMeshService service, IOptions<PeerMeshOptions> options, PeerMeshServiceState state)
+            PeerMeshService service, IOptions<PeerMeshOptions> options, PeerMeshServiceState state,
+            Specus.Server.Authentication.ClientAuthSessionStore authSessions)
         {
             _connection = connection;
             Db = db;
@@ -1382,6 +1384,7 @@ public sealed class PeerMeshServiceTests
             Service = service;
             _options = options;
             State = state;
+            _authSessions = authSessions;
         }
 
         public SpecusDbContext Db { get; }
@@ -1393,7 +1396,7 @@ public sealed class PeerMeshServiceTests
         public PeerMeshServiceState State { get; }
 
         public PeerMeshService CreateSiblingService() => new(Db, Registry, _options,
-            NullLogger<PeerMeshService>.Instance, null, State, ManagementAuth);
+            NullLogger<PeerMeshService>.Instance, null, State, ManagementAuth, _authSessions);
 
         public async Task<ManagementContext> ActorAsync(string username, ManagementRole role = ManagementRole.User, string tenant = "tenant-a")
         {
@@ -1446,9 +1449,10 @@ public sealed class PeerMeshServiceTests
                 SessionTtlSeconds = 3600,
             });
             var state = new PeerMeshServiceState();
+            var authSessions = new Specus.Server.Authentication.ClientAuthSessionStore();
             var service = new PeerMeshService(db, registry, peerOptions,
-                NullLogger<PeerMeshService>.Instance, null, state, ManagementAuth);
-            return new PeerMeshFixture(connection, db, registry, service, peerOptions, state);
+                NullLogger<PeerMeshService>.Instance, null, state, ManagementAuth, authSessions);
+            return new PeerMeshFixture(connection, db, registry, service, peerOptions, state, authSessions);
         }
 
         public ClientAccount AddClient(long id, string tenantId, string owner, string clientName)
@@ -1509,7 +1513,7 @@ public sealed class PeerMeshServiceTests
             });
         }
 
-        public CapturingFrameWriter Bind(ClientAccount account)
+        public async Task<CapturingFrameWriter> BindAsync(ClientAccount account)
         {
             var writer = new CapturingFrameWriter();
             var context = new SpecusConnectionContext(
@@ -1520,7 +1524,7 @@ public sealed class PeerMeshServiceTests
                 static () => { },
                 new ReadGate(CancellationToken.None),
                 new WriteBackpressureGate(32 * 1024, 64 * 1024));
-            context.OnLoginSuccess(account.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            await TestBoundPeerControl.PublishAsync(Db, _authSessions, account, context);
             Registry.Replace(account.ClientName, context);
             return writer;
         }

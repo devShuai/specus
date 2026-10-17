@@ -199,10 +199,10 @@ public sealed class PeerClientDeletionTests
             for (var id = 40L; id <= 42; id++)
                 db.PeerMeshSessions.Add(new PeerMeshSession { Id = id, TenantId = id == 42 ? "other" : "default", SourceClientId = 1001, SourceClientName = "delete-test-1001", TargetClientId = 1002, TargetClientName = "delete-test-1002", PathType = "RELAY", Status = id == 41 ? PeerMeshService.StatusClosed : PeerMeshService.StatusActive, ClosedAt = id == 41 ? HistoricalClose : null, StartedAt = now, UpdatedAt = now, ExpiresAt = now.AddHours(1), DirectBytes = 7, RelayBytes = 9 });
             await db.SaveChangesAsync();
-            Bind(1001, "default", new Writer(), () => Interlocked.Exchange(ref _closed, 1));
-            Bind(1002, "default", Peer, () => { });
-            Bind(1004, "default", Healthy, () => { });
-            Bind(1003, "other", Foreign, () => { });
+            await BindAsync(1001, "default", new Writer(), () => Interlocked.Exchange(ref _closed, 1));
+            await BindAsync(1002, "default", Peer, () => { });
+            await BindAsync(1004, "default", Healthy, () => { });
+            await BindAsync(1003, "other", Foreign, () => { });
             foreach (var key in new[] { ("default", 1001L, 801L), ("other", 1001L, 802L) })
             {
                 State.ServiceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(3, "test", now, now.AddMinutes(1), [new AdvertisedService { ServiceId = "service-10" }], "delete-test-1001", [], []);
@@ -212,11 +212,14 @@ public sealed class PeerClientDeletionTests
             }
         }
 
-        private void Bind(long id, string tenant, IFrameWriter writer, Action close)
+        private async Task BindAsync(long id, string tenant, IFrameWriter writer, Action close)
         {
             var context = new SpecusConnectionContext($"delete-{id}", "127.0.0.1:12345", writer, CancellationToken.None, close,
                 new ReadGate(CancellationToken.None), new WriteBackpressureGate(32768, 65536));
-            context.OnLoginSuccess($"delete-test-{id}", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), tenantId: tenant);
+            await using var scope = Server.HostServices.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+            var account = await db.ClientAccounts.AsNoTracking().SingleAsync(a => a.Id == id);
+            await TestBoundPeerControl.PublishAsync(db, scope.ServiceProvider.GetRequiredService<Specus.Server.Authentication.ClientAuthSessionStore>(), account, context, id + 50000);
             Server.HostServices.GetRequiredService<SessionRegistry>().Replace(context.ClientName!, context);
         }
         public async Task DrainAsync()

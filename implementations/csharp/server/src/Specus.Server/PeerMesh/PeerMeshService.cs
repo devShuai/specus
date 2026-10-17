@@ -56,10 +56,12 @@ public sealed partial class PeerMeshService
     private readonly ILogger<PeerMeshService> _logger;
     private readonly PeerMeshServiceState _state;
     private readonly AuthOptions _managementAuth;
+    private readonly ClientAuthSessionStore? _clientAuthSessions;
 
     public PeerMeshService(SpecusDbContext db, SessionRegistry sessions, IOptions<PeerMeshOptions> options,
         ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null,
-        PeerMeshServiceState? state = null, IOptions<AuthOptions>? managementAuth = null)
+        PeerMeshServiceState? state = null, IOptions<AuthOptions>? managementAuth = null,
+        ClientAuthSessionStore? clientAuthSessions = null)
     {
         _db = db;
         _sessions = sessions;
@@ -69,6 +71,7 @@ public sealed partial class PeerMeshService
         state ??= new PeerMeshServiceState();
         _state = state;
         _managementAuth = managementAuth?.Value ?? new AuthOptions();
+        _clientAuthSessions = clientAuthSessions;
         _serviceCatalogs = state.ServiceCatalogs;
         _serviceCatalogRevisions = state.ServiceCatalogRevisions;
         _serviceReportRevisions = state.ServiceReportRevisions;
@@ -229,23 +232,11 @@ public sealed partial class PeerMeshService
 
     public async Task<PeerMeshConfig> BuildRuntimeConfigAsync(ClientAccount account, CancellationToken cancellationToken)
     {
-        PeerMeshDevice? device = null;
-        if (Enabled)
-        {
-            device = await _db.PeerMeshDevices
-                .FirstOrDefaultAsync(d => d.TenantId == account.TenantId && d.ClientId == account.Id,
-                    cancellationToken)
-                .ConfigureAwait(false)
-                ?? await CreateDeviceAsync(account, cancellationToken).ConfigureAwait(false);
-        }
-        var clientProtocolVersion = await _db.ClientSessions.AsNoTracking()
-            .Where(session => session.TenantId == account.TenantId && session.ClientId == account.Id
-                && session.Status == ClientAccountService.StatusNettyOnline)
-            .Select(session => (int?)session.PeerServiceDiscoveryVersion)
-            .MaxAsync(cancellationToken)
-            .ConfigureAwait(false) ?? 0;
-        return await BuildConfigAsync(account, device, null, clientProtocolVersion, cancellationToken)
-            .ConfigureAwait(false);
+        var captured = CapturePeerReceiver(account);
+        var current = captured is null ? null : await ReadPeerReceiverAsync(captured, cancellationToken).ConfigureAwait(false);
+        var canonical = current?.Account ?? await _db.ClientAccounts.AsNoTracking().SingleOrDefaultAsync(a => a.Id == account.Id, cancellationToken).ConfigureAwait(false);
+        if (canonical is null || canonical.TenantId != account.TenantId) throw new ArgumentException("client not found");
+        return await BuildRuntimeConfigForReceiverAsync(canonical, current?.Session.PeerServiceDiscoveryVersion ?? 0, cancellationToken).ConfigureAwait(false);
     }
 
     public PublicStunConfig PublicStunConfig(string? requestHost)
@@ -453,20 +444,14 @@ public sealed partial class PeerMeshService
 
     public async Task PushConfigAsync(ClientAccount account, CancellationToken cancellationToken)
     {
-        var session = _sessions.Find(account.ClientName);
-        if (session is null)
-        {
-            return;
-        }
-        var config = await BuildRuntimeConfigAsync(account, cancellationToken).ConfigureAwait(false);
-        await SendSignalAsync(session, "server", account.ClientName, new PeerControlMessage
+        var captured = CapturePeerReceiver(account);
+        if (captured is null) return;
+        await SendPreparedPeerPushAsync(captured, async (current, ct) => new PeerControlMessage
         {
             Type = TypeConfig,
-            SourceClientId = account.Id,
-            SourceClientName = account.ClientName,
-            TargetClientId = account.Id,
-            TargetClientName = account.ClientName,
-            PeerMesh = config,
+            SourceClientId = current.Account.Id, SourceClientName = current.Account.ClientName,
+            TargetClientId = current.Account.Id, TargetClientName = current.Account.ClientName,
+            PeerMesh = await BuildRuntimeConfigForReceiverAsync(current.Account, current.Session.PeerServiceDiscoveryVersion, ct).ConfigureAwait(false),
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, cancellationToken).ConfigureAwait(false);
     }
@@ -477,18 +462,14 @@ public sealed partial class PeerMeshService
         {
             return;
         }
-        var session = _sessions.Find(account.ClientName);
-        if (session is null)
-        {
-            return;
-        }
-        var peers = await AllowedRosterAsync(account, cancellationToken).ConfigureAwait(false);
-        await SendSignalAsync(session, "server", account.ClientName, new PeerControlMessage
+        var captured = CapturePeerReceiver(account);
+        if (captured is null) return;
+        await SendPreparedPeerPushAsync(captured, async (current, ct) => new PeerControlMessage
         {
             Type = TypeRoster,
-            SourceClientId = account.Id,
-            SourceClientName = account.ClientName,
-            Peers = peers,
+            SourceClientId = current.Account.Id,
+            SourceClientName = current.Account.ClientName,
+            Peers = await AllowedRosterAsync(current.Account, ct).ConfigureAwait(false),
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, cancellationToken).ConfigureAwait(false);
     }

@@ -27,7 +27,7 @@ public sealed class PeerDefinitionBoundaryTests
         await SeedAsync(db);
         var actor = await ManagementResourceOwnershipTests.ContextAsync(server, services, "definition-operator", "operator-password");
         using var lifetime = new CancellationTokenSource();
-        var writer = new RecordingWriter(); var bound = Bind(server, writer, lifetime.Token);
+        var writer = new RecordingWriter(); var bound = await BindAsync(server, writer, lifetime.Token);
         var auditBefore = services.GetRequiredService<PeerMeshServiceState>().Audits.Count;
         fault.Armed = true;
         try
@@ -70,7 +70,7 @@ public sealed class PeerDefinitionBoundaryTests
                 case "egress-delete": Assert.Empty(await db.PeerMeshEgressPolicies.AsNoTracking().ToListAsync()); break;
             }
         });
-        var bound = Bind(server, writer, lifetime.Token);
+        var bound = await BindAsync(server, writer, lifetime.Token);
         try
         {
             await PeerDefinitionOwnershipTests.ChangeAsync(services.GetRequiredService<PeerMeshService>(), actor, operation);
@@ -128,10 +128,13 @@ public sealed class PeerDefinitionBoundaryTests
         await db.SaveChangesAsync();
     }
 
-    private static SpecusConnectionContext Bind(TestServerFixture server, IFrameWriter writer, CancellationToken lifetime)
+    private static async Task<SpecusConnectionContext> BindAsync(TestServerFixture server, IFrameWriter writer, CancellationToken lifetime)
     {
         var context = new SpecusConnectionContext("retained-control", "127.0.0.1:12345", writer, lifetime, () => { }, new ReadGate(lifetime), new WriteBackpressureGate(64 * 1024, 1024 * 1024));
-        context.OnLoginSuccess("laptop", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), clientSessionId: 901, clientId: 1001);
+        await using var scope = server.HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+        var account = await db.ClientAccounts.AsNoTracking().SingleAsync(a => a.Id == 1001);
+        await TestBoundPeerControl.PublishAsync(db, scope.ServiceProvider.GetRequiredService<Specus.Server.Authentication.ClientAuthSessionStore>(), account, context, 901);
         server.HostServices.GetRequiredService<SessionRegistry>().Replace("laptop", context);
         return context;
     }

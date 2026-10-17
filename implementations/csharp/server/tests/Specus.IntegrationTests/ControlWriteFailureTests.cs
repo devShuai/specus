@@ -119,6 +119,88 @@ public sealed class ControlWriteFailureTests
         Message = text + new string('x', 4096),
     };
 
+    [Fact]
+    public async Task PreparedControlBuildsAtItsActualWriteTurnUsingFreshState()
+    {
+        var stream = new CutShortStream(failFirstWrite: false);
+        await using var pair = await ConnectionPair.OpenAsync(stream);
+        var first = Message("holds-writer"); var pending = pair.Connection.WriteAsync(first).AsTask();
+        await stream.HalfWritten.WaitAsync(Timeout);
+        var prepared = false; var state = "old";
+        var next = pair.Connection.WritePreparedAsync(_ =>
+        { prepared = true; return ValueTask.FromResult<Packet?>(Message(state)); }).AsTask();
+        try
+        {
+            Assert.False(prepared); state = "fresh"; stream.Release();
+            await pending.WaitAsync(Timeout); Assert.True(await next.WaitAsync(Timeout));
+            Assert.Equal(PacketCodec.Encode(first).Concat(PacketCodec.Encode(Message("fresh"))).ToArray(), stream.Wire());
+        }
+        finally { stream.Release(); try { await pending; } catch (Exception) { } try { await next; } catch (Exception) { } }
+    }
+
+    [Fact]
+    public async Task ADeclinedPreparedFrameWritesNothingAndKeepsTheConnectionHealthy()
+    {
+        var stream = new CutShortStream(failFirstWrite: false); stream.Release();
+        await using var pair = await ConnectionPair.OpenAsync(stream);
+        Assert.False(await pair.Connection.WritePreparedAsync(_ => ValueTask.FromResult<Packet?>(null)));
+        Assert.Empty(stream.Wire()); await pair.Connection.WriteAsync(Message("after-decline"));
+        Assert.Equal(PacketCodec.Encode(Message("after-decline")), stream.Wire());
+        Assert.False(pair.Connection.Context.Lifetime.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task APreparedFactoryFailureBeforeEmissionDoesNotPoisonTheTransport()
+    {
+        var stream = new CutShortStream(failFirstWrite: false); stream.Release();
+        await using var pair = await ConnectionPair.OpenAsync(stream);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => pair.Connection.WritePreparedAsync(
+            _ => ValueTask.FromException<Packet?>(new InvalidOperationException("owned preparation failure"))).AsTask());
+        await pair.Connection.WriteAsync(Message("after-preparation-failure"));
+        Assert.Equal(PacketCodec.Encode(Message("after-preparation-failure")), stream.Wire());
+        Assert.False(pair.Connection.Context.Lifetime.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task CancellationDuringPreparationWritesNothingAndDoesNotCloseTheTransport()
+    {
+        var stream = new CutShortStream(failFirstWrite: false); stream.Release();
+        await using var pair = await ConnectionPair.OpenAsync(stream); using var caller = new CancellationTokenSource();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = pair.Connection.WritePreparedAsync(async ct =>
+        { entered.TrySetResult(); await Task.Delay(System.Threading.Timeout.Infinite, ct); return Message("cancelled"); }, caller.Token).AsTask();
+        await entered.Task.WaitAsync(Timeout); caller.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.WaitAsync(Timeout));
+        Assert.Empty(stream.Wire()); await pair.Connection.WriteAsync(Message("after-cancel"));
+        Assert.Equal(PacketCodec.Encode(Message("after-cancel")), stream.Wire());
+        Assert.False(pair.Connection.Context.Lifetime.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task CancellationAfterPreparedEmissionStartsStillWritesTheWholeFrame()
+    {
+        var stream = new CutShortStream(failFirstWrite: false);
+        await using var pair = await ConnectionPair.OpenAsync(stream); using var caller = new CancellationTokenSource();
+        var packet = Message("whole-prepared-frame");
+        var pending = pair.Connection.WritePreparedAsync(_ => ValueTask.FromResult<Packet?>(packet), caller.Token).AsTask();
+        try
+        {
+            await stream.HalfWritten.WaitAsync(Timeout); caller.Cancel(); stream.Release();
+            Assert.True(await pending.WaitAsync(Timeout)); Assert.Equal(PacketCodec.Encode(packet), stream.Wire());
+            Assert.False(pair.Connection.Context.Lifetime.IsCancellationRequested);
+        }
+        finally { stream.Release(); try { await pending; } catch (Exception) { } }
+    }
+
+    [Fact]
+    public async Task PreparedControlCannotBypassTheNatStreamScheduler()
+    {
+        var stream = new CutShortStream(failFirstWrite: false); stream.Release();
+        await using var pair = await ConnectionPair.OpenAsync(stream);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => pair.Connection.WritePreparedAsync(_ => ValueTask.FromResult<Packet?>(Data(1, 1024))).AsTask());
+        Assert.Empty(stream.Wire()); Assert.False(pair.Connection.Context.Lifetime.IsCancellationRequested);
+    }
+
     private static NatMessagePacket Data(uint streamId, int length) => new()
     {
         NatMessageType = NatMessageType.Data,

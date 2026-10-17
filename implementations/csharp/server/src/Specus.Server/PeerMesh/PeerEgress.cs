@@ -61,40 +61,22 @@ public sealed partial class PeerMeshService
         {
             return;
         }
-        var session = _sessions.Find(account.ClientName);
-        if (session is null)
+        var captured = CapturePeerReceiver(account);
+        if (captured is null) return;
+        foreach (var catalog in new[] { false, true })
         {
-            return;
-        }
-        var version = await ClientEgressVersionAsync(account, cancellationToken).ConfigureAwait(false);
-        if (version < 1)
-        {
-            return;
-        }
-        var capabilities = new ClientEgressCapabilities { Version = version };
-
-        var config = await BuildEgressConfigAsync(account, capabilities, cancellationToken).ConfigureAwait(false);
-        if (config is not null)
-        {
-            config.SourceClientId = account.Id;
-            config.SourceClientName = account.ClientName;
-            config.TargetClientId = account.Id;
-            config.TargetClientName = account.ClientName;
-            config.CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            await SendSignalAsync(session, "server", account.ClientName, config, cancellationToken)
-                .ConfigureAwait(false);
-        }
-
-        var catalog = await BuildEgressCatalogAsync(account, capabilities, cancellationToken).ConfigureAwait(false);
-        if (catalog is not null)
-        {
-            catalog.SourceClientId = account.Id;
-            catalog.SourceClientName = account.ClientName;
-            catalog.TargetClientId = account.Id;
-            catalog.TargetClientName = account.ClientName;
-            catalog.CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            await SendSignalAsync(session, "server", account.ClientName, catalog, cancellationToken)
-                .ConfigureAwait(false);
+            await SendPreparedPeerPushAsync(captured, async (current, ct) =>
+            {
+                var capabilities = new ClientEgressCapabilities { Version = current.Session.ClientEgressVersion };
+                var signal = catalog
+                    ? await BuildEgressCatalogAsync(current.Account, capabilities, ct).ConfigureAwait(false)
+                    : await BuildEgressConfigAsync(current.Account, capabilities, ct).ConfigureAwait(false);
+                if (signal is null) return null;
+                signal.SourceClientId = current.Account.Id; signal.SourceClientName = current.Account.ClientName;
+                signal.TargetClientId = current.Account.Id; signal.TargetClientName = current.Account.ClientName;
+                signal.CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                return signal;
+            }, cancellationToken).ConfigureAwait(false);
         }
     }
 
