@@ -322,7 +322,7 @@ public sealed class ProductMetricsWritePathTests
             Id = ClientIdGenerator.NewId(), TenantId = Tenant, CredentialId = credential.Id, ClientId = account.Id,
             ClientName = account.ClientName, MachineFingerprint = "pm-machine", OsUser = "pm", Hostname = "pm-host",
         };
-        var session = services.GetRequiredService<ClientAuthSessionStore>().Create(credential, identity, account,
+        var session = await TestClientSession.CreateAsync(run.Server, credential, identity, account,
             TimeSpan.FromHours(1), new ClientEnvironmentInfo
             {
                 MachineFingerprint = "pm-machine", OsUser = "pm", Hostname = "pm-host",

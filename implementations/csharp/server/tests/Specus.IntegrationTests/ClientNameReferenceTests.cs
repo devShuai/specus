@@ -135,6 +135,11 @@ public sealed class ClientNameReferenceTests
     {
         var credential = await db.ClientCredentials.SingleAsync();
         credential.Enabled = true; credential.SecretHash = ClientStartupOwnershipTests.Hash("name-fixture-secret"); credential.MaxOnlineInstances = 7;
+        // SeedAsync retains row 901 for history/transfer checks. A live-auth fixture must
+        // not simultaneously claim that this same machine already has an online control
+        // session on another server; strict SQL quota admission correctly rejects that.
+        var historical = await db.ClientSessions.SingleAsync(s => s.Id == 901);
+        historical.ExpiresAt = DateTimeOffset.UtcNow.AddDays(-1);
         await db.SaveChangesAsync();
     }
 

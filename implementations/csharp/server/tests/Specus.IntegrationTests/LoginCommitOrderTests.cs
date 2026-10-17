@@ -145,7 +145,7 @@ public sealed class LoginCommitOrderTests
             FirstSeenAt = now,
             LastSeenAt = now,
         };
-        return scope.ServiceProvider.GetRequiredService<ClientAuthSessionStore>().Create(credential, identity,
+        return await TestClientSession.CreateAsync(server, credential, identity,
             account, TimeSpan.FromHours(1), new ClientEnvironmentInfo
             {
                 MachineFingerprint = identity.MachineFingerprint,

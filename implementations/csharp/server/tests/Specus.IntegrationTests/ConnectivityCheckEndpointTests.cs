@@ -516,7 +516,7 @@ public sealed class ConnectivityCheckEndpointTests : IAsyncLifetime
                 OsUser = "connectivity",
                 Hostname = "connectivity-host",
             };
-            session = services.GetRequiredService<ClientAuthSessionStore>().Create(credential, identity, account,
+            session = await TestClientSession.CreateAsync(_server!, credential, identity, account,
                 TimeSpan.FromHours(1), new ClientEnvironmentInfo
                 {
                     MachineFingerprint = "connectivity-machine",

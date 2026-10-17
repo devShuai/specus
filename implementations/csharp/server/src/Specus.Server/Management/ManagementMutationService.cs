@@ -19,12 +19,13 @@ public sealed partial class ManagementMutationService
     private readonly NatControlService _natControl;
     private readonly ClientAuthOptions _clientAuth;
     private readonly AuthOptions _auth;
+    private readonly ClientAuthSessionStore _authSessions;
     private readonly HttpShareService _shares;
     private readonly PeerMeshService _peerMesh;
 
     public ManagementMutationService(SpecusDbContext db, SessionRegistry sessions,
         NatControlService natControl, IOptions<ClientAuthOptions> clientAuth, HttpShareService shares,
-        PeerMeshService peerMesh, IOptions<AuthOptions> auth)
+        PeerMeshService peerMesh, IOptions<AuthOptions> auth, ClientAuthSessionStore authSessions)
     {
         _db = db;
         _sessions = sessions;
@@ -33,6 +34,7 @@ public sealed partial class ManagementMutationService
         _shares = shares;
         _peerMesh = peerMesh;
         _auth = auth.Value;
+        _authSessions = authSessions;
     }
 
     public async Task<ClientResult> CreateClientAsync(ManagementContext context, ClientMutation request,
@@ -118,10 +120,12 @@ public sealed partial class ManagementMutationService
         // Remove the current binding, not its historical sessions/audit. A valid credential
         // may subsequently register the same machine/user as an entirely new client ID.
         await DeleteCurrentIdentityLinksAsync(account, cancellationToken).ConfigureAwait(false);
+        await ExpireDeletedClientSessionsAsync(account, cancellationToken).ConfigureAwait(false);
         _db.ClientAccounts.Remove(account);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         await transaction.DisposeAsync().ConfigureAwait(false);
+        _authSessions.RevokeClient(account.TenantId, account.Id);
         _peerMesh.QueueClientDeletion(peerDeletion);
         CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
         _shares.CutStreams(revokedShares);

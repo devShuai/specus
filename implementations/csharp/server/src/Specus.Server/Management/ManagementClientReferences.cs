@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Specus.Server.Authentication;
 using Specus.Server.Data.Conversion;
 using Specus.Server.Data.Entities;
 using Specus.Server.Persistence;
@@ -86,5 +87,34 @@ public sealed partial class ManagementMutationService
         await using var command = ClientOwnershipWrite.Command(_db,
             $"DELETE FROM {table} WHERE {client}=@id AND {ExactTenant(tenant)}", ("@id", account.Id), ("@tenant", account.TenantId));
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    private async Task ExpireDeletedClientSessionsAsync(ClientAccount account, CancellationToken ct)
+    {
+        var (table, client) = ClientOwnershipWrite.Identifiers<ClientSession>(_db, "ClientId");
+        var key = ClientOwnershipWrite.Identifiers<ClientSession>(_db, "Id").Key;
+        var tenant = ClientOwnershipWrite.Identifiers<ClientSession>(_db, "TenantId").Key;
+        var expires = ClientOwnershipWrite.Identifiers<ClientSession>(_db, "ExpiresAt").Key;
+        var status = ClientOwnershipWrite.Identifiers<ClientSession>(_db, "Status").Key;
+        var disconnected = ClientOwnershipWrite.Identifiers<ClientSession>(_db, "DisconnectedAt").Key;
+        var now = DateTimeOffset.UtcNow;
+        // Legacy ISO strings have variable precision. Compare parsed instants, not their
+        // lexical order, so deletion never extends or rewrites already-expired history.
+        // The credential/client locks prevent another legitimate startup/admission from
+        // inserting or extending this client's authority while the selection is applied.
+        var candidates = await _db.ClientSessions.AsNoTracking().Where(s => s.ClientId == account.Id && s.TenantId == account.TenantId)
+            .Select(s => new { s.Id, s.TenantId, s.ExpiresAt }).ToListAsync(ct).ConfigureAwait(false);
+        var active = candidates.Where(s => s.TenantId == account.TenantId && s.ExpiresAt > now).Select(s => s.Id).OrderBy(id => id);
+        foreach (var batch in active.Chunk(256))
+        {
+            var parameters = new List<(string, object?)> { ("@now", IsoDateTimeOffsetConverter.Format(now)),
+                ("@status", ClientAccountService.StatusDisconnected), ("@id", account.Id), ("@tenant", account.TenantId) };
+            var names = batch.Select((id, n) => { var name = "@session" + n; parameters.Add((name, id)); return name; }).ToArray();
+            await using var command = ClientOwnershipWrite.Command(_db,
+                $"UPDATE {table} SET {expires}=@now,{status}=@status,{disconnected}=COALESCE({disconnected},@now) " +
+                $"WHERE {client}=@id AND {ExactTenant(tenant)} AND {key} IN ({string.Join(',', names)})", parameters.ToArray());
+            if (await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != batch.Length)
+                throw new InvalidOperationException("deleted client session authority changed during revocation");
+        }
     }
 }

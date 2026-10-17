@@ -111,7 +111,7 @@ internal sealed class ClientAuthStub : IAsyncDisposable
             FirstSeenAt = DateTimeOffset.UtcNow,
             LastSeenAt = DateTimeOffset.UtcNow,
         };
-        var session = sessionStore.Create(credential, identity, account, TimeSpan.FromHours(1), new ClientEnvironmentInfo
+        var session = await TestClientSession.CreateAsync(_server, credential, identity, account, TimeSpan.FromHours(1), new ClientEnvironmentInfo
         {
             MachineFingerprint = "it-machine",
             Hostname = "integration-test",

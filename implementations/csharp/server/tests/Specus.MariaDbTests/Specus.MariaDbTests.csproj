@@ -22,6 +22,7 @@
     <Compile Include="../Specus.IntegrationTests/PeerManagementProviderProof.cs" Link="PeerManagementProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/PeerDefinitionProviderProof.cs" Link="PeerDefinitionProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ClientNameProviderProof.cs" Link="ClientNameProviderProof.cs" />
+    <Compile Include="../Specus.IntegrationTests/ClientSessionAuthorityProviderProof.cs" Link="ClientSessionAuthorityProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ManagementUserActorProviderProof.cs" Link="ManagementUserActorProviderProof.cs" />
     <Compile Include="../Specus.IntegrationTests/ClientStartupProviderProof.cs" Link="ClientStartupProviderProof.cs" />
     <Using Include="Xunit" />

@@ -14,6 +14,16 @@ namespace Specus.IntegrationTests;
 public sealed partial class PostgresBootstrapTests
 {
     [Fact]
+    public async Task NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var first = await StartAsync(database, gate);
+        await using var second = await StartAsync(database);
+        await ClientSessionAuthorityProviderProof.VerifyAsync(first, second, gate);
+    }
+
+    [Fact]
     public async Task NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup()
     {
         await using var database = await OwnedDatabase.CreateAsync();

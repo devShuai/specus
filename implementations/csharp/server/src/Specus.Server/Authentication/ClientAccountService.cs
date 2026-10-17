@@ -147,56 +147,10 @@ public sealed partial class ClientAccountService
         if (session.ExpiresAt <= DateTimeOffset.UtcNow)
         {
             _sessionStore.MarkDisconnected(session.Id);
-            await MarkSessionDisconnectedAsync(session.Id, cancellationToken).ConfigureAwait(false);
             return AuthenticationResult.Fail(null, "客户端访问令牌已过期", session.TenantId);
         }
-
-        var account = await _db.ClientAccounts
-            .FirstOrDefaultAsync(a => a.Id == session.ClientId && a.TenantId == session.TenantId,
-                cancellationToken)
+        return await AuthenticateCurrentSessionAsync(session, packet, channelId, remoteAddress, dataConnection, cancellationToken)
             .ConfigureAwait(false);
-        var credential = await _db.ClientCredentials
-            .FirstOrDefaultAsync(c => c.Id == session.CredentialId && c.TenantId == session.TenantId,
-                cancellationToken)
-            .ConfigureAwait(false);
-
-        if (account is null || credential is null)
-        {
-            return AuthenticationResult.Fail(null, "客户端不存在", session.TenantId);
-        }
-        if (!account.Enabled || !credential.Enabled)
-        {
-            return AuthenticationResult.Fail(account, "客户端已停用");
-        }
-        if (dataConnection && session.Status != ClientAuthSessionStatus.NettyOnline)
-        {
-            return AuthenticationResult.Fail(account, "数据连接要求控制连接先登录");
-        }
-        if (!dataConnection && await ExceedsRateLimitAsync(
-                account.Id, account.ConnectionRateLimitPerMinute, cancellationToken).ConfigureAwait(false))
-        {
-            return AuthenticationResult.Fail(account, "连接频率超过限制");
-        }
-        if (!dataConnection && _sessionStore.CountOnlineByMachineUser(
-                session.CredentialId, session.MachineFingerprint, session.OsUser, session.Id) >= PerMachineUserMaxInstances)
-        {
-            return AuthenticationResult.Fail(account, "同一台机器和用户已经有在线实例");
-        }
-        if (!dataConnection
-            && _sessionStore.CountOnlineByCredential(session.CredentialId, session.Id) >= credential.MaxOnlineInstances)
-        {
-            return AuthenticationResult.Fail(account, "在线实例数已达上限");
-        }
-
-        packet.ClientName = account.ClientName;
-        packet.ClientSessionId = session.Id;
-        if (!dataConnection)
-        {
-            await MarkSessionOnlineAsync(session, channelId, remoteAddress, cancellationToken)
-                .ConfigureAwait(false);
-            _sessionStore.MarkOnline(session, channelId, remoteAddress);
-        }
-        return AuthenticationResult.Pass(account);
     }
 
     private async Task<string> ResolveAuditTenantAsync(long? sessionId,
@@ -393,7 +347,7 @@ public sealed partial class ClientAccountService
             """, cancellationToken).ConfigureAwait(false);
     }
 
-    private static ClientSession ToSessionEntity(ClientAuthSession session, ClientEnvironmentInfo environment)
+    internal static ClientSession ToSessionEntity(ClientAuthSession session, ClientEnvironmentInfo environment)
     {
         var localAddresses = environment.LocalAddresses ?? new List<string>();
         return new ClientSession

@@ -10,6 +10,8 @@ public sealed class ClientAuthSessionStore
     private readonly ConcurrentDictionary<string, ClientAuthSession> _byTokenHash = new();
     private readonly ConcurrentDictionary<long, string> _tokenHashBySessionId = new();
     private readonly object _publicationGate = new();
+    // A committed deletion must also fence a prepared HTTP token published late.
+    private readonly HashSet<(string Tenant, long Client)> _revokedClients = [];
 
     public ClientAuthSession Create(ClientCredential credential, ClientIdentity identity,
         ClientAccount account, TimeSpan ttl, ClientEnvironmentInfo environment)
@@ -50,6 +52,8 @@ public sealed class ClientAuthSessionStore
     {
         lock (_publicationGate)
         {
+            if (_revokedClients.Contains((session.TenantId, session.ClientId)))
+                throw new ArgumentException("客户端已删除，请重新认证");
             if (_tokenHashBySessionId.ContainsKey(session.Id) || !_byTokenHash.TryAdd(session.TokenHash, session))
                 throw new InvalidOperationException("client session publication conflict");
             if (!_tokenHashBySessionId.TryAdd(session.Id, session.TokenHash))
@@ -73,7 +77,7 @@ public sealed class ClientAuthSessionStore
         {
             return null;
         }
-        return _byTokenHash.TryGetValue(hash, out var session) ? session : null;
+        return _byTokenHash.TryGetValue(hash, out var session) && !session.Revoked ? session : null;
     }
 
     /// <summary>
@@ -93,25 +97,51 @@ public sealed class ClientAuthSessionStore
     public int CountOnlineByCredential(long credentialId, long? excludingSessionId = null) =>
         _byTokenHash.Values.Count(s => s.CredentialId == credentialId
             && s.Id != excludingSessionId
+            && !s.Revoked && s.ExpiresAt > DateTimeOffset.UtcNow
             && s.Status == ClientAuthSessionStatus.NettyOnline);
 
     public int CountOnlineByMachineUser(long credentialId, string machineFingerprint, string osUser,
         long? excludingSessionId = null) =>
         _byTokenHash.Values.Count(s => s.CredentialId == credentialId
             && s.Id != excludingSessionId
+            && !s.Revoked && s.ExpiresAt > DateTimeOffset.UtcNow
             && s.Status == ClientAuthSessionStatus.NettyOnline
             && string.Equals(s.MachineFingerprint, machineFingerprint, StringComparison.Ordinal)
             && string.Equals(s.OsUser, osUser, StringComparison.Ordinal));
 
-    public void MarkOnline(ClientAuthSession session, string channelId, string? remoteAddress)
+    public bool MarkOnline(ClientAuthSession session, string channelId, string? remoteAddress)
     {
+        lock (_publicationGate)
         lock (session)
         {
+            if (session.Revoked || session.ExpiresAt <= DateTimeOffset.UtcNow
+                || _revokedClients.Contains((session.TenantId, session.ClientId))) return false;
             session.Status = ClientAuthSessionStatus.NettyOnline;
             session.ChannelId = channelId;
             session.RemoteAddress = remoteAddress;
             session.NettyConnectedAt = DateTimeOffset.UtcNow;
             session.DisconnectedAt = null;
+            return true;
+        }
+    }
+
+    // Call only after the account/identity/session SQL transaction committed and disposed.
+    // Keep token metadata for audit attribution, but never as authentication authority.
+    internal void RevokeClient(string tenant, long clientId)
+    {
+        lock (_publicationGate)
+        {
+            _revokedClients.Add((tenant, clientId));
+            foreach (var session in _byTokenHash.Values.Where(s => s.ClientId == clientId
+                         && string.Equals(s.TenantId, tenant, StringComparison.Ordinal)))
+            {
+                lock (session)
+                {
+                    session.Revoked = true;
+                    session.Status = ClientAuthSessionStatus.Disconnected;
+                    session.DisconnectedAt ??= DateTimeOffset.UtcNow;
+                }
+            }
         }
     }
 
@@ -150,6 +180,7 @@ public sealed class ClientAuthSessionStore
 
 public sealed class ClientAuthSession
 {
+    internal volatile bool Revoked;
     public long Id { get; init; }
     public string TenantId { get; init; } = "default";
     public long CredentialId { get; init; }

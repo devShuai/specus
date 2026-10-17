@@ -245,7 +245,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 26), ('executed', 26), ('passed', 26), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 27), ('executed', 27), ('passed', 27), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -261,12 +261,13 @@ jobs:
               'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
               'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
               'NativePeerBootstrapNormalizesAndValidatesBooleanShape',
+              'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion',
               'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 26 real PostgreSQL cases, including canonical client names and complete deletion coordinated with signed startup; zero skipped.')
+          print('Verified all 27 real PostgreSQL cases, including current SQL session authority and independent-host quota/deletion coordination; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -290,7 +291,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 20), ('executed', 20), ('passed', 20), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 21), ('executed', 21), ('passed', 21), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -306,12 +307,13 @@ jobs:
               'NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents',
               'NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion',
               'UnsafeDowngradeIsRefusedBeforeChangingDataOrHistory',
+              'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion',
               'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 20 real MySQL cases, including canonical client names and complete deletion coordinated with signed startup; zero skipped.')
+          print('Verified all 21 real MySQL cases, including current SQL session authority and independent-host quota/deletion coordination; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -335,7 +337,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 25), ('executed', 25), ('passed', 25), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 26), ('executed', 26), ('passed', 26), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -357,7 +359,10 @@ jobs:
           name = 'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup'
           matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
           assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 25 real MariaDB cases, including canonical client names and complete deletion coordinated with signed startup; zero skipped.')
+          name = 'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          print('Verified all 26 real MariaDB cases, including current SQL session authority and independent-host quota/deletion coordination; zero skipped.')
           PY
 
       - name: Keep real MariaDB results

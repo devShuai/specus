@@ -322,7 +322,7 @@ public sealed class NatControlPushFailureVectorTests
             FirstSeenAt = now,
             LastSeenAt = now,
         };
-        var session = scope.ServiceProvider.GetRequiredService<ClientAuthSessionStore>().Create(credential, identity,
+        var session = await TestClientSession.CreateAsync(server, credential, identity,
             account, TimeSpan.FromHours(1), new ClientEnvironmentInfo
             {
                 MachineFingerprint = identity.MachineFingerprint,
