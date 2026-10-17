@@ -71,6 +71,10 @@ internal static class ManagementUserActorProviderProof
                 _ = await OwnerTransferWriterProof.ScalarAsync(holder, "SELECT username FROM specus_management_user WHERE username=@key FOR UPDATE", ct, ("@key", "a-admin-key"));
                 first = firstScope.ServiceProvider.GetRequiredService<ManagementUserService>().UpdateUserAsync(low.Context, "high-admin",
                     new UserMutation(null, "changed-high-password", null, null), ct);
+                // Starting an async request does not prove it reached PostgreSQL's tuple
+                // queue before the next request. Establish that real blocking edge first;
+                // both operations still overlap while the holder keeps the LOW row locked.
+                await OwnerTransferWriterProof.WaitForBlockerAsync(observer, firstPid, holderPid, postgres, maria, first, ct);
                 second = secondScope.ServiceProvider.GetRequiredService<ManagementUserService>().UpdateUserAsync(high.Context, "low-admin",
                     new UserMutation(null, "changed-low-password", null, null), ct);
                 await OwnerTransferWriterProof.WaitForBlockerAsync(observer, firstPid, holderPid, postgres, maria, first, ct);
