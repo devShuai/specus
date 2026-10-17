@@ -14,6 +14,14 @@ namespace Specus.IntegrationTests;
 public sealed partial class PostgresBootstrapTests
 {
     [Fact]
+    public async Task NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerControlDeliveryProviderProof.VerifyCatalogAsync(server, verifySignals: true);
+    }
+
+    [Fact]
     public async Task NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn()
     {
         await using var database = await OwnedDatabase.CreateAsync();

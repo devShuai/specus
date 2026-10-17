@@ -245,7 +245,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 29), ('executed', 29), ('passed', 29), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 30), ('executed', 30), ('passed', 30), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -263,13 +263,14 @@ jobs:
               'NativePeerBootstrapNormalizesAndValidatesBooleanShape',
               'NativePeerControlDeliveryUsesOriginalCurrentAuthorityAtTheWriteTurn',
               'NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn',
+              'NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant',
               'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion',
               'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 29 real PostgreSQL cases, including current publisher/receiver and definition authority at the physical control write turn; zero skipped.')
+          print('Verified all 30 real PostgreSQL cases, including signal sender/receiver authority and undelivered grant cleanup at the physical control write turn; zero skipped.')
           PY
 
       - name: Keep real PostgreSQL bootstrap results
@@ -293,7 +294,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 23), ('executed', 23), ('passed', 23), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 24), ('executed', 24), ('passed', 24), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -311,13 +312,14 @@ jobs:
               'UnsafeDowngradeIsRefusedBeforeChangingDataOrHistory',
               'NativePeerControlDeliveryUsesOriginalCurrentAuthorityAtTheWriteTurn',
               'NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn',
+              'NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant',
               'NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion',
               'NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup',
           ]
           for name in required:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 23 real MySQL cases, including current publisher/receiver and definition authority at the physical control write turn; zero skipped.')
+          print('Verified all 24 real MySQL cases, including signal sender/receiver authority and undelivered grant cleanup at the physical control write turn; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results
@@ -341,7 +343,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 28), ('executed', 28), ('passed', 28), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 29), ('executed', 29), ('passed', 29), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -372,7 +374,10 @@ jobs:
           name = 'NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn'
           matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
           assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
-          print('Verified all 28 real MariaDB cases, including current publisher/receiver and definition authority at the physical control write turn; zero skipped.')
+          name = 'NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant'
+          matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+          assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native regression', name)
+          print('Verified all 29 real MariaDB cases, including signal sender/receiver authority and undelivered grant cleanup at the physical control write turn; zero skipped.')
           PY
 
       - name: Keep real MariaDB results

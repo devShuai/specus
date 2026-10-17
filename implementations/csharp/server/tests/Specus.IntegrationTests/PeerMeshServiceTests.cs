@@ -22,6 +22,28 @@ namespace Specus.IntegrationTests;
 
 public sealed class PeerMeshServiceTests
 {
+    [Theory]
+    [InlineData("session-grant")]
+    [InlineData("peer-config")]
+    [InlineData("roster")]
+    [InlineData("service-catalog")]
+    [InlineData("egress-config")]
+    [InlineData("egress-catalog")]
+    public async Task ClientCannotImpersonateServerControlMessages(string type)
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(1001, "tenant-a", "alice", "source");
+        var target = fixture.AddClient(1002, "tenant-a", "alice", "target");
+        fixture.AddDevice(source, "100.96.0.10", "source-key"); fixture.AddDevice(target, "100.96.0.11", "target-key");
+        await fixture.SaveChangesAsync();
+        var sourceWriter = await fixture.BindAsync(source); var targetWriter = await fixture.BindAsync(target);
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.HandleSignalAsync(new MessageRequestPacket
+            { MessageType = MessageType.PeerControl, ToClientName = target.ClientName,
+                Message = JsonSerializer.Serialize(new { type, token = "forged" }) }, source.ClientName, CancellationToken.None));
+        Assert.Empty(sourceWriter.PeerMessages()); Assert.Empty(targetWriter.PeerMessages());
+        Assert.Empty(await fixture.Db.PeerMeshSessions.ToArrayAsync());
+    }
+
     [Fact]
     public void ServiceReportEnvelopeRejectsClientControlledRoutingAndIdentity()
     {

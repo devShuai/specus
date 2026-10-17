@@ -25,7 +25,7 @@ namespace Specus.IntegrationTests;
 // SpecusConnection with a gated real loopback TCP stream. Not separate OS process coverage.
 internal static class PeerControlDeliveryProviderProof
 {
-    internal static async Task VerifyCatalogAsync(TestServerFixture server)
+    internal static async Task VerifyCatalogAsync(TestServerFixture server, bool verifySignals = false)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60)); var ct = timeout.Token;
         await using var scope = server.HostServices.CreateAsyncScope();
@@ -75,7 +75,9 @@ internal static class PeerControlDeliveryProviderProof
         await pair.Stream.HalfWritten.WaitAsync(TimeSpan.FromSeconds(10), ct);
         observer.OwnCall.Value = true;
         var pending = services.GetRequiredService<IControlChannelDispatcher>().DispatchAsync(source, new MessageRequestPacket
-            { MessageType = Specus.Protocol.MessageType.PeerControl, Message = "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[{\"serviceId\":\"catalog-service\"}]}" });
+            { MessageType = Specus.Protocol.MessageType.PeerControl, ToClientName = verifySignals ? recipientLogin.ClientName : null,
+                Message = verifySignals ? "{\"type\":\"candidates\",\"candidates\":[]}"
+                    : "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[{\"serviceId\":\"catalog-service\"}]}" });
         observer.OwnCall.Value = false;
         try
         {
@@ -85,11 +87,27 @@ internal static class PeerControlDeliveryProviderProof
             await using (var change = server.HostServices.CreateAsyncScope())
             {
                 var current = change.ServiceProvider.GetRequiredService<SpecusDbContext>();
-                (await current.PeerMeshSharedServices.SingleAsync(s => s.Id == 6501, ct)).PublishedPort = 24002;
+                if (verifySignals) (await current.ClientCredentials.SingleAsync(c => c.Id == 502, ct)).Enabled = false;
+                else (await current.PeerMeshSharedServices.SingleAsync(s => s.Id == 6501, ct)).PublishedPort = 24002;
                 await current.SaveChangesAsync(ct);
             }
             pair.Stream.Release(); await first.WaitAsync(ct); await pending.WaitAsync(ct);
             var prefix = PacketCodec.Encode(firstPacket).Length;
+            if (verifySignals)
+            {
+                Assert.Equal(PacketCodec.Encode(firstPacket), pair.Stream.Wire());
+                var session = await db.PeerMeshSessions.AsNoTracking().SingleAsync(s => s.SourceClientId == 1002 && s.TargetClientId == 1001, ct);
+                Assert.Equal(PeerMeshService.StatusClosed, session.Status); Assert.NotNull(session.ClosedAt);
+                var firstReceived = new byte[prefix]; await pair.Client.GetStream().ReadExactlyAsync(firstReceived, ct);
+                Assert.Equal(PacketCodec.Encode(firstPacket), firstReceived);
+                Assert.Null(db.Database.CurrentTransaction);
+                foreach (var type in new[] { "session-grant", "peer-config", "roster", "service-catalog", "egress-config", "egress-catalog" })
+                    await Assert.ThrowsAsync<ArgumentException>(() => services.GetRequiredService<IControlChannelDispatcher>().DispatchAsync(source,
+                        new MessageRequestPacket { MessageType = Specus.Protocol.MessageType.PeerControl, ToClientName = recipientLogin.ClientName,
+                            Message = JsonSerializer.Serialize(new { type, token = "forged" }) }));
+                Assert.Equal(PacketCodec.Encode(firstPacket), pair.Stream.Wire());
+                return;
+            }
             var packet = Assert.IsType<MessageResponsePacket>(PacketCodec.DecodeExact(pair.Stream.Wire().AsSpan(prefix)));
             var catalog = JsonSerializer.Deserialize<PeerControlMessage>(packet.Message!)!;
             Assert.Equal(publisherLogin.ClientSessionId, catalog.PublisherSessionId);
