@@ -1,5 +1,6 @@
+import { ButtonLink } from "../../components/ButtonLink";
 import { useEffect, useState } from "react";
-import { Button, Card, CardBody, CardHeader, Chip, Tab, Tabs } from "@heroui/react";
+import { Button, Card, Chip, Tab, TabList, TabPanel, Tabs, buttonVariants } from "@heroui/react";
 import { copyTextWithFeedback } from "../../lib/clipboard";
 import {
   MACOS_CLIENT_START_COMMAND,
@@ -36,7 +37,7 @@ const NAT_PATH_GUIDANCE = [
   {
     label: "EIM + ADF",
     path: "直连较友好",
-    tone: "primary",
+    tone: "accent",
     detail: "双方并行发包通常可以打洞，超时后自动切换 relay。",
   },
   {
@@ -121,31 +122,41 @@ export function HelpPanel() {
         <p className="text-small text-default-500">客户端启动方法、配置模板与常见问题</p>
       </div>
 
-      <Tabs aria-label="帮助文档" variant="underlined" selectedKey={activeTab} onSelectionChange={onTabChange}>
-        <Tab key="quickstart" title="快速开始">
+      <Tabs  variant="secondary" selectedKey={activeTab} onSelectionChange={onTabChange}>
+        <Tabs.ListContainer className="min-w-0 max-w-full"><TabList aria-label="帮助文档">
+          <Tab id="quickstart">{"快速开始"}<Tabs.Indicator /></Tab>
+          <Tab id="java">{"Java 客户端"}<Tabs.Indicator /></Tab>
+          <Tab id="go">{"Go 客户端"}<Tabs.Indicator /></Tab>
+          <Tab id="csharp">{".NET 客户端"}<Tabs.Indicator /></Tab>
+          <Tab id="peer-mesh">{"私有组网"}<Tabs.Indicator /></Tab>
+          <Tab id="protocol">{"协议与端口"}<Tabs.Indicator /></Tab>
+          <Tab id="faq">{"常见问题"}<Tabs.Indicator /></Tab>
+          <Tab id="metrics">产品指标<Tabs.Indicator /></Tab>
+        </TabList></Tabs.ListContainer>
+        <TabPanel id="quickstart">
           <QuickStartSection />
-        </Tab>
-        <Tab key="java" title="Java 客户端">
+        </TabPanel>
+        <TabPanel id="java">
           <JavaSection />
-        </Tab>
-        <Tab key="go" title="Go 客户端">
+        </TabPanel>
+        <TabPanel id="go">
           <GoSection />
-        </Tab>
-        <Tab key="csharp" title=".NET 客户端">
+        </TabPanel>
+        <TabPanel id="csharp">
           <CsharpSection />
-        </Tab>
-        <Tab key="peer-mesh" title="私有组网">
+        </TabPanel>
+        <TabPanel id="peer-mesh">
           <PeerMeshSection />
-        </Tab>
-        <Tab key="protocol" title="协议与端口">
+        </TabPanel>
+        <TabPanel id="protocol">
           <ProtocolSection />
-        </Tab>
-        <Tab key="faq" title="常见问题">
+        </TabPanel>
+        <TabPanel id="faq">
           <FaqSection />
-        </Tab>
-        <Tab key="metrics" title="产品指标">
+        </TabPanel>
+        <TabPanel id="metrics">
           <ProductMetricsSection />
-        </Tab>
+        </TabPanel>
       </Tabs>
     </div>
   );
@@ -182,7 +193,7 @@ function QuickStartSection() {
 
       {CLIENT_ONBOARDING_STEPS.map((step, index) => <DocCard key={step.title} title={`${index + 2}. ${step.title}`}>
         <p>{step.detail}</p>
-        <Button as="a" href={step.href} size="sm" variant="flat" className="mt-3">{step.action}</Button>
+        <ButtonLink href={step.href} size="sm" variant={"secondary"} className="mt-3">{step.action}</ButtonLink>
         {index === 3 ? <p className="mt-3 text-small text-default-500">端口映射会开放公网 TCP 端口；HTTP 路由可设置访问用户名和密码。创建配置和设备在线都不等于目标应用已经验证成功。</p> : null}
       </DocCard>)}
     </div>
@@ -390,7 +401,7 @@ sudo firewall-cmd --reload`} />
           {NAT_PATH_GUIDANCE.map((item) => (
             <div key={item.label} className="grid gap-2 py-2 sm:grid-cols-[150px_110px_minmax(0,1fr)] sm:items-center">
               <span className="font-mono text-small font-semibold text-foreground">{item.label}</span>
-              <Chip className="w-fit" size="sm" color={item.tone} variant="flat">
+              <Chip className="w-fit" size="sm" color={item.tone} variant="soft">
                 {item.path}
               </Chip>
               <span className="text-tiny text-default-500">{item.detail}</span>
@@ -405,16 +416,12 @@ sudo firewall-cmd --reload`} />
       <DocCard title="NAT 穿透说明">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <p className="text-small text-default-500">根据 Tailscale NAT traversal 文章做中文改写。</p>
-          <Button
-            as="a"
+          <a
             href={NAT_TRAVERSAL_REFERENCE.url}
             rel="noreferrer"
-            target="_blank"
-            size="sm"
-            variant="flat"
-          >
+            target="_blank" className={buttonVariants({ variant: "secondary", size: "sm" })}>
             阅读原文
-          </Button>
+          </a>
         </div>
         <div className="grid gap-2 md:grid-cols-2">
           {NAT_TRAVERSAL_REFERENCE.notes.map((note) => (
@@ -553,11 +560,11 @@ function FaqSection() {
 
 function DocCard({ title, children }: { title: React.ReactNode; children: React.ReactNode }) {
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardHeader className="px-5 pb-2 pt-4">
+    <Card className="rounded-md border border-default-200">
+      <Card.Header className="px-5 pb-2 pt-4">
         <h3 className="text-base font-semibold">{title}</h3>
-      </CardHeader>
-      <CardBody className="px-5 pb-4 pt-1 text-small">{children}</CardBody>
+      </Card.Header>
+      <Card.Content className="px-5 pb-4 pt-1 text-small">{children}</Card.Content>
     </Card>
   );
 }
@@ -579,7 +586,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
     <div className="overflow-hidden rounded-md border border-default-200 bg-default-50">
       <div className="flex items-center justify-between gap-2 border-b border-default-200 px-3 py-1.5">
         <span className="text-tiny text-default-400">{language}</span>
-        <Button size="sm" variant="flat" onPress={() => void onCopy()}>
+        <Button size="sm" variant="secondary" onPress={() => void onCopy()}>
           {copied ? "已复制" : "复制"}
         </Button>
       </div>

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ClipboardEvent as ReactClipboardEvent } from "react";
-import { Button, Chip, Switch } from "@heroui/react";
+import { Button, Chip, Switch, Label, Spinner } from "@heroui/react";
 import { clipboardQuickSendAllowed } from "../lib/transferExperience";
 import {
   CLIPBOARD_TEXT_MAX_CHARS,
@@ -601,11 +601,11 @@ export function SyncedClipboard({
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.07]">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h2 className="text-base font-semibold text-zinc-950 dark:text-white">文字与链接</h2>
-          <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
+          <Chip size="sm" variant={"soft"} color={canSend && targetPeerId ? "success" : "default"} className={"rounded-small"}>
             {canSend ? (targetPeerId ? quickSend ? "粘贴即发送" : "确认后发送" : "等待选择设备") : "只读"}
           </Chip>
           {blocks.length > 0 && (
-            <Chip size="sm" radius="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {blocks.length} 项
             </Chip>
           )}
@@ -620,7 +620,7 @@ export function SyncedClipboard({
       </div>
 
       <div className="flex flex-col gap-3 px-4 py-3">
-        <Switch size="sm" isSelected={quickSend} onValueChange={setQuickSend} isDisabled={!canSend || !targetPeerId}>粘贴即发送（仅本次页面，读取剪贴板仍需确认）</Switch>
+        <Switch size="sm" isSelected={quickSend} onChange={setQuickSend} isDisabled={!canSend || !targetPeerId}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>粘贴即发送（仅本次页面，读取剪贴板仍需确认）</Label></Switch.Content></Switch>
         <div className="rounded-xl border border-black/[0.06] bg-linear-to-b from-white/90 to-white/50 p-3 shadow-xs dark:border-white/[0.08] dark:from-white/[0.05] dark:to-white/[0.02]">
           <textarea
             ref={textareaRef}
@@ -655,21 +655,10 @@ export function SyncedClipboard({
                 : "文本、富文本、链接；文件走文件通道"}
             </span>
             <div className="flex items-center gap-1.5">
-              <Button
-                radius="sm"
-                size="sm"
-                variant="flat"
-                isLoading={isSystemClipboardReading}
-                onPress={readSystemClipboard}
-              >
+              <Button size="sm" variant="secondary" onPress={readSystemClipboard} isDisabled={isSystemClipboardReading}>{isSystemClipboardReading ? <Spinner size="sm" /> : null}
                 读取剪贴板
               </Button>
-              <Button
-                color="primary"
-                radius="sm"
-                size="sm"
-                isDisabled={!composerDraft || !composerWithinLimits || !canSend || !targetPeerId || isSending}
-                onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml))}
+              <Button variant="primary" size="sm" isDisabled={!composerDraft || !composerWithinLimits || !canSend || !targetPeerId || isSending} onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, composerHtml))}
               >
                 发送文字
               </Button>
@@ -680,10 +669,10 @@ export function SyncedClipboard({
         {draftFiles.length > 0 ? <div className="rounded-lg border border-default-200 p-3 text-small">
           <p className="break-words">待发送文件：{draftFiles.map((file) => file.name).join("、")}</p>
           <div className="mt-2 flex gap-2">
-            <Button size="sm" color="primary" isDisabled={!canSend || (fileTargetRequired && !targetPeerId)} onPress={() => {
+            <Button size="sm" isDisabled={!canSend || (fileTargetRequired && !targetPeerId)} onPress={() => {
               if (sendClipboardFiles(draftFiles)) setDraftFiles([]);
-            }}>发送这些文件</Button>
-            <Button size="sm" variant="light" onPress={() => setDraftFiles([])}>移除文件</Button>
+            }} variant={"primary"}>发送这些文件</Button>
+            <Button size="sm" variant={"ghost"} onPress={() => setDraftFiles([])}>移除文件</Button>
           </div>
         </div> : null}
 
@@ -695,12 +684,7 @@ export function SyncedClipboard({
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between gap-2">
               <p className="text-tiny text-zinc-400 dark:text-zinc-500">最新在前 · 最多保留 80 条</p>
-              <Button
-                radius="sm"
-                size="sm"
-                variant="light"
-                isDisabled={isSending || isClipboardWritePending}
-                onPress={clearAllBlocks}
+              <Button size="sm" variant="ghost" isDisabled={isSending || isClipboardWritePending} onPress={clearAllBlocks}
               >
                 清空记录
               </Button>
@@ -713,10 +697,10 @@ export function SyncedClipboard({
               return (
                 <article key={block.id} className="min-w-0 rounded-lg border border-black/[0.07] bg-white/55 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
                   <div className="flex min-w-0 items-center gap-2">
-                    <Chip size="sm" radius="sm" variant="flat" color={block.origin === "remote" ? "success" : "primary"}>
+                    <Chip size="sm" variant="soft" color={block.origin === "remote" ? "success" : "accent"}>
                       {block.origin === "remote" ? "收到" : "本机"}
                     </Chip>
-                    <Chip size="sm" radius="sm" variant="flat">
+                    <Chip size="sm" variant="soft">
                       {clipboardKindLabel(block.kind)}
                     </Chip>
                     <span className="min-w-0 flex-1 truncate text-tiny font-medium text-zinc-600 dark:text-zinc-300">
@@ -781,34 +765,14 @@ export function SyncedClipboard({
                     </p>
                   )}
                   <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
-                    <Button
-                      color="primary"
-                      radius="sm"
-                      size="sm"
-                      variant="flat"
-                      isLoading={sendingBlockId === block.id}
-                      isDisabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending}
-                      onPress={() => void submitText(block.text, block.id, block.kind, block.html)}
+                    <Button size="sm" variant="secondary" isDisabled={!block.text || !withinLimits || !canSend || !targetPeerId || isSending || sendingBlockId === block.id} onPress={() => void submitText(block.text, block.id, block.kind, block.html)}
                     >
                       发送到设备
                     </Button>
-                    <Button
-                      radius="sm"
-                      size="sm"
-                      variant={needsCopy ? "solid" : "flat"}
-                      color={needsCopy ? "warning" : "default"}
-                      isLoading={clipboardWriteBlockId === block.id}
-                      isDisabled={isClipboardWritePending && clipboardWriteBlockId !== block.id}
-                      onPress={() => handleManualCopy(block)}
-                    >
+                    <Button size="sm" isDisabled={isClipboardWritePending && clipboardWriteBlockId !== block.id || clipboardWriteBlockId === block.id} onPress={() => handleManualCopy(block)} variant={needsCopy ? "primary" : "secondary"}>{clipboardWriteBlockId === block.id ? <Spinner size="sm" /> : null}
                       复制到剪贴板
                     </Button>
-                    <Button
-                      radius="sm"
-                      size="sm"
-                      variant="light"
-                      isDisabled={sendingBlockId === block.id || clipboardWriteBlockId === block.id}
-                      onPress={() => removeBlock(block)}
+                    <Button size="sm" variant="ghost" isDisabled={sendingBlockId === block.id || clipboardWriteBlockId === block.id} onPress={() => removeBlock(block)}
                     >
                       删除
                     </Button>

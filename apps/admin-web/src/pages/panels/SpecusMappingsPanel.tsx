@@ -1,24 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import {
-  Button,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  Pagination,
-  Select,
-  SelectItem,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  useDisclosure,
-} from "@heroui/react";
+import { Button, Input, Label, ListBox, ListBoxItem, Modal, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, TextField, useOverlayState } from "@heroui/react";
+import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { Specus } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
@@ -43,7 +25,7 @@ export function SpecusMappingsPanel() {
   const [pendingIds, setPendingIds] = useState<Set<number>>(new Set());
   const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
   const [page, setPage] = useState(1);
-  const editModal = useDisclosure();
+  const editModal = useOverlayState();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -142,24 +124,36 @@ export function SpecusMappingsPanel() {
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
-        <Select
-          className="w-full sm:w-48"
-          label="客户端"
-          selectedKeys={clientId ? [clientId] : []}
-          onChange={(event) => setClientId(event.target.value)}
-          isRequired
-        >
-          {clients.map((client) => (
-            <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
+        <Select className="w-full sm:w-48" isRequired value={clientId || null} onChange={(event) => setClientId(String(event ?? ""))}>
+          <Label>客户端</Label>
+          <SelectTrigger>
+            <SelectValue />
+            <SelectIndicator />
+          </SelectTrigger>
+          <SelectPopover>
+            <ListBox>
+              {clients.map((client) => (
+            <ListBoxItem textValue={client.clientName} key={String(client.id)} id={String(client.id)}>{client.clientName}</ListBoxItem>
           ))}
+            </ListBox>
+          </SelectPopover>
         </Select>
-        <Input className="w-full sm:w-32" type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
-        <Input className="w-full sm:w-44" label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} isRequired />
-        <Input className="w-full sm:w-32" type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-        <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+        <TextField value={listenPort} onChange={setListenPort} isRequired type="number" className="w-full sm:w-32">
+          <Label>公网端口</Label>
+          <Input min={1} max={65535} />
+        </TextField>
+        <TextField value={targetAddress} onChange={setTargetAddress} isRequired className="w-full sm:w-44">
+          <Label>内网目标地址</Label>
+          <Input placeholder="127.0.0.1" />
+        </TextField>
+        <TextField value={targetPort} onChange={setTargetPort} isRequired type="number" className="w-full sm:w-32">
+          <Label>内网端口</Label>
+          <Input min={1} max={65535} />
+        </TextField>
+        <Button variant="primary" className="h-14 w-full sm:w-auto" type="submit" isDisabled={creating}>{creating ? <Spinner size="sm" /> : null}
           新建映射
         </Button>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="secondary" onPress={() => void load()} isDisabled={loading}>{loading ? <Spinner size="sm" /> : null}
           刷新
         </Button>
       </form>
@@ -184,22 +178,14 @@ export function SpecusMappingsPanel() {
                 subtitle={`${specus.clientName} · #${specus.id}`}
                 badges={
                   <>
-                    <Switch
-                      size="sm"
-                      isSelected={specus.enabled}
-                      isDisabled={pending}
-                      onValueChange={() => void toggle(specus)}
-                    >
+                    <Switch isSelected={specus.enabled} isDisabled={pending} onChange={() => void toggle(specus)}
+                    ><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>
                       启用
-                    </Switch>
-                    <Switch
-                      size="sm"
-                      isSelected={Boolean(specus.detailCaptureEnabled)}
-                      isDisabled={pending}
-                      onValueChange={() => void toggleDetailCapture(specus)}
-                    >
+                    </Label></Switch.Content></Switch>
+                    <Switch isSelected={Boolean(specus.detailCaptureEnabled)} isDisabled={pending} onChange={() => void toggleDetailCapture(specus)}
+                    ><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>
                       明细采集
-                    </Switch>
+                    </Label></Switch.Content></Switch>
                   </>
                 }
                 fields={[
@@ -207,10 +193,10 @@ export function SpecusMappingsPanel() {
                 ]}
                 actions={
                   <>
-                    <Button size="sm" variant="flat" onPress={() => { setEditing(specus); editModal.onOpen(); }}>
+                    <Button size="sm" variant="secondary" onPress={() => { setEditing(specus); editModal.open(); }}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(specus)}>
+                    <Button size="sm" variant="danger-soft" onPress={() => remove(specus)}>
                       删除
                     </Button>
                   </>
@@ -223,67 +209,58 @@ export function SpecusMappingsPanel() {
 
       {/* desktop: 表格 */}
       <div className="hidden min-w-0 overflow-x-auto lg:block">
-      <Table aria-label="端口映射列表" isHeaderSticky removeWrapper>
-        <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>公网端口</TableColumn>
-          <TableColumn>内网目标</TableColumn>
-          <TableColumn>启用</TableColumn>
-          <TableColumn>明细采集</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-          <TableColumn>操作</TableColumn>
-        </TableHeader>
-        <TableBody items={pagedSpecusMappings} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}>
-          {(specus) => {
-            const pending = pendingIds.has(specus.id);
-            return (
-            <TableRow key={specus.id}>
-              <TableCell>{specus.id}</TableCell>
-              <TableCell>{specus.clientName}</TableCell>
-              <TableCell>{specus.listenPort}</TableCell>
-              <TableCell>
-                <code>{specus.targetAddress}:{specus.targetPort}</code>
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="启用"
-                  size="sm"
-                  isSelected={specus.enabled}
-                  isDisabled={pending}
-                  onValueChange={() => void toggle(specus)}
-                />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  aria-label="明细采集"
-                  size="sm"
-                  isSelected={Boolean(specus.detailCaptureEnabled)}
-                  isDisabled={pending}
-                  onValueChange={() => void toggleDetailCapture(specus)}
-                />
-              </TableCell>
-              <TableCell>{formatDateTime(specus.updatedAt || specus.createdAt)}</TableCell>
-              <TableCell>
-                <div className="flex gap-2">
-                  <Button size="sm" variant="flat" onPress={() => { setEditing(specus); editModal.onOpen(); }}>
-                    编辑
-                  </Button>
-                  <Button size="sm" color="danger" variant="flat" onPress={() => remove(specus)}>
-                    删除
-                  </Button>
-                </div>
-              </TableCell>
-            </TableRow>
-            );
-          }}
-        </TableBody>
+      <Table>
+        <Table.ScrollContainer><TableContent aria-label="端口映射列表">
+          <TableHeader>
+            <TableColumn isRowHeader>ID</TableColumn>
+            <TableColumn>客户端</TableColumn>
+            <TableColumn>公网端口</TableColumn>
+            <TableColumn>内网目标</TableColumn>
+            <TableColumn>启用</TableColumn>
+            <TableColumn>明细采集</TableColumn>
+            <TableColumn>更新时间</TableColumn>
+            <TableColumn>操作</TableColumn>
+          </TableHeader>
+          <TableBody items={pagedSpecusMappings} renderEmptyState={() => (loading ? <Spinner size="sm" /> : <EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />)}>
+            {(specus) => {
+              const pending = pendingIds.has(specus.id);
+              return (
+              <TableRow key={specus.id} id={specus.id}>
+                <TableCell>{specus.id}</TableCell>
+                <TableCell>{specus.clientName}</TableCell>
+                <TableCell>{specus.listenPort}</TableCell>
+                <TableCell>
+                  <code>{specus.targetAddress}:{specus.targetPort}</code>
+                </TableCell>
+                <TableCell>
+                  <Switch aria-label="启用" isSelected={specus.enabled} isDisabled={pending} onChange={() => void toggle(specus)}><Switch.Content aria-label={"启用"}><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
+                </TableCell>
+                <TableCell>
+                  <Switch aria-label="明细采集" isSelected={Boolean(specus.detailCaptureEnabled)} isDisabled={pending} onChange={() => void toggleDetailCapture(specus)}><Switch.Content aria-label={"明细采集"}><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
+                </TableCell>
+                <TableCell>{formatDateTime(specus.updatedAt || specus.createdAt)}</TableCell>
+                <TableCell>
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="secondary" onPress={() => { setEditing(specus); editModal.open(); }}>
+                      编辑
+                    </Button>
+                    <Button size="sm" variant="danger-soft" onPress={() => remove(specus)}>
+                      删除
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+              );
+            }}
+          </TableBody>
+
+        </TableContent></Table.ScrollContainer>
       </Table>
       </div>
 
       {totalPages > 1 ? (
         <div className="flex justify-end">
-          <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+          <Pager page={safePage} total={totalPages} onChange={setPage}  />
         </div>
       ) : null}
 
@@ -302,7 +279,7 @@ export function SpecusMappingsPanel() {
 }
 
 interface EditSpecusModalProps {
-  disclosure: ReturnType<typeof useDisclosure>;
+  disclosure: ReturnType<typeof useOverlayState>;
   specus: Specus | null;
   onSaved: () => void;
 }
@@ -339,7 +316,7 @@ function EditSpecusModal({ disclosure, specus, onSaved }: EditSpecusModalProps) 
         detailCaptureEnabled,
       });
       notify("端口映射已更新");
-      disclosure.onClose();
+      disclosure.close();
       onSaved();
     } catch (error) {
       notifyError(error, "更新失败");
@@ -349,33 +326,47 @@ function EditSpecusModal({ disclosure, specus, onSaved }: EditSpecusModalProps) 
   };
 
   return (
-    <Modal isOpen={disclosure.isOpen} onOpenChange={disclosure.onOpenChange}>
-      <ModalContent>
-        {(onClose) => (
-          <>
-            <ModalHeader>编辑端口映射 #{specus?.id}</ModalHeader>
-            <ModalBody className="gap-3">
-              <Input type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
-              <Input label="内网目标地址" value={targetAddress} onValueChange={setTargetAddress} maxLength={255} isRequired />
-              <Input type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-              <Switch isSelected={enabled} onValueChange={setEnabled}>
-                启用
-              </Switch>
-              <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
-                明细采集
-              </Switch>
-            </ModalBody>
-            <ModalFooter>
-              <Button variant="flat" onPress={onClose}>
+    <Modal.Root isOpen={disclosure.isOpen} onOpenChange={disclosure.setOpen}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog>
+            {({ close: onClose }) => (
+            <><Modal.CloseTrigger />
+            <Modal.Header><Modal.Heading>编辑端口映射 #{specus?.id}</Modal.Heading></Modal.Header>
+            <Modal.Body className="gap-3">
+              <TextField value={listenPort} onChange={setListenPort} isRequired type="number">
+                <Label>公网端口</Label>
+                <Input min={1} max={65535} />
+              </TextField>
+            <TextField value={targetAddress} onChange={setTargetAddress} isRequired>
+              <Label>内网目标地址</Label>
+              <Input maxLength={255} />
+            </TextField>
+            <TextField value={targetPort} onChange={setTargetPort} isRequired type="number">
+              <Label>内网端口</Label>
+              <Input min={1} max={65535} />
+            </TextField>
+            <Switch isSelected={enabled} onChange={setEnabled}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>
+              启用
+            </Label></Switch.Content></Switch>
+            <Switch isSelected={detailCaptureEnabled} onChange={setDetailCaptureEnabled}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>
+              明细采集
+            </Label></Switch.Content></Switch>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="secondary" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isLoading={saving} onPress={() => void save()}>
+              <Button variant="primary" onPress={() => void save()} isDisabled={saving}>{saving ? <Spinner size="sm" /> : null}
                 保存
               </Button>
-            </ModalFooter>
-          </>
-        )}
-      </ModalContent>
-    </Modal>
+            </Modal.Footer>
+            </>
+            )}
+
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal.Root>
   );
 }

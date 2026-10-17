@@ -1,19 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  CardHeader,
-  Checkbox,
-  Chip,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  Spinner,
-} from "@heroui/react";
+import { Button, Card, Checkbox, Chip, Input, Modal, Spinner, Label, TextField } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { ProductMetricsSettings, ProductMetricsSummary, ProductMetricsTally } from "../../api/types";
 import { ConfirmModal } from "../../components/ConfirmModal";
@@ -127,26 +113,26 @@ export function ProductMetricsPanel() {
         </p>
       </div>
 
-      <Card shadow="none" className="border border-default-200">
-        <CardHeader className="flex flex-wrap items-center gap-3">
+      <Card className={[("border border-default-200"), ("shadow-none")].filter(Boolean).join(" ")}>
+        <Card.Header className="flex flex-wrap items-center gap-3">
           <span className="font-semibold">开关</span>
           {settings ? (
-            <Chip size="sm" color={settings.enabled ? "success" : "default"} variant="flat">
+            <Chip size="sm" color={settings.enabled ? "success" : "default"} variant={"soft"}>
               {settings.enabled ? "已开启" : "未开启"}
             </Chip>
           ) : null}
           <div className="ml-auto flex flex-wrap gap-2">
             {settings?.enabled ? (
-              <Button size="sm" variant="flat" onPress={() => setDisableOpen(true)}>关闭</Button>
+              <Button size="sm" variant={"secondary"} onPress={() => setDisableOpen(true)}>关闭</Button>
             ) : (
-              <Button size="sm" color="primary" isDisabled={!settings} onPress={() => setEnableOpen(true)}>开启…</Button>
+              <Button size="sm" isDisabled={!settings} onPress={() => setEnableOpen(true)} variant={"primary"}>开启…</Button>
             )}
-            <Button size="sm" color="danger" variant="light" isDisabled={!settings} onPress={() => setPurgeOpen(true)}>
+            <Button size="sm" variant={"ghost"} isDisabled={!settings} onPress={() => setPurgeOpen(true)} className={"text-danger"}>
               清除已收集的数据
             </Button>
           </div>
-        </CardHeader>
-        <CardBody className="pt-0 text-small text-default-600">
+        </Card.Header>
+        <Card.Content className="pt-0 text-small text-default-600">
           {loadError ? <p className="text-danger">{loadError}</p> : null}
           {settings ? (
             <p>
@@ -154,38 +140,20 @@ export function ProductMetricsPanel() {
               {settings.updatedAt ? ` 最近一次由 ${settings.updatedBy ?? "管理员"} 于 ${formatDateTime(settings.updatedAt)} 更改。` : " 从未开启过。"}
             </p>
           ) : !loadError ? <Spinner size="sm" /> : null}
-        </CardBody>
+        </Card.Content>
       </Card>
 
-      <Card shadow="none" className="border border-default-200">
-        <CardHeader className="flex flex-wrap items-end gap-3">
+      <Card className={[("border border-default-200"), ("shadow-none")].filter(Boolean).join(" ")}>
+        <Card.Header className="flex flex-wrap items-end gap-3">
           <span className="font-semibold">汇总</span>
-          <Input
-            aria-label="开始日期（UTC）"
-            className="w-40"
-            label="开始（UTC）"
-            labelPlacement="outside"
-            size="sm"
-            type="date"
-            value={range.from}
-            onValueChange={(from) => setRange((current) => ({ ...current, from }))}
-          />
-          <Input
-            aria-label="结束日期（UTC）"
-            className="w-40"
-            label="结束（UTC）"
-            labelPlacement="outside"
-            size="sm"
-            type="date"
-            value={range.to}
-            onValueChange={(to) => setRange((current) => ({ ...current, to }))}
-          />
-          <Button size="sm" variant="flat" isLoading={summaryLoading} onPress={() => void loadSummary(range)}>查询</Button>
-        </CardHeader>
-        <CardBody className="gap-6 pt-0">
+          <TextField value={range.from} onChange={(from) => setRange((current) => ({ ...current, from }))} className={[("w-40")].filter(Boolean).join(" ")}><Label>{"开始（UTC）"}</Label><Input aria-label="开始日期（UTC）" type="date" className={[("h-8 text-small")].filter(Boolean).join(" ")} /></TextField>
+          <TextField value={range.to} onChange={(to) => setRange((current) => ({ ...current, to }))} className={[("w-40")].filter(Boolean).join(" ")}><Label>{"结束（UTC）"}</Label><Input aria-label="结束日期（UTC）" type="date" className={[("h-8 text-small")].filter(Boolean).join(" ")} /></TextField>
+          <Button size="sm" variant={"secondary"} isPending={summaryLoading} onPress={() => void loadSummary(range)}>{(summaryLoading) ? <Spinner size="sm" aria-hidden="true" /> : null}查询</Button>
+        </Card.Header>
+        <Card.Content className="gap-6 pt-0">
           {summaryError ? <p className="text-small text-danger">{summaryError}</p> : null}
           {summary ? <ProductMetricsSummaryView summary={summary} /> : summaryLoading ? <Spinner size="sm" /> : null}
-        </CardBody>
+        </Card.Content>
       </Card>
 
       <EnableModal isOpen={enableOpen} onClose={() => setEnableOpen(false)} onConfirm={enable} />
@@ -221,22 +189,22 @@ function EnableModal({ isOpen, onClose, onConfirm }: { isOpen: boolean; onClose:
     }
   };
   return (
-    <Modal isOpen={isOpen} onClose={onClose} size="lg" placement="center" scrollBehavior="inside">
-      <ModalContent>
-        <ModalHeader className="text-base">开启产品指标</ModalHeader>
-        <ModalBody>
+    <Modal.Root isOpen={isOpen} onOpenChange={(open) => { if (!open && !pending) onClose(); }}>
+      <Modal.Backdrop isDismissable={!pending} isKeyboardDismissDisabled={pending}><Modal.Container placement={"center"} scroll={"inside"} size={"lg"}><Modal.Dialog><Modal.CloseTrigger isDisabled={pending} />
+        <Modal.Header className="text-base"><Modal.Heading>开启产品指标</Modal.Heading></Modal.Header>
+        <Modal.Body>
           <p className="text-small text-default-600">开启后只统计从现在起发生的事；开启前创建的账号和开启前的传输不会补算。</p>
           <ProductMetricsDisclosure />
-          <Checkbox isSelected={acknowledged} onValueChange={setAcknowledged} size="sm">
+          <Checkbox isSelected={acknowledged} onChange={setAcknowledged} className={"text-small"}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>
             我已阅读以上说明，确认为本组织开启
-          </Checkbox>
-        </ModalBody>
-        <ModalFooter>
-          <Button variant="flat" onPress={onClose} isDisabled={pending}>取消</Button>
-          <Button color="primary" isDisabled={!acknowledged} isLoading={pending} onPress={() => void confirm()}>开启</Button>
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
+          </Label></Checkbox.Content></Checkbox>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant={"secondary"} onPress={onClose} isDisabled={pending}>取消</Button>
+          <Button isDisabled={!acknowledged} isPending={pending} onPress={() => void confirm()} variant={"primary"}>{(pending) ? <Spinner size="sm" aria-hidden="true" /> : null}开启</Button>
+        </Modal.Footer>
+      </Modal.Dialog></Modal.Container></Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -258,23 +226,23 @@ function DisableModal({ isOpen, onClose, onConfirm }: { isOpen: boolean; onClose
     }
   };
   return (
-    <Modal isOpen={isOpen} onClose={onClose} size="md" placement="center">
-      <ModalContent>
-        <ModalHeader className="text-base">关闭产品指标</ModalHeader>
-        <ModalBody>
+    <Modal.Root isOpen={isOpen} onOpenChange={(open) => { if (!open && !pending) onClose(); }}>
+      <Modal.Backdrop isDismissable={!pending} isKeyboardDismissDisabled={pending}><Modal.Container placement={"center"} size={"md"}><Modal.Dialog><Modal.CloseTrigger isDisabled={pending} />
+        <Modal.Header className="text-base"><Modal.Heading>关闭产品指标</Modal.Heading></Modal.Header>
+        <Modal.Body>
           <p className="text-small text-default-600">
             关闭后立即停止采集，进行中的接入进度会被删除。已有的按天计数默认保留到期满，也可以现在一并清除。
           </p>
-          <Checkbox isSelected={purge} onValueChange={setPurge} size="sm">
+          <Checkbox isSelected={purge} onChange={setPurge} className={"text-small"}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>
             同时清除已收集的数据（硬删除，无法恢复）
-          </Checkbox>
-        </ModalBody>
-        <ModalFooter>
-          <Button variant="flat" onPress={onClose} isDisabled={pending}>取消</Button>
-          <Button color={purge ? "danger" : "primary"} isLoading={pending} onPress={() => void confirm()}>关闭</Button>
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
+          </Label></Checkbox.Content></Checkbox>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant={"secondary"} onPress={onClose} isDisabled={pending}>取消</Button>
+          <Button isPending={pending} onPress={() => void confirm()} variant={purge ? "danger" : "primary"}>{(pending) ? <Spinner size="sm" aria-hidden="true" /> : null}关闭</Button>
+        </Modal.Footer>
+      </Modal.Dialog></Modal.Container></Modal.Backdrop>
+    </Modal.Root>
   );
 }
 
@@ -318,7 +286,7 @@ export function ProductMetricsSummaryView({ summary }: { summary: ProductMetrics
         </p>
         <div className="mt-2 flex flex-wrap gap-2">
           {onboarding.durations.map((bucket) => (
-            <Chip key={bucket.bucket} size="sm" variant="flat">
+            <Chip key={bucket.bucket} size="sm" variant={"soft"}>
               {DURATION_BUCKET_LABELS[bucket.bucket] ?? bucket.bucket}：{bucket.users}
             </Chip>
           ))}

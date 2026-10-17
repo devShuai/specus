@@ -1,8 +1,10 @@
 /*
- * Tailwind CSS 4 entry point. HeroUI 2.8's theme targets Tailwind 4: its plugin is configured in
- * ../hero.ts and its component class strings are scanned from @heroui/theme's dist below.
+ * Tailwind CSS 4 entry point. HeroUI 3 supplies component styles directly; keep a single
+ * Tailwind entry and the current explicit source boundary rather than restoring the old plugin.
  */
 @import "tailwindcss" source(none);
+@import "@heroui/react/styles";
+@import "./hero-theme.css";
 
 /*
  * The hand-written stylesheet. Tailwind 3 emitted it unlayered after the plain utilities and before
@@ -13,14 +15,9 @@
  */
 @import "./index.css" layer(utilities);
 
-@plugin "../hero.ts";
-
 /* The files the Tailwind 3 config listed under `content`; automatic detection would add public/. */
 @source "../index.html";
 @source "./**/*.{js,ts,jsx,tsx}";
-@source "../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}";
-/* npm can keep HeroUI's theme package nested under @heroui/react. */
-@source "../node_modules/@heroui/react/node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}";
 
 /* Dark mode follows the .dark class ThemeContext.tsx sets on <html> (darkMode: "class" before). */
 @custom-variant dark (&:is(.dark *));
@@ -50,7 +47,7 @@
 
   /*
    * Older pages still use cyan-* utilities; 50–900 map to the editor blue (appleBlueScale in
-   * ../hero.ts) so their state selectors keep working, and 950 keeps Tailwind 3's value.
+   * ./hero-theme.css) so their state selectors keep working, and 950 keeps Tailwind 3's value.
    */
   --color-cyan-50: #f0f7ff;
   --color-cyan-100: #e1efff;

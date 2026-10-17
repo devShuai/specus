@@ -13,7 +13,7 @@ export function EmptyState({ icon = "generic", title, description, actionLabel, 
       <div className="mb-4 text-default-300">{Ill(icon)}</div>
       <h3 className="text-small font-semibold text-default-600">{title}</h3>
       {description && <p className="mt-1.5 max-w-xs text-tiny text-default-400">{description}</p>}
-      {actionLabel && onAction && <Button className="mt-4" color="primary" size="sm" variant="flat" onPress={onAction}>{actionLabel}</Button>}
+      {actionLabel && onAction && <Button className="mt-4" size="sm" variant="secondary" onPress={onAction}>{actionLabel}</Button>}
     </div>
   );
 }

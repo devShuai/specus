@@ -1,0 +1,152 @@
+/* Existing Apple palette, expressed in HeroUI 3's public semantic tokens. */
+@layer components {
+  /* Preserve the app's explicit header/body spacing, rather than double-padding cards. */
+  .card { padding: 0; gap: 0; }
+  .card__header { flex-direction: row; padding: 0.75rem; }
+  .card__content, .card__footer { padding: 0.75rem; }
+  .modal__body { display: flex; flex-direction: column; gap: 0.5rem; }
+  /* Dense management grids scroll locally; never squeeze Chinese names into single characters. */
+  .table__content { min-width: max-content; }
+  .tabs { min-width: 0; max-width: 100%; }
+}
+:root,
+.light,
+[data-theme="light"] {
+  --accent: #0066cc;
+  --accent-foreground: #ffffff;
+  --background: #f5f5f7;
+  --foreground: #1d1d1f;
+  --surface: #ffffff;
+  --surface-secondary: #fbfbfd;
+  --surface-tertiary: #f5f5f7;
+  --overlay: #ffffff;
+  --default: #e8e8ed;
+  --default-foreground: #1d1d1f;
+  --app-default-50: #fafafa;
+  --app-default-100: #f4f4f5;
+  --app-default-200: #e4e4e7;
+  --app-default-300: #d4d4d8;
+  --app-default-400: #a1a1aa;
+  --app-default-500: #71717a;
+  --app-default-600: #52525b;
+  --app-default-700: #3f3f46;
+  --app-default-800: #27272a;
+  --app-default-900: #18181b;
+  --app-secondary: #6e6e73;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #f43f5e;
+  --border: #e5e5e7;
+  --separator: #e5e5e7;
+  --focus: #0066cc;
+}
+
+.dark,
+[data-theme="dark"] {
+  --accent: #2997ff;
+  --accent-foreground: #0f1011;
+  --background: #1d1d1f;
+  --foreground: #f5f5f7;
+  --surface: #2c2c2e;
+  --surface-secondary: #242426;
+  --surface-tertiary: #323234;
+  --overlay: #2c2c2e;
+  --default: #34343a;
+  --default-foreground: #f7f8f8;
+  /* Dark semantic neutrals run opposite to light, preserving the pre-migration layers. */
+  --app-default-50: #0f1011;
+  --app-default-100: #141516;
+  --app-default-200: #23252a;
+  --app-default-300: #34343a;
+  --app-default-400: #8a8f98;
+  --app-default-500: #a8adb6;
+  --app-default-600: #d0d6e0;
+  --app-default-700: #e0e4ea;
+  --app-default-800: #eef0f3;
+  --app-default-900: #f7f8f8;
+  --app-secondary: #a8adb6;
+  --border: #3a3a3c;
+  --separator: #3a3a3c;
+  --focus: #2997ff;
+}
+
+/* Preserve app-level semantic utilities used by existing screens, not v2 component internals. */
+@theme inline {
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-foreground);
+  --color-primary-50: #f0f7ff;
+  --color-primary-100: #e1efff;
+  --color-primary-200: #bfddff;
+  --color-primary-300: #8ec4ff;
+  --color-primary-400: #5aa8ff;
+  --color-primary-500: #2997ff;
+  --color-primary-600: #0077ed;
+  --color-primary-700: #0066cc;
+  --color-primary-800: #0055aa;
+  --color-primary-900: #00447f;
+  --color-default-50: var(--app-default-50);
+  --color-default-100: var(--app-default-100);
+  --color-default-200: var(--app-default-200);
+  --color-default-300: var(--app-default-300);
+  --color-default-400: var(--app-default-400);
+  --color-default-500: var(--app-default-500);
+  --color-default-600: var(--app-default-600);
+  --color-default-700: var(--app-default-700);
+  --color-default-800: var(--app-default-800);
+  --color-default-900: var(--app-default-900);
+  --color-secondary: var(--app-secondary);
+  --color-secondary-foreground: var(--foreground);
+  --color-secondary-50: var(--app-default-50);
+  --color-secondary-100: var(--app-default-100);
+  --color-secondary-200: var(--app-default-200);
+  --color-secondary-300: var(--app-default-300);
+  --color-secondary-400: var(--app-default-400);
+  --color-secondary-500: var(--app-default-500);
+  --color-secondary-600: var(--app-default-600);
+  --color-secondary-700: var(--app-default-700);
+  --color-secondary-800: var(--app-default-800);
+  --color-secondary-900: var(--app-default-900);
+  --color-success-50: #ecfdf5;
+  --color-success-100: #d1fae5;
+  --color-success-200: #a7f3d0;
+  --color-success-300: #6ee7b7;
+  --color-success-400: #34d399;
+  --color-success-500: #10b981;
+  --color-success-600: #059669;
+  --color-success-700: #047857;
+  --color-success-800: #065f46;
+  --color-success-900: #064e3b;
+  --color-warning-50: #fffbeb;
+  --color-warning-100: #fef3c7;
+  --color-warning-200: #fde68a;
+  --color-warning-300: #fcd34d;
+  --color-warning-400: #fbbf24;
+  --color-warning-500: #f59e0b;
+  --color-warning-600: #d97706;
+  --color-warning-700: #b45309;
+  --color-warning-800: #92400e;
+  --color-warning-900: #78350f;
+  --color-danger-50: #fff1f2;
+  --color-danger-100: #ffe4e6;
+  --color-danger-200: #fecdd3;
+  --color-danger-300: #fda4af;
+  --color-danger-400: #fb7185;
+  --color-danger-500: #f43f5e;
+  --color-danger-600: #e11d48;
+  --color-danger-700: #be123c;
+  --color-danger-800: #9f1239;
+  --color-danger-900: #881337;
+  --color-content1: var(--surface);
+  --color-content2: var(--surface-secondary);
+  --color-content3: var(--surface-tertiary);
+  --text-tiny: 0.75rem;
+  --text-small: 0.875rem;
+  --text-medium: 1rem;
+  --text-large: 1.125rem;
+  --radius-small: 0.5rem;
+  --radius-medium: 0.75rem;
+  --radius-large: 0.875rem;
+  --shadow-small: var(--shadow-sm);
+  --shadow-medium: var(--shadow-md);
+  --shadow-large: var(--shadow-lg);
+}
