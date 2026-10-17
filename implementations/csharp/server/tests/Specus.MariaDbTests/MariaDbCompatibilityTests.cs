@@ -16,6 +16,15 @@ namespace Specus.IntegrationTests;
 public sealed class MariaDbCompatibilityTests
 {
     [Fact]
+    public async Task NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await using var scope = server.HostServices.CreateAsyncScope();
+        await TransferAttachmentExpiryProof.VerifyBatchAsync(scope.ServiceProvider.GetRequiredService<SpecusDbContext>(), storageEnabled: false);
+    }
+
+    [Fact]
     public async Task NativePublicOwnerTransferCommitsAndEachConsumerReplaysTheJournal()
     {
         await using var database = await OwnedDatabase.CreateAsync();

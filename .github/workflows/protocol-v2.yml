@@ -262,9 +262,10 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual PostgreSQL test counters'
-          for key, expected in [('total', 35), ('executed', 35), ('passed', 35), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 36), ('executed', 36), ('passed', 36), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
+              'NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows',
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
               'NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial',
               'NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder',
@@ -324,9 +325,10 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 34), ('executed', 34), ('passed', 34), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 35), ('executed', 35), ('passed', 35), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
+              'NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows',
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
               'NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial',
               'NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder',
@@ -385,9 +387,10 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MariaDB test counters'
-          for key, expected in [('total', 34), ('executed', 34), ('passed', 34), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 35), ('executed', 35), ('passed', 35), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
+              'NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows',
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
               'NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial',
               'NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder',
