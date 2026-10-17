@@ -7,6 +7,9 @@
     <Project Path="src/Specus.Server.Data.MySql/Specus.Server.Data.MySql.csproj" />
     <Project Path="src/Specus.Server/Specus.Server.csproj" />
   </Folder>
+  <Folder Name="/third_party/">
+    <Project Path="third_party/mysql-connector-net/Specus.MySql.Data.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Specus.IntegrationTests/Specus.IntegrationTests.csproj" />
     <Project Path="../protocol/tests/Specus.Protocol.Tests/Specus.Protocol.Tests.csproj" />

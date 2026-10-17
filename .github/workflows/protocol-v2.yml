@@ -225,6 +225,11 @@ jobs:
           npm --prefix apps/admin-web ci
           npm --prefix apps/admin-web run deploy:csharp
 
+      - name: Verify local MySQL driver provenance and upstream advisories
+        run: |
+          python3 implementations/csharp/server/third_party/mysql-connector-net/verify_source.py
+          dotnet restore implementations/csharp/server/third_party/mysql-connector-net/audit/UpstreamAudit.csproj
+
       - name: Test .NET server
         env:
           SPECUS_REQUIRE_JAVA_CLIENT: "1"
@@ -284,8 +289,12 @@ jobs:
           path: ${{ runner.temp }}/postgres-results
           if-no-files-found: error
 
+      - name: Read the owned MySQL service CA for TLS validation regressions
+        run: docker cp '${{ job.services.mysql.id }}:/var/lib/mysql/ca.pem' "$RUNNER_TEMP/specus-mysql-ca.pem"
+
       - name: Test real MySQL bootstrap, upgrades and maximum traffic rows
         env:
+          SPECUS_TEST_MYSQL_CA_FILE: ${{ runner.temp }}/specus-mysql-ca.pem
           SPECUS_TEST_MYSQL_CONNECTION: "server=127.0.0.1;port=${{ job.services.mysql.ports[3306] }};user=root;password=specus-ci-mysql-276;Pooling=false"
         run: |
           dotnet test implementations/csharp/server/tests/Specus.DatabaseTests/Specus.DatabaseTests.csproj \
@@ -297,7 +306,7 @@ jobs:
           root = ET.parse(path).getroot()
           counters = root.find('.//{*}Counters')
           assert counters is not None, 'missing actual MySQL test counters'
-          for key, expected in [('total', 27), ('executed', 27), ('passed', 27), ('failed', 0), ('notExecuted', 0)]:
+          for key, expected in [('total', 32), ('executed', 32), ('passed', 32), ('failed', 0), ('notExecuted', 0)]:
               assert int(counters.get(key, '-1')) == expected, (key, counters.attrib)
           required = [
               'NativeControlDisconnectCannotOverwriteANewerPhysicalChannel',
@@ -325,7 +334,10 @@ jobs:
           for name in ['NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait', 'NativeInboundReportCannotRestorePreTransferOwner', 'NativeInboundReportCannotRecreateClientDeletedOnIndependentHost']:
               matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
               assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending native inbound authority regression', name)
-          print('Verified all 27 real MySQL cases, including inbound report lock waits, current owner and independent-host deletion; zero skipped.')
+          for name in ['NativeCancellationStopsHostDuringAnActuallyStalledTlsHandshake', 'ActualDriverIsIdentifiableLocalSourceBuildNotOracleSignedBinary', 'TrustedCaStillConnectsAndUntrustedCaIsRejected', 'VerifyFullStillRejectsTrustedCertificateForWrongHost', 'AlreadyCanceledOpenKeepsOriginalCallerToken']:
+              matches = [case for case in root.findall('.//{*}UnitTestResult') if case.get('testName', '').endswith(name)]
+              assert len(matches) == 1 and matches[0].get('outcome') == 'Passed', ('missing/pending TLS cancellation or certificate regression', name)
+          print('Verified all 32 real MySQL cases, including original-deadline stalled TLS cancellation and certificate validation; zero skipped.')
           PY
 
       - name: Keep real MySQL schema results

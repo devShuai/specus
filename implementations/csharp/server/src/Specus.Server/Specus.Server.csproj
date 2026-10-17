@@ -33,4 +33,11 @@
     <ProjectReference Include="..\Specus.Server.Data.MySql\Specus.Server.Data.MySql.csproj" />
   </ItemGroup>
 
+  <!-- Runtime-native selection belongs to the executable: RID-agnostic referenced
+       libraries lose the publish RID and would copy Windows DLLs into Linux outputs. -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' or ('$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows')))">
+    <Content Include="..\..\third_party\mysql-connector-net\MITLibs\*.dll" Link="%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
