@@ -48,8 +48,8 @@ type ownerTargetBinding struct {
 	key      string
 }
 
-// TransferClientOwnership is the internal write core. Public POST stays unregistered until
-// ordinary CRUD, grant creation and durable runtime reconciliation join the same boundary.
+// TransferClientOwnership coordinates ownership with ordinary CRUD and grant creation.
+// Committed audits are also the durable input for per-process runtime reconciliation.
 func (db *DB) TransferClientOwnership(ctx context.Context, request OwnerTransferWrite) (OwnerTransferOutcome, error) {
 	binding := &ownerTargetBinding{}
 	for range 4 {

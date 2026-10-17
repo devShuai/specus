@@ -187,6 +187,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/clients/name-availability", a.requireAuth(a.handleCheckClientNameAvailability))
 	mux.HandleFunc("GET /api/admin/clients/{id}", a.requireAuth(a.handleGetClient))
 	mux.HandleFunc("GET /api/admin/clients/{id}/owner-transfer", noStore(a.requireAuth(a.handleClientOwnerTransferPreview)))
+	mux.HandleFunc("POST /api/admin/clients/{id}/owner-transfer", noStore(a.requireAuth(a.handleClientOwnerTransfer)))
 	mux.HandleFunc("POST /api/admin/clients", a.requireAuth(a.handleCreateClient))
 	mux.HandleFunc("PUT /api/admin/clients/{id}", a.requireAuth(a.handleUpdateClient))
 	mux.HandleFunc("DELETE /api/admin/clients/{id}", a.requireAuth(a.handleDeleteClient))
@@ -194,6 +195,7 @@ func (a *API) Register(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/admin/client-credentials", a.requireAuth(a.handleListCredentials))
 	mux.HandleFunc("GET /api/admin/client-credentials/{id}/owner-transfer", noStore(a.requireAuth(a.handleCredentialOwnerTransferPreview)))
+	mux.HandleFunc("POST /api/admin/client-credentials/{id}/owner-transfer", noStore(a.requireAuth(a.handleCredentialOwnerTransfer)))
 	mux.HandleFunc("POST /api/admin/client-credentials", a.requireAuth(a.handleCreateCredential))
 	mux.HandleFunc("PUT /api/admin/client-credentials/{id}", a.requireAuth(a.handleUpdateCredential))
 	mux.HandleFunc("DELETE /api/admin/client-credentials/{id}", a.requireAuth(a.handleDeleteCredential))

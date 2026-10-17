@@ -440,8 +440,8 @@ func TestOwnerTransferPreviewHTTPAuthorizationAndPath(t *testing.T) {
 			}
 		}
 		response, _ := h.do(http.MethodPost, prefix+"42/owner-transfer", h.fixtureToken("t1"), map[string]string{"scope": ownerScopeGroup})
-		if response.StatusCode != http.StatusMethodNotAllowed {
-			t.Fatalf("write endpoint exposed: %d", response.StatusCode)
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("write endpoint must reject missing resource before missing fields: %d", response.StatusCode)
 		}
 	}
 }

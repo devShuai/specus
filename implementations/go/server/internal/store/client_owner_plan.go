@@ -102,7 +102,7 @@ func PreviewOwnerTransfer(p ManagementWriteActor, scope string, id int64, data O
 }
 
 // Pure validation through contract steps 1–8 ONLY, never resolves a target or writes.
-// No POST route calls this until login/edit/delete/Peer/target races are database-coordinated.
+// Public POST uses the database-coordinated writer; this pure planner alone is not a write API.
 func PrepareOwnerTransfer(p ManagementWriteActor, scope string, id int64, request any, data OwnerTransferSnapshot) (OwnerTransferPreview, string, error) {
 	var empty OwnerTransferPreview
 	if err := ValidateOwnerTransferPath(p, id); err != nil {

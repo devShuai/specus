@@ -10,8 +10,8 @@ import (
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
-// The internal service is deliberately not mounted as POST yet. Exercise its real resolved
-// bearer identity and database write, then check current REST visibility through the real router.
+// Exercise the service with a previously resolved bearer identity and database write,
+// then check current REST visibility through the real router (including a stale actor).
 func TestOwnerWriteServiceUsesCurrentIdentityAndRESTOwnership(t *testing.T) {
 	h := newWorkbenchHTTPHarness(t)
 	now := time.Now()

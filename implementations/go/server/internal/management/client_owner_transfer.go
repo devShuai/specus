@@ -2,6 +2,8 @@ package management
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/auth"
@@ -29,8 +31,8 @@ func prepareOwnerTransfer(p managementPrincipal, scope string, id int64, request
 	return store.PrepareOwnerTransfer(ownerWriteActor(p), scope, id, request, data)
 }
 
-// Internal service entry only: no POST registration until ordinary writers and runtime
-// reconciliation are coordinated. AuditID is allocated by the server, never from request JSON.
+// AuditID is allocated by the server, never from request JSON. The audit and owner
+// writes commit atomically; the process-wide journal consumer retries runtime convergence.
 func (a *API) commitOwnerTransfer(ctx context.Context, p managementPrincipal, scope, textID string, body any) (store.OwnerTransferOutcome, error) {
 	id, err := parseOwnerTransferID(p, textID)
 	if err != nil {
@@ -45,6 +47,44 @@ func (a *API) commitOwnerTransfer(ctx context.Context, p managementPrincipal, sc
 		a.ownerNotifications.Committed()
 	}
 	return outcome, err
+}
+
+func (a *API) handleClientOwnerTransfer(w http.ResponseWriter, r *http.Request) {
+	a.handleOwnerTransfer(w, r, ownerScopeSingle)
+}
+func (a *API) handleCredentialOwnerTransfer(w http.ResponseWriter, r *http.Request) {
+	a.handleOwnerTransfer(w, r, ownerScopeGroup)
+}
+func (a *API) handleOwnerTransfer(w http.ResponseWriter, r *http.Request, scope string) {
+	p, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	// Role precedes malformed JSON/path; resource and request-field precedence
+	// then comes from the same coordinated writer used by internal callers.
+	if _, err := parseOwnerTransferID(p, r.PathValue("id")); err != nil {
+		a.writeOwnerTransferError(w, err)
+		return
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024))
+	decoder.UseNumber()
+	var body any
+	if err := decoder.Decode(&body); err != nil {
+		a.writeOwnerTransferError(w, &ownerTransferError{Status: 400, Code: "INVALID_TRANSFER_REQUEST"})
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		a.writeOwnerTransferError(w, &ownerTransferError{Status: 400, Code: "INVALID_TRANSFER_REQUEST"})
+		return
+	}
+	outcome, err := a.commitOwnerTransfer(r.Context(), p, scope, r.PathValue("id"), body)
+	if err != nil {
+		a.writeOwnerTransferError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, outcome.Response)
 }
 
 func (a *API) handleClientOwnerTransferPreview(w http.ResponseWriter, r *http.Request) {
