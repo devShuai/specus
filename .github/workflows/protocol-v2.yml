@@ -136,6 +136,41 @@ jobs:
         working-directory: implementations/go/server
         run: go test ./... -count=1
 
+  go-server-windows:
+    name: Go server (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/server/go.mod
+          cache-dependency-path: implementations/go/server/go.sum
+
+      # Match the existing Linux backend gate. Real SPA builds/browser acceptance
+      # remain separate; the cache-header test still fetches the real favicon.
+      - name: Create placeholder web assets for go:embed
+        shell: pwsh
+        run: |
+          $static = 'implementations/go/server/web/static'
+          New-Item -ItemType Directory -Path $static -Force | Out-Null
+          Set-Content -LiteralPath "$static/index.html" -Value '<!doctype html><title>ci-placeholder</title>' -Encoding utf8NoBOM
+          Copy-Item -LiteralPath 'apps/admin-web/public/favicon.svg' -Destination "$static/favicon.svg"
+
+      - name: Test entire Go server suite with original timeout
+        shell: pwsh
+        run: ./.github/scripts/test-go-server-windows.ps1 -ResultsDirectory '${{ runner.temp }}/go-server-windows'
+
+      - name: Preserve native Windows test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-server-windows-tests
+          path: ${{ runner.temp }}/go-server-windows/
+          if-no-files-found: warn
+
   # The Java and .NET suites ran only in the release, so a pull request could break either server
   # with every check here green. Both run whole, with the management page built as the release
   # builds it: a few tests fetch its real assets.
@@ -251,7 +286,7 @@ jobs:
 
       - name: Test real PostgreSQL native bootstrap, compatibility and catalogue data
         env:
-          SPECUS_TEST_POSTGRES_CONNECTION: "Host=127.0.0.1;Port=${{ job.services.postgres.ports[5432] }};Username=postgres;Password=specus-ci-postgres-281;Pooling=false"
+          SPECUS_TEST_POSTGRES_CONNECTION: "Host=127.0.0.1;Port=${{ job.services.postgres.ports['5432'] }};Username=postgres;Password=specus-ci-postgres-281;Pooling=false"
         run: |
           dotnet test implementations/csharp/server/tests/Specus.PostgresTests/Specus.PostgresTests.csproj \
             -c Release -p:SpecusServerWebSkip=true \
@@ -314,7 +349,7 @@ jobs:
       - name: Test real MySQL bootstrap, upgrades and maximum traffic rows
         env:
           SPECUS_TEST_MYSQL_CA_FILE: ${{ runner.temp }}/specus-mysql-ca.pem
-          SPECUS_TEST_MYSQL_CONNECTION: "server=127.0.0.1;port=${{ job.services.mysql.ports[3306] }};user=root;password=specus-ci-mysql-276;Pooling=false"
+          SPECUS_TEST_MYSQL_CONNECTION: "server=127.0.0.1;port=${{ job.services.mysql.ports['3306'] }};user=root;password=specus-ci-mysql-276;Pooling=false"
         run: |
           dotnet test implementations/csharp/server/tests/Specus.DatabaseTests/Specus.DatabaseTests.csproj \
             -c Release -p:SpecusServerWebSkip=true \
@@ -376,7 +411,7 @@ jobs:
 
       - name: Test real MariaDB bootstrap, upgrades, Unicode and migration lock safety
         env:
-          SPECUS_TEST_MARIADB_CONNECTION: "server=127.0.0.1;port=${{ job.services.mariadb.ports[3306] }};user=root;password=specus-ci-maria-277;Pooling=false"
+          SPECUS_TEST_MARIADB_CONNECTION: "server=127.0.0.1;port=${{ job.services.mariadb.ports['3306'] }};user=root;password=specus-ci-maria-277;Pooling=false"
         run: |
           dotnet test implementations/csharp/server/tests/Specus.MariaDbTests/Specus.MariaDbTests.csproj \
             -c Release -p:SpecusServerWebSkip=true \
