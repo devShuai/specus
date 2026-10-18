@@ -19,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <utf8proc.h>
 
 typedef struct {
     st_registration_turnstile_handler turnstile;
@@ -656,7 +657,19 @@ int st_registration_request(const char *database_path,
     memset(response, 0, sizeof(*response));
     snprintf(response->registration_id, sizeof(response->registration_id), "%s", challenge.registration_id);
     const char *at = strchr(email, '@');
-    size_t visible = (size_t)(at - email) <= 2U ? 1U : 2U;
+    /* Raw local-part code points, including quotes/escapes, not UTF-8 bytes or graphemes.
+     * Three decoded points suffice to choose the one- or two-point prefix. */
+    size_t offset = 0U, ends[3] = {0U, 0U, 0U}, count = 0U;
+    size_t local_bytes = (size_t)(at - email);
+    while (offset < local_bytes && count < 3U) {
+        utf8proc_int32_t point;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)email + offset,
+                                                (utf8proc_ssize_t)(local_bytes - offset), &point);
+        if (width <= 0) { count = 0U; break; } /* Never emit a partial/invalid UTF-8 prefix. */
+        offset += (size_t)width;
+        ends[count++] = offset;
+    }
+    size_t visible = count == 0U ? 0U : count <= 2U ? ends[0] : ends[1];
     snprintf(response->email_masked, sizeof(response->email_masked), "%.*s***%s",
              (int)visible, email, at);
     snprintf(response->expires_at, sizeof(response->expires_at), "%s", challenge.expires_at);

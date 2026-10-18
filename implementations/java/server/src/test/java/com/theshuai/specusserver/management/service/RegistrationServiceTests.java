@@ -4,6 +4,7 @@ import com.theshuai.specusserver.config.AuthProperties;
 import com.theshuai.specusserver.config.EmailVerificationProperties;
 import com.theshuai.specusserver.management.model.ManagementRegistrationChallenge;
 import com.theshuai.specusserver.management.model.SortableInstant;
+import com.theshuai.specusserver.management.controller.AuthController;
 import com.theshuai.specusserver.management.repository.ManagementRegistrationChallengeRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserEmailRepository;
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
@@ -27,6 +28,81 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class RegistrationServiceTests {
+    @Test
+    void registrationMvcResponsesPreserveUnicodeMaskBoundaries() throws Exception {
+        var challenges = mock(ManagementRegistrationChallengeRepository.class);
+        var users = mock(ManagementUserService.class);
+        var sender = mock(RegistrationEmailSender.class);
+        var tokens = mock(LocalTokenService.class);
+        var turnstile = mock(TurnstileVerifier.class);
+        var properties = new EmailVerificationProperties();
+        properties.setEnabled(true);
+        when(tokens.isPasswordLoginEnabled()).thenReturn(true);
+        when(tokens.getSecretKey()).thenReturn(new SecretKeySpec(new byte[32], "HmacSHA256"));
+        when(sender.isConfigured()).thenReturn(true);
+        when(turnstile.isEnabled()).thenReturn(true);
+        when(turnstile.isConfigured()).thenReturn(true);
+        when(users.normalizeUsername(org.mockito.ArgumentMatchers.anyString())).thenAnswer(call -> call.getArgument(0));
+        when(users.requirePassword("password")).thenReturn("password");
+        when(users.loginNameKey(org.mockito.ArgumentMatchers.anyString())).thenAnswer(call -> call.getArgument(0));
+        var service = new RegistrationService(challenges, mock(ManagementUserEmailRepository.class),
+                mock(ManagementUserRepository.class), users, sender, properties, new AuthProperties(), tokens, turnstile);
+        var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+                new AuthController(tokens, users, service, turnstile, null, null, null)).build();
+        Path root = Path.of("").toAbsolutePath();
+        String relative = "protocol/test-vectors/registration-email-mask-v1.json";
+        while (root != null && !Files.isRegularFile(root.resolve(relative))) root = root.getParent();
+        if (root == null) throw new IllegalStateException("Shared email mask vector missing");
+        var mapper = new ObjectMapper();
+        var names = java.util.Set.of("ascii-two", "chinese-one", "chinese-two", "chinese-three",
+                "emoji-one", "ascii-emoji-three", "quoted-chinese", "quoted-emoji");
+        int tested = 0;
+        for (var item : mapper.readTree(Files.readString(root.resolve(relative))).path("cases")) {
+            if (!names.contains(item.path("name").asText())) continue;
+            String username = "mask-wire-" + tested++;
+            String email = item.path("email").asText();
+            var response = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                            .post("/auth/register").contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                            .content(mapper.writeValueAsBytes(java.util.Map.of("username", username,
+                                    "email", email, "password", "password", "turnstileToken", "test-token"))))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isAccepted())
+                    .andReturn().getResponse();
+            String json = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(response.getContentAsByteArray())).toString();
+            assertEquals(item.path("masked").asText(), mapper.readTree(json).path("emailMasked").asText());
+            verify(sender).sendVerificationCode(org.mockito.ArgumentMatchers.eq(email),
+                    org.mockito.ArgumentMatchers.eq(username), org.mockito.ArgumentMatchers.anyString(),
+                    org.mockito.ArgumentMatchers.anyLong());
+        }
+        assertEquals(names.size(), tested);
+    }
+
+    @Test
+    void sharedEmailMasksCountCodePointsAndSerializeWithoutBrokenSurrogates() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        String relative = "protocol/test-vectors/registration-email-mask-v1.json";
+        while (root != null && !Files.isRegularFile(root.resolve(relative))) root = root.getParent();
+        if (root == null) throw new IllegalStateException("Shared email mask vector missing");
+        ObjectMapper mapper = new ObjectMapper();
+        var fixture = mapper.readTree(Files.readString(root.resolve(relative)));
+        assertEquals(1, fixture.path("version").asInt());
+        assertEquals(24, fixture.path("cases").size());
+        var encoder = java.nio.charset.StandardCharsets.UTF_8.newEncoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT);
+        for (var item : fixture.path("cases")) {
+            String name = item.path("name").asText();
+            String actual = ReflectionTestUtils.invokeMethod(RegistrationService.class,
+                    "maskEmail", item.path("email").asText());
+            assertEquals(item.path("masked").asText(), actual, name);
+            encoder.encode(java.nio.CharBuffer.wrap(actual));
+            var response = new RegistrationService.RegistrationChallengeResponse("test-id", actual,
+                    "2026-10-18T00:00:00Z", 60);
+            byte[] json = mapper.writeValueAsBytes(response);
+            assertEquals(actual, mapper.readTree(json).path("emailMasked").asText(), name);
+        }
+    }
+
     @Test
     void emailLengthLimitCountsUtf16UnitsInsteadOfUtf8Bytes() {
         RegistrationService service = new RegistrationService(null, null, null, null,

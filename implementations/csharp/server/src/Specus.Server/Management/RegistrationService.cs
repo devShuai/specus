@@ -324,7 +324,19 @@ public sealed class RegistrationService
     private static string MaskEmail(string email)
     {
         var at = email.IndexOf('@');
-        var visible = Math.Min(2, at);
+        var local = email.AsSpan(0, at);
+        var count = 0;
+        var firstEnd = 0;
+        var secondEnd = 0;
+        var offset = 0;
+        foreach (var rune in local.EnumerateRunes())
+        {
+            offset += rune.Utf16SequenceLength;
+            if (++count == 1) firstEnd = offset;
+            if (count == 2) secondEnd = offset;
+            if (count == 3) break;
+        }
+        var visible = count <= 2 ? firstEnd : secondEnd;
         return email[..visible] + "***" + email[at..];
     }
 

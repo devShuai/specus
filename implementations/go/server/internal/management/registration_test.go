@@ -2,14 +2,61 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"github.com/devShuai/specus/implementations/go/server/internal/security"
 	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
+
+func TestSharedRegistrationEmailMasks(t *testing.T) {
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	for {
+		raw, err = os.ReadFile(filepath.Join(dir, "protocol", "test-vectors", "registration-email-mask-v1.json"))
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) || filepath.Dir(dir) == dir {
+			t.Fatal(err)
+		}
+		dir = filepath.Dir(dir)
+	}
+	var fixture struct {
+		Version int
+		Cases   []struct{ Name, Email, Masked string }
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.Version != 1 || len(fixture.Cases) != 24 {
+		t.Fatal("unexpected mask vector version/count")
+	}
+	for _, item := range fixture.Cases {
+		t.Run(item.Name, func(t *testing.T) {
+			actual := maskRegistrationEmail(item.Email)
+			if !utf8.ValidString(actual) || actual != item.Masked {
+				t.Fatalf("mask = %q, want %q", actual, item.Masked)
+			}
+			wire, err := json.Marshal(map[string]string{"emailMasked": actual})
+			if err != nil || !utf8.Valid(wire) {
+				t.Fatalf("invalid JSON UTF-8: %q %v", wire, err)
+			}
+			var decoded map[string]string
+			if err := json.Unmarshal(wire, &decoded); err != nil || decoded["emailMasked"] != item.Masked {
+				t.Fatalf("JSON changed mask: %q %v", wire, err)
+			}
+		})
+	}
+}
 
 type recordingRegistrationMailer struct {
 	configured bool
@@ -60,6 +107,36 @@ func TestRegistrationRequiresEmailCodeBeforeCreatingUser(t *testing.T) {
 	}
 	if stored, err := db.FindRegistrationChallengeByID(ctx, challenge.RegistrationID); err != nil || stored != nil {
 		t.Fatalf("challenge retained after completion: challenge=%+v err=%v", stored, err)
+	}
+}
+
+func TestRegistrationChallengeUnicodeMasks(t *testing.T) {
+	service, db, mailer := newTestRegistrationService(t, 5)
+	for _, item := range []struct{ username, email, masked string }{
+		{"mask-ascii", "ab@example.test", "a***@example.test"},
+		{"mask-chinese", "用@example.test", "用***@example.test"},
+		{"mask-emoji", "😀@example.test", "😀***@example.test"},
+		{"mask-mixed", "a😀b@example.test", "a😀***@example.test"},
+	} {
+		challenge, err := service.Request(context.Background(), item.username, item.email, "password-1")
+		if err != nil {
+			t.Fatalf("%s: %v", item.username, err)
+		}
+		if challenge.EmailMasked != item.masked || mailer.email != item.email {
+			t.Fatalf("%s: response=%+v delivered=%q", item.username, challenge, mailer.email)
+		}
+		stored, err := db.FindRegistrationChallengeByID(context.Background(), challenge.RegistrationID)
+		if err != nil || stored == nil || stored.Email != item.email {
+			t.Fatalf("stored email differs: %+v %v", stored, err)
+		}
+		wire, err := json.Marshal(challenge)
+		if err != nil || !utf8.Valid(wire) {
+			t.Fatalf("invalid response UTF-8: %q %v", wire, err)
+		}
+		var decoded registrationChallengeResponse
+		if err := json.Unmarshal(wire, &decoded); err != nil || decoded.EmailMasked != item.masked {
+			t.Fatalf("wire mask differs: %q %v", wire, err)
+		}
 	}
 }
 

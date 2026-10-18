@@ -286,11 +286,12 @@ func maskRegistrationEmail(email string) string {
 	if at <= 0 {
 		return "***"
 	}
-	visible := 2
-	if at < visible {
-		visible = at
+	local := []rune(email[:at])
+	visible := 1
+	if len(local) > 2 {
+		visible = 2
 	}
-	return email[:visible] + "***" + email[at:]
+	return string(local[:visible]) + "***" + email[at:]
 }
 
 func maxInt(left, right int) int {

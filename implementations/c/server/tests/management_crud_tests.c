@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utf8proc.h>
 
 #define JWT_SECRET "management-crud-jwt-secret-long-enough-2026"
 #define BUILT_IN "crud-root"
@@ -150,9 +151,23 @@ static int register_with(const char *username, const char *email, const char *pa
     return expect("POST", "/auth/register", body, NULL, status, needle);
 }
 
-static int test_registration_mailbox_forms(void)
+static int valid_utf8(const char *text)
 {
-    FILE *file = fopen(ST_MAILBOX_VECTOR_FILE, "rb");
+    if (text == NULL) return 0;
+    size_t length = strlen(text), offset = 0U;
+    while (offset < length) {
+        utf8proc_int32_t point;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)text + offset,
+                                                (utf8proc_ssize_t)(length - offset), &point);
+        if (width <= 0) return 0;
+        offset += (size_t)width;
+    }
+    return 1;
+}
+
+static int test_registration_mailbox_vectors(const char *path, int mask_only)
+{
+    FILE *file = fopen(path, "rb");
     if (file == NULL) return 1;
     char json[32768];
     size_t bytes = fread(json, 1U, sizeof(json) - 1U, file);
@@ -163,18 +178,20 @@ static int test_registration_mailbox_forms(void)
     size_t count = 0U;
     int version = 0;
     if (failed || !st_json_is_valid_object(json) || st_json_get_int(json, "version", &version) != 0
-        || version != 1 || st_json_get_raw_array(json, "cases", &cases, &count) != 0 || count == 0U) return 1;
+        || version != 1 || st_json_get_raw_array(json, "cases", &cases, &count) != 0
+        || count != (mask_only ? 24U : 36U)) return 1;
     mailbox box = {{0}, {0}, {0}};
     st_registration_set_handlers(fake_turnstile, fake_email, &box);
     for (size_t i = 0U; i < count; ++i) {
         char *name = st_json_get_string(cases[i], "name");
         char *email = st_json_get_string(cases[i], "email");
-        char *normalized = st_json_get_string(cases[i], "normalized");
+        char *normalized = mask_only && email != NULL ? strdup(email) : st_json_get_string(cases[i], "normalized");
         char *masked = st_json_get_string(cases[i], "masked");
-        int accepted = 0;
-        int valid = name != NULL && email != NULL && st_json_get_bool(cases[i], "accepted", &accepted) == 0;
+        int accepted = mask_only;
+        int valid = name != NULL && email != NULL
+            && (mask_only || st_json_get_bool(cases[i], "accepted", &accepted) == 0);
         char username[80];
-        snprintf(username, sizeof(username), "mailbox-form-%zu", i);
+        snprintf(username, sizeof(username), "mailbox-%s-%zu", mask_only ? "mask" : "form", i);
         int result = !valid || (accepted && (normalized == NULL || masked == NULL));
         if (!result) result = register_with(username, email, "pw", "ok", accepted ? 202 : 400,
                                             accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
@@ -182,11 +199,21 @@ static int test_registration_mailbox_forms(void)
             char actual_masked[1024];
             last_member("emailMasked", actual_masked, sizeof(actual_masked));
             st_storage_registration_challenge stored;
-            result = strcmp(box.email, normalized) != 0 || strcmp(actual_masked, masked) != 0
+            result = !valid_utf8(last_body) || !st_json_is_valid_object(last_body)
+                || !valid_utf8(actual_masked) || strcmp(box.email, normalized) != 0 || strcmp(actual_masked, masked) != 0
                 || st_storage_find_registration_challenge(db_path, username, normalized, &stored) != 0
                 || strcmp(stored.email, normalized) != 0;
         }
-        printf("%s shared registration mailbox form %s\n", result ? "FAIL" : "ok  ", name == NULL ? "missing-name" : name);
+        /* Each corpus owns its challenge; repeated addresses in another corpus must not
+         * turn mask assertions into a pending-registration conflict. Clean up even if the
+         * expected mask fails, so the negative control tests each address independently. */
+        if (accepted && last_status == 202) {
+            char registration_id[128];
+            last_member("registrationId", registration_id, sizeof(registration_id));
+            result = st_storage_delete_registration_challenge(db_path, registration_id) != 0 || result;
+        }
+        printf("%s shared registration %s %s\n", result ? "FAIL" : "ok  ",
+               mask_only ? "Unicode mask HTTP/UTF8" : "mailbox form", name == NULL ? "missing-name" : name);
         failed = result || failed;
         free(name); free(email); free(normalized); free(masked);
     }
@@ -802,7 +829,8 @@ int main(void)
     if (!failed) {
         port = ntohs(address.sin_port);
         failed = test_registration() != 0;
-        failed = test_registration_mailbox_forms() != 0 || failed;
+        failed = test_registration_mailbox_vectors(ST_MAILBOX_VECTOR_FILE, 0) != 0 || failed;
+        failed = test_registration_mailbox_vectors(ST_EMAIL_MASK_VECTOR_FILE, 1) != 0 || failed;
         failed = test_registration_email_storage() != 0 || failed;
         failed = test_me() != 0 || failed;
         failed = test_credentials() != 0 || failed;
