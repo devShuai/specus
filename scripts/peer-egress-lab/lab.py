@@ -864,19 +864,26 @@ class Lab:
                    not problems, "; ".join(problems) if problems else "\n".join(self.lab_routes(table)))
         # Every runtime says which path carries each egress peer's traffic and how many flows it has;
         # a lab consumer that just reached its egress is on one path or the other. The state file is
-        # refreshed on the process's own period, so it is read until it lists the peer.
+        # refreshed on the process's own period. A peer can already be listed before
+        # its path/count is published, so wait for the original assertion, not merely
+        # a nonempty list. Keep the last observed peers as timeout evidence.
+        observed_peers = None
         def egress_peers():
+            nonlocal observed_peers
             status = self.client_status("consumer")
             if not status:
                 return None
             self.snapshots["consumer status (egress --json)"] = json.dumps(status.get("data", status), indent=2)
-            return [peer for instance in status.get("data", {}).get("instances", [])
+            observed_peers = [peer for instance in status.get("data", {}).get("instances", [])
                     for peer in ((instance.get("egress") or {}).get("consumer") or {}).get("peers", [])] or None
+            return observed_peers if observed_peers and all(
+                peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
+                for peer in observed_peers) else None
         peers, _ = self.wait_for("the consumer status to list its egress peer", egress_peers, 30, 1.0)
         self.check("status names the path to the egress and its flow count",
                    bool(peers) and all(peer.get("path") in ("direct", "relay") and isinstance(peer.get("flows"), int)
                                        for peer in peers),
-                   json.dumps(peers))
+                   json.dumps(peers if peers else observed_peers))
 
         # Up to three datagrams, the way any UDP client that wants an answer behaves: one datagram
         # lost while the path settles is what UDP permits, and a single-shot probe failed runs for it.
