@@ -14,7 +14,7 @@
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖 73 类”直接当作当前类的完整覆盖。当前 main 另有下列 49 类不在旧表中：本轮完整阅读并说明了 4 类的纯框架/平台差异，另外 45 类仍待逐方法对照。待核验不等于 C 没有相应能力；同样，已有同名功能也不等于覆盖已成立。下面每一行均属于后续核验范围，不计入旧表的 79 类统计。
+旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；本轮逐方法对照了4个连通性检查类的20个注解方法，均记为“部分”，尚有41类待逐方法对照。这里的41不包括这4类已查明的剩余缺口，也不包括旧79类的当前断言复核。待核验不等于C没有相应能力；同样，已有同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -22,9 +22,9 @@
 
 | 旧表外的 Java 测试类 | 注解方法（main／注册分支） | 当前对照状态 | 依据或剩余工作 |
 | --- | ---: | --- | --- |
-| `connectivity/HttpRouteConnectivityCheckRateTests` | 5 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `connectivity/HttpRouteConnectivityCheckVectorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `connectivity/NatConnectivityProbeTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `connectivity/HttpRouteConnectivityCheckRateTests` | 5 | 部分 | `connectivity_check_tests.c:run_rate_events` 与本轮三个限流边界函数已覆盖核心处理器层的限额、拒绝不扣额、实际10000键容量及503/no-probe；逐事件及全表满的生产HTTP响应构造入口响应头仍缺独立断言，见下方逐方法记录。 |
+| `connectivity/HttpRouteConnectivityCheckVectorTests` | 1 | 部分 | `connectivity_check_tests.c:run_case` 回放38个状态向量；尚缺完整探测元数据/次数、HEAD与GET剩余预算、完整日志字段及对应HTTP层断言。`@TestFactory` 的一个声明不等于一个运行用例。 |
+| `connectivity/NatConnectivityProbeTests` | 7 | 部分 | `nat_stream_tests.c` 有真实HEAD→GET、RST、FIN结束及迟到帧场景；全部分类/能力/断链/超时等断言尚未逐一覆盖。另有迟到DATA的真实行为差异：Java丢弃不回包，C目前回RST7，不作为平台豁免。 |
 | `database/MariaDbSchemaTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/MySqlColumnTypeTests` | 2 | 无（平台差异） | 两项均是 Hibernate `MySQLDialect` 的静态 DDL 类型/utf8mb4 行大小检查；C 只用 SQLite。C 自身的大对象保存与完整读回仍须由相应行为测试核验。 |
 | `database/PostgresSchemaMigrationTests` | 10 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -49,7 +49,7 @@
 | `http/HttpSpecusControllerFailClosedTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpSpecusControllerStreamResetTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/NatControlPushFailureVectorTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 部分 | `admin_http_tests.c:test_connectivity_check_endpoint` 已有鉴权、可见性、离线与429等生产HTTP响应构造入口断言；完整请求语料、未知目标前先判请求、完整离线响应及读库失败503等仍有缺口，见逐方法记录。 |
 | `management/controller/ManagementAccountsHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchCascadeTests` | 6 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchConcurrentWriteTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -71,6 +71,41 @@
 | `productmetrics/ProductMetricsWritePathTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `server/ControlWriteFailureTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `session/SessionUtilTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+
+## 连通性检查的逐方法对照（本轮增量）
+
+本节基于注册分支 `dbccd2fdfed6e46791594c0182b1e52fecad708f` 的 Java/C 源码逐方法核对；它是上方 `37851ae8c020fdd5a52bd0232a4ef00861f01891` 的直接后继，只修改本清单，两者的相关 Java/C 源码相同。本轮只给 `tests/connectivity_check_tests.c` 增加断言，Java方法和C生产实现未改。下列现有HTTP响应构造入口和真实NAT场景来自该基线，不冒充本轮新增用例。四个类共20个注解方法，属于上面49类中的4类“部分”，不另计为20个测试类。
+
+C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_auth`，经过生产响应构造、JWT与SQLite，但不经过监听socket；Java的对应资源测试使用MockMvc，也不是实网HTTP。`connectivity_check_tests.c` 的假设备通过注入presence、probe、单调时钟和日志回调驱动核心检查器，不是真实设备。下列 `nat_stream_tests` 场景使用真实进程/socket；相关的 `session_lifecycle_tests` 也有真实进程/socket场景，但不能由此推定已覆盖全部探测链路状态。
+
+本地 WSL Ubuntu 24.04 焦点可执行程序以 `-O2 -Wall -Wextra -Wpedantic -Werror` 构建并运行通过；ASan/UBSan版本也已实际执行同一组焦点用例，退出码0、无消毒器报告。两版均执行原38个状态向量、原 `rate.events` 与请求规则，加上三个边界回归。受测输入是本提交的 `tests/connectivity_check_tests.c` 与未变的 `src/connectivity_check.c`、`src/json.c`，使用仓库共享向量、OpenSSL和pthread；消毒器版本改用 `-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer`。合入PR的进度记录另绑定最终提交和运行结果；本段本地焦点结果不替代其新提交CI。
+
+键表用实际10000键容量，未缩小上限。两个隔离负对照分别注入“拒绝消耗用户额度”和“满表驱逐尚有效键”，注入缺陷后的测试均按预期失败。旧测试在满表驱逐缺陷下仍退出0，而新增容量断言能令其失败；扣额缺陷也触发原事件断言，因此不把两个负对照都称为只有新增断言才能发现。这不表示正常实现测试失败，也不证明其他回归均已排除。此处不声称已重跑本轮全部CMake测试、完整HTTP/NAT矩阵或跨NAT真机验收。关闭#35的完整范围应同时核对该issue及[跨语言对齐计划](../cross-language-java-alignment-plan.md)，不能只检查本节。
+
+| Java 方法 | C证据 | 已核验范围 | 剩余缺口或差异 |
+| --- | --- | --- | --- |
+| `HttpRouteConnectivityCheckRateTests.rateEventsReplayThroughTheLimiter` | `run_rate_events` 的 `st_connectivity_rate` 调用 | 共享事件的接纳、拒绝状态、code、limitedBy、Retry-After | 向量中算法/常量声明与C私有常量没有独立的逐字段对照断言 |
+| `rateEventsReplayThroughTheEndpoint` | `run_rate_events` 的 `st_connectivity_handle` 调用；`test_connectivity_check_endpoint` | 本轮补齐拒绝事件精确body、接纳事件的DEVICE_OFFLINE code、两条拒绝日志完整字段与顺序；现有生产HTTP响应构造入口测试验证429 | 核心处理器不经过HTTP响应构造入口；尚未逐事件验证HTTP Cache-Control、Retry-After及完整响应 |
+| `aRefusalConsumesNeitherKey` | 本轮 `run_refusal_consumes_neither_key` | 路由拒绝20次不消耗另一用户的10次预算；因用户额度耗尽而拒绝的请求也不消耗其所请求路由的额度 | 此方法的核心限额断言已对应，不因此提升整个类的状态 |
+| `aFullKeyTableRefusesNewKeysWithoutEvictingLiveOnes` | 本轮 `run_full_key_table_boundaries` | 10000键满表拒新键、不驱逐有效键；10秒路由键过期但用户键表仍满，30秒后可接纳 | 此方法的核心边界断言已对应 |
+| `aFullKeyTableIsCheckBusy` | 本轮 `run_full_key_table_is_busy` | 核心处理器满表503、精确CHECK_BUSY body、Retry-After=1、零探测 | 仍缺该分支的HTTP响应构造入口 Cache-Control等响应头断言 |
+| `HttpRouteConnectivityCheckVectorTests.everyCaseOfTheSharedVector` | `run_case` | 38个状态向量的状态/body比较、运行时字段形状、拒绝不探测及部分元数据/日志检查 | 未核对完整元数据键与顺序、requestId十六进制格式、探测次数/脚本耗尽、HEAD/GET剩余预算、完整日志字段；HTTP头与固定墙钟的完整对应也未建立 |
+| `NatConnectivityProbeTests.everyClassifiedResetOfACapableSessionReachesTheCheck` | `check_connectivity_client_reset_failure`；`run_case` 的 `connect-refused`、`connect-timeout`、`dns-failed`、`tls-failed`、`unreachable`、`target-invalid-on-device`、`protocol-error`、`budget-expired` | 真实进程/socket的connect-refused传递与reason脱敏；其他分类有假设备状态向量 | 全部8种分类的真实帧路径和OPEN/FIN/RST序列尚缺 |
+| `aResetIsUnverifiedWithoutTheCapabilityOrWithAnUnknownFailure` | `run_case` 的 `capable-unknown-failure`、`capable-unclassified`、`legacy-client-reset`、`legacy-client-reset-ignores-failure` | 核心检查器的不可信分类结果 | 缺能力未声明、未知failure及无failure的真实NAT帧组合与状态断言 |
+| `theProbeOpensAFixedRequestAndTheHeadEndsIt` | `check_connectivity_probe_late_rst`、`check_connectivity_probe_ended_by_fin` | 真实HEAD405→GET、响应头后复位、FIN已结束时不复位、迟到RST保留数据连接 | C对迟到DATA回RST7，Java要求直接丢弃且无WINDOW_UPDATE/RST；完整元数据和帧序列仍待对应 |
+| `aSilentDeviceIsResetWhenTheTimeIsUp` | `run_case` 的 `head-405-get-timeout`、`budget-expired` | 假设备超时结果 | 未建立真实静默设备的OPEN/FIN/RST及迟到响应头无回包断言 |
+| `aDataConnectionThatClosesIsALostLink` | `run_case` 的 `link-lost` | 核心状态机DEVICE_LINK_LOST | 缺真实探测中关闭data连接的对应场景 |
+| `aHeadOutsideTheStatusRangeIsAProtocolError` | `run_case` 的 `protocol-error` | 核心错误分类；该向量是设备复位分类，不是103/600响应头 | 缺真实NAT103/600响应头、statusClass缺失和阶段结果的完整组合 |
+| `theLinkFollowsTheSessionTable` | 相关：`session_lifecycle_tests`、`run_case` | 连接生命周期及假设备presence有各自测试 | 尚未把同一真实设备control/data/capability逐步变化与探测link结果逐一对应 |
+| `HttpRouteConnectivityCheckResourceTests.aVisibleRouteOfAnOfflineClientIsCheckedAndStopsAtTheDevice` | `test_connectivity_check_endpoint` | owner离线200、停止阶段、私有缓存与目标信息不外泄 | 缺owner和同租户admin各自完整body、checkedAt及无Retry-After的逐项比较 |
+| `anUnknownRouteAndARouteTheCallerCannotSeeAnswerTheSame404` | `test_connectivity_check_endpoint` | 未知、他人、他租户和abc ID均为同一404 code | 0、负数、溢出ID，以及所有响应完整body/头的一致性仍待补证 |
+| `withoutAManagementSessionTheAnswerIs401` | `test_connectivity_check_endpoint` | 无tokenHTTP响应构造入口401 | 缺该分支明确断言body无code、private no-store及未读取route记录 |
+| `invalidBodiesAndPathsAre400BeforeTheRouteIsLookedUp` | `run_request_rules`；`test_connectivity_check_endpoint` | 多种body/path规则和生产HTTP响应构造入口无效path/未知字段400 | 不是完整Java语料经未知route的生产HTTP响应构造入口回放；先于查库的顺序与无repo交互尚未等价证明 |
+| `validBodiesAndPathsAreChecked` | `run_request_rules`；现有生产HTTP响应构造入口离线检查 | 部分有效path、空body、长度边界及离线结果 | 不是全部Java有效语料经生产HTTP响应构造入口回放；Content-Type可省略/非JSON等仍待补证 |
+| `unreadableRecordsAre503NotNotConfigured` | `run_case` 的configReadable=false | 核心处理器CHECK_UNAVAILABLE及Retry-After | 尚缺HTTP响应构造入口读库失败503/private no-store、不冒充未配置的专门回归 |
+| `theSameRouteIsRateLimitedForEveryCaller` | `test_connectivity_check_endpoint` | owner执行后同租户admin得到429、精确code及Retry-After10 | 尚缺该429分支明确的private no-store断言 |
+
+迟到DATA差异必须作为行为缺口继续处理，不能被上述“部分”记录或平台说明豁免。[连通性检查契约](../../../protocol/spec/service-connectivity-check.md)第5节要求结束探测后丢弃在途响应DATA、不回WINDOW_UPDATE；Java的该方法另明确断言不回任何帧。C现有 `check_connectivity_probe_late_rst` 却断言RST7。本轮只记录差异，未更改生产协议或把其宣称为已修复。
 
 ## 历史表的读法与限制
 

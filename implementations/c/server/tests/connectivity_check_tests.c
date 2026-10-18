@@ -39,6 +39,7 @@ typedef struct {
     char last_log[512];
     size_t logs;
     size_t refusal_logs;
+    char refusal_lines[2][512];
 } fake_device;
 
 static void fake_presence(void *ctx, const char *client_name, int *control_online, int *data_online)
@@ -99,6 +100,9 @@ static void fake_log(void *ctx, const char *line)
     snprintf(device->last_log, sizeof(device->last_log), "%s", line);
     ++device->logs;
     if (strstr(line, " refused code=CHECK_RATE_LIMITED") != NULL) {
+        if (device->refusal_logs < 2U) {
+            snprintf(device->refusal_lines[device->refusal_logs], sizeof(device->refusal_lines[0]), "%s", line);
+        }
         ++device->refusal_logs;
     }
 }
@@ -412,6 +416,13 @@ static int run_rate_events(const char *vector)
             fprintf(stderr, "rate event %zu: handled as %d\n", i, response.status);
             failed = 1;
         }
+        char wanted_body[96];
+        snprintf(wanted_body, sizeof(wanted_body), "{\"code\":\"%s\"}", code);
+        if (admitted ? response.body == NULL || strstr(response.body, "\"code\":\"DEVICE_OFFLINE\"") == NULL
+                     : response.body == NULL || strcmp(response.body, wanted_body) != 0) {
+            fprintf(stderr, "rate event %zu: response body differs\n", i);
+            failed = 1;
+        }
         st_connectivity_response_free(&response);
     }
     /* alice is refused at 1, 9999, 10008 and 40000 -- one line a minute -- and admin once. */
@@ -419,10 +430,118 @@ static int run_rate_events(const char *vector)
         fprintf(stderr, "logged %zu rate refusals, want 2\n", device.refusal_logs);
         failed = 1;
     }
+    if (strcmp(device.refusal_lines[0], "[connectivity-check] tenant=default user=alice route=1 refused code=CHECK_RATE_LIMITED retryAfter=10") != 0
+        || strcmp(device.refusal_lines[1], "[connectivity-check] tenant=default user=admin route=1 refused code=CHECK_RATE_LIMITED retryAfter=10") != 0) {
+        fprintf(stderr, "rate refusal log fields or order differ\n");
+        failed = 1;
+    }
     st_json_free_string_array(events, events_len);
     st_connectivity_checker_free(limiter);
     st_connectivity_checker_free(checker);
     free(rate);
+    return failed;
+}
+
+/* Java aRefusalConsumesNeitherKey: a refused route cannot spend a different user's burst. */
+static int run_refusal_consumes_neither_key(void)
+{
+    fake_device device = {0};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    st_connectivity_refusal refusal;
+    int failed = st_connectivity_rate(checker, "bounds", "u1", 1, 0, &refusal) != 0;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (st_connectivity_rate(checker, "bounds", "u2", 1, 1 + attempt, &refusal) == 0
+            || refusal.status != 429 || strcmp(refusal.code, "CHECK_RATE_LIMITED") != 0
+            || refusal.limited_by == NULL || strcmp(refusal.limited_by, "route") != 0) failed = 1;
+    }
+    for (long long route = 2; route <= 11; ++route) {
+        if (st_connectivity_rate(checker, "bounds", "u2", route, 100, &refusal) != 0) failed = 1;
+    }
+    if (st_connectivity_rate(checker, "bounds", "u2", 99, 100, &refusal) == 0
+        || refusal.status != 429 || refusal.limited_by == NULL || strcmp(refusal.limited_by, "user") != 0) failed = 1;
+    /* The user refusal must not consume route99 for an unrelated user either. */
+    if (st_connectivity_rate(checker, "bounds", "u3", 99, 100, &refusal) != 0) failed = 1;
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "rate refusal consumed a key or changed refusal fields\n");
+    else printf("connectivity rate boundary: refusal consumes neither key passed\n");
+    return failed;
+}
+
+static int fill_live_rate_tables(st_connectivity_checker *checker)
+{
+    /* The reference bound is 10000, not a reduced test capacity. */
+    for (long long key = 1; key <= 10000; ++key) {
+        char user[32];
+        snprintf(user, sizeof(user), "user-%lld", key);
+        st_connectivity_refusal refusal;
+        if (st_connectivity_rate(checker, "full", user, key, 0, &refusal) != 0) {
+            fprintf(stderr, "live rate table filled before key %lld\n", key);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int run_full_key_table_boundaries(void)
+{
+    fake_device device = {0};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    int failed = fill_live_rate_tables(checker);
+    st_connectivity_refusal refusal;
+    if (!failed) {
+        failed = st_connectivity_rate(checker, "full", "new-user", 20000, 1, &refusal) == 0
+            || refusal.status != 503 || strcmp(refusal.code, "CHECK_BUSY") != 0
+            || refusal.retry_after_seconds != 1 || refusal.limited_by != NULL;
+    }
+    if (!failed) {
+        failed = st_connectivity_rate(checker, "full", "user-1", 1, 1, &refusal) == 0
+            || refusal.status != 429 || refusal.limited_by == NULL || strcmp(refusal.limited_by, "route") != 0;
+    }
+    if (!failed) {
+        /* Route entries expire at10s, user entries only at30s: the latter must still refuse. */
+        failed = st_connectivity_rate(checker, "full", "new-user", 20000, 10000, &refusal) == 0
+            || refusal.status != 503 || strcmp(refusal.code, "CHECK_BUSY") != 0;
+    }
+    if (!failed) failed = st_connectivity_rate(checker, "full", "new-user", 20000, 30000, &refusal) != 0;
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "full rate table evicted live keys or expired at the wrong boundary\n");
+    else printf("connectivity rate boundary:10000 keys preserved until expiry passed\n");
+    return failed;
+}
+
+static int run_full_key_table_is_busy(void)
+{
+    fake_device device = {.control_online = 1, .data_online = 1, .capability = 1};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    int failed = fill_live_rate_tables(checker);
+    device.now = 1;
+    fake_routes routes = {.readable = 1, .visible = 1};
+    snprintf(routes.route.tenant_id, sizeof(routes.route.tenant_id), "full");
+    snprintf(routes.route.client_name, sizeof(routes.route.client_name), "device");
+    snprintf(routes.route.route, sizeof(routes.route.route), "app");
+    snprintf(routes.route.target_base_url, sizeof(routes.route.target_base_url), "http://127.0.0.1/");
+    routes.route.route_enabled = 1;
+    routes.route.client_enabled = 1;
+    st_connectivity_request request = {1, "full", "new-user", "20000", "", 0U};
+    st_connectivity_response response;
+    if (!failed) {
+        failed = st_connectivity_handle(checker, &request, fake_load, &routes, &response) != 0;
+        if (!failed) {
+            failed = response.status != 503 || response.retry_after_seconds != 1
+                || response.body == NULL || strcmp(response.body, "{\"code\":\"CHECK_BUSY\"}") != 0
+                || device.probes != 0U;
+            st_connectivity_response_free(&response);
+        }
+    }
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "full rate table was not CHECK_BUSY/no-probe in the handler\n");
+    else printf("connectivity rate boundary: full table handler503/no-probe passed\n");
     return failed;
 }
 
@@ -524,6 +643,9 @@ int main(void)
     printf("connectivity vector: %zu/%zu cases passed\n", passed, cases_len);
     st_json_free_string_array(cases, cases_len);
     failed |= run_rate_events(vector);
+    failed |= run_refusal_consumes_neither_key();
+    failed |= run_full_key_table_boundaries();
+    failed |= run_full_key_table_is_busy();
     failed |= run_request_rules();
     free(vector);
     return failed ? 1 : 0;
