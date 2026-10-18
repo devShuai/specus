@@ -677,6 +677,7 @@ static check_answer exchange(st_connectivity_checker *checker,
             }
         }
         break;
+    case ST_CONNECTIVITY_PROBE_INVALID_HEAD:
     case ST_CONNECTIVITY_PROBE_LINK_LOST:
         break;
     default:
@@ -761,6 +762,11 @@ static void run_check(st_connectivity_checker *checker,
         return;
     case ST_CONNECTIVITY_PROBE_LINK_LOST:
         decide(result, "failed", "DEVICE_LINK_LOST", head.at_ms);
+        return;
+    case ST_CONNECTIVITY_PROBE_INVALID_HEAD:
+        /* Locally validated stream protocol, independent of the peer's classification capability. */
+        decide(result, "passed", "DEVICE_ONLINE", head.at_ms);
+        decide(result, "failed", "TARGET_PROTOCOL_ERROR", head.at_ms);
         return;
     case ST_CONNECTIVITY_PROBE_RESET:
         if (head.trusted) {

@@ -33,7 +33,8 @@ enum {
     ST_CONNECTIVITY_PROBE_LINK_LOST,    /* the data connection closed or was replaced first */
     ST_CONNECTIVITY_PROBE_WRITE_FAILED, /* OPEN or the request FIN could not be written */
     ST_CONNECTIVITY_PROBE_STREAM_LIMIT, /* the data connection carries its maximum of streams */
-    ST_CONNECTIVITY_PROBE_TIMEOUT       /* no answer within the time given */
+    ST_CONNECTIVITY_PROBE_TIMEOUT,      /* no answer within the time given */
+    ST_CONNECTIVITY_PROBE_INVALID_HEAD  /* this server rejected the response OPEN before a head */
 };
 
 typedef struct {

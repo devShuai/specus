@@ -2374,13 +2374,21 @@ static long long connectivity_now_ms(void *ctx)
 /*
  * Test hook, SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true: once a response head has come, the
  * probe also waits, within the same deadline, for the stream to end (FIN, or a reset) before it
- * decides whether to reset it. A test can then show that a response its FIN ended is not reset,
+ * decides whether to reset it. The "get" mode waits only on a GET, so a fallback can keep its
+ * HEAD reset and deterministically observe the GET FIN, within the same unchanged budget.
+ * A test can then show that a response its FIN ended is not reset,
  * which otherwise depends on whether the FIN was read before the probe woke up. Off by default.
  */
-static int connectivity_probe_awaits_end(void)
+static int connectivity_probe_awaits_end(const char *metadata_json)
 {
     const char *value = getenv("SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END");
-    return value != NULL && strcmp(value, "true") == 0;
+    if (value == NULL) return 0;
+    if (strcmp(value, "true") == 0) return 1;
+    if (strcmp(value, "get") != 0) return 0;
+    char *method = st_json_get_top_level_string(metadata_json, "method");
+    int wait = method != NULL && strcmp(method, "GET") == 0;
+    free(method);
+    return wait;
 }
 
 /*
@@ -2413,7 +2421,16 @@ static void connectivity_probe(void *ctx,
     memset(&pending, 0, sizeof(pending));
     pending.send_credit = ST_STREAM_INITIAL_WINDOW;
     pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
-    pthread_cond_init(&pending.cond, NULL);
+    pthread_condattr_t probe_cond_attr;
+    int attr_ok = pthread_condattr_init(&probe_cond_attr) == 0;
+    int cond_ok = attr_ok && pthread_condattr_setclock(&probe_cond_attr, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&pending.cond, &probe_cond_attr) == 0;
+    if (attr_ok) pthread_condattr_destroy(&probe_cond_attr);
+    if (!cond_ok) {
+        session_reference_release(session);
+        answer->kind = ST_CONNECTIVITY_PROBE_WRITE_FAILED;
+        return;
+    }
     pthread_mutex_lock(&session->map_lock);
     pending.stream_id = session->next_stream_id++;
     if (session->next_stream_id == 0U) {
@@ -2448,7 +2465,8 @@ static void connectivity_probe(void *ctx,
         pthread_mutex_unlock(&session->direct_lock);
     } else {
         struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        /* The checker budget is monotonic; wall-clock corrections must not shorten/extend it. */
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
         long long wait_ms = timeout_ms < 0 ? 0 : timeout_ms;
         deadline.tv_sec += (time_t)(wait_ms / 1000LL);
         deadline.tv_nsec += (long)(wait_ms % 1000LL) * 1000000L;
@@ -2462,7 +2480,7 @@ static void connectivity_probe(void *ctx,
                 break;
             }
         }
-        if (connectivity_probe_awaits_end() && pending.events_head != NULL
+        if (connectivity_probe_awaits_end(metadata_json) && pending.events_head != NULL
             && pending.events_head->type == ST_NAT_OPEN) {
             while (!pending.done && pending.error == NULL) {
                 if (pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline) == ETIMEDOUT) {
@@ -2478,6 +2496,9 @@ static void connectivity_probe(void *ctx,
         } else if (pending.error != NULL && pending.client_reset) {
             answer->kind = ST_CONNECTIVITY_PROBE_RESET;
             snprintf(answer->failure, sizeof(answer->failure), "%s", pending.failure);
+        } else if (pending.error != NULL && pending.reset) {
+            /* A locally rejected response OPEN is not a lost data connection (Java LOCAL origin). */
+            answer->kind = ST_CONNECTIVITY_PROBE_INVALID_HEAD;
         } else if (pending.error != NULL) {
             /* The data connection closed or was replaced, which fails every pending stream. */
             answer->kind = ST_CONNECTIVITY_PROBE_LINK_LOST;

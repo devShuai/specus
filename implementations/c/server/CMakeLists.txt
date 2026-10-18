@@ -443,6 +443,8 @@ set_tests_properties(client_route_scale_tests PROPERTIES TIMEOUT 180)
 add_executable(specus_c_nat_stream_tests tests/nat_stream_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_nat_stream_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_nat_stream_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_nat_stream_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME nat_stream_tests
     COMMAND specus_c_nat_stream_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(nat_stream_tests PROPERTIES TIMEOUT 420)
@@ -481,3 +483,21 @@ add_test(NAME tls_deployment_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tls_deployment_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
 set_tests_properties(tls_deployment_e2e PROPERTIES TIMEOUT 90)
+
+# Keep the deterministic wall-clock regression separate from the real HTTP package suite.
+add_executable(specus_c_client_package_clock_tests tests/client_package_clock_tests.c)
+target_link_libraries(specus_c_client_package_clock_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_client_package_clock_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_package_clock_tests COMMAND specus_c_client_package_clock_tests)
+
+# Process-local adverse clock view; the normal NAT test and its 10s lower bound are unchanged.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(specus_c_connectivity_clock_offset SHARED tests/connectivity_clock_offset.c)
+    target_compile_options(specus_c_connectivity_clock_offset PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME nat_connectivity_clock_adjustment
+        COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:specus_c_connectivity_clock_offset>"
+            "SPECUS_NAT_STREAM_ONLY=connectivity NAT complete"
+            $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
+    set_tests_properties(nat_connectivity_clock_adjustment PROPERTIES TIMEOUT 60)
+endif()

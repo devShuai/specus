@@ -24,6 +24,7 @@ DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
 CLIENT_AUTH_NONCE_TESTS := $(BUILD_DIR)/specus_c_client_auth_nonce_tests
 CLIENT_PACKAGE_TESTS := $(BUILD_DIR)/specus_c_client_package_tests
+CLIENT_PACKAGE_CLOCK_TESTS := $(BUILD_DIR)/specus_c_client_package_clock_tests
 CONNECTIVITY_CHECK_TESTS := $(BUILD_DIR)/specus_c_connectivity_check_tests
 CONNECTIVITY_HTTP_VECTOR_TESTS := $(BUILD_DIR)/specus_c_connectivity_http_vector_tests
 CONNECTIVITY_RESOURCE_WIRE_TESTS := $(BUILD_DIR)/specus_c_connectivity_resource_wire_tests
@@ -86,10 +87,25 @@ TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
 ALL_TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
 ALL_TESTS += $(CONNECTIVITY_RESOURCE_WIRE_TESTS)
 ALL_TESTS += $(CONNECTIVITY_RATE_HTTP_TESTS)
+TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
+ALL_TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
+
+# This adverse clock view uses Linux's process-local preload, never the host clock.
+ifeq ($(shell uname -s),Linux)
+CONNECTIVITY_CLOCK_OFFSET := $(BUILD_DIR)/libspecus_connectivity_clock_offset.so
+ALL_TESTS += $(CONNECTIVITY_CLOCK_OFFSET)
+CONNECTIVITY_CLOCK_TEST_COMMAND = env LD_PRELOAD="$(abspath $(CONNECTIVITY_CLOCK_OFFSET))" SPECUS_NAT_STREAM_ONLY="connectivity NAT complete" $(NAT_STREAM_TESTS) $(SERVER)
+endif
 
 .PHONY: all test release clean
 
 all: $(SERVER) $(ALL_TESTS)
+
+$(BUILD_DIR)/libspecus_connectivity_clock_offset.so: tests/connectivity_clock_offset.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@
+
+$(CLIENT_PACKAGE_CLOCK_TESTS): $(CORE_OBJS) tests/client_package_clock_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_package_clock_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -209,8 +225,8 @@ $(HTTP_ROUTE_LIFECYCLE_TESTS): $(CORE_OBJS) tests/http_route_lifecycle_tests.c t
 $(CLIENT_ROUTE_SCALE_TESTS): $(CORE_OBJS) tests/client_route_scale_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_route_scale_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(NAT_STREAM_TESTS): $(CORE_OBJS) tests/nat_stream_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_stream_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(NAT_STREAM_TESTS): $(CORE_OBJS) tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/nat_stream_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(PRODUCT_METRICS_TESTS): $(CORE_OBJS) tests/product_metrics_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/product_metrics_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -284,6 +300,7 @@ test: all
 	$(HTTP_ROUTE_LIFECYCLE_TESTS) $(SERVER)
 	$(CLIENT_ROUTE_SCALE_TESTS) $(SERVER)
 	$(NAT_STREAM_TESTS) $(SERVER)
+	$(CONNECTIVITY_CLOCK_TEST_COMMAND)
 	$(PRODUCT_METRICS_TESTS) $(SERVER)
 	$(CONNECTION_ARCHIVE_TESTS) $(SERVER)
 	$(CLIENT_MESSAGES_TESTS) $(SERVER)

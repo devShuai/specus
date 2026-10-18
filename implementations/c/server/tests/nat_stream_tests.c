@@ -2203,6 +2203,9 @@ static const char *const long_idle_probe_awaits_end[] = {
     "SPECUS_CONTROL_READ_IDLE_SECONDS=900", "SPECUS_CONNECTIVITY_PROBE_TEST_AWAIT_END=true", NULL
 };
 
+#include "connectivity_nat_test_cases.h"
+#include "connectivity_nat_complete_cases.h"
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -2214,6 +2217,8 @@ int main(int argc, char **argv)
     srand((unsigned int)wall_clock_ms());
 
     int failures = test_tombstones();
+    failures += run_nat_parity_cases();
+    failures += run_nat_complete_cases();
     failures += run_check("HTTP DATA before the response head resets only that stream", check_http_data_before_head);
     failures += run_check("HTTP second response head resets only that stream", check_http_second_head);
     failures += run_check("HTTP DATA|END_STREAM is DATA then FIN", check_http_end_stream);
