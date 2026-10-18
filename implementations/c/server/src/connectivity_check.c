@@ -16,15 +16,6 @@
 #include "json.h"
 
 #define ST_CONNECTIVITY_MAX_CONCURRENT 32U
-#define ST_CONNECTIVITY_ROUTE_INTERVAL_MS 10000LL
-#define ST_CONNECTIVITY_ROUTE_BURST 1LL
-#define ST_CONNECTIVITY_USER_INTERVAL_MS 30000LL
-#define ST_CONNECTIVITY_USER_BURST 10LL
-/*
- * Each key table holds at most this many entries. An entry whose time is not after now is dead and
- * may go at any time; a live one is never evicted, since that would hand it a fresh allowance.
- */
-#define ST_CONNECTIVITY_MAX_KEYS 10000U
 /* A rate-limited caller is logged at most once a minute. */
 #define ST_CONNECTIVITY_REFUSAL_LOG_INTERVAL_MS 60000LL
 #define ST_CONNECTIVITY_KEY_MAX 256U

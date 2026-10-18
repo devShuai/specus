@@ -159,6 +159,14 @@ target_compile_options(specus_c_connectivity_resource_wire_tests PRIVATE -Wall -
 add_test(NAME connectivity_resource_wire_tests COMMAND specus_c_connectivity_resource_wire_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(connectivity_resource_wire_tests PROPERTIES TIMEOUT 120)
 
+add_executable(specus_c_connectivity_rate_http_tests tests/connectivity_rate_http_tests.c tests/connectivity_test_clock.c)
+target_link_libraries(specus_c_connectivity_rate_http_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_connectivity_rate_http_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_connectivity_rate_http_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME connectivity_rate_http_tests COMMAND specus_c_connectivity_rate_http_tests)
+set_tests_properties(connectivity_rate_http_tests PROPERTIES TIMEOUT 120)
+
 add_executable(specus_c_crypto_tests tests/crypto_tests.c)
 target_link_libraries(specus_c_crypto_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_crypto_tests PRIVATE -Wall -Wextra -Wpedantic)
