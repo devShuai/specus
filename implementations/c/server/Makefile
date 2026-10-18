@@ -26,6 +26,7 @@ CLIENT_AUTH_NONCE_TESTS := $(BUILD_DIR)/specus_c_client_auth_nonce_tests
 CLIENT_PACKAGE_TESTS := $(BUILD_DIR)/specus_c_client_package_tests
 CONNECTIVITY_CHECK_TESTS := $(BUILD_DIR)/specus_c_connectivity_check_tests
 CONNECTIVITY_HTTP_VECTOR_TESTS := $(BUILD_DIR)/specus_c_connectivity_http_vector_tests
+CONNECTIVITY_RESOURCE_WIRE_TESTS := $(BUILD_DIR)/specus_c_connectivity_resource_wire_tests
 CRYPTO_TESTS := $(BUILD_DIR)/specus_c_crypto_tests
 DECOMPRESSION_LIMITS_TESTS := $(BUILD_DIR)/specus_c_decompression_limits_tests
 ELASTICSEARCH_TRAFFIC_TESTS := $(BUILD_DIR)/specus_c_elasticsearch_traffic_tests
@@ -82,6 +83,7 @@ CORE_OBJS += $(BUILD_DIR)/unicode_java21.o
 ALL_TESTS += $(UNICODE_JAVA21_TESTS)
 TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
 ALL_TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
+ALL_TESTS += $(CONNECTIVITY_RESOURCE_WIRE_TESTS)
 
 .PHONY: all test release clean
 
@@ -155,8 +157,11 @@ $(PASSWORD_HASH_TESTS): $(CORE_OBJS) tests/password_hash_tests.c | $(BUILD_DIR)
 $(CONNECTIVITY_CHECK_TESTS): $(CORE_OBJS) tests/connectivity_check_tests.c tests/connectivity_check_test_support.h tests/connectivity_test_clock.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_check_tests.c tests/connectivity_test_clock.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(CONNECTIVITY_HTTP_VECTOR_TESTS): $(CORE_OBJS) tests/connectivity_http_vector_tests.c tests/connectivity_check_test_support.h tests/connectivity_test_clock.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_http_vector_tests.c tests/connectivity_test_clock.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(CONNECTIVITY_HTTP_VECTOR_TESTS): $(CORE_OBJS) tests/connectivity_http_vector_tests.c tests/connectivity_http_resource_tests.c tests/connectivity_http_test_support.h tests/connectivity_check_test_support.h tests/connectivity_test_clock.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_http_vector_tests.c tests/connectivity_http_resource_tests.c tests/connectivity_test_clock.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONNECTIVITY_RESOURCE_WIRE_TESTS): $(CORE_OBJS) tests/connectivity_resource_wire_tests.c tests/server_harness.c tests/server_harness.h tests/connectivity_http_test_support.h tests/connectivity_check_test_support.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_resource_wire_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(PEER_EGRESS_TESTS): $(CORE_OBJS) tests/peer_egress_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_egress_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -255,6 +260,7 @@ $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 test: all
+	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)
 	$(UNICODE_JAVA21_TESTS) "$(abspath $(UNICODE_JAVA21_VECTORS))"
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)

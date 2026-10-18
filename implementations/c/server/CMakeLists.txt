@@ -145,13 +145,19 @@ target_compile_definitions(specus_c_connectivity_check_tests PRIVATE
     ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME connectivity_check_tests COMMAND specus_c_connectivity_check_tests)
 
-add_executable(specus_c_connectivity_http_vector_tests tests/connectivity_http_vector_tests.c tests/connectivity_test_clock.c)
+add_executable(specus_c_connectivity_http_vector_tests tests/connectivity_http_vector_tests.c tests/connectivity_http_resource_tests.c tests/connectivity_test_clock.c)
 target_link_libraries(specus_c_connectivity_http_vector_tests PRIVATE specus_c_core pthread)
 target_compile_options(specus_c_connectivity_http_vector_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(specus_c_connectivity_http_vector_tests PRIVATE
     ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME connectivity_http_vector_tests COMMAND specus_c_connectivity_http_vector_tests)
 set_tests_properties(connectivity_http_vector_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_connectivity_resource_wire_tests tests/connectivity_resource_wire_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connectivity_resource_wire_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_connectivity_resource_wire_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connectivity_resource_wire_tests COMMAND specus_c_connectivity_resource_wire_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connectivity_resource_wire_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_crypto_tests tests/crypto_tests.c)
 target_link_libraries(specus_c_crypto_tests PRIVATE specus_c_core)

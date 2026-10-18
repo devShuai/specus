@@ -14,7 +14,7 @@
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；本轮逐方法对照了4个连通性检查类的20个注解方法，首批均为“部分”，本批补齐Vector类行为断言（日志框架差异单列），其余3类仍为“部分”，尚有41类待逐方法对照。这里的41不包括这3类已查明的剩余缺口，也不包括旧79类的当前断言复核。待核验不等于C没有相应能力；同样，已有同名功能也不等于覆盖已成立。
+旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后补齐Vector类行为断言及本批Resource类7个参考方法，Rate与NAT两类仍为“部分”，尚有41类待逐方法对照。这里的41不包括这2类已查明的剩余缺口，也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -49,7 +49,7 @@
 | `http/HttpSpecusControllerFailClosedTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpSpecusControllerStreamResetTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/NatControlPushFailureVectorTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 部分 | `admin_http_tests.c:test_connectivity_check_endpoint` 已有鉴权、可见性、离线与429等生产HTTP响应构造入口断言；本批HTTP向量补齐实际路由读库失败503。完整请求语料、未知目标前先判请求、owner/admin完整离线响应及鉴权交互等仍有缺口，见逐方法记录。 |
+| `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 覆盖（参考7方法；候选） | `connectivity_http_resource_tests.c` 补齐34种无效body、12种有效请求、完整离线/404/401/503/429响应及SQLite路由访问顺序观察；`connectivity_resource_wire_tests.c` 用真实进程/socket及生产会话表验证owner/admin离线完整结果。另修复并验证9个ASCII Long-ID边界；不扩张为全部数字字符、URL解码或跨NAT验收。 |
 | `management/controller/ManagementAccountsHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchCascadeTests` | 6 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchConcurrentWriteTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -74,7 +74,7 @@
 
 ## 连通性检查的逐方法对照（本轮增量）
 
-本节初次逐方法核对基于注册分支 `dbccd2fdfed6e46791594c0182b1e52fecad708f` 的 Java/C 源码；它是上方 `37851ae8c020fdd5a52bd0232a4ef00861f01891` 的直接后继，只修改本清单，两者的相关 Java/C 源码相同。首批提交 `fee457f` 只给 `tests/connectivity_check_tests.c` 增加断言，Java方法和C生产实现未改；后续生产修复、核心向量及HTTP补证分别单列。下列未标为增量的HTTP响应构造入口和NAT证据来自原基线，不冒充新增用例。四个类共20个注解方法，属于上面49类中的4类；首批均为“部分”，本批Vector类的行为证据与日志框架差异列明后，其余3类仍为“部分”，不另计为20个测试类。
+本节初次逐方法核对基于注册分支 `dbccd2fdfed6e46791594c0182b1e52fecad708f` 的 Java/C 源码；它是上方 `37851ae8c020fdd5a52bd0232a4ef00861f01891` 的直接后继，只修改本清单，两者的相关 Java/C 源码相同。首批提交 `fee457f` 只给 `tests/connectivity_check_tests.c` 增加断言，Java方法和C生产实现未改；后续生产修复、核心向量及HTTP补证分别单列。下列未标为增量的HTTP响应构造入口和NAT证据来自原基线，不冒充新增用例。四个类共20个注解方法，属于上面49类中的4类；首批均为“部分”，Vector类补证后3类仍部分，本批Resource类7个参考方法对应后只剩Rate/NAT两类部分，不另计为20个测试类。
 
 C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_auth`，经过生产响应构造、JWT与SQLite，但不经过监听socket；Java的对应资源测试使用MockMvc，也不是实网HTTP。`connectivity_check_tests.c` 的假设备通过注入presence、probe、单调时钟和日志回调驱动核心检查器，不是真实设备。下列 `nat_stream_tests` 场景使用真实进程/socket；相关的 `session_lifecycle_tests` 也有真实进程/socket场景，但不能由此推定已覆盖全部探测链路状态。
 
@@ -89,7 +89,7 @@ C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_aut
 | `aRefusalConsumesNeitherKey` | 本轮 `run_refusal_consumes_neither_key` | 路由拒绝20次不消耗另一用户的10次预算；因用户额度耗尽而拒绝的请求也不消耗其所请求路由的额度 | 此方法的核心限额断言已对应，不因此提升整个类的状态 |
 | `aFullKeyTableRefusesNewKeysWithoutEvictingLiveOnes` | 本轮 `run_full_key_table_boundaries` | 10000键满表拒新键、不驱逐有效键；10秒路由键过期但用户键表仍满，30秒后可接纳 | 此方法的核心边界断言已对应 |
 | `aFullKeyTableIsCheckBusy` | 本轮 `run_full_key_table_is_busy` | 核心处理器满表503、精确CHECK_BUSY body、Retry-After=1、零探测 | 仍缺该分支的HTTP响应构造入口 Cache-Control等响应头断言 |
-| `HttpRouteConnectivityCheckVectorTests.everyCaseOfTheSharedVector` | `connectivity_http_vector_tests.c:replay/assert_http`；共享 `assert_vector_response`；核心 `run_case/run_vector_admission_constants` | 全部38个向量经生产HTTP响应构造入口、真实JWT/SQLite，逐一核验状态、完整有序body、Cache-Control、Content-Type、Retry-After及401无code；32个200结果的固定checkedAt、元数据/探测/脚本/预算/完整日志断言同核心版本；6个拒绝零探测/零完成日志；真实线程占住1个同路由或全部32个进程槽位，释放后所有占位请求200 | Java的Logback INFO级别在C字符串日志回调中没有同一框架概念，书面差异仅限级别注册；完整字段与一次完成日志未豁免。与Java MockMvc一样不经过监听socket，假设备不等于真实NAT；工厂声明、行为及框架差异已逐项对应，不扩展至另外3类 |
+| `HttpRouteConnectivityCheckVectorTests.everyCaseOfTheSharedVector` | `connectivity_http_vector_tests.c:replay/assert_http`；共享 `assert_vector_response`；核心 `run_case/run_vector_admission_constants` | 全部38个向量经生产HTTP响应构造入口、真实JWT/SQLite，逐一核验状态、完整有序body、Cache-Control、Content-Type、Retry-After及401无code；32个200结果的固定checkedAt、元数据/探测/脚本/预算/完整日志断言同核心版本；6个拒绝零探测/零完成日志；真实线程占住1个同路由或全部32个进程槽位，释放后所有占位请求200 | Java的Logback INFO级别在C字符串日志回调中没有同一框架概念，书面差异仅限级别注册；完整字段与一次完成日志未豁免。与Java MockMvc一样不经过监听socket，假设备不等于真实NAT；工厂声明、行为及框架差异已逐项对应，不据此证明另外3类；Resource后续补证见下 |
 | `NatConnectivityProbeTests.everyClassifiedResetOfACapableSessionReachesTheCheck` | `check_connectivity_client_reset_failure`；`run_case` 的 `connect-refused`、`connect-timeout`、`dns-failed`、`tls-failed`、`unreachable`、`target-invalid-on-device`、`protocol-error`、`budget-expired` | 真实进程/socket的connect-refused传递与reason脱敏；其他分类有假设备状态向量 | 全部8种分类的真实帧路径和OPEN/FIN/RST序列尚缺 |
 | `aResetIsUnverifiedWithoutTheCapabilityOrWithAnUnknownFailure` | `run_case` 的 `capable-unknown-failure`、`capable-unclassified`、`legacy-client-reset`、`legacy-client-reset-ignores-failure` | 核心检查器的不可信分类结果 | 缺能力未声明、未知failure及无failure的真实NAT帧组合与状态断言 |
 | `theProbeOpensAFixedRequestAndTheHeadEndsIt` | `check_connectivity_probe_late_rst`、`check_connectivity_probe_ended_by_fin` | 真实HEAD405→GET、响应头后复位、FIN已结束时不复位；后续增量对已结束HEAD/GET及FIN结束的探测逐帧验证迟到响应被静默丢弃，且普通流历史更替不会破坏该行为 | 完整请求元数据、requestId格式及全部OPEN/FIN/RST顺序仍待逐断言对应；不能只凭此行把该方法或整类标为完整覆盖 |
@@ -97,13 +97,13 @@ C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_aut
 | `aDataConnectionThatClosesIsALostLink` | `run_case` 的 `link-lost` | 核心状态机DEVICE_LINK_LOST | 缺真实探测中关闭data连接的对应场景 |
 | `aHeadOutsideTheStatusRangeIsAProtocolError` | `run_case` 的 `protocol-error` | 核心错误分类；该向量是设备复位分类，不是103/600响应头 | 缺真实NAT103/600响应头、statusClass缺失和阶段结果的完整组合 |
 | `theLinkFollowsTheSessionTable` | 相关：`session_lifecycle_tests`、`run_case` | 连接生命周期及假设备presence有各自测试 | 尚未把同一真实设备control/data/capability逐步变化与探测link结果逐一对应 |
-| `HttpRouteConnectivityCheckResourceTests.aVisibleRouteOfAnOfflineClientIsCheckedAndStopsAtTheDevice` | `test_connectivity_check_endpoint` | owner离线200、停止阶段、私有缓存与目标信息不外泄 | 缺owner和同租户admin各自完整body、checkedAt及无Retry-After的逐项比较 |
-| `anUnknownRouteAndARouteTheCallerCannotSeeAnswerTheSame404` | `test_connectivity_check_endpoint` | 未知、他人、他租户和abc ID均为同一404 code | 0、负数、溢出ID，以及所有响应完整body/头的一致性仍待补证 |
-| `withoutAManagementSessionTheAnswerIs401` | `test_connectivity_check_endpoint`；本批HTTP向量unauthenticated | 无token生产HTTP入口401；本批补齐body无code、private no-store、无Retry-After和零探测/完成日志 | 尚缺未读取route记录的交互断言；不把旧测试本身未加断言误写成当前没有HTTP证据 |
-| `invalidBodiesAndPathsAre400BeforeTheRouteIsLookedUp` | `run_request_rules`；`test_connectivity_check_endpoint` | 多种body/path规则和生产HTTP响应构造入口无效path/未知字段400 | 不是完整Java语料经未知route的生产HTTP响应构造入口回放；先于查库的顺序与无repo交互尚未等价证明 |
-| `validBodiesAndPathsAreChecked` | `run_request_rules`；现有生产HTTP响应构造入口离线检查 | 部分有效path、空body、长度边界及离线结果 | 不是全部Java有效语料经生产HTTP响应构造入口回放；Content-Type可省略/非JSON等仍待补证 |
-| `unreadableRecordsAre503NotNotConfigured` | 核心 `run_case`；本批HTTP向量的configReadable=false | 实际破坏SQLite路由表结构但保留用户表可读，真实JWT仍认证；生产HTTP入口完整503 CHECK_UNAVAILABLE、Retry-After1、private no-store、零探测/完成日志 | 此方法的失败读取行为有对应；不等于资源类其余请求语料、查库顺序和鉴权交互断言已补齐 |
-| `theSameRouteIsRateLimitedForEveryCaller` | `test_connectivity_check_endpoint` | owner执行后同租户admin得到429、精确code及Retry-After10 | 尚缺该429分支明确的private no-store断言 |
+| `HttpRouteConnectivityCheckResourceTests.aVisibleRouteOfAnOfflineClientIsCheckedAndStopsAtTheDevice` | `resource_scenario` 0/1及 `connectivity_resource_wire_tests` | owner/admin各自完整有序body、checkedAt、无Retry-After及私有缓存；构造入口用固定时钟与离线回调，另由两个真实进程/socket场景验证生产会话表的离线结果和真实UTC时间格式；目标/path不泄露 | 对应本参考方法；真实联网探测和会话变化仍属NAT类缺口 |
+| `anUnknownRouteAndARouteTheCallerCannotSeeAnswerTheSame404` | `resource_scenario` 2 | 未知、他人、他租户，以及abc/0/-7/溢出ID共7种响应，精确同一404 body、private no-store、无Retry-After | 本方法对应；另有9个ASCII Long-ID边界，不据此声称所有Unicode数字或URL解码规则已对齐 |
+| `withoutAManagementSessionTheAnswerIs401` | `resource_scenario` 3、`positive_observer_control` | 无token严格生产响应入口401、框架JSON无code、private no-store、零探测/完成日志；SQLite观察器验证零路由表访问，随后有效请求作为观察器正控 | 对应不访问路由记录的行为；观察的是C真实SQL访问，不是虚构Java仓库方法调用 |
+| `invalidBodiesAndPathsAre400BeforeTheRouteIsLookedUp` | `invalid_corpus/invalid_body` | 全部34种Java无效body/path经未知route999回放，逐个400精确body与响应头、零路由表访问/探测/完成日志；正常请求正控验证观察器确实看得到路由访问 | 本方法对应；不只用未知route的400代替顺序观察 |
+| `validBodiesAndPathsAreChecked` | `resource_scenario` 5–16 | 12种Java有效请求各用新进程/检查器，包括无body、空白、空对象、转义/保留字符、256字节路径边界、text/plain及省略Content-Type；逐一完整DEVICE_OFFLINE结果 | 有效请求用真实JWT和生产响应构造；假离线回调的边界由前述真实进程/socket离线补证限定 |
+| `unreadableRecordsAre503NotNotConfigured` | `resource_scenario` 17；先前HTTP向量configReadable=false | 破坏路由表结构但保留用户表可读，真实JWT正常认证；完整503 CHECK_UNAVAILABLE、Retry-After1、private no-store、零探测/完成日志 | 本参考方法对应；不是把认证库不可读当作路由库错误 |
+| `theSameRouteIsRateLimitedForEveryCaller` | `resource_scenario` 18 | owner完整离线200后，同租户admin得到完整429 CHECK_RATE_LIMITED、Retry-After10及private no-store；两者共享同一检查器和路由 | 本方法对应；不替代Rate类尚缺的逐事件HTTP及实际满键表503证据 |
 
 ### 生产修复 `3d9af54`：已结束探测的迟到帧
 
@@ -131,9 +131,26 @@ C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_aut
 
 每个向量使用独立子进程、SQLite文件和一次设置的生产检查器，避免跨用例状态泄漏或增加生产重置接口。调用 `st_admin_build_response_with_auth`，正常请求使用真实签发的Bearer JWT并由用户表重新解析账号；routeId42、t1/alice、api及健康路径与Java相同。不可见路由实际归其他用户；读库失败只破坏路由表结构，保留用户表，因此503不是认证失败冒充的结果。逐响应检查唯一且精确的Cache-Control、Retry-After、Content-Type及Content-Length；401读取真实框架JSON，明确验证无顶层code后才归一为核心401表示，不丢弃未经验证的响应体。200的完整字段顺序、阶段顺序、状态、固定checkedAt、元数据、预算、脚本耗尽及日志字符串/条数仍由共享断言逐一比较；32个200结果不等于32个探测或实网请求。
 
-route-in-progress由真实线程在生产HTTP入口占住42号路由；server-busy用32个不同真实用户/路由同时占住全部进程槽位。测试等待实际probe回调全部阻塞后才发送目标请求，不直接调用admit伪造占位；等待及释放完成仍各受原10秒界限约束，释放并join后逐个验证占位请求200。目标请求结束后停止捕获日志，再释放占位请求，避免把它们的完成日志算作目标日志。子进程正常exit，使ASan/UBSan及退出时泄漏检查有机会执行；没有关闭泄漏检查。C的日志回调不携带Java Logback的INFO注册级别；仅此框架概念书面记差异，不豁免日志字段、次数或脱敏。该证据对应Vector类的行为断言，不代表监听socket、真实设备时钟/网络、跨NAT或另外三个连通性类已覆盖。
+route-in-progress由真实线程在生产HTTP入口占住42号路由；server-busy用32个不同真实用户/路由同时占住全部进程槽位。测试等待实际probe回调全部阻塞后才发送目标请求，不直接调用admit伪造占位；等待及释放完成仍各受原10秒界限约束，释放并join后逐个验证占位请求200。目标请求结束后停止捕获日志，再释放占位请求，避免把它们的完成日志算作目标日志。子进程正常exit，使ASan/UBSan及退出时泄漏检查有机会执行；没有关闭泄漏检查。C的日志回调不携带Java Logback的INFO注册级别；仅此框架概念书面记差异，不豁免日志字段、次数或脱敏。该证据对应Vector类的行为断言，不代表监听socket、真实设备时钟/网络、跨NAT或另外三个连通性类已覆盖；这是该HTTP向量批次的范围，Resource后续补证另列如下。
 
 本批本地验证和负对照的最终结果由PR #290按精确输入另行列明；不使用75f或3d9的CI作为新批次CI。隔离负对照分别修改HTTP缓存头、重试秒数、路由可见性及实际前置401响应；核心回放均仍退出0，新HTTP回放均退出1并保留对应失败断言。最初修改内部401分支的变体没有命中前置鉴权路径，核心/HTTP均退出0；这个未命中结果也保留，不计入上述四个成功负对照。负对照源码不进入提交，也不声称全部变体经过消毒器。本批不合并main、不关闭#35、不发版或更新Homebrew；41类待对照及旧79类当前断言复核仍未完成。
+
+### 后续增量：资源类请求语料、SQL访问顺序与真实离线接入
+
+本批基于 `6b4a140f081f37736c6ce292ec02bb81204c6de5`（树 `63b1556e9e1eb03f837f622eebf9bc3de0c9845f`），完整阅读同一Java资源类的7个测试方法后补证。新增 `connectivity_http_resource_tests.c` 与 `connectivity_resource_wire_tests.c`，将HTTP夹具/响应头辅助函数抽到测试专用 `connectivity_http_test_support.h`。前者接入原HTTP向量可执行程序，原38向量和核心限流/请求规则仍执行；不是新增Java类或方法。28个独立子进程场景包括参考7方法对应的19个场景和额外9个ASCII ID边界；一个场景可能回放多个请求，不能把28当请求总数。34种无效body及12种有效请求完整沿用Java语料，不另造更容易通过的子集。
+
+
+为防止复制转义后得到“另一种同样无效的输入”，另由JDK21求值参考类中的原始语料表达式，并在测试链接时包装C生产响应构造函数、记录实际收到的UTF-8 body及Content-Type后原样转调。34种无效body按多重集逐字节相等（不声称回放顺序相同），12种有效请求按顺序逐字节比较body与内容类型；无body的NULL与空串仅归一为零字节。此私有核对不修改候选源码、不捕获Bearer，也不是重跑Spring/Java资源测试。候选最终完整CMake58/58、零跳过，完整Make保留600秒限制通过；焦点消毒器结果和新提交CI仍须按精确输入另验，不把该本地结果当新CI。
+
+每个场景使用真实SQLite与生产响应构造入口；有认证场景使用签发JWT并重新解析真实用户角色/租户，未登录场景不发送token。未登录场景使用无默认管理员的严格 `with_auth` 入口；带真实Bearer的内容类型场景使用 `with_content`。首轮曾误用 `with_content(NULL认证)` 的旧辅助入口，得到默认管理员的404，失败记录保留；源码核对表明实际socket入口始终关闭该回退，因此未把夹具错误宣称为线上鉴权绕过，也未改生产鉴权政策。
+
+SQL访问顺序由测试进程通过SQLite的auto-extension给每个新连接安装authorizer观察，在夹具建立完成后注册；authorizer不按动作编号过滤，只要参数1或2精确等于http_route_mapping就计数，观察全部命名路由表的动作；不改变其允许/拒绝结果，不增加生产注入接口。无认证场景在调用前为0，34种无效请求分别在调用前清零、返回后逐个要求路由动作计数为0，并要求无探测/完成日志；随后同一观察器下发有效请求，必须看到连接和路由访问，防止把失效观察器的零值当成功。另将观察器故意断开的私有测试变体确实失败。这个零访问结论仅限所测入口、语料和调用观察窗口。仅返回400不足以证明顺序：另一个隔离生产变体在请求解析前偷偷查路由再丢弃结果，原38个HTTP向量仍退出0，新增资源回放因观察到访问而退出1。另一个隔离生产变体在未认证请求返回401前偷偷查路由，原38向量仍退出0，新增资源回放在无认证场景退出1。两个提前读取变体的响应码仍可正确，失败来自新增SQL观察断言，不把它们与失效观察器这个测试夹具变体混为一类。观察证据是C数据库交互，不冒称Java mock仓库调用；它不证明无认证请求完全不读任何表，正常Bearer解析本就需要读用户表。
+
+构造入口为确定性结果注入离线presence与时钟；为覆盖Java资源参考使用真实NAT探测器时的离线接入，另启动两个真实服务端进程，分别以owner及同租户admin经loopback HTTP请求。没有设备连接，不替换生产会话表/presence或生产时钟；逐个核验完整离线body、真实UTC checkedAt格式、private no-store、无Retry-After及目标/path脱敏。这只补真实离线接入，不代表在线设备、数据通道变化、NAT帧分类或跨NAT验收。
+
+扩展检查还复现生产差异：旧C解析器把路由ID限制在18位，会把SQLite中实际存在的 `9223372036854775807` 误报404；Java参考使用 `Long.parseLong`。本批只修改 `src/connectivity_check.c` 的ID解析，按LLONG_MAX逐位检查溢出，允许正号和前导零，仍拒绝溢出、空正号、空白、重复正号和非正ID。9个ASCII输入在JDK21解析探针与C HTTP场景逐项对应；旧生产输入在合法最大ID处失败、修复后通过的原日志保留。该证据不声称覆盖Long.parseLong所有Unicode数字字符或URL解码差异。Java参考、共享向量、工作流和既有运行门禁未修改；最终完整本地验证与新提交CI须由PR #290按本批精确输入列明，不借用6b4或75f的结果。
+
+本批只完成Resource参考7方法的候选对照，并修复上述ASCII ID边界。Rate与NAT两类仍部分，41类待对照及旧79类当前断言复核仍未完成；不合并main、不关闭#35、不发版或更新Homebrew。
 
 ## 历史表的读法与限制
 

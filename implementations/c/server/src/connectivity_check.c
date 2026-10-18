@@ -2,6 +2,7 @@
 
 #include "connectivity_check.h"
 
+#include <limits.h>
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -892,15 +893,20 @@ static char *result_body(const check_result *result, long long route_id, const c
 
 static int parse_route_id(const char *text, long long *route_id)
 {
-    if (text == NULL || *text == '\0' || strlen(text) > 18U) {
+    if (text == NULL || *text == '\0') {
         return -1;
     }
+    const char *p = text;
+    if (*p == '+') ++p;
+    if (*p == '\0') return -1;
     long long value = 0;
-    for (const char *p = text; *p != '\0'; ++p) {
+    for (; *p != '\0'; ++p) {
         if (*p < '0' || *p > '9') {
             return -1;
         }
-        value = value * 10LL + (*p - '0');
+        int digit = *p - '0';
+        if (value > (LLONG_MAX - digit) / 10LL) return -1;
+        value = value * 10LL + digit;
     }
     if (value <= 0) {
         return -1;
