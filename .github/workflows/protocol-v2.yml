@@ -331,6 +331,12 @@ jobs:
           sudo sysctl -w "kernel.core_pattern=$RUNNER_TEMP/c-server-cores/core.%P.%E"
       - name: Test native crash diagnostics
         run: bash implementations/c/server/scripts/collect_core_diagnostics_test.sh
+      - name: Verify Java 21 registration Unicode profile
+        run: |
+          java --add-opens java.base/java.lang=ALL-UNNAMED \
+            implementations/c/server/scripts/GenerateRegistrationUnicode.java \
+            "$RUNNER_TEMP/unicode_java21_data.h"
+          cmp implementations/c/server/src/unicode_java21_data.h "$RUNNER_TEMP/unicode_java21_data.h"
       - name: Configure
         run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -g"
       - name: Build

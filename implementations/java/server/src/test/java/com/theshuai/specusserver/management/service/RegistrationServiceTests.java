@@ -29,6 +29,21 @@ import static org.mockito.Mockito.when;
 
 class RegistrationServiceTests {
     @Test
+    void sharedJava21RootCaseVectorsMatchTheReferenceRuntime() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        String relative = "protocol/test-vectors/java21-root-case-v1.json";
+        while (root != null && !Files.isRegularFile(root.resolve(relative))) root = root.getParent();
+        if (root == null) throw new IllegalStateException("Shared ROOT case vector missing");
+        var fixture = new ObjectMapper().readTree(Files.readString(root.resolve(relative)));
+        assertEquals(1, fixture.path("version").asInt());
+        assertEquals(55, fixture.path("cases").size());
+        for (var item : fixture.path("cases")) {
+            assertEquals(item.path("lower").asText(),
+                    item.path("input").asText().toLowerCase(java.util.Locale.ROOT), item.path("name").asText());
+        }
+    }
+
+    @Test
     void registrationMvcResponsesPreserveUnicodeMaskBoundaries() throws Exception {
         var challenges = mock(ManagementRegistrationChallengeRepository.class);
         var users = mock(ManagementUserService.class);

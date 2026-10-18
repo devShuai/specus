@@ -49,11 +49,18 @@ add_library(specus_c_core
     src/traffic_capture.c
     src/turn_auth.c
     src/upstream_browser_headers.c
+    src/unicode_java21.c
     src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(specus_c_core PUBLIC ZLIB::ZLIB SQLite::SQLite3 OpenSSL::SSL OpenSSL::Crypto CURL::libcurl ${HIREDIS_LIBRARY} ${UTF8PROC_LIBRARY})
 target_compile_options(specus_c_core PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(specus_c_unicode_java21_tests tests/unicode_java21_tests.c)
+target_link_libraries(specus_c_unicode_java21_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_unicode_java21_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME unicode_java21_tests COMMAND specus_c_unicode_java21_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/java21-root-case-v1.json")
 
 # libbrotlidec is optional: with it, Content-Encoding br is decoded as Java's org.brotli:dec does
 # (traffic detail previews and display, media manifests); without it a br body stays as stored.
