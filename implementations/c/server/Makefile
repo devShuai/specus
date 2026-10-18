@@ -94,6 +94,10 @@ SESSION_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_session_reference_server
 SESSION_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_session_reference_tests
 TESTS += $(CONTROL_WRITE_REFERENCE_TESTS)
 ALL_TESTS += $(CONTROL_WRITE_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER) $(SESSION_REFERENCE_TESTS)
+HTTP_LOG_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_log_reason_reference_tests
+HTTP_RESET_REASON_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_http_reset_reason_reference_tests
+TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS)
+ALL_TESTS += $(HTTP_LOG_REASON_REFERENCE_TESTS) $(HTTP_RESET_REASON_REFERENCE_TESTS)
 
 # This adverse clock view uses Linux's process-local preload, never the host clock.
 ifeq ($(shell uname -s),Linux)
@@ -139,6 +143,12 @@ $(SESSION_REFERENCE_SERVER): $(CORE_OBJS) $(BUILD_DIR)/session_reference_main.o 
 
 $(SESSION_REFERENCE_TESTS): $(CORE_OBJS) tests/session_reference_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/session_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(HTTP_LOG_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_log_reason_reference_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/http_log_reason_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(HTTP_RESET_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_reset_reason_reference_tests.c tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/http_reset_reason_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/admin_http_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -301,6 +311,7 @@ $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $
 
 test: all
 	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)
+	$(HTTP_RESET_REASON_REFERENCE_TESTS) $(SERVER)
 	$(CONNECTIVITY_RATE_HTTP_TESTS)
 	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)
 	$(UNICODE_JAVA21_TESTS) "$(abspath $(UNICODE_JAVA21_VECTORS))"

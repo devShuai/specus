@@ -528,3 +528,21 @@ target_compile_options(specus_c_session_reference_tests PRIVATE -Wall -Wextra -W
 add_test(NAME session_reference_tests
     COMMAND specus_c_session_reference_tests $<TARGET_FILE:specus_c_session_reference_server>)
 set_tests_properties(session_reference_tests PROPERTIES TIMEOUT 120)
+
+# Java HttpSpecusControllerStreamResetTests: pure formatting plus real public HTTP/RST,
+# traffic-detail persistence and continued use of the same client control/data session.
+add_executable(specus_c_http_log_reason_reference_tests tests/http_log_reason_reference_tests.c)
+target_link_libraries(specus_c_http_log_reason_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_log_reason_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME http_log_reason_reference_tests COMMAND specus_c_http_log_reason_reference_tests)
+set_tests_properties(http_log_reason_reference_tests PROPERTIES TIMEOUT 30)
+
+add_executable(specus_c_http_reset_reason_reference_tests
+    tests/http_reset_reason_reference_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_http_reset_reason_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_http_reset_reason_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_http_reset_reason_reference_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME http_reset_reason_reference_tests
+    COMMAND specus_c_http_reset_reason_reference_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(http_reset_reason_reference_tests PROPERTIES TIMEOUT 60)

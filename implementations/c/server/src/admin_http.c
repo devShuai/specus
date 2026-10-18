@@ -15138,7 +15138,9 @@ static void record_direct_http_failure(const char *client_name,
             .error = (char *)(failure == NULL ? public_message : failure)
         };
         long long elapsed_ms = admin_now_ms() - started_ms;
-        record_direct_http_exchange(client_name, route, request, &response, body_len, 0, remote_address,
+        /* This body is the server's local error, not bytes received from the upstream. Keep its
+         * captured preview/body, but do not count it as proxied response traffic (Java does not). */
+        record_direct_http_exchange(client_name, route, request, &response, 0U, 0, remote_address,
                                     elapsed_ms < 0 ? 0 : elapsed_ms);
     }
     free(body);
@@ -15384,7 +15386,7 @@ typedef struct {
 } admin_direct_http_sink_state;
 
 /* Returns the length of the valid UTF-8 sequence at text (0 if invalid) and its code point. */
-static size_t admin_log_utf8_sequence(const unsigned char *text, uint32_t *code_point)
+static size_t admin_log_utf8_sequence(const unsigned char *text, size_t remaining, uint32_t *code_point)
 {
     size_t length;
     uint32_t value;
@@ -15404,6 +15406,9 @@ static size_t admin_log_utf8_sequence(const unsigned char *text, uint32_t *code_
     } else {
         return 0U;
     }
+    if (length > remaining) {
+        return 0U;
+    }
     for (size_t i = 1U; i < length; ++i) {
         if ((text[i] & 0xc0U) != 0x80U) {
             return 0U;
@@ -15417,7 +15422,7 @@ static size_t admin_log_utf8_sequence(const unsigned char *text, uint32_t *code_
     return length;
 }
 
-size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
+size_t st_admin_log_safe_reason_n(const char *reason, size_t reason_len, char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0U) {
         return 0U;
@@ -15428,9 +15433,10 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
     }
     static const char truncated[] = "...(truncated)";
     const unsigned char *cursor = (const unsigned char *)reason;
+    const unsigned char *end = cursor + reason_len;
     size_t written = 0U;
     size_t code_points = 0U;
-    while (*cursor != '\0') {
+    while (cursor < end) {
         if (code_points == ST_ADMIN_LOG_REASON_MAX_CODE_POINTS) {
             if (written + sizeof(truncated) <= out_len) {
                 memcpy(out + written, truncated, sizeof(truncated));
@@ -15453,7 +15459,7 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
             piece = (const char *)cursor;
             piece_len = 1U;
         } else {
-            size_t sequence = admin_log_utf8_sequence(cursor, &code_point);
+            size_t sequence = admin_log_utf8_sequence(cursor, (size_t)(end - cursor), &code_point);
             if (sequence == 0U) {
                 piece_len = (size_t)snprintf(escaped, sizeof(escaped), "\\x%02x", (unsigned)*cursor);
             } else if (code_point <= 0x9fU || code_point == 0x2028U || code_point == 0x2029U) {
@@ -15477,7 +15483,12 @@ size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
     return written;
 }
 
-static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
+size_t st_admin_log_safe_reason(const char *reason, char *out, size_t out_len)
+{
+    return st_admin_log_safe_reason_n(reason, reason == NULL ? 0U : strlen(reason), out, out_len);
+}
+
+static void direct_sink_on_reset_bytes(void *ctx, uint32_t code, const char *reason, size_t reason_len)
 {
     admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
     char safe_client[512];
@@ -15487,7 +15498,7 @@ static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
     (void)st_admin_log_safe_reason(state->client_name, safe_client, sizeof(safe_client));
     (void)st_admin_log_safe_reason(state->route, safe_route, sizeof(safe_route));
     (void)st_admin_log_safe_reason(state->method, safe_method, sizeof(safe_method));
-    (void)st_admin_log_safe_reason(reason, safe_reason, sizeof(state->reset_reason));
+    (void)st_admin_log_safe_reason_n(reason, reason_len, safe_reason, sizeof(state->reset_reason));
     fprintf(stderr,
             "[http-stream-v2] stream reset client=%s route=%s method=%s status=502 errorCode=%u reason=%s\n",
             safe_client,
@@ -15496,6 +15507,11 @@ static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
             (unsigned)code,
             safe_reason);
     fflush(stderr);
+}
+
+static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
+{
+    direct_sink_on_reset_bytes(ctx, code, reason, reason == NULL ? 0U : strlen(reason));
 }
 
 static void direct_free_strings(char **values, size_t values_len)
@@ -18446,7 +18462,8 @@ static void admin_forward_direct_http(st_admin_server *server,
         .on_data = direct_sink_on_data,
         .on_end = direct_sink_on_end,
         .on_reset = direct_sink_on_reset,
-        .bind_cancel = share == NULL ? NULL : direct_sink_bind_cancel
+        .bind_cancel = share == NULL ? NULL : direct_sink_bind_cancel,
+        .on_reset_bytes = direct_sink_on_reset_bytes
     };
     char remote_address[128];
     admin_fd_remote_text(fd, remote_address);

@@ -10,11 +10,11 @@
 
 ## 2026-10-18 范围盘点与后续核验清单（状态更新至2026-10-19）
 
-本次范围锚定已合并的 main `b8d6e725686b7353db98082b6082a94f5b7c8afa`；注册修复分支另锚定 `37851ae8c020fdd5a52bd0232a4ef00861f01891`。不将尚未合并的归属转移分支新增测试混入 main 的完成率。
+本次范围锚定已合并的 main `b8d6e725686b7353db98082b6082a94f5b7c8afa`；注册修复分支另锚定 `37851ae8c020fdd5a52bd0232a4ef00861f01891`。下文“当前main”均指这个锚定快照，不实时追踪分支变化。不将尚未合并的归属转移分支新增测试混入 main 的完成率。
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；随后补列控制写入、会话清理、离线通知与上线指标4类共8方法的行为证据及限定API差异，见对应新节。当前49=4类纯平台差异+8类候选覆盖（28个注解方法）+37类待核验；37也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；随后补列控制写入、会话清理、离线通知与上线指标4类共8方法，以及HTTP流重置1类2方法的行为证据及限定差异，见对应新节。当前49=4类纯平台差异+9类候选覆盖（30个注解方法）+36类待核验；36也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -47,7 +47,7 @@
 | `http/HttpShareHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpShareVectorTests` | 11 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpSpecusControllerFailClosedTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `http/HttpSpecusControllerStreamResetTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `http/HttpSpecusControllerStreamResetTests` | 2 | 覆盖（行为及既定错误信封差异；候选） | `http_log_reason_reference_tests.c` 逐字比较Java的控制字符/NUL、null及256码点截断预期；`http_reset_reason_reference_tests.c:reset_reason_case` 的3个真实进程/socket场景验证固定公网502、完整安全诊断落库、请求字段及零上游响应字节，并在原连接继续HTTP/TCP。不是另外三个HTTP类的完整对照，精确新提交CI另验。 |
 | `http/NatControlPushFailureVectorTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 覆盖（参考7方法；候选） | `connectivity_http_resource_tests.c` 补齐34种无效body、12种有效请求、完整离线/404/401/503/429响应及SQLite路由访问顺序观察；`connectivity_resource_wire_tests.c` 用真实进程/socket及生产会话表验证owner/admin离线完整结果。另修复并验证9个ASCII Long-ID边界；不扩张为全部数字字符、URL解码或跨NAT验收。 |
 | `management/controller/ManagementAccountsHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -220,6 +220,29 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 最终本地输入核验通过：CMake Release（O3/NDEBUG、Werror）63/63、零失败零跳过；原61个测试序号保留，新增写入与会话测试为62/63。独立O2/Werror Make构建及完整 `make test` 通过，原10000键容量、正常及进程时钟偏差下的真实10秒探测门禁均保留。严格O3焦点的写入2场景与专用测试server进程4场景通过；O2 ASan/UBSan、开启泄漏检查的写入2场景及带观察器server/驱动进程4场景通过，无消毒器报告，不外推普通server所有路径。构建后核验CMake/Make专用main对象确实引用recv观察器，普通server均不含fixture符号；全部生产src经Git文本规范化比较与前驱一致。先前未含最终通知/非默认tenant补强的完整通过记录另行保留，不冒充最终输入结果。
 
 本批精确新提交CI仍待核验，不能沿用前驱 `b1d1590` 的21项CI作为本批结果。失败日志、负对照源码及二进制留在本地证据，不进入发布产物。本节仍是未合并候选；37类待逐项对照、旧79类当前断言复核以及#35其他运行时/真实环境验收尚未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
+
+## HTTP流重置：公网错误、诊断与流量字节（2026-10-19增量）
+
+本节源码基线为未合并C分支 `1f59784a065aa58b7f77f157f0ab9b6ccd4d98db`（树 `038b1dbf20398d522b8518e721be85e3b76453d8`），本节新增1类2个Java注解方法的候选对照，累计为9类30方法。前驱原始Protocol 12项与实验室9项CI已独立核验通过，其实际测试合成提交为 `250387984ddc143e4d784af689861dc93f2c0e10`、测试树与前驱相同；这些绿灯不能作为本批新增修复的验收证据。Java参考类与上方main盘点一致，Java源码、共享规范/向量和工作流不变。同期完整阅读的 `HttpSpecusControllerFailClosedTests`、`NatControlPushFailureVectorTests`、`HttpRouteLifecycleVectorTests` 仍保持待逐项核验，不因读过源码或相关功能已存在而改为覆盖。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `clientResetBeforeResponseHeadersReturnsGenericBadGatewayAndLogsEscapedReason` | `http_reset_reason_reference_tests.c:reset_reason_case` mode0：真实HTTP/JWT/SQLite、control/data连接，收到实际请求FIN后发送带Java相同URL/query/CRLF伪造头reason及connect-refused分类的RST；公网严格502及固定通用正文，不泄露IP、URL、secret、分类或伪造头。真实失败明细逐项核验client、GET、相对路径、原始query、success=false、完整转义原因、request_bytes=0及response_bytes=0；日志保留完整转义原因而无原始CR。原数据连接随后继续提供HTTP与TCP服务。 | Java使用EmbeddedChannel、MockServletResponse和mock记录器；C经真实进程/线上帧并检查实际SQLite记录。按既定 `http-route.md` 第1节，C继续用JSON错误信封承载同一固定通用文本，Java正文是纯文本；不为追求字节相同而更改已规定的C信封。 |
+| `logSafeReasonEscapesControlCharactersAndTruncates` | `http_log_reason_reference_tests.c` 逐字比较原Java字符串的CR/LF/TAB/NUL/U+2028/反斜线、NULL为空及300个x保留前256个再加截断标记；额外检查257个emoji按完整码点截断、非NUL结尾的不完整UTF-8有界处理、旧C字符串入口和小输出缓冲。mode1在真实FIN后、mode2在实际发送满1MiB信用且未补窗口/尚不能发FIN的上传中发送含NUL的RST，两条生产错误分支都验证NUL后的完整诊断、零上游响应字节及原连接可继续服务。 | Java String与C字节串/缓冲API不同；新增带长度的可选sink回调优先，旧on_reset和C字符串格式入口仍保留。256按Unicode码点而非UTF-8字节计数；这些额外边界不是新增Java注解方法。 |
+
+具体长度入口为 `on_reset_bytes(ctx, code, reason, reason_len)` 与 `st_admin_log_safe_reason_n(reason, reason_len, out, out_len)`；未设置新回调时回退到旧 `on_reset`，旧 `st_admin_log_safe_reason` 继续接收C字符串。mode2的请求体为1MiB+1字节，驱动实际读到该stream累计恰好1MiB的DATA，期间若读到FIN或超额DATA就失败，不发送WINDOW_UPDATE；剩余1字节没有信用可发，随后RST触发上传等待的失败路径。这里是loopback真实进程/帧验证，不是跨NAT或TLS验收。
+
+公网固定文本仍为 `HTTP 转发请求失败`，C正文精确为 `{"error":"HTTP 转发请求失败"}`；诊断截断标记为 `...(truncated)`。实际复现两处生产偏差。第一，旧C把JSON中的 `\u0000` 解码后当C字符串结尾，日志及管理失败原因丢失后缀；候选沿解析、pending保存/拷贝、正常等待及上传失败两条报告路径传递字节长度，并在诊断中把NUL转义为可见的 `\u0000`。这不是邮箱输入的NUL拒绝规则，也不改变RST自由诊断文本的输入政策或metadata.failure分类解析。第二，在尚未收到任何上游响应时，旧C把本地生成的35字节JSON错误正文记入response_bytes；候选只将这种本地失败记录的响应流量计为0，仍保留本地错误正文用于明细采集，不改变公网正文或已转发响应分支的实际字节统计。本批实测零字节场景不证明所有部分响应、改写缓冲或采集路径的计数均已对齐。
+
+基线实际复现和中间输入分别保留：最初探针漏给共享向量编译宏只造成编译失败，不算生产证据；修正后同一真实RST场景在完整安全原因断言失败，原日志明确止于NUL。补充明细夹具时曾误用不存在的client_id列，SQL设置失败也不算统计偏差；改为实际client_name键后，原实现与仅修NUL的中间实现都实测response_bytes=35而非0。没有删除这些准备失败，也不把脚本退出0误读成其内期望失败的可执行程序退出0。
+
+两个独立故障负对照已执行：仅把收到的reason长度改回strlen时，普通泄露reason场景通过、两个NUL场景均在完整落库原因断言失败；仅把本地失败response_bytes从0改回body_len时，三个真实场景都实测35而非0并失败。两个变体的可执行程序各退出1，核验这些预期失败的脚本退出0；它们不进入提交，不声称整个旧测试套件在这些变体下都通过。正常焦点的格式程序、三场景、原admin HTTP程序及上一批写入2/会话4场景通过；O2/NDEBUG ASan/UBSan的格式程序、三场景驱动与普通服务端也实际通过、退出泄漏检查开启且无报告。消毒器证据不外推TLS、负对照或服务端全部路径。
+
+新增两个测试接入CMake/Make，原63个Linux CTest序号与全部旧测试入口保留；新格式与真实RST套件的序号为64/65。真实RST套件复用原nat_stream真实连接夹具但不执行其原main，原nat_stream的独立完整入口未删减。首轮完整CMake为58/65、零跳过：7个脚本入口因私有Linux导出的CRLF行尾在执行测试逻辑前失败，其余58项通过；原始完整输入及失败日志保留。仅规范化副本脚本行尾后，15个脚本的Git规范文本均与前驱相同，不把准备修正说成生产修复。
+
+修正副本导出后的完整Linux CMake Release（O3/NDEBUG、Werror）65/65、零失败零跳过。O2/Werror完整Make首次在原TURN断言“stale nonce刷新应得438”处未取得有效响应而失败，记录保留；前驱O2、本批O2及O3的完整TURN程序独立重放均通过，原失败的确切或唯一原因仍未证明。没有改TURN生产代码、原2秒UDP接收超时或断言，也不声称重放通过就修复了该历史失败。随后相同149个冻结执行源码输入、相同O2二进制，在原600秒上限下完整Make通过，保留实际10000键、原正常NAT及进程时钟偏差下的真实10秒门禁。最终CMake注册的两个新增套件（格式程序及三场景）另独立通过ASan/UBSan，两个故障变体也用最终真实RST程序重跑，均命中原定失败阶段。
+
+上述是本批本地证据；精确新提交CI仍须按PR #290的实际提交/测试树及原始产物另验，不能借前驱21项绿灯。上节37类是该阶段记录；本批后当前36类待对照，旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
 
 ## 历史表的读法与限制
 

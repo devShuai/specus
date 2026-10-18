@@ -191,6 +191,7 @@ typedef struct direct_http_pending {
     /* metadata.failure of the client's RST, for the connectivity check; "" when absent. */
     char failure[32];
     char *error;
+    size_t error_len;
     direct_http_event *events_head;
     direct_http_event *events_tail;
     size_t event_count;
@@ -1382,6 +1383,7 @@ static void direct_pending_fail_all(specus_session *session, const char *message
         if (!pending->done) {
             free(pending->error);
             pending->error = dup_string(message);
+            pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
             pending->done = 1;
             pthread_cond_broadcast(&pending->cond);
         }
@@ -1558,9 +1560,12 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     if (message->type == ST_NAT_RST) {
         /* A client RST after the server's own reset keeps the server's failure. */
         if (!pending->reset) {
-            char *reason = st_json_get_string(metadata, "reason");
+            size_t reason_len = 0U;
+            char *reason = st_json_get_string_len(metadata, "reason", &reason_len);
             free(pending->error);
             pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
+            pending->error_len = reason != NULL ? reason_len
+                : pending->error == NULL ? 0U : strlen(pending->error);
             pending->client_reset = 1;
             pending->reset_code = message->value;
             /* Only the connectivity check reads it, and only from a session that announced it. */
@@ -1640,6 +1645,7 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
     if (reset_code != 0U) {
         free(pending->error);
         pending->error = dup_string(reset_reason);
+        pending->error_len = pending->error == NULL ? 0U : strlen(pending->error);
         pending->done = 1;
         pending->reset = 1;
         pthread_cond_broadcast(&pending->cond);
@@ -1787,9 +1793,11 @@ static void active_session_close_data_locked(specus_session *control)
 /* Hands a client RST reason to the sink for server-side logging; it never reaches the caller. */
 static int direct_report_client_reset(const st_admin_direct_http_sink *sink,
                                       uint32_t code,
-                                      const char *reason)
+                                      const char *reason, size_t reason_len)
 {
-    if (sink->on_reset != NULL) {
+    if (sink->on_reset_bytes != NULL) {
+        sink->on_reset_bytes(sink->ctx, code, reason, reason_len);
+    } else if (sink->on_reset != NULL) {
         sink->on_reset(sink->ctx, code, reason);
     }
     return ST_ADMIN_DIRECT_HTTP_STREAM_RESET;
@@ -2232,8 +2240,12 @@ static int direct_http_forward(void *ctx,
         int cancelled = pending.cancelled;
         int already_reset = pending.reset;
         direct_http_event *event = result == 0 && !cancelled ? direct_pending_pop(&pending) : NULL;
-        char *pending_error = !cancelled && event == NULL && pending.error != NULL
-            ? dup_string(pending.error) : NULL;
+        size_t pending_error_len = pending.error_len;
+        char *pending_error = NULL;
+        if (!cancelled && event == NULL && pending.error != NULL) {
+            pending_error = (char *)malloc(pending_error_len + 1U);
+            if (pending_error != NULL) memcpy(pending_error, pending.error, pending_error_len + 1U);
+        }
         int client_reset = pending.client_reset;
         uint32_t reset_code = pending.reset_code;
         pthread_mutex_unlock(&session->direct_lock);
@@ -2252,7 +2264,7 @@ static int direct_http_forward(void *ctx,
         }
         if (pending_error != NULL) {
             result = client_reset
-                ? direct_report_client_reset(sink, reset_code, pending_error) : -1;
+                ? direct_report_client_reset(sink, reset_code, pending_error, pending_error_len) : -1;
             free(pending_error);
             break;
         }
@@ -2346,7 +2358,7 @@ failed:
     /* A client RST while the request body was still uploading is reported like one after it. */
     int failed_result = failed_cancelled ? ST_ADMIN_DIRECT_HTTP_STREAM_CANCELLED
         : pending.client_reset && pending.error != NULL
-        ? direct_report_client_reset(sink, pending.reset_code, pending.error) : -1;
+        ? direct_report_client_reset(sink, pending.reset_code, pending.error, pending.error_len) : -1;
     free(pending.error);
     pthread_cond_destroy(&pending.cond);
     session_reference_release(session);
