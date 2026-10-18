@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "connectivity_check.h"
 #include "json.h"
@@ -18,6 +19,18 @@
 #define ST_CONNECTIVITY_VECTOR_DIR "../../../protocol/test-vectors/"
 #endif
 
+#define CHECK_START_MS 7000000LL
+#define CHECKED_AT "2026-10-06T08:00:00Z"
+
+/* Test-executable-only libc symbol interposition, matching the Java fixture's fixed wall clock.
+ * No production clock seam, date conversion or random-byte source is replaced. */
+time_t time(time_t *out)
+{
+    time_t fixed = (time_t)1791273600;
+    if (out != NULL) *out = fixed;
+    return fixed;
+}
+
 typedef struct {
     char kind[16];
     int status;
@@ -28,6 +41,7 @@ typedef struct {
 
 typedef struct {
     long long now;
+    long long check_start;
     int control_online;
     int data_online;
     int capability;
@@ -35,6 +49,7 @@ typedef struct {
     size_t answers_len;
     size_t next_answer;
     char metadata[4][1024];
+    long long timeouts[4];
     size_t probes;
     char last_log[512];
     size_t logs;
@@ -57,21 +72,21 @@ static void fake_probe(void *ctx,
                        st_connectivity_probe_answer *answer)
 {
     (void)client_name;
-    (void)timeout_ms;
     fake_device *device = (fake_device *)ctx;
     if (device->probes < 4U) {
         snprintf(device->metadata[device->probes], sizeof(device->metadata[0]), "%s", metadata_json);
+        device->timeouts[device->probes] = timeout_ms;
     }
     ++device->probes;
     memset(answer, 0, sizeof(*answer));
     answer->capability = device->capability;
     if (device->next_answer >= device->answers_len) {
         answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
-        device->now = ST_CONNECTIVITY_BUDGET_MS;
+        device->now = device->check_start + ST_CONNECTIVITY_BUDGET_MS;
         return;
     }
     const scripted_answer *scripted = &device->answers[device->next_answer++];
-    device->now = scripted->at_ms;
+    device->now = device->check_start + scripted->at_ms;
     if (strcmp(scripted->kind, "response") == 0) {
         answer->kind = ST_CONNECTIVITY_PROBE_RESPONSE;
         answer->status_code = scripted->status;
@@ -85,7 +100,7 @@ static void fake_probe(void *ctx,
             ? ST_CONNECTIVITY_PROBE_STREAM_LIMIT : ST_CONNECTIVITY_PROBE_WRITE_FAILED;
     } else {
         answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
-        device->now = ST_CONNECTIVITY_BUDGET_MS;
+        device->now = device->check_start + ST_CONNECTIVITY_BUDGET_MS;
     }
 }
 
@@ -201,15 +216,17 @@ static int run_case(const char *raw_case)
 
     fake_device device;
     memset(&device, 0, sizeof(device));
+    device.now = CHECK_START_MS;
+    device.check_start = CHECK_START_MS;
     device.control_online = 1;
     device.data_online = 1;
     fake_routes routes = {
         .readable = bool_or(input, "configReadable", 1),
         .visible = bool_or(input, "routeVisible", 1),
     };
-    snprintf(routes.route.tenant_id, sizeof(routes.route.tenant_id), "default");
-    snprintf(routes.route.client_name, sizeof(routes.route.client_name), "device-a");
-    snprintf(routes.route.route, sizeof(routes.route.route), "app");
+    snprintf(routes.route.tenant_id, sizeof(routes.route.tenant_id), "t1");
+    snprintf(routes.route.client_name, sizeof(routes.route.client_name), "device-42");
+    snprintf(routes.route.route, sizeof(routes.route.route), "api");
     snprintf(routes.route.target_base_url, sizeof(routes.route.target_base_url), "http://127.0.0.1:8080/base");
     routes.route.route_enabled = 1;
     routes.route.client_enabled = 1;
@@ -230,6 +247,7 @@ static int run_case(const char *raw_case)
     char **answers = NULL;
     size_t answers_len = 0;
     if (input != NULL && st_json_get_raw_array(input, "answers", &answers, &answers_len) == 0) {
+        if (answers_len > 4U) failed = 1;
         for (size_t i = 0; i < answers_len && i < 4U; ++i) {
             scripted_answer *answer = &device.answers[device.answers_len++];
             copy_string(answers[i], "kind", answer->kind, sizeof(answer->kind));
@@ -247,7 +265,7 @@ static int run_case(const char *raw_case)
     char admission[32];
     copy_string(input == NULL ? "{}" : input, "admission", admission, sizeof(admission));
     if (strcmp(admission, "route-in-progress") == 0) {
-        failed |= st_connectivity_admit(checker, "default", "admin", 42, 0, &occupied) != 0;
+        failed |= st_connectivity_admit(checker, "t1", "admin", 42, CHECK_START_MS, &occupied) != 0;
     } else if (strcmp(admission, "server-busy") == 0) {
         for (long long id = 1; id <= 32; ++id) {
             char user[32];
@@ -256,10 +274,10 @@ static int run_case(const char *raw_case)
         }
     }
 
-    const char *body = bool_or(input, "requestValid", 1) ? "" : "{\"path\":\"/../admin\"}";
+    const char *body = bool_or(input, "requestValid", 1) ? "{\"path\":\"/healthz\"}" : "{\"path\":\"/status/../admin\"}";
     st_connectivity_request request = {
         .authenticated = bool_or(input, "authenticated", 1),
-        .tenant_id = "default",
+        .tenant_id = "t1",
         .username = "alice",
         .route_id = "42",
         .body = body,
@@ -297,6 +315,10 @@ static int run_case(const char *raw_case)
             fprintf(stderr, "%s: a refused check reached the device\n", name);
             failed = 1;
         }
+        if (device.logs != 0U) {
+            fprintf(stderr, "%s: a refused check emitted a completion log\n", name);
+            failed = 1;
+        }
     } else if (!failed) {
         char *body_raw = st_json_get_top_level_raw(expect, "body");
         static char want[8192];
@@ -307,8 +329,8 @@ static int run_case(const char *raw_case)
         const char *prefix = "{\"schemaVersion\":1,\"kind\":\"http-route\",\"routeId\":42,\"checkedAt\":\"";
         const char *checked_at = strncmp(response.body, prefix, strlen(prefix)) == 0
             ? response.body + strlen(prefix) : NULL;
-        if (checked_at == NULL || strlen(checked_at) < 22U || checked_at[4] != '-' || checked_at[10] != 'T'
-            || checked_at[19] != 'Z' || checked_at[20] != '"' || checked_at[21] != ',') {
+        if (checked_at == NULL || strlen(checked_at) < 22U || strncmp(checked_at, CHECKED_AT, 20U) != 0
+            || checked_at[20] != '"' || checked_at[21] != ',') {
             fprintf(stderr, "%s: runtime fields malformed in %s\n", name, response.body);
             failed = 1;
         } else {
@@ -318,29 +340,58 @@ static int run_case(const char *raw_case)
                 failed = 1;
             }
         }
-        /* Each request is one probe with the fixed metadata; the log line names no target. */
+        char *expected_body = st_json_get_top_level_raw(expect, "body");
+        char **requests = NULL;
+        size_t requests_len = 0;
+        if (expected_body == NULL || st_json_get_string_array(expected_body, "requests", &requests, &requests_len) != 0
+            || requests_len != device.probes || requests_len != device.answers_len
+            || device.next_answer != device.answers_len || response.retry_after_seconds != 0) {
+            fprintf(stderr, "%s: probe/script counts or successful Retry-After differ\n", name);
+            failed = 1;
+        }
+        /* Exact key order and values reject extra headers/fields, not merely a substring match. */
         for (size_t i = 0; i < device.probes && i < 4U; ++i) {
             const char *metadata = device.metadata[i];
-            char *method = st_json_get_top_level_string(metadata, "method");
-            char *relative = st_json_get_top_level_string(metadata, "relativePath");
-            char *query = st_json_get_top_level_string(metadata, "rawQuery");
-            int ok = method != NULL && strcmp(method, i == 0U ? "HEAD" : "GET") == 0
-                && relative != NULL && strcmp(relative, "/") == 0 && query != NULL && *query == '\0'
-                && strstr(metadata, "\"headers\":[\"Accept:*/*\",\"User-Agent:specus-connectivity-check/1\"]") != NULL
-                && strstr(metadata, "contentLength") == NULL && strstr(metadata, "\"requestId\":\"") != NULL;
-            free(method);
-            free(relative);
-            free(query);
+            char *request_id = st_json_get_top_level_string(metadata, "requestId");
+            int ok = request_id != NULL && strlen(request_id) == 32U;
+            for (size_t j = 0U; ok && j < 32U; ++j) {
+                char c = request_id[j];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) ok = 0;
+            }
+            char wanted_metadata[1024];
+            char got_metadata[1024];
+            snprintf(wanted_metadata, sizeof(wanted_metadata),
+                     "{\"source\":\"http\",\"phase\":\"request\",\"requestId\":\"%s\",\"method\":\"%s\","
+                     "\"route\":\"api\",\"relativePath\":\"/healthz\",\"rawQuery\":\"\","
+                     "\"headers\":[\"Accept:*/*\",\"User-Agent:specus-connectivity-check/1\"]}",
+                     request_id == NULL ? "" : request_id, i < requests_len ? requests[i] : "missing-request");
+            minify(metadata, got_metadata, sizeof(got_metadata));
+            long long wanted_timeout = ST_CONNECTIVITY_BUDGET_MS - (i == 0U ? 0 : device.answers[0].at_ms);
+            ok = ok && strcmp(got_metadata, wanted_metadata) == 0 && device.timeouts[i] == wanted_timeout;
+            free(request_id);
             if (!ok) {
-                fprintf(stderr, "%s: probe metadata %s\n", name, metadata);
+                fprintf(stderr, "%s: probe %zu metadata/budget differs: %s timeout=%lld want=%lld\n",
+                        name, i, metadata, device.timeouts[i], wanted_timeout);
                 failed = 1;
             }
         }
-        if (strncmp(device.last_log, "[connectivity-check] tenant=default user=alice route=42 outcome=", 64U) != 0
-            || strstr(device.last_log, "127.0.0.1") != NULL) {
+        char outcome[32], stopped_at[32], code[64];
+        copy_string(expected_body, "outcome", outcome, sizeof(outcome));
+        copy_string(expected_body, "stoppedAt", stopped_at, sizeof(stopped_at));
+        copy_string(expected_body, "code", code, sizeof(code));
+        long long total_ms = -1;
+        (void)st_json_get_i64(expected_body, "totalMs", &total_ms);
+        char wanted_log[512];
+        snprintf(wanted_log, sizeof(wanted_log),
+                 "[connectivity-check] tenant=t1 user=alice route=42 outcome=%s stage=%s code=%s totalMs=%lld",
+                 outcome, stopped_at[0] == '\0' ? "-" : stopped_at, code, total_ms);
+        if (device.logs != 1U || strcmp(device.last_log, wanted_log) != 0
+            || strstr(device.last_log, "/healthz") != NULL || strstr(device.last_log, "127.0.0.1") != NULL) {
             fprintf(stderr, "%s: log line %s\n", name, device.last_log);
             failed = 1;
         }
+        st_json_free_string_array(requests, requests_len);
+        free(expected_body);
     }
     st_connectivity_response_free(&response);
     st_connectivity_checker_free(checker);
@@ -348,6 +399,39 @@ static int run_case(const char *raw_case)
     free(expect);
     free(route_raw);
     free(device_raw);
+    return failed;
+}
+
+/* Factory-level shared declarations must agree with the actual admission boundary too. */
+static int run_vector_admission_constants(const char *vector)
+{
+    char *rate = st_json_get_top_level_raw(vector, "rate");
+    int per_route = 0;
+    int per_server = 0;
+    int failed = rate == NULL || st_json_get_int(rate, "maxConcurrentPerRoute", &per_route) != 0
+        || st_json_get_int(rate, "maxConcurrentPerServer", &per_server) != 0
+        || per_route != 1 || per_server < 1 || per_server > 4096;
+    free(rate);
+    if (failed) return 1;
+    fake_device device = {0};
+    st_connectivity_device fake = {fake_presence, fake_probe, fake_now, fake_log, &device};
+    st_connectivity_checker *checker = st_connectivity_checker_new(&fake);
+    if (checker == NULL) return 1;
+    st_connectivity_refusal refusal;
+    failed = st_connectivity_admit(checker, "vector", "owner", 42, 0, &refusal) != 0
+        || st_connectivity_admit(checker, "vector", "other", 42, 0, &refusal) == 0
+        || refusal.status != 429 || strcmp(refusal.code, "CHECK_IN_PROGRESS") != 0;
+    st_connectivity_release(checker, 42);
+    for (int i = 0; !failed && i < per_server; ++i) {
+        char user[32];
+        snprintf(user, sizeof(user), "vector-user-%d", i);
+        failed = st_connectivity_admit(checker, "vector", user, 1000 + i, 0, &refusal) != 0;
+    }
+    if (!failed) failed = st_connectivity_admit(checker, "vector", "overflow", 99999, 0, &refusal) == 0
+        || refusal.status != 503 || strcmp(refusal.code, "CHECK_BUSY") != 0;
+    st_connectivity_checker_free(checker);
+    if (failed) fprintf(stderr, "shared vector admission constants disagree with actual limits\n");
+    else puts("connectivity vector: shared admission constants and boundaries passed");
     return failed;
 }
 
@@ -642,6 +726,7 @@ int main(void)
     }
     printf("connectivity vector: %zu/%zu cases passed\n", passed, cases_len);
     st_json_free_string_array(cases, cases_len);
+    failed |= run_vector_admission_constants(vector);
     failed |= run_rate_events(vector);
     failed |= run_refusal_consumes_neither_key();
     failed |= run_full_key_table_boundaries();

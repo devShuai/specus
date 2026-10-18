@@ -23,7 +23,7 @@
 | 旧表外的 Java 测试类 | 注解方法（main／注册分支） | 当前对照状态 | 依据或剩余工作 |
 | --- | ---: | --- | --- |
 | `connectivity/HttpRouteConnectivityCheckRateTests` | 5 | 部分 | `connectivity_check_tests.c:run_rate_events` 与本轮三个限流边界函数已覆盖核心处理器层的限额、拒绝不扣额、实际10000键容量及503/no-probe；逐事件及全表满的生产HTTP响应构造入口响应头仍缺独立断言，见下方逐方法记录。 |
-| `connectivity/HttpRouteConnectivityCheckVectorTests` | 1 | 部分 | `connectivity_check_tests.c:run_case` 回放38个状态向量；尚缺完整探测元数据/次数、HEAD与GET剩余预算、完整日志字段及对应HTTP层断言。`@TestFactory` 的一个声明不等于一个运行用例。 |
+| `connectivity/HttpRouteConnectivityCheckVectorTests` | 1 | 部分 | `run_case` 回放38个向量，并补齐核心层完整元数据、探测/脚本次数、HEAD/GET预算参数、固定checkedAt及完整日志；`run_vector_admission_constants` 检查工厂声明与名额边界。仍缺逐向量的生产HTTP响应构造入口、响应头及并发占位等证据。`@TestFactory` 的一个声明不等于一个运行用例。 |
 | `connectivity/NatConnectivityProbeTests` | 7 | 部分 | `nat_stream_tests.c` 有真实HEAD→GET、RST、FIN结束及迟到帧场景；本节后续增量修复了已结束探测的迟到帧回包差异。全部分类/能力/断链/超时及完整元数据等断言仍未逐一覆盖，不能提升为整类覆盖。 |
 | `database/MariaDbSchemaTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/MySqlColumnTypeTests` | 2 | 无（平台差异） | 两项均是 Hibernate `MySQLDialect` 的静态 DDL 类型/utf8mb4 行大小检查；C 只用 SQLite。C 自身的大对象保存与完整读回仍须由相应行为测试核验。 |
@@ -74,7 +74,7 @@
 
 ## 连通性检查的逐方法对照（本轮增量）
 
-本节初次逐方法核对基于注册分支 `dbccd2fdfed6e46791594c0182b1e52fecad708f` 的 Java/C 源码；它是上方 `37851ae8c020fdd5a52bd0232a4ef00861f01891` 的直接后继，只修改本清单，两者的相关 Java/C 源码相同。首批提交 `fee457f` 只给 `tests/connectivity_check_tests.c` 增加断言，Java方法和C生产实现未改；后续对已结束探测的生产修复单列在本节末。下列未标为增量的HTTP响应构造入口和NAT证据来自原基线，不冒充新增用例。四个类共20个注解方法，属于上面49类中的4类“部分”，不另计为20个测试类。
+本节初次逐方法核对基于注册分支 `dbccd2fdfed6e46791594c0182b1e52fecad708f` 的 Java/C 源码；它是上方 `37851ae8c020fdd5a52bd0232a4ef00861f01891` 的直接后继，只修改本清单，两者的相关 Java/C 源码相同。首批提交 `fee457f` 只给 `tests/connectivity_check_tests.c` 增加断言，Java方法和C生产实现未改；后续生产修复及核心向量补证分别单列。下列未标为增量的HTTP响应构造入口和NAT证据来自原基线，不冒充新增用例。四个类共20个注解方法，属于上面49类中的4类“部分”，不另计为20个测试类。
 
 C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_auth`，经过生产响应构造、JWT与SQLite，但不经过监听socket；Java的对应资源测试使用MockMvc，也不是实网HTTP。`connectivity_check_tests.c` 的假设备通过注入presence、probe、单调时钟和日志回调驱动核心检查器，不是真实设备。下列 `nat_stream_tests` 场景使用真实进程/socket；相关的 `session_lifecycle_tests` 也有真实进程/socket场景，但不能由此推定已覆盖全部探测链路状态。
 
@@ -89,7 +89,7 @@ C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_aut
 | `aRefusalConsumesNeitherKey` | 本轮 `run_refusal_consumes_neither_key` | 路由拒绝20次不消耗另一用户的10次预算；因用户额度耗尽而拒绝的请求也不消耗其所请求路由的额度 | 此方法的核心限额断言已对应，不因此提升整个类的状态 |
 | `aFullKeyTableRefusesNewKeysWithoutEvictingLiveOnes` | 本轮 `run_full_key_table_boundaries` | 10000键满表拒新键、不驱逐有效键；10秒路由键过期但用户键表仍满，30秒后可接纳 | 此方法的核心边界断言已对应 |
 | `aFullKeyTableIsCheckBusy` | 本轮 `run_full_key_table_is_busy` | 核心处理器满表503、精确CHECK_BUSY body、Retry-After=1、零探测 | 仍缺该分支的HTTP响应构造入口 Cache-Control等响应头断言 |
-| `HttpRouteConnectivityCheckVectorTests.everyCaseOfTheSharedVector` | `run_case` | 38个状态向量的状态/body比较、运行时字段形状、拒绝不探测及部分元数据/日志检查 | 未核对完整元数据键与顺序、requestId十六进制格式、探测次数/脚本耗尽、HEAD/GET剩余预算、完整日志字段；HTTP头与固定墙钟的完整对应也未建立 |
+| `HttpRouteConnectivityCheckVectorTests.everyCaseOfTheSharedVector` | `run_case`、`run_vector_admission_constants` | 38个核心向量状态/body；32个200结果的固定checkedAt、完整有序元数据、32位小写十六进制requestId、探测次数/脚本耗尽、非零起点的HEAD/GET剩余预算、日志字符串与条数；6个拒绝不探测/不记完成日志；工厂预算与名额边界 | 未逐向量经过生产HTTP响应构造入口核验Cache-Control、Content-Type、Retry-After及401框架响应；顺序占用名额不替代真实并发HTTP占位。Java的Logback INFO级别断言在C字符串日志回调中没有同一框架概念，不以该差异豁免日志字段/条数 |
 | `NatConnectivityProbeTests.everyClassifiedResetOfACapableSessionReachesTheCheck` | `check_connectivity_client_reset_failure`；`run_case` 的 `connect-refused`、`connect-timeout`、`dns-failed`、`tls-failed`、`unreachable`、`target-invalid-on-device`、`protocol-error`、`budget-expired` | 真实进程/socket的connect-refused传递与reason脱敏；其他分类有假设备状态向量 | 全部8种分类的真实帧路径和OPEN/FIN/RST序列尚缺 |
 | `aResetIsUnverifiedWithoutTheCapabilityOrWithAnUnknownFailure` | `run_case` 的 `capable-unknown-failure`、`capable-unclassified`、`legacy-client-reset`、`legacy-client-reset-ignores-failure` | 核心检查器的不可信分类结果 | 缺能力未声明、未知failure及无failure的真实NAT帧组合与状态断言 |
 | `theProbeOpensAFixedRequestAndTheHeadEndsIt` | `check_connectivity_probe_late_rst`、`check_connectivity_probe_ended_by_fin` | 真实HEAD405→GET、响应头后复位、FIN已结束时不复位；后续增量对已结束HEAD/GET及FIN结束的探测逐帧验证迟到响应被静默丢弃，且普通流历史更替不会破坏该行为 | 完整请求元数据、requestId格式及全部OPEN/FIN/RST顺序仍待逐断言对应；不能只凭此行把该方法或整类标为完整覆盖 |
@@ -105,7 +105,7 @@ C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_aut
 | `unreadableRecordsAre503NotNotConfigured` | `run_case` 的configReadable=false | 核心处理器CHECK_UNAVAILABLE及Retry-After | 尚缺HTTP响应构造入口读库失败503/private no-store、不冒充未配置的专门回归 |
 | `theSameRouteIsRateLimitedForEveryCaller` | `test_connectivity_check_endpoint` | owner执行后同租户admin得到429、精确code及Retry-After10 | 尚缺该429分支明确的private no-store断言 |
 
-### 后续增量：已结束探测的迟到帧
+### 生产修复 `3d9af54`：已结束探测的迟到帧
 
 `fee457f` 基线确有行为差异：Java丢弃已结束探测的迟到响应，C的原测试却要求迟到DATA得到RST7。该差异不是平台豁免。[连通性检查契约](../../../protocol/spec/service-connectivity-check.md)第5节要求丢弃在途响应DATA、不回WINDOW_UPDATE；Java `abandonHttpStream` 及本类测试另明确丢弃迟到OPEN/DATA/FIN/RST，不回任何帧。
 
@@ -114,6 +114,16 @@ C的 `test_connectivity_check_endpoint` 调用 `st_admin_build_response_with_aut
 新增socket回归对迟到DATA、DATA|END_STREAM、FIN、RST和响应OPEN逐帧检查：每发一个迟到帧，再在同一有序数据连接发送心跳；收到该次心跳响应前，不得收到该流的任何NAT帧（不只是没有RST，也包括没有WINDOW_UPDATE）。该连接的读循环先同步分派前面的NAT帧再处理心跳，测试没有并发发送其他心跳；这是处理屏障，不是等待任意固定延时后推断静默。随后在原数据连接完成新的HTTP请求（状态200且body为`served`），以及TCP DATA转送与RST关闭，证明仍可服务，不只是socket未关闭。覆盖被RST结束的HEAD/GET及已由FIN结束的探测；另对1025条普通未知流逐条断言RST7，再确认原探测仍静默。独立的私有状态检查验证1024条自身上限、复用清理和pending到历史的交接；它不是实网强制复用32位ID的验收。
 
 同一新增socket测试对未修复基线在首个迟到DATA处失败；仅把探测查询错误改为共用普通流历史的负对照，在1025条普通流更替之后失败。私有状态检查也能检出故意不清除复用ID的缺陷。这些证据只接受本增量的已结束探测行为，不补足本表其他分类、预算、元数据、断链、HTTP入口或跨NAT真机缺口。首次完整本地CMake因导出准备问题为48/56（7项脚本CRLF、1项缺静态资源），原日志保留；重新按Linux行尾导出并补齐静态资源后，同一生产候选完整CMake为56/56、零跳过，完整Make也通过且保留600秒限制。两次导出的C生产和测试源码规范化行尾后相同，不把测试准备差异说成源码修复。该本地结果不是新提交CI；最终提交、测试树及原始CI产物由[PR #290进度记录](https://github.com/devShuai/specus/pull/290)逐批绑定核验，不借用旧提交绿灯。
+
+### 后续增量：核心向量的请求参数与时钟断言
+
+本批以 `3d9af54b580ba3201770ea0e9a4c554a4b7334ab`（树 `6e2fd97958c0b96fa5aa92c856f8661003348dc2`）为源码基线，只补 `connectivity_check_tests.c` 与本清单，不修改C生产实现、Java参考、共享向量或工作流。本批受测测试文件Git blob为 `d1d4b79529ea95226095b35438ebd1c73ff1f200`；最终提交会绑定该文件，而不在本文写入自引用的文档提交SHA。38个向量中32个为200结果、6个为拒绝；不是新增38个类或Java方法，也不是新增实网请求数。200表示检查结果成功返回，可能在设备离线等阶段零探测；每条向量的具体探测次数由requests决定。
+
+核心回放采用与Java参考相同的单调时钟起点7000000ms、`t1`租户、`api`路由和`/healthz`路径。每个探测记录实际timeout参数，逐项比较HEAD为10000ms、GET为10000减HEAD的atMs（脚本相对本次检查开始的毫秒数），并要求实际探测数、脚本答案数、已消耗答案数与向量requests数全部相等。元数据固定键顺序为 `source, phase, requestId, method, route, relativePath, rawQuery, headers`，值分别为http/request、生成的ID、对应HEAD或GET、api、/healthz、空query及精确有序的两个Accept/User-Agent头；requestId另验证32位小写十六进制。沿用生产的RAND_bytes及原回退，不替换随机字节来源，本批只验证ID格式，不证明随机性或唯一性。额外字段、头或请求不会被只查子串的旧断言放过。这里核验的是核心传给设备回调的预算参数与状态决策，不是实际NAT设备耗时或超时回收验收。
+
+在本批WSL Ubuntu24.04构建中，只有connectivity测试可执行程序自行定义libc `time` 符号，固定为 `2026-10-06T08:00:00Z`，验证完整checkedAt；该进程内解析time符号的调用会使用此固定值，没有为生产增加墙钟注入接口，其他测试可执行程序与服务端均未链接该定义。每个200要求恰好一条完整日志，逐字段比较outcome/stage/code/totalMs并禁止路径/目标泄露；拒绝要求无完成日志和零探测。工厂的预算声明与C公开常量比较，并顺序占用名额验证每路由1个、每进程32个的实际准入边界；这不是多线程/多实例并发证明。
+
+正常焦点版本与ASan/UBSan版本均实际执行38个向量、原限流/请求规则及新增工厂边界并通过，消毒器无报告；本批还完整运行CMake56/56、零跳过和Make（保留600秒限制）。CMake与Make产物的符号检查均确认：仅connectivity测试程序定义time，服务端仍从libc导入time。七个隔离生产缺陷变体分别为GET仍给10000ms而非剩余预算、额外空trailerNames、requestId首字符改为G、日志totalMs加1、结果算完后额外发GET、耗时错误使用绝对单调时间、墙钟偏移1秒；同一变体在旧测试全部退出0，在增强测试全部退出1，对应原始失败断言及输入对照由PR进度记录保留。它们只证明对应断言的检错能力，不代表所有错误已排除；变体不进入提交，七个变体未宣称都经过消毒器，焦点消毒器结果不冒充整个服务端消毒器验收。逐向量HTTP入口和响应头仍有缺口，所以本类与其他三类仍为“部分”，#35继续开放。本节记录本批已核验的本地结果；最终提交CI是否收齐并通过，须按PR #290所列该精确提交/测试树/运行产物另行核验，不借用 `3d9af54` 的CI结果接受本批。
 
 ## 历史表的读法与限制
 
