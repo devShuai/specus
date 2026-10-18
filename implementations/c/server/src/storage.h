@@ -55,7 +55,8 @@ typedef struct {
 typedef struct {
     char registration_id[65];
     char username[81];
-    char email[255];
+    /* Java accepts 254 UTF-16 units: each can require up to 3 UTF-8 bytes. */
+    char email[254U * 3U + 1U];
     char password_hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     char code_hash[65];
     int attempts_remaining;

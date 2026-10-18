@@ -28,6 +28,29 @@ import static org.mockito.Mockito.when;
 
 class RegistrationServiceTests {
     @Test
+    void emailLengthLimitCountsUtf16UnitsInsteadOfUtf8Bytes() {
+        RegistrationService service = new RegistrationService(null, null, null, null,
+                null, null, null, null, null);
+        String[] addresses = {
+                "ab" + "a".repeat(245) + "@e.test",
+                "ab" + "用".repeat(245) + "@e.test",
+                "ab" + "😀".repeat(122) + "用@e.test",
+                "\"ab" + "用".repeat(243) + "\"@e.test"
+        };
+        int[] utf8Bytes = {254, 744, 500, 740};
+        for (int i = 0; i < addresses.length; i++) {
+            String address = addresses[i];
+            assertEquals(254, address.length());
+            assertEquals(utf8Bytes[i], address.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+            assertEquals(address, ReflectionTestUtils.invokeMethod(service, "normalizeEmail", address));
+            String tooLong = address.startsWith("\"") ? "\"x" + address.substring(1) : "x" + address;
+            var error = assertThrows(IllegalArgumentException.class,
+                    () -> ReflectionTestUtils.invokeMethod(service, "normalizeEmail", tooLong));
+            assertEquals("邮箱格式无效", error.getMessage());
+        }
+    }
+
+    @Test
     void sharedMailboxAddressFormsMatchTheCurrentReference() throws Exception {
         Path root = Path.of("").toAbsolutePath();
         String relative = "protocol/test-vectors/registration-mailbox-forms-v1.json";

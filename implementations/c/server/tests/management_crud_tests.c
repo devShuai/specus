@@ -195,6 +195,67 @@ static int test_registration_mailbox_forms(void)
     return failed;
 }
 
+/* Java limits the normalized address to 254 UTF-16 units, not 254 UTF-8 bytes.
+ * Keep an ASCII mask prefix here: Unicode masking has its own contract/tests. */
+static int test_registration_email_storage(void)
+{
+    mailbox box = {{0}, {0}, {0}};
+    st_registration_set_handlers(fake_turnstile, fake_email, &box);
+    static const char *const units[] = {"a", "\xe7\x94\xa8", "\xf0\x9f\x98\x80", "\xe7\x94\xa8"};
+    static const size_t repeats[] = {245U, 245U, 122U, 243U};
+    static const size_t byte_lengths[] = {254U, 744U, 500U, 740U};
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(repeats) / sizeof(repeats[0]); ++i) {
+        char repeated[1024];
+        char email[1100];
+        char username[80];
+        int result = repeat_into(repeated, sizeof(repeated), units[i], repeats[i]) != 0;
+        if (result) { failed = 1; continue; }
+        snprintf(email, sizeof(email), "%sab%s%s@e.test", i == 3U ? "\"" : "", repeated,
+                 i == 2U ? "\xe7\x94\xa8" : i == 3U ? "\"" : "");
+        snprintf(username, sizeof(username), "mailbox-storage-%zu", i);
+        result = strlen(email) != byte_lengths[i]
+            || register_with(username, email, "pw", "ok", 202, "\"registrationId\"") != 0;
+        char registration_id[128];
+        last_member("registrationId", registration_id, sizeof(registration_id));
+        st_storage_registration_challenge stored;
+        int loaded = st_storage_get_registration_challenge(db_path, registration_id, &stored);
+        int complete_email = loaded == 0 && strcmp(stored.email, email) == 0;
+        result = result || strcmp(box.email, email) != 0 || !complete_email;
+        printf("%s registration email storage case=%zu bytes=%zu stored=%zu exact=%d\n",
+               result ? "FAIL" : "ok  ", i, strlen(email), loaded == 0 ? strlen(stored.email) : 0U,
+               complete_email);
+
+        /* A new SQLite connection reads the challenge; then verify the real code over HTTP.
+         * The verified full address must survive and prevent another account claiming it. */
+        char body[256];
+        snprintf(body, sizeof(body), "{\"registrationId\":\"%s\",\"code\":\"%s\"}", registration_id, box.code);
+        int verified = expect("POST", "/auth/register/verify", body, NULL, 200, NULL) == 0;
+        st_storage_management_user user;
+        int registered = verified && st_storage_get_management_user_in_tenant(db_path, "default", username, &user) == 0
+            && st_storage_management_email_exists(db_path, email) == 1
+            && st_storage_get_registration_challenge(db_path, registration_id, &stored) != 0;
+        snprintf(username, sizeof(username), "mailbox-storage-duplicate-%zu", i);
+        int duplicate_refused = register_with(username, email, "pw", "ok", 400, "该邮箱已注册") == 0;
+        printf("%s registration email verification case=%zu registered=%d duplicateRefused=%d\n",
+               registered && duplicate_refused ? "ok  " : "FAIL", i, registered, duplicate_refused);
+        result = result || !registered || !duplicate_refused;
+
+        /* One extra BMP unit crosses the same reference limit, without sending email. */
+        char too_long[1104];
+        if (i == 3U) snprintf(too_long, sizeof(too_long), "\"x%s", email + 1);
+        else snprintf(too_long, sizeof(too_long), "x%s", email);
+        box.email[0] = '\0';
+        int refused = register_with("mailbox-storage-over-limit", too_long, "pw", "ok", 400,
+                                    "邮箱格式无效") == 0 && box.email[0] == '\0';
+        printf("%s registration email UTF16 limit case=%zu refusedWithoutMail=%d\n",
+               refused ? "ok  " : "FAIL", i, refused);
+        failed = result || !refused || failed;
+    }
+    st_registration_set_handlers(NULL, NULL, NULL);
+    return failed;
+}
+
 /*
  * AuthController.register runs the Turnstile check before RegistrationService.requestRegistration,
  * whose checks come in this order: username, reserved name, password, email, existing login name,
@@ -742,6 +803,7 @@ int main(void)
         port = ntohs(address.sin_port);
         failed = test_registration() != 0;
         failed = test_registration_mailbox_forms() != 0 || failed;
+        failed = test_registration_email_storage() != 0 || failed;
         failed = test_me() != 0 || failed;
         failed = test_credentials() != 0 || failed;
         failed = test_mappings() != 0 || failed;
