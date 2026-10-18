@@ -178,6 +178,8 @@ typedef struct direct_http_event {
 typedef struct direct_http_pending {
     uint32_t stream_id;
     int done;
+    /* The probe no longer wants any response frames, even before this pending entry retires. */
+    int abandoned;
     int response_started;
     /* Either side reset the stream; frames the client sent before it saw an RST are dropped. */
     int reset;
@@ -244,6 +246,8 @@ struct specus_session {
     uint32_t next_stream_id;
     /* Recently closed NAT streams of this data connection, guarded by map_lock. */
     st_stream_tombstones closed_streams;
+    /* Separate bounded probe history, as Java abandonedHttpStreams; ordinary traffic cannot evict it. */
+    st_stream_tombstones abandoned_http_streams;
     char remote[128];
     long long connection_record_id;
     long long connected_since_ms;
@@ -1540,6 +1544,12 @@ static int process_direct_http_message(specus_session *session, const st_nat_mes
         pthread_mutex_unlock(&session->direct_lock);
         return 0;
     }
+    if (pending->abandoned && (message->type == ST_NAT_OPEN || message->type == ST_NAT_DATA
+        || message->type == ST_NAT_FIN || message->type == ST_NAT_RST
+        || message->type == ST_NAT_WINDOW_UPDATE)) {
+        pthread_mutex_unlock(&session->direct_lock);
+        return 1;
+    }
 
     int violation = 0;
     uint32_t reset_code = 0U;
@@ -2062,10 +2072,20 @@ static void direct_pending_cancel(void *ctx)
     pthread_mutex_unlock(&cancel->session->direct_lock);
 }
 
+/* Every stream allocation clears both histories before publishing the reused id. map_lock held. */
+static void mark_stream_opened_locked(specus_session *session, uint32_t stream_id)
+{
+    st_stream_tombstones_remove(&session->closed_streams, stream_id);
+    st_stream_tombstones_remove(&session->abandoned_http_streams, stream_id);
+}
+
 static void direct_pending_retire(specus_session *session, direct_http_pending *pending)
 {
     pthread_mutex_lock(&session->map_lock);
     st_stream_tombstones_add(&session->closed_streams, pending->stream_id);
+    if (pending->abandoned) {
+        st_stream_tombstones_add(&session->abandoned_http_streams, pending->stream_id);
+    }
     pthread_mutex_unlock(&session->map_lock);
     pthread_mutex_lock(&session->direct_lock);
     direct_pending_remove(session, pending);
@@ -2120,7 +2140,7 @@ static int direct_http_forward(void *ctx,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
+    mark_stream_opened_locked(session, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -2399,7 +2419,7 @@ static void connectivity_probe(void *ctx,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, pending.stream_id);
+    mark_stream_opened_locked(session, pending.stream_id);
     pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
@@ -2423,6 +2443,9 @@ static void connectivity_probe(void *ctx,
     }
     if (!written) {
         answer->kind = ST_CONNECTIVITY_PROBE_WRITE_FAILED;
+        pthread_mutex_lock(&session->direct_lock);
+        pending.abandoned = 1;
+        pthread_mutex_unlock(&session->direct_lock);
     } else {
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
@@ -2462,6 +2485,8 @@ static void connectivity_probe(void *ctx,
             answer->kind = ST_CONNECTIVITY_PROBE_TIMEOUT;
         }
         int ended = pending.done;
+        /* Stop accepting response frames before sending RST, not after the peer can observe it. */
+        pending.abandoned = 1;
         pthread_mutex_unlock(&session->direct_lock);
         if (!ended) {
             (void)send_reset(session, pending.stream_id, ST_CONNECTIVITY_PROBE_RESET_CODE,
@@ -2470,9 +2495,9 @@ static void connectivity_probe(void *ctx,
     }
 
     /*
-     * Tombstoned like a public stream: the device's own RST may cross the one sent above, or follow
-     * it when the device fails the request it was told to drop. Either is a stale frame then, not an
-     * RST for a never-opened stream that would close the whole data connection.
+     * Also record the abandoned probe independently of ordinary closed streams: a response OPEN,
+     * DATA, FIN or RST still in flight is silently dropped, without WINDOW_UPDATE or another RST.
+     * Both histories stay bounded; reopening an id clears both before it can serve a new stream.
      */
     direct_pending_retire(session, &pending);
     free(pending.error);
@@ -2522,7 +2547,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, conn->stream_id);
+    mark_stream_opened_locked(session, conn->stream_id);
     conn->next = session->ws_conns;
     session->ws_conns = conn;
     pthread_mutex_unlock(&session->map_lock);
@@ -4501,7 +4526,7 @@ static int start_external_conn(specus_session *session,
     if (session->next_stream_id == 0U) {
         session->next_stream_id = 1U;
     }
-    st_stream_tombstones_remove(&session->closed_streams, conn->stream_id);
+    mark_stream_opened_locked(session, conn->stream_id);
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
     conn->next = session->conns;
     session->conns = conn;
@@ -4830,6 +4855,16 @@ static int process_nat_message(specus_session *session, const st_nat_message *me
             return -1;
         }
         return 0;
+    }
+    if (message->type == ST_NAT_OPEN || message->type == ST_NAT_DATA
+        || message->type == ST_NAT_FIN || message->type == ST_NAT_RST) {
+        pthread_mutex_lock(&session->map_lock);
+        int abandoned = st_stream_tombstones_contains(&session->abandoned_http_streams,
+                                                       message->stream_id);
+        pthread_mutex_unlock(&session->map_lock);
+        if (abandoned) {
+            return 0;
+        }
     }
     switch (message->type) {
         case ST_NAT_REGISTER:
