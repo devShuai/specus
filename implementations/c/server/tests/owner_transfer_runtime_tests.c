@@ -102,7 +102,7 @@ static void finish(fixture *f) { sqlite3_close(f->db);unlink(f->path);rmdir(f->d
 static int committed_delivery(int failed_type)
 {
     fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};
-    st_peer_mesh_runtime runtime={f.path,send_signal,online,&ctx,701,2};st_peer_mesh_owner_cursor cursor={0};
+    st_peer_mesh_runtime runtime={.database_path=f.path,.send=send_signal,.online=online,.ctx=&ctx,.publisher_session_id=701,.peer_service_discovery_version=2};st_peer_mesh_owner_cursor cursor={0};
     CHECK(st_peer_mesh_owner_changes_init(f.path,&cursor)==0 && cursor.after_id==0,"bookmark before transfer");
     st_storage_peer_mesh_session lost={0},kept={0};
     CHECK(st_storage_create_peer_mesh_session(f.path,&f.source,&f.target,"DIRECT","lost-token",60,&lost)==0
@@ -135,7 +135,9 @@ static int committed_delivery(int failed_type)
 static int rollback_and_independent_cursors(void)
 {
     fixture f;CHECK(fresh(&f)==0,"fixture");capture first={.only_id=f.source.id},second={.only_id=f.target.id};
-    st_peer_mesh_runtime runtimes[]={{f.path,send_signal,online,&first,0,2},{f.path,send_signal,online,&second,0,2}};
+    st_peer_mesh_runtime runtimes[]={
+        {.database_path=f.path,.send=send_signal,.online=online,.ctx=&first,.peer_service_discovery_version=2},
+        {.database_path=f.path,.send=send_signal,.online=online,.ctx=&second,.peer_service_discovery_version=2}};
     st_peer_mesh_owner_cursor cursors[2];memset(cursors,0,sizeof(cursors));
     CHECK(st_peer_mesh_owner_changes_init(f.path,&cursors[0])==0 && st_peer_mesh_owner_changes_init(f.path,&cursors[1])==0,"two bookmarks");
     st_storage_peer_mesh_session session={0};CHECK(st_storage_create_peer_mesh_session(f.path,&f.source,&f.target,"DIRECT","session-token",60,&session)==0,"session");
@@ -153,7 +155,7 @@ static int rollback_and_independent_cursors(void)
 }
 static int malformed_event(void)
 {
-    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={f.path,send_signal,online,&ctx,0,2};
+    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={.database_path=f.path,.send=send_signal,.online=online,.ctx=&ctx,.peer_service_discovery_version=2};
     st_peer_mesh_owner_cursor cursor={0};CHECK(st_peer_mesh_owner_changes_init(f.path,&cursor)==0,"bookmark");
     CHECK(sql(f.db,"INSERT INTO client_owner_transfer_audit(tenant_id,actor_username,scope,resource_id,target_username,payload_json,occurred_at_ms) VALUES('default','fixture','single',1,'bob','{}',1)")==0,"malformed committed fixture");
     CHECK(st_peer_mesh_owner_changes_drain(&runtime,&cursor)<0 && cursor.after_id==0 && ctx.count==0,"malformed event skipped or delivered");
@@ -184,7 +186,7 @@ static int announce(const char *path,const st_storage_client *client)
 }
 static int egress_and_live_catalogue(void)
 {
-    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={f.path,send_signal,online,&ctx,701,2};
+    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={.database_path=f.path,.send=send_signal,.online=online,.ctx=&ctx,.publisher_session_id=701,.peer_service_discovery_version=2};
     st_peer_mesh_owner_cursor cursor={0};CHECK(st_peer_mesh_owner_changes_init(f.path,&cursor)==0,"bookmark");
     CHECK(announce(f.path,&f.source)==0 && announce(f.path,&f.target)==0 && announce(f.path,&f.explicit_peer)==0,"current egress capabilities");
     st_storage_peer_mesh_egress_switch enabled={.tenant_id="default",.enabled=1};
@@ -223,7 +225,7 @@ static int egress_and_live_catalogue(void)
 }
 static int journal_visibility_and_large_event(void)
 {
-    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={f.path,send_signal,online,&ctx,0,2};
+    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={.database_path=f.path,.send=send_signal,.online=online,.ctx=&ctx,.peer_service_discovery_version=2};
     st_peer_mesh_owner_cursor cursor={0};CHECK(st_peer_mesh_owner_changes_init(f.path,&cursor)==0,"bookmark");
     CHECK(sql(f.db,"BEGIN IMMEDIATE; INSERT INTO client_owner_transfer_audit(tenant_id,actor_username,scope,resource_id,target_username,payload_json,occurred_at_ms) VALUES('default','fixture','single',1,'bob','{\"tenantId\":\"default\",\"closedPeerSessions\":[]}',1)")==0,"uncommitted event fixture");
     (void)st_peer_mesh_owner_changes_drain(&runtime,&cursor);
@@ -237,7 +239,7 @@ static int journal_visibility_and_large_event(void)
 }
 static int journal_batch(void)
 {
-    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={f.path,send_signal,online,&ctx,0,2};
+    fixture f;CHECK(fresh(&f)==0,"fixture");capture ctx={0};st_peer_mesh_runtime runtime={.database_path=f.path,.send=send_signal,.online=online,.ctx=&ctx,.peer_service_discovery_version=2};
     st_peer_mesh_owner_cursor cursor={0};CHECK(st_peer_mesh_owner_changes_init(f.path,&cursor)==0,"bookmark");
     CHECK(sql(f.db,"WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<65) INSERT INTO client_owner_transfer_audit(tenant_id,actor_username,scope,resource_id,target_username,payload_json,occurred_at_ms) SELECT 'default','fixture','single',1,'bob','{\"tenantId\":\"default\",\"closedPeerSessions\":[]}',n.x FROM n")==0,"ordered event fixture");
     CHECK(st_peer_mesh_owner_changes_drain(&runtime,&cursor)==0 && cursor.after_id==64,"bounded batch skipped/stalled");
@@ -271,7 +273,7 @@ static int snapshot_ordering(void)
 {
     fixture f;CHECK(fresh(&f)==0,"fixture");int failed=0,started=0;pthread_t thread;
     ordering_capture ctx={.lock=PTHREAD_MUTEX_INITIALIZER,.condition=PTHREAD_COND_INITIALIZER};
-    st_peer_mesh_runtime runtime={f.path,ordered_send,ordered_online,&ctx,0,2};st_peer_mesh_owner_cursor cursor={0};
+    st_peer_mesh_runtime runtime={.database_path=f.path,.send=ordered_send,.online=ordered_online,.ctx=&ctx,.peer_service_discovery_version=2};st_peer_mesh_owner_cursor cursor={0};
     st_storage_owner_transfer_result result={0};ordering_worker worker={.runtime=&runtime,.rc=-1};
     st_storage_peer_mesh_service service={.tenant_id="default",.client_id=f.source.id,.service_id="ordering-service",.name="ordering",
         .transport="tcp",.application="http",.target_host="127.0.0.1",.target_port=8080,.published_port=18080,.path="/",.enabled=1,.visibility="ACL"};

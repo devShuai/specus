@@ -150,8 +150,8 @@ static int scenario(const char *mode)
         snprintf(path, sizeof(path), "%s/%s", server.dir, bind_case ? "late-listen" : "late-worker");
         FILE *late = fopen(path, "r");
         if (late) {
-            int actual = -999; fscanf(late, "%d", &actual); fclose(late);
-            fprintf(stderr, "observed real late %s result=%d\n", bind_case ? "listen" : "pthread_create", actual);
+            int actual = -999; int parsed = fscanf(late, "%d", &actual); fclose(late);
+            fprintf(stderr, "observed real late %s result=%d parsed=%d\n", bind_case ? "listen" : "pthread_create", actual, parsed);
             REQUIRE(0, "retired namespace must not attempt LISTEN or admit a new external worker");
         }
     }

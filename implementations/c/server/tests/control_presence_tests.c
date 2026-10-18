@@ -89,13 +89,23 @@ static int kernel_lifecycle(const char *self, const char *path)
     CHECK(waitpid(child, &status, 0) == child);
     CHECK(received == 1 && byte == 'D' && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(st_control_presence_probe(path, channels[6]) == ST_CONTROL_PRESENCE_DEAD);
+    /* A successful probe cannot report success when its reply pipe is invalid. */
+    CHECK(pipe(start) == 0); child = fork(); CHECK(child >= 0);
+    if (child == 0) {
+        close(start[1]); char read_fd[24];
+        snprintf(read_fd, sizeof(read_fd), "%d", start[0]);
+        execl(self, self, "--exec-probe", path, channels[6], read_fd, "-1", (char *)NULL); _exit(99);
+    }
+    close(start[0]); byte = 'P'; CHECK(write(start[1], &byte, 1) == 1); close(start[1]);
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);
     st_control_presence_forget_dead(path, channels[6]);
     int ready[2]; CHECK(pipe(ready) == 0); child = fork(); CHECK(child >= 0);
     if (child == 0) {
         close(ready[0]); st_control_presence *owned = NULL;
         char ready_byte = st_control_presence_acquire(path, channels[4], &owned) == 0 ? 'R' : 'X';
-        (void)write(ready[1], &ready_byte, 1); close(ready[1]);
-        if (ready_byte != 'R') _exit(98);
+        ssize_t written = write(ready[1], &ready_byte, 1); close(ready[1]);
+        if (written != 1 || ready_byte != 'R') _exit(98);
         for (;;) pause();
     }
     close(ready[1]); received = (int)read(ready[0], &byte, 1); close(ready[0]);
@@ -169,7 +179,9 @@ int main(int argc, char **argv)
     if (argc == 6 && !strcmp(argv[1], "--exec-probe")) {
         int input = atoi(argv[4]), output = atoi(argv[5]); char byte;
         int ok = read(input, &byte, 1) == 1 && st_control_presence_probe(argv[2], argv[3]) == ST_CONTROL_PRESENCE_DEAD;
-        byte = ok ? 'D' : 'X'; (void)write(output, &byte, 1); close(input); close(output); return ok ? 0 : 1;
+        byte = ok ? 'D' : 'X';
+        if (write(output, &byte, 1) != 1) ok = 0;
+        close(input); close(output); return ok ? 0 : 1;
     }
     char dir[] = "/tmp/specus-presence-XXXXXX", path[512]; CHECK(mkdtemp(dir));
     snprintf(path, sizeof(path), "%s/specus.db", dir); CHECK(st_storage_init(path, 0) == 0);

@@ -247,7 +247,7 @@ static int test_egress_catalog_domain_targets(void)
     egress_test_context context;
     memset(&context, 0, sizeof(context));
     context.dns_egress_online = 1;
-    st_peer_mesh_runtime runtime = {path, capture_egress_signal, egress_is_online, &context, 0, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_egress_signal, .online = egress_is_online, .ctx = &context, .peer_service_discovery_version = 2};
     if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0) {
         fprintf(stderr, "egress catalog refresh failed\n");
         unlink(path);
@@ -374,7 +374,7 @@ static int test_egress_config_domain_rules(void)
 
     egress_test_context context;
     memset(&context, 0, sizeof(context));
-    st_peer_mesh_runtime runtime = {path, capture_egress_signal, egress_is_online, &context, 0, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_egress_signal, .online = egress_is_online, .ctx = &context, .peer_service_discovery_version = 2};
     const char *config = NULL;
     if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress") != 0
         || (config = last_egress_config(&context.capture, "egress-plain")) == NULL
@@ -483,7 +483,7 @@ static int test_egress_pushes_are_gated(void)
     }
     peer_test_context capture;
     memset(&capture, 0, sizeof(capture));
-    st_peer_mesh_runtime runtime = {path, capture_signal, gates_online, &capture, 0, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = gates_online, .ctx = &capture, .peer_service_discovery_version = 2};
     char allowed[64];
     snprintf(allowed, sizeof(allowed), "\"allowedConsumerClientIds\":[%lld]", consumer.id);
 
@@ -590,7 +590,7 @@ static int test_egress_catalog_egress_version(void)
 
     peer_test_context capture;
     memset(&capture, 0, sizeof(capture));
-    st_peer_mesh_runtime runtime = {path, capture_signal, version_egress_is_online, &capture, 0, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = version_egress_is_online, .ctx = &capture, .peer_service_discovery_version = 2};
     if (st_peer_mesh_refresh_tenant(&runtime, "tenant-egress-version") != 0) {
         fprintf(stderr, "egress version catalog refresh failed\n");
         unlink(path);
@@ -725,7 +725,7 @@ static int test_egress_report_vector(const char *path)
     long long session_id = 0;
     peer_test_context capture = {0};
     int failed = egress_report_client(path, "report-vector", 1, &egress, &session_id) != 0;
-    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, &capture, session_id, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &capture, .publisher_session_id = session_id, .peer_service_discovery_version = 2};
     char *first = NULL;
     size_t reports = 0U;
     for (size_t i = 0U; !failed && i < event_count; ++i) {
@@ -778,7 +778,7 @@ static int test_egress_report(void)
         return 1;
     }
     peer_test_context capture = {0};
-    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, &capture, session_id, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &capture, .publisher_session_id = session_id, .peer_service_discovery_version = 2};
     st_storage_peer_mesh_egress_activity row;
 
     /* The reporter and its session come from the connection; unknown refusal codes are dropped. */
@@ -849,8 +849,8 @@ static int test_egress_report(void)
     }
 
     /* A client that did not announce egress capability, or a connection without a session, cannot report. */
-    st_peer_mesh_runtime legacy_runtime = {path, capture_signal, always_online, &capture, legacy_session, 2};
-    st_peer_mesh_runtime sessionless = {path, capture_signal, always_online, &capture, 0, 2};
+    st_peer_mesh_runtime legacy_runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &capture, .publisher_session_id = legacy_session, .peer_service_discovery_version = 2};
+    st_peer_mesh_runtime sessionless = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &capture, .peer_service_discovery_version = 2};
     if (!failed && (st_peer_mesh_handle_control(&legacy_runtime, legacy.client_name, NULL,
                                                 "{\"type\":\"egress-report\",\"revision\":1}") == 0
                     || egress_activity(path, &legacy, &row) != 1
@@ -866,7 +866,7 @@ static int test_egress_report(void)
     st_storage_client limited;
     long long limited_session = 0;
     if (!failed && egress_report_client(path, "report-limited", 1, &limited, &limited_session) != 0) failed = 1;
-    st_peer_mesh_runtime limited_runtime = {path, capture_signal, always_online, &capture, limited_session, 2};
+    st_peer_mesh_runtime limited_runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &capture, .publisher_session_id = limited_session, .peer_service_discovery_version = 2};
     for (int revision = 1; !failed && revision <= 20; ++revision) {
         snprintf(message, sizeof(message), "{\"type\":\"egress-report\",\"revision\":%d}", revision);
         if (st_peer_mesh_handle_control(&limited_runtime, limited.client_name, NULL, message) != 0) {
@@ -888,7 +888,7 @@ static int test_egress_report(void)
     st_storage_client newcomer;
     long long newcomer_session = 0;
     if (!failed && egress_report_client(path, "report-newcomer", 1, &newcomer, &newcomer_session) != 0) failed = 1;
-    st_peer_mesh_runtime newcomer_runtime = {path, capture_signal, always_online, &capture, newcomer_session, 2};
+    st_peer_mesh_runtime newcomer_runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &capture, .publisher_session_id = newcomer_session, .peer_service_discovery_version = 2};
     if (!failed) {
         size_t used_sessions = st_peer_mesh_egress_report_rate_sessions_for_testing();
         failed = used_sessions >= 4096U
@@ -973,7 +973,7 @@ static int test_session_reuse(void)
         return 1;
     }
     peer_test_context ctx = {0};
-    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, &ctx, 0, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &ctx, .peer_service_discovery_version = 2};
     long long first = 0, again = 0, reverse = 0, after_close = 0, after_expiry = 0;
     char first_token[64], again_token[64], reverse_token[64], close_token[64], expiry_token[64];
     int failed = open_offer(&runtime, &ctx, "reuse-a", "reuse-b", &first, first_token) != 0
@@ -1049,7 +1049,7 @@ static int test_session_reports(void)
         return 1;
     }
     peer_test_context ctx = {0};
-    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, &ctx, 0, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &ctx, .peer_service_discovery_version = 2};
     long long id = 0;
     char token[64];
     int failed = open_offer(&runtime, &ctx, "reports-a", "reports-b", &id, token) != 0
@@ -1285,7 +1285,7 @@ static int test_service_report_lifecycle(void)
         return 1;
     }
     peer_test_context ctx = {0};
-    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, &ctx, 8201, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &ctx, .publisher_session_id = 8201, .peer_service_discovery_version = 2};
     static const char *const report_format =
         "{\"type\":\"service-report\",\"enabled\":%s,\"revision\":%d,"
         "\"generatedAt\":\"2099-01-01T00:00:00Z\",\"expiresAt\":\"2099-01-01T01:00:00Z\","
@@ -1402,7 +1402,7 @@ static int test_deleted_client_catalog_retry(void)
     snprintf(service.visibility, sizeof(service.visibility), "OWNER");
     failed = failed || st_storage_upsert_peer_mesh_service(path, &service, NULL) != 0;
     deleted_peer_context ctx = {0};
-    st_peer_mesh_runtime runtime = {path, deleted_peer_send, always_online, &ctx, 9101, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = deleted_peer_send, .online = always_online, .ctx = &ctx, .publisher_session_id = 9101, .peer_service_discovery_version = 2};
     long long session_id = 0;
     char token[64];
     if (!failed) failed = open_offer(&runtime, &ctx.capture, publisher.client_name, peer.client_name, &session_id, token) != 0;
@@ -1460,7 +1460,7 @@ static int test_deleted_client_catalog_retry(void)
 static int service_report(const char *path, peer_test_context *ctx, long long session_id, const char *client,
                           const char *message)
 {
-    st_peer_mesh_runtime runtime = {path, capture_signal, always_online, ctx, session_id, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = ctx, .publisher_session_id = session_id, .peer_service_discovery_version = 2};
     ctx->count = 0;
     return st_peer_mesh_handle_control(&runtime, client, NULL, message);
 }
@@ -1523,7 +1523,7 @@ static int test_service_report_bounds(void)
         "targetClientId", "targetClientName", "targetVirtualIp", "targetPublicKey", "sessionId", "token",
         "publisherClientId", "publisherClientName", "publisherSessionId",
     };
-    st_peer_mesh_runtime envelope_runtime = {path, capture_signal, always_online, &ctx, 8105, 2};
+    st_peer_mesh_runtime envelope_runtime = {.database_path = path, .send = capture_signal, .online = always_online, .ctx = &ctx, .publisher_session_id = 8105, .peer_service_discovery_version = 2};
     if (!failed && st_peer_mesh_handle_control(&envelope_runtime, "bounds-publisher", "peer-b",
             "{\"type\":\"service-report\",\"enabled\":true,\"revision\":1,\"services\":[]}") == 0) {
         fprintf(stderr, "a service-report addressed to a peer was accepted\n");
@@ -1627,7 +1627,7 @@ static int test_server_owned_catalog_revisions(void)
     snprintf(service.target_host,sizeof(service.target_host),"127.0.0.1");snprintf(service.path,sizeof(service.path),"/");
     service.target_port=8080;service.published_port=18080;service.enabled=1;snprintf(service.visibility,sizeof(service.visibility),"OWNER");
     failed=failed||st_storage_upsert_peer_mesh_service(path,&service,NULL)!=0;
-    peer_test_context ctx={0};st_peer_mesh_runtime runtime={path,capture_signal,always_online,&ctx,7381,2};
+    peer_test_context ctx={0};st_peer_mesh_runtime runtime={.database_path=path,.send=capture_signal,.online=always_online,.ctx=&ctx,.publisher_session_id=7381,.peer_service_discovery_version=2};
     char report[512];char wire[5][8192];
     for (int step=0;step<5&&!failed;step++) {
         ctx.count=0;
@@ -1721,7 +1721,7 @@ int main(void)
 
     peer_test_context context = {0};
     context.target_online = 1;
-    st_peer_mesh_runtime runtime = {path, capture_signal, is_online, &context, 7001, 2};
+    st_peer_mesh_runtime runtime = {.database_path = path, .send = capture_signal, .online = is_online, .ctx = &context, .publisher_session_id = 7001, .peer_service_discovery_version = 2};
     if (st_peer_mesh_push_on_login(&runtime, source.client_name) != 0
         || context.count < 2
         || !contains(context.signals[0].message, "\"type\":\"peer-config\"")
