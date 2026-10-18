@@ -25,6 +25,7 @@ CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
 CLIENT_AUTH_NONCE_TESTS := $(BUILD_DIR)/specus_c_client_auth_nonce_tests
 CLIENT_PACKAGE_TESTS := $(BUILD_DIR)/specus_c_client_package_tests
 CONNECTIVITY_CHECK_TESTS := $(BUILD_DIR)/specus_c_connectivity_check_tests
+CONNECTIVITY_HTTP_VECTOR_TESTS := $(BUILD_DIR)/specus_c_connectivity_http_vector_tests
 CRYPTO_TESTS := $(BUILD_DIR)/specus_c_crypto_tests
 DECOMPRESSION_LIMITS_TESTS := $(BUILD_DIR)/specus_c_decompression_limits_tests
 ELASTICSEARCH_TRAFFIC_TESTS := $(BUILD_DIR)/specus_c_elasticsearch_traffic_tests
@@ -79,6 +80,8 @@ UNICODE_JAVA21_TESTS := $(BUILD_DIR)/specus_c_unicode_java21_tests
 UNICODE_JAVA21_VECTORS := ../../../protocol/test-vectors/java21-root-case-v1.json
 CORE_OBJS += $(BUILD_DIR)/unicode_java21.o
 ALL_TESTS += $(UNICODE_JAVA21_TESTS)
+TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
+ALL_TESTS += $(CONNECTIVITY_HTTP_VECTOR_TESTS)
 
 .PHONY: all test release clean
 
@@ -149,8 +152,11 @@ $(OIDC_TESTS): $(CORE_OBJS) tests/oidc_tests.c | $(BUILD_DIR)
 $(PASSWORD_HASH_TESTS): $(CORE_OBJS) tests/password_hash_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/password_hash_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(CONNECTIVITY_CHECK_TESTS): $(CORE_OBJS) tests/connectivity_check_tests.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_check_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(CONNECTIVITY_CHECK_TESTS): $(CORE_OBJS) tests/connectivity_check_tests.c tests/connectivity_check_test_support.h tests/connectivity_test_clock.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_check_tests.c tests/connectivity_test_clock.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONNECTIVITY_HTTP_VECTOR_TESTS): $(CORE_OBJS) tests/connectivity_http_vector_tests.c tests/connectivity_check_test_support.h tests/connectivity_test_clock.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_http_vector_tests.c tests/connectivity_test_clock.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(PEER_EGRESS_TESTS): $(CORE_OBJS) tests/peer_egress_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_egress_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@

@@ -138,12 +138,20 @@ target_link_libraries(specus_c_client_auth_nonce_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_client_auth_nonce_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME client_auth_nonce_tests COMMAND specus_c_client_auth_nonce_tests)
 
-add_executable(specus_c_connectivity_check_tests tests/connectivity_check_tests.c)
+add_executable(specus_c_connectivity_check_tests tests/connectivity_check_tests.c tests/connectivity_test_clock.c)
 target_link_libraries(specus_c_connectivity_check_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_connectivity_check_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(specus_c_connectivity_check_tests PRIVATE
     ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
 add_test(NAME connectivity_check_tests COMMAND specus_c_connectivity_check_tests)
+
+add_executable(specus_c_connectivity_http_vector_tests tests/connectivity_http_vector_tests.c tests/connectivity_test_clock.c)
+target_link_libraries(specus_c_connectivity_http_vector_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_connectivity_http_vector_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_connectivity_http_vector_tests PRIVATE
+    ST_CONNECTIVITY_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/")
+add_test(NAME connectivity_http_vector_tests COMMAND specus_c_connectivity_http_vector_tests)
+set_tests_properties(connectivity_http_vector_tests PROPERTIES TIMEOUT 120)
 
 add_executable(specus_c_crypto_tests tests/crypto_tests.c)
 target_link_libraries(specus_c_crypto_tests PRIVATE specus_c_core)
