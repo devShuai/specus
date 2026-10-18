@@ -1,6 +1,6 @@
 export type NatReachability = "direct" | "likely" | "conditional" | "relay" | "unknown";
 
-export type NatTone = "default" | "primary" | "success" | "warning" | "danger";
+export type NatTone = "default" | "accent" | "success" | "warning" | "danger";
 
 export interface NatTypeProfile {
   key: string;
@@ -155,7 +155,7 @@ export const NAT_TYPE_PROFILES: Record<string, NatTypeProfile> = {
     key: "PORT_PRESERVED_NAT",
     label: "端口保持（基础判断）",
     shortLabel: "端口保持 / 基础",
-    tone: "primary",
+    tone: "accent",
     reachability: "likely",
     reachabilityLabel: "直连较友好",
     summary: "NAT 会保留客户端源端口，打洞成功率通常较高。",
@@ -166,7 +166,7 @@ export const NAT_TYPE_PROFILES: Record<string, NatTypeProfile> = {
     key: "FULL_CONE_OR_RESTRICTED_NAT",
     label: "EIM + EIF/ADF（兼容）",
     shortLabel: "EIM / EIF-ADF",
-    tone: "primary",
+    tone: "accent",
     reachability: "likely",
     reachabilityLabel: "直连较友好",
     summary: "兼容标签：映射端点稳定，过滤行为为 EIF 或 ADF；应优先查看独立的 mapping/filtering 字段。",
@@ -177,7 +177,7 @@ export const NAT_TYPE_PROFILES: Record<string, NatTypeProfile> = {
     key: "CONE_LIKE_NAT",
     label: "EIM（浏览器兼容）",
     shortLabel: "EIM / 浏览器",
-    tone: "primary",
+    tone: "accent",
     reachability: "likely",
     reachabilityLabel: "直连较友好",
     summary: "同一 UDP 基址访问不同 STUN 目标时公网映射保持一致，但端口已被改写；过滤行为仍需单独验证。",
@@ -267,7 +267,7 @@ export function natClassificationProfile(
         "EIM_ADF",
         "EIM + ADF",
         "EIM / ADF",
-        "primary",
+        "accent",
         "likely",
         "直连较友好",
         "公网映射稳定，但只有客户端已联系过的外部 IP 可以回包。",
@@ -292,7 +292,7 @@ export function natClassificationProfile(
       "EIM_FILTER_UNKNOWN",
       "EIM + 过滤待定",
       "EIM / 过滤待定",
-      "primary",
+      "accent",
       "conditional",
       "需要连通性验证",
       "已确认公网映射不依赖目标，但浏览器限制、服务能力或端点异常使过滤行为无法确认。",

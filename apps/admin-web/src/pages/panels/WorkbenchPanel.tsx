@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { Button, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader, Spinner } from "@heroui/react";
+import { Button, Modal, Spinner } from "@heroui/react";
 import { adminApi, recordWorkbenchOpenAsCaller } from "../../api/client";
 import type {
   Client,
@@ -242,8 +242,8 @@ export function WorkbenchPanel() {
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
-          <Button size="sm" variant="flat" isLoading={refreshing} onPress={() => void refresh()}>刷新</Button>
-          <Button size="sm" color="primary" onPress={() => setPublishOpen(true)}>发布服务</Button>
+          <Button size="sm" variant={"secondary"} isPending={refreshing} onPress={() => void refresh()}>{(refreshing) ? <Spinner size="sm" aria-hidden="true" /> : null}刷新</Button>
+          <Button size="sm" onPress={() => setPublishOpen(true)} variant={"primary"}>发布服务</Button>
         </div>
       </div>
 
@@ -258,7 +258,7 @@ export function WorkbenchPanel() {
             title="常用服务"
             subtitle={workbenchDocument ? `${workbenchDocument.favorites.length} / ${workbenchDocument.limits.maxFavorites} · 按加入顺序` : "你收藏的服务，只有你自己能看到"}
             action={workbenchDocument && workbenchDocument.favorites.length > 0
-              ? <Button size="sm" variant="light" color="danger" onPress={() => setConfirmClearFavorites(true)}>清空收藏</Button>
+              ? <Button size="sm" variant={"ghost"} onPress={() => setConfirmClearFavorites(true)} className={"text-danger"}>清空收藏</Button>
               : null}
           >
             <RefList
@@ -281,7 +281,7 @@ export function WorkbenchPanel() {
             title="最近打开"
             subtitle={workbenchDocument ? `从控制台打开或复制过的服务，保留 ${workbenchDocument.limits.recentRetentionDays} 天、最多 ${workbenchDocument.limits.maxRecents} 条；不说明访问是否成功` : "从控制台打开或复制过的服务"}
             action={workbenchDocument && workbenchDocument.recents.length > 0
-              ? <Button size="sm" variant="light" onPress={() => void runWrite("recents:clear", () => adminApi.clearWorkbenchRecents(), "清空失败")}>清空最近打开</Button>
+              ? <Button size="sm" variant={"ghost"} onPress={() => void runWrite("recents:clear", () => adminApi.clearWorkbenchRecents(), "清空失败")}>清空最近打开</Button>
               : null}
           >
             <RefList
@@ -364,7 +364,7 @@ function ProblemsSection({ problems, readAt, stale, isAdmin, clientIndex, servic
   const subtitle = readAt == null ? "正在读取状态…" : `状态读取于 ${formatClock(readAt)}${stale ? " · 已过时" : ""}`;
   return (
     <Section title="待处理问题" subtitle={subtitle}>
-      {problems == null ? <Spinner size="sm" label="读取中…" /> : (
+      {problems == null ? <span className="inline-flex items-center gap-2" role="status"><Spinner size="sm" aria-hidden={true} /><span>{"读取中…"}</span></span> : (
         <div className="flex flex-col gap-3">
           {!problems.complete ? (
             <Notice tone="warning">
@@ -431,7 +431,7 @@ function RefList({ state, entries, emptyText, serviceIndex, clientIndex, markers
   removeLabel: string;
   onOpen: (action: WorkbenchOpenAction, ref: WorkbenchRef) => void;
 }) {
-  if (state.status === "loading") return <Spinner size="sm" label="读取中…" />;
+  if (state.status === "loading") return <span className="inline-flex items-center gap-2" role="status"><Spinner size="sm" aria-hidden={true} /><span>{"读取中…"}</span></span>;
   if (state.status === "failed") return <Notice tone="warning">读取失败，请稍后刷新。</Notice>;
   if (entries.length === 0) return <p className="text-small text-default-500">{emptyText}</p>;
   return (
@@ -452,7 +452,7 @@ function RefList({ state, entries, emptyText, serviceIndex, clientIndex, markers
             <div className="flex flex-wrap items-center gap-1">
               <span className="text-tiny text-default-400">{timeLabel} {formatDateTime(at)}</span>
               {service ? <ServiceActions service={service} sharingEnabled={sharingEnabled} onOpen={onOpen} /> : null}
-              <Button size="sm" variant="light" isDisabled={busy} onPress={() => onRemove(ref)}>{removeLabel}</Button>
+              <Button size="sm" variant={"ghost"} isDisabled={busy} onPress={() => onRemove(ref)}>{removeLabel}</Button>
             </div>
           </li>
         );
@@ -497,7 +497,7 @@ function ServiceActions({ service, sharingEnabled, onOpen }: {
     const url = httpRouteAccessUrl(service.route, window.location.origin);
     return (<>
       <a className={linkClass} href={url} rel="noreferrer" target="_blank" {...linkHandlers("http-route.open-link")}>打开</a>
-      <Button size="sm" variant="light" onPress={() => void copyThenRecord(
+      <Button size="sm" variant={"ghost"} onPress={() => void copyThenRecord(
         () => copyTextWithFeedback(url, "访问链接已复制"), async () => onOpen("http-route.copy-link", ref))}>
         复制访问链接
       </Button>
@@ -505,7 +505,7 @@ function ServiceActions({ service, sharingEnabled, onOpen }: {
   }
   if (service.kind === "tcp-mapping") {
     return (
-      <Button size="sm" variant="light" onPress={() => void copyThenRecord(
+      <Button size="sm" variant={"ghost"} onPress={() => void copyThenRecord(
         () => copyTextWithFeedback(String(service.mapping.listenPort), "公网端口已复制"),
         async () => onOpen("tcp-mapping.copy-port", ref))}>
         复制公网端口
@@ -522,7 +522,7 @@ function ServiceActions({ service, sharingEnabled, onOpen }: {
   const openUrl = peerOpenUrl(peer);
   return (<>
     {openUrl ? <a className={linkClass} href={openUrl} rel="noreferrer" target="_blank" {...linkHandlers("peer-service.open-link")}>打开</a> : null}
-    <Button size="sm" variant="light" onPress={() => void copyThenRecord(
+    <Button size="sm" variant={"ghost"} onPress={() => void copyThenRecord(
       () => copyTextWithFeedback(address, "已复制虚拟地址"), async () => onOpen("peer-service.copy-address", ref))}>
       复制地址
     </Button>
@@ -542,7 +542,7 @@ function ServiceList({ reads, services, clientIndex, markers, sharingEnabled, fa
   onToggleFavorite: (ref: WorkbenchRef) => void;
   onOpen: (action: WorkbenchOpenAction, ref: WorkbenchRef) => void;
 }) {
-  if (!reads) return <Spinner size="sm" label="读取中…" />;
+  if (!reads) return <span className="inline-flex items-center gap-2" role="status"><Spinner size="sm" aria-hidden={true} /><span>{"读取中…"}</span></span>;
   const failed = ([
     ["httpRoutes", "HTTP 路由"],
     ["tcpMappings", "端口映射"],
@@ -564,9 +564,7 @@ function ServiceList({ reads, services, clientIndex, markers, sharingEnabled, fa
               <div className="flex flex-wrap items-center gap-1">
                 <ServiceActions service={service} sharingEnabled={sharingEnabled} onOpen={onOpen} />
                 {favorites ? (
-                  <Button size="sm" variant={favorite ? "flat" : "light"} color={favorite ? "primary" : "default"}
-                    aria-pressed={favorite} isDisabled={pending.has(`favorite:${refKey(ref)}`)}
-                    onPress={() => onToggleFavorite(ref)}>
+                  <Button size="sm" variant={favorite ? "primary" : "secondary"} aria-pressed={favorite} isDisabled={pending.has(`favorite:${refKey(ref)}`)} onPress={() => onToggleFavorite(ref)}>
                     {favorite ? "已收藏" : "收藏"}
                   </Button>
                 ) : null}
@@ -605,16 +603,16 @@ function PublishChooser({ open, onClose, reads, isAdmin }: {
       hash: "/peer-mesh/services", disabledReason: peerDisabledReason },
   ];
   return (
-    <Modal isOpen={open} onClose={onClose} size="lg">
-      <ModalContent>
-        <ModalHeader>发布服务</ModalHeader>
-        <ModalBody className="gap-3">
+    <Modal.Root isOpen={open} onOpenChange={(open) => { if (!open) (onClose)?.(); }}>
+      <Modal.Backdrop><Modal.Container size={"lg"}><Modal.Dialog><Modal.CloseTrigger />
+        <Modal.Header><Modal.Heading>发布服务</Modal.Heading></Modal.Header>
+        <Modal.Body className="gap-3">
           <p className="text-small text-default-500">选择服务类型后进入对应的发布表单，沿用它的全部确认；这里不会扫描或推荐任何服务。</p>
           {clientsRead?.state === "failed" ? <Notice tone="warning">设备状态读取失败，无法确认是否已有设备。</Notice> : null}
           {noDevices ? (
             <Notice tone="default">
               还没有设备。请先接入设备，再发布服务。
-              <Button className="ml-2" size="sm" variant="flat" onPress={() => go("/clients")}>去接入设备</Button>
+              <Button className="ml-2" size="sm" variant={"secondary"} onPress={() => go("/clients")}>去接入设备</Button>
             </Notice>
           ) : null}
           {options.map((option) => {
@@ -633,11 +631,11 @@ function PublishChooser({ open, onClose, reads, isAdmin }: {
               </button>
             );
           })}
-        </ModalBody>
-        <ModalFooter>
-          <Button variant="light" onPress={onClose}>取消</Button>
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant={"ghost"} onPress={onClose}>取消</Button>
+        </Modal.Footer>
+      </Modal.Dialog></Modal.Container></Modal.Backdrop>
+    </Modal.Root>
   );
 }

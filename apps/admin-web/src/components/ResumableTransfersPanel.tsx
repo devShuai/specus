@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { Button, Chip, Progress } from "@heroui/react";
+import { Button, Chip, ProgressBar } from "@heroui/react";
 import { formatBytes, formatDateTime } from "../lib/format";
 import type { DirectOutgoingResume, DirectStoredReceive } from "../hooks/useDirectTransfer";
 
@@ -57,7 +57,7 @@ export function ResumableTransfersPanel({
             已校验的分块保存在本机浏览器，24 小时内可从中断处继续；浏览器可能自行清除这些数据，过期数据在下次打开本页时删除。
           </div>
         </div>
-        <Button size="sm" radius="sm" variant="light" onPress={onClearAll}>
+        <Button size="sm" variant={"ghost"} onPress={onClearAll} className={"rounded-small"}>
           清除互传本地数据
         </Button>
       </div>
@@ -85,14 +85,14 @@ export function ResumableTransfersPanel({
                     来自 {peerDisplayNames[item.sourcePeerId] ?? (item.sourceName || "对方设备")} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}
                   </div>
                 </div>
-                <Chip size="sm" radius="sm" variant="flat">{item.storage === "persistent" ? "已暂停" : "已暂停（仅内存）"}</Chip>
+                <Chip size="sm" variant={"soft"} className={"rounded-small"}>{item.storage === "persistent" ? "已暂停" : "已暂停（仅内存）"}</Chip>
               </div>
-              <Progress className="mt-2" aria-label={`${item.fileName} 已接收`} size="sm" value={percent(item.receivedBytes, item.sizeBytes)} />
+              <ProgressBar className="mt-2" aria-label={`${item.fileName} 已接收`} size="sm" value={percent(item.receivedBytes, item.sizeBytes)}><ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track></ProgressBar>
               <div className="mt-2 text-tiny text-zinc-500">
                 对方重新连接并继续发送后会自动续传，无需再次同意。{expiryLabel(item.expiresAt)}
               </div>
               <div className="mt-2 flex justify-end">
-                <Button size="sm" radius="sm" variant="flat" onPress={() => onAbandonReceive(item.transferId)}>
+                <Button size="sm" variant={"secondary"} onPress={() => onAbandonReceive(item.transferId)} className={"rounded-small"}>
                   放弃并删除
                 </Button>
               </div>
@@ -111,11 +111,11 @@ export function ResumableTransfersPanel({
                     发给 {peerDisplayNames[item.targetPeerId] ?? (item.targetName || "对方设备")} · 对方已收 {formatBytes(item.ackedBytes)} / {formatBytes(item.sizeBytes)}
                   </div>
                 </div>
-                <Chip size="sm" radius="sm" variant="flat" color={item.running ? "primary" : "default"}>
+                <Chip size="sm" variant={"soft"} color={item.running ? "accent" : "default"} className={"rounded-small"}>
                   {item.running ? "续传中" : "未完成的发送"}
                 </Chip>
               </div>
-              <Progress className="mt-2" aria-label={`${item.fileName} 对方已收`} size="sm" value={percent(item.ackedBytes, item.sizeBytes)} />
+              <ProgressBar className="mt-2" aria-label={`${item.fileName} 对方已收`} size="sm" value={percent(item.ackedBytes, item.sizeBytes)}><ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track></ProgressBar>
               <div className="mt-2 text-tiny text-zinc-500">
                 {item.hasSource
                   ? "原文件仍在本页，可以继续发送。"
@@ -124,22 +124,18 @@ export function ResumableTransfersPanel({
               </div>
               {!item.running ? (
                 <div className="mt-2 flex justify-end gap-2">
-                  <Button size="sm" radius="sm" variant="flat" onPress={() => onAbandonOutgoing(item.transferId)}>
+                  <Button size="sm" variant={"secondary"} onPress={() => onAbandonOutgoing(item.transferId)} className={"rounded-small"}>
                     放弃
                   </Button>
                   {item.hasSource ? (
-                    <Button size="sm" radius="sm" color="primary" onPress={() => resume(item.transferId)}>
+                    <Button size="sm" onPress={() => resume(item.transferId)} className={"rounded-small"} variant={"primary"}>
                       继续发送
                     </Button>
                   ) : (
-                    <Button
-                      size="sm"
-                      radius="sm"
-                      color="primary"
-                      onPress={() => {
+                    <Button size="sm" onPress={() => {
                         reselectForRef.current = item.transferId;
                         fileInputRef.current?.click();
-                      }}
+                      }} className={"rounded-small"} variant={"primary"}
                     >
                       重新选择文件继续
                     </Button>

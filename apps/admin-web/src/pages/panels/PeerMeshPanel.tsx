@@ -1,26 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  Button,
-  Card,
-  CardBody,
-  Chip,
-  Input,
-  Pagination,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-  Select,
-  SelectItem,
-  Switch,
-  Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableColumn,
-  TableHeader,
-  TableRow,
-  Tabs,
-} from "@heroui/react";
+import { Button, Card, Chip, Input, Label, ListBox, ListBoxItem, Popover, PopoverContent,  Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, Spinner, Switch, Tab, TabList, Table, TableBody, TableCell, TableColumn, TableContent, TableHeader, TableRow, Tabs, TextField, buttonVariants } from "@heroui/react";
+import { Pager } from "../../components/Pager";
 import { adminApi } from "../../api/client";
 import type { PeerMeshAcl, PeerMeshDevice, PeerMeshPathStats, PeerMeshSession, PeerMeshStatus } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
@@ -315,16 +295,11 @@ export function PeerMeshPanel() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            color="danger"
-            variant="flat"
-            isDisabled={sessionTotal === 0 && openSessions.length === 0}
-            isLoading={clearingSessions}
-            onPress={closeOpenSessions}
-          >
+          <Button variant="danger-soft" isDisabled={sessionTotal === 0 && openSessions.length === 0 || clearingSessions} onPress={closeOpenSessions}
+          >{clearingSessions ? <Spinner size="sm" /> : null}
             清理未关闭链路
           </Button>
-          <Button variant="flat" isLoading={refreshing} onPress={() => void refresh()}>
+          <Button variant="secondary" onPress={() => void refresh()} isDisabled={refreshing}>{refreshing ? <Spinner size="sm" /> : null}
             刷新
           </Button>
         </div>
@@ -351,25 +326,27 @@ export function PeerMeshPanel() {
       </div>
 
       {!status?.enabled && (
-        <Card shadow="none" className="rounded-md border border-warning-200 bg-warning-50 dark:border-warning-400/30 dark:bg-warning-500/10">
-          <CardBody className="p-3 text-small text-warning-700 dark:text-warning-200">
+        <Card className="rounded-md border border-warning-200 bg-warning-50 dark:border-warning-400/30 dark:bg-warning-500/10">
+          <Card.Content className="p-3 text-small text-warning-700 dark:text-warning-200">
             server 当前未启用 peer mesh。设置 SPECUS_PEER_MESH_ENABLED=true 后，客户端下次登录会收到虚拟 IP、独立 STUN 拓扑和 TURN/ICE 凭证。
-          </CardBody>
+          </Card.Content>
         </Card>
       )}
 
       <Tabs
-        aria-label="私有组网视图"
+
         selectedKey={peerView}
-        variant="underlined"
+        variant="secondary"
         onSelectionChange={(key) => setPeerView(String(key) as PeerMeshViewKey)}
       >
-        <Tab key="devices" title="设备拓扑" />
-        <Tab key="services" title="服务" />
-        <Tab key="egress" title="出口分流" />
-        <Tab key="sessions" title={`活跃会话 ${globalActiveSessions}`} />
-        <Tab key="acl" title={`ACL ${acls.length}`} />
-        <Tab key="nat" title="NAT 诊断" />
+        <Tabs.ListContainer className="min-w-0 max-w-full"><TabList aria-label="私有组网视图">
+          <Tab id="devices">设备拓扑<Tabs.Indicator /></Tab>
+          <Tab id="services">服务<Tabs.Indicator /></Tab>
+          <Tab id="egress">出口分流<Tabs.Indicator /></Tab>
+          <Tab id="sessions">活跃会话 {globalActiveSessions}<Tabs.Indicator /></Tab>
+          <Tab id="acl">ACL {acls.length}<Tabs.Indicator /></Tab>
+          <Tab id="nat">NAT 诊断<Tabs.Indicator /></Tab>
+        </TabList></Tabs.ListContainer>
       </Tabs>
 
       {peerView === "services" && (
@@ -418,13 +395,13 @@ export function PeerMeshPanel() {
                   subtitle={device.ownerUsername || "-"}
                   badges={
                     <>
-                      <Chip size="sm" color={device.online ? "success" : "default"} variant="flat">
+                      <Chip size="sm" color={device.online ? "success" : "default"} variant="soft">
                         {device.online ? "在线" : "离线"}
                       </Chip>
-                      <Chip size="sm" color={device.enabled ? "primary" : "default"} variant="flat">
+                      <Chip size="sm" variant="soft" color={device.enabled ? "accent" : "default"}>
                         {device.enabled ? "组网启用" : "未启用"}
                       </Chip>
-                      <Chip size="sm" color={virtualDeviceColor(device.virtualDeviceStatus)} variant="flat">
+                      <Chip size="sm" color={virtualDeviceColor(device.virtualDeviceStatus)} variant="soft">
                         {virtualDeviceLabel(device.virtualDeviceStatus)}
                       </Chip>
                     </>
@@ -467,12 +444,7 @@ export function PeerMeshPanel() {
                   actions={
                     <div className="flex w-full items-center justify-between">
                       <span className="text-tiny text-default-500">私有组网</span>
-                      <Switch
-                        aria-label={`启用 ${device.clientName} 私有组网`}
-                        isSelected={device.enabled}
-                        isDisabled={updatingDeviceIds.has(device.clientId)}
-                        onValueChange={(enabled) => void updateDevice(device, enabled)}
-                      />
+                      <Switch aria-label={`启用 ${device.clientName} 私有组网`} isSelected={device.enabled} isDisabled={updatingDeviceIds.has(device.clientId)} onChange={(enabled) => void updateDevice(device, enabled)}><Switch.Content aria-label={`启用 ${device.clientName} 私有组网`}><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
                     </div>
                   }
                 />
@@ -483,80 +455,78 @@ export function PeerMeshPanel() {
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="Peer mesh 设备" isHeaderSticky removeWrapper>
-          <TableHeader>
-            <TableColumn>客户端</TableColumn>
-            <TableColumn>归属</TableColumn>
-            <TableColumn>虚拟 IP</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>虚拟网卡</TableColumn>
-            <TableColumn>NAT / Endpoint</TableColumn>
-            <TableColumn>最后上线</TableColumn>
-            <TableColumn>启用</TableColumn>
-          </TableHeader>
-          <TableBody items={devices} isLoading={devicesLoading} emptyContent="暂无 peer mesh 设备">
-            {(device) => (
-              <TableRow key={device.clientId}>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col">
-                    <span className="font-medium">{device.clientName}</span>
-                    <span className="text-tiny text-default-400">{device.clientId}</span>
-                  </div>
-                </TableCell>
-                <TableCell>{device.ownerUsername || "-"}</TableCell>
-                <TableCell>
-                  <div className="flex flex-col">
-                    <span className="font-mono">{device.virtualIp || "-"}</span>
-                    <span className="text-tiny text-default-400">{device.cidr}</span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap gap-1">
-                    <Chip size="sm" color={device.online ? "success" : "default"} variant="flat">
-                      {device.online ? "在线" : "离线"}
-                    </Chip>
-                    <Chip size="sm" color={device.enabled ? "primary" : "default"} variant="flat">
-                      {device.enabled ? "组网启用" : "未启用"}
-                    </Chip>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex max-w-64 flex-col gap-1 text-small">
-                    <div className="flex flex-wrap items-center gap-1">
-                      <Chip size="sm" color={virtualDeviceColor(device.virtualDeviceStatus)} variant="flat">
-                        {virtualDeviceLabel(device.virtualDeviceStatus)}
-                      </Chip>
-                      <span className="font-mono text-tiny text-default-500">
-                        {device.virtualDeviceName || device.virtualDeviceMode || "-"}
-                      </span>
+        <Table>
+          <Table.ScrollContainer><TableContent aria-label="Peer mesh 设备">
+            <TableHeader>
+              <TableColumn isRowHeader>客户端</TableColumn>
+              <TableColumn>归属</TableColumn>
+              <TableColumn>虚拟 IP</TableColumn>
+              <TableColumn>状态</TableColumn>
+              <TableColumn>虚拟网卡</TableColumn>
+              <TableColumn>NAT / Endpoint</TableColumn>
+              <TableColumn>最后上线</TableColumn>
+              <TableColumn>启用</TableColumn>
+            </TableHeader>
+            <TableBody items={devices} renderEmptyState={() => (devicesLoading ? <Spinner size="sm" /> : "暂无 peer mesh 设备")}>
+              {(device) => (
+                <TableRow key={device.clientId} id={device.clientId}>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col">
+                      <span className="font-medium">{device.clientName}</span>
+                      <span className="text-tiny text-default-400">{device.clientId}</span>
                     </div>
-                    {device.virtualDeviceError && (
-                      <span className="line-clamp-2 text-tiny text-danger">{device.virtualDeviceError}</span>
-                    )}
-                    {device.virtualDeviceUpdatedAt && (
-                      <span className="text-tiny text-default-400">上报 {formatDateTime(device.virtualDeviceUpdatedAt)}</span>
-                    )}
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex max-w-72 flex-col gap-0.5 break-all text-small">
-                    <span>{peerNatProfile(device).label}</span>
-                    <PeerNatBehaviorLine device={device} />
-                    <span className="text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
-                  </div>
-                </TableCell>
-                <TableCell>{formatDateTime(device.lastSeenAt)}</TableCell>
-                <TableCell>
-                  <Switch
-                    aria-label={`启用 ${device.clientName} 私有组网`}
-                    isSelected={device.enabled}
-                    isDisabled={updatingDeviceIds.has(device.clientId)}
-                    onValueChange={(enabled) => void updateDevice(device, enabled)}
-                  />
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
+                  </TableCell>
+                  <TableCell>{device.ownerUsername || "-"}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-col">
+                      <span className="font-mono">{device.virtualIp || "-"}</span>
+                      <span className="text-tiny text-default-400">{device.cidr}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      <Chip size="sm" color={device.online ? "success" : "default"} variant="soft">
+                        {device.online ? "在线" : "离线"}
+                      </Chip>
+                      <Chip size="sm" variant="soft" color={device.enabled ? "accent" : "default"}>
+                        {device.enabled ? "组网启用" : "未启用"}
+                      </Chip>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex max-w-64 flex-col gap-1 text-small">
+                      <div className="flex flex-wrap items-center gap-1">
+                        <Chip size="sm" color={virtualDeviceColor(device.virtualDeviceStatus)} variant="soft">
+                          {virtualDeviceLabel(device.virtualDeviceStatus)}
+                        </Chip>
+                        <span className="font-mono text-tiny text-default-500">
+                          {device.virtualDeviceName || device.virtualDeviceMode || "-"}
+                        </span>
+                      </div>
+                      {device.virtualDeviceError && (
+                        <span className="line-clamp-2 text-tiny text-danger">{device.virtualDeviceError}</span>
+                      )}
+                      {device.virtualDeviceUpdatedAt && (
+                        <span className="text-tiny text-default-400">上报 {formatDateTime(device.virtualDeviceUpdatedAt)}</span>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex max-w-72 flex-col gap-0.5 break-all text-small">
+                      <span>{peerNatProfile(device).label}</span>
+                      <PeerNatBehaviorLine device={device} />
+                      <span className="text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell>{formatDateTime(device.lastSeenAt)}</TableCell>
+                  <TableCell>
+                    <Switch aria-label={`启用 ${device.clientName} 私有组网`} isSelected={device.enabled} isDisabled={updatingDeviceIds.has(device.clientId)} onChange={(enabled) => void updateDevice(device, enabled)}><Switch.Content aria-label={`启用 ${device.clientName} 私有组网`}><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+
+          </TableContent></Table.ScrollContainer>
         </Table>
         </div>
       </section>
@@ -565,25 +535,52 @@ export function PeerMeshPanel() {
 
       {peerView === "acl" && (
       <section className="grid gap-3">
-        <Card shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-3 p-3">
+        <Card className="rounded-md border border-default-200">
+          <Card.Content className="gap-3 p-3">
             <div>
               <h3 className="text-base font-semibold">显式 ACL</h3>
               <p className="text-small text-default-500">同一用户默认放行；跨用户互访需要 admin 创建显式 ACL。</p>
             </div>
             <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto]">
-              <Select label="源客户端" selectedKeys={sourceClientId ? [sourceClientId] : []} onSelectionChange={(keys) => setSourceClientId(String(Array.from(keys)[0] ?? ""))}>
-                {devices.map((device) => (<SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>))}
+              <Select value={sourceClientId || null} onChange={(keys) => setSourceClientId(String(keys ?? ""))}>
+                <Label>源客户端</Label>
+                <SelectTrigger>
+                  <SelectValue />
+                  <SelectIndicator />
+                </SelectTrigger>
+                <SelectPopover>
+                  <ListBox>
+                    {devices.map((device) => (<ListBoxItem textValue={device.clientName} key={String(device.clientId)} id={String(device.clientId)}>{device.clientName}</ListBoxItem>))}
+                  </ListBox>
+                </SelectPopover>
               </Select>
-              <Select label="目标客户端" selectedKeys={targetClientId ? [targetClientId] : []} onSelectionChange={(keys) => setTargetClientId(String(Array.from(keys)[0] ?? ""))}>
-                {devices.map((device) => (<SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>))}
+              <Select value={targetClientId || null} onChange={(keys) => setTargetClientId(String(keys ?? ""))}>
+                <Label>目标客户端</Label>
+                <SelectTrigger>
+                  <SelectValue />
+                  <SelectIndicator />
+                </SelectTrigger>
+                <SelectPopover>
+                  <ListBox>
+                    {devices.map((device) => (<ListBoxItem textValue={device.clientName} key={String(device.clientId)} id={String(device.clientId)}>{device.clientName}</ListBoxItem>))}
+                  </ListBox>
+                </SelectPopover>
               </Select>
-              <Select label="方向" selectedKeys={[aclDirection]} onSelectionChange={(keys) => setAclDirection(String(Array.from(keys)[0] ?? "OUTBOUND") as typeof aclDirection)}>
-                <SelectItem key="OUTBOUND">允许我连他人</SelectItem>
-                <SelectItem key="INBOUND">允许他人连我</SelectItem>
-                <SelectItem key="BOTH">双向允许</SelectItem>
+              <Select value={aclDirection} onChange={(keys) => setAclDirection(String(keys ?? "OUTBOUND") as typeof aclDirection)}>
+                <Label>方向</Label>
+                <SelectTrigger>
+                  <SelectValue />
+                  <SelectIndicator />
+                </SelectTrigger>
+                <SelectPopover>
+                  <ListBox>
+                    <ListBoxItem textValue="允许我连他人" id="OUTBOUND">允许我连他人</ListBoxItem>
+                <ListBoxItem textValue="允许他人连我" id="INBOUND">允许他人连我</ListBoxItem>
+                <ListBoxItem textValue="双向允许" id="BOTH">双向允许</ListBoxItem>
+                  </ListBox>
+                </SelectPopover>
               </Select>
-              <Button className="md:self-end" color="primary" onPress={() => void createAcl()}>放行</Button>
+              <Button variant="primary" className="md:self-end" onPress={() => void createAcl()}>放行</Button>
             </div>
 
             {/* mobile: ACL 卡片 */}
@@ -603,12 +600,12 @@ export function PeerMeshPanel() {
                         </span>
                       }
                       badges={
-                        <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="flat">
+                        <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="soft">
                           {acl.allowed ? "允许" : "拒绝"}
                         </Chip>
                       }
                       actions={
-                        <Button size="sm" color="danger" variant="flat" onPress={() => void deleteAcl(acl)}>
+                        <Button size="sm" variant="danger-soft" onPress={() => void deleteAcl(acl)}>
                           删除
                         </Button>
                       }
@@ -620,45 +617,43 @@ export function PeerMeshPanel() {
 
             {/* desktop: ACL 表格 */}
             <div className="hidden min-w-0 overflow-x-auto lg:block">
-            <Table aria-label="Peer ACL" removeWrapper>
-              <TableHeader>
-                <TableColumn>源</TableColumn>
-                <TableColumn>目标</TableColumn>
-                <TableColumn>方向</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>操作</TableColumn>
-              </TableHeader>
-              <TableBody items={acls} isLoading={devicesLoading} emptyContent="暂无显式 ACL">
-                {(acl) => (
-                  <TableRow key={acl.id}>
-                    <TableCell>{acl.sourceClientName}</TableCell>
-                    <TableCell>{acl.targetClientName}</TableCell>
-                    <TableCell>
-                      <Chip
-                        aria-label={aclDirectionLabel(acl.direction)}
-                        size="sm"
-                        variant="flat"
-                        color={acl.direction === "BOTH" ? "success" : acl.direction === "INBOUND" ? "warning" : "primary"}
-                      >
-                        {aclDirectionLabel(acl.direction)}
-                      </Chip>
-                    </TableCell>
-                    <TableCell>
-                      <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="flat">
-                        {acl.allowed ? "允许" : "拒绝"}
-                      </Chip>
-                    </TableCell>
-                    <TableCell>
-                      <Button size="sm" color="danger" variant="flat" onPress={() => void deleteAcl(acl)}>
-                        删除
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
+            <Table>
+              <Table.ScrollContainer><TableContent aria-label="Peer ACL">
+                <TableHeader>
+                  <TableColumn isRowHeader>源</TableColumn>
+                  <TableColumn>目标</TableColumn>
+                  <TableColumn>方向</TableColumn>
+                  <TableColumn>状态</TableColumn>
+                  <TableColumn>操作</TableColumn>
+                </TableHeader>
+                <TableBody items={acls} renderEmptyState={() => (devicesLoading ? <Spinner size="sm" /> : "暂无显式 ACL")}>
+                  {(acl) => (
+                    <TableRow key={acl.id} id={acl.id}>
+                      <TableCell>{acl.sourceClientName}</TableCell>
+                      <TableCell>{acl.targetClientName}</TableCell>
+                      <TableCell>
+                        <Chip aria-label={aclDirectionLabel(acl.direction)} size="sm" variant="soft" color={acl.direction === "BOTH" ? "success" : acl.direction === "INBOUND" ? "warning" : "accent"}>
+                          {aclDirectionLabel(acl.direction)}
+                        </Chip>
+                      </TableCell>
+                      <TableCell>
+                        <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="soft">
+                          {acl.allowed ? "允许" : "拒绝"}
+                        </Chip>
+                      </TableCell>
+                      <TableCell>
+                        <Button size="sm" variant="danger-soft" onPress={() => void deleteAcl(acl)}>
+                          删除
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+
+              </TableContent></Table.ScrollContainer>
             </Table>
             </div>
-          </CardBody>
+          </Card.Content>
         </Card>
       </section>
       )}
@@ -667,17 +662,17 @@ export function PeerMeshPanel() {
       <section className="grid gap-3">
         <PeerPathStatsCard stats={pathStats} />
         {!sessionsLoading && activeSessions.length === 0 ? (
-          <Card shadow="none" className="rounded-md border border-default-200">
-            <CardBody className="p-3">
+          <Card className="rounded-md border border-default-200">
+            <Card.Content className="p-3">
               <EmptyState icon="peer" title="暂无活跃 peer 会话" description="客户端之间建立直连或 relay 链路后，活跃会话将在这里显示。" actionLabel="配置私有组网" onAction={() => { window.location.hash = "/help/peer-mesh"; }} />
-            </CardBody>
+            </Card.Content>
           </Card>
         ) : (
           <>
             {/* 桌面端主从分栏 */}
             <div className="hidden lg:flex lg:gap-3 lg:min-h-[320px]">
-              <Card shadow="none" className="w-[38%] min-w-0 shrink-0 rounded-md border border-default-200">
-                <CardBody className="gap-2 p-3">
+              <Card className="w-[38%] min-w-0 shrink-0 rounded-md border border-default-200">
+                <Card.Content className="gap-2 p-3">
                   <div className="flex items-center justify-between"><h3 className="text-small font-semibold">活跃会话</h3><span className="text-tiny text-default-500">有效 {activeSessions.length} / 未关闭 {sessionTotal}</span></div>
                   <div className="flex-1 space-y-1 overflow-y-auto">
                     {activeSessions.map((s) => {
@@ -688,7 +683,7 @@ export function PeerMeshPanel() {
                           <div className="min-w-0 flex-1">
                             <div className="truncate text-small font-medium">{s.sourceClientName} → {s.targetClientName}</div>
                             <div className="mt-0.5 flex items-center gap-2 text-tiny text-default-500">
-                              <Chip size="sm" variant="flat" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>
+                              <Chip size="sm" variant="soft" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>
                               <span>{s.rttMillis != null ? `${s.rttMillis} ms` : "-"}</span>
                               <span>·</span>
                               <span>{s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-"}</span>
@@ -699,21 +694,21 @@ export function PeerMeshPanel() {
                       );
                     })}
                   </div>
-                  {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pagination showControls size="sm" page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))} /></div>}
-                </CardBody>
+                  {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pager page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))}  /></div>}
+                </Card.Content>
               </Card>
-              <Card shadow="none" className="flex-1 min-w-0 rounded-md border border-default-200">
-                <CardBody className="gap-4 p-4">
+              <Card className="flex-1 min-w-0 rounded-md border border-default-200">
+                <Card.Content className="gap-4 p-4">
                   {selectedSession ? <SessionDetail session={selectedSession} onDisconnect={(s) => void closeSession(s)} /> : <div className="flex h-full items-center justify-center text-small text-default-400">← 选择左侧会话查看详情</div>}
-                </CardBody>
+                </Card.Content>
               </Card>
             </div>
 
             {/* 移动端全宽列表 + 详情 */}
             <div className="lg:hidden">
               {!mobileDetailOpen ? (
-                <Card shadow="none" className="rounded-md border border-default-200">
-                  <CardBody className="gap-2 p-3">
+                <Card className="rounded-md border border-default-200">
+                  <Card.Content className="gap-2 p-3">
                     <h3 className="text-small font-semibold">活跃会话 · 有效 {activeSessions.length} / 未关闭 {sessionTotal}</h3>
                     <MobileListCardList items={activeSessions} isLoading={sessionsLoading} emptyContent="暂无活跃 peer session" renderCard={(raw) => {
                       const s = raw as PeerMeshSession;
@@ -721,29 +716,29 @@ export function PeerMeshPanel() {
                       return (
                         <MobileListCard key={s.id}
                           title={<span className="break-all">{s.sourceClientName} → {s.targetClientName}</span>}
-                          badges={<Chip size="sm" variant="flat" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>}
+                          badges={<Chip size="sm" variant="soft" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>}
                           fields={[
                             { label: "RTT", value: s.rttMillis == null ? "-" : `${s.rttMillis} ms` },
                             { label: "Keepalive", value: s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-" },
                           ]}
-                          actions={<Button size="sm" variant="flat" onPress={() => { setSelectedSession(s); setMobileDetailOpen(true); }}>详情</Button>}
+                          actions={<Button size="sm" variant="secondary" onPress={() => { setSelectedSession(s); setMobileDetailOpen(true); }}>详情</Button>}
                         />
                       );
                     }} />
-                    {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pagination showControls size="sm" page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))} /></div>}
-                  </CardBody>
+                    {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pager page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))}  /></div>}
+                  </Card.Content>
                 </Card>
               ) : (
-                <Card shadow="none" className="rounded-md border border-default-200">
-                  <CardBody className="gap-3 p-3">
+                <Card className="rounded-md border border-default-200">
+                  <Card.Content className="gap-3 p-3">
                     <div className="flex items-center gap-2">
-                      <Button size="sm" variant="light" isIconOnly onPress={() => setMobileDetailOpen(false)}>
+                      <Button size="sm" variant="ghost" isIconOnly onPress={() => setMobileDetailOpen(false)}>
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" /></svg>
                       </Button>
                       <span className="text-small font-semibold">会话详情</span>
                     </div>
                     {selectedSession && <SessionDetail session={selectedSession} onDisconnect={(s) => void closeSession(s)} />}
-                  </CardBody>
+                  </Card.Content>
                 </Card>
               )}
             </div>
@@ -777,8 +772,8 @@ function SessionDetail({ session, onDisconnect }: { session: PeerMeshSession; on
       <div className="flex items-center justify-between">
         <h3 className="text-base font-semibold">{session.sourceClientName} → {session.targetClientName}</h3>
         <div className="flex items-center gap-2">
-          <Chip size="sm" variant="flat" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>
-          <Chip size="sm" variant="flat" color={session.status === "ACTIVE" ? "success" : session.status === "CLOSED" ? "danger" : "default"}>{session.status}</Chip>
+          <Chip size="sm" variant="soft" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>
+          <Chip size="sm" variant="soft" color={session.status === "ACTIVE" ? "success" : session.status === "CLOSED" ? "danger" : "default"}>{session.status}</Chip>
         </div>
       </div>
       <div className="grid grid-cols-2 gap-3 rounded-md border border-default-200 bg-default-50 p-3 text-small">
@@ -804,7 +799,7 @@ function SessionDetail({ session, onDisconnect }: { session: PeerMeshSession; on
         </div>
       </div>
       <div className="flex gap-2 pt-1">
-        <Button size="sm" color="danger" variant="flat" isDisabled={session.status === "CLOSED"} onPress={() => onDisconnect(session)}>断开会话</Button>
+        <Button size="sm" variant="danger-soft" isDisabled={session.status === "CLOSED"} onPress={() => onDisconnect(session)}>断开会话</Button>
       </div>
     </div>
   );
@@ -844,8 +839,8 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
   const filteringRows = [...(stats.natFilteringBehaviors ?? [])].sort((a, b) => b.devices - a.devices);
   const discoveryRows = [...(stats.natBehaviorDiscoveries ?? [])].sort((a, b) => b.devices - a.devices);
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-3 p-3">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="gap-3 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-small font-semibold">打洞 / 路径统计</h3>
           <span className="text-tiny text-default-500">
@@ -876,12 +871,7 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
           <div className="flex flex-wrap items-center gap-1.5 border-t border-default-200 pt-3">
             <span className="text-tiny text-default-500">实际路径地址族：</span>
             {addressFamilyRows.map((item) => (
-              <Chip
-                key={item.addressFamily}
-                size="sm"
-                variant="flat"
-                color={item.addressFamily === "IPv6" ? "primary" : item.addressFamily === "IPv4" ? "success" : "default"}
-              >
+              <Chip key={item.addressFamily} size="sm" variant="soft" color={item.addressFamily === "IPv6" ? "accent" : item.addressFamily === "IPv4" ? "success" : "default"}>
                 {item.addressFamily} · 活跃 {item.activeSessions} · Direct {item.directSessions} / Relay {item.relaySessions}
               </Chip>
             ))}
@@ -922,37 +912,40 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
 
         {pathTypeRows.length > 0 && (
           <div className="min-w-0 overflow-x-auto">
-            <Table aria-label="路径类型统计" removeWrapper>
-              <TableHeader>
-                <TableColumn>路径</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>会话数</TableColumn>
-                <TableColumn>确立过路径</TableColumn>
-                <TableColumn>平均 RTT</TableColumn>
-                <TableColumn>Direct 流量</TableColumn>
-                <TableColumn>Relay 流量</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {pathTypeRows.map((row) => (
-                  <TableRow key={`${row.pathType}-${row.status}`}>
-                    <TableCell>
-                      <Chip size="sm" variant="flat" color={row.pathType === "DIRECT" ? "success" : row.pathType === "RELAY" ? "warning" : "default"}>
-                        {row.pathType}
-                      </Chip>
-                    </TableCell>
-                    <TableCell>
-                      <Chip size="sm" variant="flat" color={row.status === "ACTIVE" ? "success" : row.status === "CLOSED" ? "default" : "warning"}>
-                        {row.status}
-                      </Chip>
-                    </TableCell>
-                    <TableCell>{row.sessions}</TableCell>
-                    <TableCell>{row.reportedSessions}</TableCell>
-                    <TableCell>{row.avgRttMillis == null ? "-" : `${Math.round(row.avgRttMillis)} ms`}</TableCell>
-                    <TableCell>{formatBytes(row.directBytes)}</TableCell>
-                    <TableCell>{formatBytes(row.relayBytes)}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
+            <Table>
+              <Table.ScrollContainer><TableContent aria-label="路径类型统计">
+                <TableHeader>
+                  <TableColumn isRowHeader>路径</TableColumn>
+                  <TableColumn>状态</TableColumn>
+                  <TableColumn>会话数</TableColumn>
+                  <TableColumn>确立过路径</TableColumn>
+                  <TableColumn>平均 RTT</TableColumn>
+                  <TableColumn>Direct 流量</TableColumn>
+                  <TableColumn>Relay 流量</TableColumn>
+                </TableHeader>
+                <TableBody>
+                  {pathTypeRows.map((row) => (
+                    <TableRow key={`${row.pathType}-${row.status}`} id={`${row.pathType}-${row.status}`}>
+                      <TableCell>
+                        <Chip size="sm" variant="soft" color={row.pathType === "DIRECT" ? "success" : row.pathType === "RELAY" ? "warning" : "default"}>
+                          {row.pathType}
+                        </Chip>
+                      </TableCell>
+                      <TableCell>
+                        <Chip size="sm" variant="soft" color={row.status === "ACTIVE" ? "success" : row.status === "CLOSED" ? "default" : "warning"}>
+                          {row.status}
+                        </Chip>
+                      </TableCell>
+                      <TableCell>{row.sessions}</TableCell>
+                      <TableCell>{row.reportedSessions}</TableCell>
+                      <TableCell>{row.avgRttMillis == null ? "-" : `${Math.round(row.avgRttMillis)} ms`}</TableCell>
+                      <TableCell>{formatBytes(row.directBytes)}</TableCell>
+                      <TableCell>{formatBytes(row.relayBytes)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+
+              </TableContent></Table.ScrollContainer>
             </Table>
           </div>
         )}
@@ -961,13 +954,13 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-tiny text-default-500">兼容 NAT 标签：</span>
             {natTypeRows.map((item) => (
-              <Chip key={item.natType} size="sm" variant="flat" color={natTypeColor(item.natType)}>
+              <Chip key={item.natType} size="sm" variant="soft" color={natTypeColor(item.natType)}>
                 {natTypeLabel(item.natType)} · {item.devices}
               </Chip>
             ))}
           </div>
         )}
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -1002,8 +995,8 @@ function PeerNatInsight({
           <PeerNatMetric label="新鲜上报" value={String(stats.fresh)} tone={stats.fresh > 0 ? "success" : "default"} />
         </div>
 
-        <Card shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-3 p-3">
+        <Card className="rounded-md border border-default-200">
+          <Card.Content className="gap-3 p-3">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
                 <h3 className="text-base font-semibold">客户端 NAT 探测</h3>
@@ -1011,7 +1004,7 @@ function PeerNatInsight({
                   原生客户端使用业务 UDP socket 执行 RFC 5780，分别上报映射和过滤行为；兼容 NAT 标签仅用于旧版本识别。
                 </p>
               </div>
-              <Chip size="sm" variant="flat">
+              <Chip size="sm" variant="soft">
                 {stats.distribution.length} 类 NAT
               </Chip>
             </div>
@@ -1035,18 +1028,20 @@ function PeerNatInsight({
                     aria-label="搜索客户端 NAT 结果"
                     placeholder="搜索客户端 / IP / Endpoint"
                     value={keyword}
-                    onValueChange={onKeywordChange}
-                    variant="flat"
+                    onChange={(event) => onKeywordChange(event.target.value)}
                   />
-                  <Select
-                    aria-label="筛选客户端 NAT 结果"
-                    selectedKeys={[filter]}
-                    onSelectionChange={(keys) => onFilterChange(String(Array.from(keys)[0] ?? "all") as PeerNatFilterKey)}
-                    variant="flat"
-                  >
-                    {peerNatFilterOptions.map((option) => (
-                      <SelectItem key={option.key}>{option.label}</SelectItem>
+                  <Select aria-label="筛选客户端 NAT 结果" variant="secondary" value={filter} onChange={(keys) => onFilterChange(String(keys ?? "all") as PeerNatFilterKey)}>
+                    <SelectTrigger>
+                      <SelectValue />
+                      <SelectIndicator />
+                    </SelectTrigger>
+                    <SelectPopover>
+                      <ListBox>
+                        {peerNatFilterOptions.map((option) => (
+                      <ListBoxItem textValue={option.label} key={option.key} id={option.key}>{option.label}</ListBoxItem>
                     ))}
+                      </ListBox>
+                    </SelectPopover>
                   </Select>
                 </div>
 
@@ -1065,13 +1060,13 @@ function PeerNatInsight({
                           subtitle={device.ownerUsername || "-"}
                           badges={
                             <>
-                              <Chip size="sm" color={device.online ? "success" : "default"} variant="flat">
+                              <Chip size="sm" color={device.online ? "success" : "default"} variant="soft">
                                 {device.online ? "在线" : "离线"}
                               </Chip>
-                              <Chip size="sm" color={profile.tone} variant="flat">
+                              <Chip size="sm" color={profile.tone} variant="soft">
                                 {profile.label}
                               </Chip>
-                              <Chip size="sm" color={peerNatFreshnessColor(device)} variant="flat">
+                              <Chip size="sm" color={peerNatFreshnessColor(device)} variant="soft">
                                 {peerNatFreshnessLabel(device)}
                               </Chip>
                             </>
@@ -1095,83 +1090,79 @@ function PeerNatInsight({
 
                 <div className="mt-2 hidden min-w-0 lg:block">
                   <Table
-                    aria-label="客户端 NAT 检测结果"
-                    classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
-                    removeWrapper
                   >
-                    <TableHeader>
-                      <TableColumn className="w-[22%]">
-                        <PeerNatKeywordHeader keyword={keyword} onKeywordChange={onKeywordChange} />
-                      </TableColumn>
-                      <TableColumn className="w-[24%]">
-                        <PeerNatTypeFilterHeader filter={filter} onFilterChange={onFilterChange} />
-                      </TableColumn>
-                      <TableColumn className="w-[18%]">Endpoint</TableColumn>
-                      <TableColumn className="w-[22%]">建议</TableColumn>
-                      <TableColumn className="w-[14%]">上报</TableColumn>
-                    </TableHeader>
-                    <TableBody items={devices} isLoading={loading} emptyContent="暂无客户端 NAT 检测结果">
-                      {(device) => {
-                        const profile = peerNatProfile(device);
-                        return (
-                          <TableRow key={device.clientId}>
-                            <TableCell>
-                              <div className="flex min-w-0 flex-col">
-                                <span className="truncate font-semibold" title={device.clientName}>{device.clientName}</span>
-                                <span className="truncate font-mono text-tiny text-default-400" title={device.virtualIp || "-"}>{device.virtualIp || "-"}</span>
-                              </div>
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex min-w-0 flex-col gap-1">
-                                <Chip className="w-fit" size="sm" color={profile.tone} variant="flat">
-                                  {profile.label}
-                                </Chip>
-                                <PeerNatBehaviorLine device={device} />
-                              </div>
-                            </TableCell>
-                            <TableCell>
-                              <span className="block truncate font-mono text-tiny" title={device.lastEndpoint || "-"}>{device.lastEndpoint || "-"}</span>
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex min-w-0 flex-col text-small">
-                                <span className="truncate font-semibold" title={profile.reachabilityLabel}>{profile.reachabilityLabel}</span>
-                                <span className="truncate text-tiny text-default-500" title={profile.recommendation}>{profile.recommendation}</span>
-                              </div>
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex flex-col text-small">
-                                <span className="truncate" title={formatDateTime(peerNatLastReportAt(device))}>{formatDateTime(peerNatLastReportAt(device))}</span>
-                                <span className="truncate text-tiny text-default-400" title={peerNatAgeLabel(peerNatLastReportAt(device))}>{peerNatAgeLabel(peerNatLastReportAt(device))}</span>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        );
-                      }}
-                    </TableBody>
+                    <Table.ScrollContainer><TableContent aria-label="客户端 NAT 检测结果">
+                      <TableHeader>
+                        <TableColumn isRowHeader className="w-[22%]">
+                          <PeerNatKeywordHeader keyword={keyword} onKeywordChange={onKeywordChange} />
+                        </TableColumn>
+                        <TableColumn className="w-[24%]">
+                          <PeerNatTypeFilterHeader filter={filter} onFilterChange={onFilterChange} />
+                        </TableColumn>
+                        <TableColumn className="w-[18%]">Endpoint</TableColumn>
+                        <TableColumn className="w-[22%]">建议</TableColumn>
+                        <TableColumn className="w-[14%]">上报</TableColumn>
+                      </TableHeader>
+                      <TableBody items={devices} renderEmptyState={() => (loading ? <Spinner size="sm" /> : "暂无客户端 NAT 检测结果")}>
+                        {(device) => {
+                          const profile = peerNatProfile(device);
+                          return (
+                            <TableRow key={device.clientId} id={device.clientId}>
+                              <TableCell>
+                                <div className="flex min-w-0 flex-col">
+                                  <span className="truncate font-semibold" title={device.clientName}>{device.clientName}</span>
+                                  <span className="truncate font-mono text-tiny text-default-400" title={device.virtualIp || "-"}>{device.virtualIp || "-"}</span>
+                                </div>
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex min-w-0 flex-col gap-1">
+                                  <Chip className="w-fit" size="sm" color={profile.tone} variant="soft">
+                                    {profile.label}
+                                  </Chip>
+                                  <PeerNatBehaviorLine device={device} />
+                                </div>
+                              </TableCell>
+                              <TableCell>
+                                <span className="block truncate font-mono text-tiny" title={device.lastEndpoint || "-"}>{device.lastEndpoint || "-"}</span>
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex min-w-0 flex-col text-small">
+                                  <span className="truncate font-semibold" title={profile.reachabilityLabel}>{profile.reachabilityLabel}</span>
+                                  <span className="truncate text-tiny text-default-500" title={profile.recommendation}>{profile.recommendation}</span>
+                                </div>
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex flex-col text-small">
+                                  <span className="truncate" title={formatDateTime(peerNatLastReportAt(device))}>{formatDateTime(peerNatLastReportAt(device))}</span>
+                                  <span className="truncate text-tiny text-default-400" title={peerNatAgeLabel(peerNatLastReportAt(device))}>{peerNatAgeLabel(peerNatLastReportAt(device))}</span>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          );
+                        }}
+                      </TableBody>
+
+                    </TableContent></Table.ScrollContainer>
                   </Table>
                 </div>
               </div>
             </div>
-          </CardBody>
+          </Card.Content>
         </Card>
       </div>
 
       <div className="flex min-w-0 flex-col gap-3">
-        <Card shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-3 p-3">
+        <Card className="rounded-md border border-default-200">
+          <Card.Content className="gap-3 p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <h3 className="text-base font-semibold">NAT 行为分类</h3>
                 <p className="text-small text-default-500">映射与过滤是相互独立的两个轴，路径选择以实际 ICE 连通性为最终依据。</p>
               </div>
-              <Button
-                as="a"
-                href="#/help/peer-mesh"
-                size="sm"
-                variant="flat"
-              >
+              <a
+                href="#/help/peer-mesh" className={buttonVariants({ variant: "secondary", size: "sm" })}>
                 查看详细文档
-              </Button>
+              </a>
             </div>
             <div className="grid gap-4 lg:grid-cols-2">
               {NAT_BEHAVIOR_AXES.map((axis) => (
@@ -1194,7 +1185,7 @@ function PeerNatInsight({
                 </div>
               ))}
             </div>
-          </CardBody>
+          </Card.Content>
         </Card>
       </div>
     </section>
@@ -1231,11 +1222,7 @@ function NatBehaviorDistribution({
     <div className="flex flex-wrap items-center gap-1.5">
       <span className="w-8 shrink-0 text-tiny text-default-500">{label}</span>
       {items.map((item) => (
-        <Chip
-          key={`${label}-${item.behavior}`}
-          size="sm"
-          variant="flat"
-          color={["UNKNOWN", "UNSUPPORTED"].includes(item.behavior.toUpperCase()) ? "warning" : "default"}
+        <Chip key={`${label}-${item.behavior}`} size="sm" variant="soft" color={["UNKNOWN", "UNSUPPORTED"].includes(item.behavior.toUpperCase()) ? "warning" : "default"}
         >
           {item.label} · {item.devices}
         </Chip>
@@ -1259,36 +1246,25 @@ function PeerNatKeywordHeader({
       <span className="truncate" title={label}>
         {label}
       </span>
-      <Popover placement="bottom-start" shouldBlockScroll={false}>
-        <PopoverTrigger>
-          <Button
-            isIconOnly
-            aria-label="搜索客户端 NAT 结果"
-            className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="搜索客户端 NAT 结果"
-            variant={active ? "flat" : "light"}
-          >
+      <Popover>
+
+          <Button isIconOnly aria-label="搜索客户端 NAT 结果" className="h-7 min-w-7 text-default-500" size="sm" variant={active ? "secondary" : "ghost"}>
             <PeerNatFilterIcon />
           </Button>
-        </PopoverTrigger>
-        <PopoverContent className="w-72 p-3">
+
+        <PopoverContent placement="bottom start" className="w-72 p-3"><Popover.Dialog aria-label="搜索客户端 NAT 结果">
           <div className="flex w-full flex-col gap-3">
             <div className="text-small font-semibold">搜索客户端</div>
-            <Input
-              autoFocus
-              label="关键词"
-              placeholder="客户端 / IP / Endpoint"
-              size="sm"
-              value={keyword}
-              onValueChange={onKeywordChange}
-            />
-            <Button size="sm" variant="flat" onPress={() => onKeywordChange("")}>
+            <TextField value={keyword} onChange={onKeywordChange}>
+              <Label>关键词</Label>
+              <Input autoFocus
+              placeholder="客户端 / IP / Endpoint" />
+            </TextField>
+            <Button size="sm" variant="secondary" onPress={() => onKeywordChange("")}>
               清空搜索
             </Button>
           </div>
-        </PopoverContent>
+        </Popover.Dialog></PopoverContent>
       </Popover>
       {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
     </div>
@@ -1311,21 +1287,13 @@ function PeerNatTypeFilterHeader({
       <span className="truncate" title={label}>
         {label}
       </span>
-      <Popover placement="bottom-start" shouldBlockScroll={false}>
-        <PopoverTrigger>
-          <Button
-            isIconOnly
-            aria-label="筛选 NAT 状态"
-            className="h-7 min-w-7 text-default-500"
-            color={active ? "primary" : "default"}
-            size="sm"
-            title="筛选 NAT 状态"
-            variant={active ? "flat" : "light"}
-          >
+      <Popover>
+
+          <Button isIconOnly aria-label="筛选 NAT 状态" className="h-7 min-w-7 text-default-500" size="sm" variant={active ? "secondary" : "ghost"}>
             <PeerNatFilterIcon />
           </Button>
-        </PopoverTrigger>
-        <PopoverContent className="w-56 p-3">
+
+        <PopoverContent placement="bottom start" className="w-56 p-3"><Popover.Dialog aria-label="NAT 状态筛选">
           <div className="flex w-full flex-col gap-3">
             <div className="text-small font-semibold">NAT 状态筛选</div>
             <select
@@ -1340,7 +1308,7 @@ function PeerNatTypeFilterHeader({
               ))}
             </select>
           </div>
-        </PopoverContent>
+        </Popover.Dialog></PopoverContent>
       </Popover>
       {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
     </div>
@@ -1409,7 +1377,7 @@ function PeerNatDistributionRow({
     <div className="grid gap-1">
       <div className="flex items-center justify-between gap-2 text-small">
         <span className="flex min-w-0 items-center gap-2">
-          <Chip className="shrink-0" size="sm" color={item.profile.tone} variant="flat">
+          <Chip className="shrink-0" size="sm" color={item.profile.tone} variant="soft">
             {item.profile.shortLabel}
           </Chip>
           <span className="truncate text-default-500">{item.profile.reachabilityLabel}</span>
@@ -1436,11 +1404,11 @@ function PeerNatMetric({
 }) {
   const color = tone === "success" ? "text-success" : tone === "danger" ? "text-danger" : "text-foreground";
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-1 p-3">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="gap-1 p-3">
         <span className="text-small text-default-500">{label}</span>
         <span className={`text-xl font-semibold ${color}`}>{value}</span>
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -1591,8 +1559,8 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
   const hiddenLinkCount = Math.max(0, topologyLinks.length - 12);
 
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-3 p-3">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="gap-3 p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 className="text-base font-semibold">组网拓扑</h3>
@@ -1601,10 +1569,10 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
             </p>
           </div>
           <div className="flex flex-wrap gap-1">
-            <Chip size="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {topologyLinks.length} 条逻辑链路
             </Chip>
-            <Chip size="sm" variant="flat">
+            <Chip size="sm" variant="soft">
               {sessions.length} 个会话
             </Chip>
           </div>
@@ -1618,7 +1586,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
                   <div className="truncate font-semibold">{device.clientName}</div>
                   <div className="font-mono text-small text-default-500">{device.virtualIp || "-"}</div>
                 </div>
-                <Chip size="sm" color={device.online ? "success" : "default"} variant="flat">
+                <Chip size="sm" color={device.online ? "success" : "default"} variant="soft">
                   {device.online ? "online" : "offline"}
                 </Chip>
               </div>
@@ -1650,7 +1618,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
                       <span className="px-2 text-default-400">{"<->"}</span>
                       <span>{link.secondName}</span>
                     </div>
-                    <Chip size="sm" color={pathColor(pathType, session.status)} variant="flat">
+                    <Chip size="sm" color={pathColor(pathType, session.status)} variant="soft">
                       {pathType} · {session.status}
                     </Chip>
                   </div>
@@ -1676,7 +1644,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
         {hiddenLinkCount > 0 && (
           <p className="text-tiny text-default-400">仅展示前 12 条链路，其余 {hiddenLinkCount} 条见「活跃会话」页。</p>
         )}
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }
@@ -1859,13 +1827,13 @@ function MetricCard({
   value: string;
 }) {
   return (
-    <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-1 p-3">
+    <Card className="rounded-md border border-default-200">
+      <Card.Content className="gap-1 p-3">
         <span className="text-small text-default-500">{label}</span>
         <span className={tone === "success" ? "text-xl font-semibold text-success" : "text-xl font-semibold"}>
           {value}
         </span>
-      </CardBody>
+      </Card.Content>
     </Card>
   );
 }

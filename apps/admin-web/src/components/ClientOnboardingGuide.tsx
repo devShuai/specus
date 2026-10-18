@@ -1,5 +1,6 @@
+import { ButtonLink } from "./ButtonLink";
 import { useState } from "react";
-import { Button } from "@heroui/react";
+import { Button, Spinner } from "@heroui/react";
 import { CLIENT_ONBOARDING_STEPS, clientOnboardingStatus } from "../lib/clientOnboarding";
 
 export function ClientOnboardingGuide({ loading, error, online, registered, credentials, onRefresh }: {
@@ -14,9 +15,9 @@ export function ClientOnboardingGuide({ loading, error, online, registered, cred
         <p className="mt-1 text-small text-default-600" role="status">{clientOnboardingStatus({ loading, error, online, registered, credentials })}</p>
       </div>
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" variant="flat" isLoading={loading} onPress={onRefresh}>{error ? "重新加载接入状态" : "检查设备上线"}</Button>
-        <Button size="sm" variant="light" aria-expanded={showSteps} aria-controls="client-onboarding-steps" onPress={() => setExpanded(!showSteps)}>{showSteps ? "收起接入步骤" : "查看接入步骤"}</Button>
-        {online > 0 && !error ? <Button as="a" href="#/http-routes" size="sm" variant="flat" color="primary">发布 HTTP 服务</Button> : null}
+        <Button size="sm" variant={"secondary"} isPending={loading} onPress={onRefresh}>{(loading) ? <Spinner size="sm" aria-hidden="true" /> : null}{error ? "重新加载接入状态" : "检查设备上线"}</Button>
+        <Button size="sm" variant={"ghost"} aria-expanded={showSteps} aria-controls="client-onboarding-steps" onPress={() => setExpanded(!showSteps)}>{showSteps ? "收起接入步骤" : "查看接入步骤"}</Button>
+        {online > 0 && !error ? <ButtonLink href="#/http-routes" size="sm" variant={"secondary"}>发布 HTTP 服务</ButtonLink> : null}
       </div>
     </div>
     <ol id="client-onboarding-steps" className={showSteps ? "mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" : "hidden"}>

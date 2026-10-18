@@ -1,5 +1,7 @@
+import { ButtonLink } from "./ButtonLink";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { Button, Checkbox, Chip, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader, Pagination, Select, SelectItem, Spinner } from "@heroui/react";
+import { Button, Checkbox, Chip, Modal, Select, Spinner, Label, ListBox, ListBoxItem, SelectTrigger, SelectValue, SelectIndicator, SelectPopover, FieldError } from "@heroui/react";
+import { Pager } from "./Pager";
 import { adminApi } from "../api/client";
 import type { OwnerTransferResult } from "../api/types";
 import { OWNER_TRANSFER_WARNING, OwnerTransferController, ownerResourcesHash, transferCanSubmit, type TransferResource } from "../lib/ownerTransfer";
@@ -39,15 +41,14 @@ export function OwnerTransferDialog({ resource, onClose, onTransferred }: Props)
     try { await onTransferred(result); } catch { setRefreshError(true); }
   };
   const close = () => { if (controller.snapshot().phase !== "submitting") onClose(); };
-  return <Modal isOpen onClose={close} isDismissable={!busy} isKeyboardDismissDisabled={busy} hideCloseButton={busy}
-    size="2xl" scrollBehavior="inside" placement="center" classNames={{ base: "max-h-[90dvh] mx-3", footer: "flex-wrap" }}>
-    <ModalContent>
-      <ModalHeader className="flex-col gap-1">
-        <span>转移管理归属</span>
+  return <Modal.Root isOpen onOpenChange={(open) => { if (!open) (close)?.(); }}>
+    <Modal.Backdrop isDismissable={!busy} isKeyboardDismissDisabled={busy}><Modal.Container placement={"center"} scroll={"inside"} size={"lg"}><Modal.Dialog className={[("max-w-2xl"), ("max-h-[90dvh] mx-3")].filter(Boolean).join(" ")}>{!(busy) && <Modal.CloseTrigger />}
+      <Modal.Header className="flex-col gap-1">
+        <Modal.Heading>转移管理归属</Modal.Heading>
         <span className="text-small font-normal text-default-500">{group ? "完整凭证组" : "单台客户端"} · 资源 <span className="font-mono">#{state.resource?.id ?? resource.id}</span></span>
-      </ModalHeader>
-      <ModalBody ref={bodyRef} className="gap-4">
-        {state.phase === "loading" && <div role="status" className="py-8 text-center"><Spinner label="读取完整影响清单与可用账号…" /></div>}
+      </Modal.Header>
+      <Modal.Body ref={bodyRef} className="gap-4">
+        {state.phase === "loading" && <div role="status" className="py-8 text-center"><Spinner aria-hidden="true" /><p>读取完整影响清单与可用账号…</p></div>}
         {state.message && <div role={state.phase === "unknown" || state.phase === "error" ? "alert" : "status"}
           className="rounded-md border border-warning-300 bg-warning-50 p-3 text-small text-warning-800">{state.message}</div>}
         {state.phase === "success" && state.result ? <div role="status" className="space-y-3">
@@ -55,20 +56,21 @@ export function OwnerTransferDialog({ resource, onClose, onTransferred }: Props)
           <p className="text-small">目标账号：<strong>{state.result.targetUsername}</strong>。已核对 {state.result.affectedClientIds.length} 台设备{state.result.credentialId !== null ? "及其接入凭证" : ""}。</p>
           <p className="text-small text-default-600">原接入能力保留。若还需删除原管理账号，请返回账号管理重新确认删除。</p>
           {refreshError && <p role="alert" className="text-small text-warning-700">转移已成功，但列表刷新失败。请手动刷新列表，不要重复提交。</p>}
-          <Button as="a" role="link" href={ownerResourcesHash(state.result.targetUsername, group ? "credentials" : "clients")} variant="flat" onPress={onClose}>查看新归属资源</Button>
+          <ButtonLink href={ownerResourcesHash(state.result.targetUsername, group ? "credentials" : "clients")} variant={"secondary"} onPress={onClose}>查看新归属资源</ButtonLink>
         </div> : preview && <>
           <div className="grid gap-3 rounded-md border border-default-200 bg-default-50 p-3 sm:grid-cols-2">
             <div><p className="text-tiny text-default-500">预览时归属</p><p className="break-all text-small font-medium">{Array.from(new Set([
               ...(preview.credentialId !== null ? [preview.credentialOwnerUsername || "未记录归属"] : []),
               ...preview.affectedClients.map(client => client.ownerUsername || "未记录归属"),
             ])).join("、")}</p></div>
-            <Select label="目标账号" placeholder="选择当前租户已启用的账号" selectedKeys={state.target ? [state.target] : []}
-              // Keep the nested overlay in the modal's accessibility tree instead of an aria-hidden body sibling.
-              popoverProps={{ portalContainer: bodyRef.current ?? undefined }}
-              disabledKeys={targetMissing ? [state.target] : []} isDisabled={state.phase !== "review"}
-              isInvalid={targetMissing} errorMessage={targetMissing ? "请重新选择已启用账号" : undefined}
-              onSelectionChange={keys => controller.setTarget(Array.from(keys)[0]?.toString() ?? "")}>
-              {targets.map(user => <SelectItem key={user.key} textValue={user.name}>{user.name}</SelectItem>)}
+            <Select placeholder="选择当前租户已启用的账号" disabledKeys={targetMissing ? [state.target] : []} isDisabled={state.phase !== "review"} isInvalid={targetMissing} value={state.target || null} onChange={key => controller.setTarget(key == null ? "" : String(key))}>
+              <Label>目标账号</Label>
+              <SelectTrigger><SelectValue /><SelectIndicator /></SelectTrigger>
+              {/* Keep the nested overlay in the modal's accessibility tree, not an aria-hidden body sibling. */}
+              <SelectPopover UNSTABLE_portalContainer={bodyRef.current ?? undefined}>
+                <ListBox>{targets.map(user => <ListBoxItem key={user.key} id={user.key} textValue={user.name}>{user.name}</ListBoxItem>)}</ListBox>
+              </SelectPopover>
+              <FieldError>{targetMissing ? "请重新选择已启用账号" : undefined}</FieldError>
             </Select>
           </div>
           <section aria-label="转移影响清单" className="space-y-2">
@@ -78,29 +80,28 @@ export function OwnerTransferDialog({ resource, onClose, onTransferred }: Props)
               : <ul className="divide-y divide-default-200 rounded-md border border-default-200">
                 {preview.affectedClients.slice((currentPage - 1) * 10, currentPage * 10).map(client => <li key={client.id} className="flex items-center justify-between gap-3 px-3 py-2">
                   <div className="min-w-0"><p className="break-all text-small font-medium">{client.clientName}</p><p className="text-tiny text-default-500"><span className="font-mono">#{client.id}</span> · {client.ownerUsername || "未记录归属"}</p></div>
-                  <Chip size="sm" variant="flat">{client.enabled ? "启用" : "停用"}</Chip>
+                  <Chip size="sm" variant={"soft"}>{client.enabled ? "启用" : "停用"}</Chip>
                 </li>)}
               </ul>}
-            {pages > 1 && <div className="flex flex-wrap items-center justify-between gap-2"><span className="text-tiny text-default-500">仅分页展示；确认绑定全部 {preview.affectedClientCount} 台设备，不只本页。</span><Pagination aria-label="影响清单分页" page={currentPage} total={pages} onChange={setPage} isDisabled={busy} /></div>}
+            {pages > 1 && <div className="flex flex-wrap items-center justify-between gap-2"><span className="text-tiny text-default-500">仅分页展示；确认绑定全部 {preview.affectedClientCount} 台设备，不只本页。</span><Pager page={currentPage} total={pages} onChange={setPage} isDisabled={busy} /></div>}
           </section>
           {preview.conflictCode === "CREDENTIAL_SHARED" && <div className="space-y-2 rounded-md border border-warning-300 bg-warning-50 p-3">
             <p className="text-small">此凭证还关联其他设备，不能只转移这一台。整组操作需要重新预览并显式确认。</p>
-            <Button variant="flat" onPress={() => void controller.group()} isDisabled={state.phase !== "review"}>查看凭证整组预览</Button>
+            <Button variant={"secondary"} onPress={() => void controller.group()} isDisabled={state.phase !== "review"}>查看凭证整组预览</Button>
           </div>}
           <div className="rounded-md border border-warning-300 bg-warning-50 p-3 text-small text-warning-800">{OWNER_TRANSFER_WARNING}</div>
-          <Checkbox isSelected={state.confirmed} onValueChange={value => controller.confirm(value)}
-            isDisabled={state.phase !== "review" || !preview.canTransfer || !state.target || targetMissing}>
+          <Checkbox isSelected={state.confirmed} onChange={value => controller.confirm(value)} isDisabled={state.phase !== "review" || !preview.canTransfer || !state.target || targetMissing}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control><Label>
             我已核对完整清单与目标账号，并知晓原接入能力保留
-          </Checkbox>
+          </Label></Checkbox.Content></Checkbox>
         </>}
-      </ModalBody>
-      <ModalFooter>
-        <Button variant="flat" onPress={close} isDisabled={busy}>{state.phase === "success" ? "完成" : "取消"}</Button>
-        {state.phase !== "success" && <Button variant="flat" isDisabled={busy || state.phase === "loading"} onPress={() => void controller.refresh()}>{state.phase === "unknown" ? "重新读取当前归属" : "刷新预览"}</Button>}
-        {state.phase !== "success" && <Button color="primary" className="h-auto whitespace-normal py-2" isDisabled={!transferCanSubmit(state)} isLoading={busy} onPress={() => void submit()}>
+      </Modal.Body>
+      <Modal.Footer className={"flex-wrap"}>
+        <Button variant={"secondary"} onPress={close} isDisabled={busy}>{state.phase === "success" ? "完成" : "取消"}</Button>
+        {state.phase !== "success" && <Button variant={"secondary"} isDisabled={busy || state.phase === "loading"} onPress={() => void controller.refresh()}>{state.phase === "unknown" ? "重新读取当前归属" : "刷新预览"}</Button>}
+        {state.phase !== "success" && <Button className="h-auto whitespace-normal py-2" isDisabled={!transferCanSubmit(state)} isPending={busy} onPress={() => void submit()} variant={"primary"}>{(busy) ? <Spinner size="sm" aria-hidden="true" /> : null}
           {group ? preview ? `转移此凭证及 ${preview.affectedClientCount} 台设备` : "等待完整凭证组清单" : "确认转移这台客户端"}
         </Button>}
-      </ModalFooter>
-    </ModalContent>
-  </Modal>;
+      </Modal.Footer>
+    </Modal.Dialog></Modal.Container></Modal.Backdrop>
+  </Modal.Root>;
 }
