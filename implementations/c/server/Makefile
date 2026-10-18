@@ -104,6 +104,11 @@ ifeq ($(shell uname -s),Linux)
 CONNECTIVITY_CLOCK_OFFSET := $(BUILD_DIR)/libspecus_connectivity_clock_offset.so
 ALL_TESTS += $(CONNECTIVITY_CLOCK_OFFSET)
 CONNECTIVITY_CLOCK_TEST_COMMAND = env LD_PRELOAD="$(abspath $(CONNECTIVITY_CLOCK_OFFSET))" SPECUS_NAT_STREAM_ONLY="connectivity NAT complete" $(NAT_STREAM_TESTS) $(SERVER)
+NAT_PUSH_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_nat_push_reference_server
+NAT_PUSH_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_nat_push_reference_tests
+NAT_CONTROL_SIZE_VECTOR := ../../../protocol/test-vectors/nat-control-size-v1.json
+ALL_TESTS += $(NAT_PUSH_REFERENCE_SERVER) $(NAT_PUSH_REFERENCE_TESTS)
+NAT_PUSH_REFERENCE_TEST_COMMAND = $(NAT_PUSH_REFERENCE_TESTS) $(NAT_PUSH_REFERENCE_SERVER)
 endif
 
 .PHONY: all test release clean
@@ -149,6 +154,14 @@ $(HTTP_LOG_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_log_reason_reference
 
 $(HTTP_RESET_REASON_REFERENCE_TESTS): $(CORE_OBJS) tests/http_reset_reason_reference_tests.c tests/nat_stream_tests.c tests/connectivity_nat_test_cases.h tests/connectivity_nat_complete_cases.h tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_CONNECTIVITY_VECTOR_DIR='"../../../protocol/test-vectors/"' tests/http_reset_reason_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+ifeq ($(shell uname -s),Linux)
+$(NAT_PUSH_REFERENCE_SERVER): $(CORE_OBJS) src/main.c tests/nat_push_reference_server.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_push_reference_server.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(NAT_PUSH_REFERENCE_TESTS): $(CORE_OBJS) tests/nat_push_reference_tests.c tests/session_lifecycle_tests.c tests/server_harness.c tests/server_harness.h $(NAT_CONTROL_SIZE_VECTOR) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_NAT_CONTROL_SIZE_VECTOR_FILE='"$(abspath $(NAT_CONTROL_SIZE_VECTOR))"' tests/nat_push_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+endif
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/admin_http_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -310,6 +323,7 @@ $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 test: all
+	$(NAT_PUSH_REFERENCE_TEST_COMMAND)
 	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)
 	$(HTTP_RESET_REASON_REFERENCE_TESTS) $(SERVER)
 	$(CONNECTIVITY_RATE_HTTP_TESTS)

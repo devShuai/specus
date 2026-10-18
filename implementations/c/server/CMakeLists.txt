@@ -546,3 +546,20 @@ target_compile_definitions(specus_c_http_reset_reason_reference_tests PRIVATE
 add_test(NAME http_reset_reason_reference_tests
     COMMAND specus_c_http_reset_reason_reference_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(http_reset_reason_reference_tests PROPERTIES TIMEOUT 60)
+
+# TCP_INFO observes a real kernel reset before releasing the held login. These observers
+# belong only to this test server; specus-server-c does not link or enable them.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(specus_c_nat_push_reference_server tests/nat_push_reference_server.c)
+    target_link_libraries(specus_c_nat_push_reference_server PRIVATE specus_c_core)
+    target_compile_options(specus_c_nat_push_reference_server PRIVATE -Wall -Wextra -Wpedantic)
+    add_executable(specus_c_nat_push_reference_tests
+        tests/nat_push_reference_tests.c tests/server_harness.c)
+    target_link_libraries(specus_c_nat_push_reference_tests PRIVATE specus_c_core)
+    target_compile_options(specus_c_nat_push_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(specus_c_nat_push_reference_tests PRIVATE
+        ST_NAT_CONTROL_SIZE_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/nat-control-size-v1.json")
+    add_test(NAME nat_push_reference_tests
+        COMMAND specus_c_nat_push_reference_tests $<TARGET_FILE:specus_c_nat_push_reference_server>)
+    set_tests_properties(nat_push_reference_tests PROPERTIES TIMEOUT 90)
+endif()

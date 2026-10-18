@@ -14,7 +14,7 @@
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；随后补列控制写入、会话清理、离线通知与上线指标4类共8方法，以及HTTP流重置1类2方法的行为证据及限定差异，见对应新节。当前49=4类纯平台差异+9类候选覆盖（30个注解方法）+36类待核验；36也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；随后补列控制写入、会话清理、离线通知与上线指标4类共8方法、HTTP流重置1类2方法，以及路由生命周期/失败关闭/NAT推送3类5方法的行为证据及限定差异，见对应新节。当前49=4类纯平台差异+12类候选覆盖（35个注解方法）+33类待核验；33也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -43,12 +43,12 @@
 | `database/SqliteUniqueIndexStartupTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `handler/ManagedLoginLogoutPushTests` | 3 | 覆盖（行为及限定调用层差异；候选） | `session_reference_tests.c:pair_scenario` 的mode0/1/2，真实注册表在线状态、实际离线roster发送、数据关闭不下线及替换后最终关闭恰好一次；C的替换保护位于logout helper内部，不等同于Java handler从不调用mock，详见新节。 |
 | `handler/ManagedLoginProductMetricsTests` | 1 | 覆盖（行为及限定API差异；候选） | `session_reference_tests.c:metrics_scenario` 经真实用户/凭证/连接验证非默认tenant及owner、固定client_online、一次control回调、data无新增与真实落库；C直接调用通用原语而非Java clientOnline包装方法，详见新节。 |
-| `http/HttpRouteLifecycleVectorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `http/HttpRouteLifecycleVectorTests` | 1 | 覆盖（共享9场景；候选） | `http_route_lifecycle_tests.c` 以真实REST凭证/HTTP认证重放全部9个共享server场景，核验完整推送路由集、HTTP/WS拒绝、重连/改名/旧token及实际双EOF；原C-only场景保留。工厂声明不是场景执行数，本批精确提交CI另验。 |
 | `http/HttpShareHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpShareVectorTests` | 11 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `http/HttpSpecusControllerFailClosedTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `http/HttpSpecusControllerFailClosedTests` | 2 | 覆盖（参考2方法；候选） | 路由套件新增直接删库中保护路由及直接禁用客户端的2个真实场景，旧control/data始终可心跳；有效转发正控后验证404/no-store、拒绝请求在有序心跳屏障内零NAT帧，不把管理踢线当失败关闭前提。 |
 | `http/HttpSpecusControllerStreamResetTests` | 2 | 覆盖（行为及既定错误信封差异；候选） | `http_log_reason_reference_tests.c` 逐字比较Java的控制字符/NUL、null及256码点截断预期；`http_reset_reason_reference_tests.c:reset_reason_case` 的3个真实进程/socket场景验证固定公网502、完整安全诊断落库、请求字段及零上游响应字节，并在原连接继续HTTP/TCP。不是另外三个HTTP类的完整对照，精确新提交CI另验。 |
-| `http/NatControlPushFailureVectorTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `http/NatControlPushFailureVectorTests` | 2 | 覆盖（行为及限定夹具差异；候选） | 保留容量套件全部7步超限配置回放，补JSON error及首条路由列表断言；新增Linux `nat_push_reference_tests.c` 实际4步写失败，核验真实发送锁入口、内核RST、失败回调、201/409/409/204及同一route持久化。C逐步重绑同一HTTP token的control，不冒称Java同一失败通道或每步NAT字节写入内核，详见新节。 |
 | `management/controller/HttpRouteConnectivityCheckResourceTests` | 7 | 覆盖（参考7方法；候选） | `connectivity_http_resource_tests.c` 补齐34种无效body、12种有效请求、完整离线/404/401/503/429响应及SQLite路由访问顺序观察；`connectivity_resource_wire_tests.c` 用真实进程/socket及生产会话表验证owner/admin离线完整结果。另修复并验证9个ASCII Long-ID边界；不扩张为全部数字字符、URL解码或跨NAT验收。 |
 | `management/controller/ManagementAccountsHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `management/controller/WorkbenchCascadeTests` | 6 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -223,7 +223,7 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 
 ## HTTP流重置：公网错误、诊断与流量字节（2026-10-19增量）
 
-本节源码基线为未合并C分支 `1f59784a065aa58b7f77f157f0ab9b6ccd4d98db`（树 `038b1dbf20398d522b8518e721be85e3b76453d8`），本节新增1类2个Java注解方法的候选对照，累计为9类30方法。前驱原始Protocol 12项与实验室9项CI已独立核验通过，其实际测试合成提交为 `250387984ddc143e4d784af689861dc93f2c0e10`、测试树与前驱相同；这些绿灯不能作为本批新增修复的验收证据。Java参考类与上方main盘点一致，Java源码、共享规范/向量和工作流不变。同期完整阅读的 `HttpSpecusControllerFailClosedTests`、`NatControlPushFailureVectorTests`、`HttpRouteLifecycleVectorTests` 仍保持待逐项核验，不因读过源码或相关功能已存在而改为覆盖。
+本节源码基线为未合并C分支 `1f59784a065aa58b7f77f157f0ab9b6ccd4d98db`（树 `038b1dbf20398d522b8518e721be85e3b76453d8`），本节新增1类2个Java注解方法的候选对照，该批结束时累计为9类30方法。前驱原始Protocol 12项与实验室9项CI已独立核验通过，其实际测试合成提交为 `250387984ddc143e4d784af689861dc93f2c0e10`、测试树与前驱相同；这些绿灯不能作为本批新增修复的验收证据。Java参考类与上方main盘点一致，Java源码、共享规范/向量和工作流不变。同期完整阅读的 `HttpSpecusControllerFailClosedTests`、`NatControlPushFailureVectorTests`、`HttpRouteLifecycleVectorTests` 在该批结束时仍待逐项核验，不因读过源码或相关功能已存在而改为覆盖；后续补证单列于下一节。
 
 | Java方法 | C证据及精确断言 | 限定差异 |
 | --- | --- | --- |
@@ -242,7 +242,35 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 
 修正副本导出后的完整Linux CMake Release（O3/NDEBUG、Werror）65/65、零失败零跳过。O2/Werror完整Make首次在原TURN断言“stale nonce刷新应得438”处未取得有效响应而失败，记录保留；前驱O2、本批O2及O3的完整TURN程序独立重放均通过，原失败的确切或唯一原因仍未证明。没有改TURN生产代码、原2秒UDP接收超时或断言，也不声称重放通过就修复了该历史失败。随后相同149个冻结执行源码输入、相同O2二进制，在原600秒上限下完整Make通过，保留实际10000键、原正常NAT及进程时钟偏差下的真实10秒门禁。最终CMake注册的两个新增套件（格式程序及三场景）另独立通过ASan/UBSan，两个故障变体也用最终真实RST程序重跑，均命中原定失败阶段。
 
-上述是本批本地证据；精确新提交CI仍须按PR #290的实际提交/测试树及原始产物另验，不能借前驱21项绿灯。上节37类是该阶段记录；本批后当前36类待对照，旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
+上述是本批本地证据；精确新提交CI仍须按PR #290的实际提交/测试树及原始产物另验，不能借前驱21项绿灯。上节37类是该阶段记录；该批结束时36类待对照，旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
+
+## HTTP路由生命周期、失败关闭与NAT推送（2026-10-19增量）
+
+本节基于未合并C分支 `acf0d43484af106c4807d8eb8efa401d455dd6a7`（树 `8153c74b9373c3c83915c2834931a21c9e5b35ed`），完整阅读3类5个Java注解方法后补证。前驱原始Protocol12项和实验室9项CI已独立核验，实际合成提交 `c7841c6259841bc8476f366a0dfedac888443e6a` 的树与前驱相同；不能拿前驱21项绿灯接受本节。本节最终输入已通过下述本地完整核验，这3类列为未合并的候选覆盖，累计12类35方法；不是main覆盖率，也不是本节新提交CI已通过。Java参考和C生产源码不变；共享 `nat-control-size-v1.json` 只更新C夹具的说明，去掉notes后与前驱逐字段一致，步骤、状态和常量未变。
+
+| Java方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `HttpRouteLifecycleVectorTests.serverScenarios` | `http_route_lifecycle_tests.c:replay_current_scenario/run_step/check_request` 实际重放共享向量全部9个server场景：登录及变更后的完整路由集合（含空集合）、路由启停/删除、客户端启停/改名/删除及重建、旧token拒绝或跟随原账号、HTTP状态或允许状态集合、no-store、Basic挑战、正文、是否转发及WebSocket拒绝不得101。通过管理REST创建凭证并实际HTTP认证，后续重连复用原token；断开等待两条真实连接EOF后再确认持久会话DISCONNECTED。 | Java使用真实Spring/Netty监听器和脚本客户端，C使用真实进程、HTTP/JWT/SQLite及TCP控制/data连接。一个工厂方法对应9个共享场景，不是9个Java注解方法。原有C-only账号换名后同名账号替换场景仍保留，不计为本批新增。 |
+| `HttpSpecusControllerFailClosedTests.deletedProtectedRouteReturnsNotFoundAndOpensNoStream` | 新增 `deleted_protected_route_scenario`：先以有效凭据成功转发作观察器正控；旧保护路由无凭据401且零NAT帧，随后只直接删除SQLite路由记录，不触发管理推送或踢线；同一仍存活的控制/data连接下，无凭据得到404/no-store且零NAT帧，之后两连接仍可心跳。 | Java使用真实认证服务、mock仓库与绑定的EmbeddedChannel，C用直接改库保留旧连接的相同前提。零帧结论截止于下述有序心跳屏障，不声称无限期静默；主动发出的心跳及其响应不算业务出站帧。 |
+| `HttpSpecusControllerFailClosedTests.routeOfDisabledClientReturnsNotFoundAndOpensNoStream` | 新增 `disabled_client_scenario`：先成功转发校准，随后只将当前客户端记录enabled置0，不调用管理接口清理连接；确认两旧连接仍活着，再用无凭据及有效凭据分别取得404/no-store、零NAT帧，最后两连接仍能心跳。 | C额外核验有效Basic也不能绕过当前禁用状态；不把“账号已禁用所以连接原本就不在线”当作本参考方法的证据。 |
+| `NatControlPushFailureVectorTests.existingOversizeConfigurationIsNeitherSentNorDisconnecting` | 保留 `client_route_scale_tests.c:scenario_existing_oversize_nat_control/control_round` 的全部7个共享步骤：真实Peer Mesh登录推送、超限期间零NAT_CONTROL及控制连接持续可心跳、手动409的JSON error字段、新建201/删除204、直接缩小配置后首条NAT_CONTROL。新增 `first_nat_has_no_fill_routes` 要求真实JSON路由数组存在、逐个route不以fill-开头；空列表可接受，缺列表/null/缺route及fill路由均有断言校准。 | 原有容量套件另两场景继续运行，不冒充本批新场景。该旧夹具直接存储接入凭证后走真实HTTP登录，不声称它也覆盖了REST创建凭证；本批另两类的真实REST凭证设置不挪作它的设置证据。Java在静默窗口等待，C在同一控制通道以有序心跳收集管理操作已发送的推送。 |
+| `NatControlPushFailureVectorTests.writeFailureAnswersAsAnOfflineClient` | 新增 `nat_push_reference_tests.c:replay_all_write_failures`，同一次真实REST凭证创建及HTTP认证、同一client/session/token，按共享4步执行createRoute201、push409、refresh409、delete204。每步真实NAT回调都到达目标控制连接send锁竞争入口，内核确认RST后放行登录，实际回调结果为-1；409解析JSON error字段，不能只在整段响应找文本。前三步核验同一实际route ID、client_name、route、target及enabled仍在库，最后删除该ID并确认不存在，查询错误不当作不存在。 | Java四步始终绑定同一写入失败的EmbeddedChannel；C按既有写失败关闭语义清理失败连接，每步仅重绑同一HTTP token的真实control，不重新HTTP认证或换客户端。每步证明至少一次真实NAT发送入口/失败回调，不要求恰好一次回调，也不声称每步另有NAT字节或部分帧进入内核；失败的登录写可能已使该连接不可写。 |
+
+`existingOversize` 的7步严格按共享顺序为：connect（成功登录、收到Peer Mesh推送）→pushNatControl（409）→forceRefreshPortMapping（409）→createRoute（停用的idle路由，201）→deleteFillRoute（204）→shrinkInStore（只在库中停用填充路由，不触发管理推送）→pushNatControl（200，收到首条且不含fill路由的NAT_CONTROL）。每步之后仍要求control可用，最后一步之前不能有NAT_CONTROL。Java该方法经管理REST创建凭证并实际HTTP认证；C这个旧超限夹具直接存储凭证再HTTP认证，只是设置路径不同，不把REST创建凭证本身算作已测。
+
+路由套件总计12个真实进程场景=9个共享场景+1个保留C-only场景+2个新增失败关闭场景。拒绝请求既数OPEN，也数所有NAT帧，并拒绝意外的数据通道包。HTTP响应结束不能证明另一条TCP连接已排空；驱动在该响应之后向仍存活的data发送心跳，读取到对应心跳响应前继续计数。该屏障仅截止本次读取窗口，不等待或排除未来的异步任务，也不把单条TCP连接的有序性解释为跨线程业务全部完成。此处没有并发发送其他心跳；队列中的OPEN也会被计入，正常转发正控会实际收到OPEN并回答。成功请求的FIN/窗口帧可正常存在，只有期望不转发的请求要求零NAT帧。失去连接的生命周期场景另以实际EOF为截止，不把关闭的socket解释为仍在线失败关闭场景。
+
+`nat_push_reference_server.c` 只编译到Linux专用测试server：包含真实main代码，仅别名化管理NAT回调注册及锁调用，在生产注册表查找并持有目标真实control引用，原样调用注册的生产回调。在真实发送锁入口发布事件后，等实际socket的TCP_INFO变为TCP_CLOSE，再允许持有该锁的登录继续；内核状态等待有5秒单调上限及1ms轮询间隔，不以任意100ms睡眠推断RST已发生。普通 `specus-server-c` 不链接这些观察器，也没有新增生产开关。Linux限定的是TCP_INFO夹具，不是对其他平台行为的豁免；本节未证明TLS、跨NAT或所有平台实网行为。
+
+9个独立故障变体分别漏掉新建自动推送、漏掉删除自动推送、写失败谎报200、新建目标错误落库、忽略客户端禁用、删除路由仍发401挑战、插入非OPEN的NAT FIN、409把error改成detail、首条NAT_CONTROL缺正确路由列表。最后三项有明确的前版对照：本批早期只数OPEN的12场景程序、整段文本查错误的4步程序、只查fill子串的7步超限程序分别仍退出0，对应补强程序退出1；不声称这些变体能躲过全部旧测试。各变体不进入候选，不算9个线上缺陷，也不声称所有变体都经过消毒器。最终冻结程序对9个变体重新执行，均在对应预期断言处退出1，核验这些失败的汇总脚本退出0。
+
+准备失败保留：观察器最初误用会话fd字段及main参数、驱动误用不存在的存储getter，均是夹具编译错误，不是生产缺陷。首次完整CMake59/66，7项shell测试因导出副本CRLF在逻辑执行前失败，Make未执行；原输入/日志保留。专用脚本仅规范化15个私有脚本的行尾，规范文本与前驱一致；初次内联规范化命令的引号错误也保留。随后含零NAT帧断言、尚未加最终JSON结构断言的中间输入完整CMake66/66、零跳过及独立O2完整Make（原600秒上限）通过，但不能冒充最终输入。初轮负对照核验脚本误把FAIL的词序写反而退出1，实际变体测试结果已失败；保留原记录后按真实日志词序核验，并另外运行未执行的变体。
+
+最终冻结输入已实际通过Linux CMake Release（O3/NDEBUG、Werror）66/66、零失败零跳过；原65个CTest名称与序号完整保留，新增NAT写失败套件为66。独立O2/Werror完整Make在原600秒上限下通过；实际10000键及正常/进程时钟偏差下两组真实10秒门禁保留。3个注册套件（12场景路由、原3场景容量、4步NAT写失败）的驱动及所用普通/专用服务端实际通过O2 ASan/UBSan，退出泄漏检查开启且无报告；不外推全部服务端路径或9个负对照的消毒器覆盖。
+
+213个执行源码/脚本/顶层向量输入的冻结哈希在验证后未变；另核验34个二进制协议fixture与最初冻结归档及前驱逐字节一致，并重新执行CMake/Make的协议fixture程序通过，不把213写成全部递归输入数。221个静态资源另核验与前驱一致并保留实际字节哈希。74个C生产文件和3个Java参考类与前驱规范文本一致，CMake/Make普通服务端均无新增NAT观察器符号。本批不声称修复新的线上生产缺陷；改进的是参考测试证据与检错能力。
+
+上方阶段记录的36类在本节补证后剩33类待逐项对照，旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成。本节精确新提交CI仍须按PR #290的提交、实际测试树及原始产物另验，不借前驱绿灯。不合并main、不关闭#35、不发版或更新Homebrew。
 
 ## 历史表的读法与限制
 
