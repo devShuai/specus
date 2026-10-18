@@ -194,6 +194,8 @@ set_tests_properties(management_lists_tests PROPERTIES TIMEOUT 180)
 add_executable(specus_c_management_crud_tests tests/management_crud_tests.c tests/server_harness.c)
 target_link_libraries(specus_c_management_crud_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_management_crud_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_management_crud_tests PRIVATE
+    ST_MAILBOX_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-mailbox-forms-v1.json")
 add_test(NAME management_crud_tests COMMAND specus_c_management_crud_tests)
 
 # The Peer Mesh / Egress management endpoints, Spring-converted parameters, mapping create, times.

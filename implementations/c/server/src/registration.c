@@ -464,12 +464,31 @@ static const char *registration_text_error(char *value, size_t max_length, size_
 
 /*
  * The local part or the domain of an address as jakarta.mail InternetAddress.checkAddress (strict)
- * takes it: not empty, no leading, trailing or doubled dot, no control character, space or special;
- * the domain is ASCII. Quoted local parts and domain literals, which Java also takes, are refused.
+ * takes it. Quoted local parts preserve escapes and may contain dots/specials;
+ * bracketed domain literals are not subjected to DNS-label grammar. The caller
+ * still applies Java's whole-address regex (including ASCII whitespace and @).
+ * Unicode domain normalization/storage remains a separate alignment requirement.
  */
 static int registration_address_part(const char *start, const char *end, int domain)
 {
-    if (start == end || *start == '.' || end[-1] == '.') return 0;
+    if (start == end) return 0;
+    if (!domain && *start == '"') {
+        if (end - start < 2 || end[-1] != '"') return 0;
+        for (const char *p = start + 1; p < end - 1; ++p) {
+            if (*p == '"') return 0;
+            if (*p == '\\' && ++p >= end - 1) return 0;
+        }
+        return 1;
+    }
+    if (domain && *start == '[') {
+        if (end - start < 2 || end[-1] != ']') return 0;
+        for (const char *p = start + 1; p < end - 1; ++p) {
+            unsigned char c = (unsigned char)*p;
+            if (c <= 0x20U || c >= 0x7fU || c == '[' || c == ']') return 0;
+        }
+        return 1;
+    }
+    if (*start == '.' || end[-1] == '.') return 0;
     for (const char *p = start; p < end; ++p) {
         unsigned char c = (unsigned char)*p;
         if (c <= 0x20U || c == 0x7fU || (domain && c > 0x7fU) || strchr("()<>,;:\\\"[]@", c) != NULL
@@ -491,6 +510,9 @@ static const char *registration_normalize_email(char *email)
     if (!registration_has_text(email)) return "邮箱不能为空";
     registration_java_trim(email);
     for (char *p = email; *p != '\0'; ++p) *p = (char)tolower((unsigned char)*p);
+    for (const unsigned char *p = (const unsigned char *)email; *p != '\0'; ++p) {
+        if (strchr(" \t\r\n\f\v", *p) != NULL) return "邮箱格式无效";
+    }
     const char *at = strchr(email, '@');
     const char *domain = at == NULL ? NULL : at + 1;
     const char *last_dot = domain == NULL ? NULL : strrchr(domain, '.');

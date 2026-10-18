@@ -9,12 +9,15 @@ import com.theshuai.specusserver.management.repository.ManagementUserEmailReposi
 import com.theshuai.specusserver.management.repository.ManagementUserRepository;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.TurnstileVerifier;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import javax.crypto.spec.SecretKeySpec;
 import java.time.Instant;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -24,6 +27,33 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class RegistrationServiceTests {
+    @Test
+    void sharedMailboxAddressFormsMatchTheCurrentReference() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        String relative = "protocol/test-vectors/registration-mailbox-forms-v1.json";
+        while (root != null && !Files.isRegularFile(root.resolve(relative))) root = root.getParent();
+        if (root == null) throw new IllegalStateException("Shared mailbox vector missing");
+        var fixture = new ObjectMapper().readTree(Files.readString(root.resolve(relative)));
+        assertEquals(1, fixture.path("version").asInt());
+        assertEquals(36, fixture.path("cases").size());
+        RegistrationService service = new RegistrationService(null, null, null, null,
+                null, null, null, null, null);
+        for (var item : fixture.path("cases")) {
+            String name = item.path("name").asText();
+            String email = item.path("email").asText();
+            if (item.path("accepted").asBoolean()) {
+                String normalized = ReflectionTestUtils.invokeMethod(service, "normalizeEmail", email);
+                assertEquals(item.path("normalized").asText(), normalized, name);
+                assertEquals(item.path("masked").asText(), ReflectionTestUtils.invokeMethod(
+                        RegistrationService.class, "maskEmail", normalized), name);
+            } else {
+                var error = assertThrows(IllegalArgumentException.class,
+                        () -> ReflectionTestUtils.invokeMethod(service, "normalizeEmail", email), name);
+                assertEquals("邮箱格式无效", error.getMessage(), name);
+            }
+        }
+    }
+
     @Test
     void domainPunctuationIsNotConfusedWithValidLocalPartPunctuation() {
         RegistrationService service = new RegistrationService(null, null, null, null,

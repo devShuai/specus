@@ -116,6 +116,7 @@ static int repeat_into(char *out, size_t out_len, const char *unit, size_t times
 typedef struct {
     char code[7];
     char username[400];
+    char email[1024];
 } mailbox;
 
 static int fake_turnstile(void *ctx, const char *token, const char *action)
@@ -128,11 +129,11 @@ static int fake_turnstile(void *ctx, const char *token, const char *action)
 
 static int fake_email(void *ctx, const char *email, const char *username, const char *code, long long ttl)
 {
-    (void)email;
     (void)ttl;
     mailbox *box = ctx;
     snprintf(box->code, sizeof(box->code), "%s", code);
     snprintf(box->username, sizeof(box->username), "%s", username);
+    snprintf(box->email, sizeof(box->email), "%s", email);
     return 0;
 }
 
@@ -140,10 +141,58 @@ static int register_with(const char *username, const char *email, const char *pa
                          int status, const char *needle)
 {
     char body[2048];
+    char *escaped_email = st_json_escape(email);
+    if (escaped_email == NULL) return -1;
     snprintf(body, sizeof(body),
              "{\"username\":\"%s\",\"email\":\"%s\",\"password\":\"%s\",\"turnstileToken\":\"%s\"}",
-             username, email, password, token);
+             username, escaped_email, password, token);
+    free(escaped_email);
     return expect("POST", "/auth/register", body, NULL, status, needle);
+}
+
+static int test_registration_mailbox_forms(void)
+{
+    FILE *file = fopen(ST_MAILBOX_VECTOR_FILE, "rb");
+    if (file == NULL) return 1;
+    char json[32768];
+    size_t bytes = fread(json, 1U, sizeof(json) - 1U, file);
+    int failed = ferror(file) || bytes == sizeof(json) - 1U;
+    fclose(file);
+    json[bytes] = '\0';
+    char **cases = NULL;
+    size_t count = 0U;
+    int version = 0;
+    if (failed || !st_json_is_valid_object(json) || st_json_get_int(json, "version", &version) != 0
+        || version != 1 || st_json_get_raw_array(json, "cases", &cases, &count) != 0 || count == 0U) return 1;
+    mailbox box = {{0}, {0}, {0}};
+    st_registration_set_handlers(fake_turnstile, fake_email, &box);
+    for (size_t i = 0U; i < count; ++i) {
+        char *name = st_json_get_string(cases[i], "name");
+        char *email = st_json_get_string(cases[i], "email");
+        char *normalized = st_json_get_string(cases[i], "normalized");
+        char *masked = st_json_get_string(cases[i], "masked");
+        int accepted = 0;
+        int valid = name != NULL && email != NULL && st_json_get_bool(cases[i], "accepted", &accepted) == 0;
+        char username[80];
+        snprintf(username, sizeof(username), "mailbox-form-%zu", i);
+        int result = !valid || (accepted && (normalized == NULL || masked == NULL));
+        if (!result) result = register_with(username, email, "pw", "ok", accepted ? 202 : 400,
+                                            accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
+        if (!result && accepted) {
+            char actual_masked[1024];
+            last_member("emailMasked", actual_masked, sizeof(actual_masked));
+            st_storage_registration_challenge stored;
+            result = strcmp(box.email, normalized) != 0 || strcmp(actual_masked, masked) != 0
+                || st_storage_find_registration_challenge(db_path, username, normalized, &stored) != 0
+                || strcmp(stored.email, normalized) != 0;
+        }
+        printf("%s shared registration mailbox form %s\n", result ? "FAIL" : "ok  ", name == NULL ? "missing-name" : name);
+        failed = result || failed;
+        free(name); free(email); free(normalized); free(masked);
+    }
+    st_registration_set_handlers(NULL, NULL, NULL);
+    st_json_free_string_array(cases, count);
+    return failed;
 }
 
 /*
@@ -692,6 +741,7 @@ int main(void)
     if (!failed) {
         port = ntohs(address.sin_port);
         failed = test_registration() != 0;
+        failed = test_registration_mailbox_forms() != 0 || failed;
         failed = test_me() != 0 || failed;
         failed = test_credentials() != 0 || failed;
         failed = test_mappings() != 0 || failed;
