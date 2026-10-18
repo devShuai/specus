@@ -167,7 +167,7 @@ class PeerServiceDiscoveryServiceTests {
                 2L, "b", "100.96.0.2", "pk", true, false, false, false, false, 0, 1, List.of("ssh"))));
         when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, peer));
         when(clientAccountRepository.findByIdAndTenantId(1L, "tenant-a")).thenReturn(Optional.of(publisher));
-        when(peerMeshService.canPeer(publisher, peer)).thenReturn(true);
+        when(peerMeshService.canPeer(peer, publisher)).thenReturn(true);
 
         PeerControlMessage first = reportMessage(definition.getServiceId());
         first.setRevision(2L);
@@ -176,7 +176,7 @@ class PeerServiceDiscoveryServiceTests {
         stale.setRevision(1L);
         var ignored = service.acceptReport(publisher, stale, 99L);
         assertThat(ignored).isEmpty();
-        assertThat(service.currentCatalog("tenant-a", 1L, 99L).revision()).isEqualTo(2L);
+        assertThat(service.currentCatalog("tenant-a", 1L, 99L).revision()).isEqualTo(1L);
         assertThat(service.currentCatalog("tenant-a", 1L, 99L).services())
                 .allSatisfy(item -> {
                     assertThat(item.getName()).isEqualTo("local-ssh");
@@ -187,7 +187,7 @@ class PeerServiceDiscoveryServiceTests {
                 .satisfies(delivery -> {
                     assertThat(delivery.recipient()).isSameAs(peer);
                     assertThat(delivery.catalog().getPublisherSessionId()).isEqualTo(99L);
-                    assertThat(delivery.catalog().getRevision()).isEqualTo(2L);
+                    assertThat(delivery.catalog().getRevision()).isEqualTo(1L);
                     assertThat(delivery.catalog().getServices()).hasSize(1);
                 });
     }
@@ -209,7 +209,7 @@ class PeerServiceDiscoveryServiceTests {
         when(peerMeshService.allowedRoster(publisher)).thenReturn(List.of(new PeerMeshService.PeerRosterItem(
                 2L, "b", "100.96.0.2", "pk", true, false, false, false, false, 0, 2, List.of("ssh"))));
         when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, peer));
-        when(peerMeshService.canPeer(publisher, peer)).thenReturn(true);
+        when(peerMeshService.canPeer(peer, publisher)).thenReturn(true);
 
         PeerControlMessage published = reportMessage(definition.getServiceId());
         published.setRevision(2L);
@@ -223,7 +223,7 @@ class PeerServiceDiscoveryServiceTests {
         withdrawal.setRevision(3L);
         withdrawal.setEnabled(false);
         var deliveries = service.acceptReport(publisher, withdrawal, 99L);
-        assertThat(deliveries).allSatisfy(item -> assertThat(item.catalog().getRevision()).isEqualTo(3L));
+        assertThat(deliveries).allSatisfy(item -> assertThat(item.catalog().getRevision()).isEqualTo(2L));
         assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNull();
 
         assertThat(service.acceptReport(publisher, published, 99L)).isEmpty();
@@ -264,8 +264,8 @@ class PeerServiceDiscoveryServiceTests {
                         true, false, false, false, false, 0, 2, List.of("http")),
                 new PeerMeshService.PeerRosterItem(peerC.getId(), peerC.getClientName(), "100.96.0.3", "pk-c",
                         true, false, false, false, false, 0, 2, List.of("http"))));
-        when(peerMeshService.canPeer(publisher, peerB)).thenReturn(true);
-        when(peerMeshService.canPeer(publisher, peerC)).thenReturn(true);
+        when(peerMeshService.canPeer(peerB, publisher)).thenReturn(true);
+        when(peerMeshService.canPeer(peerC, publisher)).thenReturn(true);
 
         EmbeddedChannel channelB = new EmbeddedChannel();
         EmbeddedChannel channelC = new EmbeddedChannel();
@@ -288,7 +288,7 @@ class PeerServiceDiscoveryServiceTests {
             service.updateService(admin(), definition.getId(), new PeerServiceDiscoveryService.ServiceMutation(
                     null, null, null, null, null, null, null, null, null, null, null, "ACL", List.of(2L, 3L)));
 
-            when(peerMeshService.canPeer(publisher, peerB)).thenReturn(false);
+            when(peerMeshService.canPeer(peerB, publisher)).thenReturn(false);
             var revoked = service.onAuthorizationChanged("tenant-a");
             assertThat(revoked).filteredOn(delivery -> delivery.recipient() == peerB)
                     .hasSize(2)
@@ -299,7 +299,7 @@ class PeerServiceDiscoveryServiceTests {
             assertThat(service.catalogsForRecipient(peerB)).hasSize(2)
                     .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).isEmpty());
 
-            when(peerMeshService.canPeer(publisher, peerB)).thenReturn(true);
+            when(peerMeshService.canPeer(peerB, publisher)).thenReturn(true);
             assertThat(service.catalogsForRecipient(peerB)).hasSize(2)
                     .allSatisfy(delivery -> assertThat(delivery.catalog().getServices()).hasSize(1));
 
@@ -319,6 +319,42 @@ class PeerServiceDiscoveryServiceTests {
         } finally {
             channelB.close();
             channelC.close();
+        }
+    }
+
+    @Test
+    void deletedPublisherWithdrawsCatalogEvenAfterItsAccountRowIsGone() {
+        ClientAccount publisher = client(1, "alice", "deleted-publisher");
+        ClientAccount peer = client(2, "alice", "remaining-recipient");
+        PeerMeshSharedService definition = definition(publisher);
+        PeerMeshServiceSharing sharing = new PeerMeshServiceSharing();
+        sharing.setTenantId("tenant-a"); sharing.setEnabled(true);
+        when(sharingRepository.findById("tenant-a")).thenReturn(Optional.of(sharing));
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L))
+                .thenReturn(Optional.of(device(1, publisher.getClientName(), true)));
+        when(serviceRepository.findByTenantIdAndClientIdOrderByNameAsc("tenant-a", 1L))
+                .thenReturn(List.of(definition));
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, peer));
+        when(peerMeshService.allowedRoster(publisher)).thenReturn(List.of(new PeerMeshService.PeerRosterItem(
+                2L, peer.getClientName(), "100.96.0.2", "pk", true, false, false, false, false, 0, 2, List.of("ssh"))));
+        service.acceptReport(publisher, reportMessage(definition.getServiceId()), 99L);
+        assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNotNull();
+
+        when(clientAccountRepository.findByIdAndTenantId(1L, "tenant-a")).thenReturn(Optional.empty());
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(peer));
+        EmbeddedChannel recipient = new EmbeddedChannel();
+        SessionUtil.bindSession(new Session(peer.getClientName()), recipient);
+        try {
+            var deliveries = service.withdrawDeletedClient(publisher);
+            assertThat(deliveries).hasSize(1);
+            assertThat(deliveries.getFirst().catalog().getPublisherClientId()).isEqualTo(1L);
+            assertThat(deliveries.getFirst().catalog().getServices()).isEmpty();
+            assertThat(service.currentCatalog("tenant-a", 1L, 99L)).isNull();
+            assertThat(service.trackedCatalogRevisionCount()).isZero();
+        } finally {
+            SessionUtil.unBindSession(recipient);
+            recipient.finishAndReleaseAll();
         }
     }
 
@@ -392,8 +428,8 @@ class PeerServiceDiscoveryServiceTests {
                 new PeerMeshService.PeerRosterItem(2L, "b", "100.96.0.2", "pk", true, false, false, false, false, 0, 1, List.of()),
                 new PeerMeshService.PeerRosterItem(3L, "c", "100.96.0.3", "pk", true, false, false, false, false, 0, 1, List.of())));
         when(clientAccountRepository.findByTenantIdOrderByIdDesc("tenant-a")).thenReturn(List.of(publisher, allowed, other));
-        when(peerMeshService.canPeer(publisher, allowed)).thenReturn(true);
-        when(peerMeshService.canPeer(publisher, other)).thenReturn(true);
+        when(peerMeshService.canPeer(allowed, publisher)).thenReturn(true);
+        when(peerMeshService.canPeer(other, publisher)).thenReturn(true);
 
         PeerAdvertisedService advertised = fromDefinition(definition);
         assertThat(service.visibleTo(publisher, allowed, advertised)).isTrue();

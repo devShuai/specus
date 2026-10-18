@@ -2,9 +2,12 @@ package com.theshuai.specusserver.websocket;
 
 import com.theshuai.specusserver.management.model.ManagementRole;
 import com.theshuai.specusserver.management.service.ManagementUserService;
+import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.tenant.TenantContext;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Whether the identity a management WebSocket ticket recorded still holds (management-accounts.md
@@ -24,9 +27,15 @@ public class ManagementWebSocketIdentity {
     }
 
     public boolean current(Map<String, Object> attributes) {
+        return resolve(attributes).isPresent();
+    }
+
+    /** Canonical identity at connection registration. Old UID-less tickets retain their existing
+     * login-resolution semantics, then become pinned to the resolved key for this connection. */
+    public Optional<ManagementContext> resolve(Map<String, Object> attributes) {
         if (!(attributes.get(WebSocketTicketHandshakeInterceptor.ATTR_USER) instanceof String username)
                 || !(attributes.get(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID) instanceof String tenantId)) {
-            return false;
+            return Optional.empty();
         }
         // Tickets issued before the key was recorded resolve like tokens without uid.
         String accountKey = attributes.get(WebSocketTicketHandshakeInterceptor.ATTR_ACCOUNT_KEY) instanceof String key
@@ -34,7 +43,7 @@ public class ManagementWebSocketIdentity {
                 : null;
         boolean admin = Boolean.TRUE.equals(attributes.get(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN));
         return users.resolveLocalTokenUser(username, tenantId, accountKey)
-                .map(user -> (user.role() == ManagementRole.ADMIN) == admin)
-                .orElse(false);
+                .filter(user -> (user.role() == ManagementRole.ADMIN) == admin)
+                .map(user -> new ManagementContext(new TenantContext(user.tenantId()), user.username(), admin, user.tokenAccountKey()));
     }
 }

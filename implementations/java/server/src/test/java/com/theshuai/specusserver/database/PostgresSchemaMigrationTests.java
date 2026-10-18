@@ -71,6 +71,21 @@ class PostgresSchemaMigrationTests {
     }
 
     @Test
+    void credentialAuthenticationUsesCurrentMaterialAndDatabaseLocks() throws Exception {
+        String database = createDatabase();
+        try (ConfigurableApplicationContext auth = start(database)) {
+            ClientCredentialAuthAssertions.verify(auth, postgres.getDatabase("postgres", database), false);
+        }
+    }
+
+    @Test
+    void humanPasswordHashesSurviveLegacyColumnUpgrade() throws Exception {
+        String database = createDatabase();
+        try (var legacy = start(database)) { ManagementResourceWriteAssertions.prepareLegacyPasswordSchema(legacy, false); }
+        try (var upgraded = start(database)) { ManagementResourceWriteAssertions.verifyPasswordSchemaUpgrade(upgraded); }
+    }
+
+    @Test
     void serverStartsRestartsAndReinitializesOnPostgres() {
         String database = createDatabase();
         List<Map<String, Object>> indexes;
@@ -87,6 +102,13 @@ class PostgresSchemaMigrationTests {
             assertThat(second.getBean(DatabaseInitializer.class).initialize())
                     .containsEntry("initialized", true);
             assertThat(indexes(second)).isEqualTo(indexes);
+        }
+    }
+
+    @Test
+    void ownershipPreviewUsesCompleteGroupsOnActualPostgresSchema() {
+        try (ConfigurableApplicationContext context = start(createDatabase())) {
+            OwnerTransferPreviewAssertions.verify(context);
         }
     }
 
@@ -354,7 +376,7 @@ class PostgresSchemaMigrationTests {
     private ConfigurableApplicationContext start(String database) {
         // Command-line arguments, because builder properties are defaults that application.yml
         // overrides: the datasource would silently fall back to ./specus.db.
-        return new SpringApplicationBuilder(SpecusServerApplication.class)
+        return new SpringApplicationBuilder(SpecusServerApplication.class, ManagementLoginAssertions.ProofConfiguration.class)
                 .web(WebApplicationType.NONE)
                 .run(
                         "--spring.datasource.url=" + postgres.getJdbcUrl("postgres", database),

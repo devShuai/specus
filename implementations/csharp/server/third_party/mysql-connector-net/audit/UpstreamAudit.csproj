@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Restore independently, outside the runtime project graph: a source project override
+       must not hide new advisories against the corresponding upstream NuGet release. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MySql.Data" Version="26.7.0" ExcludeAssets="all" PrivateAssets="all" />
+  </ItemGroup>
+</Project>

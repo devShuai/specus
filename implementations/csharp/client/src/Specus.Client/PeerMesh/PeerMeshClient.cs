@@ -2778,7 +2778,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private void CloseSession(PeerControlMessage message)
     {
-        if (message.SessionId is null)
+        if (message.SessionId is null or <= 0)
         {
             return;
         }
@@ -2790,6 +2790,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 _sessionsById.Remove(session.Id);
                 _sessions.Remove(peerId);
                 session.DisposeTrafficCodecs();
+                // Only the matched session may revoke flows. Keep replacement and release
+                // ordered under _sync, as with expiry in ReusableSessionLocked.
+                _egress.RevokeConsumer(peerId);
             }
         }
     }

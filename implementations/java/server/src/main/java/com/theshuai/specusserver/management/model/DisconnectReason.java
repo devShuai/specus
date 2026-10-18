@@ -31,7 +31,11 @@ public enum DisconnectReason {
     SERVER_BUSY            ("服务端繁忙拒绝"),
     SERVER_SHUTDOWN        ("服务端优雅停机"),
     SERVER_RESTARTED       ("服务端重启时清理"),
-    UNKNOWN                ("未知");
+    UNKNOWN                ("未知"),
+    // Append to preserve existing ordinals. Recognize physical CONTROL lifecycle audit codes,
+    // not management ownership-transfer events or a security handoff.
+    AUTH_SOURCE_RETIRED    ("原控制连接已失效"),
+    SOURCE_PROCESS_GONE    ("所属服务进程退出后清理");
 
     /** AttributeKey 名称；specus-common 用同名字符串引用同一属性。 */
     public static final String CHANNEL_ATTR_NAME = "disconnectReason";

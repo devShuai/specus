@@ -16,6 +16,7 @@ typedef struct {
     uint8_t *data;
     size_t len;
     size_t cap;
+    int fixed;
 } compact_writer;
 
 #define ST_NAT_HEADER_SIZE 16U
@@ -155,9 +156,11 @@ static int reader_nullable_long(compact_reader *reader, int64_t *value)
 
 static int writer_reserve(compact_writer *writer, size_t more)
 {
+    if (more > SIZE_MAX - writer->len) return -1;
     if (writer->len + more <= writer->cap) {
         return 0;
     }
+    if (writer->fixed) return -1;
     size_t next = writer->cap == 0 ? 64U : writer->cap;
     while (next < writer->len + more) {
         if (next > SIZE_MAX / 2U) {
@@ -467,6 +470,23 @@ st_buffer st_protocol_encode_message_response(const char *client_name,
     buffer = encode_compact_frame(ST_CMD_MESSAGE_RESPONSE, &payload);
     free(payload.data);
     return buffer;
+}
+
+int st_protocol_encode_message_response_into(const char *client_name, const char *to_client_name,
+    int message_type, const char *message, uint8_t *data, size_t capacity, size_t *length)
+{
+    if (!length) return -1;
+    *length = 0;
+    if (!data || capacity < ST_HEADER_SIZE || message_type < ST_MESSAGE_TYPE_SERVER_TO_CLIENT
+        || message_type > ST_MESSAGE_TYPE_PEER_CONTROL) return -1;
+    compact_writer payload = {.data=data+ST_HEADER_SIZE, .cap=capacity-ST_HEADER_SIZE, .fixed=1};
+    if (writer_string(&payload, client_name) != 0 || writer_string(&payload, to_client_name) != 0
+        || writer_varint(&payload, (uint32_t)message_type) != 0 || writer_string(&payload, message) != 0
+        || payload.len > ST_MAX_MESSAGE_BODY_SIZE) return -1;
+    write_be32(data, ST_MAGIC); data[4]=ST_VERSION; data[5]=ST_SERIALIZER_COMPACT_BINARY;
+    data[6]=(uint8_t)ST_CMD_MESSAGE_RESPONSE; write_be32(data+7,(uint32_t)payload.len);
+    *length=ST_HEADER_SIZE+payload.len;
+    return 0;
 }
 
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json)

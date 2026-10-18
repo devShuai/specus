@@ -273,8 +273,41 @@ func (s *Service) OnClientDisconnected(ctx context.Context, clientName string, s
 	if err != nil || account == nil {
 		return
 	}
-	s.withdrawSession(ctx, *account, sessionID)
 	key := catalogKey{account.TenantID, account.ID, sessionID}
+	s.catalogMu.Lock()
+	_, hasCatalog := s.catalogs[key]
+	_, hasReport := s.reportRevisions[key]
+	s.catalogMu.Unlock()
+	if !hasCatalog && !hasReport {
+		s.catalogMu.Lock()
+		delete(s.catalogRevisions, key)
+		delete(s.serviceReportRates, sessionID)
+		s.catalogMu.Unlock()
+		return
+	}
+	s.withdrawSession(ctx, *account, sessionID)
+	s.catalogMu.Lock()
+	delete(s.catalogRevisions, key)
+	delete(s.reportRevisions, key)
+	delete(s.serviceReportRates, sessionID)
+	s.catalogMu.Unlock()
+}
+
+// OnControlConnected retires only this authenticated session's prior physical publisher.
+// The transport calls it under the same lifecycle lease as report admission and disconnect,
+// before publishing the new binding/login response and without holding a socket write lock.
+func (s *Service) OnControlConnected(ctx context.Context, publisher store.ClientAccount, sessionID int64) {
+	if s == nil || sessionID <= 0 {
+		return
+	}
+	key := catalogKey{publisher.TenantID, publisher.ID, sessionID}
+	s.catalogMu.Lock()
+	_, hasCatalog := s.catalogs[key]
+	_, hasReport := s.reportRevisions[key]
+	s.catalogMu.Unlock()
+	if hasCatalog || hasReport {
+		s.withdrawSession(ctx, publisher, sessionID)
+	}
 	s.catalogMu.Lock()
 	delete(s.catalogRevisions, key)
 	delete(s.reportRevisions, key)
@@ -460,6 +493,9 @@ func (s *Service) fanoutCatalog(ctx context.Context, publisher store.ClientAccou
 
 func (s *Service) fanoutCatalogMode(ctx context.Context, publisher store.ClientAccount, publisherSessionID, revision int64,
 	services []AdvertisedService, expiresAt time.Time, includeDenied bool) {
+	if revision < 1 {
+		return
+	} // Allocation failure is never a wire revision.
 	clients, err := s.db.ListClients(ctx)
 	if err != nil {
 		return
@@ -468,7 +504,7 @@ func (s *Service) fanoutCatalogMode(ctx context.Context, publisher store.ClientA
 		if recipient.ID == publisher.ID || recipient.TenantID != publisher.TenantID {
 			continue
 		}
-		ok, err := s.CanPeer(ctx, publisher, recipient)
+		ok, err := s.CanPeer(ctx, recipient, publisher)
 		if err != nil || (!ok && !includeDenied) {
 			continue
 		}
@@ -540,7 +576,7 @@ func (s *Service) pushCurrentCatalogs(ctx context.Context, recipient store.Clien
 		if err != nil || publisher == nil {
 			continue
 		}
-		allowed, err := s.CanPeer(ctx, *publisher, recipient)
+		allowed, err := s.CanPeer(ctx, recipient, *publisher)
 		if err != nil {
 			continue
 		}
@@ -605,12 +641,9 @@ func (s *Service) acceptReportRevision(key catalogKey, revision int64) (int64, b
 	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
 		return 0, false
 	}
-	catalogRevision := revision
-	if previous := s.catalogRevisions[key]; catalogRevision <= previous {
-		if previous == int64(^uint64(0)>>1) {
-			return 0, false
-		}
-		catalogRevision = previous + 1
+	catalogRevision := s.allocateCatalogRevisionLocked(s.catalogRevisions[key])
+	if catalogRevision == 0 {
+		return 0, false
 	}
 	s.reportRevisions[key] = revision
 	s.catalogRevisions[key] = catalogRevision
@@ -619,14 +652,25 @@ func (s *Service) acceptReportRevision(key catalogKey, revision int64) (int64, b
 
 func (s *Service) nextCatalogRevisionLocked(key catalogKey) int64 {
 	if _, exists := s.catalogRevisions[key]; !exists && len(s.catalogRevisions) >= 4096 {
-		return int64(^uint64(0) >> 1)
+		return 0
 	}
-	next := s.catalogRevisions[key] + 1
-	if next < 1 {
-		next = 1
+	next := s.allocateCatalogRevisionLocked(s.catalogRevisions[key])
+	if next == 0 {
+		return 0
 	}
 	s.catalogRevisions[key] = next
 	return next
+}
+
+// Called under catalogMu. Per-session cleanup must not reset this output clock: a
+// reconnect can reuse its authenticated session ID while consumers stay connected.
+func (s *Service) allocateCatalogRevisionLocked(previous int64) int64 {
+	floor := max(previous, s.catalogSequence)
+	if floor == int64(^uint64(0)>>1) {
+		return 0
+	} // Fail closed, never wrap or emit an invalid revision.
+	s.catalogSequence = floor + 1
+	return s.catalogSequence
 }
 
 func (s *Service) expireServiceCatalogs(ctx context.Context, now time.Time) {
@@ -724,16 +768,24 @@ func (s *Service) effectiveSharing(ctx context.Context, account store.ClientAcco
 }
 
 func (s *Service) localServicesFor(ctx context.Context, account store.ClientAccount, clientProtocolVersion int) []LocalPeerService {
+	out, _ := s.localServicesForChecked(ctx, account, clientProtocolVersion)
+	return out
+}
+
+func (s *Service) localServicesForChecked(ctx context.Context, account store.ClientAccount, clientProtocolVersion int) ([]LocalPeerService, error) {
 	out := []LocalPeerService{}
 	if s.db == nil || clientProtocolVersion < 2 {
-		return out
+		return out, nil
 	}
 	rows, err := s.db.ListPeerMeshSharedServices(ctx, account.TenantID, []int64{account.ID})
 	if err != nil {
-		return out
+		return nil, err
 	}
 	for _, row := range rows {
-		allowedPeerVirtualIPs := s.allowedPeerVirtualIPs(ctx, account, row)
+		allowedPeerVirtualIPs, err := s.allowedPeerVirtualIPsChecked(ctx, account, row)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, LocalPeerService{
 			ServiceID:             row.ServiceID,
 			Name:                  row.Name,
@@ -749,16 +801,21 @@ func (s *Service) localServicesFor(ctx context.Context, account store.ClientAcco
 			AllowedPeerVirtualIPs: allowedPeerVirtualIPs,
 		})
 	}
-	return out
+	return out, nil
 }
 
 func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.ClientAccount, definition store.PeerMeshSharedService) []string {
+	out, _ := s.allowedPeerVirtualIPsChecked(ctx, publisher, definition)
+	return out
+}
+
+func (s *Service) allowedPeerVirtualIPsChecked(ctx context.Context, publisher store.ClientAccount, definition store.PeerMeshSharedService) ([]string, error) {
 	if !definition.Enabled {
-		return []string{}
+		return []string{}, nil
 	}
 	clients, err := s.db.ListClients(ctx)
 	if err != nil {
-		return []string{}
+		return nil, err
 	}
 	explicit := decodeClientIDs(definition.AllowedClientIDs)
 	allowed := make([]string, 0)
@@ -766,8 +823,11 @@ func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.Cli
 		if recipient.ID == publisher.ID || recipient.TenantID != publisher.TenantID {
 			continue
 		}
-		canPeer, err := s.CanPeer(ctx, publisher, recipient)
-		if err != nil || !canPeer {
+		canPeer, err := s.CanPeer(ctx, recipient, publisher)
+		if err != nil {
+			return nil, err
+		}
+		if !canPeer {
 			continue
 		}
 		visible := normalizeOwner(publisher.OwnerUsername) == normalizeOwner(recipient.OwnerUsername)
@@ -778,12 +838,15 @@ func (s *Service) allowedPeerVirtualIPs(ctx context.Context, publisher store.Cli
 			continue
 		}
 		device, err := s.db.FindPeerMeshDeviceByClientID(ctx, publisher.TenantID, recipient.ID)
-		if err == nil && device != nil && device.Enabled && strings.TrimSpace(device.VirtualIP) != "" {
+		if err != nil {
+			return nil, err
+		}
+		if device != nil && device.Enabled && strings.TrimSpace(device.VirtualIP) != "" {
 			allowed = append(allowed, strings.TrimSpace(device.VirtualIP))
 		}
 	}
 	slices.Sort(allowed)
-	return slices.Compact(allowed)
+	return slices.Compact(allowed), nil
 }
 
 func (s *Service) sharingStatusFor(account store.ClientAccount, device *store.PeerMeshDevice) ServiceSharingStatus {
@@ -799,7 +862,7 @@ func (s *Service) sharingStatusFor(account store.ClientAccount, device *store.Pe
 			mdns = row.MdnsImportEnabled
 		}
 	}
-	deviceEnabled := s.Enabled() && device != nil && device.Enabled
+	deviceEnabled := s.Enabled() && account.Enabled && device != nil && device.Enabled
 	effective := s.Enabled() && configured && deviceEnabled
 	return ServiceSharingStatus{
 		DeploymentEnabled: s.Enabled(),

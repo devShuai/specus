@@ -6,6 +6,8 @@ import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.session.Session;
 import com.theshuai.specusserver.session.SessionUtil;
+import com.theshuai.specusserver.session.ControlLifecycle;
+import com.theshuai.specusserver.attribute.ServerAttributes;
 import com.theshuai.specusserver.management.model.DisconnectReason;
 import com.theshuai.specusserver.management.service.AuthenticationResult;
 import com.theshuai.specusserver.management.service.ClientAuthService;
@@ -15,6 +17,7 @@ import com.theshuai.specusserver.management.service.PeerSignalService;
 import com.theshuai.specusserver.config.NettyServerProperties;
 import com.theshuai.specusserver.productmetrics.ProductMetricsService;
 import io.netty.channel.ChannelHandler;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.AttributeKey;
@@ -25,6 +28,8 @@ import org.springframework.util.StringUtils;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
 @ChannelHandler.Sharable
@@ -81,25 +86,65 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
 
     private void handleLogin(ChannelHandlerContext ctx, LoginRequestPacket packet) {
         try {
+            boolean control = ConnectionRole.CONTROL.equals(packet.getConnectionRole());
+            Long clientId = control ? clientAuthService.controlClientId(packet.getAccessToken()) : null;
+            try (var ignored = clientId == null ? null : ControlLifecycle.acquire(clientId, ctx.channel());
+                 var pending = clientId == null ? null : ControlLifecycle.beginPublication(clientId, ctx.channel())) {
+                handleLoginUnderLease(ctx, packet, clientId);
+            }
+        } catch (Exception failure) {
+            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+            log.warn("CONTROL admission stopped for client={}: {}", packet.getClientName(), failure.getClass().getSimpleName());
+            if (failure instanceof RejectedExecutionException) {
+                DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.SERVER_BUSY);
+                ctx.writeAndFlush(busyResponse(packet)).addListener(io.netty.channel.ChannelFutureListener.CLOSE);
+            } else ctx.close();
+        }
+    }
+
+    private void handleLoginUnderLease(ChannelHandlerContext ctx, LoginRequestPacket packet, Long clientId) {
+        AuthenticationResult admitted = null;
+        long recorded = 0;
+        boolean dataConnection = ConnectionRole.DATA.equals(packet.getConnectionRole());
+        var publication = new CompletableFuture<Boolean>();
+        // 0 queued/not started, 1 owned by the I/O callback, 2 cancelled before that callback.
+        var publicationState = new AtomicInteger();
+        SessionUtil.PreparedBinding preparation = null;
+        try {
             boolean validRole = ConnectionRole.isValid(packet.getConnectionRole());
-            boolean dataConnection = ConnectionRole.DATA.equals(packet.getConnectionRole());
-            AuthenticationResult authentication = validRole && StringUtils.hasText(packet.getAccessToken())
-                    ? clientAuthService.authenticateNetty(
-                    packet,
-                    ctx.channel().id().asLongText(),
-                    String.valueOf(ctx.channel().remoteAddress()),
-                    dataConnection)
-                    : AuthenticationResult.failure(null, validRole
-                    ? "客户端必须先通过 HTTP 登录获取访问令牌"
-                    : "登录包缺少有效 connectionRole");
-            if (authentication.success() && dataConnection
-                    && !SessionUtil.hasMatchingControl(packet.getClientName(), authentication.clientSessionId())) {
-                authentication = AuthenticationResult.failure(authentication.account(), "数据连接未找到匹配的控制连接");
+            AuthenticationResult authentication;
+            if (!validRole || !StringUtils.hasText(packet.getAccessToken())) {
+                authentication = AuthenticationResult.failure(null, validRole
+                        ? "客户端必须先通过 HTTP 登录获取访问令牌" : "登录包缺少有效 connectionRole");
+            } else if (dataConnection) {
+                authentication = clientAuthService.authenticateNetty(packet, ctx.channel().id().asLongText(),
+                        String.valueOf(ctx.channel().remoteAddress()), true);
+            } else if (clientId == null) {
+                authentication = AuthenticationResult.failure(null, "客户端访问令牌无效");
+            } else {
+                authentication = clientAuthService.authenticateNetty(packet, ctx.channel().id().asLongText(),
+                        String.valueOf(ctx.channel().remoteAddress()), false, clientId);
+            }
+            Channel authenticatedControl = authentication.success() && dataConnection
+                    ? SessionUtil.getMatchingControl(packet.getClientName(), authentication.clientSessionId()) : null;
+            if (authentication.success() && dataConnection && authenticatedControl == null) {
+                authentication = AuthenticationResult.failure(authentication.account(), "数据连接要求控制连接先登录：未找到匹配的控制连接");
             }
             AuthenticationResult finalAuthentication = authentication;
+            admitted = authentication;
             long connectionRecordId = dataConnection ? 0L : connectionRecordService.recordConnection(
                     finalAuthentication, packet, ctx.channel().id().asLongText(),
                     String.valueOf(ctx.channel().remoteAddress()));
+            recorded = connectionRecordId;
+            if (authentication.success() && !dataConnection) {
+                peerSignalService.onControlConnected(authentication.account(), authentication.clientSessionId());
+            }
+            if(authentication.success()) {
+                preparation=SessionUtil.prepareBinding(new Session(packet.getClientName()),ctx.channel(),
+                        authenticatedControl,authentication.clientSessionId(),dataConnection);
+                if(preparation != null) preparation.awaitRetired(); // Worker only; no DB/registry lock is held.
+            }
+            SessionUtil.PreparedBinding ready=preparation;
 
             LoginResponsePacket response = new LoginResponsePacket();
             response.setVersion(packet.getVersion());
@@ -109,34 +154,45 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
 
             // Channel-affecting work (attribute, session bind, write) must run on the channel's
             // event loop so it stays ordered relative to other I/O on this connection.
-            ctx.channel().eventLoop().execute(() -> {
+            Runnable publish = () -> {
+                if (!publicationState.compareAndSet(0,1)) return;
+                try {
+                if (!ctx.channel().isActive()) {publication.complete(false);return;}
                 if (finalAuthentication.success()) {
-                    if (ctx.pipeline().context(Spliter.PRE_AUTH_HANDLER_NAME) != null) {
-                        ctx.pipeline().replace(
-                                Spliter.PRE_AUTH_HANDLER_NAME,
-                                Spliter.AUTHENTICATED_HANDLER_NAME,
-                                new Spliter(nettyProperties.getMaxFrameSize()));
-                    }
                     if (connectionRecordId > 0) {
                         ctx.channel().attr(CONNECTION_RECORD_ID).set(connectionRecordId);
                     }
                     ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.LOGIN_TIME_MS).set(System.currentTimeMillis());
                     ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.TENANT_ID).set(
                             finalAuthentication.account().getTenantId());
+                    ctx.channel().attr(ServerAttributes.CLIENT_ID).set(finalAuthentication.account().getId());
                     ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.CONNECTION_ROLE).set(
                             packet.getConnectionRole());
                     if (finalAuthentication.clientSessionId() != null) {
                         ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.CLIENT_SESSION_ID).set(
                                 finalAuthentication.clientSessionId());
                     }
-                    if (dataConnection) {
-                        SessionUtil.bindDataSession(new Session(packet.getClientName()), ctx.channel());
-                    } else {
-                        SessionUtil.bindControlSession(new Session(packet.getClientName()), ctx.channel());
+                    if (ready == null || !ready.publish()) {
+                            // Authentication ran on a worker. Its CONTROL may have gone away or
+                            // been replaced while this event-loop callback was queued.
+                            response.setSuccess(false);
+                            response.setReason(dataConnection ? "数据连接要求控制连接先登录：原控制连接已改变，请重新建立数据连接"
+                                    : "原控制连接已改变，请重新登录");
+                            ctx.channel().attr(ServerAttributes.TENANT_ID).set(null);
+                            ctx.channel().attr(ServerAttributes.CONNECTION_ROLE).set(null);
+                            ctx.channel().attr(ServerAttributes.CLIENT_SESSION_ID).set(null);
+                            ctx.channel().attr(ServerAttributes.CLIENT_ID).set(null);
+                            ctx.channel().attr(ServerAttributes.LOGIN_TIME_MS).set(null);
+                    }
+                    if (response.isSuccess() && ctx.pipeline().context(Spliter.PRE_AUTH_HANDLER_NAME) != null) {
+                        ctx.pipeline().replace(
+                                Spliter.PRE_AUTH_HANDLER_NAME,
+                                Spliter.AUTHENTICATED_HANDLER_NAME,
+                                new Spliter(nettyProperties.getMaxFrameSize()));
                     }
                 }
                 io.netty.channel.ChannelFuture writeFuture = ctx.writeAndFlush(response);
-                if (finalAuthentication.success()) {
+                if (response.isSuccess()) {
                     if (!dataConnection) {
                         // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
                         submit(() -> pushNatControlOnLogin(packet.getClientName()));
@@ -151,11 +207,52 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                     DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.LOGIN_FAILURE);
                     writeFuture.addListener(io.netty.channel.ChannelFutureListener.CLOSE);
                 }
-            });
+                publication.complete(response.isSuccess());
+                } catch (Throwable failure) {
+                    publication.completeExceptionally(failure);ctx.close();
+                } finally {
+                    if(dataConnection && ready != null) ready.close();
+                }
+            };
+            if (ctx.channel().eventLoop().inEventLoop()) publish.run();
+            else ctx.channel().eventLoop().execute(publish);
+            // Only CONTROL owns a lifecycle lease. Keep it until native ONLINE and the binding/raw
+            // cursor publication agree; the event loop itself never waits on this lease or the DB.
+            if (!dataConnection && !publication.get() && admitted.success()) {
+                retireUnpublished(ctx, admitted, recorded);
+            }
         } catch (Exception e) {
-            log.error("login handling failed for client={}", packet.getClientName(), e);
+            if (publicationState.compareAndSet(0,2)) publication.complete(false);
+            else publication.handle((accepted, failure) -> null).join();
+            if (!dataConnection && admitted != null && admitted.success()) retireUnpublished(ctx, admitted, recorded);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                log.debug("login admission interrupted for client={}",packet.getClientName());
+            } else if(e instanceof java.util.concurrent.CancellationException) {
+                log.debug("login channel closed during retirement for client={}",packet.getClientName());
+            } else log.error("login handling failed for client={}", packet.getClientName(), e);
             DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.IO_ERROR);
             ctx.close();
+        } finally {
+            if(preparation != null && (!dataConnection || publicationState.get() == 2)) preparation.close();
+        }
+    }
+
+    private void retireUnpublished(ChannelHandlerContext ctx, AuthenticationResult authentication, long recordId) {
+        try {
+            if (clientAuthService.markNettyDisconnected(authentication.clientSessionId(), ctx.channel().id().asLongText())
+                    || clientAuthService.isSessionDisconnected(authentication.clientSessionId(), authentication.account().getId())) {
+                Channel obsolete = SessionUtil.getChannel(authentication.account().getClientName());
+                if (obsolete != null && obsolete != ctx.channel()
+                        && java.util.Objects.equals(obsolete.attr(ServerAttributes.CLIENT_SESSION_ID).get(), authentication.clientSessionId())) {
+                    obsolete.close();
+                }
+                peerSignalService.onClientDisconnected(authentication.clientSessionId());
+            }
+        } catch (RuntimeException failure) {log.warn("unpublished CONTROL cleanup failed", failure);}
+        if (recordId > 0 && ctx.channel().attr(CONNECTION_RECORD_ID).get() == null) {
+            try {connectionRecordService.recordDisconnect(recordId, DisconnectReason.LOGIN_FAILURE);}
+            catch (RuntimeException failure) {log.warn("unpublished CONTROL audit failed", failure);}
         }
     }
 
@@ -167,6 +264,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         Long connectionRecordId = ctx.channel().attr(CONNECTION_RECORD_ID).getAndSet(null);
         Long clientSessionId = ctx.channel().attr(com.theshuai.specusserver.attribute.ServerAttributes.CLIENT_SESSION_ID)
                 .getAndSet(null);
+        Long clientId = ctx.channel().attr(ServerAttributes.CLIENT_ID).getAndSet(null);
         if (connectionRecordId != null) {
             long recordId = connectionRecordId;
             // 读通道属性还原 reason；缺省视为客户端主动 FIN。
@@ -174,11 +272,17 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             DisconnectReason reason = marked == null ? DisconnectReason.CLIENT_CLOSED : marked;
             submit(() -> connectionRecordService.recordDisconnect(recordId, reason));
         }
-        if (clientSessionId != null && !dataConnection) {
+        if (clientSessionId != null && clientId != null && !dataConnection) {
             long sessionId = clientSessionId;
             submit(() -> {
-                clientAuthService.markNettyDisconnected(sessionId);
-                peerSignalService.onClientDisconnected(sessionId);
+                try (var ignored = ControlLifecycle.acquire(clientId, null)) {
+                    if (clientAuthService.markNettyDisconnected(sessionId, ctx.channel().id().asLongText())
+                            || clientAuthService.isSessionDisconnected(sessionId, clientId)) {
+                        peerSignalService.onClientDisconnected(sessionId);
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();log.warn("CONTROL disconnect cleanup interrupted");
+                }
             });
         }
         // The close-future listener has normally unbound the session already, closing the data

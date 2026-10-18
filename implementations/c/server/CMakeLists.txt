@@ -20,6 +20,9 @@ add_library(specus_c_core
     src/client_auth_nonce.c
     src/client_package.c
     src/connectivity_check.c
+    src/control_lifecycle.c
+    src/control_outbox.c
+    src/control_presence.c
     src/crypto.c
     src/decompression_limits.c
     src/elasticsearch_traffic.c
@@ -30,6 +33,7 @@ add_library(specus_c_core
     src/login_rate_limiter.c
     src/media_capture.c
     src/object_storage.c
+    src/owner_transfer.c
     src/oidc.c
     src/password_hash.c
     src/peer_egress.c
@@ -77,6 +81,107 @@ target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(specus_c_peer_output_tests tests/peer_output_tests.c)
+target_link_libraries(specus_c_peer_output_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_peer_output_tests PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=calloc" "-Wl,--wrap=realloc")
+target_compile_options(specus_c_peer_output_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME peer_output_tests COMMAND specus_c_peer_output_tests)
+set_tests_properties(peer_output_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_control_outbox_tests tests/control_outbox_tests.c)
+target_link_libraries(specus_c_control_outbox_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_control_outbox_tests PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=calloc")
+target_compile_options(specus_c_control_outbox_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME control_outbox_tests COMMAND specus_c_control_outbox_tests)
+set_tests_properties(control_outbox_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_catalog_acceptance_tests tests/catalog_acceptance_tests.c)
+target_link_libraries(specus_c_catalog_acceptance_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_catalog_acceptance_tests PRIVATE "-Wl,--wrap=sqlite3_exec")
+target_compile_options(specus_c_catalog_acceptance_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME catalog_acceptance_tests COMMAND specus_c_catalog_acceptance_tests)
+set_tests_properties(catalog_acceptance_tests PROPERTIES TIMEOUT 60)
+add_executable(specus_c_catalog_binding_tests tests/catalog_binding_tests.c)
+target_link_libraries(specus_c_catalog_binding_tests PRIVATE specus_c_core pthread)
+target_link_options(specus_c_catalog_binding_tests PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=calloc" "-Wl,--wrap=realloc")
+target_compile_options(specus_c_catalog_binding_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME catalog_binding_tests COMMAND specus_c_catalog_binding_tests)
+set_tests_properties(catalog_binding_tests PROPERTIES TIMEOUT 60)
+add_executable(specus_c_catalog_read_tests tests/catalog_read_tests.c)
+target_link_libraries(specus_c_catalog_read_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_catalog_read_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME catalog_read_tests COMMAND specus_c_catalog_read_tests)
+set_tests_properties(catalog_read_tests PROPERTIES TIMEOUT 60)
+add_executable(specus_c_catalog_source_tests tests/catalog_source_tests.c)
+target_link_libraries(specus_c_catalog_source_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_catalog_source_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME catalog_source_tests COMMAND specus_c_catalog_source_tests)
+set_tests_properties(catalog_source_tests PROPERTIES TIMEOUT 30)
+add_library(specus_c_catalog_source_barrier SHARED tests/catalog_source_barrier.c)
+target_link_libraries(specus_c_catalog_source_barrier PRIVATE SQLite::SQLite3 pthread dl)
+target_compile_options(specus_c_catalog_source_barrier PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_executable(specus_c_catalog_source_e2e_tests tests/catalog_source_e2e_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_catalog_source_e2e_tests PRIVATE specus_c_core pthread dl)
+target_compile_options(specus_c_catalog_source_e2e_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME catalog_source_e2e_tests COMMAND specus_c_catalog_source_e2e_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_catalog_source_barrier>)
+set_tests_properties(catalog_source_e2e_tests PROPERTIES TIMEOUT 90)
+add_executable(specus_c_disconnect_reasons_vector_tests tests/disconnect_reasons_vector_tests.c)
+target_link_libraries(specus_c_disconnect_reasons_vector_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_disconnect_reasons_vector_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+target_compile_definitions(specus_c_disconnect_reasons_vector_tests PRIVATE
+    ST_DISCONNECT_REASONS_FIXTURE_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/disconnect-reasons-v1.json")
+add_test(NAME disconnect_reasons_vector_tests COMMAND specus_c_disconnect_reasons_vector_tests)
+set_tests_properties(disconnect_reasons_vector_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_control_lifecycle_tests tests/control_lifecycle_tests.c)
+target_link_libraries(specus_c_control_lifecycle_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_lifecycle_tests COMMAND specus_c_control_lifecycle_tests)
+add_executable(specus_c_control_queue_tests tests/control_queue_tests.c)
+target_link_libraries(specus_c_control_queue_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_queue_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_queue_tests COMMAND specus_c_control_queue_tests)
+set_tests_properties(control_queue_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_control_source_watch_tests tests/control_source_watch_tests.c)
+target_link_libraries(specus_c_control_source_watch_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_source_watch_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_source_watch_tests COMMAND specus_c_control_source_watch_tests)
+set_tests_properties(control_source_watch_tests PROPERTIES TIMEOUT 30)
+add_executable(specus_c_control_presence_tests tests/control_presence_tests.c)
+target_link_libraries(specus_c_control_presence_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_presence_tests PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+add_test(NAME control_presence_tests COMMAND specus_c_control_presence_tests)
+set_tests_properties(control_presence_tests PROPERTIES TIMEOUT 30)
+add_library(specus_c_control_source_watch_barrier SHARED tests/control_source_watch_barrier.c)
+target_link_libraries(specus_c_control_source_watch_barrier PRIVATE SQLite::SQLite3 pthread dl)
+add_executable(specus_c_control_source_watch_e2e_tests tests/control_source_watch_e2e_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_control_source_watch_e2e_tests PRIVATE specus_c_core pthread dl)
+target_compile_options(specus_c_control_source_watch_e2e_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_source_watch_e2e_tests COMMAND specus_c_control_source_watch_e2e_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_control_source_watch_barrier>)
+set_tests_properties(control_source_watch_e2e_tests PROPERTIES TIMEOUT 60)
+add_executable(specus_c_catalog_reconnect_tests tests/catalog_reconnect_tests.c)
+add_executable(specus_c_control_source_storage_tests tests/control_source_storage_tests.c)
+target_link_libraries(specus_c_control_source_storage_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_control_source_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_source_storage_tests COMMAND specus_c_control_source_storage_tests)
+set_tests_properties(control_source_storage_tests PROPERTIES TIMEOUT 60)
+target_link_libraries(specus_c_catalog_reconnect_tests PRIVATE specus_c_core pthread)
+target_compile_options(specus_c_catalog_reconnect_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME catalog_reconnect_tests COMMAND specus_c_catalog_reconnect_tests)
+set_tests_properties(catalog_reconnect_tests PROPERTIES TIMEOUT 60)
+add_library(specus_c_control_business_barrier SHARED tests/control_business_barrier.c)
+target_link_libraries(specus_c_control_business_barrier PRIVATE SQLite::SQLite3 pthread dl)
+add_executable(specus_c_control_business_tests tests/control_business_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_control_business_tests PRIVATE specus_c_core pthread dl)
+target_compile_options(specus_c_control_business_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_business_tests COMMAND specus_c_control_business_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_control_business_barrier>)
+set_tests_properties(control_business_tests PROPERTIES TIMEOUT 90)
+add_executable(specus_c_catalog_reconnect_e2e_tests tests/catalog_reconnect_e2e_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_catalog_reconnect_e2e_tests PRIVATE specus_c_core pthread dl)
+target_compile_options(specus_c_catalog_reconnect_e2e_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME catalog_reconnect_e2e_tests COMMAND specus_c_catalog_reconnect_e2e_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_control_business_barrier>)
+set_tests_properties(catalog_reconnect_e2e_tests PROPERTIES TIMEOUT 90)
 add_executable(specus_c_admin_http_tests tests/admin_http_tests.c)
 target_link_libraries(specus_c_admin_http_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_admin_http_tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -294,6 +399,13 @@ target_compile_options(specus_c_public_coordination_tests PRIVATE -Wall -Wextra 
 add_test(NAME public_coordination_tests
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_coordination_test.sh
                  $<TARGET_FILE:specus_c_public_coordination_tests>)
+add_test(NAME fixture_isolation_tests
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_isolation_tests.py)
+set_tests_properties(fixture_isolation_tests PROPERTIES TIMEOUT 30)
+add_test(NAME smoke_build_tests COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_build_tests.py)
+set_tests_properties(smoke_build_tests PROPERTIES TIMEOUT 30)
+add_test(NAME smoke_server_selection_tests COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_server_selection_tests.py)
+set_tests_properties(smoke_server_selection_tests PROPERTIES TIMEOUT 30)
 add_test(NAME public_discovery_cluster_e2e
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/public_discovery_cluster_e2e.sh
                  $<TARGET_FILE:specus-server-c>)
@@ -435,8 +547,50 @@ add_executable(specus_c_management_accounts_tests tests/management_accounts_test
 target_link_libraries(specus_c_management_accounts_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_management_accounts_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(specus_c_management_accounts_tests PRIVATE
-    ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/management-accounts-v1.json")
+    ST_MANAGEMENT_ACCOUNTS_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/management-accounts-v1.json"
+    ST_CLIENT_PEER_DELETION_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/client-peer-deletion-v1.json")
 add_test(NAME management_accounts_tests COMMAND specus_c_management_accounts_tests)
+
+add_executable(specus_c_owner_transfer_tests tests/owner_transfer_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_owner_transfer_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_owner_transfer_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(specus_c_owner_transfer_tests PRIVATE
+    ST_OWNER_TRANSFER_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/client-owner-transfer-plan-v1.json")
+add_test(NAME owner_transfer_tests COMMAND specus_c_owner_transfer_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(owner_transfer_tests PROPERTIES TIMEOUT 120)
+
+add_executable(specus_c_owner_transfer_runtime_tests tests/owner_transfer_runtime_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_owner_transfer_runtime_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_owner_transfer_runtime_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME owner_transfer_runtime_tests COMMAND specus_c_owner_transfer_runtime_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(owner_transfer_runtime_tests PROPERTIES TIMEOUT 60)
+
+add_library(specus_c_auth_read_barrier SHARED tests/auth_read_barrier.c)
+target_link_libraries(specus_c_auth_read_barrier PRIVATE SQLite::SQLite3 ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_auth_read_barrier PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specus_c_client_identity_coordination_tests tests/client_identity_coordination_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_client_identity_coordination_tests PRIVATE specus_c_core ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_client_identity_coordination_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME client_identity_coordination_tests COMMAND specus_c_client_identity_coordination_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_auth_read_barrier>)
+set_tests_properties(client_identity_coordination_tests PROPERTIES TIMEOUT 120)
+
+add_library(specus_c_nat_lifecycle_barrier SHARED tests/nat_lifecycle_barrier.c)
+target_link_libraries(specus_c_nat_lifecycle_barrier PRIVATE ${CMAKE_DL_LIBS} pthread)
+target_compile_options(specus_c_nat_lifecycle_barrier PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specus_c_nat_lifecycle_tests tests/nat_lifecycle_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_nat_lifecycle_tests PRIVATE specus_c_core ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_nat_lifecycle_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME nat_lifecycle_tests COMMAND specus_c_nat_lifecycle_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_nat_lifecycle_barrier>)
+set_tests_properties(nat_lifecycle_tests PROPERTIES TIMEOUT 60)
+
+add_executable(specus_c_stream_retirement_tests tests/stream_retirement_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_stream_retirement_tests PRIVATE specus_c_core ${CMAKE_DL_LIBS})
+target_compile_options(specus_c_stream_retirement_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME stream_retirement_tests COMMAND specus_c_stream_retirement_tests
+    $<TARGET_FILE:specus-server-c> $<TARGET_FILE:specus_c_nat_lifecycle_barrier>)
+set_tests_properties(stream_retirement_tests PROPERTIES TIMEOUT 60)
 
 add_executable(specus_c_tls_transport_tests tests/tls_transport_tests.c)
 target_link_libraries(specus_c_tls_transport_tests PRIVATE specus_c_core)

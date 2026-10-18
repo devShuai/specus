@@ -15,6 +15,208 @@ namespace Specus.IntegrationTests;
 
 public sealed class MariaDbCompatibilityTests
 {
+    [Fact]
+    public async Task NativeAttachmentExpiryCleansGrantsAndMultipleBatchesWithoutChangingLiveRows()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await using var scope = server.HostServices.CreateAsyncScope();
+        await TransferAttachmentExpiryProof.VerifyBatchAsync(scope.ServiceProvider.GetRequiredService<SpecusDbContext>(), storageEnabled: false);
+    }
+
+    [Fact]
+    public async Task NativePublicOwnerTransferCommitsAndEachConsumerReplaysTheJournal()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferPostProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeConnectionEventsRecheckCurrentIdentityBeforeDelivery()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ConnectionEventProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeInboundReportRechecksCredentialAfterRealDatabaseLockWait()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerInboundReportProviderProof.VerifyCredentialWaitAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeInboundReportCannotRestorePreTransferOwner()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerInboundReportProviderProof.SourceHintGate();
+        await using var server = await StartAsync(database, gate);
+        await PeerInboundReportProviderProof.VerifyStaleSourceHintAsync(server, gate);
+    }
+
+    [Fact]
+    public async Task NativeInboundReportCannotRecreateClientDeletedOnIndependentHost()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerInboundReportProviderProof.SourceHintGate();
+        await using var server = await StartAsync(database, gate);
+        await using var otherHost = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerInboundReportProviderProof.VerifyStaleSourceHintAsync(server, gate, otherHost);
+    }
+
+    [Fact]
+    public async Task NativePeerSignalWriteTurnRejectsRevokedSenderAndClosesUndeliveredGrant()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerControlDeliveryProviderProof.VerifyCatalogAsync(server, verifySignals: true);
+    }
+
+    [Fact]
+    public async Task NativePeerCatalogRevalidatesPublisherAndDefinitionsAtThePhysicalWriteTurn()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerControlDeliveryProviderProof.VerifyCatalogAsync(server);
+    }
+
+    [Fact]
+    public async Task NativePeerControlDeliveryUsesOriginalCurrentAuthorityAtTheWriteTurn()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database, new PeerDefinitionProviderProof.CommitGate());
+        await PeerControlDeliveryProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeSessionAuthoritySerializesIndependentHostQuotasAndDeletion()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var first = await StartAsync(database, gate);
+        await using var second = await StartAsync(database);
+        await ClientSessionAuthorityProviderProof.VerifyAsync(first, second, gate);
+    }
+
+    [Fact]
+    public async Task NativeClientNamesAndCompleteDeletionCoordinateWithSignedStartup()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var server = await StartAsync(database, gate);
+        await ClientNameProviderProof.VerifyAsync(server, gate);
+    }
+
+    [Fact]
+    public async Task NativePeerDefinitionsSerializeFirstSettingsImportsAndClientDeletion()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new PeerDefinitionProviderProof.CommitGate();
+        await using var server = await StartAsync(database, gate);
+        await PeerDefinitionProviderProof.VerifyAsync(server, gate);
+    }
+
+    [Fact]
+    public async Task NativePeerManagementWritesRecheckTransferredOwnersAndDeletedParents()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await PeerManagementProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeConfigurationMutationsRecheckTransferredOwnersAndDeletedParents()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ClientConfigurationProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeManagementMutationsRevalidateActorsAndUseOneAccountLockOrder()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ManagementUserActorProviderProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeManagementPasswordHashesUpgradeWithoutTruncationOrUnsafeDowngrade()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var db = database.Context();
+        await OwnerTransferWriterProof.VerifyPasswordHashUpgradeAsync(db);
+    }
+
+    [Fact]
+    public async Task NativeResourceMutationsRecheckOwnersAndOriginalActorsAfterDatabaseWaits()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyNativeResourceWriteOrderingAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeTargetDeletionCannotOrphanACommittedOwnershipTransfer()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyNativeTargetDeletionOrderingAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeSignedHttpStartupUsesCurrentOwnerAndCanonicalIdentityMaterial()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new ClientStartupProviderProof.StartupGate(false);
+        await using var server = await StartStartupAsync(database, gate);
+        await ClientStartupProviderProof.VerifyTransferBeforeStartupAsync(server, gate);
+    }
+
+    [Fact]
+    public async Task NativeStartupCredentialLockMakesTransferRefreshItsCompletePreview()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        var gate = new ClientStartupProviderProof.StartupGate(true);
+        await using var server = await StartStartupAsync(database, gate);
+        await ClientStartupProviderProof.VerifyStartupBeforeTransferAsync(server, gate);
+    }
+
+    private static Task<TestServerFixture> StartStartupAsync(OwnedDatabase database, ClientStartupProviderProof.StartupGate gate) =>
+        TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Specus:Database:Provider"] = "mariadb", ["ConnectionStrings:Specus"] = database.ConnectionString,
+            ["Specus:Database:SeedDemoClient"] = "false", ["Specus:PeerMesh:Enabled"] = "true",
+            ["Specus:PeerMesh:StunTurnPort"] = "0", ["Specus:PeerMesh:NatProbeAlternatePort"] = "0",
+        }, services => services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(gate)));
+
+    [Fact]
+    public async Task NativeOwnerTransferTargetStatusHasAnObservedDatabaseCommitOrder()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyNativeTargetOrderingAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeOwnerTransferWriterCommitsCanonicalGroupAndAuditWithoutRevokingAccessMaterial()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await OwnerTransferWriterProof.VerifyAsync(server);
+    }
+
+    [Fact]
+    public async Task NativeControlDisconnectCannotOverwriteANewerPhysicalChannel()
+    {
+        await using var database = await OwnedDatabase.CreateAsync();
+        await using var server = await StartAsync(database);
+        await ControlDisconnectProviderProof.VerifyAsync(server);
+    }
+
     private const string Previous = "20261013031423_BindManagementWebSocketAccount";
     private const string Repair = "20261014023000_WidenHttpTrafficText";
 
@@ -289,12 +491,18 @@ public sealed class MariaDbCompatibilityTests
         Assert.Equal(1, Convert.ToInt64(await command.ExecuteScalarAsync()));
     }
 
-    private static Task<TestServerFixture> StartAsync(OwnedDatabase database) => TestServerFixture.StartAsync(new Dictionary<string, string?>
+    private static Task<TestServerFixture> StartAsync(OwnedDatabase database, Microsoft.EntityFrameworkCore.Diagnostics.IInterceptor? gate = null)
     {
-        ["Specus:Database:Provider"] = "mariadb",
-        ["ConnectionStrings:Specus"] = database.ConnectionString,
-        ["Specus:Database:SeedDemoClient"] = "false",
-    });
+        var settings = new Dictionary<string, string?>
+        {
+            ["Specus:Database:Provider"] = "mariadb",
+            ["ConnectionStrings:Specus"] = database.ConnectionString,
+            ["Specus:Database:SeedDemoClient"] = "false",
+        };
+        if (gate is not null) settings["Specus:PeerMesh:Enabled"] = "true";
+        return TestServerFixture.StartAsync(settings, gate is null ? null : services =>
+            services.ConfigureDbContext<SpecusDbContext>((_, options) => options.AddInterceptors(gate)));
+    }
 
     private static async Task<int> NullCollationsAsync(MySqlConnection connection)
     {

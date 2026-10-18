@@ -12,6 +12,7 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 
 import java.net.InetSocketAddress;
+import java.util.concurrent.CompletableFuture;
 
 public class TcpServer {
 
@@ -39,13 +40,30 @@ public class TcpServer {
                 .childOption(ChannelOption.TCP_NODELAY, properties.isTcpNoDelay())
                 .childOption(ChannelOption.ALLOW_HALF_CLOSURE, true)
                 .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, waterMark);
-        channel = bootstrap.bind(port).sync().channel();
+        var binding = bootstrap.bind(port);
+        channel = binding.channel(); // Retain ownership even if the blocking bind is interrupted.
+        try {
+            binding.sync();
+        } catch (InterruptedException | RuntimeException failure) {
+            // bind() must not report failure while its listener can still occupy the port.
+            channel.close().syncUninterruptibly();
+            throw failure;
+        }
     }
 
     public synchronized void close() {
+        closeAsync();
+    }
+
+    public synchronized CompletableFuture<Void> closeAsync() {
+        var closed = new CompletableFuture<Void>();
         if (channel != null) {
-            channel.close();
-        }
+            channel.close().addListener(result -> {
+                if(result.isSuccess()) closed.complete(null);
+                else closed.completeExceptionally(result.cause());
+            });
+        } else closed.complete(null);
+        return closed;
     }
 
     synchronized int localPort() {

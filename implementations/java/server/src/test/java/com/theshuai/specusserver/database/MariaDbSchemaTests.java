@@ -91,6 +91,29 @@ class MariaDbSchemaTests {
     }
 
     @Test
+    void ownershipPreviewUsesCompleteGroupsOnActualMySqlDialectSchema() throws ManagedProcessException {
+        try (ConfigurableApplicationContext preview = boot(createDatabase("specus_owner_preview"))) {
+            OwnerTransferPreviewAssertions.verify(preview);
+        }
+    }
+
+    @Test
+    void credentialAuthenticationUsesCurrentMaterialAndDatabaseLocks() throws Exception {
+        String database = createDatabase("specus_owner_auth");
+        try (ConfigurableApplicationContext auth = boot(database, true)) {
+            ClientCredentialAuthAssertions.verify(auth,
+                    new DriverManagerDataSource(url(database) + "&useAffectedRows=true", "root", ""), true);
+        }
+    }
+
+    @Test
+    void humanPasswordHashesSurviveLegacyColumnUpgrade() throws Exception {
+        String database = createDatabase("specus_password_storage");
+        try (var legacy = boot(database)) { ManagementResourceWriteAssertions.prepareLegacyPasswordSchema(legacy, true); }
+        try (var upgraded = boot(database)) { ManagementResourceWriteAssertions.verifyPasswordSchemaUpgrade(upgraded); }
+    }
+
+    @Test
     void noLargeObjectColumnStopsAt64KiB() {
         // The binary and text columns of this schema hold bodies, payloads and snapshots.
         assertThat(jdbc().queryForList("""
@@ -207,13 +230,20 @@ class MariaDbSchemaTests {
     }
 
     private static ConfigurableApplicationContext boot(String database) {
+        return boot(database, false);
+    }
+
+    private static ConfigurableApplicationContext boot(String database, boolean zeroAffectedRows) {
         // Command-line arguments, because builder properties are defaults that application.yml overrides.
-        return new SpringApplicationBuilder(SpecusServerApplication.class)
+        return new SpringApplicationBuilder(SpecusServerApplication.class, ManagementLoginAssertions.ProofConfiguration.class)
                 .web(WebApplicationType.NONE)
                 .run(
-                        "--spring.datasource.url=" + url(database),
+                        "--spring.datasource.url=" + url(database) + (zeroAffectedRows ? "&useAffectedRows=true" : ""),
                         "--spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver",
                         "--spring.datasource.username=root",
+                        // Concurrent caller transactions need separate connections, not SQLite's
+                        // default single-connection pool. Leave the other schema fixtures unchanged.
+                        "--spring.datasource.hikari.maximum-pool-size=" + (zeroAffectedRows ? 4 : 1),
                         "--spring.jpa.database-platform=org.hibernate.dialect.MySQLDialect",
                         "--spring.jpa.hibernate.ddl-auto=update",
                         // A create table that fails would otherwise only be logged.

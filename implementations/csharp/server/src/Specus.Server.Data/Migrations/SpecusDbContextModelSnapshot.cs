@@ -357,6 +357,95 @@ namespace Specus.Server.Data.Migrations
                     b.ToTable("specus_client_identity", (string)null);
                 });
 
+            modelBuilder.Entity("Specus.Server.Data.Entities.ClientOwnerTransferAudit", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<string>("Actor")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("actor");
+
+                    b.Property<long?>("CredentialId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("credential_id");
+
+                    b.Property<string>("DetailJson")
+                        .IsRequired()
+                        .HasColumnType("TEXT")
+                        .HasColumnName("detail_json");
+
+                    b.Property<string>("OccurredAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("occurred_at");
+
+                    b.Property<long>("PathId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("path_id");
+
+                    b.Property<string>("Scope")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("scope");
+
+                    b.Property<string>("TargetUsername")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("target_username");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "Id")
+                        .HasDatabaseName("idx_owner_transfer_audit_tenant");
+
+                    b.ToTable("client_owner_transfer_audit", (string)null);
+                });
+
+            modelBuilder.Entity("Specus.Server.Data.Entities.ClientOwnerTransferReceipt", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("id");
+
+                    b.Property<long>("EventId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("event_id");
+
+                    b.Property<string>("NodeId")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("node_id");
+
+                    b.Property<string>("ProcessedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("processed_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NodeId", "EventId")
+                        .IsUnique()
+                        .HasDatabaseName("idx_owner_transfer_receipt_node_event");
+
+                    b.ToTable("client_owner_transfer_receipt", (string)null);
+                });
+
             modelBuilder.Entity("Specus.Server.Data.Entities.ClientSession", b =>
                 {
                     b.Property<long>("Id")
@@ -1347,7 +1436,7 @@ namespace Specus.Server.Data.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
+                        .HasMaxLength(256)
                         .HasColumnType("TEXT")
                         .HasColumnName("password_hash");
 
@@ -1429,7 +1518,7 @@ namespace Specus.Server.Data.Migrations
 
                     b.Property<string>("PasswordHash")
                         .IsRequired()
-                        .HasMaxLength(64)
+                        .HasMaxLength(256)
                         .HasColumnType("TEXT")
                         .HasColumnName("password_hash");
 

@@ -74,11 +74,15 @@ func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
 
 // InsertClient persists a new client account (id is caller-assigned).
 func (db *DB) InsertClient(ctx context.Context, account ClientAccount) error {
+	return db.insertClientOn(ctx, db.sql, account)
+}
+
+func (db *DB) insertClientOn(ctx context.Context, runner sqlRunner, account ClientAccount) error {
 	query := db.rebind(`INSERT INTO specus_client_account
 		(id, tenant_id, owner_username, client_name, password_hash, enabled,
 		 connection_rate_limit_per_minute, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, account.ID, defaultTenant(account.TenantID),
+	_, err := runner.ExecContext(ctx, query, account.ID, defaultTenant(account.TenantID),
 		defaultOwner(account.OwnerUsername), account.ClientName, account.PasswordHash,
 		boolToInt(account.Enabled), account.ConnectionRateLimitPerMinute,
 		formatTime(account.CreatedAt), formatTime(account.UpdatedAt))
@@ -119,6 +123,10 @@ func (db *DB) updateClientAndRenameReferences(ctx context.Context, tx sqlRunner,
 		formatTime(account.UpdatedAt), account.ID); err != nil {
 		return err
 	}
+	return db.renameClientReferencesOn(ctx, tx, account, oldName)
+}
+
+func (db *DB) renameClientReferencesOn(ctx context.Context, tx sqlRunner, account ClientAccount, oldName string) error {
 	if account.ClientName != oldName {
 		updates := []struct {
 			query string
@@ -134,7 +142,10 @@ func (db *DB) updateClientAndRenameReferences(ctx context.Context, tx sqlRunner,
 			{`UPDATE specus_resource_traffic_usage SET client_name = ? WHERE client_id = ?`, []any{account.ClientName, account.ID}},
 		}
 		for _, update := range updates {
-			if _, err := tx.ExecContext(ctx, db.rebind(update.query), update.args...); err != nil {
+			// A corrupt legacy reference can reuse this client ID in another tenant. Names
+			// there aren't ours to rewrite; every mutable denormalized reference is scoped.
+			args := append(update.args, defaultTenant(account.TenantID))
+			if _, err := tx.ExecContext(ctx, db.rebind(update.query+` AND COALESCE(tenant_id, 'default') = ?`), args...); err != nil {
 				return err
 			}
 		}
@@ -151,6 +162,9 @@ func (db *DB) DeleteClient(ctx context.Context, id int64) error {
 	}
 	defer tx.Rollback()
 	if err := deleteClientWorkbenchReferences(ctx, db, tx, id); err != nil {
+		return err
+	}
+	if _, err := db.deleteClientPeerReferences(ctx, tx, id, time.Now().UTC()); err != nil {
 		return err
 	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
@@ -201,11 +215,15 @@ func (db *DB) GetCredential(ctx context.Context, id int64) (*ClientCredential, e
 }
 
 func (db *DB) InsertCredential(ctx context.Context, credential ClientCredential) error {
+	return db.insertCredentialOn(ctx, db.sql, credential)
+}
+
+func (db *DB) insertCredentialOn(ctx context.Context, runner sqlRunner, credential ClientCredential) error {
 	query := db.rebind(`INSERT INTO specus_client_credential
 		(id, tenant_id, owner_username, api_key, secret_hash, enabled,
 		 max_online_instances, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, credential.ID, defaultTenant(credential.TenantID),
+	_, err := runner.ExecContext(ctx, query, credential.ID, defaultTenant(credential.TenantID),
 		defaultOwner(credential.OwnerUsername), credential.APIKey, credential.SecretHash,
 		boolToInt(credential.Enabled), credential.MaxOnlineInstances,
 		formatTime(credential.CreatedAt), formatTime(credential.UpdatedAt))

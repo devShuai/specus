@@ -681,15 +681,17 @@ static char *read_file(const char *path)
  * connection closed or nothing came in time. NAT_CONTROL frames that came before the answer are
  * added to *nat_controls, the first one's JSON kept in *first_nat_json, and *peer_config is set when
  * a Peer Mesh peer-config came. The server writes a push before it answers a later heartbeat, so a
- * round after a management call sees whatever that call sent.
+ * round after a management call sees whatever that call sent. Login additionally waits for its
+ * actual peer-config within the SAME deadline: a heartbeat no longer fences queued business.
  */
-static int control_round(int fd, int *nat_controls, int *peer_config, char **first_nat_json)
+static int control_round(int fd, int *nat_controls, int *peer_config, char **first_nat_json, int require_peer_config)
 {
     st_buffer heartbeat = st_protocol_encode_empty_packet(ST_CMD_HEARTBEAT_REQUEST);
     if (send_buffer(fd, &heartbeat) != 0) {
         return -1;
     }
     long long deadline = monotonic_ms() + IO_TIMEOUT_MS;
+    int heartbeat_answered = 0;
     for (;;) {
         long long remaining = deadline - monotonic_ms();
         if (remaining <= 0) {
@@ -702,7 +704,9 @@ static int control_round(int fd, int *nat_controls, int *peer_config, char **fir
         }
         if (header.command == ST_CMD_HEARTBEAT_RESPONSE) {
             free(body);
-            return 0;
+            heartbeat_answered = 1;
+            if (!require_peer_config || *peer_config) return 0;
+            continue;
         }
         st_message_response message;
         if (header.command != ST_CMD_MESSAGE_RESPONSE
@@ -723,6 +727,7 @@ static int control_round(int fd, int *nat_controls, int *peer_config, char **fir
             free(type);
         }
         st_message_response_free(&message);
+        if (heartbeat_answered && (!require_peer_config || *peer_config)) return 0;
     }
 }
 
@@ -858,7 +863,7 @@ static int scenario_existing_oversize_nat_control(test_server *server)
             }
         }
         free(answer);
-        if (!failed && control_round(c.control, &nat_controls, &peer_config, &first_nat) != 0) {
+        if (!failed && control_round(c.control, &nat_controls, &peer_config, &first_nat, strcmp(op, "connect") == 0) != 0) {
             fprintf(stderr, "FAIL step %zu %s: the control connection is no longer served\n", i, op);
             failed = 1;
         }

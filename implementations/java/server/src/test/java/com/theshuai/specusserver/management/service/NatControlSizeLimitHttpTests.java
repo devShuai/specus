@@ -57,6 +57,7 @@ class NatControlSizeLimitHttpTests {
     @LocalServerPort private int port;
     @Autowired private NatControlService natControlService;
     @Autowired private ManagementUserService managementUserService;
+    @Autowired private com.theshuai.specusserver.management.repository.ManagementUserRepository managementUserRepository;
     @Autowired private LocalTokenService localTokenService;
     @Autowired private ClientAccountRepository clientAccountRepository;
     @Autowired private HttpRouteMappingRepository httpRouteMappingRepository;
@@ -77,7 +78,8 @@ class NatControlSizeLimitHttpTests {
         String errorContains = vector.get("errorContains").asText();
         JsonNode management = vector.get("management");
 
-        managementUserService.createUser(new ManagementContext(new TenantContext(TENANT), "nat-size-fixture", true),
+        managementUserService.createUser(com.theshuai.specusserver.management.ManagementActorFixtures.admin(
+                        managementUserRepository, TENANT, "nat-size-fixture"),
                 new ManagementUserService.UserMutation("nat-size-admin", "Nat-size-test-password-1",
                         ManagementRole.ADMIN, true));
         token = localTokenService.issueToken("nat-size-admin", TENANT, ManagementRole.ADMIN);

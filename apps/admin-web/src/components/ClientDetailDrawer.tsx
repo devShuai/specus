@@ -5,7 +5,7 @@ import type { Client, ClientDetail, Specus, HttpRoute } from "../api/types";
 import { formatBytes, formatDateTime, formatSince } from "../lib/format";
 import { notifyError, notify } from "./toast";
 
-export function ClientDetailDrawer({ client, open, onClose }: { client: Client | null; open: boolean; onClose: () => void }) {
+export function ClientDetailDrawer({ client, open, onClose, onTransfer }: { client: Client | null; open: boolean; onClose: () => void; onTransfer?: () => void }) {
   const [detail, setDetail] = useState<ClientDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const load = useCallback(async () => { if (!client) return; setLoading(true); try { setDetail(await adminApi.getClient(client.id)); } catch (e) { notifyError(e, "加载详情失败"); } finally { setLoading(false); } }, [client]);
@@ -23,6 +23,7 @@ export function ClientDetailDrawer({ client, open, onClose }: { client: Client |
         <div className="flex-1 overflow-y-auto p-4">
           {loading ? <div className="flex items-center justify-center py-12"><Spinner label="\u52A0\u8F7D\u4E2D\u2026" /></div> : detail ? (
             <div className="flex flex-col gap-5">
+              {onTransfer && <Button variant="flat" onPress={onTransfer}>转移管理归属</Button>}
               <Sec t="\u57FA\u672C\u4FE1\u606F"><F l="ID" v={String(detail.client.id)} /><F l="\u540D\u79F0" v={detail.client.clientName} /><F l="\u5F52\u5C5E" v={detail.client.ownerUsername || "-"} /><F l="\u521B\u5EFA" v={formatDateTime(detail.client.createdAt)} /></Sec>
               <Sec t="\u5728\u7EBF\u72B6\u6001">
                 <div className="flex items-center gap-2"><Chip size="sm" variant="flat" color={detail.client.online ? "success" : "default"}>{detail.client.online ? "\u5728\u7EBF" : "\u79BB\u7EBF"}</Chip><Chip size="sm" variant="flat" color={detail.client.enabled ? "success" : "default"}>{detail.client.enabled ? "\u5DF2\u542F\u7528" : "\u5DF2\u505C\u7528"}</Chip></div>

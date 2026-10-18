@@ -696,7 +696,7 @@ CREATE TABLE IF NOT EXISTS peer_mesh_egress_activity (
 
 CREATE TABLE IF NOT EXISTS peer_mesh_egress_switch (
   tenant_id TEXT NOT NULL PRIMARY KEY,
-  enabled BOOLEAN NOT NULL DEFAULT 0,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
   updated_by TEXT,
   updated_at TEXT NOT NULL
 );
@@ -792,3 +792,24 @@ CREATE TABLE IF NOT EXISTS http_access_audit (
 
 CREATE INDEX IF NOT EXISTS idx_http_access_audit_route ON http_access_audit (tenant_id, route_id, id);
 CREATE INDEX IF NOT EXISTS idx_http_access_audit_at ON http_access_audit (occurred_at);
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_audit (
+  id BIGINT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  occurred_at VARCHAR(40) NOT NULL,
+  actor VARCHAR(120) NOT NULL,
+  scope VARCHAR(32) NOT NULL,
+  path_id BIGINT NOT NULL,
+  target_username VARCHAR(120) NOT NULL,
+  credential_id BIGINT,
+  detail_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_owner_transfer_tenant_at ON client_owner_transfer_audit (tenant_id, occurred_at, id);
+
+CREATE TABLE IF NOT EXISTS client_owner_transfer_receipt (
+  id VARCHAR(200) PRIMARY KEY,
+  node_id VARCHAR(80) NOT NULL,
+  event_id BIGINT NOT NULL,
+  processed_at VARCHAR(40) NOT NULL,
+  UNIQUE (node_id, event_id)
+);

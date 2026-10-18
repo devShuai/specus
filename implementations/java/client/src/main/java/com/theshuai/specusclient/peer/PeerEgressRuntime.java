@@ -413,6 +413,13 @@ final class PeerEgressRuntime {
             return;
         }
 
+        if (flow.consumer == consumer && flow.handle instanceof TcpFlow previous
+                && previous.connection().canReopen(segment)) {
+            lock.unlock();
+            openTcpFlow(consumer, key, segment, nowMs);
+            return;
+        }
+
         try {
             if (!(flow.handle instanceof TcpFlow handle)) {
                 // The reservation exists but its connect has not returned, so there is no state
@@ -459,7 +466,7 @@ final class PeerEgressRuntime {
             lock.unlock();
             return;
         }
-        Reservation reservation = reserveTo(consumer, key, destination.address(), destination.name(), nowMs);
+        Reservation reservation = reserveTo(consumer, key, destination.address(), destination.name(), nowMs, syn);
         if (reservation.code() != null) {
             lock.unlock();
             refuse(consumer, key, reservation.code(), nowMs);
@@ -520,7 +527,8 @@ final class PeerEgressRuntime {
                 };
             }
             PeerEgressTcpConnection connection = PeerEgressTcpConnection.accept(
-                    syn, newInitialSendSequence(), mtu, flows.idleTimeoutMs(), nowMs, output, transmit);
+                    syn, flow.initialSendSequence == null ? newInitialSendSequence() : flow.initialSendSequence,
+                    mtu, flows.idleTimeoutMs(), nowMs, output, transmit);
             TcpFlow handle = new TcpFlow(connection, socket, lock.newCondition());
             flow.handle = handle;
             totalFlows++;
@@ -873,14 +881,33 @@ final class PeerEgressRuntime {
      */
     private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, String destination, String name,
             long nowMs) {
+        return reserveTo(consumer, key, destination, name, nowMs, null);
+    }
+
+    private Reservation reserveTo(long consumer, PeerEgressFlowTable.Key key, String destination, String name,
+            long nowMs, PeerEgressSegment.Segment syn) {
+        PeerEgressFlowTable.Flow previous = flows.lookup(key);
+        TcpFlow retired = previous != null && previous.consumer == consumer && previous.handle instanceof TcpFlow tcp
+                && syn != null && tcp.connection().canReopen(syn) ? tcp : null;
+        // This call will perform no I/O for an existing reservation. Its own slot must not make
+        // a racing duplicate fail the cap check and reset the connect that already owns that slot.
+        if (previous != null && retired == null) {
+            return new Reservation(previous, null, false);
+        }
         String code = authorizeTo(consumer, key, destination, name);
         if (code != null) {
             return new Reservation(null, code, false);
         }
         // Last, and only for a four-tuple with no flow yet: a refused attempt costs no token, and
         // neither does a retransmitted SYN or a frame racing the one that is opening its flow.
-        if (flows.lookup(key) == null && !flowRate.tryTake(consumer, flowRateClock.getAsLong())) {
+        if ((previous == null || retired != null) && !flowRate.tryTake(consumer, flowRateClock.getAsLong())) {
             return new Reservation(null, PeerEgressCodes.LIMIT_EXCEEDED, false);
+        }
+        Integer replacementSequence = null;
+        if (retired != null) {
+            replacementSequence = retired.connection().nextIncarnationSequence(random.nextInt());
+            flows.close(key);
+            closeHandle(retired);
         }
         PeerEgressFlowTable.Flow opened = flows.open(key, consumer, nowMs);
         if (opened == null) {
@@ -888,6 +915,7 @@ final class PeerEgressRuntime {
         }
         opened.address = destination;
         opened.name = name;
+        opened.initialSendSequence = replacementSequence;
         return new Reservation(opened, null, true);
     }
 

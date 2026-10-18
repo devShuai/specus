@@ -135,8 +135,12 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeClientAuthError(w, http.StatusBadRequest, "客户端凭证已停用")
 		return
 	}
-	account, identity, err := a.findOrCreateClientIdentity(r.Context(), *credential, request.Environment)
+	account, identity, err := a.findOrCreateClientIdentity(r.Context(), credential, request.Environment)
 	if err != nil {
+		if errors.Is(err, store.ErrClientStartupChanged) {
+			writeClientAuthError(w, http.StatusBadRequest, "客户端凭证已变更或停用，请重新认证")
+			return
+		}
 		a.failClientAuthInternal(w, "create-identity", "客户端身份创建失败", err)
 		return
 	}
@@ -167,8 +171,10 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// Every read below can fail, and a session created before them would linger in the database
 	// holding an online-instance slot while the client never receives its token. Load the
 	// configuration first, then mint the session as the last fallible step.
-	machineFingerprint := limit(strings.TrimSpace(request.Environment.MachineFingerprint), 160)
-	osUser := limit(strings.TrimSpace(request.Environment.OSUser), 120)
+	// Bind the runtime to the resolved identity, not request spelling: native
+	// database collations may resolve case variants to an existing identity.
+	machineFingerprint := identity.MachineFingerprint
+	osUser := identity.OSUser
 	if _, err := a.db.CloseHTTPAuthenticatedClientSessions(r.Context(), credential.ID,
 		machineFingerprint, osUser, auth.StatusHTTPAuthenticated, auth.StatusDisconnected, time.Now()); err != nil {
 		a.failClientAuthInternal(w, "close-stale-sessions", "清理旧客户端会话失败", err)
@@ -180,6 +186,11 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		osUser,
 		ttl)
 	a.clientAuth.SetHTTPRouteCapability(session.ID, request.Environment.ClientHTTPRouteCapabilities.Version)
+	if !a.clientAuth.BindIdentityID(session.ID, identity.ID) {
+		a.clientAuth.Discard(session.ID)
+		a.failClientAuthInternal(w, "bind-identity", "保存客户端会话身份失败", errors.New("runtime identity binding failed"))
+		return
+	}
 	now := time.Now()
 	if err := a.db.InsertClientSession(r.Context(), store.ClientSession{
 		ID:                          session.ID,
@@ -278,29 +289,13 @@ func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthL
 	return credential, nil
 }
 
-func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.ClientCredential,
+func (a *App) findOrCreateClientIdentity(ctx context.Context, credential *store.ClientCredential,
 	environment clientEnvironmentInfo) (*store.ClientAccount, *store.ClientIdentity, error) {
 	machine := limit(strings.TrimSpace(environment.MachineFingerprint), 160)
 	osUser := limit(strings.TrimSpace(environment.OSUser), 120)
 	hostname := limit(firstText(environment.Hostname, "unknown-host"), 160)
-	identity, err := a.db.FindIdentity(ctx, credential.ID, machine, osUser)
-	if err != nil {
-		return nil, nil, err
-	}
-	if identity != nil {
-		_ = a.db.UpdateIdentityLastSeen(ctx, identity.ID, hostname, time.Now())
-		account, err := a.db.GetClient(ctx, identity.ClientID)
-		if err != nil {
-			return nil, nil, err
-		}
-		return account, identity, nil
-	}
-
 	now := time.Now()
-	clientName, err := a.generateClientName(ctx, credential, machine, osUser, hostname)
-	if err != nil {
-		return nil, nil, err
-	}
+	clientName := startupClientName(*credential, machine, osUser, hostname)
 	account := store.ClientAccount{
 		ID:                           auth.NewClientID(),
 		TenantID:                     firstText(credential.TenantID, "default"),
@@ -312,7 +307,7 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		CreatedAt:                    now,
 		UpdatedAt:                    now,
 	}
-	identity = &store.ClientIdentity{
+	identity := store.ClientIdentity{
 		ID:                 auth.NewClientID(),
 		TenantID:           account.TenantID,
 		CredentialID:       credential.ID,
@@ -324,32 +319,20 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		FirstSeenAt:        now,
 		LastSeenAt:         now,
 	}
-	// One transaction: an account without its identity row could never be matched on the next
-	// login, yet would keep its name reserved and appear in the management UI.
-	if err := a.db.InsertClientWithIdentity(ctx, account, *identity); err != nil {
+	current, resolvedAccount, resolvedIdentity, err := a.db.ResolveClientStartup(ctx, *credential, account, identity)
+	if err != nil {
 		return nil, nil, err
 	}
-	return &account, identity, nil
+	// Use the locked, current online limit in the response, not the authentication snapshot.
+	*credential = *current
+	return resolvedAccount, resolvedIdentity, nil
 }
 
-func (a *App) generateClientName(ctx context.Context, credential store.ClientCredential,
-	machineFingerprint, osUser, hostname string) (string, error) {
+func startupClientName(credential store.ClientCredential, machineFingerprint, osUser, hostname string) string {
 	host := slug(hostname, "client")
 	user := slug(osUser, "user")
 	sum := sha256.Sum256([]byte(strconv.FormatInt(credential.ID, 10) + "\n" + machineFingerprint + "\n" + osUser))
-	base := limit(host+"-"+user+"-"+hex.EncodeToString(sum[:])[:8], 120)
-	candidate := base
-	for i := 2; ; i++ {
-		existing, err := a.db.FindClientByName(ctx, candidate)
-		if err != nil {
-			return "", err
-		}
-		if existing == nil {
-			return candidate, nil
-		}
-		extra := "-" + strconv.Itoa(i)
-		candidate = limit(base, 120-len(extra)) + extra
-	}
+	return limit(host+"-"+user+"-"+hex.EncodeToString(sum[:])[:8], 120)
 }
 
 func firstText(values ...string) string {

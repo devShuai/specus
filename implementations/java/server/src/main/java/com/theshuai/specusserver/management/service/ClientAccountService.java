@@ -13,12 +13,15 @@ import com.theshuai.specusserver.management.repository.HttpRouteMappingRepositor
 import com.theshuai.specusserver.management.repository.TrafficTotal;
 import com.theshuai.specusserver.management.repository.TrafficUsageRepository;
 import com.theshuai.specusserver.management.security.ManagementContext;
+import com.theshuai.specusserver.management.security.ManagementWriteAuthority;
 import com.theshuai.specusserver.management.tenant.TenantContext;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
@@ -26,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -53,6 +57,8 @@ public class ClientAccountService {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final HttpShareService httpShareService;
     private final WorkbenchReferences workbenchReferences;
+    private final ClientPeerReferences clientPeerReferences;
+    private final ManagementWriteAuthority authority;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
@@ -60,7 +66,9 @@ public class ClientAccountService {
                                 ClientNameReferenceRepository clientNameReferenceRepository,
                                 HttpRouteMappingRepository httpRouteMappingRepository,
                                 HttpShareService httpShareService,
-                                WorkbenchReferences workbenchReferences) {
+                                WorkbenchReferences workbenchReferences,
+                                ClientPeerReferences clientPeerReferences,
+                                ManagementWriteAuthority authority) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
@@ -68,6 +76,8 @@ public class ClientAccountService {
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.httpShareService = httpShareService;
         this.workbenchReferences = workbenchReferences;
+        this.clientPeerReferences = clientPeerReferences;
+        this.authority = authority;
     }
 
     @Transactional(readOnly = true)
@@ -105,6 +115,7 @@ public class ClientAccountService {
 
     @Transactional
     public ClientResult createClient(TenantContext tenant, ClientMutation request) {
+        authority.reserveWriter();
         String clientName = requireClientName(request.clientName());
         clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
             throw new IllegalArgumentException("clientName " + clientName + " 已存在");
@@ -121,11 +132,14 @@ public class ClientAccountService {
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
         invalidateNameCache(account.getClientName());
-        return new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        ClientResult result = new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        afterCommit(account.getClientName(), account.getClientName(), null);
+        return result;
     }
 
     @Transactional
     public ClientResult createClient(ManagementContext context, ClientMutation request) {
+        context = authority.current(context);
         String clientName = requireClientName(request.clientName());
         clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
             throw new IllegalArgumentException("clientName " + clientName + " 已存在");
@@ -143,7 +157,9 @@ public class ClientAccountService {
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
         invalidateNameCache(account.getClientName());
-        return new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        ClientResult result = new ClientResult(toView(clientAccountRepository.save(account), null, null));
+        afterCommit(account.getClientName(), account.getClientName(), null);
+        return result;
     }
 
     @Transactional
@@ -153,13 +169,14 @@ public class ClientAccountService {
 
     @Transactional
     public ClientResult updateClient(TenantContext tenant, long id, ClientMutation request) {
-        ClientAccount account = findClientById(tenant, id);
+        ClientAccount account = lockClient(tenant, id);
         return updateClient(tenant, account, request, null);
     }
 
     @Transactional
     public ClientResult updateClient(ManagementContext context, long id, ClientMutation request) {
-        ClientAccount account = findClientById(context, id);
+        context = authority.current(context);
+        ClientAccount account = lockClient(context, id);
         return updateClient(context.tenant(), account, request, context.username());
     }
 
@@ -214,7 +231,9 @@ public class ClientAccountService {
             DisconnectReason reason = !account.isEnabled()
                     ? DisconnectReason.ADMIN_DISABLED
                     : DisconnectReason.ADMIN_RENAMED;
-            closeOnlineChannel(originalClientName, reason);
+            afterCommit(originalClientName, account.getClientName(), reason);
+        } else {
+            afterCommit(originalClientName, account.getClientName(), null);
         }
         TrafficTotal total = trafficUsageRepository
                 .sumBytesByTenantIdAndClientId(tenant.tenantId(), account.getId())
@@ -229,13 +248,14 @@ public class ClientAccountService {
 
     @Transactional
     public void deleteClient(TenantContext tenant, long id) {
-        ClientAccount account = findClientById(tenant, id);
+        ClientAccount account = lockClient(tenant, id);
         deleteClient(account, null);
     }
 
     @Transactional
     public void deleteClient(ManagementContext context, long id) {
-        ClientAccount account = findClientById(context, id);
+        context = authority.current(context);
+        ClientAccount account = lockClient(context, id);
         deleteClient(account, context.username());
     }
 
@@ -247,13 +267,36 @@ public class ClientAccountService {
         // Every identity's workbench reference to the client's services goes in this transaction,
         // looked up by client id while the route rows still exist.
         workbenchReferences.forgetClientServices(account.getId());
+        clientPeerReferences.forgetClient(account);
         List<HttpRouteMapping> routes = httpRouteMappingRepository.findByClientIdOrderByIdDesc(account.getId());
         httpShareService.onClientDeleted(actor, routes);
         httpRouteMappingRepository.deleteAll(routes);
         httpRouteMappingRepository.flush();
-        closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
-        invalidateNameCache(account.getClientName());
         clientAccountRepository.delete(account);
+        // A failed delete must not disconnect a client that still exists after rollback.
+        afterCommit(account.getClientName(), account.getClientName(), DisconnectReason.ADMIN_DELETED);
+    }
+
+    private ClientAccount lockClient(TenantContext tenant, long id) {
+        return clientAccountRepository.lockCurrent(id, tenant.tenantId())
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
+    }
+
+    private ClientAccount lockClient(ManagementContext context, long id) {
+        ClientAccount account = lockClient(context.tenant(), id);
+        if (!context.isAdmin() && !context.username().equals(account.getOwnerUsername()))
+            throw new IllegalArgumentException("client not found: " + id);
+        return account;
+    }
+
+    private void afterCommit(String oldName, String newName, DisconnectReason reason) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() {
+                invalidateNameCache(oldName);
+                invalidateNameCache(newName);
+                if (reason != null) closeOnlineChannel(oldName, reason);
+            }
+        });
     }
 
     @Transactional(readOnly = true)
@@ -263,13 +306,15 @@ public class ClientAccountService {
         }
         // S1.3 60 秒 TTL 名称缓存。trafficUsageService.flushCounter() 每 5 秒为每个活跃
         // 客户端调一次本方法，加缓存后稳定状态下 DB 查询量降到 ~1/12。
+        long generation = nameCacheGeneration.get();
         CachedClient cached = nameCache.get(clientName);
         long now = System.currentTimeMillis();
-        if (cached != null && cached.expiresAtMillis > now) {
+        if (cached != null && cached.generation == generation && cached.expiresAtMillis > now) {
             return Optional.ofNullable(cached.account);
         }
         Optional<ClientAccount> fresh = clientAccountRepository.findByClientName(clientName);
-        nameCache.put(clientName, new CachedClient(fresh.orElse(null), now + NAME_CACHE_TTL_MILLIS));
+        if (generation == nameCacheGeneration.get())
+            nameCache.put(clientName, new CachedClient(fresh.orElse(null), now + NAME_CACHE_TTL_MILLIS, generation));
         return fresh;
     }
 
@@ -281,10 +326,21 @@ public class ClientAccountService {
     }
 
     /** 60s TTL 缓存条目；过期则从 DB 重读。 */
-    private record CachedClient(ClientAccount account, long expiresAtMillis) {}
+    private record CachedClient(ClientAccount account, long expiresAtMillis, long generation) {}
+
+    /** Committed ownership invalidation, including another server's journal event. An older
+     * in-flight lookup cannot install a cache entry usable in the new generation. This cache
+     * remains a lookup hint, never an authorization substitute for current database guards. */
+    public void invalidateOwnershipCache() {
+        if (TransactionSynchronizationManager.isActualTransactionActive())
+            throw new IllegalStateException("ownership cache invalidation must follow commit");
+        nameCacheGeneration.incrementAndGet();
+        nameCache.clear();
+    }
 
     private static final long NAME_CACHE_TTL_MILLIS = 60_000;
     private final Map<String, CachedClient> nameCache = new ConcurrentHashMap<>();
+    private final AtomicLong nameCacheGeneration = new AtomicLong();
 
     private ClientAccount findClientById(long id) {
         return clientAccountRepository.findById(id)

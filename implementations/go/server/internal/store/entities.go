@@ -17,6 +17,8 @@ const (
 	ReasonProtocolViolation  = "PROTOCOL_VIOLATION"
 	ReasonRegisterFailed     = "REGISTER_FAILED"
 	ReasonReplacedByNewLogin = "REPLACED_BY_NEW_LOGIN"
+	ReasonAuthSourceRetired  = "AUTH_SOURCE_RETIRED"
+	ReasonSourceProcessGone  = "SOURCE_PROCESS_GONE"
 	ReasonAdminDisabled      = "ADMIN_DISABLED"
 	ReasonAdminRenamed       = "ADMIN_RENAMED"
 	ReasonAdminDeleted       = "ADMIN_DELETED"
@@ -45,6 +47,10 @@ func ReasonText(reason string) string {
 		return "注册失败"
 	case ReasonReplacedByNewLogin:
 		return "被新登录替换"
+	case ReasonAuthSourceRetired:
+		return "原控制连接已失效"
+	case ReasonSourceProcessGone:
+		return "所属服务进程退出后清理"
 	case ReasonAdminDisabled:
 		return "管理员停用账号"
 	case ReasonAdminRenamed:

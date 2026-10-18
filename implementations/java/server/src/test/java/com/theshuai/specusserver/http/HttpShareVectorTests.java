@@ -837,7 +837,7 @@ class HttpShareVectorTests {
     private ManagementContext context(String actor) {
         JsonNode user = VECTOR.get("world").get("users").get(actor);
         return new ManagementContext(new TenantContext(user.get("tenantId").asText()), actor,
-                "ADMIN".equals(user.get("role").asText()));
+                "ADMIN".equals(user.get("role").asText()), "account-" + actor);
     }
 
     private String bearer(String username) {

@@ -53,6 +53,24 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 - `mac-utun` / `utun` / `macos-utun` / `darwin-utun`：macOS 使用内核 utun；Java、Go、.NET 客户端均提供实验性实现。
 - `auto`：Java、Go、.NET 客户端按系统选择 Linux TUN、Windows Wintun 或 macOS utun；不支持的平台回退 `noop`。
 
+## 客户端删除与管理归属
+
+删除客户端必须在同一事务中清理同租户 Peer 设备、以它为任一端点的 ACL、它发布的共享服务与出口策略，
+并从其他服务/出口的显式允许列表移除该 ID 的所有重复项。其他租户的同 ID 引用不受影响。
+关闭涉及它的未结束 Peer session，但保留历史、原有关闭时刻与流量计数；没有设备行也不能遗漏 session。
+相关工作台引用随服务删除，不能再收藏已不存在的服务。
+
+服务的存储字段 `allowed_client_ids` 为空表示不额外限制基础 Peer ACL 范围；删除最后一个显式接收设备时，
+必须关闭该 ACL 可见服务，不能把「只允许该设备」变成「允许整个基础 ACL 范围」。原本为空的列表与 OWNER
+可见服务不因此关闭。出口的空消费列表则拒绝所有设备，清空后不能被解释成通配放行。
+这与下发客户端的 `allowedPeerVirtualIps=[]` 一律拒绝全部的规则不是同一种字段语义。
+
+只在提交之后清理运行时缓存、撤销会话、撤下目录并向存活设备重发配置；回滚时数据库和在用连接均保留。
+四端重放 [`client-peer-deletion-v1.json`](../test-vectors/client-peer-deletion-v1.json) 的完整清理与晚期失败回滚场景。
+
+管理归属转移另见 [`client-owner-transfer.md`](client-owner-transfer.md)（待实现草案）：共享凭证下单设备转移
+拒绝，整组必须显式确认；首期保留设备接入能力，但所有者变化后的管理与 Peer 权限按当前状态重新判定。
+
 ## 设备与虚拟 IP
 
 服务端开启 Peer Mesh 后，客户端 HTTP 登录时会调用 `PeerMeshService.ensureDevice`：
@@ -326,6 +344,11 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
 ```
 
 服务端标记 session 为 `CLOSED`，并向双方在线客户端转发 close 信令。
+
+客户端按 `sessionId` 匹配当前会话，并仅释放该会话对应的出口连接；不依赖可选的
+`sourceClientId` / `targetClientId` 来选择关闭对象。缺失、非正数或不匹配当前会话的 ID
+不产生清理副作用。重复或延迟到达的 close 不得关闭同一对端后来建立的新会话及其连接。
+跨语言控制消息与出口连接生命周期回归见 `protocol/test-vectors/peer-session-close-v1.json`。
 
 ## 本地服务发现（默认关闭）
 

@@ -1,6 +1,7 @@
 package com.theshuai.specusserver.management.controller;
 
 import com.theshuai.specusserver.management.service.AccountStillOwnsResourcesException;
+import com.theshuai.specusserver.management.service.ClientOwnerTransferException;
 import com.theshuai.specusserver.management.service.RateLimitedException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -25,6 +26,12 @@ import java.util.Map;
  */
 @RestControllerAdvice(basePackages = "com.theshuai.specusserver.management.controller")
 public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ClientOwnerTransferException.class)
+    public ResponseEntity<Map<String, String>> handleOwnerTransfer(ClientOwnerTransferException exception) {
+        return ResponseEntity.status(exception.status()).cacheControl(org.springframework.http.CacheControl.noStore())
+                .body(Map.of("error", exception.getMessage(), "code", exception.code()));
+    }
 
     @ExceptionHandler(ResponseStatusException.class)
     public ResponseEntity<Map<String, String>> handleResponseStatus(ResponseStatusException exception) {

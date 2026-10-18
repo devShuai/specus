@@ -32,6 +32,12 @@ public static class AdminApiEndpoints
             {
                 await next().ConfigureAwait(false);
             }
+            catch (ClientOwnerTransferException ex) when (IsAdminSurface(context.Request.Path))
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                context.Response.StatusCode = ex.Status;
+                await context.Response.WriteAsJsonAsync(new { error = ex.Code, code = ex.Code }).ConfigureAwait(false);
+            }
             catch (RateLimitedException ex) when (IsAdminSurface(context.Request.Path))
             {
                 context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
@@ -493,6 +499,25 @@ public static class AdminApiEndpoints
                 await service.DeleteAsync(ManagementContext.From(context, authOptions.Value), id,
                     cancellationToken).ConfigureAwait(false);
                 return Results.NoContent();
+            });
+
+        app.MapOwnerTransferWrites();
+        app.MapGet("/api/admin/clients/{id}/owner-transfer",
+            async (HttpContext context, string id, IOptions<AuthOptions> authOptions,
+                ClientOwnerTransferService service, CancellationToken cancellationToken) =>
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                return await service.PreviewClientAsync(ManagementContext.From(context, authOptions.Value), id,
+                    cancellationToken).ConfigureAwait(false);
+            });
+
+        app.MapGet("/api/admin/client-credentials/{id}/owner-transfer",
+            async (HttpContext context, string id, IOptions<AuthOptions> authOptions,
+                ClientOwnerTransferService service, CancellationToken cancellationToken) =>
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                return await service.PreviewCredentialAsync(ManagementContext.From(context, authOptions.Value), id,
+                    cancellationToken).ConfigureAwait(false);
             });
 
         app.MapGet("/api/admin/clients/{id:long}",

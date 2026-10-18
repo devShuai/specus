@@ -83,22 +83,9 @@ public class ConnectionRecordService {
             return;
         }
         DisconnectReason effective = reason == null ? DisconnectReason.UNKNOWN : reason;
-        connectionRecordRepository.findById(connectionRecordId).ifPresent(record -> {
-            boolean dirty = false;
-            if (record.getDisconnectedAt() == null) {
-                record.setDisconnectedAt(Instant.now().toString());
-                dirty = true;
-            }
-            if (record.getDisconnectReason() == null) {
-                record.setDisconnectReason(effective.name());
-                dirty = true;
-            }
-            if (dirty) {
-                ConnectionRecord saved = connectionRecordRepository.save(record);
-                events.publishEvent(ConnectionEvent.updated(
-                        TenantContext.normalize(saved.getTenantId()), toView(saved)));
-            }
-        });
+        connectionRecordRepository.disconnectCurrent(connectionRecordId, Instant.now().toString(), effective.name())
+                .ifPresent(current -> events.publishEvent(ConnectionEvent.updated(
+                        TenantContext.normalize(current.getTenantId()), toView(current))));
     }
 
     /**

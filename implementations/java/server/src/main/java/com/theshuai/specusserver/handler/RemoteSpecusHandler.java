@@ -46,7 +46,7 @@ public class RemoteSpecusHandler extends NatCommonHandler {
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
         super.channelActive(ctx);
         ChannelHandlerContext controlCtx = specusHandler.getCtx();
-        if (controlCtx == null || !controlCtx.channel().isActive()) {
+        if (controlCtx == null || !specusHandler.ownsExternalChannel(streamId,ctx.channel())) {
             ctx.close();
             return;
         }
@@ -80,7 +80,7 @@ public class RemoteSpecusHandler extends NatCommonHandler {
             return;
         }
         closeState.reset();
-        if (controlCtx != null && controlCtx.channel().isActive()) {
+        if (controlCtx != null && specusHandler.isActiveData()) {
             StreamFlowController.get(controlCtx.channel()).reset(
                     streamId, 9, "external TCP channel closed before FIN");
         } else if (controlCtx != null) {
@@ -96,7 +96,7 @@ public class RemoteSpecusHandler extends NatCommonHandler {
             return;
         }
         ChannelHandlerContext controlCtx = specusHandler.getCtx();
-        if (controlCtx == null || !controlCtx.channel().isActive()) {
+        if (controlCtx == null || !specusHandler.ownsExternalChannel(streamId,ctx.channel())) {
             closeState.reset();
             ctx.close();
             return;
@@ -135,6 +135,7 @@ public class RemoteSpecusHandler extends NatCommonHandler {
             return;
         }
         execute(externalCtx, () -> {
+            if(!specusHandler.ownsExternalChannel(streamId,externalCtx.channel())) {externalCtx.close();return;}
             if (!closeState.canReceiveRemoteData()) {
                 protocolViolation(externalCtx, "client TCP DATA after FIN");
                 return;
@@ -191,7 +192,7 @@ public class RemoteSpecusHandler extends NatCommonHandler {
             return;
         }
         ChannelHandlerContext controlCtx = specusHandler.getCtx();
-        if (controlCtx == null || !controlCtx.channel().isActive()) {
+        if (controlCtx == null || !specusHandler.ownsExternalChannel(streamId,externalCtx.channel())) {
             closeState.reset();
             externalCtx.close();
             return;
@@ -208,6 +209,7 @@ public class RemoteSpecusHandler extends NatCommonHandler {
     }
 
     private void receiveClientFinOnEventLoop(ChannelHandlerContext externalCtx) {
+        if(!specusHandler.ownsExternalChannel(streamId,externalCtx.channel())) {externalCtx.close();return;}
         TcpHalfCloseState.Transition transition = closeState.receiveRemoteFin();
         if (transition == TcpHalfCloseState.Transition.DUPLICATE) {
             protocolViolation(externalCtx, "duplicate client TCP FIN");

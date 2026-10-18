@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 
@@ -19,6 +21,7 @@ public sealed class MultiProviderModelTests
         "product_metrics_onboarding_daily",
         "product_metrics_transfer_daily",
         "specus_client_account",
+        "client_owner_transfer_audit",
         "specus_connection_record",
         "specus_mapping",
         "http_route_mapping",
@@ -60,6 +63,18 @@ public sealed class MultiProviderModelTests
         // i.e. someone changed the model but forgot to add a migration.
         Assert.False(context.Database.HasPendingModelChanges(),
             $"model differs from the committed migrations for provider '{provider}'");
+    }
+
+    [Theory]
+    [MemberData(nameof(Providers))]
+    public void OwnershipAuditDowngradeRefusesBeforeGeneratingAnyDestructiveOperations(string provider)
+    {
+        using var context = CreateContext(provider);
+        var migrations = context.GetService<IMigrationsAssembly>();
+        var audit = Assert.Single(migrations.Migrations, m => m.Key.EndsWith("_AddClientOwnerTransferAudit", StringComparison.Ordinal));
+        var migration = migrations.CreateMigration(audit.Value, context.Database.ProviderName!);
+        var error = Assert.Throws<NotSupportedException>(() => migration.DownOperations);
+        Assert.Contains("audit history", error.Message, StringComparison.Ordinal);
     }
 
     [Theory]

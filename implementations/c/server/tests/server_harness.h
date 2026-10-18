@@ -18,7 +18,7 @@
 #define ADMIN_PASSWORD "lifecycle-e2e-password-2026"
 #define ADMIN_JWT_SECRET "lifecycle-e2e-jwt-secret-that-is-long-and-random-2026"
 #define IO_TIMEOUT_MS 5000
-#define MAX_EXTRA_ENV 4
+#define MAX_EXTRA_ENV 8
 
 typedef struct {
     pid_t pid;
@@ -56,6 +56,9 @@ void sleep_ms(int ms);
 
 /* Sockets */
 int pick_free_port(void);
+/* Bind both candidates simultaneously so the OS cannot hand out the first twice.
+ * Releases them before return; this is not a reservation against another process. */
+int pick_free_port_pair(int *first, int *second);
 int connect_local(int port);
 int send_all(int fd, const uint8_t *data, size_t len);
 /* 1 = filled, 0 = orderly EOF or reset, -1 = error, -2 = timed out. */
@@ -124,6 +127,8 @@ int db_scalar(const char *db_path, const char *sql, const char *text_arg, long l
 void dump_server_log(const test_server *server);
 int server_prepare(test_server *server);
 int server_start(test_server *server);
+/* For the deterministic accept/crypto/drain test: readiness must not create another CONTROL. */
+int server_start_without_control_probe(test_server *server);
 /* Sends SIGTERM and waits for the exit; returns the exit status, or -1 if it had to be killed. */
 int server_stop(test_server *server, int timeout_ms);
 void server_cleanup(test_server *server, int failed);

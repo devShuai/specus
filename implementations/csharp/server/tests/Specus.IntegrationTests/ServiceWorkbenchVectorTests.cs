@@ -1,9 +1,12 @@
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Specus.Server.Configuration;
 using Specus.Server.Authentication;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
@@ -293,7 +296,7 @@ public sealed class ServiceWorkbenchVectorTests
                 {
                     var kind = step.GetProperty("kind").GetString()!;
                     var id = step.GetProperty("id").GetInt64();
-                    var admin = TenantAdmin(_objectTenants[(kind, id)]);
+                    var admin = await TenantAdminAsync(_objectTenants[(kind, id)], services);
                     switch (kind)
                     {
                         case WorkbenchKinds.HttpRoute:
@@ -323,7 +326,7 @@ public sealed class ServiceWorkbenchVectorTests
                 case "set-admin":
                 {
                     var (tenant, username) = Identity(step);
-                    await services.GetRequiredService<ManagementUserService>().UpdateUserAsync(TenantAdmin(tenant),
+                    await services.GetRequiredService<ManagementUserService>().UpdateUserAsync(await TenantAdminAsync(tenant, services),
                         username, new UserMutation(null, null, step.GetProperty("admin").GetBoolean() ? "ADMIN" : "USER",
                             null), CancellationToken.None);
                     break;
@@ -332,7 +335,7 @@ public sealed class ServiceWorkbenchVectorTests
                 {
                     var (tenant, username) = Identity(step);
                     // The token issued before the deletion is kept: later steps replay it.
-                    await services.GetRequiredService<ManagementUserService>().DeleteUserAsync(TenantAdmin(tenant),
+                    await services.GetRequiredService<ManagementUserService>().DeleteUserAsync(await TenantAdminAsync(tenant, services),
                         username, CancellationToken.None);
                     break;
                 }
@@ -340,7 +343,7 @@ public sealed class ServiceWorkbenchVectorTests
                 {
                     var (tenant, username) = Identity(step);
                     var admin = step.TryGetProperty("admin", out var flag) && flag.GetBoolean();
-                    await services.GetRequiredService<ManagementUserService>().CreateUserAsync(TenantAdmin(tenant),
+                    await services.GetRequiredService<ManagementUserService>().CreateUserAsync(await TenantAdminAsync(tenant, services),
                         new UserMutation(username, "vector-password", admin ? "ADMIN" : "USER", true),
                         CancellationToken.None);
                     IssueToken(tenant, username);
@@ -401,8 +404,23 @@ public sealed class ServiceWorkbenchVectorTests
         /// take the context the admin layer would have resolved; the vector's own identities are not
         /// used, so none of them gains rows or rights from it.
         /// </summary>
-        private static ManagementContext TenantAdmin(string tenant) =>
-            new(tenant, "vector-fixture-admin", ManagementRole.Admin, BuiltInAdmin: false);
+        private async Task<ManagementContext> TenantAdminAsync(string tenant, IServiceProvider services)
+        {
+            var key = "vector-fixture-admin:" + tenant;
+            await using (var scope = _server.HostServices.CreateAsyncScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<SpecusDbContext>();
+                if (!await db.ManagementUsers.AnyAsync(u => u.Username == key))
+                {
+                    db.ManagementUsers.Add(new ManagementUser { Username = key, LoginName = "vector-fixture-admin", TenantId = tenant, Role = ManagementRole.Admin, Enabled = true });
+                    await db.SaveChangesAsync();
+                }
+            }
+            var token = services.GetRequiredService<LocalTokenService>().IssueToken("vector-fixture-admin", tenant, ManagementRole.Admin, key);
+            var principal = await services.GetRequiredService<AdminBearerTokenValidator>().ValidateAsync(token);
+            Assert.NotNull(principal);
+            return ManagementContext.From(new DefaultHttpContext { User = principal }, services.GetRequiredService<IOptions<AuthOptions>>().Value);
+        }
 
         private async Task<ClientAccount> ClientOfAsync(SpecusDbContext db, string tenant, string owner)
         {

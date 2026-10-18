@@ -48,8 +48,10 @@ void sleep_ms(int ms)
 /* ------------------------------------------------------------------------------------------- */
 /* Sockets                                                                                       */
 
-int pick_free_port(void)
+/* Keep the socket bound until the caller has selected all of its endpoints. */
+static int reserve_free_port(int *reserved_fd)
 {
+    *reserved_fd = -1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -65,8 +67,28 @@ int pick_free_port(void)
         && getsockname(fd, (struct sockaddr *)&address, &length) == 0) {
         port = ntohs(address.sin_port);
     }
-    close(fd);
+    if (port > 0) *reserved_fd = fd;
+    else close(fd);
     return port;
+}
+
+int pick_free_port(void)
+{
+    int reserved_fd = -1;
+    int port = reserve_free_port(&reserved_fd);
+    if (reserved_fd >= 0) close(reserved_fd);
+    return port;
+}
+
+int pick_free_port_pair(int *first, int *second)
+{
+    if (first == NULL || second == NULL || first == second) return -1;
+    int first_fd = -1, second_fd = -1;
+    *first = reserve_free_port(&first_fd);
+    *second = *first > 0 ? reserve_free_port(&second_fd) : -1;
+    if (first_fd >= 0) close(first_fd);
+    if (second_fd >= 0) close(second_fd);
+    return *first > 0 && *second > 0 && *first != *second ? 0 : -1;
 }
 
 int connect_local(int port)
@@ -708,17 +730,20 @@ int server_prepare(test_server *server)
     return st_storage_init(server->db_path, 1);
 }
 
-int server_start(test_server *server)
+static int server_start_impl(test_server *server, int control_probe)
 {
-    server->control_port = pick_free_port();
-    server->admin_port = pick_free_port();
-    if (server->control_port <= 0 || server->admin_port <= 0 || server->control_port == server->admin_port) {
+    if (pick_free_port_pair(&server->control_port, &server->admin_port) != 0) {
+        fprintf(stderr, "server startup refused before fork: control_port=%d admin_port=%d reason=%s\n",
+                server->control_port, server->admin_port,
+                server->control_port == server->admin_port ? "ports-not-distinct" : "port-selection-failed");
         return -1;
     }
     fflush(stdout);
     fflush(stderr);
     pid_t pid = fork();
     if (pid < 0) {
+        fprintf(stderr, "server startup fork failed: %s (control_port=%d admin_port=%d)\n",
+                strerror(errno), server->control_port, server->admin_port);
         return -1;
     }
     if (pid == 0) {
@@ -764,9 +789,10 @@ int server_start(test_server *server)
             return -1;
         }
         int admin = connect_local(server->admin_port);
-        int control = admin < 0 ? -1 : connect_local(server->control_port);
+        int control = admin < 0 || !control_probe ? -1 : connect_local(server->control_port);
+        int admin_ready = admin >= 0;
         close_fd(&admin);
-        if (control >= 0) {
+        if (control >= 0 || (!control_probe && admin_ready)) {
             close_fd(&control);
             return 0;
         }
@@ -775,6 +801,9 @@ int server_start(test_server *server)
     fprintf(stderr, "server did not become ready\n");
     return -1;
 }
+
+int server_start(test_server *server) { return server_start_impl(server, 1); }
+int server_start_without_control_probe(test_server *server) { return server_start_impl(server, 0); }
 
 int server_stop(test_server *server, int timeout_ms)
 {
@@ -786,6 +815,9 @@ int server_stop(test_server *server, int timeout_ms)
     while (monotonic_ms() < deadline) {
         int status = 0;
         if (waitpid(server->pid, &status, WNOHANG) == server->pid) {
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                fprintf(stderr, "server shutdown pid=%ld raw_status=%d exit=%d signal=%d\n", (long)server->pid,
+                        status, WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
             server->pid = -1;
             return WIFEXITED(status) ? WEXITSTATUS(status) : 1000 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
         }
@@ -826,7 +858,12 @@ int run_on_fresh_server(const char *name, server_scenario scenario, const char *
     for (size_t i = 0; extra_env != NULL && extra_env[i] != NULL && i < MAX_EXTRA_ENV; ++i) {
         server.extra_env[i] = extra_env[i];
     }
-    int failed = server_start(&server) != 0;
+    int started = server_start(&server);
+    int failed = started != 0;
+    if (failed) {
+        fprintf(stderr, "%s: server_start=%d control_port=%d admin_port=%d pid=%ld; scenario not executed\n",
+                name, started, server.control_port, server.admin_port, (long)server.pid);
+    }
     if (!failed) {
         failed = scenario(&server) != 0;
     }

@@ -42,6 +42,9 @@ class ManagedLoginProductMetricsTests {
         ClientAuthService auth = mock(ClientAuthService.class);
         when(auth.authenticateNetty(any(), anyString(), anyString(), anyBoolean()))
                 .thenReturn(AuthenticationResult.success(account, 7L));
+        when(auth.controlClientId(anyString())).thenReturn(42L);
+        when(auth.authenticateNetty(any(), anyString(), anyString(), anyBoolean(), any()))
+                .thenReturn(AuthenticationResult.success(account, 7L));
         ProductMetricsService metrics = mock(ProductMetricsService.class);
         ExecutorService executor = Executors.newSingleThreadExecutor();
         ManagedLoginRequestHandler handler = new ManagedLoginRequestHandler(auth, mock(ConnectionRecordService.class),

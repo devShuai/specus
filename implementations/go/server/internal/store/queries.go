@@ -211,6 +211,35 @@ func (db *DB) InsertConnectionRecord(ctx context.Context, record ConnectionRecor
 	return result.LastInsertId()
 }
 
+// GetConnectionRecord reads the persisted audit snapshot, including nullable identity
+// fields. Disconnect events must not invent a new connection time or omit the client
+// ID used by current-owner subscription authorization.
+func (db *DB) GetConnectionRecord(ctx context.Context, recordID int64) (*ConnectionRecord, error) {
+	var record ConnectionRecord
+	var connectedAt string
+	var disconnectedAt sql.NullString
+	var success databaseBoolean
+	err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT id, COALESCE(tenant_id, 'default'),
+		client_id, client_name, channel_id, remote_address, connected_at, disconnected_at,
+		success, failure_reason, disconnect_reason FROM specus_connection_record WHERE id = ?`), recordID).
+		Scan(&record.ID, &record.TenantID, &record.ClientID, &record.ClientName,
+			&record.ChannelID, &record.RemoteAddress, &connectedAt, &disconnectedAt,
+			&success, &record.FailureReason, &record.DisconnectReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	record.ConnectedAt = parseTime(connectedAt)
+	if disconnectedAt.Valid {
+		when := parseTime(disconnectedAt.String)
+		record.DisconnectedAt = &when
+	}
+	record.Success = bool(success)
+	return &record, nil
+}
+
 // MarkDisconnect stamps disconnected_at/disconnect_reason on a record if not already set.
 func (db *DB) MarkDisconnect(ctx context.Context, recordID int64, reason string, when time.Time) error {
 	query := db.rebind(`UPDATE specus_connection_record

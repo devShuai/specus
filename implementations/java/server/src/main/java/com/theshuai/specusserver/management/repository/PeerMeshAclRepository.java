@@ -6,7 +6,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import java.util.List;
 import java.util.Optional;
 
-public interface PeerMeshAclRepository extends JpaRepository<PeerMeshAcl, Long> {
+public interface PeerMeshAclRepository extends JpaRepository<PeerMeshAcl, Long>, PeerMeshAclRepositoryCustom {
     Optional<PeerMeshAcl> findByTenantIdAndSourceClientIdAndTargetClientId(String tenantId, Long sourceClientId, Long targetClientId);
 
     List<PeerMeshAcl> findByTenantIdOrderByIdDesc(String tenantId);

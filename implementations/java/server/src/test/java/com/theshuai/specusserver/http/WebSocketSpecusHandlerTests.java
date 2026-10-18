@@ -6,6 +6,8 @@ import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.WebSocketSpecusFrame;
 import com.theshuai.common.session.Session;
 import com.theshuai.specusserver.session.SessionUtil;
+import com.theshuai.specusserver.handler.NatServerHandler;
+import com.theshuai.specusserver.testsupport.PairedDataFixture;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -27,8 +29,38 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.clearInvocations;
 
 class WebSocketSpecusHandlerTests {
+    @Test
+    void delayedOriginalDataCleanupLeavesANewerPhysicalWebSocketAlone() throws Exception {
+        var registry=new WebSocketStreamRegistry();var handler=new WebSocketSpecusHandler(registry,1_000);
+        var first=tunnelFixture(registry,handler,"shared-"+UUID.randomUUID());
+        var second=tunnelFixture(registry,handler,
+                (String)first.session.getAttributes().get(WebSocketSpecusHandler.ATTR_CLIENT_NAME));
+        try {
+            clearInvocations(second.session);
+            handler.onDataChannelInactive(first.control);
+            assertThat(registry.getByStreamId(second.streamId)).isSameAs(second.session);
+            verify(second.session,never()).close(any(CloseStatus.class));
+            handler.afterConnectionClosed(first.session,CloseStatus.NORMAL);
+            second.control.runPendingTasks();assertThat((Object)second.control.readOutbound()).isNull();
+        } finally {first.close();second.close();}
+    }
+
+    @Test
+    void aDifferentClientsDataCannotReadOrCloseAnotherWebSocketByGuessingItsStreamId() throws Exception {
+        var registry=new WebSocketStreamRegistry();var handler=new WebSocketSpecusHandler(registry,1_000);
+        var first=tunnelFixture(registry,handler,"client-a-"+UUID.randomUUID());
+        var second=tunnelFixture(registry,handler,"client-b-"+UUID.randomUUID());
+        try {
+            var attack=new NatMessagePacket();attack.setNatMessageType(NatMessageType.DATA);attack.setStreamId(second.streamId);
+            attack.setData(frame(WebSocketSpecusFrame.OPCODE_TEXT,true,"cross-client"));first.control.writeInbound(attack);
+            var reset=new NatMessagePacket();reset.setNatMessageType(NatMessageType.RST);reset.setStreamId(second.streamId);first.control.writeInbound(reset);
+            assertThat(second.control.isActive()).isTrue();assertThat(registry.getByStreamId(second.streamId)).isSameAs(second.session);
+            verify(second.session,never()).sendMessage(any());verify(second.session,never()).close(any(CloseStatus.class));
+        } finally {first.close();second.close();}
+    }
 
     @Test
     void rejectsNewMessageBeforeFragmentedMessageCompletes() throws Exception {
@@ -121,9 +153,14 @@ class WebSocketSpecusHandlerTests {
     private static TunnelFixture tunnelFixture(long closeTimeoutMillis) throws Exception {
         WebSocketStreamRegistry registry = new WebSocketStreamRegistry();
         WebSocketSpecusHandler handler = new WebSocketSpecusHandler(registry, closeTimeoutMillis);
-        EmbeddedChannel control = new EmbeddedChannel();
-        String clientName = "client-" + UUID.randomUUID();
-        SessionUtil.bindDataSession(new Session(clientName), control);
+        return tunnelFixture(registry,handler,"client-"+UUID.randomUUID());
+    }
+
+    private static TunnelFixture tunnelFixture(WebSocketStreamRegistry registry,WebSocketSpecusHandler handler,String clientName) throws Exception {
+        EmbeddedChannel control = new EmbeddedChannel(new NatServerHandler(
+                mock(com.theshuai.specusserver.management.service.TrafficUsageService.class),
+                mock(com.theshuai.specusserver.management.service.TrafficInspectionService.class),null,null,registry,handler));
+        PairedDataFixture pair=new PairedDataFixture(clientName,control);
 
         WebSocketSession session = mock(WebSocketSession.class);
         Map<String, Object> attributes = new HashMap<>();
@@ -136,7 +173,7 @@ class WebSocketSpecusHandlerTests {
         control.runPendingTasks();
         drain(control);
         return new TunnelFixture(handler, session, control,
-                (Integer) attributes.get(WebSocketSpecusHandler.ATTR_STREAM_ID));
+                (Integer) attributes.get(WebSocketSpecusHandler.ATTR_STREAM_ID),pair);
     }
 
     private static void drain(EmbeddedChannel channel) {
@@ -149,9 +186,10 @@ class WebSocketSpecusHandlerTests {
     }
 
     private record TunnelFixture(WebSocketSpecusHandler handler, WebSocketSession session,
-                                 EmbeddedChannel control, int streamId) {
+                                 EmbeddedChannel control, int streamId,PairedDataFixture pair) {
         void close() {
             control.finishAndReleaseAll();
+            pair.close();
         }
     }
 }

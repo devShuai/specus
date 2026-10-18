@@ -979,7 +979,7 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
             context.OnLoginSuccess(ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 clientSessionId: 1, connectionRole: ConnectionRole.Data);
             writer.Context = context;
-            registry.ReplaceData(ClientName, context);
+            SyntheticDataBinding.Bind(registry, context);
             nat.Attach(context);
             return new BoundNatSession(nat, registry, lifetime, writer, context);
         }
@@ -987,7 +987,7 @@ public sealed class DirectHttpWebSocketTests : IAsyncLifetime
         public async ValueTask DisposeAsync()
         {
             Writer.ReleasePriorityWrites();
-            _registry.Unbind(ClientName, Context);
+            SyntheticDataBinding.Unbind(_registry, Context);
             _lifetime.Cancel();
             await _nat.OnConnectionClosedAsync(Context);
             _lifetime.Dispose();

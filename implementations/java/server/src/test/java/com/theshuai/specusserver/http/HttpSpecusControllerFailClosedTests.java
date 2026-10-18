@@ -12,6 +12,7 @@ import com.theshuai.specusserver.management.service.TrafficInspectionService;
 import com.theshuai.specusserver.management.service.TrafficUsageService;
 import com.theshuai.specusserver.security.PasswordService;
 import com.theshuai.specusserver.session.SessionUtil;
+import com.theshuai.specusserver.testsupport.PairedDataFixture;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -49,6 +50,7 @@ class HttpSpecusControllerFailClosedTests {
     private final String clientName = "fail-closed-" + UUID.randomUUID();
     private ClientAccount account;
     private EmbeddedChannel dataChannel;
+    private PairedDataFixture pair;
 
     @BeforeEach
     void setUp() {
@@ -74,12 +76,13 @@ class HttpSpecusControllerFailClosedTests {
         dataChannel = new EmbeddedChannel(new NatServerHandler(
                 null, null, null, null, mock(WebSocketStreamRegistry.class), mock(WebSocketSpecusHandler.class)));
         dataChannel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
-        SessionUtil.bindDataSession(new Session(clientName), dataChannel);
+        pair=new PairedDataFixture(clientName,dataChannel);
     }
 
     @AfterEach
     void tearDown() {
         dataChannel.finishAndReleaseAll();
+        pair.close();
     }
 
     @Test

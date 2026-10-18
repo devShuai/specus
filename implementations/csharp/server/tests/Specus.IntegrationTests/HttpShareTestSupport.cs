@@ -433,17 +433,15 @@ internal sealed class ShareFakeDevice : IAsyncDisposable
     private readonly SessionRegistry _registry;
     private readonly CancellationTokenSource _lifetime;
     private readonly CapturingWriter _writer;
-    private readonly string _clientName;
 
     private ShareFakeDevice(NatServerHandler nat, SessionRegistry registry, CancellationTokenSource lifetime,
-        CapturingWriter writer, SpecusConnectionContext context, string clientName)
+        CapturingWriter writer, SpecusConnectionContext context)
     {
         _nat = nat;
         _registry = registry;
         _lifetime = lifetime;
         _writer = writer;
         Context = context;
-        _clientName = clientName;
     }
 
     public SpecusConnectionContext Context { get; }
@@ -461,9 +459,9 @@ internal sealed class ShareFakeDevice : IAsyncDisposable
             new WriteBackpressureGate(64 * 1024, 1024 * 1024));
         context.OnLoginSuccess(clientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             clientSessionId: 1, connectionRole: ConnectionRole.Data);
-        registry.ReplaceData(clientName, context);
+        SyntheticDataBinding.Bind(registry, context);
         nat.Attach(context);
-        return new ShareFakeDevice(nat, registry, lifetime, writer, context, clientName);
+        return new ShareFakeDevice(nat, registry, lifetime, writer, context);
     }
 
     public Task<NatMessagePacket> ReadAsync(Func<NatMessagePacket, bool> predicate,
@@ -511,7 +509,7 @@ internal sealed class ShareFakeDevice : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _registry.Unbind(_clientName, Context);
+        SyntheticDataBinding.Unbind(_registry, Context);
         _lifetime.Cancel();
         await _nat.OnConnectionClosedAsync(Context);
         _lifetime.Dispose();

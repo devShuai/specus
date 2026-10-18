@@ -92,9 +92,8 @@ if [[ -z "${SPECUS_CLIENT_COMMAND:-}" && ! -f "$JAVA_CLIENT_JAR" ]]; then
 fi
 
 # SPECUS_SMOKE_REUSE_BUILD=1 reuses a server an earlier run built and unit-tested.
-if [[ "${SPECUS_SMOKE_REUSE_BUILD:-}" != 1 || ! -x "$C_DIR/build/specus-server-c" ]]; then
-  make -C "$C_DIR" test
-fi
+source "$C_DIR/scripts/smoke_server.sh"
+specus_smoke_prepare_server "$C_DIR"
 
 # shellcheck source=tls_test_pki.sh
 source "$C_DIR/scripts/tls_test_pki.sh"
@@ -135,7 +134,7 @@ SPECUS_ADMIN_PORT="$ADMIN_PORT" \
 SPECUS_AUTH_USERNAME="$ADMIN_USERNAME" \
 SPECUS_AUTH_PASSWORD="$ADMIN_PASSWORD" \
 SPECUS_AUTH_JWT_SECRET="$ADMIN_JWT_SECRET" \
-stdbuf -oL -eL "$C_DIR/build/specus-server-c" >"$TMP_DIR/server.log" 2>&1 &
+stdbuf -oL -eL "$SPECUS_SMOKE_RESOLVED_SERVER" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 dump_logs() {

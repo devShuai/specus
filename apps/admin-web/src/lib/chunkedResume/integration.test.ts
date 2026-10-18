@@ -678,12 +678,31 @@ describe("chunked resume between two pages", { timeout: 30_000 }, () => {
     const [first] = peer.answers(x1.transferId);
     await receiver.controller.accept(x2);
     await eventually(() => peer.answers(x2, "file-accept").length === 1);
+    const withheldCompletion: string[] = [];
+    peer.rx.tap = (data) => {
+      if (typeof data === "string") {
+        const message = JSON.parse(data) as Json;
+        if (message.kind === "transfer-complete" && message.transferId === x2) {
+          withheldCompletion.push(data);
+          return "drop";
+        }
+      }
+      return data;
+    };
     if (first.kind === "resume-state") {
       // A sender told to go on streams X1's missing chunks on this channel.
       peer.sendContent(x1.transferId, x1.manifest, x1Bytes, first);
     }
     peer.sendContent(x2, x2Manifest, x2Bytes, peer.answers(x2, "file-accept")[0]);
     await eventually(() => receiver.completed.length === 1 || peer.inbox.some((message) => message.kind === "transfer-error"));
+    // Local completion is not delivery to the sending page. Make that ordering deterministic
+    // instead of assuming the fake channel's next timer has already delivered its final frame.
+    expect(withheldCompletion).toHaveLength(1);
+    expect(peer.answers(x2, "transfer-complete")).toEqual([]);
+    peer.rx.tap = null;
+    peer.rx.send(withheldCompletion[0]);
+    await eventually(() => (receiver.completed.length === 1 && peer.answers(x2, "transfer-complete").length === 1)
+      || peer.inbox.some((message) => message.kind === "transfer-error"));
     expect(peer.inbox.filter((message) => message.kind === "transfer-error")).toEqual([]);
     expect(first).toEqual({ kind: "resume-reject", transferId: x1.transferId, code: "BUSY" });
     expect(peer.answers(x2).map((message) => message.kind)).toContain("transfer-complete");

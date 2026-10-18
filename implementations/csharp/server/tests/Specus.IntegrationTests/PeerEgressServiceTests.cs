@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
@@ -9,11 +10,14 @@ using Specus.Protocol.Packets;
 using Specus.Protocol.PeerEgress;
 using Specus.Server.Authentication;
 using Specus.Server.Configuration;
+using Specus.Server.ControlChannel;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
+using Specus.Server.Networking;
 using Specus.Server.PeerMesh;
 using Specus.Server.Sessions;
+using Specus.Server.Security;
 
 namespace Specus.IntegrationTests;
 
@@ -775,6 +779,7 @@ public sealed class PeerEgressServiceTests
         var egress = fixture.AddClient(EgressId, "egress-owner", "office-gateway");
         fixture.AddOnlineSession(egress, 4201, egressVersion: 1);
         await fixture.SaveChangesAsync();
+        await fixture.BindAsync(egress, 4201);
 
         await fixture.Service.HandleEgressReportAsync(egress, new PeerControlMessage
         {
@@ -787,6 +792,7 @@ public sealed class PeerEgressServiceTests
             RejectedFlows = new Dictionary<string, long> { [PeerEgressCodes.DestinationDenied] = 4 },
         }, 4201, default);
 
+        fixture.Unbind(egress);
         var view = Assert.Single(await fixture.Service.ListEgressActivityAsync(fixture.Admin, default));
         Assert.Equal(EgressId, view.EgressClientId);
         Assert.Equal(18, view.ActiveFlows);
@@ -796,12 +802,14 @@ public sealed class PeerEgressServiceTests
         // whatever it last reported.
         Assert.False(view.Online);
 
+        await fixture.BindAsync(egress, 4201);
         await fixture.Service.HandleEgressReportAsync(egress, new PeerControlMessage
         {
             Type = "egress-report",
             Revision = 5,
             ActiveFlows = 1,
         }, 4201, default);
+        fixture.Unbind(egress);
         view = Assert.Single(await fixture.Service.ListEgressActivityAsync(fixture.Admin, default));
         Assert.Equal(18, view.ActiveFlows);
     }
@@ -819,6 +827,7 @@ public sealed class PeerEgressServiceTests
         fixture.AddOnlineSession(egress, 4301, egressVersion: 1);
         fixture.AddOnlineSession(other, 4302, egressVersion: 0);
         await fixture.SaveChangesAsync();
+        await fixture.BindAsync(other, 4302);
 
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.HandleEgressReportAsync(
             other, new PeerControlMessage { Type = "egress-report" }, 4301, default));
@@ -902,19 +911,25 @@ public sealed class PeerEgressServiceTests
     private sealed class EgressFixture : IAsyncDisposable
     {
         private readonly SqliteConnection _connection;
+        private readonly SessionRegistry _registry;
+        private readonly ClientAuthSessionStore _authSessions;
 
-        private EgressFixture(SqliteConnection connection, SpecusDbContext db, PeerMeshService service)
+        private EgressFixture(SqliteConnection connection, SpecusDbContext db, PeerMeshService service, ManagementContext admin,
+            SessionRegistry registry, ClientAuthSessionStore authSessions)
         {
             _connection = connection;
+            _registry = registry;
+            _authSessions = authSessions;
             Db = db;
             Service = service;
+            Admin = admin;
         }
 
         public SpecusDbContext Db { get; }
 
         public PeerMeshService Service { get; }
 
-        public ManagementContext Admin { get; } = new("default", "admin", ManagementRole.Admin, true);
+        public ManagementContext Admin { get; }
 
         public static async Task<EgressFixture> CreateAsync()
         {
@@ -924,8 +939,15 @@ public sealed class PeerEgressServiceTests
                 .UseSqlite(connection)
                 .Options);
             await db.Database.EnsureCreatedAsync();
+            var managementAuth = Options.Create(new AuthOptions { Password = "egress-fixture-private-password", JwtSecret = "egress-fixture-private-signing-key-2026" });
+            var tokens = new LocalTokenService(managementAuth);
+            var principal = tokens.Validate(tokens.IssueToken("admin"));
+            Assert.NotNull(principal);
+            var admin = ManagementContext.From(new DefaultHttpContext { User = principal }, managementAuth.Value);
+            var registry = new SessionRegistry(NullLogger<SessionRegistry>.Instance);
+            var authSessions = new ClientAuthSessionStore();
             var service = new PeerMeshService(db,
-                new SessionRegistry(NullLogger<SessionRegistry>.Instance),
+                registry,
                 Options.Create(new PeerMeshOptions
                 {
                     Enabled = true,
@@ -935,9 +957,25 @@ public sealed class PeerEgressServiceTests
                 }),
                 NullLogger<PeerMeshService>.Instance,
                 null,
-                new PeerMeshServiceState());
-            return new EgressFixture(connection, db, service);
+                new PeerMeshServiceState(), managementAuth, authSessions);
+            return new EgressFixture(connection, db, service, admin, registry, authSessions);
         }
+
+        public async Task BindAsync(ClientAccount account, long sessionId)
+        {
+            var context = new SpecusConnectionContext("egress-fixture-" + sessionId, "127.0.0.1", new Sink(), CancellationToken.None,
+                () => { }, new ReadGate(CancellationToken.None), new WriteBackpressureGate(65536, 1048576));
+            await TestBoundPeerControl.PublishAsync(Db, _authSessions, account, context, sessionId);
+            _registry.Replace(account.ClientName, context);
+        }
+
+        public void Unbind(ClientAccount account)
+        {
+            if (_registry.Find(account.ClientName) is { } context) _registry.Unbind(account.ClientName, context);
+        }
+
+        private sealed class Sink : IFrameWriter
+        { public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default) => ValueTask.CompletedTask; }
 
         public ClientAccount AddClient(long id, string owner, string clientName)
         {

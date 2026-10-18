@@ -64,6 +64,9 @@ type egressFlow struct {
 	// table stores it so that everything needed to tear a flow down travels with the entry that
 	// authorises it, and never reads it.
 	Handle any
+
+	// Chosen under the reservation lock for a TIME_WAIT replacement, never by a racing SYN.
+	initialSendSequence *uint32
 }
 
 // dialled is the address the flow's socket goes to.

@@ -6,6 +6,7 @@ using Specus.Server.Authentication;
 using Specus.Server.Configuration;
 using Specus.Server.Data;
 using Specus.Server.Data.Entities;
+using Specus.Server.Persistence;
 using Specus.Server.WebSockets;
 
 namespace Specus.Server.Management;
@@ -408,6 +409,11 @@ public sealed class ManagementUserService
         {
             throw new ArgumentException("内置 admin 用户不能重复创建");
         }
+        RequireCleanUserWriteScope();
+        await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, cancellationToken)
+            .ConfigureAwait(false);
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken).ConfigureAwait(false);
+        RequireAdmin(context);
         var loginNameNormalized = ManagementUser.NormalizeLoginName(username);
         if (await _db.ManagementUsers.AsNoTracking()
                 .AnyAsync(u => u.TenantId == context.TenantId && u.LoginNameNormalized == loginNameNormalized,
@@ -441,6 +447,7 @@ public sealed class ManagementUserService
             _db.Entry(user).State = EntityState.Detached;
             throw CreateConflict(context, username);
         }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return ToView(user);
     }
 
@@ -453,8 +460,12 @@ public sealed class ManagementUserService
         {
             throw new ArgumentException("内置 admin 用户只能通过配置文件修改");
         }
-        var user = await RequireMutableUserInTenantAsync(context, normalized, "update", cancellationToken)
+        RequireCleanUserWriteScope();
+        await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, cancellationToken)
             .ConfigureAwait(false);
+        var (currentActor, user) = await RequireMutableUserInTenantAsync(context, normalized, "update", cancellationToken)
+            .ConfigureAwait(false);
+        context = currentActor;
         var wasEnabled = user.Enabled;
         var previousRole = user.Role;
         if (!string.IsNullOrWhiteSpace(request.Password))
@@ -474,20 +485,15 @@ public sealed class ManagementUserService
             : wasEnabled && previousRole != user.Role ? ManagementAccessRevocations.RoleChanged : null;
         // Disabling a user or changing its role ends the shares it created that it could no longer
         // create now, in the same transaction.
-        List<string> revokedShares;
-        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-                         .ConfigureAwait(false))
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (revocationReason is not null)
         {
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            if (revocationReason is not null)
-            {
-                await ManagementAccessRevocations.RevokeTicketsAsync(_db, user.TenantId,
-                    user.EffectiveLoginName(), cancellationToken).ConfigureAwait(false);
-            }
-            revokedShares = await _shares.OnUserChangedAsync(context.Username, user.EffectiveLoginName(),
-                user.TenantId, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await ManagementAccessRevocations.RevokeTicketsAsync(_db, user.TenantId,
+                user.EffectiveLoginName(), cancellationToken).ConfigureAwait(false);
         }
+        var revokedShares = await _shares.OnUserChangedAsync(context.Username, user.EffectiveLoginName(),
+            user.TenantId, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         _shares.CutStreams(revokedShares);
         if (revocationReason is not null && _revocations is not null)
         {
@@ -507,15 +513,17 @@ public sealed class ManagementUserService
         {
             throw new ArgumentException("内置 admin 用户不能删除");
         }
-        var user = await RequireMutableUserInTenantAsync(context, normalized, "delete", cancellationToken)
+        RequireCleanUserWriteScope();
+        await using var transaction = await ClientOwnershipWrite.BeginAsync(_db, cancellationToken)
             .ConfigureAwait(false);
+        var (currentActor, user) = await RequireMutableUserInTenantAsync(context, normalized, "delete", cancellationToken)
+            .ConfigureAwait(false);
+        context = currentActor;
         // Everything keyed by the account records its identity: the tenant and the login name.
         var tenantId = ManagementContext.NormalizeTenant(user.TenantId);
         var loginName = user.EffectiveLoginName();
         // The user's shares end with it: a share records its creator by name, and a later user of
         // the same name must not inherit them.
-        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
         // Clients and credentials carry tunnels in use: the administrator deletes or hands them over
         // first, as a later account of the same name would own them (management-accounts.md 7.1).
         var clients = await _db.ClientAccounts
@@ -541,10 +549,8 @@ public sealed class ManagementUserService
         // The registered email points at the account key and goes with the account, so the address
         // can register again once the transaction commits.
         var accountKey = user.Username;
-        await _db.ManagementUserEmails
-            .Where(email => email.Username == accountKey)
-            .ExecuteDeleteAsync(cancellationToken)
-            .ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM specus_management_user_email WHERE username={accountKey}",
+            cancellationToken).ConfigureAwait(false);
         _db.ManagementUsers.Remove(user);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await ManagementAccessRevocations.RevokeTicketsAsync(_db, tenantId, loginName, cancellationToken)
@@ -572,9 +578,10 @@ public sealed class ManagementUserService
     private async Task ForgetOwnedDataAsync(string tenantId, string loginName, string actor,
         CancellationToken cancellationToken)
     {
-        await _db.UserDiagramDocuments
-            .Where(document => document.TenantId == tenantId && document.OwnerUsername == loginName)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        // Portable parameterized single-table DELETEs: Oracle EF emits a DELETE alias form
+        // rejected by supported MariaDB. All statements still join this owned transaction.
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM user_diagram_document WHERE tenant_id={tenantId} AND owner_username={loginName}",
+            cancellationToken).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         await _db.TransferAttachments
             .Where(attachment => attachment.TenantId == tenantId && attachment.OwnerUsername == loginName
@@ -584,16 +591,15 @@ public sealed class ManagementUserService
                 .SetProperty(attachment => attachment.UploadExpiresAt, now)
                 .SetProperty(attachment => attachment.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
-        await _db.TransferAttachmentDownloadGrants
-            .Where(grant => grant.TenantId == tenantId && grant.Username == loginName)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.TransferAttachmentDownloadUsages
-            .Where(usage => usage.TenantId == tenantId && usage.Username == loginName)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-        await _db.PeerMeshDevices
-            .Where(device => device.TenantId == tenantId && device.OwnerUsername == loginName
-                && !_db.ClientAccounts.Any(client => client.Id == device.ClientId))
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM transfer_attachment_download_grant WHERE tenant_id={tenantId} AND username={loginName}",
+            cancellationToken).ConfigureAwait(false);
+        await _db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM transfer_attachment_download_usage WHERE tenant_id={tenantId} AND username={loginName}",
+            cancellationToken).ConfigureAwait(false);
+        var (clientTable, clientKey) = ClientOwnershipWrite.Identifiers<ClientAccount>(_db, nameof(ClientAccount.Id));
+        await using (var orphanDevices = ClientOwnershipWrite.Command(_db,
+            $"DELETE FROM peer_mesh_device WHERE tenant_id=@tenant AND owner_username=@owner AND NOT EXISTS (SELECT 1 FROM {clientTable} AS c WHERE c.{clientKey}=peer_mesh_device.client_id)",
+            ("@tenant", tenantId), ("@owner", loginName)))
+            await orphanDevices.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await _db.PeerMeshAcls
             .Where(acl => acl.TenantId == tenantId && acl.OwnerUsername == loginName)
             .ExecuteUpdateAsync(setters => setters.SetProperty(acl => acl.OwnerUsername, actor), cancellationToken)
@@ -657,12 +663,26 @@ public sealed class ManagementUserService
     /// user that only exists in another tenant answer the same, so no tenant can probe another's
     /// login names; the refused attempt is still logged.
     /// </summary>
-    private async Task<ManagementUser> RequireMutableUserInTenantAsync(ManagementContext context,
+    private async Task<(ManagementContext Actor, ManagementUser User)> RequireMutableUserInTenantAsync(ManagementContext context,
         string loginName, string action, CancellationToken cancellationToken)
     {
-        var user = await FindByLoginNameAsync(_db.ManagementUsers, context.TenantId, loginName,
+        var hint = await FindByLoginNameAsync(_db.ManagementUsers.AsNoTracking(), context.TenantId, loginName,
                 cancellationToken)
             .ConfigureAwait(false);
+        var targetKeys = hint is not null && hint.TenantId == context.TenantId ? new[] { hint.Username } : Array.Empty<string>();
+        context = await ManagementWriteAuthorization.LockAsync(_db, _auth, context, cancellationToken, targetKeys).ConfigureAwait(false);
+        RequireAdmin(context);
+        ManagementUser? user = null;
+        if (hint is not null && hint.TenantId == context.TenantId)
+        {
+            // The discovered original key was locked with the actor in canonical order. Never
+            // follow a replacement of the same name, or use an earlier tracked target snapshot.
+            user = await _db.ManagementUsers.AsNoTracking().SingleOrDefaultAsync(u =>
+                u.Username == hint.Username && u.TenantId == context.TenantId, cancellationToken).ConfigureAwait(false);
+            if (user is not null && (user.Username != hint.Username || user.TenantId != context.TenantId
+                || ManagementUser.NormalizeLoginName(user.EffectiveLoginName()) != ManagementUser.NormalizeLoginName(loginName)))
+                user = null;
+        }
         if (user is null)
         {
             _logger?.LogWarning(
@@ -670,7 +690,22 @@ public sealed class ManagementUserService
                 action, context.Username, context.TenantId, loginName);
             throw new ArgumentException("用户不存在: " + loginName);
         }
-        return user;
+        var tracked = _db.ChangeTracker.Entries<ManagementUser>().SingleOrDefault(e => e.Entity.Username == user.Username);
+        if (tracked is null) _db.ManagementUsers.Attach(user);
+        else
+        {
+            tracked.CurrentValues.SetValues(user);
+            tracked.OriginalValues.SetValues(user);
+            tracked.State = EntityState.Unchanged;
+            user = tracked.Entity;
+        }
+        return (context, user);
+    }
+
+    private void RequireCleanUserWriteScope()
+    {
+        if (_db.ChangeTracker.HasChanges())
+            throw new InvalidOperationException("management account mutation requires a clean pending-write scope");
     }
 
     private ArgumentException CreateConflict(ManagementContext context, string loginName)

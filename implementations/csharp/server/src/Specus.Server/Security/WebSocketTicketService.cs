@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Specus.Server.Data;
+using Specus.Server.Data.Conversion;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
 
@@ -49,8 +50,11 @@ public sealed class WebSocketTicketService
         };
         await using var serviceScope = _scopeFactory.CreateAsyncScope();
         var db = serviceScope.ServiceProvider.GetRequiredService<SpecusDbContext>();
-        await db.WebSocketTickets.Where(item => item.ExpiresAt <= now)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        // Oracle EF's DELETE alias is rejected by supported MariaDB. Preserve the
+        // model's exact UTC ISO conversion when binding the portable SQL cutoff.
+        var cutoff = IsoDateTimeOffsetConverter.Format(now);
+        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM specus_websocket_ticket WHERE expires_at <= {cutoff}",
+            cancellationToken).ConfigureAwait(false);
         db.WebSocketTickets.Add(row);
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return new IssuedWebSocketTicket(token, row.ExpiresAt);
@@ -77,10 +81,12 @@ public sealed class WebSocketTicketService
         {
             return null;
         }
-        var consumed = await db.WebSocketTickets
-            .Where(item => item.TokenHash == tokenHash && item.Scope == scope
-                && item.RemoteAddressHash == addressHash && item.ExpiresAt > now)
-            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        var cutoff = IsoDateTimeOffsetConverter.Format(now);
+        var consumed = await db.Database.ExecuteSqlInterpolatedAsync($"""
+            DELETE FROM specus_websocket_ticket
+            WHERE token_hash={tokenHash} AND scope={scope}
+              AND remote_address_hash={addressHash} AND expires_at>{cutoff}
+            """, cancellationToken).ConfigureAwait(false);
         if (consumed != 1)
         {
             return null;

@@ -15,6 +15,24 @@ public interface IFrameWriter
     /// frame is never cut short by it, and one whose write fails closes the connection.</summary>
     ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Builds a small control frame only after obtaining its physical write turn. Returning
+    /// null declines delivery without writing bytes. Preparation may be cancelled before
+    /// any byte is emitted; after emission starts the normal whole-frame rule applies.
+    /// The callback must not write to this connection. Shared writers must override this;
+    /// the default is suitable only for a single-producer writer.
+    /// </summary>
+    async ValueTask<bool> WritePreparedAsync(Func<CancellationToken, ValueTask<Packet?>> prepare,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var packet = await prepare(cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (packet is null) return false;
+        await WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     /// <summary>Queues a small flow-control frame so a blocked DATA write cannot stop reads.</summary>
     ValueTask WritePriorityAsync(Packet packet, CancellationToken cancellationToken = default) =>
         WriteAsync(packet, cancellationToken);

@@ -6,6 +6,36 @@
 
 #include "password_hash.h"
 
+/* Immutable authority of one database-backed physical CONTROL, never supplied by a report body.
+ * Guarded writers validate this under their SQLite writer fence; NULL/malformed is not trusted. */
+typedef struct {
+    long long client_id;
+    long long session_id;
+    char tenant_id[64];
+    char client_name[256];
+    char channel_id[161];
+    char token_hash[65];
+} st_storage_control_source;
+#define ST_STORAGE_CONTROL_SOURCE_RETIRED (-31)
+#define ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE (-32)
+/* One native snapshot: 0 current, RETIRED identity/epoch lost, UNAVAILABLE temporarily
+ * disabled, -1 database failure. Disabled is never permission to write or a trusted fallback,
+ * but does not invent permanent connection revocation for a reversible policy switch. */
+int st_storage_control_source_validate(const char *path, const st_storage_control_source *source);
+#define ST_STORAGE_CONTROL_SOURCE_BATCH 64U
+/* Background-only bounded read snapshot, 25ms SQLite busy wait, no writes. On any database
+ * failure all results are -1 and the caller must not retire a source. count must be <=64. */
+int st_storage_control_sources_validate(const char *path, const st_storage_control_source *sources,
+                                        size_t count, int *results);
+/* Query outside any registry lock; successful unused result permits terminal sidecar removal. */
+int st_storage_control_channel_unused(const char *path, const char *channel, int *unused);
+/* Recover only positively dead physical owners, not "absent from this process". credential_id=0
+ * also scans open audits at startup/shutdown. Native snapshots close before nonblocking probes;
+ * every update is conditional on the exact observed channel, never a global ONLINE sweep. */
+int st_storage_reap_dead_control_channels(const char *path, long long credential_id,
+                                          long long exclude_session_id, const char *now,
+                                          const char *reason, int *closed_audits);
+
 typedef struct {
     long long id;
     char tenant_id[64];
@@ -52,6 +82,15 @@ typedef struct {
     char updated_at[64];
 } st_storage_management_user;
 
+/* The resolved identity, not a cached role. Mutations re-read this exact account key and
+ * verify its current login name, tenant, enabled state and role under the database write lock.
+ * Only the built-in administrator has an empty account_key. */
+typedef struct {
+    const char *username;
+    const char *tenant_id;
+    const char *account_key;
+} st_storage_management_actor;
+
 typedef struct {
     char registration_id[65];
     char username[81];
@@ -77,6 +116,25 @@ typedef struct {
     char created_at[64];
     char updated_at[64];
 } st_storage_client_credential;
+
+/* API key/hash are already validated and normalized by the HTTP binder; NULL preserves
+ * the current value. Explicit flags distinguish omitted/null policy fields from false/zero. */
+typedef struct {
+    const char *api_key;
+    const char *secret_hash;
+    int enabled_provided;
+    int enabled;
+    int max_online_provided;
+    int max_online_instances;
+} st_storage_credential_patch;
+
+typedef struct {
+    const char *client_name; /* NULL preserves the current name. */
+    int enabled_provided;
+    int enabled;
+    int rate_limit_provided;
+    int connection_rate_limit_per_minute;
+} st_storage_client_patch;
 
 typedef struct {
     long long id;
@@ -314,6 +372,16 @@ typedef struct {
     char last_keepalive_at[64];
 } st_storage_peer_mesh_session;
 
+/* Identities of sessions closed by a committed client deletion; no token or target address. */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    long long source_client_id;
+    char source_client_name[256];
+    long long target_client_id;
+    char target_client_name[256];
+} st_storage_peer_close;
+
 typedef struct {
     int enabled;
     int mdns_import_enabled;
@@ -341,6 +409,28 @@ typedef struct {
     char created_at[64];
     char updated_at[64];
 } st_storage_peer_mesh_service;
+
+typedef struct {
+    st_storage_peer_mesh_service service;
+    char (*allowed_peer_ips)[64];
+    size_t allowed_peer_count;
+} st_storage_peer_mesh_config_service;
+
+typedef struct {
+    st_storage_client client;
+    int has_device;
+    st_storage_peer_mesh_device device;
+    st_storage_peer_mesh_service_sharing sharing;
+    st_storage_peer_mesh_config_service *services;
+    size_t service_count;
+} st_storage_peer_mesh_config;
+
+/* Current client, optional device ensure, sharing, services and effective IP grants
+ * form one database transaction. No output or device write survives a failed snapshot.
+ * Output must be empty; release successful snapshots with the matching free function. */
+int st_storage_load_peer_mesh_config(const char *path, const st_storage_client *client,
+    int ensure_device, int include_services, st_storage_peer_mesh_config *out);
+void st_storage_peer_mesh_config_free(st_storage_peer_mesh_config *config);
 
 typedef struct {
     char at[64];
@@ -797,6 +887,17 @@ int st_storage_delete_user_diagram(const char *path,
                                    const char *owner_username);
 void st_storage_user_diagram_free(st_storage_user_diagram *diagram);
 int st_storage_delete_client_download_link(const char *path, long long id);
+enum { ST_STORAGE_IDENTITY_AUTH_CHANGED = 1, ST_STORAGE_IDENTITY_AUTH_DISABLED = 2 };
+/* Authenticated snapshot is immutable. Under BEGIN IMMEDIATE, re-read current credential,
+ * reject changed key/hash/tenant or disabled state, then atomically provision/touch identity.
+ * 0 success, positive AUTH_* refusal, -1 store/integrity failure; outputs only after commit. */
+int st_storage_find_or_create_client_identity_current(const char *path,
+                                                      const st_storage_client_credential *credential,
+                                                      const char *machine_fingerprint,
+                                                      const char *os_user,
+                                                      const char *hostname,
+                                                      st_storage_client_identity *identity,
+                                                      st_storage_client_credential *effective_credential);
 int st_storage_find_or_create_client_identity(const char *path,
                                               const st_storage_client_credential *credential,
                                               const char *machine_fingerprint,
@@ -849,6 +950,10 @@ int st_storage_mark_client_session_online(const char *path,
 int st_storage_mark_client_session_disconnected(const char *path,
                                                 long long id,
                                                 const char *disconnected_at);
+/* Physical CONTROL cleanup: a reusable SID must not mark a successor's native binding offline.
+ * Returns 0 for either a successful CAS or a mismatch, -1 for storage failure; changed is 0/1. */
+int st_storage_mark_client_session_disconnected_if_channel(const char *path, long long id,
+    const char *channel_id, const char *disconnected_at, int *changed);
 int st_storage_close_client_sessions_by_status(const char *path,
                                                const char *from_status,
                                                const char *disconnected_at);
@@ -1117,9 +1222,14 @@ int st_storage_list_peer_mesh_acls_visible(const char *path,
                                            int include_all_clients,
                                            st_storage_peer_mesh_acl **acls,
                                            size_t *acl_count);
+/* Cached client identifies id+tenant only. Each ensure/enable/report re-reads current client
+ * under one database write transaction, rolls back creation on later failure, publishes after commit. */
 int st_storage_ensure_peer_mesh_device(const char *path,
                                        const st_storage_client *client,
                                        st_storage_peer_mesh_device *out_device);
+int st_storage_ensure_peer_mesh_device_from_control(const char *path, const st_storage_control_source *control,
+                                                    const st_storage_client *client,
+                                                    st_storage_peer_mesh_device *out_device);
 int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                const st_storage_client *client,
                                                int enabled,
@@ -1157,6 +1267,12 @@ int st_storage_update_peer_mesh_device_report(const char *path,
                                               const char *virtual_device_status,
                                               const char *virtual_device_error,
                                               st_storage_peer_mesh_device *out_device);
+int st_storage_update_peer_mesh_device_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *client, const char *public_key,
+    const char *nat_type, const char *nat_mapping_behavior, const char *nat_filtering_behavior,
+    const char *nat_behavior_discovery, const char *last_endpoint, const char *virtual_device_mode,
+    const char *virtual_device_name, const char *virtual_device_status, const char *virtual_device_error,
+    st_storage_peer_mesh_device *out_device);
 int st_storage_get_peer_mesh_acl(const char *path, long long id, st_storage_peer_mesh_acl *acl);
 int st_storage_can_peer(const char *path,
                         const st_storage_client *source,
@@ -1273,6 +1389,9 @@ int st_storage_close_open_peer_mesh_sessions_visible(const char *path,
                                                      int include_all_clients,
                                                      st_storage_peer_mesh_session **sessions,
                                                      size_t *session_count);
+/* Fresh endpoint binding/authorization, insert and validation share one write
+ * transaction with ownership transfer. No cached names/owners are authority;
+ * publish only after commit, clear failure output and validate even with NULL output. */
 int st_storage_create_peer_mesh_session(const char *path,
                                         const st_storage_client *source,
                                         const st_storage_client *target,
@@ -1280,6 +1399,9 @@ int st_storage_create_peer_mesh_session(const char *path,
                                         const char *token_hash,
                                         long long ttl_seconds,
                                         st_storage_peer_mesh_session *out_session);
+int st_storage_create_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *source, const st_storage_client *target, const char *path_type,
+    const char *token_hash, long long ttl_seconds, st_storage_peer_mesh_session *out_session);
 int st_storage_get_peer_mesh_session(const char *path,
                                      const char *tenant_id,
                                      long long id,
@@ -1304,6 +1426,10 @@ int st_storage_report_peer_mesh_session(const char *path,
                                         long long relay_bytes,
                                         int close_session,
                                         st_storage_peer_mesh_session *out_session);
+int st_storage_report_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *reporter, long long id, const char *path_type, const char *status,
+    long long rtt_millis, const char *local_endpoint, const char *remote_endpoint,
+    long long direct_bytes, long long relay_bytes, int close_session, st_storage_peer_mesh_session *out_session);
 int st_storage_authorize_peer_mesh_relay(const char *path,
                                          long long session_id,
                                          long long from_client_id,
@@ -1371,6 +1497,8 @@ int st_storage_find_peer_mesh_egress_activity(const char *path,
                                               st_storage_peer_mesh_egress_activity *out_row);
 int st_storage_upsert_peer_mesh_egress_activity(const char *path,
                                                 const st_storage_peer_mesh_egress_activity *row);
+int st_storage_upsert_peer_mesh_egress_activity_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_peer_mesh_egress_activity *row);
 /* Returns 0 on a hit, 1 when the tenant has never set it, -1 on a storage failure. */
 int st_storage_get_peer_mesh_egress_switch(const char *path,
                                            const char *tenant_id,
@@ -1384,6 +1512,59 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
                                               long long session_id,
                                               const char *service_id,
                                               const char *reason);
+/* The stage callback mutates only caller-owned, invisible memory. It must not perform SQL,
+ * socket I/O, or acquire/wait for registry/CID/cache locks. Reserve cache resources BEFORE
+ * calling; publish them only after this function commits successfully, otherwise discard.
+ * Current client/device/sharing, original session's discovery capability and immutable physical source are read under the same
+ * native writer as the audit insert+retention. A rolled-back authority change returns -1,
+ * not permanent retirement. The unguarded entrypoint is for explicit trusted service calls. */
+typedef int (*st_storage_peer_service_report_stage_fn)(void *context,
+    const st_storage_client *current, const st_storage_peer_mesh_device *device,
+    const st_storage_peer_mesh_service_sharing *sharing, const char **audit_reason);
+int st_storage_commit_peer_service_report(const char *path, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client);
+int st_storage_commit_peer_service_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client);
+typedef struct {
+    int guarded; /* False only for an explicit trusted service call, never network fallback. */
+    st_storage_control_source control;
+} st_storage_peer_catalog_source;
+typedef struct {
+    st_storage_client publisher, recipient;
+    int publisher_current, recipient_current, recipient_authenticated, sharing_enabled, mdns_enabled, allowed;
+    st_storage_peer_mesh_service *services;
+    size_t service_count;
+} st_storage_peer_catalog_view;
+/* One native read snapshot for original physical sources, captured original recipient capability, current parents/devices/sharing,
+ * consumer->publisher ACL and at most 32 reported definitions. No cache locks or network I/O.
+ * source_visible and view are published only on successful completion; SQL failure clears them.
+ * A hidden/missing publisher or source is a successful empty projection, not permanent cleanup. */
+int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
+    const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_view *view);
+void st_storage_peer_catalog_view_free(st_storage_peer_catalog_view *view);
+/* Publication acceptance, NOT socket I/O. Reserve a bounded invisible transport ticket BEFORE
+ * calling. The same projection is evaluated under BEGIN IMMEDIATE; the pure callback may only
+ * stage private memory, without allocation waits, registry/CID/cache/queue locks or I/O. The
+ * view is borrowed for the callback only; publisher_visible identifies the original source,
+ * while view->allowed and services additionally apply recipient/definition policy. A NULL
+ * publisher_source requests an empty withdrawal.
+ * After 0 (native commit), make the staged ticket ready OUTSIDE SQL; after any other result,
+ * abort it. 1 means recipient no longer authenticates or callback cancelled, -1 is SQL/stage
+ * failure. An invisible publisher/policy is a successful empty projection, not retirement.
+ * No callback runs on a failed read or unavailable original recipient. */
+typedef int (*st_storage_peer_catalog_delivery_stage_fn)(void *context,
+    const st_storage_peer_catalog_view *view, int publisher_visible);
+int st_storage_commit_peer_catalog_delivery(const char *path, const char *tenant_id,
+    long long publisher_id, const st_storage_peer_catalog_source *publisher_source,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_delivery_stage_fn stage, void *context);
 int st_storage_list_peer_mesh_service_audits(const char *path,
                                              const char *tenant_id,
                                              st_storage_peer_mesh_service_audit *events,
@@ -1570,6 +1751,34 @@ typedef struct {
     int accepted;
 } st_storage_share_builtin_admin;
 
+enum {
+    ST_STORAGE_MANAGEMENT_ACTOR_CHANGED = 1,
+    ST_STORAGE_CREDENTIAL_NOT_VISIBLE = 2,
+    ST_STORAGE_CREDENTIAL_KEY_EXISTS = 3,
+    ST_STORAGE_CLIENT_NOT_VISIBLE = 4,
+    ST_STORAGE_CLIENT_NAME_EXISTS = 5
+};
+/* Plain INSERT, authorized and validated inside one write transaction. Current USER
+ * accounts may create; no stale tenant/owner or output is accepted before COMMIT. */
+int st_storage_create_client_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *client_name, int enabled, int connection_rate_limit_per_minute,
+    st_storage_client *out_client);
+/* BEGIN IMMEDIATE encloses current actor, current credential visibility and the entire write.
+ * No tenant/owner replacement from a stale caller object; output only after successful commit.
+ * 0 success, positive refusal above, -1 store/integrity/argument failure. */
+/* Create uses the freshly resolved actor's canonical tenant/login as owner; never upserts
+ * an existing key. USER accounts may create, and no stale cached role grants extra rights. */
+int st_storage_create_client_credential_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *api_key, const char *secret_hash, int enabled, int max_online_instances,
+    st_storage_client_credential *out_credential);
+int st_storage_patch_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_credential_patch *patch, st_storage_client_credential *out_credential);
+int st_storage_delete_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin);
+
 /* Share ids a call revoked, so the caller can cut this instance's streams of them. */
 typedef struct {
     char (*ids)[17];
@@ -1755,6 +1964,21 @@ int st_storage_delete_client_audited(const char *path,
                                      const char *actor,
                                      long long now_ms,
                                      st_storage_share_ids *revoked);
+int st_storage_delete_client_audited_with_peers(const char *path, long long id,
+                                               const char *actor, long long now_ms,
+                                               st_storage_share_ids *revoked,
+                                               st_storage_peer_close **closed, size_t *closed_count);
+/* Current exact actor and resource visibility are checked inside the same write transaction.
+ * Omitted fields preserve current values, never a caller snapshot. Outputs publish only after
+ * commit; revoked/closed outputs must be empty and closed/count must be provided together. */
+int st_storage_patch_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_client_patch *patch, long long now_ms, st_storage_client *out_before,
+    st_storage_client *out_client, st_storage_share_ids *revoked);
+int st_storage_delete_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    long long now_ms, st_storage_client *out_before, st_storage_share_ids *revoked,
+    st_storage_peer_close **closed, size_t *closed_count);
 int st_storage_update_management_user_audited(const char *path,
                                               const st_storage_share_builtin_admin *builtin,
                                               const char *tenant_id,
@@ -1779,5 +2003,41 @@ int st_storage_delete_management_user_audited(const char *path,
                                               long long now_ms,
                                               st_storage_share_ids *revoked,
                                               st_storage_account_owned *owned);
+
+typedef struct {
+    char *json;
+    char tenant_id[64];
+    char target_username[81];
+    long long audit_id;
+    int changed;
+    long long *client_ids;
+    size_t client_count;
+    st_storage_peer_close *closed;
+    size_t closed_count;
+} st_storage_owner_transfer_result;
+
+/* Authenticated transfer writer used by the dedicated single/group HTTP POSTs. HTTP status/stable code;
+ * fresh actor/target/group/revision, ownership, selective session closure and one audit
+ * are atomic. Outputs only after commit; NULL output still validates everything.
+ * Caller supplies an empty output and frees successful outputs with the matching helper.
+ * Runtime instances independently consume the committed audit journal after this returns. */
+int st_storage_transfer_owner(const char *path, const st_storage_management_actor *actor,
+    const st_storage_share_builtin_admin *builtin, int group, long long id,
+    const char *request, long long now_ms, st_storage_owner_transfer_result *out, const char **code);
+void st_storage_owner_transfer_result_free(st_storage_owner_transfer_result *result);
+
+/* Committed audit rows are the durable, ordered ownership-change journal. Each
+ * runtime instance has its own cursor; reading never acknowledges for other instances. */
+typedef struct {
+    long long id;
+    char tenant_id[64];
+    st_storage_peer_close *closed;
+    size_t closed_count;
+} st_storage_owner_transfer_event;
+int st_storage_owner_transfer_last_id(const char *path, long long *id);
+/* 1 = next committed event, 0 = none, -1 = unreadable/malformed (do not advance). */
+int st_storage_owner_transfer_next(const char *path, long long after,
+                                   st_storage_owner_transfer_event *event);
+void st_storage_owner_transfer_event_free(st_storage_owner_transfer_event *event);
 
 #endif

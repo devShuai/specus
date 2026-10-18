@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Specus.Server.Authentication;
+using Specus.Server.ControlChannel;
 using Specus.Server.Data.Entities;
 using Specus.Server.Management;
 
@@ -54,6 +55,8 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshServiceSharingView> SetSharingAsync(ManagementContext context,
         PeerMeshSharingMutation mutation, CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireAdmin(context);
         if (mutation.Enabled is null && mutation.MdnsImportEnabled is null)
         {
@@ -63,15 +66,9 @@ public sealed partial class PeerMeshService
         {
             throw new ArgumentException("部署端未启用 Peer Mesh，不能开启服务共享");
         }
-        var previous = await _db.PeerMeshServiceSharings
-            .FirstOrDefaultAsync(row => row.TenantId == context.TenantId, cancellationToken)
-            .ConfigureAwait(false);
-        var wasEnabled = previous?.Enabled == true;
-        if (previous is null)
-        {
-            previous = new PeerMeshServiceSharing { TenantId = context.TenantId };
-            _db.PeerMeshServiceSharings.Add(previous);
-        }
+        var current = (await LockPeerSharingAsync(context, true, cancellationToken).ConfigureAwait(false))!;
+        var previous = TrackPeerCurrent(current, context.TenantId, nameof(PeerMeshServiceSharing.TenantId));
+        var wasEnabled = previous.Enabled;
         if (mutation.Enabled is not null)
         {
             previous.Enabled = mutation.Enabled.Value;
@@ -83,6 +80,8 @@ public sealed partial class PeerMeshService
         previous.UpdatedBy = context.Username;
         previous.UpdatedAt = DateTimeOffset.UtcNow;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         Audit("sharing-toggle", context.TenantId, null, null, null, previous.Enabled ? "enabled" : "updated");
         if (wasEnabled && mutation.Enabled == false)
         {
@@ -116,15 +115,25 @@ public sealed partial class PeerMeshService
         return views;
     }
 
-    public async Task<PeerMeshSharedServiceView> CreateSharedServiceAsync(ManagementContext context,
-        PeerMeshServiceMutation mutation, CancellationToken cancellationToken)
+    public Task<PeerMeshSharedServiceView> CreateSharedServiceAsync(ManagementContext context,
+        PeerMeshServiceMutation mutation, CancellationToken cancellationToken) =>
+        CreateSharedServiceCoreAsync(context, mutation, false, cancellationToken);
+
+    private async Task<PeerMeshSharedServiceView> CreateSharedServiceCoreAsync(ManagementContext context,
+        PeerMeshServiceMutation mutation, bool mdnsImport, CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireAdmin(context);
-        var account = await _db.ClientAccounts
-                .FirstOrDefaultAsync(row => row.TenantId == context.TenantId && row.Id == mutation.ClientId,
-                    cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ArgumentException("client not found");
+        if (mdnsImport)
+        {
+            var sharing = await LockPeerSharingAsync(context, false, cancellationToken).ConfigureAwait(false);
+            if (sharing is not { Enabled: true, MdnsImportEnabled: true } || !Enabled)
+                throw new InvalidOperationException("mDNS 候选导入开关已变更，请刷新后重试");
+        }
+        var clientId = mutation.ClientId ?? throw new ArgumentException("client not found");
+        var parents = await LockPeerClientsAsync(context, [clientId], cancellationToken).ConfigureAwait(false);
+        var account = RequirePeerClient(parents, clientId);
         var serviceId = string.IsNullOrWhiteSpace(mutation.ServiceId)
             ? Guid.NewGuid().ToString()
             : RequireServiceId(mutation.ServiceId);
@@ -150,6 +159,8 @@ public sealed partial class PeerMeshService
         row.UpdatedAt = now;
         _db.PeerMeshSharedServices.Add(row);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
         await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
         return await ToViewAsync(row, true, cancellationToken).ConfigureAwait(false);
     }
@@ -157,19 +168,21 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshSharedServiceView> UpdateSharedServiceAsync(ManagementContext context, long id,
         PeerMeshServiceMutation mutation, CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireAdmin(context);
-        var row = await _db.PeerMeshSharedServices
-                .FirstOrDefaultAsync(item => item.TenantId == context.TenantId && item.Id == id, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ArgumentException("service not found");
-        var previousRuntime = ServiceRuntimeDefinition.From(row);
-        ApplyMutation(row, mutation, creating: false);
-        await RejectPortConflictAsync(row, cancellationToken).ConfigureAwait(false);
-        row.UpdatedAt = DateTimeOffset.UtcNow;
+        var (current, parent) = await LockSharedDefinitionAsync(context, id, true, cancellationToken).ConfigureAwait(false);
+        var previousRuntime = ServiceRuntimeDefinition.From(current);
+        var proposed = CopyPeerValues(current);
+        ApplyMutation(proposed, mutation, creating: false);
+        await RejectPortConflictAsync(proposed, cancellationToken).ConfigureAwait(false);
+        proposed.UpdatedAt = DateTimeOffset.UtcNow;
+        var row = TrackPeerCurrent(current, id);
+        _db.Entry(row).CurrentValues.SetValues(proposed);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        var account = await _db.ClientAccounts.AsNoTracking()
-                .FirstAsync(item => item.TenantId == row.TenantId && item.Id == row.ClientId, cancellationToken)
-                .ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
+        var account = parent!;
         await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
         if (previousRuntime == ServiceRuntimeDefinition.From(row))
         {
@@ -184,44 +197,42 @@ public sealed partial class PeerMeshService
 
     public async Task DeleteSharedServiceAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false);
+        context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
         RequireAdmin(context);
-        var row = await _db.PeerMeshSharedServices
-                .FirstOrDefaultAsync(item => item.TenantId == context.TenantId && item.Id == id, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ArgumentException("service not found");
-        await using (var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
-                         .ConfigureAwait(false))
-        {
-            // Every identity's workbench references to the service go in the same transaction.
-            await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.PeerService, row.Id,
-                cancellationToken).ConfigureAwait(false);
-            _db.PeerMeshSharedServices.Remove(row);
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        var account = await _db.ClientAccounts.AsNoTracking()
-                .FirstAsync(item => item.TenantId == row.TenantId && item.Id == row.ClientId, cancellationToken)
-                .ConfigureAwait(false);
-        await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
+        var (current, account) = await LockSharedDefinitionAsync(context, id, false, cancellationToken).ConfigureAwait(false);
+        var row = TrackPeerCurrent(current, id);
+        await WorkbenchService.DeleteObjectReferencesAsync(_db, WorkbenchKinds.PeerService, row.Id, cancellationToken).ConfigureAwait(false);
+        _db.PeerMeshSharedServices.Remove(row);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.DisposeAsync().ConfigureAwait(false);
+        if (account is not null) await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
         await WithdrawClientAsync(row.TenantId, row.ClientId, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task HandleServiceReportAsync(ClientAccount source, PeerControlMessage report,
-        long? publisherSessionId, CancellationToken cancellationToken)
+        long? publisherSessionId, CancellationToken cancellationToken, SpecusConnectionContext? publisherTransport = null)
     {
         ValidateReportCollections(report);
         var sessionId = publisherSessionId is > 0
             ? publisherSessionId.Value
             : throw new ArgumentException("publisher session is required");
         var key = (source.TenantId, source.Id, sessionId);
+        var origin = CapturePeerReceiver(source);
+        if (origin is null || origin.SessionId != sessionId
+            || (publisherTransport is not null && !ReferenceEquals(origin.Transport, publisherTransport)))
+            throw new ArgumentException("publisher session is not current");
         var gate = CatalogMutationGate(key);
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var publisherSession = await _db.ClientSessions.AsNoTracking()
-                    .FirstOrDefaultAsync(session => session.Id == sessionId, cancellationToken)
-                    .ConfigureAwait(false)
+            // The original physical publisher must still own its SQL session after the
+            // catalog gate wait. Invalid reports must not consume a revision or rate slot.
+            var currentPublisher = await ReadPeerReceiverAsync(origin, cancellationToken).ConfigureAwait(false)
                 ?? throw new ArgumentException("publisher session is not current");
+            source = currentPublisher.Account;
+            var publisherSession = currentPublisher.Session;
             if (!ManagementContext.SameTenant(publisherSession.TenantId, source.TenantId)
                 || publisherSession.ClientId != source.Id
                 || !string.Equals(publisherSession.Status, ClientAccountService.StatusNettyOnline,
@@ -265,7 +276,7 @@ public sealed partial class PeerMeshService
             var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
             _serviceCatalogs[key] = new PeerMeshServiceCatalogSnapshot(catalogRevision, NormalizeInstanceId(report.InstanceId), DateTimeOffset.UtcNow,
                 expiresAt, advertised, source.ClientName, CopyStats(report.Stats, advertised),
-                SanitizeMdns(report.MdnsCandidates));
+                SanitizeMdns(report.MdnsCandidates), origin.Channel);
             Audit("service-report", source.TenantId, source.Id, sessionId, null,
                 advertised.Count == 0 ? "empty" : "published");
             await FanoutAsync(source, sessionId, catalogRevision, advertised, expiresAt, cancellationToken)
@@ -360,55 +371,52 @@ public sealed partial class PeerMeshService
 
     private async Task FanoutAsync(ClientAccount publisher, long publisherSessionId, long revision,
         IReadOnlyList<AdvertisedService> services, DateTimeOffset expiresAt, bool includeDenied,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, TimeSpan? deliveryBudget = null)
     {
         var recipients = await _db.ClientAccounts.AsNoTracking()
             .Where(account => account.TenantId == publisher.TenantId && account.Id != publisher.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        var key = (publisher.TenantId, publisher.Id, publisherSessionId);
+        _serviceCatalogs.TryGetValue(key, out var snapshot);
+        var origin = CaptureCatalogPublisher(publisher, publisherSessionId, snapshot?.PublisherChannelId);
+        var failures = new List<Exception>();
         foreach (var recipient in recipients)
         {
-            var canPeer = await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false);
-            if (!canPeer && !includeDenied)
+            if (recipient.TenantId != publisher.TenantId) continue;
+            if (!includeDenied && !await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false)) continue;
+            var receiver = CapturePeerReceiver(recipient);
+            if (receiver is null) continue;
+            if (deliveryBudget is null)
+                await SendPreparedCatalogAsync(receiver, publisher, publisherSessionId, revision, services,
+                    expiresAt, origin, cancellationToken).ConfigureAwait(false);
+            else
             {
-                continue;
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(deliveryBudget.Value);
+                try { await SendPreparedCatalogAsync(receiver, publisher, publisherSessionId, revision, services,
+                    expiresAt, origin, timeout.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception error) { failures.Add(error); }
             }
-            var session = _sessions.Find(recipient.ClientName);
-            if (session is null)
-            {
-                continue;
-            }
-            var visible = new List<AdvertisedService>();
-            foreach (var service in services)
-            {
-                if (canPeer && await VisibleToAsync(publisher, recipient, service, cancellationToken).ConfigureAwait(false))
-                {
-                    visible.Add(service);
-                }
-            }
-            await SendSignalAsync(session, "server", recipient.ClientName, new PeerControlMessage
-            {
-                Type = TypeServiceCatalog,
-                PublisherClientId = publisher.Id,
-                PublisherClientName = publisher.ClientName,
-                PublisherSessionId = publisherSessionId,
-                Revision = revision,
-                ExpiresAt = expiresAt.ToString("O"),
-                Services = visible,
-                CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            }, cancellationToken).ConfigureAwait(false);
         }
+        if (failures.Count > 0) throw new AggregateException(failures);
     }
 
-    private async Task OnAuthorizationChangedAsync(string tenantId, CancellationToken cancellationToken)
+    private async Task OnAuthorizationChangedAsync(string tenantId, CancellationToken cancellationToken, TimeSpan? deliveryBudget = null)
     {
+        var failures = new List<Exception>();
         foreach (var entry in _serviceCatalogs.Where(item =>
                      ManagementContext.SameTenant(item.Key.TenantId, tenantId)).ToArray())
         {
             var gate = CatalogMutationGate(entry.Key);
-            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var acquired = false;
+            using var timeout = deliveryBudget.HasValue ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+            timeout?.CancelAfter(deliveryBudget!.Value);
             try
             {
+                await gate.WaitAsync(timeout?.Token ?? cancellationToken).ConfigureAwait(false);
+                acquired = true;
                 if (!_serviceCatalogs.TryGetValue(entry.Key, out var current))
                 {
                     continue;
@@ -425,19 +433,22 @@ public sealed partial class PeerMeshService
                 var snapshot = current with { Revision = revision };
                 _serviceCatalogs[entry.Key] = snapshot;
                 await FanoutAsync(publisher, entry.Key.SessionId, revision, snapshot.Services, snapshot.ExpiresAt,
-                    includeDenied: true, cancellationToken).ConfigureAwait(false);
+                    includeDenied: true, cancellationToken, deliveryBudget).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception error) when (deliveryBudget.HasValue) { failures.Add(error); }
             finally
             {
-                gate.Release();
+                if (acquired) gate.Release();
             }
         }
+        if (failures.Count > 0) throw new AggregateException(failures);
     }
 
     private async Task PushCurrentCatalogsAsync(ClientAccount recipient, CancellationToken cancellationToken)
     {
-        var session = _sessions.Find(recipient.ClientName);
-        if (session is null)
+        var receiver = CapturePeerReceiver(recipient);
+        if (receiver is null)
         {
             return;
         }
@@ -458,28 +469,9 @@ public sealed partial class PeerMeshService
             {
                 continue;
             }
-            var visible = new List<AdvertisedService>();
-            if (await CanPeerAsync(publisher, recipient, cancellationToken).ConfigureAwait(false))
-            {
-                foreach (var service in snapshot.Services)
-                {
-                    if (await VisibleToAsync(publisher, recipient, service, cancellationToken).ConfigureAwait(false))
-                    {
-                        visible.Add(service);
-                    }
-                }
-            }
-            await SendSignalAsync(session, "server", recipient.ClientName, new PeerControlMessage
-            {
-                Type = TypeServiceCatalog,
-                PublisherClientId = publisher.Id,
-                PublisherClientName = publisher.ClientName,
-                PublisherSessionId = key.SessionId,
-                Revision = snapshot.Revision,
-                ExpiresAt = snapshot.ExpiresAt.ToString("O"),
-                Services = visible,
-                CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            }, cancellationToken).ConfigureAwait(false);
+            var origin = CaptureCatalogPublisher(publisher, key.SessionId, snapshot.PublisherChannelId);
+            await SendPreparedCatalogAsync(receiver, publisher, key.SessionId, snapshot.Revision,
+                snapshot.Services, snapshot.ExpiresAt, origin, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -519,6 +511,31 @@ public sealed partial class PeerMeshService
         {
             gate.Release();
         }
+    }
+
+    // Called under the transport lifecycle lease, before publishing the new physical control,
+    // outside its socket write lock. Raw client revisions belong to one physical publisher.
+    internal async Task OnControlConnectedAsync(ClientAccount publisher, long sessionId,
+        CancellationToken cancellationToken)
+    {
+        var key = (publisher.TenantId, publisher.Id, sessionId);
+        var gate = CatalogMutationGate(key);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var hadPublisher = _serviceCatalogs.TryRemove(key, out _)
+                | _serviceReportRevisions.ContainsKey(key);
+            if (hadPublisher)
+            {
+                await FanoutAsync(publisher, sessionId, NextCatalogRevision(key), [], DateTimeOffset.UtcNow,
+                    includeDenied: true, cancellationToken).ConfigureAwait(false);
+            }
+            _serviceCatalogRevisions.TryRemove(key, out _);
+            _serviceReportRevisions.TryRemove(key, out _);
+            _serviceReportWindows.TryRemove(sessionId, out _);
+            // The process-owned outbound sequence is deliberately NOT reset.
+        }
+        finally { gate.Release(); }
     }
 
     public async Task OnClientDisconnectedAsync(long sessionId, CancellationToken cancellationToken)
@@ -621,11 +638,7 @@ public sealed partial class PeerMeshService
             return false;
         }
         var deliveredRevision = _serviceCatalogRevisions.GetValueOrDefault(key);
-        if (revision <= deliveredRevision && deliveredRevision == long.MaxValue)
-        {
-            return false;
-        }
-        catalogRevision = revision > deliveredRevision ? revision : checked(deliveredRevision + 1);
+        catalogRevision = _state.NextServiceCatalogRevision(deliveredRevision);
         _serviceReportRevisions[key] = revision;
         _serviceCatalogRevisions[key] = catalogRevision;
         return true;
@@ -635,9 +648,11 @@ public sealed partial class PeerMeshService
     {
         if (!_serviceCatalogRevisions.ContainsKey(key) && _serviceCatalogRevisions.Count >= 4096)
         {
-            return long.MaxValue;
+            throw new InvalidOperationException("service catalog revision table is full");
         }
-        return _serviceCatalogRevisions.AddOrUpdate(key, 1, static (_, current) => checked(current + 1));
+        var next = _state.NextServiceCatalogRevision(_serviceCatalogRevisions.GetValueOrDefault(key));
+        _serviceCatalogRevisions[key] = next;
+        return next;
     }
 
     private async Task WithdrawClientAsync(string tenantId, long clientId, CancellationToken cancellationToken)
@@ -781,11 +796,17 @@ public sealed partial class PeerMeshService
     public async Task<PeerMeshImportResult> ImportCandidatesAsync(ManagementContext context, long clientId,
         string? source, CancellationToken cancellationToken)
     {
-        RequireAdmin(context);
-        var account = await _db.ClientAccounts
-                .FirstOrDefaultAsync(row => row.TenantId == context.TenantId && row.Id == clientId, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw new ArgumentException("client not found");
+        ClientAccount account;
+        // Keep per-item commits/partial import semantics, but authorize the import itself before
+        // reading candidates. Every actual creation independently revalidates the same actor.
+        await using (var transaction = await BeginPeerWriteAsync(cancellationToken).ConfigureAwait(false))
+        {
+            context = await LockPeerActorAsync(context, cancellationToken).ConfigureAwait(false);
+            RequireAdmin(context);
+            var parents = await LockPeerClientsAsync(context, [clientId], cancellationToken).ConfigureAwait(false);
+            account = RequirePeerClient(parents, clientId);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
         if (string.Equals(source, "mdns", StringComparison.OrdinalIgnoreCase))
         {
             return await ImportMdnsAsync(context, account, cancellationToken).ConfigureAwait(false);
@@ -843,7 +864,7 @@ public sealed partial class PeerMeshService
                 publishedPort, path, false, "OWNER", null), cancellationToken).ConfigureAwait(false));
             return true;
         }
-        catch
+        catch (ArgumentException)
         {
             return false;
         }
@@ -1081,12 +1102,12 @@ public sealed partial class PeerMeshService
                     skipped++;
                     continue;
                 }
-                created.Add(await CreateSharedServiceAsync(context, new PeerMeshServiceMutation(
+                created.Add(await CreateSharedServiceCoreAsync(context, new PeerMeshServiceMutation(
                     account.Id, null, candidate.Name, "imported candidate", candidate.Transport,
                     candidate.Application, targetHost, candidate.TargetPort, candidate.TargetPort, "", false, "OWNER",
-                    null), cancellationToken).ConfigureAwait(false));
+                    null), true, cancellationToken).ConfigureAwait(false));
             }
-            catch
+            catch (ArgumentException)
             {
                 skipped++;
             }

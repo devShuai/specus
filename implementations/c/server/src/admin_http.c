@@ -16,6 +16,7 @@
 #include "login_rate_limiter.h"
 #include "media_capture.h"
 #include "object_storage.h"
+#include "owner_transfer.h"
 #include "oidc.h"
 #include "password_hash.h"
 #include "peer_mesh.h"
@@ -43,6 +44,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -183,6 +185,8 @@ typedef struct {
  */
 struct st_admin_direct_ws_stream {
     int fd;
+    int fd_attached; /* admin_direct_ws_ref_lock: cleared before the browser owner returns/closes. */
+    atomic_int retired;
     pthread_mutex_t send_lock;
     pthread_cond_t handshake_cond;
     pthread_mutex_t flow_lock;
@@ -274,6 +278,8 @@ static void *admin_client_message_ctx = NULL;
 static size_t admin_pending_client_message_writes = 0U;
 static pthread_mutex_t admin_peer_mesh_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_mesh_refresh_handler admin_peer_mesh_refresh_handler = NULL;
+static st_admin_peer_client_deleted_handler admin_peer_client_deleted_handler = NULL;
+static void *admin_peer_client_deleted_ctx = NULL;
 static void *admin_peer_mesh_refresh_ctx = NULL;
 static pthread_mutex_t admin_peer_control_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_peer_control_send_handler admin_peer_control_send_handler = NULL;
@@ -320,6 +326,14 @@ void st_admin_set_peer_mesh_refresh_handler(st_admin_peer_mesh_refresh_handler h
     pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
     admin_peer_mesh_refresh_handler = handler;
     admin_peer_mesh_refresh_ctx = ctx;
+    pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+}
+
+void st_admin_set_peer_client_deleted_handler(st_admin_peer_client_deleted_handler handler, void *ctx)
+{
+    pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
+    admin_peer_client_deleted_handler = handler;
+    admin_peer_client_deleted_ctx = ctx;
     pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
 }
 
@@ -3232,12 +3246,14 @@ static int build_database_client_auth_login_response(const char *database_path,
     }
 
     st_storage_client_identity identity;
-    int rc = st_storage_find_or_create_client_identity(database_path,
+    st_storage_client_credential effective_credential;
+    int rc = st_storage_find_or_create_client_identity_current(database_path,
                                                        &credential,
                                                        machine_fingerprint,
                                                        os_user,
                                                        hostname == NULL ? "unknown-host" : hostname,
-                                                       &identity);
+                                                       &identity,
+                                                       &effective_credential);
     if (rc != 0) {
         free(api_key);
         free(timestamp);
@@ -3251,8 +3267,13 @@ static int build_database_client_auth_login_response(const char *database_path,
         free(os_arch);
         free(client_version);
         free(java_version);
+        if (rc == ST_STORAGE_IDENTITY_AUTH_CHANGED)
+            return write_response(out, out_len, 401, "Unauthorized", "{\"error\":\"client credential changed\"}");
+        if (rc == ST_STORAGE_IDENTITY_AUTH_DISABLED)
+            return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"客户端凭证已停用\"}");
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client identity build failed\"}");
     }
+    credential = effective_credential;
     /*
      * The identity names its account by id; the name it recorded may since belong to another
      * account. As Java and Go do, the account is loaded by id within the credential's tenant, and its
@@ -4311,6 +4332,12 @@ static const char *admin_disconnect_reason_text(const char *reason)
     }
     if (strcmp(reason, "REPLACED_BY_NEW_LOGIN") == 0) {
         return "被新登录替换";
+    }
+    if (strcmp(reason, "AUTH_SOURCE_RETIRED") == 0) {
+        return "原控制连接已失效";
+    }
+    if (strcmp(reason, "SOURCE_PROCESS_GONE") == 0) {
+        return "所属服务进程退出后清理";
     }
     if (strcmp(reason, "ADMIN_DISABLED") == 0) {
         return "管理员停用账号";
@@ -5904,7 +5931,7 @@ static int append_peer_mesh_service_view(st_admin_string_builder *builder,
     if (rc == 0) rc = admin_sb_append(builder, ",\"instances\":[");
     st_peer_mesh_service_instance instances[64];
     size_t instance_count = 0U;
-    if (rc == 0 && st_peer_mesh_list_service_instances(service->tenant_id, service->client_id,
+    if (rc == 0 && st_peer_mesh_list_service_instances(database_path, service->tenant_id, service->client_id,
             service->service_id, instances, 64U, &instance_count) != 0) rc = -1;
     for (size_t i = 0; rc == 0 && i < instance_count; ++i) {
         st_peer_mesh_service_instance *instance = &instances[i];
@@ -7202,7 +7229,7 @@ static int handle_peer_mesh_service_import(const st_admin_context *context,
         }
         st_peer_mesh_mdns_candidate candidates[256];
         size_t candidate_count = 0U;
-        if (st_peer_mesh_list_mdns_candidates(client.tenant_id, client.id, candidates,
+        if (st_peer_mesh_list_mdns_candidates(database_path, client.tenant_id, client.id, candidates,
                                               256U, &candidate_count) != 0) {
             rc = -1;
         }
@@ -8644,16 +8671,18 @@ static int handle_client_create(const st_admin_context *context, const char *bod
         free(client_name);
         return len;
     }
-    int rc = st_storage_upsert_client(database_path,
-                                      0,
-                                      context->tenant_id,
-                                      client_name,
-                                      context->username,
-                                      enabled,
-                                      rate_limit,
-                                      &client);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_create_client_current_actor(database_path, &actor, &builtin, client_name,
+                                                    enabled, rate_limit, &client);
+    int refusal = 0;
+    if (rc == ST_STORAGE_CLIENT_NAME_EXISTS) refusal = write_client_name_exists(client_name, out, out_len);
+    else if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+        refusal = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
     free(client_name);
     if (rc != 0) {
+        if (refusal != 0) return refusal;
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client create failed\"}");
     }
     admin_notify_peer_mesh_refresh(client.tenant_id);
@@ -8695,27 +8724,33 @@ static int handle_client_update(const st_admin_context *context, long long id, c
         return len;
     }
     int enabled = existing.enabled;
-    (void)admin_jackson_boolean(body, "enabled", &enabled);
+    int enabled_provided = admin_jackson_boolean(body, "enabled", &enabled) == 1;
     int rate_limit = existing.connection_rate_limit_per_minute;
-    (void)admin_jackson_int(body, "connectionRateLimitPerMinute", &rate_limit);
+    int rate_provided = admin_jackson_int(body, "connectionRateLimitPerMinute", &rate_limit) == 1;
     st_storage_client updated;
     st_storage_share_ids revoked = {0};
     /* Disabling the client ends the shares of all its routes in the same transaction. */
-    int rc = st_storage_update_client_audited(database_path,
-                                              id,
-                                              next_client_name,
-                                              enabled,
-                                              rate_limit,
-                                              context->username,
-                                              st_http_share_now_ms(),
-                                              &updated,
-                                              &revoked);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    st_storage_client_patch patch = {name_given ? client_name : NULL, enabled_provided, enabled, rate_provided, rate_limit};
+    /* Replace the earlier read with the actual transactional before-state for notifications. */
+    int rc = st_storage_patch_client_visible_audited(database_path, id, &actor, &builtin, &patch,
+                                                    st_http_share_now_ms(), &existing, &updated, &revoked);
+    int refusal = 0;
+    if (rc == ST_STORAGE_CLIENT_NAME_EXISTS) refusal = write_client_name_exists(client_name, out, out_len);
+    else if (rc == ST_STORAGE_CLIENT_NOT_VISIBLE)
+        refusal = write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
+    else if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+        refusal = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
     free(client_name);
-    admin_share_cut_revoked(&revoked);
-    st_storage_share_ids_free(&revoked);
     if (rc != 0) {
+        st_storage_share_ids_free(&revoked);
+        if (refusal != 0) return refusal;
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"client update failed\"}");
     }
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
     /*
      * As Go's management API: the online connections of a disabled or renamed client are closed,
      * so none keeps serving under a name or route set the server no longer has.
@@ -8743,13 +8778,29 @@ static int handle_client_delete(const st_admin_context *context, long long id, c
     }
     /* Its routes go with it, audited as route.deleted, and their shares end. */
     st_storage_share_ids revoked = {0};
-    int rc = st_storage_delete_client_audited(database_path, id, context->username, st_http_share_now_ms(),
-                                              &revoked);
-    admin_share_cut_revoked(&revoked);
-    st_storage_share_ids_free(&revoked);
+    st_storage_peer_close *closed = NULL;
+    size_t closed_count = 0U;
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_delete_client_visible_audited(database_path, id, &actor, &builtin, st_http_share_now_ms(),
+                                                     &existing, &revoked, &closed, &closed_count);
     if (rc != 0) {
+        st_storage_share_ids_free(&revoked);
+        free(closed);
+        if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+            return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found\"}");
     }
+    admin_share_cut_revoked(&revoked);
+    st_storage_share_ids_free(&revoked);
+    pthread_mutex_lock(&admin_peer_mesh_refresh_lock);
+    st_admin_peer_client_deleted_handler deleted_handler = admin_peer_client_deleted_handler;
+    void *deleted_ctx = admin_peer_client_deleted_ctx;
+    pthread_mutex_unlock(&admin_peer_mesh_refresh_lock);
+    if (deleted_handler != NULL && deleted_handler(deleted_ctx, &existing, closed, closed_count) != 0)
+        fprintf(stderr, "[peer-mesh] failed to queue deleted client notification id=%lld\n", existing.id);
+    free(closed);
     admin_close_client_connections(existing.client_name, "ADMIN_DELETED");
     admin_notify_peer_mesh_refresh(existing.tenant_id);
     return write_response(out, out_len, 204, "No Content", "");
@@ -10641,18 +10692,17 @@ static int handle_credential_create(const st_admin_context *context, const char 
     /* A plain insert: a create that races another one for the api key never replaces it; Java's
      * unique column refuses it and GlobalExceptionHandler answers 400. */
     st_storage_client_credential credential;
-    int rc = st_storage_insert_client_credential(database_path,
-                                                 context->tenant_id,
-                                                 context->username,
-                                                 api_key,
-                                                 secret_hash,
-                                                 enabled,
-                                                 max_online_instances,
-                                                 &credential);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_create_client_credential_current_actor(database_path, &actor, &builtin,
+        api_key, secret_hash, enabled, max_online_instances, &credential);
     free(api_key);
     if (rc != 0) {
         free(secret);
-        return rc > 0
+        if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+            return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+        return rc == ST_STORAGE_CREDENTIAL_KEY_EXISTS
             ? write_response(out, out_len, 400, "Bad Request", "{\"error\":\"客户端名称已存在或数据不符合约束\"}")
             : write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential create failed\"}");
     }
@@ -10687,7 +10737,7 @@ static int handle_credential_update(const st_admin_context *context,
     /* Java updateCredential: only what the request carries changes, in this order. */
     char *api_key = st_json_get_string(body, "apiKey");
     char *secret = st_json_get_string(body, "secret");
-    const char *next_api_key = existing.api_key;
+    const char *next_api_key = NULL;
     int answer = 0;
     if (admin_java_has_text(api_key)) {
         st_storage_client_credential duplicate;
@@ -10700,7 +10750,7 @@ static int handle_credential_update(const st_admin_context *context,
         next_api_key = api_key;
     }
     char secret_hash[ST_SHA256_HEX_LEN + 1];
-    const char *secret_hash_ptr = existing.secret_hash;
+    const char *secret_hash_ptr = NULL;
     const char *revealed_secret = NULL;
     if (answer == 0 && admin_java_has_text(secret)) {
         if (password_hash_hex(admin_java_trim(secret), secret_hash) != 0) {
@@ -10714,7 +10764,7 @@ static int handle_credential_update(const st_admin_context *context,
     int max_online_instances = existing.max_online_instances <= 0
         ? client_auth_default_max_online_instances()
         : existing.max_online_instances;
-    (void)admin_jackson_boolean(body, "enabled", &enabled);
+    int enabled_provided = admin_jackson_boolean(body, "enabled", &enabled) == 1;
     int max_online = answer == 0 ? admin_credential_max_online(body, &max_online_instances) : 0;
     if (answer == 0 && max_online == -2) {
         answer = write_spring_bad_request(out, out_len);
@@ -10727,17 +10777,22 @@ static int handle_credential_update(const st_admin_context *context,
         return answer;
     }
     st_storage_client_credential credential;
-    int rc = st_storage_upsert_client_credential(database_path,
-                                                 existing.id,
-                                                 existing.tenant_id,
-                                                 existing.owner_username,
-                                                 next_api_key,
-                                                 secret_hash_ptr,
-                                                 enabled,
-                                                 max_online_instances,
-                                                 &credential);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    /* An account-less authenticated context also covers the existing trusted default-admin
+     * embedding mode. Database identities always have a bound key and cannot take this branch. */
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    st_storage_credential_patch patch = {next_api_key, secret_hash_ptr, enabled_provided, enabled,
+                                        max_online == 1, max_online_instances};
+    int rc = st_storage_patch_client_credential_visible(database_path, existing.id, &actor, &builtin, &patch, &credential);
     int response_len;
-    if (rc != 0) {
+    if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED) {
+        response_len = write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+    } else if (rc == ST_STORAGE_CREDENTIAL_NOT_VISIBLE) {
+        response_len = write_credential_not_found(id, out, out_len);
+    } else if (rc == ST_STORAGE_CREDENTIAL_KEY_EXISTS) {
+        response_len = write_response(out, out_len, 400, "Bad Request", ST_ADMIN_API_KEY_EXISTS_BODY);
+    } else if (rc != 0) {
         response_len = write_response(out, out_len, 409, "Conflict", "{\"error\":\"credential update failed\"}");
     } else {
         response_len = build_credential_result_response(&credential, revealed_secret, 200, "OK", out, out_len);
@@ -10756,10 +10811,16 @@ static int handle_credential_delete(const st_admin_context *context, long long i
     }
     st_storage_client_credential existing;
     if (st_storage_get_client_credential(database_path, id, &existing) != 0
-        || !admin_can_access_credential(context, &existing)
-        || st_storage_delete_client_credential(database_path, id) != 0) {
+        || !admin_can_access_credential(context, &existing)) {
         return write_credential_not_found(id, out, out_len);
     }
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    int rc = st_storage_delete_client_credential_visible(database_path, id, &actor, &builtin);
+    if (rc == ST_STORAGE_MANAGEMENT_ACTOR_CHANGED)
+        return write_response(out, out_len, 403, "Forbidden", "{\"error\":\"账号未绑定、已禁用或权限已撤销\"}");
+    if (rc != 0) return write_credential_not_found(id, out, out_len);
     return write_response(out, out_len, 204, "No Content", "");
 }
 
@@ -12460,6 +12521,48 @@ static int write_auth_refusal(char *out,
         : write_response(out, out_len, status, reason, body);
 }
 
+/* Use the unbounded response path, never silently truncate a large group. */
+static int handle_owner_transfer_preview(const st_admin_context *context, int group, long long id,
+                                         int id_valid, char *out, size_t out_len)
+{
+    if (!context->admin) return write_workbench_error(out, out_len, 403, "FORBIDDEN", "FORBIDDEN", 0);
+    if (!id_valid) return write_workbench_error(out, out_len, 400, "INVALID_TRANSFER_REQUEST", "INVALID_TRANSFER_REQUEST", 0);
+    st_owner_snapshot snapshot;
+    if (st_owner_snapshot_load(admin_database_path(), context->tenant_id, group, id, &snapshot) != 0)
+        return write_workbench_error(out, out_len, 500, "INTERNAL_SERVER_ERROR", "INTERNAL_SERVER_ERROR", 0);
+    char *json = NULL;
+    char revision[65];
+    const char *code = NULL;
+    int status = st_owner_transfer_preview(context->tenant_id, context->admin, group, id, &snapshot, &json, revision, &code);
+    st_owner_snapshot_free(&snapshot);
+    if (status != 200) return write_workbench_error(out, out_len, status, code, code, 0);
+    int result = write_unbounded_response(out, out_len, 200, "OK", json);
+    free(json);
+    return result;
+}
+
+static int handle_owner_transfer_write(const st_admin_context *context, int group, long long id,
+                                       int id_valid, const char *body, char *out, size_t out_len)
+{
+    if (!context->admin) return write_workbench_error(out, out_len, 403, "FORBIDDEN", "FORBIDDEN", 0);
+    if (!id_valid) return write_workbench_error(out, out_len, 400, "INVALID_TRANSFER_REQUEST", "INVALID_TRANSFER_REQUEST", 0);
+    st_storage_management_actor actor = {context->username, context->tenant_id, context->account_key};
+    st_storage_share_builtin_admin builtin = admin_share_builtin_admin();
+    builtin.accepted = builtin.accepted || (context->authenticated && context->account_key[0] == '\0');
+    st_storage_owner_transfer_result transfer = {0};
+    const char *code = NULL;
+    int status = st_storage_transfer_owner(admin_database_path(), &actor, &builtin, group, id,
+                                           body, st_workbench_now_ms(), &transfer, &code);
+    if (status != 200) return write_workbench_error(out, out_len, status, code, code, 0);
+    /* The transaction committed its durable event before publishing this result. Every instance's
+     * maintenance worker independently consumes that journal and retries failures. Do not drain
+     * its cursor here, race maintenance, notify before commit, or turn a delivery failure into a
+     * rollback-looking HTTP error after a successful transfer. No-op writes publish no event. */
+    int result = write_unbounded_response(out, out_len, 200, "OK", transfer.json);
+    st_storage_owner_transfer_result_free(&transfer);
+    return result;
+}
+
 /* Only failures of the store are logged, and never with the reference: no access log can form. */
 static void admin_workbench_log_unavailable(const st_admin_context *context, st_workbench_op op)
 {
@@ -13071,6 +13174,12 @@ static int st_admin_build_response_internal(const char *method,
     if (product_metrics_path) {
         return handle_product_metrics_request(&context, method, path, body, body_len, out, out_len);
     }
+    int owner_group = 0, owner_id_valid = 0;
+    long long owner_id = 0;
+    if (strcmp(method, "GET") == 0 && st_owner_transfer_match(path, &owner_group, &owner_id, &owner_id_valid))
+        return handle_owner_transfer_preview(&context, owner_group, owner_id, owner_id_valid, out, out_len);
+    if (strcmp(method, "POST") == 0 && st_owner_transfer_match(path, &owner_group, &owner_id, &owner_id_valid))
+        return handle_owner_transfer_write(&context, owner_group, owner_id, owner_id_valid, body, out, out_len);
     st_workbench_request workbench_request;
     if (st_workbench_match(method, path, &workbench_request)) {
         return handle_workbench_request(&context, &workbench_request, out, out_len);
@@ -15498,6 +15607,15 @@ static void direct_sink_on_reset(void *ctx, uint32_t code, const char *reason)
     fflush(stderr);
 }
 
+static void direct_sink_on_link_lost(void *ctx)
+{
+    /* The forwarder invokes this under its pending-list lock and removes that pending entry
+     * before returning. This browser owner cannot close/reuse fd until that return. No send,
+     * share-registry callback or lock acquisition here: shutdown interrupts an in-flight send. */
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    shutdown(state->fd, SHUT_RDWR);
+}
+
 static void direct_free_strings(char **values, size_t values_len)
 {
     if (values == NULL) {
@@ -16344,7 +16462,7 @@ static int admin_direct_ws_write_locked(st_admin_direct_ws_stream *stream,
                                         const uint8_t *payload,
                                         size_t payload_len)
 {
-    if (stream->closed || stream->close_sent || stream->handshake_pending) {
+    if (stream->closed || stream->close_sent || stream->handshake_pending || atomic_load(&stream->retired)) {
         return -1;
     }
     if (admin_send_websocket_frame_ex(stream->fd, fin, 0U, opcode, payload, payload_len) != 0) {
@@ -16379,7 +16497,9 @@ static void admin_direct_ws_abort_locked(st_admin_direct_ws_stream *stream)
 {
     if (!stream->closed) {
         stream->closed = 1;
-        shutdown(stream->fd, SHUT_RDWR);
+        pthread_mutex_lock(&admin_direct_ws_ref_lock);
+        if (stream->fd_attached) shutdown(stream->fd, SHUT_RDWR);
+        pthread_mutex_unlock(&admin_direct_ws_ref_lock);
     }
     pthread_cond_broadcast(&stream->handshake_cond);
 }
@@ -16395,10 +16515,16 @@ static void admin_direct_ws_close_flow(st_admin_direct_ws_stream *stream)
 /* Client frames may race the 101 response, so they queue behind it rather than precede it. */
 static int admin_direct_ws_wait_handshake_locked(st_admin_direct_ws_stream *stream)
 {
-    while (stream->handshake_pending && !stream->closed) {
-        pthread_cond_wait(&stream->handshake_cond, &stream->send_lock);
+    while (stream->handshake_pending && !stream->closed && !atomic_load(&stream->retired)) {
+        /* Retirement cannot wait for send_lock (it may be held by a blocked write). Its atomic
+         * predicate plus this bounded wait also covers a broadcast racing entry to cond_wait. */
+        struct timespec wake;
+        clock_gettime(CLOCK_MONOTONIC, &wake);
+        wake.tv_nsec += 100L * 1000000L;
+        if (wake.tv_nsec >= 1000000000L) { ++wake.tv_sec; wake.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&stream->handshake_cond, &stream->send_lock, &wake);
     }
-    return stream->closed ? -1 : 0;
+    return stream->closed || atomic_load(&stream->retired) ? -1 : 0;
 }
 
 /* Non-zero once a CLOSE went to the browser: the monotonic bound on waiting for its reply. */
@@ -16439,7 +16565,7 @@ static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream
         if (stream->close_deadline_ms > 0 && (limit == 0 || stream->close_deadline_ms < limit)) {
             limit = stream->close_deadline_ms;
         }
-        if (stream->flow_closed) {
+        if (stream->flow_closed || atomic_load(&stream->retired)) {
             pthread_mutex_unlock(&stream->flow_lock);
             return -1;
         }
@@ -16584,7 +16710,9 @@ int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
     pthread_mutex_lock(&stream->send_lock);
     (void)admin_direct_ws_wait_handshake_locked(stream);
     int result;
-    if (stream->peer_finished) {
+    if (atomic_load(&stream->retired)) {
+        result = ST_ADMIN_DIRECT_WS_ACCEPTED; /* A retained callback cannot revive the stream. */
+    } else if (stream->peer_finished) {
         result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
     } else if (!decoded || stream->peer_close_received) {
         /* A malformed envelope, or anything after the client's own CLOSE. */
@@ -16619,7 +16747,9 @@ int st_admin_direct_ws_peer_finished(st_admin_direct_ws_stream *stream)
     }
     pthread_mutex_lock(&stream->send_lock);
     int result = ST_ADMIN_DIRECT_WS_ACCEPTED;
-    if (stream->peer_finished) {
+    if (atomic_load(&stream->retired)) {
+        /* Already retired, including a FIN captured before the namespace was detached. */
+    } else if (stream->peer_finished) {
         result = ST_ADMIN_DIRECT_WS_AFTER_FIN;
         admin_direct_ws_fail_locked(stream, result);
     } else {
@@ -16647,7 +16777,7 @@ static void admin_direct_ws_shutdown(st_admin_direct_ws_stream *stream,
                                      uint16_t code,
                                      const char *reason)
 {
-    if (stream == NULL) {
+    if (stream == NULL || atomic_load(&stream->retired)) {
         return;
     }
     pthread_mutex_lock(&stream->send_lock);
@@ -16679,7 +16809,7 @@ int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32
         return -1;
     }
     /* Credit racing the stream's own shutdown is harmless; only window overflow is a violation. */
-    if (!stream->flow_closed) {
+    if (!stream->flow_closed && !atomic_load(&stream->retired)) {
         stream->send_credit += credit;
         pthread_cond_broadcast(&stream->flow_cond);
     }
@@ -16690,6 +16820,31 @@ int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
 {
     admin_direct_ws_shutdown(stream, ST_ADMIN_WS_CLOSE_GOING_AWAY, "");
+}
+
+void st_admin_direct_ws_retire(st_admin_direct_ws_stream *stream)
+{
+    if (stream == NULL) return;
+    atomic_store(&stream->retired, 1);
+    /* Never wait for a writer. A single nonblocking send preserves graceful 1001 when possible;
+     * a partial/failed write or an occupied send lock instead gets immediate transport abort. */
+    if (pthread_mutex_trylock(&stream->send_lock) == 0) {
+        if (!stream->closed && !stream->close_sent && !stream->handshake_pending) {
+            const uint8_t close_frame[] = {0x88U, 2U, 0x03U, 0xe9U};
+            if (send(stream->fd, close_frame, sizeof(close_frame), MSG_DONTWAIT | MSG_NOSIGNAL)
+                == (ssize_t)sizeof(close_frame)) stream->close_sent = 1;
+        }
+        stream->closed = 1;
+        pthread_cond_broadcast(&stream->handshake_cond);
+        pthread_mutex_unlock(&stream->send_lock);
+    }
+    /* Ref lifetime is separate from fd lifetime: a captured NAT reference can outlive the browser
+     * handler. mark_closed clears attached under this lock BEFORE handle_client closes/reuses fd. */
+    pthread_mutex_lock(&admin_direct_ws_ref_lock);
+    if (stream->fd_attached) shutdown(stream->fd, SHUT_RDWR);
+    pthread_mutex_unlock(&admin_direct_ws_ref_lock);
+    pthread_cond_broadcast(&stream->handshake_cond);
+    admin_direct_ws_close_flow(stream);
 }
 
 /* The share this WebSocket was opened through ended: 1008 to the browser, RST to the client. */
@@ -17756,6 +17911,9 @@ static void admin_direct_ws_mark_closed(st_admin_direct_ws_stream *stream)
 {
     pthread_mutex_lock(&stream->send_lock);
     stream->closed = 1;
+    pthread_mutex_lock(&admin_direct_ws_ref_lock);
+    stream->fd_attached = 0;
+    pthread_mutex_unlock(&admin_direct_ws_ref_lock);
     stream->handshake_pending = 0;
     pthread_cond_broadcast(&stream->handshake_cond);
     pthread_mutex_unlock(&stream->send_lock);
@@ -18181,17 +18339,19 @@ static void admin_direct_ws_run(st_admin_server *server,
         return;
     }
     stream->fd = fd;
+    stream->fd_attached = 1;
+    atomic_init(&stream->retired, 0);
     stream->send_credit = ST_ADMIN_STREAM_INITIAL_WINDOW;
     stream->handshake_pending = 1;
     stream->refs = 1U;
     admin_utf8_reset(&stream->outbound_utf8);
     pthread_mutex_init(&stream->send_lock, NULL);
-    pthread_cond_init(&stream->handshake_cond, NULL);
     pthread_mutex_init(&stream->flow_lock, NULL);
     /* Credit waits are bounded by monotonic deadlines, so the condition uses that clock too. */
     pthread_condattr_t flow_cond_attr;
     pthread_condattr_init(&flow_cond_attr);
     pthread_condattr_setclock(&flow_cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&stream->handshake_cond, &flow_cond_attr);
     pthread_cond_init(&stream->flow_cond, &flow_cond_attr);
     pthread_condattr_destroy(&flow_cond_attr);
 
@@ -18213,6 +18373,7 @@ static void admin_direct_ws_run(st_admin_server *server,
     };
     int open_rc = server->direct_ws_open(server->direct_ws_ctx, &direct);
     if (open_rc != 0) {
+        admin_direct_ws_mark_closed(stream);
         st_admin_direct_ws_release(stream);
         free(accept_key);
         if (open_rc == -3) {
@@ -18243,7 +18404,8 @@ static void admin_direct_ws_run(st_admin_server *server,
      * 101 is written under send_lock, so no WebSocket frame can reach the browser before it.
      */
     pthread_mutex_lock(&stream->send_lock);
-    int upgraded = !stream->closed && response_len > 0 && (size_t)response_len < sizeof(response)
+    int upgraded = !stream->closed && !atomic_load(&stream->retired)
+        && response_len > 0 && (size_t)response_len < sizeof(response)
         && send_all(fd, response, (size_t)response_len) == 0;
     stream->handshake_pending = 0;
     if (!upgraded) {
@@ -18446,6 +18608,7 @@ static void admin_forward_direct_http(st_admin_server *server,
         .on_data = direct_sink_on_data,
         .on_end = direct_sink_on_end,
         .on_reset = direct_sink_on_reset,
+        .on_link_lost = direct_sink_on_link_lost,
         .bind_cancel = share == NULL ? NULL : direct_sink_bind_cancel
     };
     char remote_address[128];

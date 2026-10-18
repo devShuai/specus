@@ -21,6 +21,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.times;
+import static org.mockito.ArgumentMatchers.argThat;
 
 /**
  * A device that leaves has to be announced as gone, the way a device that arrives is announced as
@@ -31,9 +33,10 @@ class PeerSignalServiceLogoutTests {
 
     private final ClientAccountService accounts = mock(ClientAccountService.class);
     private final PeerMeshService mesh = mock(PeerMeshService.class);
+    private final PeerServiceDiscoveryService discovery = mock(PeerServiceDiscoveryService.class);
     private final PeerSignalService service = new PeerSignalService(accounts, mesh,
-            mock(PeerServiceDiscoveryService.class), mock(ClientSessionRepository.class),
-            mock(PeerEgressService.class));
+            discovery, mock(ClientSessionRepository.class),
+            mock(PeerEgressService.class), mock(PeerCatalogPublicationService.class));
     private final List<EmbeddedChannel> bound = new ArrayList<>();
 
     @AfterEach
@@ -75,6 +78,27 @@ class PeerSignalServiceLogoutTests {
 
         assertNull(consumerChannel.readOutbound(), "a device that is still bound was announced");
         verify(mesh, never()).rosterRefreshTargets(any());
+    }
+
+    @Test
+    void committedDeletionDefersDatabaseQueriesAndRetainsFailedRefreshForRetry() {
+        var event = new ClientPeerReferences.Deleted("tenant-a", 1202L, "deleted-gateway", List.of());
+        when(discovery.withdrawDeletedClient(any()))
+                .thenThrow(new IllegalStateException("temporary database failure"))
+                .thenReturn(List.of());
+
+        service.onClientDeleted(event);
+        verify(discovery, never()).withdrawDeletedClient(any());
+        verify(accounts, never()).listTenantAccounts("tenant-a");
+        service.refreshDeletedClients();
+        service.refreshDeletedClients();
+        service.refreshDeletedClients();
+
+        verify(discovery, times(2)).withdrawDeletedClient(argThat(account ->
+                account.getId() == 1202L && account.getTenantId().equals("tenant-a")
+                        && account.getClientName().equals("deleted-gateway")));
+        verify(discovery).onAuthorizationChanged("tenant-a");
+        verify(accounts).listTenantAccounts("tenant-a");
     }
 
     private EmbeddedChannel bind(String clientName) {

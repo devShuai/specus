@@ -118,6 +118,50 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
         }
         CheckPrivate(path);
     }
+    /// <summary>
+    /// Read one immutable published generation without blocking its atomic replacement. Sharing
+    /// delete is required on Windows even when this reader never deletes anything. Keep the
+    /// original private-file checks; access/ACL failures must not be swallowed as missing state.
+    /// Callers validate the private root before enumerating and bound this handle's length.
+    /// </summary>
+    internal static FileStream OpenSnapshot(string path) => RetrySnapshotSharing(() =>
+    {
+        CheckPrivate(path);
+        // ReplaceFile briefly holds the incoming generation with write access as well. A new
+        // reader must share that handle, not just allow deletion of its old generation. Sharing
+        // grants no ACL rights; private owner/root/file validation above remains mandatory.
+        return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+    });
+    internal static T RetrySnapshotSharing<T>(Func<T> read)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try { return read(); }
+            catch (IOException failure) when (OperatingSystem.IsWindows()
+                && failure.HResult == unchecked((int)0x80070020) && attempt < 5)
+            {
+                // ReplaceFile can hold the arriving generation exclusively for a short window.
+                // Retry only ERROR_SHARING_VIOLATION, with at most 62ms total delay. Never turn
+                // unsafe ACLs, denied access or persistent I/O failure into a valid/empty state.
+                Thread.Sleep(2 << attempt);
+            }
+        }
+    }
+    internal static void PublishSnapshot(string temporary, string path)
+    {
+        CheckPrivate(Path.GetDirectoryName(path)!);
+        CheckPrivate(temporary);
+        if (File.Exists(path))
+        {
+            // ReplaceFile preserves destination security metadata: never copy new state into
+            // a destination whose ACL/owner was made unsafe. MoveFileEx cannot overwrite an
+            // open Windows target even when its readers share delete; ReplaceFile can.
+            CheckPrivate(path);
+            if (OperatingSystem.IsWindows()) File.Replace(temporary, path, null);
+            else File.Move(temporary, path, overwrite: true);
+        }
+        else File.Move(temporary, path); // no unchecked overwrite if another publisher wins
+    }
     public void OnStatusChanged(SpecusClientStatusSnapshot snapshot)
     {
         lock (_gate) { _authenticated = snapshot.LoggedIn; _ready = snapshot.Phase == "RUNNING";
@@ -149,7 +193,7 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
             using (var file = new FileStream(temporary, options))
             using (var writer = new StreamWriter(file, new UTF8Encoding(false))) writer.Write(json);
             ProtectNewFile(temporary);
-            File.Move(temporary, _path, overwrite: true);
+            PublishSnapshot(temporary, _path);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
@@ -204,11 +248,11 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
         foreach (var path in paths)
         {
             if (!File.Exists(path)) continue;
-            CheckPrivate(path);
-            if (new FileInfo(path).Length > 1024 * 1024) continue;
             try
             {
-                using var file = JsonDocument.Parse(File.ReadAllText(path)); var data = file.RootElement;
+                using var snapshot = OpenSnapshot(path);
+                if (snapshot.Length > 1024 * 1024) continue;
+                using var file = JsonDocument.Parse(snapshot); var data = file.RootElement;
                 if (!string.Equals(data.GetProperty("configPath").GetString(), config,
                     OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) || FreshPid(data) is null) continue;
                 fresh.Add(data.Clone());
@@ -257,9 +301,9 @@ internal sealed class CliState : ISpecusClientObserver, IDisposable
             {
                 try
                 {
-                    CheckPrivate(path);
-                    if (new FileInfo(path).Length > 1024 * 1024) continue;
-                    using var file = JsonDocument.Parse(File.ReadAllText(path)); var data = file.RootElement;
+                    using var snapshot = OpenSnapshot(path);
+                    if (snapshot.Length > 1024 * 1024) continue;
+                    using var file = JsonDocument.Parse(snapshot); var data = file.RootElement;
                     // The id first: it costs nothing, and the process lookup is for the one that matches.
                     if (data.TryGetProperty("pid", out var id) && id.ValueKind == JsonValueKind.Number && id.TryGetInt32(out var published)
                         && published == pid && FreshPid(data) == pid) return true;

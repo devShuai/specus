@@ -19,6 +19,18 @@ endif
 BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_auth_nonce.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/oidc.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/traffic_capture.o $(BUILD_DIR)/turn_auth.o $(BUILD_DIR)/stream_tombstones.o $(BUILD_DIR)/workbench.o $(BUILD_DIR)/http_share.o $(BUILD_DIR)/product_metrics.o $(BUILD_DIR)/upstream_browser_headers.o
 SERVER := $(BUILD_DIR)/specus-server-c
+CORE_OBJS += $(BUILD_DIR)/control_presence.o
+CORE_OBJS += $(BUILD_DIR)/owner_transfer.o
+CORE_OBJS += $(BUILD_DIR)/control_lifecycle.o
+CORE_OBJS += $(BUILD_DIR)/control_outbox.o
+PEER_OUTPUT_TESTS := $(BUILD_DIR)/specus_c_peer_output_tests
+OWNER_TRANSFER_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_tests
+OWNER_RUNTIME_TESTS := $(BUILD_DIR)/specus_c_owner_transfer_runtime_tests
+IDENTITY_COORDINATION_TESTS := $(BUILD_DIR)/specus_c_client_identity_coordination_tests
+AUTH_READ_BARRIER := $(BUILD_DIR)/libspecus_c_auth_read_barrier.so
+NAT_LIFECYCLE_BARRIER := $(BUILD_DIR)/libspecus_c_nat_lifecycle_barrier.so
+NAT_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_nat_lifecycle_tests
+STREAM_RETIREMENT_TESTS := $(BUILD_DIR)/specus_c_stream_retirement_tests
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
 DIRECT_WEBSOCKET_TESTS := $(BUILD_DIR)/specus_c_direct_websocket_tests
 CLIENT_ADDRESS_TESTS := $(BUILD_DIR)/specus_c_client_address_tests
@@ -72,6 +84,45 @@ MANAGEMENT_ACCOUNTS_TESTS := $(BUILD_DIR)/specus_c_management_accounts_tests
 TESTS := $(ADMIN_TESTS) $(DIRECT_WEBSOCKET_TESTS) $(CLIENT_ADDRESS_TESTS) $(CLIENT_AUTH_NONCE_TESTS) $(CONNECTIVITY_CHECK_TESTS) $(CRYPTO_TESTS) $(DECOMPRESSION_LIMITS_TESTS) $(GITHUB_RELEASE_TESTS) $(HTTP_CLIENT_TESTS) $(JSON_TESTS) $(LOGIN_RATE_LIMITER_TESTS) $(OBJECT_STORAGE_TESTS) $(OIDC_TESTS) $(PASSWORD_HASH_TESTS) $(PEER_EGRESS_TESTS) $(PEER_MESH_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(SECURITY_BASELINE_TESTS) $(STORAGE_TESTS) $(STUN_TURN_TESTS) $(TLS_TRANSPORT_TESTS) $(WORKBENCH_TESTS) $(MANAGEMENT_ACCOUNTS_TESTS) $(HTTP_SHARE_TESTS) $(SEMANTIC_VERSION_TESTS) $(TRAFFIC_CAPTURE_TESTS) $(TURNSTILE_VERIFIER_TESTS) $(UPSTREAM_BROWSER_HEADERS_TESTS) $(CLIENT_PACKAGE_TESTS) $(PUBLIC_CLUSTER_CODEC_TESTS) $(PUBLIC_TRANSFER_TESTS)
 ALL_TESTS := $(TESTS) $(PUBLIC_COORDINATION_TESTS) $(ELASTICSEARCH_TRAFFIC_TESTS) $(MEDIA_CAPTURE_TESTS) $(SESSION_LIFECYCLE_TESTS) $(SECURITY_RULES_TESTS) $(HTTP_ROUTE_LIFECYCLE_TESTS) $(NAT_STREAM_TESTS) $(PRODUCT_METRICS_TESTS) $(CONNECTION_ARCHIVE_TESTS) $(HTTP_WEBSOCKET_ROUTING_TESTS) $(TRAFFIC_DETAIL_API_TESTS) $(CLIENT_MESSAGES_TESTS) $(MANAGEMENT_LISTS_TESTS) $(MANAGEMENT_CRUD_TESTS) $(PEER_MESH_API_TESTS) $(MANAGEMENT_OVERVIEW_TESTS)
 ALL_TESTS += $(PEER_MESH_E2E_TESTS) $(CLIENT_ROUTE_SCALE_TESTS)
+ALL_TESTS += $(OWNER_TRANSFER_TESTS)
+ALL_TESTS += $(OWNER_RUNTIME_TESTS)
+ALL_TESTS += $(IDENTITY_COORDINATION_TESTS) $(AUTH_READ_BARRIER)
+ALL_TESTS += $(NAT_LIFECYCLE_TESTS) $(NAT_LIFECYCLE_BARRIER)
+ALL_TESTS += $(STREAM_RETIREMENT_TESTS)
+CONTROL_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_control_lifecycle_tests
+CONTROL_QUEUE_TESTS := $(BUILD_DIR)/specus_c_control_queue_tests
+CONTROL_BUSINESS_TESTS := $(BUILD_DIR)/specus_c_control_business_tests
+CONTROL_BUSINESS_BARRIER := $(BUILD_DIR)/libspecus_c_control_business_barrier.so
+ALL_TESTS += $(CONTROL_LIFECYCLE_TESTS) $(CONTROL_BUSINESS_TESTS) $(CONTROL_BUSINESS_BARRIER)
+ALL_TESTS += $(CONTROL_QUEUE_TESTS)
+CATALOG_RECONNECT_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_tests
+ALL_TESTS += $(CATALOG_RECONNECT_TESTS)
+CATALOG_RECONNECT_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_reconnect_e2e_tests
+ALL_TESTS += $(CATALOG_RECONNECT_E2E_TESTS)
+CONTROL_SOURCE_STORAGE_TESTS := $(BUILD_DIR)/specus_c_control_source_storage_tests
+ALL_TESTS += $(CONTROL_SOURCE_STORAGE_TESTS)
+CONTROL_SOURCE_WATCH_TESTS := $(BUILD_DIR)/specus_c_control_source_watch_tests
+ALL_TESTS += $(CONTROL_SOURCE_WATCH_TESTS)
+CONTROL_SOURCE_WATCH_E2E_TESTS := $(BUILD_DIR)/specus_c_control_source_watch_e2e_tests
+CONTROL_SOURCE_WATCH_BARRIER := $(BUILD_DIR)/libspecus_c_control_source_watch_barrier.so
+ALL_TESTS += $(CONTROL_SOURCE_WATCH_E2E_TESTS) $(CONTROL_SOURCE_WATCH_BARRIER)
+CONTROL_PRESENCE_TESTS := $(BUILD_DIR)/specus_c_control_presence_tests
+ALL_TESTS += $(CONTROL_PRESENCE_TESTS)
+DISCONNECT_REASONS_TESTS := $(BUILD_DIR)/specus_c_disconnect_reasons_vector_tests
+ALL_TESTS += $(DISCONNECT_REASONS_TESTS)
+CATALOG_SOURCE_TESTS := $(BUILD_DIR)/specus_c_catalog_source_tests
+ALL_TESTS += $(CATALOG_SOURCE_TESTS)
+CATALOG_READ_TESTS := $(BUILD_DIR)/specus_c_catalog_read_tests
+ALL_TESTS += $(CATALOG_READ_TESTS)
+CATALOG_BINDING_TESTS := $(BUILD_DIR)/specus_c_catalog_binding_tests
+ALL_TESTS += $(CATALOG_BINDING_TESTS)
+CONTROL_OUTBOX_TESTS := $(BUILD_DIR)/specus_c_control_outbox_tests
+CATALOG_ACCEPTANCE_TESTS := $(BUILD_DIR)/specus_c_catalog_acceptance_tests
+ALL_TESTS += $(CONTROL_OUTBOX_TESTS) $(CATALOG_ACCEPTANCE_TESTS)
+ALL_TESTS += $(PEER_OUTPUT_TESTS)
+CATALOG_SOURCE_E2E_TESTS := $(BUILD_DIR)/specus_c_catalog_source_e2e_tests
+CATALOG_SOURCE_BARRIER := $(BUILD_DIR)/libspecus_c_catalog_source_barrier.so
+ALL_TESTS += $(CATALOG_SOURCE_E2E_TESTS) $(CATALOG_SOURCE_BARRIER)
 
 .PHONY: all test release clean
 
@@ -83,7 +134,14 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
+$(BUILD_DIR)/storage.o $(BUILD_DIR)/owner_transfer.o: src/owner_transfer_internal.h src/owner_transfer.h src/storage.h
+$(BUILD_DIR)/peer_mesh.o: src/peer_mesh.h src/storage.h
+$(BUILD_DIR)/control_outbox.o: src/control_outbox.h
+$(BUILD_DIR)/protocol.o: src/protocol.h
+$(CONTROL_QUEUE_TESTS) $(CONTROL_SOURCE_WATCH_TESTS): src/control_outbox.h src/peer_mesh.h src/protocol.h
+$(BUILD_DIR)/control_presence.o $(BUILD_DIR)/storage.o: src/control_presence.h
+
+$(SERVER): $(CORE_OBJS) src/main.c src/peer_mesh.h src/storage.h src/control_presence.h src/control_outbox.h src/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
@@ -94,6 +152,33 @@ $(DIRECT_WEBSOCKET_TESTS): $(CORE_OBJS) tests/direct_websocket_tests.c | $(BUILD
 
 $(CLIENT_ADDRESS_TESTS): $(CORE_OBJS) tests/client_address_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_address_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(DISCONNECT_REASONS_TESTS): $(CORE_OBJS) tests/disconnect_reasons_vector_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration -DST_DISCONNECT_REASONS_FIXTURE_FILE='"$(abspath ../../../protocol/test-vectors/disconnect-reasons-v1.json)"' tests/disconnect_reasons_vector_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CATALOG_SOURCE_TESTS): $(CORE_OBJS) tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_source_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CATALOG_READ_TESTS): $(CORE_OBJS) tests/catalog_read_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_read_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CONTROL_OUTBOX_TESTS): $(CORE_OBJS) tests/control_outbox_tests.c src/control_outbox.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/control_outbox_tests.c $(CORE_OBJS) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -o $@
+
+$(PEER_OUTPUT_TESTS): $(CORE_OBJS) tests/peer_output_tests.c src/main.c src/peer_mesh.h src/protocol.h src/control_outbox.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/peer_output_tests.c $(CORE_OBJS) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -o $@
+
+$(CATALOG_ACCEPTANCE_TESTS): $(CORE_OBJS) tests/catalog_acceptance_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h src/control_outbox.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_acceptance_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -Wl,--wrap=sqlite3_exec -o $@
+
+$(CATALOG_BINDING_TESTS): $(CORE_OBJS) tests/catalog_binding_tests.c tests/catalog_source_tests.c src/peer_mesh.c src/peer_mesh.h src/storage.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_binding_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -o $@
+
+$(CATALOG_SOURCE_E2E_TESTS): $(CORE_OBJS) tests/catalog_source_e2e_tests.c tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/catalog_source_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CATALOG_SOURCE_BARRIER): tests/catalog_source_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 $(CLIENT_AUTH_NONCE_TESTS): $(CORE_OBJS) tests/client_auth_nonce_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_auth_nonce_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -234,11 +319,90 @@ $(WORKBENCH_TESTS): $(CORE_OBJS) tests/workbench_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/workbench_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) \
+	  -DST_MANAGEMENT_ACCOUNTS_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/management-accounts-v1.json)"' \
+	  -DST_CLIENT_PEER_DELETION_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/client-peer-deletion-v1.json)"' \
+	  tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(OWNER_TRANSFER_TESTS): $(CORE_OBJS) tests/owner_transfer_tests.c tests/owner_transfer_write_tests.h tests/owner_transfer_http_write_tests.h tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) \
+	  -DST_OWNER_TRANSFER_VECTOR_FILE='"$(abspath ../../../protocol/test-vectors/client-owner-transfer-plan-v1.json)"' \
+	  tests/owner_transfer_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(AUTH_READ_BARRIER): tests/auth_read_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lsqlite3 -ldl -lpthread -o $@
+
+$(NAT_LIFECYCLE_BARRIER): tests/nat_lifecycle_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -ldl -lpthread -o $@
+
+$(NAT_LIFECYCLE_TESTS): $(CORE_OBJS) tests/nat_lifecycle_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/nat_lifecycle_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(STREAM_RETIREMENT_TESTS): $(CORE_OBJS) tests/stream_retirement_tests.c tests/server_harness.c tests/server_harness.h src/admin_http.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/stream_retirement_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(OWNER_RUNTIME_TESTS): $(CORE_OBJS) tests/owner_transfer_runtime_tests.c tests/server_harness.c tests/server_harness.h src/peer_mesh.h src/storage.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/owner_transfer_runtime_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(IDENTITY_COORDINATION_TESTS): $(CORE_OBJS) tests/client_identity_coordination_tests.c tests/management_ws_coordination_tests.h tests/peer_session_coordination_tests.h tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/client_identity_coordination_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CONTROL_LIFECYCLE_TESTS): $(CORE_OBJS) tests/control_lifecycle_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_lifecycle_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONTROL_QUEUE_TESTS): $(CORE_OBJS) tests/control_queue_tests.c src/main.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_queue_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CATALOG_RECONNECT_TESTS): $(CORE_OBJS) tests/catalog_reconnect_tests.c src/peer_mesh.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CONTROL_SOURCE_STORAGE_TESTS): $(CORE_OBJS) tests/control_source_storage_tests.c src/peer_mesh.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_storage_tests.c $(filter-out $(BUILD_DIR)/peer_mesh.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CONTROL_SOURCE_WATCH_TESTS): $(CORE_OBJS) tests/control_source_watch_tests.c src/main.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_watch_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONTROL_PRESENCE_TESTS): $(CORE_OBJS) tests/control_presence_tests.c src/storage.c src/control_presence.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror=implicit-function-declaration tests/control_presence_tests.c $(filter-out $(BUILD_DIR)/storage.o,$(CORE_OBJS)) $(LDFLAGS) -o $@
+
+$(CONTROL_SOURCE_WATCH_E2E_TESTS): $(CORE_OBJS) tests/control_source_watch_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_source_watch_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CONTROL_SOURCE_WATCH_BARRIER): tests/control_source_watch_barrier.c | $(BUILD_DIR)
+	$(CC) -std=c11 -Wall -Wextra -fPIC -shared $< -lsqlite3 -lpthread -ldl -o $@
+
+$(CATALOG_RECONNECT_E2E_TESTS): $(CORE_OBJS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/catalog_reconnect_e2e_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CONTROL_BUSINESS_TESTS): $(CORE_OBJS) tests/control_business_tests.c tests/server_harness.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_business_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -ldl -o $@
+
+$(CONTROL_BUSINESS_BARRIER): tests/control_business_barrier.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -lpthread -lsqlite3 -ldl -o $@
 
 test: all
+	$(PEER_OUTPUT_TESTS)
+	$(CONTROL_OUTBOX_TESTS)
+	$(CATALOG_ACCEPTANCE_TESTS)
+	$(CATALOG_BINDING_TESTS)
+	$(CATALOG_READ_TESTS)
+	$(CATALOG_SOURCE_TESTS)
+	$(CATALOG_SOURCE_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CATALOG_SOURCE_BARRIER))
+	$(DISCONNECT_REASONS_TESTS)
+	$(CONTROL_LIFECYCLE_TESTS)
+	$(CONTROL_QUEUE_TESTS)
+	$(CATALOG_RECONNECT_TESTS)
+	$(CONTROL_SOURCE_STORAGE_TESTS)
+	$(CONTROL_SOURCE_WATCH_TESTS)
+	$(CONTROL_PRESENCE_TESTS)
+	$(CONTROL_SOURCE_WATCH_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_SOURCE_WATCH_BARRIER))
+	$(CATALOG_RECONNECT_E2E_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
+	$(CONTROL_BUSINESS_TESTS) $(abspath $(SERVER)) $(abspath $(CONTROL_BUSINESS_BARRIER))
 	@for test in $(TESTS); do $$test || exit 1; done
 	bash scripts/public_coordination_test.sh $(PUBLIC_COORDINATION_TESTS)
+	python3 tests/fixture_isolation_tests.py
+	python3 tests/smoke_build_tests.py
+	python3 tests/smoke_server_selection_tests.py
 	bash scripts/public_discovery_cluster_e2e.sh $(SERVER)
 	python3 scripts/management_cluster_e2e.py $(SERVER)
 	SPECUS_TEST_OSS_START_DELAY_SECONDS=0.5 bash scripts/object_storage_e2e.sh $(SERVER)
@@ -260,6 +424,11 @@ test: all
 	$(MANAGEMENT_OVERVIEW_TESTS) $(SERVER)
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)
+	$(OWNER_TRANSFER_TESTS) $(SERVER)
+	$(OWNER_RUNTIME_TESTS) $(SERVER)
+	$(IDENTITY_COORDINATION_TESTS) $(abspath $(SERVER)) $(abspath $(AUTH_READ_BARRIER))
+	$(NAT_LIFECYCLE_TESTS) $(abspath $(SERVER)) $(abspath $(NAT_LIFECYCLE_BARRIER))
+	$(STREAM_RETIREMENT_TESTS) $(abspath $(SERVER)) $(abspath $(NAT_LIFECYCLE_BARRIER))
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
 release: clean $(SERVER)

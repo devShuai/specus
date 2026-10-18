@@ -251,6 +251,20 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
         CancellationToken cancellationToken = default) =>
         WriteDirectAsync(PacketCodec.Encode(packet), cancellationToken, commit: commit);
 
+    public async ValueTask<bool> WritePreparedAsync(Func<CancellationToken, ValueTask<Packet?>> prepare,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(prepare);
+        try
+        {
+            return await WriteEncodedAsync(null, cancellationToken, prepare: prepare).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new ObjectDisposedException(nameof(SpecusConnection));
+        }
+    }
+
     private async ValueTask WriteDirectAsync(byte[] bytes, CancellationToken cancellationToken,
         DisconnectReason failureReason = DisconnectReason.IoError, Action? commit = null)
     {
@@ -322,17 +336,32 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
     /// is held and before the frame is written, and not at all when the lock wait is cancelled or
     /// the connection already failed a write.
     /// </summary>
-    private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken,
-        DisconnectReason failureReason = DisconnectReason.IoError, Action? commit = null)
+    private async Task<bool> WriteEncodedAsync(byte[]? bytes, CancellationToken cancellationToken,
+        DisconnectReason failureReason = DisconnectReason.IoError, Action? commit = null,
+        Func<CancellationToken, ValueTask<Packet?>>? prepare = null)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         var failed = false;
+        var preparedBytes = 0L;
         try
         {
             if (_writeFailed)
             {
                 throw new IOException("the connection was closed after a failed write");
             }
+            if (prepare is not null)
+            {
+                using var pending = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeCts.Token);
+                pending.Token.ThrowIfCancellationRequested();
+                var packet = await prepare(pending.Token).ConfigureAwait(false);
+                pending.Token.ThrowIfCancellationRequested();
+                if (packet is null) return false;
+                if (packet is NatMessagePacket { NatMessageType: NatMessageType.Data or NatMessageType.Fin, StreamId: not 0 })
+                    throw new InvalidOperationException("prepared control writes cannot bypass NAT stream scheduling");
+                bytes = PacketCodec.Encode(packet);
+                preparedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
+            }
+            if (bytes is null) throw new InvalidOperationException("a physical frame requires encoded bytes");
             commit?.Invoke();
             try
             {
@@ -352,9 +381,11 @@ internal sealed class SpecusConnection : IFrameWriter, IAsyncDisposable
                 throw;
             }
             Volatile.Write(ref _lastWriteTicks, Environment.TickCount64);
+            return true;
         }
         finally
         {
+            if (preparedBytes > 0) Context.WriteBackpressure.ReleasePending(preparedBytes);
             _writeLock.Release();
             if (failed)
             {

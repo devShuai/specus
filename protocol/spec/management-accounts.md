@@ -4,7 +4,7 @@
 
 关联 [issue #183](https://github.com/devShuai/specus/issues/183)；账号删除与 token 的账号键声明见 [issue #199](https://github.com/devShuai/specus/issues/199)，删除账号时按登录名记录的数据怎样处理见 [issue #225](https://github.com/devShuai/specus/issues/225)，账号的访问权变化时管理 WebSocket 怎样失效见 [issue #236](https://github.com/devShuai/specus/issues/236)。参考实现是 Java server：`ManagementUser`、`ManagementUserService`、`ManagementUserSchemaMigrator`、`AuthController`、`ManagementContextResolver`、`LocalTokenService`，测试 `ManagementUserServiceTests`、`ManagementUserServiceIntegrationTests`、`ManagementUserSchemaMigratorTests`。
 
-**状态：四个服务端已实现。** 第 11 节列出各端的书面差异。
+**状态：既有账号契约四个服务端已实现。** 第 11 节列出各端的书面差异；7.3 节新增的归属转移契约仍是待实现草案，不能视为已交付。
 
 ## 1. 名词
 
@@ -148,7 +148,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
    {"error": "该账号仍拥有 2 个客户端、1 个接入凭证，需先转移或删除", "clients": 2, "credentials": 1}
    ```
 
-   两个计数都给出，为零的也给；`error` 的措辞各端可以不同（C 为英文）。客户端带着在用的隧道，凭证会在客户端登录时派生新的客户端，这些不能被一次账号删除顺带删掉或交给别人，由管理员先删除，或把归属转给其他账号。目前没有修改 `owner_username` 的接口，转移只能直接改数据；转移客户端时它的 Peer Mesh 设备行要一起改（设备行的归属跟随客户端，客户端每次登录也会刷新）。
+   两个计数都给出，为零的也给；`error` 的措辞各端可以不同（C 为英文）。客户端带着在用的隧道，凭证会在客户端登录时派生新的客户端，这些不能被一次账号删除顺带删掉或交给别人，由管理员先删除，或把归属转给其他账号。安全的管理归属转移流程见 7.3 节；该接口尚待实现，不能用直接改客户端归属替代凭证组一致性处理。
 2. **个人数据随账号删除**，与账号行、邮箱记录同一事务：
 
    | 数据 | 处理 |
@@ -158,7 +158,7 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
    | 绘图文档 `user_diagram_document` | 删除该身份的全部文档；文档只有作者本人能读写，管理员也看不到别人的 |
    | 云端附件 `transfer_attachment` | 该身份上传、状态不是 `EXPIRED` 且尚未过期的附件，`expires_at` 与 `upload_expires_at` 都改为删除时刻：之后不能再完成上传、签发或领取下载，也不再计入存储额度；下一次过期扫描（[public-transfer.md](public-transfer.md) 第 3.4 节）删除存储里的对象并标为 `EXPIRED`。不直接删行，因为行是删除对象的唯一依据 |
    | 附件下载授权 `transfer_attachment_download_grant`、下载用量 `transfer_attachment_download_usage` | 删除该身份（`tenant_id` + `username`）的全部行：未领取的授权失效，本月下载用量不会算到同名新账号头上 |
-   | Peer Mesh 设备 `peer_mesh_device` | 删除该身份名下、所属客户端已不存在的行（删除客户端时设备行不随之删除，这些是残留）。所属客户端还在的行不动 |
+   | Peer Mesh 设备 `peer_mesh_device` | 删除该身份名下、所属客户端已不存在的历史残留行。客户端删除的完整清理契约见 [`client-peer-deletion-v1.json`](../test-vectors/client-peer-deletion-v1.json)；所属客户端还在的行不动 |
    | 临时 HTTP 分享 | 该身份创建的有效分享以 `creator-lost-access` 结束（[temporary-http-share.md](temporary-http-share.md)） |
 
 3. **租户策略保留，归属转给执行删除的管理员。** Peer Mesh ACL（`peer_mesh_acl`）与 Peer 出口策略（`peer_mesh_egress_policy`）决定租户里的客户端之间能否互通、谁能经哪个出口访问外部，管理员可以在别人的客户端之间建立它们，删掉会切断其他人在用的连接。该身份的这两类行保留，`owner_username` 改为调用者的登录名（内置管理员为配置中的写法），其他列不变。ACL 的 `owner_username` 决定普通用户能否在列表里看到、能否删除它，转走后同名新账号既看不到也删不了；出口策略只有租户管理员能管理，`owner_username` 只是记录。
@@ -203,6 +203,12 @@ OIDC 直连 Bearer（非本地 token）按已绑定的 issuer/subject 找账号�
 连接登记之后再检查一次，不通过时以 `1008`（`identity revoked`）关闭。握手检查可能与另一个请求的失效交错：检查读到旧状态，第 2 步的关闭（或别的实例收到的 kind 5）又在登记之前跑完；登记之后的检查读到的是已提交的新状态。
 
 已知限制：Redis Pub/Sub 不保证送达。发布失败、或某个实例当时与 Redis 断开时，该实例上已打开的连接要等断开才结束；新的握手仍被上面的检查拒绝。新旧版本混部时，旧版本实例把 kind 5 当作未知 kind 丢弃，它上面的连接同样不关闭。
+
+### 7.3 客户端与接入凭证的管理归属转移（待实现）
+
+按 [`client-owner-transfer.md`](client-owner-transfer.md) 实现：仅本租户管理员操作，目标账号已启用；共享凭证的单设备转移 `409`，整组转移必须预览完整设备清单并显式确认，零设备凭证也可转移。事务同时处理客户端、凭证、Peer 设备归属与审计，并与认证派生新设备串行化。
+
+首期只改变管理归属，保留接入密钥和有效客户端会话，不是设备安全交接。管理和 Peer 授权仍按当前归属重新判断，旧所有者仅失去基于旧归属的权限，独立管理员角色权限不受影响。
 
 ## 8. 邮件注册
 

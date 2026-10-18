@@ -1,13 +1,16 @@
 #include "storage.h"
 
 #include "crypto.h"
+#include "control_presence.h"
 #include "elasticsearch_traffic.h"
 #include "http_share.h"
 #include "json.h"
+#include "owner_transfer_internal.h"
 #include "traffic_capture.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <openssl/rand.h>
 #include <sqlite3.h>
@@ -772,6 +775,11 @@ int st_storage_init(const char *path, int seed_demo_client)
 
     int rc = exec_sql(db,
         "CREATE TABLE IF NOT EXISTS client_account (" CLIENT_ACCOUNT_COLUMNS ");"
+        "CREATE TABLE IF NOT EXISTS client_owner_transfer_audit ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,actor_username TEXT NOT NULL,"
+        "scope TEXT NOT NULL,resource_id INTEGER NOT NULL,credential_id INTEGER,"
+        "target_username TEXT NOT NULL,payload_json TEXT NOT NULL,occurred_at_ms INTEGER NOT NULL);"
+        "CREATE INDEX IF NOT EXISTS idx_owner_transfer_audit_tenant_id ON client_owner_transfer_audit(tenant_id,id);"
         "CREATE TABLE IF NOT EXISTS specus_management_user ("
         "username TEXT PRIMARY KEY,"
         "login_name TEXT,"
@@ -1509,6 +1517,8 @@ int st_storage_init(const char *path, int seed_demo_client)
             "CREATE INDEX IF NOT EXISTS idx_client_identity_client ON specus_client_identity(client_id);"
             "CREATE INDEX IF NOT EXISTS idx_client_session_token ON specus_client_session(token_hash);"
             "CREATE INDEX IF NOT EXISTS idx_client_session_credential_status ON specus_client_session(credential_id, status);"
+            "CREATE INDEX IF NOT EXISTS idx_client_session_channel_status ON specus_client_session(channel_id, status);"
+            "CREATE INDEX IF NOT EXISTS idx_connection_channel_open ON connection_record(channel_id, disconnected_at);"
             "CREATE INDEX IF NOT EXISTS idx_client_session_machine_status ON specus_client_session(credential_id, machine_fingerprint, os_user, status);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_source ON peer_mesh_acl(tenant_id, source_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_target ON peer_mesh_acl(tenant_id, target_client_id);"
@@ -2350,12 +2360,8 @@ int st_storage_list_all_clients(const char *path, st_storage_client **clients, s
     return 0;
 }
 
-int st_storage_get_client(const char *path, long long id, st_storage_client *client)
+static int load_client(sqlite3 *db, long long id, st_storage_client *client)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
@@ -2377,15 +2383,22 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
         &stmt,
         NULL);
     if (rc != SQLITE_OK) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_bind_int64(stmt, 1, id);
     rc = sqlite3_step(stmt);
     int ok = rc == SQLITE_ROW && scan_client(stmt, client) == 0;
     sqlite3_finalize(stmt);
-    sqlite3_close(db);
     return ok ? 0 : -1;
+}
+
+int st_storage_get_client(const char *path, long long id, st_storage_client *client)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = load_client(db, id, client);
+    sqlite3_close(db);
+    return rc;
 }
 
 int st_storage_get_client_by_name(const char *path, const char *client_name, st_storage_client *client)
@@ -3456,14 +3469,9 @@ int st_storage_get_client_credential_by_api_key(const char *path,
     return ok ? 0 : -1;
 }
 
-int st_storage_get_client_credential(const char *path,
-                                     long long id,
-                                     st_storage_client_credential *credential)
+/* 0 found, 1 absent, -1 store/shape failure. Also used inside the identity write transaction. */
+static int load_client_credential(sqlite3 *db, long long id, st_storage_client_credential *credential)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, owner_username, api_key, secret_hash, enabled, "
@@ -3473,15 +3481,25 @@ int st_storage_get_client_credential(const char *path,
         &stmt,
         NULL);
     if (rc != SQLITE_OK) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_bind_int64(stmt, 1, id);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_client_credential(stmt, credential) == 0;
+    int result = rc == SQLITE_DONE ? 1
+        : rc == SQLITE_ROW && scan_client_credential(stmt, credential) == 0 ? 0 : -1;
     sqlite3_finalize(stmt);
+    return result;
+}
+
+int st_storage_get_client_credential(const char *path,
+                                     long long id,
+                                     st_storage_client_credential *credential)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = load_client_credential(db, id, credential);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return result == 0 ? 0 : -1;
 }
 
 int st_storage_list_client_credentials(const char *path,
@@ -3587,19 +3605,16 @@ int st_storage_upsert_client_credential(const char *path,
     return out_credential == NULL ? 0 : st_storage_get_client_credential_by_api_key(path, api_key, out_credential);
 }
 
-int st_storage_insert_client_credential(const char *path,
+/* Plain insert shared by bootstrap callers and the current-actor transaction below. */
+static int insert_client_credential_on_db(sqlite3 *db,
                                         const char *tenant_id,
                                         const char *owner_username,
                                         const char *api_key,
                                         const char *secret_hash,
                                         int enabled,
                                         int max_online_instances,
-                                        st_storage_client_credential *out_credential)
+                                        long long *inserted_id)
 {
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO specus_client_credential(tenant_id, owner_username, api_key, secret_hash, enabled, "
@@ -3621,6 +3636,23 @@ int st_storage_insert_client_credential(const char *path,
         rc = -1;
     }
     sqlite3_finalize(stmt);
+    if (rc == 0 && inserted_id != NULL) *inserted_id = sqlite3_last_insert_rowid(db);
+    return rc;
+}
+
+int st_storage_insert_client_credential(const char *path,
+                                        const char *tenant_id,
+                                        const char *owner_username,
+                                        const char *api_key,
+                                        const char *secret_hash,
+                                        int enabled,
+                                        int max_online_instances,
+                                        st_storage_client_credential *out_credential)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = insert_client_credential_on_db(db, tenant_id, owner_username, api_key,
+                                          secret_hash, enabled, max_online_instances, NULL);
     sqlite3_close(db);
     if (rc != 0) {
         return rc;
@@ -3650,6 +3682,246 @@ int st_storage_delete_client_credential(const char *path, long long id)
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
+}
+
+static int management_actor_is_admin(const char *role)
+{
+    while (*role != '\0' && isspace((unsigned char)*role)) ++role;
+    size_t length = strlen(role);
+    while (length > 0 && isspace((unsigned char)role[length - 1])) --length;
+    return length == 5 && sqlite3_strnicmp(role, "ADMIN", 5) == 0;
+}
+
+static int load_management_actor(sqlite3 *db, const st_storage_management_actor *actor,
+    const st_storage_share_builtin_admin *builtin, st_storage_management_user *current)
+{
+    memset(current, 0, sizeof(*current));
+    if (actor == NULL || actor->username == NULL || actor->tenant_id == NULL
+        || *actor->username == '\0' || *actor->tenant_id == '\0') return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+    if (actor->account_key == NULL || *actor->account_key == '\0') {
+        if (builtin == NULL || !builtin->accepted || builtin->username == NULL || builtin->tenant_id == NULL
+            || sqlite3_stricmp(actor->username, builtin->username) != 0
+            || strcmp(actor->tenant_id, builtin->tenant_id) != 0
+            || strlen(builtin->username) >= sizeof(current->username)
+            || strlen(builtin->tenant_id) >= sizeof(current->tenant_id)) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+        strcpy(current->username, builtin->username);
+        strcpy(current->tenant_id, builtin->tenant_id);
+        strcpy(current->role, "ADMIN");
+        current->enabled = 1;
+        return 0;
+    }
+    int found = management_user_lookup(db, 0, 0, NULL, actor->account_key, current);
+    if (found < 0) return -1;
+    if (found != 0 || !current->enabled || strcmp(current->tenant_id, actor->tenant_id) != 0
+        || strcmp(current->username, actor->username) != 0) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+    return 0;
+}
+
+static int load_visible_client(sqlite3 *db, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    st_storage_management_user *current_actor, st_storage_client *client)
+{
+    int rc = load_management_actor(db, actor, builtin, current_actor);
+    if (rc != 0) return rc;
+    if (load_client(db, id, client) != 0 || strcmp(client->tenant_id, current_actor->tenant_id) != 0
+        || (!management_actor_is_admin(current_actor->role) && strcmp(client->owner_username, current_actor->username) != 0))
+        return ST_STORAGE_CLIENT_NOT_VISIBLE;
+    return 0;
+}
+
+int st_storage_create_client_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *client_name, int enabled, int connection_rate_limit_per_minute,
+    st_storage_client *out_client)
+{
+    if (out_client != NULL) memset(out_client, 0, sizeof(*out_client));
+    if (client_name == NULL || *client_name == '\0'
+        || strlen(client_name) >= sizeof(((st_storage_client *)0)->client_name)) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = -1, transaction = 0;
+    int rate = connection_rate_limit_per_minute <= 0 ? 30 : connection_rate_limit_per_minute;
+    st_storage_management_user current_actor;
+    st_storage_client staged = {0};
+    sqlite3_stmt *stmt = NULL;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    result = load_management_actor(db, actor, builtin, &current_actor);
+    if (result != 0) goto done;
+    result = -1;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE client_name = ?", -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (step == SQLITE_ROW) { result = ST_STORAGE_CLIENT_NAME_EXISTS; goto done; }
+    if (step != SQLITE_DONE) goto done;
+    /* Names are globally unique. Never reuse or overwrite another account's row. */
+    if (sqlite3_prepare_v2(db,
+        "INSERT INTO client_account(tenant_id, client_name, owner_username, enabled, connection_limit_per_minute) VALUES(?,?,?,?,?)",
+        -1, &stmt, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(stmt, 1, current_actor.tenant_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, client_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, current_actor.username, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, enabled != 0);
+    sqlite3_bind_int(stmt, 5, rate);
+    step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (step != SQLITE_DONE) goto done;
+    long long id = sqlite3_last_insert_rowid(db);
+    /* Validate even without an output pointer: a malformed trigger result must roll back. */
+    if (id <= 0 || load_client(db, id, &staged) != 0 || staged.id != id
+        || strcmp(staged.tenant_id, current_actor.tenant_id) != 0
+        || strcmp(staged.owner_username, current_actor.username) != 0
+        || strcmp(staged.client_name, client_name) != 0 || staged.enabled != (enabled != 0)
+        || staged.connection_rate_limit_per_minute != rate
+        || staged.created_at[0] == '\0' || staged.updated_at[0] == '\0') goto done;
+    result = 0;
+done:
+    sqlite3_finalize(stmt);
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (result == 0 && out_client != NULL) *out_client = staged;
+    return result;
+}
+
+int st_storage_create_client_credential_current_actor(const char *path,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const char *api_key, const char *secret_hash, int enabled, int max_online_instances,
+    st_storage_client_credential *out_credential)
+{
+    if (out_credential != NULL) memset(out_credential, 0, sizeof(*out_credential));
+    if (api_key == NULL || *api_key == '\0' || strlen(api_key) >= sizeof(((st_storage_client_credential *)0)->api_key)
+        || secret_hash == NULL || strlen(secret_hash) != ST_SHA256_HEX_LEN
+        || max_online_instances < 1 || max_online_instances > 10000) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = -1, transaction = 0;
+    st_storage_management_user current_actor;
+    st_storage_client_credential staged = {0};
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    result = load_management_actor(db, actor, builtin, &current_actor);
+    if (result != 0) goto done;
+    long long inserted_id = 0;
+    result = insert_client_credential_on_db(db, current_actor.tenant_id, current_actor.username,
+                                          api_key, secret_hash, enabled, max_online_instances, &inserted_id);
+    if (result == 1) { result = ST_STORAGE_CREDENTIAL_KEY_EXISTS; goto done; }
+    if (result != 0) goto done;
+    result = -1;
+    /* Validate on the same connection before COMMIT, even when no output was requested.
+     * A malformed row/trigger failure must not commit an orphan or report a partial success. */
+    if (load_client_credential(db, inserted_id, &staged) != 0
+        || staged.id <= 0 || strcmp(staged.tenant_id, current_actor.tenant_id) != 0
+        || strcmp(staged.owner_username, current_actor.username) != 0
+        || strcmp(staged.api_key, api_key) != 0 || strcmp(staged.secret_hash, secret_hash) != 0
+        || staged.enabled != (enabled != 0) || staged.max_online_instances != max_online_instances
+        || staged.created_at[0] == '\0' || staged.updated_at[0] == '\0') goto done;
+    result = 0;
+done:
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (result == 0 && out_credential != NULL) *out_credential = staged;
+    return result;
+}
+
+static int mutate_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_credential_patch *patch, int deleting, st_storage_client_credential *out_credential)
+{
+    if (out_credential != NULL) memset(out_credential, 0, sizeof(*out_credential));
+    if (id <= 0 || (!deleting && (patch == NULL
+        || (patch->api_key != NULL && (*patch->api_key == '\0' || strlen(patch->api_key) >= sizeof(((st_storage_client_credential *)0)->api_key)))
+        || (patch->secret_hash != NULL && strlen(patch->secret_hash) != ST_SHA256_HEX_LEN)
+        || (patch->max_online_provided && (patch->max_online_instances < 1 || patch->max_online_instances > 10000))))) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int result = -1, transaction = 0;
+    st_storage_management_user current_actor;
+    st_storage_client_credential current = {0}, staged = {0};
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    result = load_management_actor(db, actor, builtin, &current_actor);
+    if (result != 0) goto done;
+    result = -1;
+    int found = load_client_credential(db, id, &current);
+    if (found < 0) goto done;
+    if (found > 0 || strcmp(current.tenant_id, current_actor.tenant_id) != 0
+        || (!management_actor_is_admin(current_actor.role) && strcmp(current.owner_username, current_actor.username) != 0)) {
+        result = ST_STORAGE_CREDENTIAL_NOT_VISIBLE;
+        goto done;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (!deleting && patch->api_key != NULL && strcmp(patch->api_key, current.api_key) != 0) {
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM specus_client_credential WHERE api_key = ? AND id <> ?", -1, &stmt, NULL) != SQLITE_OK) goto done;
+        sqlite3_bind_text(stmt, 1, patch->api_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, id);
+        int step = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+        if (step == SQLITE_ROW) { result = ST_STORAGE_CREDENTIAL_KEY_EXISTS; goto done; }
+        if (step != SQLITE_DONE) goto done;
+    }
+    const char *sql = deleting ? "DELETE FROM specus_client_credential WHERE id = ?"
+        : "UPDATE specus_client_credential SET api_key=COALESCE(?,api_key),secret_hash=COALESCE(?,secret_hash),"
+          "enabled=CASE WHEN ? THEN ? ELSE enabled END,"
+          "max_online_instances=CASE WHEN ? THEN ? ELSE max_online_instances END,updated_at=CURRENT_TIMESTAMP WHERE id=?";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) goto done;
+    if (deleting) sqlite3_bind_int64(stmt, 1, id);
+    else {
+        if (patch->api_key != NULL) sqlite3_bind_text(stmt, 1, patch->api_key, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(stmt, 1);
+        if (patch->secret_hash != NULL) sqlite3_bind_text(stmt, 2, patch->secret_hash, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(stmt, 2);
+        sqlite3_bind_int(stmt, 3, patch->enabled_provided != 0);
+        sqlite3_bind_int(stmt, 4, patch->enabled != 0);
+        sqlite3_bind_int(stmt, 5, patch->max_online_provided != 0);
+        sqlite3_bind_int(stmt, 6, patch->max_online_instances);
+        sqlite3_bind_int64(stmt, 7, id);
+    }
+    int written = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(stmt);
+    if (!written) goto done;
+    found = load_client_credential(db, id, &staged);
+    if (deleting) {
+        if (found != 1) goto done;
+    } else if (found != 0 || strcmp(staged.tenant_id, current.tenant_id) != 0
+        || strcmp(staged.owner_username, current.owner_username) != 0
+        || strcmp(staged.created_at, current.created_at) != 0
+        || strcmp(staged.api_key, patch->api_key == NULL ? current.api_key : patch->api_key) != 0
+        || strcmp(staged.secret_hash, patch->secret_hash == NULL ? current.secret_hash : patch->secret_hash) != 0
+        || staged.enabled != (patch->enabled_provided ? patch->enabled != 0 : current.enabled)
+        || staged.max_online_instances != (patch->max_online_provided ? patch->max_online_instances : current.max_online_instances)) goto done;
+    result = 0;
+done:
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (result == 0 && out_credential != NULL) *out_credential = staged;
+    return result;
+}
+
+int st_storage_patch_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_credential_patch *patch, st_storage_client_credential *out_credential)
+{
+    return mutate_client_credential_visible(path, id, actor, builtin, patch, 0, out_credential);
+}
+
+int st_storage_delete_client_credential_visible(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin)
+{
+    return mutate_client_credential_visible(path, id, actor, builtin, NULL, 1, NULL);
 }
 
 int st_storage_list_client_download_links(const char *path,
@@ -4189,23 +4461,77 @@ static int load_identity_by_machine(sqlite3 *db,
     sqlite3_bind_text(stmt, 2, machine_fingerprint, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, os_user, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    int ok = rc == SQLITE_ROW && scan_client_identity(stmt, identity) == 0;
+    int result = rc == SQLITE_DONE ? 1
+        : rc == SQLITE_ROW && scan_client_identity(stmt, identity) == 0 ? 0 : -1;
     sqlite3_finalize(stmt);
-    return ok ? 0 : -1;
+    return result;
 }
 
-int st_storage_find_or_create_client_identity(const char *path,
+/* The caller's HMAC check ran before the write boundary. Preserve that exact key/tenant/hash
+ * identity, but take ownership and current policy from the locked credential row. */
+static int credential_snapshot_matches(const st_storage_client_credential *authenticated,
+                                        const st_storage_client_credential *current)
+{
+    size_t a_len = strlen(authenticated->secret_hash), c_len = strlen(current->secret_hash);
+    return authenticated->id == current->id
+        && strcmp(normalize_tenant_id(authenticated->tenant_id), normalize_tenant_id(current->tenant_id)) == 0
+        && strcmp(authenticated->api_key, current->api_key) == 0
+        && a_len == c_len
+        && st_constant_time_eq((const uint8_t *)authenticated->secret_hash,
+                               (const uint8_t *)current->secret_hash, a_len);
+}
+
+static int identity_account_matches(sqlite3 *db, const st_storage_client_identity *identity,
+                                    const st_storage_client_credential *credential)
+{
+    if (identity->id <= 0 || identity->client_id <= 0
+        || strcmp(normalize_tenant_id(identity->tenant_id), normalize_tenant_id(credential->tenant_id)) != 0) return 0;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT tenant_id FROM client_account WHERE rowid = ?", -1, &stmt, NULL);
+    int matches = 0;
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, identity->client_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *tenant = (const char *)sqlite3_column_text(stmt, 0);
+            matches = tenant != NULL && strcmp(normalize_tenant_id(tenant), normalize_tenant_id(credential->tenant_id)) == 0;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return matches;
+}
+
+int st_storage_find_or_create_client_identity_current(const char *path,
                                               const st_storage_client_credential *credential,
                                               const char *machine_fingerprint,
                                               const char *os_user,
                                               const char *hostname,
-                                              st_storage_client_identity *identity)
+                                              st_storage_client_identity *identity,
+                                              st_storage_client_credential *effective_credential)
 {
+    if (identity == NULL) return -1;
+    if (effective_credential != NULL && effective_credential == credential) return -1;
+    memset(identity, 0, sizeof(*identity));
+    if (effective_credential != NULL) memset(effective_credential, 0, sizeof(*effective_credential));
+    if (credential == NULL || credential->id <= 0 || machine_fingerprint == NULL || os_user == NULL) return -1;
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
+    if (open_db(path, &db) != 0) return -1;
+    /* SQLite's database write lock coordinates independent connections and server processes,
+     * not just this process. No old credential read can cross it and create an old-owner row. */
+    int result = -1, transaction = 0;
+    st_storage_client_credential current = {0};
+    st_storage_client_identity staged = {0};
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    int found = load_client_credential(db, credential->id, &current);
+    if (found < 0) goto done;
+    if (found > 0 || !credential_snapshot_matches(credential, &current)) {
+        result = ST_STORAGE_IDENTITY_AUTH_CHANGED; goto done;
     }
-    if (load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity) == 0) {
+    if (!current.enabled) { result = ST_STORAGE_IDENTITY_AUTH_DISABLED; goto done; }
+    found = load_identity_by_machine(db, current.id, machine_fingerprint, os_user, &staged);
+    if (found < 0) goto done;
+    if (found == 0) {
+        if (!identity_account_matches(db, &staged, &current)) goto done;
         sqlite3_stmt *update = NULL;
         int rc = sqlite3_prepare_v2(db,
             "UPDATE specus_client_identity SET hostname = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -4214,24 +4540,20 @@ int st_storage_find_or_create_client_identity(const char *path,
             NULL);
         if (rc == SQLITE_OK) {
             sqlite3_bind_text(update, 1, hostname == NULL ? "" : hostname, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(update, 2, identity->id);
-            rc = sqlite3_step(update) == SQLITE_DONE ? 0 : -1;
+            sqlite3_bind_int64(update, 2, staged.id);
+            rc = sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
         } else {
             rc = -1;
         }
         sqlite3_finalize(update);
-        if (rc == 0) {
-            rc = load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity);
-        }
-        sqlite3_close(db);
-        return rc == 0 ? 0 : -1;
+        if (rc != 0 || load_identity_by_machine(db, current.id, machine_fingerprint, os_user, &staged) != 0
+            || !identity_account_matches(db, &staged, &current)) goto done;
+        result = 0;
+        goto done;
     }
 
     char client_name[121];
-    if (build_client_name(db, credential, machine_fingerprint, os_user, hostname, client_name, sizeof(client_name)) != 0) {
-        sqlite3_close(db);
-        return -1;
-    }
+    if (build_client_name(db, &current, machine_fingerprint, os_user, hostname, client_name, sizeof(client_name)) != 0) goto done;
     sqlite3_stmt *client_stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO client_account(tenant_id, client_name, owner_username, enabled, connection_limit_per_minute, created_at, updated_at) "
@@ -4240,9 +4562,9 @@ int st_storage_find_or_create_client_identity(const char *path,
         &client_stmt,
         NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(client_stmt, 1, credential->tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(client_stmt, 1, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(client_stmt, 2, client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(client_stmt, 3, credential->owner_username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(client_stmt, 3, current.owner_username, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(client_stmt, 4, 1);
         rc = sqlite3_step(client_stmt) == SQLITE_DONE ? 0 : -1;
     } else {
@@ -4250,10 +4572,7 @@ int st_storage_find_or_create_client_identity(const char *path,
     }
     sqlite3_finalize(client_stmt);
     long long client_id = sqlite3_last_insert_rowid(db);
-    if (rc != 0 || client_id <= 0) {
-        sqlite3_close(db);
-        return -1;
-    }
+    if (rc != 0 || client_id <= 0) goto done;
 
     sqlite3_stmt *identity_stmt = NULL;
     rc = sqlite3_prepare_v2(db,
@@ -4263,8 +4582,8 @@ int st_storage_find_or_create_client_identity(const char *path,
         &identity_stmt,
         NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(identity_stmt, 1, credential->tenant_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(identity_stmt, 2, credential->id);
+        sqlite3_bind_text(identity_stmt, 1, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(identity_stmt, 2, current.id);
         sqlite3_bind_int64(identity_stmt, 3, client_id);
         sqlite3_bind_text(identity_stmt, 4, client_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(identity_stmt, 5, machine_fingerprint, -1, SQLITE_TRANSIENT);
@@ -4275,11 +4594,32 @@ int st_storage_find_or_create_client_identity(const char *path,
         rc = -1;
     }
     sqlite3_finalize(identity_stmt);
-    if (rc == 0) {
-        rc = load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity);
+    if (rc == 0 && load_identity_by_machine(db, current.id, machine_fingerprint, os_user, &staged) == 0
+        && identity_account_matches(db, &staged, &current)) result = 0;
+done:
+    if (transaction && result == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else result = -1;
     }
+    if (transaction) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    /* Nothing, including allocated ids, is published to callers before successful commit. */
+    if (result == 0) {
+        *identity = staged;
+        if (effective_credential != NULL) *effective_credential = current;
+    }
+    return result;
+}
+
+int st_storage_find_or_create_client_identity(const char *path,
+                                              const st_storage_client_credential *credential,
+                                              const char *machine_fingerprint,
+                                              const char *os_user,
+                                              const char *hostname,
+                                              st_storage_client_identity *identity)
+{
+    return st_storage_find_or_create_client_identity_current(path, credential, machine_fingerprint,
+                                                            os_user, hostname, identity, NULL);
 }
 
 int st_storage_close_http_authenticated_sessions(const char *path,
@@ -4639,6 +4979,29 @@ int st_storage_mark_client_session_disconnected(const char *path,
     return rc == 0 ? 0 : -1;
 }
 
+int st_storage_mark_client_session_disconnected_if_channel(const char *path, long long id,
+    const char *channel_id, const char *disconnected_at, int *changed)
+{
+    if (changed != NULL) *changed = 0;
+    if (id <= 0 || channel_id == NULL || *channel_id == '\0') return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "UPDATE specus_client_session SET status = 'DISCONNECTED', disconnected_at = COALESCE(disconnected_at, ?) "
+        "WHERE id = ? AND channel_id = ? AND status = 'NETTY_ONLINE'", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, disconnected_at == NULL ? "" : disconnected_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, id);
+        sqlite3_bind_text(stmt, 3, channel_id, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        if (rc == 0 && changed != NULL) *changed = sqlite3_changes(db);
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc;
+}
+
 int st_storage_close_client_sessions_by_status(const char *path,
                                                const char *from_status,
                                                const char *disconnected_at)
@@ -4821,13 +5184,163 @@ int st_storage_upsert_client(const char *path,
     return out_client == NULL ? 0 : st_storage_get_client(path, id, out_client);
 }
 
-/* Deletes the client with its mappings and HTTP routes. */
-static int delete_client_on_db(sqlite3 *db, long long id, const char *client_name)
+/* Return a filtered CSV without granting any recipient that was not already listed. */
+static int delete_peer_id_from_csv(const char *raw, long long id, char **filtered)
+{
+    size_t length = strlen(raw);
+    char *copy = malloc(length + 1U);
+    char *out = malloc(length + 1U);
+    if (copy == NULL || out == NULL) {
+        free(copy);
+        free(out);
+        return -1;
+    }
+    memcpy(copy, raw, length + 1U);
+    out[0] = '\0';
+    size_t used = 0U;
+    int changed = 0;
+    char *part = copy;
+    while (part != NULL) {
+        char *next = strchr(part, ',');
+        if (next != NULL) *next++ = '\0';
+        char *end = NULL;
+        errno = 0;
+        long long value = strtoll(part, &end, 10);
+        int valid = errno != ERANGE && end != part && *end == '\0' && value > 0;
+        if (valid && value == id) {
+            changed = 1;
+        } else if (valid) {
+            size_t size = strlen(part);
+            if (used != 0U) out[used++] = ',';
+            memcpy(out + used, part, size);
+            used += size;
+            out[used] = '\0';
+        }
+        part = next;
+    }
+    free(copy);
+    *filtered = out;
+    return changed;
+}
+
+static int delete_peer_allowlist_references(sqlite3 *db, const char *tenant, long long id, int services)
+{
+    const char *table = services ? "peer_mesh_shared_service" : "peer_mesh_egress_policy";
+    const char *column = services ? "allowed_client_ids" : "allowed_consumer_client_ids";
+    char sql[320];
+    snprintf(sql, sizeof(sql), "SELECT id, COALESCE(%s, ''), %s FROM %s WHERE tenant_id = ?",
+             column, services ? "visibility" : "'OWNER'", table);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+    typedef struct { long long id; char *csv; int disable; } peer_list_update;
+    peer_list_update *updates = NULL;
+    size_t count = 0U;
+    int step = SQLITE_DONE;
+    int rc = 0;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        char *csv = NULL;
+        int changed = delete_peer_id_from_csv((const char *)sqlite3_column_text(stmt, 1), id, &csv);
+        if (changed < 0) { rc = -1; break; }
+        if (!changed) { free(csv); continue; }
+        if (count >= SIZE_MAX / sizeof(*updates) - 1U) { free(csv); rc = -1; break; }
+        peer_list_update *grown = realloc(updates, (count + 1U) * sizeof(*updates));
+        if (grown == NULL) { free(csv); rc = -1; break; }
+        updates = grown;
+        updates[count].id = sqlite3_column_int64(stmt, 0);
+        updates[count].csv = csv;
+        const char *visibility = (const char *)sqlite3_column_text(stmt, 2);
+        updates[count].disable = services && *csv == '\0' && (visibility == NULL || strcmp(visibility, "OWNER") != 0);
+        ++count;
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    snprintf(sql, sizeof(sql), "UPDATE %s SET %s = ?, updated_at = strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', 'now')%s"
+             " WHERE tenant_id = ? AND id = ?", table, column,
+             services ? ", enabled = CASE WHEN ? THEN 0 ELSE enabled END" : "");
+    stmt = NULL;
+    if (rc == 0 && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) rc = -1;
+    for (size_t i = 0U; rc == 0 && i < count; ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, updates[i].csv, -1, SQLITE_TRANSIENT);
+        int index = 2;
+        if (services) sqlite3_bind_int(stmt, index++, updates[i].disable);
+        sqlite3_bind_text(stmt, index++, tenant, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, index, updates[i].id);
+        if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    for (size_t i = 0U; i < count; ++i) free(updates[i].csv);
+    free(updates);
+    return rc;
+}
+
+static int delete_client_peer_references(sqlite3 *db, const char *tenant, long long id)
+{
+    static const struct { const char *sql; int both; } statements[] = {
+        {"UPDATE peer_mesh_session SET status = 'CLOSED', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),"
+         " closed_at = COALESCE(NULLIF(closed_at, ''), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+         " WHERE tenant_id = ? AND status <> 'CLOSED' AND (source_client_id = ? OR target_client_id = ?)", 1},
+        {"DELETE FROM peer_mesh_acl WHERE tenant_id = ? AND (source_client_id = ? OR target_client_id = ?)", 1},
+        {"DELETE FROM peer_mesh_device WHERE tenant_id = ? AND client_id = ?", 0},
+        {"DELETE FROM peer_mesh_egress_policy WHERE tenant_id = ? AND egress_client_id = ?", 0},
+        {"DELETE FROM peer_mesh_shared_service WHERE tenant_id = ? AND client_id = ?", 0}
+    };
+    for (size_t i = 0U; i < sizeof(statements) / sizeof(statements[0]); ++i) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, statements[i].sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+        sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, id);
+        if (statements[i].both) sqlite3_bind_int64(stmt, 3, id);
+        int ok = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        if (!ok) return -1;
+    }
+    return delete_peer_allowlist_references(db, tenant, id, 0) == 0
+        && delete_peer_allowlist_references(db, tenant, id, 1) == 0 ? 0 : -1;
+}
+
+static int collect_deleted_peer_sessions(sqlite3 *db, const char *tenant, long long id,
+                                         st_storage_peer_close **closed, size_t *count)
+{
+    if (closed == NULL) return 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT id, tenant_id, source_client_id, source_client_name,"
+        " target_client_id, target_client_name FROM peer_mesh_session WHERE tenant_id = ?"
+        " AND status <> 'CLOSED' AND (source_client_id = ? OR target_client_id = ?)", -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, id);
+    sqlite3_bind_int64(stmt, 3, id);
+    int step;
+    int rc = 0;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (*count >= SIZE_MAX / sizeof(**closed) - 1U) { rc = -1; break; }
+        st_storage_peer_close *grown = realloc(*closed, (*count + 1U) * sizeof(**closed));
+        if (grown == NULL) { rc = -1; break; }
+        *closed = grown;
+        st_storage_peer_close *item = &grown[*count];
+        memset(item, 0, sizeof(*item));
+        item->id = sqlite3_column_int64(stmt, 0);
+        item->source_client_id = sqlite3_column_int64(stmt, 2);
+        item->target_client_id = sqlite3_column_int64(stmt, 4);
+        if (copy_text_column(stmt, 1, item->tenant_id, sizeof(item->tenant_id)) != 0
+            || copy_text_column(stmt, 3, item->source_client_name, sizeof(item->source_client_name)) != 0
+            || copy_text_column(stmt, 5, item->target_client_name, sizeof(item->target_client_name)) != 0) { rc = -1; break; }
+        ++*count;
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* Deletes operational rows in the caller's transaction; historical sessions and usage remain. */
+static int delete_client_on_db(sqlite3 *db, long long id, const char *client_name, const char *tenant,
+                               st_storage_peer_close **closed, size_t *closed_count)
 {
     /*
      * Workbench references to everything the client carries go first, in the caller's transaction:
-     * its routes and mappings below, and its Peer services, whose rows this deletion leaves in
-     * place but which no longer resolve to a client.
+     * its routes and mappings below, and its Peer services, before their rows are removed.
      */
     static const char *const workbench_refs_sql[] = {
         "DELETE FROM management_workbench_item WHERE kind = 'http-route' AND object_id IN ("
@@ -4853,6 +5366,8 @@ static int delete_client_on_db(sqlite3 *db, long long id, const char *client_nam
         sqlite3_finalize(stmt);
         stmt = NULL;
     }
+    if (rc == 0) rc = collect_deleted_peer_sessions(db, tenant, id, closed, closed_count);
+    if (rc == 0) rc = delete_client_peer_references(db, tenant, id);
     if (rc == 0) {
         rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE client_name = ?", -1, &stmt, NULL);
         if (rc == SQLITE_OK) {
@@ -4920,7 +5435,7 @@ int st_storage_delete_client(const char *path, long long id)
         sqlite3_close(db);
         return -1;
     }
-    int rc = delete_client_on_db(db, id, client.client_name);
+    int rc = delete_client_on_db(db, id, client.client_name, client.tenant_id, NULL, NULL);
     if (rc == 0) {
         rc = exec_sql(db, "COMMIT");
     } else {
@@ -6973,17 +7488,9 @@ static int peer_mesh_allocate_virtual_ip(sqlite3 *db,
     return -1;
 }
 
-int st_storage_ensure_peer_mesh_device(const char *path,
-                                       const st_storage_client *client,
-                                       st_storage_peer_mesh_device *out_device)
+/* Called only with the current client row under the caller's database write transaction. */
+static int ensure_peer_mesh_device_on_db(sqlite3 *db, const st_storage_client *client)
 {
-    if (client == NULL || client->id <= 0) {
-        return -1;
-    }
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
     const char *cidr = getenv("SPECUS_PEER_MESH_CIDR");
     if (cidr == NULL || *cidr == '\0') cidr = "100.96.0.0/11";
     char virtual_ip[64];
@@ -6992,7 +7499,6 @@ int st_storage_ensure_peer_mesh_device(const char *path,
         && existing.virtual_ip[0] != '\0') {
         snprintf(virtual_ip, sizeof(virtual_ip), "%s", existing.virtual_ip);
     } else if (peer_mesh_allocate_virtual_ip(db, client, cidr, virtual_ip) != 0) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
@@ -7022,18 +7528,290 @@ int st_storage_ensure_peer_mesh_device(const char *path,
         rc = -1;
     }
     sqlite3_finalize(stmt);
-    if (rc == 0 && out_device != NULL) {
-        rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
-        if (rc == 0) {
-            out_device->message_send_capable = client->message_send_capable;
-            out_device->message_receive_capable = client->message_receive_capable;
-            out_device->message_attachments_capable = client->message_attachments_capable;
-            out_device->message_media_preview_capable = client->message_media_preview_capable;
-            out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
-        }
+    return rc;
+}
+
+/* The caller already owns BEGIN IMMEDIATE when mutation follows this check. Reading the
+ * source in another connection, or only before waiting for the SQLite writer, is not authority. */
+static int control_source_on_db(sqlite3 *db, const st_storage_control_source *source,
+                                 long long client_id, const char *tenant_id)
+{
+    if (source == NULL || source->client_id <= 0 || source->session_id <= 0
+        || source->client_id != client_id || tenant_id == NULL
+        || !memchr(source->tenant_id, '\0', sizeof(source->tenant_id))
+        || !memchr(source->client_name, '\0', sizeof(source->client_name))
+        || !memchr(source->channel_id, '\0', sizeof(source->channel_id))
+        || !memchr(source->token_hash, '\0', sizeof(source->token_hash))
+        || !*source->tenant_id || !*source->client_name || !*source->channel_id
+        || strlen(source->token_hash) != 64U || strcmp(source->tenant_id, tenant_id) != 0)
+        return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT c.enabled,k.enabled FROM specus_client_session s JOIN client_account c ON c.rowid=s.client_id "
+        "JOIN specus_client_credential k ON k.id=s.credential_id "
+        "WHERE s.id=? AND s.client_id=? AND s.tenant_id COLLATE BINARY=? "
+        "AND s.channel_id COLLATE BINARY=? AND s.token_hash COLLATE BINARY=? AND s.status='NETTY_ONLINE' "
+        "AND (s.expires_at='' OR s.expires_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+        "AND c.tenant_id COLLATE BINARY=s.tenant_id "
+        "AND c.client_name COLLATE BINARY=? AND k.tenant_id COLLATE BINARY=s.tenant_id",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, source->session_id); sqlite3_bind_int64(stmt, 2, source->client_id);
+        sqlite3_bind_text(stmt, 3, source->tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, source->channel_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, source->token_hash, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, source->client_name, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(stmt);
+        rc = step == SQLITE_ROW
+            ? (sqlite3_column_int(stmt, 0) == 1 && sqlite3_column_int(stmt, 1) == 1
+                ? 0 : ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE)
+            : step == SQLITE_DONE ? ST_STORAGE_CONTROL_SOURCE_RETIRED : -1;
+    } else rc = -1;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int st_storage_control_source_validate(const char *path, const st_storage_control_source *source)
+{
+    if (source == NULL) return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = control_source_on_db(db, source, source->client_id, source->tenant_id);
+    sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_control_sources_validate(const char *path, const st_storage_control_source *sources,
+                                        size_t count, int *results)
+{
+    if (count == 0U) return 0;
+    if (count > ST_STORAGE_CONTROL_SOURCE_BATCH || sources == NULL || results == NULL) return -1;
+    for (size_t i = 0; i < count; ++i) results[i] = -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = sqlite3_busy_timeout(db, 25) == SQLITE_OK
+        && sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        results[i] = control_source_on_db(db, &sources[i], sources[i].client_id, sources[i].tenant_id);
+        if (results[i] == -1) rc = -1;
+    }
+    if (rc == 0 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc != 0) {
+        (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        for (size_t i = 0; i < count; ++i) results[i] = -1;
     }
     sqlite3_close(db);
+    return rc;
+}
+
+int st_storage_control_channel_unused(const char *path, const char *channel, int *unused)
+{
+    if (!unused || !channel) return -1;
+    *unused = 0;
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT NOT EXISTS(SELECT 1 FROM specus_client_session WHERE channel_id=?1 AND status='NETTY_ONLINE') "
+        "AND NOT EXISTS(SELECT 1 FROM connection_record WHERE channel_id=?1 AND (disconnected_at IS NULL OR disconnected_at=''))",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, channel, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) *unused = sqlite3_column_int(stmt, 0);
+        else rc = -1;
+    }
+    sqlite3_finalize(stmt); sqlite3_close(db); return rc;
+}
+
+typedef struct { long long id; int valid; char channel[161]; } dead_control_candidate;
+static int read_dead_control_page(const char *path, int audits, long long credential,
+                                  long long excluded, long long after, long long *upper,
+                                  dead_control_candidate rows[64], size_t *count)
+{
+    *count = 0;
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = 0;
+    if (*upper < 0) {
+        rc = sqlite3_prepare_v2(db, audits ? "SELECT COALESCE(MAX(id),0) FROM connection_record"
+            : "SELECT COALESCE(MAX(id),0) FROM specus_client_session", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0 && sqlite3_step(stmt) == SQLITE_ROW) *upper = sqlite3_column_int64(stmt, 0);
+        else rc = -1;
+        sqlite3_finalize(stmt); stmt = NULL;
+    }
+    if (rc == 0) rc = sqlite3_prepare_v2(db, audits
+        ? "SELECT id,COALESCE(channel_id,'') FROM connection_record WHERE id>?1 AND id<=?2 "
+          "AND (disconnected_at IS NULL OR disconnected_at='') ORDER BY id LIMIT 64"
+        : "SELECT id,COALESCE(channel_id,'') FROM specus_client_session WHERE id>?1 AND id<=?2 "
+          "AND status='NETTY_ONLINE' AND (?3=0 OR credential_id=?3) AND id<>?4 ORDER BY id LIMIT 64",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_int64(stmt, 1, after); sqlite3_bind_int64(stmt, 2, *upper);
+        if (!audits) { sqlite3_bind_int64(stmt, 3, credential); sqlite3_bind_int64(stmt, 4, excluded); }
+        int step;
+        while ((step = sqlite3_step(stmt)) == SQLITE_ROW && *count < 64U) {
+            dead_control_candidate *row = &rows[(*count)++]; memset(row, 0, sizeof(*row));
+            row->id = sqlite3_column_int64(stmt, 0);
+            const char *channel = (const char *)sqlite3_column_text(stmt, 1);
+            int bytes = sqlite3_column_bytes(stmt, 1);
+            if (channel && bytes >= 0 && (size_t)bytes < sizeof(row->channel) && !memchr(channel, '\0', (size_t)bytes)) {
+                memcpy(row->channel, channel, (size_t)bytes); row->valid = 1;
+            }
+        }
+        if (step != SQLITE_DONE) rc = -1;
+    }
+    sqlite3_finalize(stmt); sqlite3_close(db); return rc;
+}
+
+static int reap_dead_control_row(const char *path, int audit_only, const dead_control_candidate *row,
+                                 const char *now, const char *reason, int *closed)
+{
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL; int changed = 0;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0 && !audit_only) {
+        rc = sqlite3_prepare_v2(db, "UPDATE specus_client_session SET status='DISCONNECTED',"
+            "disconnected_at=COALESCE(NULLIF(disconnected_at,''),?1) "
+            "WHERE id=?2 AND status='NETTY_ONLINE' AND COALESCE(channel_id,'')=?3 COLLATE BINARY", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 2, row->id);
+            sqlite3_bind_text(stmt, 3, row->channel, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+        }
+        sqlite3_finalize(stmt); stmt = NULL;
+    }
+    if (rc == 0) rc = sqlite3_prepare_v2(db, audit_only
+        ? "UPDATE connection_record SET disconnected_at=?1,disconnect_reason=COALESCE(NULLIF(disconnect_reason,''),?2) "
+          "WHERE id=?4 AND COALESCE(channel_id,'')=?3 COLLATE BINARY AND (disconnected_at IS NULL OR disconnected_at='')"
+        : "UPDATE connection_record SET disconnected_at=?1,disconnect_reason=COALESCE(NULLIF(disconnect_reason,''),?2) "
+          "WHERE COALESCE(channel_id,'')=?3 COLLATE BINARY AND (disconnected_at IS NULL OR disconnected_at='')",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT); sqlite3_bind_text(stmt, 2, reason, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, row->channel, -1, SQLITE_TRANSIENT);
+        if (audit_only) sqlite3_bind_int64(stmt, 4, row->id);
+        if (sqlite3_step(stmt) == SQLITE_DONE) changed = sqlite3_changes(db); else rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc == 0) {
+        *closed += changed;
+        int unused = 0;
+        if (st_storage_control_channel_unused(path, row->channel, &unused) == 0 && unused)
+            st_control_presence_forget_dead(path, row->channel);
+    }
+    return rc;
+}
+
+int st_storage_reap_dead_control_channels(const char *path, long long credential_id,
+                                          long long exclude_session_id, const char *now,
+                                          const char *reason, int *closed_audits)
+{
+    if (closed_audits) *closed_audits = 0;
+    if (!now || !reason || credential_id < 0) return -1;
+    int closed = 0;
+    for (int audits = 0; audits < (credential_id == 0 ? 2 : 1); ++audits) {
+        long long after = 0, upper = -1;
+        for (;;) {
+            dead_control_candidate rows[64]; size_t count = 0;
+            if (read_dead_control_page(path, audits, credential_id, exclude_session_id, after, &upper, rows, &count) != 0) return -1;
+            if (!count) break;
+            /* The entire native read is closed before any filesystem probe. No registry lock,
+             * socket wait or advisory lock wait is taken while owning a SQLite transaction. */
+            for (size_t i = 0; i < count; ++i) {
+                after = rows[i].id;
+                if (!rows[i].valid || st_control_presence_probe(path, rows[i].channel) != ST_CONTROL_PRESENCE_DEAD) continue;
+                if (reap_dead_control_row(path, audits, &rows[i], now, reason, &closed) != 0) return -1;
+            }
+            if (after >= upper) break;
+        }
+    }
+    if (closed_audits) *closed_audits = closed;
+    return 0;
+}
+
+static int peer_control_write_check(sqlite3 *db, const st_storage_control_source *control,
+                                     long long client_id, const char *tenant_id)
+{
+    if (control == NULL) return 0; /* Only explicit pre-existing trusted service entrypoints. */
+    return control_source_on_db(db, control, client_id, tenant_id);
+}
+
+/* A trigger may change authority within our own transaction. Roll it all back, but do not
+ * classify a rolled-back change as permanent retirement of the physical CONTROL. */
+static int peer_control_write_postcheck(sqlite3 *db, const st_storage_control_source *control,
+                                       long long client_id, const char *tenant_id, int rc)
+{
+    return rc == 0 && peer_control_write_check(db, control, client_id, tenant_id) != 0 ? -1 : rc;
+}
+
+static int peer_client_write_begin(const char *path, const st_storage_client *cached,
+                                  sqlite3 **db, st_storage_client *current,
+                                  st_storage_peer_mesh_device *out_device)
+{
+    if (out_device != NULL) memset(out_device, 0, sizeof(*out_device));
+    *db = NULL;
+    if (cached == NULL || cached->id <= 0 || open_db(path, db) != 0) return -1;
+    /* A cached owner/name/capability is not authority. The SQLite writer lock also fences
+     * independent connections/processes, including future ownership transfer transactions. */
+    if (exec_sql(*db, "BEGIN IMMEDIATE") != 0) {
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    if (load_client(*db, cached->id, current) != 0
+        || strcmp(normalize_tenant_id(current->tenant_id), normalize_tenant_id(cached->tenant_id)) != 0) {
+        (void)exec_sql(*db, "ROLLBACK");
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int peer_client_write_end(sqlite3 *db, const st_storage_client *current, int rc,
+                                st_storage_peer_mesh_device *out_device)
+{
+    st_storage_peer_mesh_device staged = {0};
+    if (rc == 0) rc = read_peer_mesh_device(db, current->tenant_id, current->id, &staged);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc == 0 && out_device != NULL) {
+        staged.message_send_capable = current->message_send_capable;
+        staged.message_receive_capable = current->message_receive_capable;
+        staged.message_attachments_capable = current->message_attachments_capable;
+        staged.message_media_preview_capable = current->message_media_preview_capable;
+        staged.message_max_attachment_bytes = current->message_max_attachment_bytes;
+        *out_device = staged;
+    }
     return rc == 0 ? 0 : -1;
+}
+
+static int ensure_peer_mesh_device_impl(const char *path, const st_storage_client *client,
+                                       st_storage_peer_mesh_device *out_device,
+                                       const st_storage_control_source *control)
+{
+    sqlite3 *db = NULL;
+    st_storage_client current;
+    if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    int guard = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (guard != 0) { (void)exec_sql(db, "ROLLBACK"); sqlite3_close(db); return guard; }
+    int rc = ensure_peer_mesh_device_on_db(db, &current);
+    rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
+    return peer_client_write_end(db, &current, rc, out_device);
+}
+
+int st_storage_ensure_peer_mesh_device(const char *path, const st_storage_client *client,
+                                       st_storage_peer_mesh_device *out_device)
+{ return ensure_peer_mesh_device_impl(path, client, out_device, NULL); }
+
+int st_storage_ensure_peer_mesh_device_from_control(const char *path, const st_storage_control_source *control,
+                                                    const st_storage_client *client, st_storage_peer_mesh_device *out_device)
+{
+    if (control == NULL) { if (out_device != NULL) memset(out_device, 0, sizeof(*out_device)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return ensure_peer_mesh_device_impl(path, client, out_device, control);
 }
 
 int st_storage_update_peer_mesh_device_enabled(const char *path,
@@ -7041,16 +7819,11 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                                int enabled,
                                                st_storage_peer_mesh_device *out_device)
 {
-    if (client == NULL || client->id <= 0) {
-        return -1;
-    }
-    if (st_storage_ensure_peer_mesh_device(path, client, NULL) != 0) {
-        return -1;
-    }
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
-    }
+    st_storage_client current;
+    if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    if (ensure_peer_mesh_device_on_db(db, &current) != 0)
+        return peer_client_write_end(db, &current, -1, out_device);
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
                                 "UPDATE peer_mesh_device SET enabled = ?, owner_username = ?, "
@@ -7061,27 +7834,16 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
                                 NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int(stmt, 1, enabled ? 1 : 0);
-        sqlite3_bind_text(stmt, 2, normalize_owner_username(client->owner_username), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, client->client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, normalize_tenant_id(client->tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 5, client->id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        sqlite3_bind_text(stmt, 2, normalize_owner_username(current.owner_username), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, current.client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 5, current.id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else {
         rc = -1;
     }
     sqlite3_finalize(stmt);
-    if (rc == 0 && out_device != NULL) {
-        rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
-        if (rc == 0) {
-            out_device->message_send_capable = client->message_send_capable;
-            out_device->message_receive_capable = client->message_receive_capable;
-            out_device->message_attachments_capable = client->message_attachments_capable;
-            out_device->message_media_preview_capable = client->message_media_preview_capable;
-            out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
-        }
-    }
-    sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    return peer_client_write_end(db, &current, rc, out_device);
 }
 
 int st_storage_get_peer_mesh_device_by_client(const char *path,
@@ -7240,7 +8002,7 @@ int st_storage_list_open_peer_mesh_sessions(const char *path,
     return 0;
 }
 
-int st_storage_update_peer_mesh_device_report(const char *path,
+static int update_peer_mesh_device_report_impl(const char *path,
                                               const st_storage_client *client,
                                               const char *public_key,
                                               const char *nat_type,
@@ -7252,11 +8014,16 @@ int st_storage_update_peer_mesh_device_report(const char *path,
                                               const char *virtual_device_name,
                                               const char *virtual_device_status,
                                               const char *virtual_device_error,
-                                              st_storage_peer_mesh_device *out_device)
+                                              st_storage_peer_mesh_device *out_device,
+                                              const st_storage_control_source *control)
 {
-    if (client == NULL || st_storage_ensure_peer_mesh_device(path, client, NULL) != 0) return -1;
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
+    st_storage_client current;
+    if (peer_client_write_begin(path, client, &db, &current, out_device) != 0) return -1;
+    int guard = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (guard != 0) { (void)exec_sql(db, "ROLLBACK"); sqlite3_close(db); return guard; }
+    if (ensure_peer_mesh_device_on_db(db, &current) != 0)
+        return peer_client_write_end(db, &current, -1, out_device);
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "UPDATE peer_mesh_device SET public_key=COALESCE(?,public_key),nat_type=COALESCE(?,nat_type),"
@@ -7283,33 +8050,45 @@ int st_storage_update_peer_mesh_device_report(const char *path,
         bind_nullable_text_limit(stmt, 12, virtual_device_name, 127);
         bind_nullable_text_limit(stmt, 13, virtual_device_status, 31);
         bind_nullable_text_limit(stmt, 14, virtual_device_error, 255);
-        sqlite3_bind_text(stmt, 15, normalize_tenant_id(client->tenant_id), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 16, client->id);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        sqlite3_bind_text(stmt, 15, normalize_tenant_id(current.tenant_id), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 16, current.id);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
-    if (rc == 0 && out_device != NULL) rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
-    sqlite3_close(db);
-    return rc;
+    rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
+    return peer_client_write_end(db, &current, rc, out_device);
 }
 
-int st_storage_can_peer(const char *path,
-                        const st_storage_client *source,
-                        const st_storage_client *target,
-                        int *allowed)
+int st_storage_update_peer_mesh_device_report(const char *path, const st_storage_client *client,
+    const char *public_key, const char *nat_type, const char *nat_mapping_behavior, const char *nat_filtering_behavior,
+    const char *nat_behavior_discovery, const char *last_endpoint, const char *virtual_device_mode,
+    const char *virtual_device_name, const char *virtual_device_status, const char *virtual_device_error,
+    st_storage_peer_mesh_device *out_device)
+{ return update_peer_mesh_device_report_impl(path, client, public_key, nat_type, nat_mapping_behavior,
+    nat_filtering_behavior, nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
+    virtual_device_status, virtual_device_error, out_device, NULL); }
+
+int st_storage_update_peer_mesh_device_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *client, const char *public_key,
+    const char *nat_type, const char *nat_mapping_behavior, const char *nat_filtering_behavior,
+    const char *nat_behavior_discovery, const char *last_endpoint, const char *virtual_device_mode,
+    const char *virtual_device_name, const char *virtual_device_status, const char *virtual_device_error,
+    st_storage_peer_mesh_device *out_device)
 {
-    if (source == NULL || target == NULL || allowed == NULL
-        || source->id <= 0 || target->id <= 0 || source->id == target->id) {
-        return -1;
-    }
+    if (control == NULL) { if (out_device != NULL) memset(out_device, 0, sizeof(*out_device)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return update_peer_mesh_device_report_impl(path, client,
+    public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery, last_endpoint,
+    virtual_device_mode, virtual_device_name, virtual_device_status, virtual_device_error, out_device, control);
+}
+
+/* Caller supplies current rows under one SQLite transaction, not caller snapshots. */
+static int can_peer_on_db(sqlite3 *db, const st_storage_client *source,
+                         const st_storage_client *target, int *allowed)
+{
     *allowed = 0;
     if (!source->enabled || !target->enabled
         || strcmp(source->tenant_id, target->tenant_id) != 0) {
         return 0;
-    }
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) {
-        return -1;
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(
@@ -7320,7 +8099,6 @@ int st_storage_can_peer(const char *path,
         &stmt,
         NULL);
     if (rc != SQLITE_OK) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_bind_text(stmt, 1, source->tenant_id, -1, SQLITE_TRANSIENT);
@@ -7330,17 +8108,14 @@ int st_storage_can_peer(const char *path,
     int enabled_devices = rc == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 0;
     sqlite3_finalize(stmt);
     if (rc != SQLITE_ROW) {
-        sqlite3_close(db);
         return -1;
     }
     if (enabled_devices != 2) {
-        sqlite3_close(db);
         return 0;
     }
     if (strcmp(normalize_owner_username(source->owner_username),
                normalize_owner_username(target->owner_username)) == 0) {
         *allowed = 1;
-        sqlite3_close(db);
         return 0;
     }
 
@@ -7353,7 +8128,6 @@ int st_storage_can_peer(const char *path,
         &stmt,
         NULL);
     if (rc != SQLITE_OK) {
-        sqlite3_close(db);
         return -1;
     }
     sqlite3_bind_text(stmt, 1, source->tenant_id, -1, SQLITE_TRANSIENT);
@@ -7364,8 +8138,30 @@ int st_storage_can_peer(const char *path,
     rc = sqlite3_step(stmt);
     *allowed = rc == SQLITE_ROW;
     sqlite3_finalize(stmt);
-    sqlite3_close(db);
     return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+int st_storage_can_peer(const char *path, const st_storage_client *source,
+                        const st_storage_client *target, int *allowed)
+{
+    if (allowed != NULL) *allowed = 0;
+    if (source == NULL || target == NULL || allowed == NULL
+        || source->id <= 0 || target->id <= 0 || source->id == target->id) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    st_storage_client current_source = {0}, current_target = {0};
+    int staged = 0;
+    int rc = exec_sql(db, "BEGIN");
+    if (rc == 0 && (load_client(db, source->id, &current_source) != 0
+        || load_client(db, target->id, &current_target) != 0
+        || strcmp(current_source.tenant_id, source->tenant_id) != 0
+        || strcmp(current_target.tenant_id, target->tenant_id) != 0)) rc = -1;
+    if (rc == 0) rc = can_peer_on_db(db, &current_source, &current_target, &staged);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc == 0) *allowed = staged;
+    return rc;
 }
 
 int st_storage_get_peer_mesh_acl(const char *path, long long id, st_storage_peer_mesh_acl *acl)
@@ -8186,43 +8982,109 @@ static int read_peer_mesh_session(sqlite3 *db,
     return ok ? 0 : -1;
 }
 
-int st_storage_create_peer_mesh_session(const char *path,
+static int create_peer_mesh_session_impl(const char *path,
                                         const st_storage_client *source,
                                         const st_storage_client *target,
                                         const char *path_type,
                                         const char *token_hash,
                                         long long ttl_seconds,
-                                        st_storage_peer_mesh_session *out_session)
+                                        st_storage_peer_mesh_session *out_session,
+                                        const st_storage_control_source *control)
 {
-    if (source == NULL || target == NULL || token_hash == NULL || ttl_seconds <= 0) return -1;
-    int allowed = 0;
-    if (st_storage_can_peer(path, source, target, &allowed) != 0 || !allowed) return -1;
+    if (source == NULL || target == NULL || source->id <= 0 || target->id <= 0
+        || source->id == target->id || token_hash == NULL || ttl_seconds <= 0) {
+        if (out_session != NULL) memset(out_session, 0, sizeof(*out_session));
+        return -1;
+    }
     sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
+    if (open_db(path, &db) != 0) {
+        if (out_session != NULL) memset(out_session, 0, sizeof(*out_session));
+        return -1;
+    }
+    /* Transfer and session creation must share the database writer fence: a
+     * separate permission read followed by an insert can resurrect a lost grant. */
+    st_storage_client current_source = {0}, current_target = {0};
+    st_storage_client checked_source = {0}, checked_target = {0};
+    st_storage_peer_mesh_session staged = {0};
+    int allowed = 0, rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0) rc = peer_control_write_check(db, control, source->id, source->tenant_id);
+    if (rc == 0 && (load_client(db, source->id, &current_source) != 0
+        || load_client(db, target->id, &current_target) != 0
+        || strcmp(current_source.tenant_id, source->tenant_id) != 0
+        || strcmp(current_target.tenant_id, target->tenant_id) != 0)) rc = -1;
+    if (rc == 0 && (can_peer_on_db(db, &current_source, &current_target, &allowed) != 0 || !allowed)) rc = -1;
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db,
+    const char *selected_path = path_type == NULL || *path_type == '\0' ? "DIRECT" : path_type;
+    if (rc == 0) rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_session(tenant_id,source_client_id,source_client_name,target_client_id,"
         "target_client_name,path_type,status,token_hash,started_at,updated_at,expires_at) "
         "VALUES(?,?,?,?,?,?, 'NEGOTIATING',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,datetime('now',?))",
-        -1, &stmt, NULL);
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
     char ttl[64];
     snprintf(ttl, sizeof(ttl), "+%lld seconds", ttl_seconds);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, source->tenant_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 2, source->id);
-        sqlite3_bind_text(stmt, 3, source->client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 4, target->id);
-        sqlite3_bind_text(stmt, 5, target->client_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 6, path_type == NULL || *path_type == '\0' ? "DIRECT" : path_type, -1, SQLITE_TRANSIENT);
+    if (rc == 0) {
+        sqlite3_bind_text(stmt, 1, current_source.tenant_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, current_source.id);
+        sqlite3_bind_text(stmt, 3, current_source.client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, current_target.id);
+        sqlite3_bind_text(stmt, 5, current_target.client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, selected_path, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 7, token_hash, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 8, ttl, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
-    } else rc = -1;
-    sqlite3_finalize(stmt);
+        rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+    }
+    sqlite3_finalize(stmt); stmt = NULL;
     long long id = rc == 0 ? sqlite3_last_insert_rowid(db) : 0;
-    if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, source->tenant_id, id, out_session);
+    /* Even callers that discard the result must reject malformed/deleted rows or
+     * an insert trigger changing the grant, token or initial session state. */
+    if (rc == 0 && (id <= 0 || read_peer_mesh_session(db, current_source.tenant_id, id, &staged) != 0
+        || staged.source_client_id != current_source.id || staged.target_client_id != current_target.id
+        || strcmp(staged.source_client_name, current_source.client_name) != 0
+        || strcmp(staged.target_client_name, current_target.client_name) != 0
+        || strcmp(staged.path_type, selected_path) != 0 || strcmp(staged.status, "NEGOTIATING") != 0)) rc = -1;
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db,
+            "SELECT 1 FROM peer_mesh_session WHERE id=? AND token_hash=? AND closed_at IS NULL "
+            "AND started_at=updated_at AND expires_at=datetime(started_at,?) "
+            "AND rtt_millis IS NULL AND local_endpoint IS NULL AND remote_endpoint IS NULL "
+            "AND direct_bytes=0 AND relay_bytes=0 AND last_traffic_at IS NULL AND last_keepalive_at IS NULL",
+            -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, id); sqlite3_bind_text(stmt, 2, token_hash, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, ttl, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_ROW ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0 && (load_client(db, current_source.id, &checked_source) != 0
+        || load_client(db, current_target.id, &checked_target) != 0
+        || strcmp(checked_source.tenant_id, current_source.tenant_id) != 0
+        || strcmp(checked_target.tenant_id, current_target.tenant_id) != 0
+        || strcmp(checked_source.client_name, current_source.client_name) != 0
+        || strcmp(checked_target.client_name, current_target.client_name) != 0
+        || can_peer_on_db(db, &checked_source, &checked_target, &allowed) != 0 || !allowed)) rc = -1;
+    rc = peer_control_write_postcheck(db, control, source->id, source->tenant_id, rc);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     sqlite3_close(db);
+    if (out_session != NULL) {
+        if (rc == 0) *out_session = staged;
+        else memset(out_session, 0, sizeof(*out_session));
+    }
     return rc;
+}
+
+int st_storage_create_peer_mesh_session(const char *path, const st_storage_client *source,
+    const st_storage_client *target, const char *path_type, const char *token_hash,
+    long long ttl_seconds, st_storage_peer_mesh_session *out_session)
+{ return create_peer_mesh_session_impl(path, source, target, path_type, token_hash, ttl_seconds, out_session, NULL); }
+
+int st_storage_create_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *source, const st_storage_client *target, const char *path_type,
+    const char *token_hash, long long ttl_seconds, st_storage_peer_mesh_session *out_session)
+{
+    if (control == NULL) { if (out_session != NULL) memset(out_session, 0, sizeof(*out_session)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return create_peer_mesh_session_impl(path, source, target, path_type, token_hash, ttl_seconds, out_session, control);
 }
 
 int st_storage_get_peer_mesh_session(const char *path,
@@ -8343,7 +9205,7 @@ static int peer_session_pair_matches(const peer_session_state *state, long long 
  * - a reported path type is taken as is only while nothing has been counted, and is the effective
  *   one after that.
  */
-int st_storage_report_peer_mesh_session(const char *path,
+static int report_peer_mesh_session_impl(const char *path,
                                         const st_storage_client *reporter,
                                         long long id,
                                         const char *path_type,
@@ -8354,17 +9216,22 @@ int st_storage_report_peer_mesh_session(const char *path,
                                         long long direct_bytes,
                                         long long relay_bytes,
                                         int close_session,
-                                        st_storage_peer_mesh_session *out_session)
+                                        st_storage_peer_mesh_session *out_session,
+                                        const st_storage_control_source *control)
 {
+    if (out_session != NULL) memset(out_session, 0, sizeof(*out_session));
     if (reporter == NULL || id <= 0) return -1;
     if (direct_bytes < 0) direct_bytes = 0;
     if (relay_bytes < 0) relay_bytes = 0;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
+    int rc = exec_sql(db, "BEGIN IMMEDIATE");
+    if (rc == 0) rc = peer_control_write_check(db, control, reporter->id, reporter->tenant_id);
     peer_session_state state;
-    int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
-    int rc = found == 1
-        && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    if (rc == 0) {
+        int found = read_peer_session_state(db, id, reporter->tenant_id, &state);
+        rc = found == 1 && (state.source_client_id == reporter->id || state.target_client_id == reporter->id) ? 0 : -1;
+    }
     if (rc == 0 && close_session) {
         rc = close_peer_session(db, id);
     } else if (rc == 0) {
@@ -8410,9 +9277,31 @@ int st_storage_report_peer_mesh_session(const char *path,
             sqlite3_finalize(stmt);
         }
     }
-    if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, out_session);
+    st_storage_peer_mesh_session staged = {0};
+    if (rc == 0 && out_session != NULL) rc = read_peer_mesh_session(db, reporter->tenant_id, id, &staged);
+    rc = peer_control_write_postcheck(db, control, reporter->id, reporter->tenant_id, rc);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
     sqlite3_close(db);
+    if (rc == 0 && out_session != NULL) *out_session = staged;
     return rc;
+}
+
+int st_storage_report_peer_mesh_session(const char *path, const st_storage_client *reporter,
+    long long id, const char *path_type, const char *status, long long rtt_millis,
+    const char *local_endpoint, const char *remote_endpoint, long long direct_bytes, long long relay_bytes,
+    int close_session, st_storage_peer_mesh_session *out_session)
+{ return report_peer_mesh_session_impl(path, reporter, id, path_type, status, rtt_millis, local_endpoint,
+    remote_endpoint, direct_bytes, relay_bytes, close_session, out_session, NULL); }
+
+int st_storage_report_peer_mesh_session_from_control(const char *path, const st_storage_control_source *control,
+    const st_storage_client *reporter, long long id, const char *path_type, const char *status,
+    long long rtt_millis, const char *local_endpoint, const char *remote_endpoint,
+    long long direct_bytes, long long relay_bytes, int close_session, st_storage_peer_mesh_session *out_session)
+{
+    if (control == NULL) { if (out_session != NULL) memset(out_session, 0, sizeof(*out_session)); return ST_STORAGE_CONTROL_SOURCE_RETIRED; }
+    return report_peer_mesh_session_impl(path, reporter, id, path_type, status, rtt_millis, local_endpoint,
+        remote_endpoint, direct_bytes, relay_bytes, close_session, out_session, control);
 }
 
 /*
@@ -8558,13 +9447,9 @@ int st_storage_open_peer_mesh_sessions_between(const char *path,
     return rc;
 }
 
-int st_storage_get_peer_mesh_service_sharing(const char *path,
-                                             const char *tenant_id,
-                                             st_storage_peer_mesh_service_sharing *out_sharing)
+static int read_peer_mesh_service_sharing(sqlite3 *db, const char *tenant_id,
+                                         st_storage_peer_mesh_service_sharing *out_sharing)
 {
-    if (out_sharing == NULL) return -1;
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT enabled,mdns_import_enabled,updated_by,updated_at FROM peer_mesh_service_sharing WHERE tenant_id=?",
@@ -8581,8 +9466,18 @@ int st_storage_get_peer_mesh_service_sharing(const char *path,
         }
     }
     sqlite3_finalize(stmt);
-    sqlite3_close(db);
     return rc == SQLITE_ROW ? 0 : (rc == SQLITE_DONE ? 1 : -1);
+}
+
+int st_storage_get_peer_mesh_service_sharing(const char *path, const char *tenant_id,
+                                             st_storage_peer_mesh_service_sharing *out_sharing)
+{
+    if (out_sharing == NULL) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = read_peer_mesh_service_sharing(db, tenant_id, out_sharing);
+    sqlite3_close(db);
+    return rc;
 }
 
 int st_storage_upsert_peer_mesh_service_sharing(const char *path,
@@ -8641,6 +9536,149 @@ static const char *peer_mesh_service_select(void)
     return "SELECT s.id,s.tenant_id,s.client_id,s.client_name,s.service_id,s.name,s.description,"
         "s.transport,s.application,s.target_host,s.target_port,s.published_port,s.path,s.enabled,"
         "s.visibility,s.allowed_client_ids,s.created_at,s.updated_at FROM peer_mesh_shared_service s";
+}
+
+void st_storage_peer_mesh_config_free(st_storage_peer_mesh_config *config)
+{
+    if (config == NULL) return;
+    for (size_t i = 0; i < config->service_count; ++i) free(config->services[i].allowed_peer_ips);
+    free(config->services);
+    memset(config, 0, sizeof(*config));
+}
+
+static int config_service_allows(const st_storage_peer_mesh_service *service, long long id)
+{
+    const char *nonspace = service->allowed_client_ids;
+    while (isspace((unsigned char)*nonspace)) ++nonspace;
+    if (*nonspace == '\0') return 1;
+    char copy[sizeof(service->allowed_client_ids)];
+    strcpy(copy, service->allowed_client_ids);
+    int matched = 0;
+    for (char *part = copy; part != NULL;) {
+        char *next = strchr(part, ',');
+        if (next != NULL) *next++ = '\0';
+        while (isspace((unsigned char)*part)) ++part;
+        char *last = part + strlen(part);
+        while (last > part && isspace((unsigned char)last[-1])) *--last = '\0';
+        char *end = NULL;
+        errno = 0;
+        long long value = strtoll(part, &end, 10);
+        if (errno || end == part || *end != '\0' || value <= 0) return 0;
+        matched |= value == id;
+        part = next;
+    }
+    return matched;
+}
+
+static int catalog_service_allows(const st_storage_peer_mesh_service *service,
+    const st_storage_client *publisher, const st_storage_client *recipient)
+{
+    if (!strcmp(service->visibility, "OWNER"))
+        return !strcmp(normalize_owner_username(publisher->owner_username), normalize_owner_username(recipient->owner_username));
+    return !strcmp(service->visibility, "ACL") && config_service_allows(service, recipient->id);
+}
+
+int st_storage_load_peer_mesh_config(const char *path, const st_storage_client *cached,
+    int ensure_device, int include_services, st_storage_peer_mesh_config *out)
+{
+    if (out == NULL || out->services != NULL || out->service_count != 0) return -1;
+    memset(out, 0, sizeof(*out));
+    if (cached == NULL || cached->id <= 0) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    st_storage_peer_mesh_config staged = {0};
+    typedef struct { st_storage_client client; char ip[64]; } config_recipient;
+    config_recipient *recipients = NULL;
+    size_t recipient_count = 0, recipient_capacity = 0, service_capacity = 0;
+    sqlite3_stmt *stmt = NULL;
+    int rc = exec_sql(db, ensure_device ? "BEGIN IMMEDIATE" : "BEGIN");
+    int transaction = rc == 0;
+    if (rc != 0) goto done;
+    if (load_client(db, cached->id, &staged.client) != 0 || !staged.client.enabled
+        || strcmp(staged.client.tenant_id, cached->tenant_id) != 0) { rc = -1; goto done; }
+    if (ensure_device) {
+        rc = ensure_peer_mesh_device_on_db(db, &staged.client);
+        st_storage_client checked = {0};
+        if (rc == 0 && (load_client(db, cached->id, &checked) != 0 || !checked.enabled
+            || strcmp(checked.tenant_id, staged.client.tenant_id) != 0
+            || strcmp(checked.owner_username, staged.client.owner_username) != 0
+            || strcmp(checked.client_name, staged.client.client_name) != 0)) rc = -1;
+        if (rc == 0) rc = read_peer_mesh_device(db, staged.client.tenant_id, staged.client.id, &staged.device);
+        if (rc == 0 && (strcmp(staged.device.owner_username, staged.client.owner_username) != 0
+            || strcmp(staged.device.client_name, staged.client.client_name) != 0)) rc = -1;
+        if (rc != 0) goto done;
+        staged.has_device = 1;
+        staged.device.message_send_capable = staged.client.message_send_capable;
+        staged.device.message_receive_capable = staged.client.message_receive_capable;
+        staged.device.message_attachments_capable = staged.client.message_attachments_capable;
+        staged.device.message_media_preview_capable = staged.client.message_media_preview_capable;
+        staged.device.message_max_attachment_bytes = staged.client.message_max_attachment_bytes;
+    }
+    rc = read_peer_mesh_service_sharing(db, staged.client.tenant_id, &staged.sharing);
+    if (rc < 0) goto done;
+    rc = 0; /* Missing tenant settings mean disabled, just as before. */
+    if (!include_services) goto done;
+    char sql[1024];
+    int written = snprintf(sql, sizeof(sql), "%s WHERE s.tenant_id=? AND s.client_id=? ORDER BY s.client_name,s.name",
+                           peer_mesh_service_select());
+    if (written <= 0 || (size_t)written >= sizeof(sql)
+        || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) { rc = -1; goto done; }
+    sqlite3_bind_text(stmt, 1, staged.client.tenant_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, staged.client.id);
+    int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (storage_reserve((void **)&staged.services, staged.service_count, &service_capacity, sizeof(*staged.services)) != 0) { rc = -1; break; }
+        st_storage_peer_mesh_config_service *service = &staged.services[staged.service_count++];
+        memset(service, 0, sizeof(*service));
+        if (scan_peer_mesh_service(stmt, &service->service) != 0) { rc = -1; break; }
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt); stmt = NULL;
+    if (rc != 0 || staged.service_count == 0) goto done;
+    if (sqlite3_prepare_v2(db,
+        "SELECT c.rowid FROM client_account c JOIN peer_mesh_device d ON d.client_id=c.rowid AND d.tenant_id=c.tenant_id "
+        "WHERE c.tenant_id=? AND c.enabled<>0 AND d.enabled=1 AND c.rowid<>? ORDER BY c.client_name",
+        -1, &stmt, NULL) != SQLITE_OK) { rc = -1; goto done; }
+    sqlite3_bind_text(stmt, 1, staged.client.tenant_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, staged.client.id);
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        st_storage_client client = {0};
+        st_storage_peer_mesh_device device = {0};
+        int allowed = 0;
+        if (load_client(db, sqlite3_column_int64(stmt, 0), &client) != 0
+            || can_peer_on_db(db, &client, &staged.client, &allowed) != 0) { rc = -1; break; }
+        if (!allowed) continue;
+        if (read_peer_mesh_device(db, client.tenant_id, client.id, &device) != 0) { rc = -1; break; }
+        if (device.virtual_ip[0] == '\0') continue;
+        if (storage_reserve((void **)&recipients, recipient_count, &recipient_capacity, sizeof(*recipients)) != 0) { rc = -1; break; }
+        recipients[recipient_count].client = client;
+        strcpy(recipients[recipient_count++].ip, device.virtual_ip);
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt); stmt = NULL;
+    for (size_t i = 0; rc == 0 && i < staged.service_count; ++i) {
+        st_storage_peer_mesh_config_service *service = &staged.services[i];
+        size_t capacity = 0;
+        for (size_t j = 0; service->service.enabled && j < recipient_count; ++j) {
+            const config_recipient *recipient = &recipients[j];
+            if (!catalog_service_allows(&service->service, &staged.client, &recipient->client)) continue;
+            if (storage_reserve((void **)&service->allowed_peer_ips, service->allowed_peer_count, &capacity,
+                                sizeof(*service->allowed_peer_ips)) != 0) { rc = -1; break; }
+            strcpy(service->allowed_peer_ips[service->allowed_peer_count++], recipient->ip);
+        }
+    }
+done:
+    sqlite3_finalize(stmt);
+    free(recipients);
+    if (transaction && rc == 0) {
+        if (exec_sql(db, "COMMIT") == 0) transaction = 0;
+        else rc = -1;
+    }
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    if (rc == 0) { *out = staged; memset(&staged, 0, sizeof(staged)); }
+    st_storage_peer_mesh_config_free(&staged);
+    return rc;
 }
 
 /*
@@ -9094,12 +10132,18 @@ int st_storage_find_peer_mesh_egress_activity(const char *path,
     return result;
 }
 
-int st_storage_upsert_peer_mesh_egress_activity(const char *path,
-                                                const st_storage_peer_mesh_egress_activity *row)
+static int upsert_peer_mesh_egress_activity_impl(const char *path,
+    const st_storage_peer_mesh_egress_activity *row, const st_storage_control_source *control)
 {
     if (row == NULL || row->egress_client_id <= 0) return -1;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) return -1;
+    if (control != NULL) {
+        int guard = exec_sql(db, "BEGIN IMMEDIATE");
+        if (guard == 0) guard = peer_control_write_check(db, control, row->egress_client_id, row->tenant_id);
+        if (guard == 0 && row->session_id != control->session_id) guard = ST_STORAGE_CONTROL_SOURCE_RETIRED;
+        if (guard != 0) { (void)exec_sql(db, "ROLLBACK"); sqlite3_close(db); return guard; }
+    }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_egress_activity(tenant_id,egress_client_id,egress_client_name,session_id,"
@@ -9113,7 +10157,7 @@ int st_storage_upsert_peer_mesh_egress_activity(const char *path,
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, normalize_tenant_id(row->tenant_id), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 2, row->egress_client_id);
-        sqlite3_bind_text(stmt, 3, row->egress_client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, control == NULL ? row->egress_client_name : control->client_name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 4, row->session_id);
         sqlite3_bind_int64(stmt, 5, row->revision);
         sqlite3_bind_int64(stmt, 6, row->active_flows);
@@ -9125,9 +10169,21 @@ int st_storage_upsert_peer_mesh_egress_activity(const char *path,
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else rc = -1;
     sqlite3_finalize(stmt);
+    if (control != NULL) {
+        rc = peer_control_write_postcheck(db, control, row->egress_client_id, row->tenant_id, rc);
+        if (rc == 0) rc = exec_sql(db, "COMMIT");
+        if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    }
     sqlite3_close(db);
     return rc;
 }
+
+int st_storage_upsert_peer_mesh_egress_activity(const char *path, const st_storage_peer_mesh_egress_activity *row)
+{ return upsert_peer_mesh_egress_activity_impl(path, row, NULL); }
+
+int st_storage_upsert_peer_mesh_egress_activity_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_peer_mesh_egress_activity *row)
+{ return control == NULL ? ST_STORAGE_CONTROL_SOURCE_RETIRED : upsert_peer_mesh_egress_activity_impl(path, row, control); }
 
 int st_storage_get_peer_mesh_egress_switch(const char *path,
                                            const char *tenant_id,
@@ -9183,7 +10239,7 @@ int st_storage_upsert_peer_mesh_egress_switch(const char *path,
     return rc;
 }
 
-int st_storage_record_peer_mesh_service_audit(const char *path,
+static int record_peer_mesh_service_audit_on_db(sqlite3 *db,
                                               const char *action,
                                               const char *tenant_id,
                                               long long client_id,
@@ -9192,8 +10248,6 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
                                               const char *reason)
 {
     if (action == NULL || *action == '\0') return -1;
-    sqlite3 *db = NULL;
-    if (open_db(path, &db) != 0) return -1;
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_service_audit(action,tenant_id,client_id,session_id,service_id,reason) "
@@ -9220,7 +10274,242 @@ int st_storage_record_peer_mesh_service_audit(const char *path,
         } else rc = -1;
         sqlite3_finalize(stmt);
     }
+    return rc;
+}
+
+int st_storage_record_peer_mesh_service_audit(const char *path, const char *action,
+    const char *tenant_id, long long client_id, long long session_id,
+    const char *service_id, const char *reason)
+{
+    if (action == NULL || *action == '\0') return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = record_peer_mesh_service_audit_on_db(db, action, tenant_id, client_id,
+        session_id, service_id, reason);
     sqlite3_close(db);
+    return rc;
+}
+
+static int service_report_policy_on_db(sqlite3 *db, const st_storage_client *client,
+    st_storage_peer_mesh_device *device, st_storage_peer_mesh_service_sharing *sharing)
+{
+    memset(device, 0, sizeof(*device)); memset(sharing, 0, sizeof(*sharing));
+    if (!client->enabled || read_peer_mesh_device(db, client->tenant_id, client->id, device) != 0
+        || strcmp(device->owner_username, client->owner_username) != 0
+        || strcmp(device->client_name, client->client_name) != 0) return -1;
+    return read_peer_mesh_service_sharing(db, client->tenant_id, sharing) < 0 ? -1 : 0;
+}
+
+static int catalog_source_discovery_on_db(sqlite3 *db, const st_storage_control_source *source, int *enabled);
+
+static int commit_peer_service_report_impl(const char *path, const st_storage_control_source *control,
+    const st_storage_client *cached, long long session_id, st_storage_peer_service_report_stage_fn stage,
+    void *context, st_storage_client *committed_client)
+{
+    if (committed_client != NULL) memset(committed_client, 0, sizeof(*committed_client));
+    if (stage == NULL || session_id <= 0) return -1;
+    if (control != NULL && session_id != control->session_id) return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    sqlite3 *db = NULL; st_storage_client current = {0}, checked = {0};
+    st_storage_peer_mesh_device device = {0}, checked_device = {0};
+    st_storage_peer_mesh_service_sharing sharing = {0}, checked_sharing = {0};
+    if (peer_client_write_begin(path, cached, &db, &current, NULL) != 0) return -1;
+    int rc = peer_control_write_check(db, control, current.id, current.tenant_id);
+    if (rc == 0 && control != NULL) {
+        int discovery = 0;
+        rc = catalog_source_discovery_on_db(db, control, &discovery);
+        if (rc == 0 && !discovery) rc = ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE;
+    }
+    if (rc == 0) rc = service_report_policy_on_db(db, &current, &device, &sharing);
+    const char *reason = NULL;
+    if (rc == 0) rc = stage(context, &current, &device, &sharing, &reason);
+    if (rc == 0 && (reason == NULL || *reason == '\0')) rc = -1;
+    if (rc == 0) rc = record_peer_mesh_service_audit_on_db(db, "service-report", current.tenant_id,
+        current.id, session_id, NULL, reason);
+    /* A trigger is part of our transaction too. Do not publish a stage computed under a
+     * different policy, nor misclassify our rolled-back trigger as permanent source loss. */
+    if (rc == 0 && (load_client(db, current.id, &checked) != 0
+        || strcmp(checked.tenant_id, current.tenant_id) != 0
+        || strcmp(checked.client_name, current.client_name) != 0
+        || strcmp(checked.owner_username, current.owner_username) != 0
+        || checked.enabled != current.enabled
+        || service_report_policy_on_db(db, &checked, &checked_device, &checked_sharing) != 0
+        || checked_device.enabled != device.enabled || checked_sharing.enabled != sharing.enabled
+        || checked_sharing.mdns_import_enabled != sharing.mdns_import_enabled)) rc = -1;
+    if (rc == 0 && control != NULL) {
+        int discovery = 0;
+        if (catalog_source_discovery_on_db(db, control, &discovery) != 0 || !discovery) rc = -1;
+    }
+    rc = peer_control_write_postcheck(db, control, current.id, current.tenant_id, rc);
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0) (void)exec_sql(db, "ROLLBACK");
+    sqlite3_close(db);
+    if (rc == 0 && committed_client != NULL) *committed_client = checked;
+    return rc;
+}
+
+int st_storage_commit_peer_service_report(const char *path, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client)
+{ return commit_peer_service_report_impl(path, NULL, cached, session_id, stage, context, committed_client); }
+
+int st_storage_commit_peer_service_report_from_control(const char *path,
+    const st_storage_control_source *control, const st_storage_client *cached,
+    long long session_id, st_storage_peer_service_report_stage_fn stage, void *context,
+    st_storage_client *committed_client)
+{
+    if (control == NULL) {
+        if (committed_client != NULL) memset(committed_client, 0, sizeof(*committed_client));
+        return ST_STORAGE_CONTROL_SOURCE_RETIRED;
+    }
+    return commit_peer_service_report_impl(path, control, cached, session_id, stage, context, committed_client);
+}
+
+void st_storage_peer_catalog_view_free(st_storage_peer_catalog_view *view)
+{
+    if (view == NULL) return;
+    free(view->services); memset(view, 0, sizeof(*view));
+}
+
+/* Unlike load_client's legacy API, distinguish absence from a failed read. */
+static int catalog_client_on_db(sqlite3 *db, const char *tenant, long long id, st_storage_client *client)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE rowid=? AND tenant_id COLLATE BINARY=?", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_int64(stmt, 1, id); sqlite3_bind_text(stmt, 2, tenant, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt); sqlite3_finalize(stmt);
+    return rc == SQLITE_ROW ? load_client(db, id, client) : rc == SQLITE_DONE ? 1 : -1;
+}
+
+static int catalog_device_on_db(sqlite3 *db, const st_storage_client *client, int *enabled)
+{
+    *enabled = 0; sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT 1 FROM peer_mesh_device WHERE tenant_id COLLATE BINARY=? "
+        "AND client_id=? AND owner_username COLLATE BINARY=? AND client_name COLLATE BINARY=? AND enabled=1", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, client->tenant_id, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 2, client->id);
+    sqlite3_bind_text(stmt, 3, client->owner_username, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, client->client_name, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt); *enabled = rc == SQLITE_ROW; sqlite3_finalize(stmt);
+    return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int catalog_source_discovery_on_db(sqlite3 *db, const st_storage_control_source *source, int *enabled)
+{
+    *enabled = 0; sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT peer_service_discovery_version FROM specus_client_session WHERE id=?", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_int64(stmt, 1, source->session_id); rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) *enabled = sqlite3_column_int(stmt, 0) >= 2;
+    sqlite3_finalize(stmt); return rc == SQLITE_ROW || rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int read_peer_catalog_impl(const char *path, const char *tenant_id, long long publisher_id,
+    const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_view *view, st_storage_peer_catalog_delivery_stage_fn stage, void *context)
+{
+    if (view == NULL) return -1;
+    memset(view, 0, sizeof(*view));
+    if (source_count && source_visible && source_count <= 4096U) memset(source_visible, 0, source_count * sizeof(*source_visible));
+    if (path == NULL || !*path || source_count > 4096U || service_count > 32U || publisher_id <= 0 || tenant_id == NULL || !*tenant_id
+        || (source_count && (sources == NULL || source_visible == NULL)) || (service_count && service_ids == NULL)) return -1;
+    int *visible = source_count ? calloc(source_count, sizeof(*visible)) : NULL;
+    if (source_count && visible == NULL) return -1;
+    st_storage_peer_catalog_view staged = {0}; st_storage_peer_mesh_service_sharing sharing = {0};
+    sqlite3 *db = NULL; int rc = open_db(path, &db);
+    if (rc == 0) rc = exec_sql(db, stage ? "BEGIN IMMEDIATE" : "BEGIN");
+    int present = 1, device = 0;
+    if (rc == 0) { present = catalog_client_on_db(db, tenant_id, publisher_id, &staged.publisher); if (present < 0) rc = -1; }
+    if (rc == 0 && present == 0) {
+        rc = catalog_device_on_db(db, &staged.publisher, &device);
+        if (rc == 0 && read_peer_mesh_service_sharing(db, tenant_id, &sharing) < 0) rc = -1;
+        staged.publisher_current = staged.publisher.enabled && device;
+        staged.sharing_enabled = sharing.enabled; staged.mdns_enabled = sharing.enabled && sharing.mdns_import_enabled;
+    }
+    for (size_t i = 0; rc == 0 && i < source_count; ++i) {
+        if (!staged.publisher_current || !staged.sharing_enabled) continue;
+        if (!sources[i].guarded) { visible[i] = 1; continue; }
+        int check = control_source_on_db(db, &sources[i].control, publisher_id, tenant_id);
+        if (check == 0) rc = catalog_source_discovery_on_db(db, &sources[i].control, &visible[i]);
+        else if (check != ST_STORAGE_CONTROL_SOURCE_RETIRED && check != ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE) rc = -1;
+    }
+    int any_source = source_count == 0;
+    for (size_t i = 0; i < source_count; ++i) any_source |= visible[i];
+    if (rc == 0 && recipient_id > 0) {
+        present = catalog_client_on_db(db, tenant_id, recipient_id, &staged.recipient);
+        if (present < 0) rc = -1;
+        if (rc == 0 && present == 0) {
+            staged.recipient_authenticated = staged.recipient.enabled;
+            if (recipient_source != NULL && recipient_source->guarded) {
+                int check = control_source_on_db(db, &recipient_source->control, recipient_id, tenant_id);
+                if (check == 0) rc = catalog_source_discovery_on_db(db, &recipient_source->control, &staged.recipient_authenticated);
+                else if (check == ST_STORAGE_CONTROL_SOURCE_RETIRED || check == ST_STORAGE_CONTROL_SOURCE_UNAVAILABLE)
+                    staged.recipient_authenticated = 0;
+                else rc = -1;
+            }
+            device = 0; if (rc == 0) rc = catalog_device_on_db(db, &staged.recipient, &device);
+            staged.recipient_current = staged.recipient_authenticated && staged.recipient.enabled && device;
+            if (rc == 0 && any_source && staged.recipient_current && staged.publisher_current && staged.sharing_enabled
+                && recipient_id != publisher_id) rc = can_peer_on_db(db, &staged.recipient, &staged.publisher, &staged.allowed);
+        }
+    }
+    if (rc == 0 && staged.allowed && service_count) {
+        staged.services = calloc(service_count, sizeof(*staged.services));
+        if (staged.services == NULL) rc = -1;
+        sqlite3_stmt *stmt = NULL; char sql[1024];
+        int length = snprintf(sql, sizeof(sql), "%s WHERE s.tenant_id COLLATE BINARY=? AND s.client_id=? AND s.service_id COLLATE BINARY=?", peer_mesh_service_select());
+        if (rc == 0 && (length < 0 || (size_t)length >= sizeof(sql) || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)) rc = -1;
+        for (size_t i = 0; rc == 0 && i < service_count; ++i) {
+            if (memchr(service_ids[i], '\0', 65) == NULL) { rc = -1; break; }
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+            sqlite3_bind_text(stmt, 1, tenant_id, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 2, publisher_id);
+            sqlite3_bind_text(stmt, 3, service_ids[i], -1, SQLITE_TRANSIENT);
+            int step = sqlite3_step(stmt);
+            if (step == SQLITE_DONE) continue;
+            st_storage_peer_mesh_service service;
+            if (step != SQLITE_ROW || scan_peer_mesh_service(stmt, &service) != 0 || sqlite3_step(stmt) != SQLITE_DONE) { rc = -1; break; }
+            int permitted = catalog_service_allows(&service, &staged.publisher, &staged.recipient);
+            if (service.enabled && permitted) staged.services[staged.service_count++] = service;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0 && stage) {
+        if (!staged.recipient_authenticated) rc = 1;
+        else {
+            int result = stage(context, &staged, source_count ? visible[0] : 0);
+            rc = result == 0 ? 0 : result == 1 ? 1 : -1;
+        }
+    }
+    if (rc == 0) rc = exec_sql(db, "COMMIT");
+    if (rc != 0 && db != NULL) (void)exec_sql(db, "ROLLBACK");
+    if (db != NULL) sqlite3_close(db);
+    if (rc == 0) { *view = staged; memset(&staged, 0, sizeof(staged)); if (source_count) memcpy(source_visible, visible, source_count * sizeof(*visible)); }
+    free(visible); st_storage_peer_catalog_view_free(&staged); return rc;
+}
+
+int st_storage_read_peer_catalog(const char *path, const char *tenant_id, long long publisher_id,
+    const st_storage_peer_catalog_source *sources, size_t source_count, int *source_visible,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count, st_storage_peer_catalog_view *view)
+{
+    return read_peer_catalog_impl(path, tenant_id, publisher_id, sources, source_count, source_visible,
+        recipient_id, recipient_source, service_ids, service_count, view, NULL, NULL);
+}
+
+int st_storage_commit_peer_catalog_delivery(const char *path, const char *tenant_id,
+    long long publisher_id, const st_storage_peer_catalog_source *publisher_source,
+    long long recipient_id, const st_storage_peer_catalog_source *recipient_source,
+    const char (*service_ids)[65], size_t service_count,
+    st_storage_peer_catalog_delivery_stage_fn stage, void *context)
+{
+    if (!stage || !recipient_source || recipient_id <= 0 || (!publisher_source && service_count)) return -1;
+    st_storage_peer_catalog_view view = {0}; int visible = 0;
+    int rc = read_peer_catalog_impl(path, tenant_id, publisher_id, publisher_source,
+        publisher_source ? 1U : 0U, &visible, recipient_id, recipient_source,
+        service_ids, service_count, &view, stage, context);
+    st_storage_peer_catalog_view_free(&view);
     return rc;
 }
 
@@ -11965,12 +13254,85 @@ int st_storage_update_client_audited(const char *path,
     return out_client == NULL ? 0 : st_storage_get_client(path, id, out_client);
 }
 
+int st_storage_patch_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    const st_storage_client_patch *patch, long long now_ms, st_storage_client *out_before,
+    st_storage_client *out_client, st_storage_share_ids *revoked)
+{
+    if (out_before != NULL) memset(out_before, 0, sizeof(*out_before));
+    if (out_client != NULL) memset(out_client, 0, sizeof(*out_client));
+    if (id <= 0 || patch == NULL
+        || (patch->client_name != NULL && (*patch->client_name == '\0' || strlen(patch->client_name) >= sizeof(((st_storage_client *)0)->client_name)))
+        || (revoked != NULL && (revoked->ids != NULL || revoked->len != 0 || revoked->cap != 0))) return -1;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    st_storage_management_user current_actor;
+    st_storage_client before = {0}, staged = {0};
+    st_storage_share_ids pending_revoked = {0};
+    int rc = share_begin(db);
+    if (rc == 0) rc = load_visible_client(db, id, actor, builtin, &current_actor, &before);
+    const char *name = patch->client_name == NULL ? before.client_name : patch->client_name;
+    int enabled = patch->enabled_provided ? patch->enabled != 0 : before.enabled;
+    int rate = patch->rate_limit_provided
+        ? (patch->connection_rate_limit_per_minute <= 0 ? 30 : patch->connection_rate_limit_per_minute)
+        : before.connection_rate_limit_per_minute;
+    if (rc == 0 && strcmp(name, before.client_name) != 0) {
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE client_name = ? AND rowid <> ?", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, id);
+            int step = sqlite3_step(stmt);
+            rc = step == SQLITE_ROW ? ST_STORAGE_CLIENT_NAME_EXISTS : step == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (rc == 0) rc = update_client_on_db(db, id, before.client_name, before.tenant_id, name,
+                                         before.owner_username, enabled, rate);
+    if (rc == 0 && before.enabled && !enabled) {
+        st_storage_http_share *shares = NULL;
+        size_t count = 0U;
+        rc = share_active_of_client(db, name, now_ms, &shares, &count);
+        if (rc == 0) rc = share_revoke_each(db, shares, count, current_actor.username, "client-disabled", now_ms, &pending_revoked);
+        free(shares);
+    }
+    if (rc == 0 && (load_client(db, id, &staged) != 0 || staged.id != before.id
+        || strcmp(staged.tenant_id, before.tenant_id) != 0 || strcmp(staged.owner_username, before.owner_username) != 0
+        || strcmp(staged.created_at, before.created_at) != 0 || strcmp(staged.client_name, name) != 0
+        || staged.enabled != enabled || staged.connection_rate_limit_per_minute != rate)) rc = -1;
+    rc = share_end(db, rc);
+    sqlite3_close(db);
+    if (rc == 0) {
+        if (out_before != NULL) *out_before = before;
+        if (out_client != NULL) *out_client = staged;
+        if (revoked != NULL) { *revoked = pending_revoked; memset(&pending_revoked, 0, sizeof(pending_revoked)); }
+    }
+    st_storage_share_ids_free(&pending_revoked);
+    return rc;
+}
+
 int st_storage_delete_client_audited(const char *path,
                                      long long id,
                                      const char *actor,
                                      long long now_ms,
                                      st_storage_share_ids *revoked)
 {
+    return st_storage_delete_client_audited_with_peers(path, id, actor, now_ms, revoked, NULL, NULL);
+}
+
+static int delete_client_audited_with_peers(const char *path, long long id,
+                                               const char *actor, long long now_ms,
+                                               st_storage_share_ids *revoked,
+                                               st_storage_peer_close **closed, size_t *closed_count,
+                                               const st_storage_management_actor *management_actor,
+                                               const st_storage_share_builtin_admin *builtin,
+                                               st_storage_client *out_before)
+{
+    if (out_before != NULL) memset(out_before, 0, sizeof(*out_before));
+    if ((closed == NULL) != (closed_count == NULL)) return -1;
+    if (closed != NULL) { *closed = NULL; *closed_count = 0U; }
+    st_storage_peer_close *pending_closed = NULL;
+    size_t pending_count = 0U;
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
         return -1;
@@ -11981,7 +13343,13 @@ int st_storage_delete_client_audited(const char *path,
     size_t route_count = 0U;
     st_storage_http_share *shares = NULL;
     size_t share_count = 0U;
+    st_storage_client before = {0};
+    st_storage_management_user current_actor;
     int rc = share_begin(db);
+    if (rc == 0 && management_actor != NULL) {
+        rc = load_visible_client(db, id, management_actor, builtin, &current_actor, &before);
+        if (rc == 0) actor = current_actor.username;
+    }
     if (rc == 0) {
         rc = share_load_client_state(db, id, &client);
     }
@@ -12025,7 +13393,8 @@ int st_storage_delete_client_audited(const char *path,
         rc = share_active_of_client(db, client.client_name, now_ms, &shares, &share_count);
     }
     if (rc == 0) {
-        rc = delete_client_on_db(db, id, client.client_name);
+        rc = delete_client_on_db(db, id, client.client_name, client.tenant_id,
+                                  closed == NULL ? NULL : &pending_closed, &pending_count);
     }
     for (size_t i = 0U; rc == 0 && i < route_count; ++i) {
         char detail[64];
@@ -12035,12 +13404,63 @@ int st_storage_delete_client_audited(const char *path,
     if (rc == 0) {
         rc = share_revoke_each(db, shares, share_count, actor, "client-deleted", now_ms, revoked);
     }
+    if (rc == 0 && management_actor != NULL) {
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_account WHERE rowid = ?", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, id);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        }
+        sqlite3_finalize(stmt);
+    }
     free(route_ids);
     free(exposures);
     free(shares);
     rc = share_end(db, rc);
     sqlite3_close(db);
-    return rc == 0 ? 0 : -1;
+    if (rc == 0 && closed != NULL) {
+        *closed = pending_closed;
+        *closed_count = pending_count;
+    } else {
+        free(pending_closed);
+        if (rc != 0) st_storage_share_ids_free(revoked);
+    }
+    if (rc == 0 && out_before != NULL) *out_before = before;
+    return rc;
+}
+
+int st_storage_delete_client_audited_with_peers(const char *path, long long id,
+    const char *actor, long long now_ms, st_storage_share_ids *revoked,
+    st_storage_peer_close **closed, size_t *closed_count)
+{
+    return delete_client_audited_with_peers(path, id, actor, now_ms, revoked, closed, closed_count, NULL, NULL, NULL) == 0 ? 0 : -1;
+}
+
+int st_storage_delete_client_visible_audited(const char *path, long long id,
+    const st_storage_management_actor *actor, const st_storage_share_builtin_admin *builtin,
+    long long now_ms, st_storage_client *out_before, st_storage_share_ids *revoked,
+    st_storage_peer_close **closed, size_t *closed_count)
+{
+    if (out_before != NULL) memset(out_before, 0, sizeof(*out_before));
+    if ((closed == NULL) != (closed_count == NULL)
+        || (revoked != NULL && (revoked->ids != NULL || revoked->len != 0 || revoked->cap != 0))) return -1;
+    if (closed != NULL) { *closed = NULL; *closed_count = 0U; }
+    if (id <= 0) return -1;
+    if (actor == NULL) return ST_STORAGE_MANAGEMENT_ACTOR_CHANGED;
+    st_storage_client before = {0};
+    st_storage_share_ids pending_revoked = {0};
+    st_storage_peer_close *pending_closed = NULL;
+    size_t pending_count = 0U;
+    int rc = delete_client_audited_with_peers(path, id, NULL, now_ms, &pending_revoked, &pending_closed,
+                                             &pending_count, actor, builtin, &before);
+    if (rc == 0) {
+        if (out_before != NULL) *out_before = before;
+        if (revoked != NULL) { *revoked = pending_revoked; memset(&pending_revoked, 0, sizeof(pending_revoked)); }
+        if (closed != NULL) { *closed = pending_closed; *closed_count = pending_count; pending_closed = NULL; }
+    }
+    st_storage_share_ids_free(&pending_revoked);
+    free(pending_closed);
+    return rc;
 }
 
 typedef struct {
@@ -12168,4 +13588,343 @@ int st_storage_delete_management_user_audited(const char *path,
         return ST_STORAGE_ACCOUNT_STILL_OWNS;
     }
     return rc == 0 ? 0 : -1;
+}
+
+void st_storage_owner_transfer_result_free(st_storage_owner_transfer_result *result)
+{
+    if (result == NULL) return;
+    free(result->json); free(result->client_ids); free(result->closed);
+    memset(result, 0, sizeof(*result));
+}
+
+void st_storage_owner_transfer_event_free(st_storage_owner_transfer_event *event)
+{
+    if (event == NULL) return;
+    free(event->closed); memset(event, 0, sizeof(*event));
+}
+
+int st_storage_owner_transfer_last_id(const char *path, long long *id)
+{
+    if (id == NULL) return -1;
+    *id = 0; sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    int rc = sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(id),0) FROM client_owner_transfer_audit", -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) == SQLITE_INTEGER ? 0 : -1;
+    long long staged = rc == 0 ? sqlite3_column_int64(stmt, 0) : -1;
+    sqlite3_finalize(stmt); sqlite3_close(db);
+    if (rc == 0 && staged >= 0) *id = staged;
+    else rc = -1;
+    return rc;
+}
+
+static int owner_transfer_event_text(const char *json, const char *field, char *out, size_t capacity)
+{
+    char *raw = st_json_get_top_level_raw(json, field); size_t length = 0;
+    char *decoded = raw == NULL ? NULL : st_json_decode_string(raw, &length);
+    int rc = decoded != NULL && length < capacity && memchr(decoded, '\0', length) == NULL ? 0 : -1;
+    if (rc == 0) memcpy(out, decoded, length + 1U);
+    free(raw); free(decoded); return rc;
+}
+
+int st_storage_owner_transfer_next(const char *path, long long after, st_storage_owner_transfer_event *event)
+{
+    if (event == NULL || event->closed != NULL || event->closed_count != 0) return -1;
+    memset(event, 0, sizeof(*event));
+    if (after < 0) return -1;
+    sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL;
+    if (open_db(path, &db) != 0) return -1;
+    st_storage_owner_transfer_event staged = {0}; char **rows = NULL; size_t count = 0;
+    int rc = sqlite3_prepare_v2(db, "SELECT id,tenant_id,payload_json FROM client_owner_transfer_audit WHERE id>? ORDER BY id LIMIT 1", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc != 0) goto done;
+    sqlite3_bind_int64(stmt, 1, after);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_DONE) goto done;
+    rc = -1;
+    if (step != SQLITE_ROW || sqlite3_column_type(stmt, 0) != SQLITE_INTEGER) goto done;
+    staged.id = sqlite3_column_int64(stmt, 0);
+    if (staged.id <= after || copy_text_column(stmt, 1, staged.tenant_id, sizeof(staged.tenant_id)) != 0
+        || staged.tenant_id[0] == '\0') goto done;
+    const char *payload = (const char *)sqlite3_column_text(stmt, 2);
+    int payload_length = sqlite3_column_bytes(stmt, 2); char tenant[64];
+    if (payload == NULL || payload_length <= 0 || memchr(payload, '\0', (size_t)payload_length) != NULL
+        || !st_json_is_valid_object(payload)
+        || owner_transfer_event_text(payload, "tenantId", tenant, sizeof(tenant)) != 0
+        || strcmp(tenant, staged.tenant_id) != 0
+        || st_json_get_raw_array(payload, "closedPeerSessions", &rows, &count) != 0
+        || count > SIZE_MAX / sizeof(*staged.closed)) goto done;
+    if (count != 0 && (staged.closed = calloc(count, sizeof(*staged.closed))) == NULL) goto done;
+    staged.closed_count = count;
+    for (size_t i = 0; i < count; ++i) {
+        st_storage_peer_close *closed = &staged.closed[i];
+        if (!st_json_is_valid_object(rows[i]) || st_json_get_i64(rows[i], "id", &closed->id) != 0
+            || st_json_get_i64(rows[i], "sourceClientId", &closed->source_client_id) != 0
+            || st_json_get_i64(rows[i], "targetClientId", &closed->target_client_id) != 0
+            || closed->id <= 0 || (i != 0 && closed->id <= staged.closed[i-1].id)
+            || closed->source_client_id <= 0 || closed->target_client_id <= 0
+            || closed->source_client_id == closed->target_client_id
+            || owner_transfer_event_text(rows[i], "sourceClientName", closed->source_client_name, sizeof(closed->source_client_name)) != 0
+            || owner_transfer_event_text(rows[i], "targetClientName", closed->target_client_name, sizeof(closed->target_client_name)) != 0) goto done;
+        strcpy(closed->tenant_id, staged.tenant_id);
+    }
+    *event = staged; memset(&staged, 0, sizeof(staged)); rc = 1;
+done:
+    st_json_free_string_array(rows, count); st_storage_owner_transfer_event_free(&staged);
+    sqlite3_finalize(stmt); sqlite3_close(db); return rc;
+}
+
+static int owner_transfer_scalar(sqlite3 *db, const char *sql, long long *value)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK
+        && sqlite3_step(stmt) == SQLITE_ROW ? 0 : -1;
+    if (rc == 0) *value = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt); return rc;
+}
+
+static int owner_transfer_target(sqlite3 *db, const char *tenant, const char *name,
+    const st_storage_share_builtin_admin *builtin, st_storage_management_user *target)
+{
+    if (builtin != NULL && builtin->accepted && builtin->username != NULL && builtin->tenant_id != NULL
+        && strcmp(tenant, builtin->tenant_id) == 0 && sqlite3_stricmp(name, builtin->username) == 0) {
+        st_storage_management_actor descriptor = {name, tenant, ""};
+        return load_management_actor(db, &descriptor, builtin, target) == 0 ? 0 : 1;
+    }
+    int found = management_user_lookup(db, 1, 0, tenant, name, target);
+    return found < 0 ? -1 : found != 0 || !target->enabled ? 1 : 0;
+}
+
+static int owner_transfer_compare_id(const void *a, const void *b)
+{
+    long long x = *(const long long *)a, y = *(const long long *)b;
+    return (x > y) - (x < y);
+}
+
+static int owner_transfer_capture(sqlite3 *db, const st_owner_snapshot *before)
+{
+    if (exec_sql(db, "CREATE TEMP TABLE st_owner_ids(id INTEGER PRIMARY KEY);"
+                     "CREATE TEMP TABLE st_owner_credentials(id INTEGER PRIMARY KEY);"
+                     "CREATE TEMP TABLE st_owner_peer_ids(id INTEGER PRIMARY KEY);"
+                     "CREATE TEMP TABLE st_owner_closed(id INTEGER PRIMARY KEY);") != 0) return -1;
+    const st_owner_rows *rows[] = {&before->clients, &before->credentials, &before->peers};
+    const char *sql[] = {"INSERT INTO st_owner_ids VALUES(?)", "INSERT INTO st_owner_credentials VALUES(?)",
+                         "INSERT INTO st_owner_peer_ids VALUES(?)"};
+    for (size_t n = 0; n < 3; ++n) {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, sql[n], -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        for (size_t i = 0; rc == 0 && i < rows[n]->len; ++i) {
+            sqlite3_bind_int64(stmt, 1, rows[n]->items[i].id);
+            if (sqlite3_step(stmt) != SQLITE_DONE) rc = -1;
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+        }
+        sqlite3_finalize(stmt); if (rc != 0) return -1;
+    }
+    return exec_sql(db,
+        "CREATE TEMP TABLE st_owner_before_clients AS SELECT * FROM client_account WHERE rowid IN (SELECT id FROM st_owner_ids);"
+        "CREATE TEMP TABLE st_owner_before_credentials AS SELECT * FROM specus_client_credential WHERE id IN (SELECT id FROM st_owner_credentials);"
+        "CREATE TEMP TABLE st_owner_before_peers AS SELECT * FROM peer_mesh_device WHERE client_id IN (SELECT id FROM st_owner_ids);"
+        "CREATE TEMP TABLE st_owner_foreign_peers AS SELECT * FROM st_owner_before_peers WHERE id NOT IN (SELECT id FROM st_owner_peer_ids);"
+        "CREATE TEMP TABLE st_owner_before_identities AS SELECT * FROM specus_client_identity WHERE client_id IN (SELECT id FROM st_owner_ids) OR credential_id IN (SELECT id FROM st_owner_credentials);"
+        "CREATE TEMP TABLE st_owner_before_access AS SELECT * FROM specus_client_session WHERE client_id IN (SELECT id FROM st_owner_ids) OR credential_id IN (SELECT id FROM st_owner_credentials);"
+        "CREATE TEMP TABLE st_owner_before_sessions AS SELECT * FROM peer_mesh_session WHERE source_client_id IN (SELECT id FROM st_owner_ids) OR target_client_id IN (SELECT id FROM st_owner_ids);"
+        "CREATE TEMP TABLE st_owner_kept_sessions AS SELECT * FROM st_owner_before_sessions;");
+}
+
+static int owner_transfer_update_rows(sqlite3 *db, const st_owner_rows *rows, const char *sql,
+    const char *tenant, const char *target)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    for (size_t i = 0; rc == 0 && i < rows->len; ++i) {
+        const st_owner_row *row = &rows->items[i];
+        if (row->owner_username != NULL && strcmp(row->owner_username, target) == 0) continue;
+        sqlite3_bind_text(stmt, 1, target, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, row->id);
+        sqlite3_bind_text(stmt, 3, tenant, -1, SQLITE_TRANSIENT);
+        if (row->owner_username == NULL) sqlite3_bind_null(stmt, 4);
+        else sqlite3_bind_text(stmt, 4, row->owner_username, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE || sqlite3_changes(db) != 1) rc = -1;
+        sqlite3_reset(stmt); sqlite3_clear_bindings(stmt);
+    }
+    sqlite3_finalize(stmt); return rc;
+}
+
+static int owner_transfer_close_lost(sqlite3 *db, const char *tenant, st_storage_owner_transfer_result *result)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT id,tenant_id,source_client_id,source_client_name,target_client_id,target_client_name "
+        "FROM peer_mesh_session WHERE tenant_id=? AND status<>'CLOSED' AND "
+        "(source_client_id IN (SELECT id FROM st_owner_ids) OR target_client_id IN (SELECT id FROM st_owner_ids)) ORDER BY id",
+        -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+    if (rc != 0) return -1;
+    sqlite3_bind_text(stmt, 1, tenant, -1, SQLITE_TRANSIENT);
+    size_t capacity = 0; int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        st_storage_client source = {0}, target = {0}; int allowed = 0;
+        /* Missing/corrupt endpoints cannot keep an effective grant. */
+        if (load_client(db, sqlite3_column_int64(stmt, 2), &source) == 0
+            && load_client(db, sqlite3_column_int64(stmt, 4), &target) == 0
+            && strcmp(source.tenant_id, tenant) == 0 && strcmp(target.tenant_id, tenant) == 0) {
+            if (can_peer_on_db(db, &source, &target, &allowed) != 0) { rc = -1; break; }
+        }
+        if (allowed) continue;
+        if (storage_reserve((void **)&result->closed, result->closed_count, &capacity, sizeof(*result->closed)) != 0) { rc = -1; break; }
+        st_storage_peer_close *closed = &result->closed[result->closed_count]; memset(closed, 0, sizeof(*closed));
+        closed->id = sqlite3_column_int64(stmt, 0);
+        closed->source_client_id = sqlite3_column_int64(stmt, 2); closed->target_client_id = sqlite3_column_int64(stmt, 4);
+        if (copy_text_column(stmt, 1, closed->tenant_id, sizeof(closed->tenant_id)) != 0
+            || copy_text_column(stmt, 3, closed->source_client_name, sizeof(closed->source_client_name)) != 0
+            || copy_text_column(stmt, 5, closed->target_client_name, sizeof(closed->target_client_name)) != 0) { rc = -1; break; }
+        ++result->closed_count;
+    }
+    if (step != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(stmt);
+    for (size_t i = 0; rc == 0 && i < result->closed_count; ++i) {
+        if (close_peer_session(db, result->closed[i].id) != 0) { rc = -1; break; }
+        sqlite3_stmt *insert = NULL;
+        rc = sqlite3_prepare_v2(db, "INSERT INTO st_owner_closed VALUES(?)", -1, &insert, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) { sqlite3_bind_int64(insert, 1, result->closed[i].id); rc = sqlite3_step(insert) == SQLITE_DONE ? 0 : -1; }
+        sqlite3_finalize(insert);
+    }
+    if (rc == 0) rc = exec_sql(db, "DELETE FROM st_owner_kept_sessions WHERE id IN (SELECT id FROM st_owner_closed)");
+    return rc;
+}
+
+static int owner_transfer_validate_preserved(sqlite3 *db)
+{
+    static const char *const ownership[] = {"owner_username", "updated_at"};
+    static const char *const session_state[] = {"status", "closed_at", "updated_at"};
+    const char *client_scope = "rowid IN (SELECT id FROM st_owner_ids)";
+    const char *credential_scope = "id IN (SELECT id FROM st_owner_credentials)";
+    const char *peer_scope = "client_id IN (SELECT id FROM st_owner_ids)";
+    const char *identity_scope = "client_id IN (SELECT id FROM st_owner_ids) OR credential_id IN (SELECT id FROM st_owner_credentials)";
+    const char *session_scope = "source_client_id IN (SELECT id FROM st_owner_ids) OR target_client_id IN (SELECT id FROM st_owner_ids)";
+    if (st_owner_transfer_rows_preserved(db, "client_account", "st_owner_before_clients", client_scope, ownership, 2) != 0
+        || st_owner_transfer_rows_preserved(db, "specus_client_credential", "st_owner_before_credentials", credential_scope, ownership, 2) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_device", "st_owner_before_peers", peer_scope, ownership, 2) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_device", "st_owner_foreign_peers",
+            "client_id IN (SELECT id FROM st_owner_ids) AND id NOT IN (SELECT id FROM st_owner_peer_ids)", NULL, 0) != 0
+        || st_owner_transfer_rows_preserved(db, "specus_client_identity", "st_owner_before_identities", identity_scope, NULL, 0) != 0
+        || st_owner_transfer_rows_preserved(db, "specus_client_session", "st_owner_before_access", identity_scope, NULL, 0) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_session", "st_owner_before_sessions", session_scope, session_state, 3) != 0
+        || st_owner_transfer_rows_preserved(db, "peer_mesh_session", "st_owner_kept_sessions",
+            "id IN (SELECT id FROM st_owner_kept_sessions)", NULL, 0) != 0) return -1;
+    long long invalid = 0;
+    if (owner_transfer_scalar(db, "SELECT COUNT(*) FROM peer_mesh_session WHERE id IN (SELECT id FROM st_owner_closed) "
+        "AND (status<>'CLOSED' OR COALESCE(closed_at,'')='')", &invalid) != 0 || invalid != 0) return -1;
+    return 0;
+}
+
+int st_storage_transfer_owner(const char *path, const st_storage_management_actor *actor,
+    const st_storage_share_builtin_admin *builtin, int group, long long id,
+    const char *request, long long now_ms, st_storage_owner_transfer_result *out, const char **code)
+{
+    const char *local_code = NULL;
+    if (code == NULL) code = &local_code;
+    *code = "INTERNAL_SERVER_ERROR";
+    if (out != NULL) {
+        if (out->json != NULL || out->client_ids != NULL || out->closed != NULL
+            || out->client_count != 0 || out->closed_count != 0) return 500;
+        memset(out, 0, sizeof(*out));
+    }
+    if (path == NULL || *path == '\0') return 500;
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) return 500;
+    st_owner_snapshot before = {0}, after = {0};
+    st_storage_management_user current_actor = {0}, target = {0}, checked = {0};
+    st_storage_owner_transfer_result staged = {0};
+    char *preview = NULL, *requested_target = NULL, *audit = NULL, *after_json = NULL;
+    int status = 500, transaction = 0;
+    if (exec_sql(db, "BEGIN IMMEDIATE") != 0) goto done;
+    transaction = 1;
+    int actor_status = load_management_actor(db, actor, builtin, &current_actor);
+    if (actor_status != 0 || !management_actor_is_admin(current_actor.role)) {
+        if (actor_status >= 0) { status = 403; *code = "FORBIDDEN"; } goto done;
+    }
+    if ((group != 0 && group != 1) || id <= 0 || id > 9007199254740991LL
+        || request == NULL || !st_json_is_valid_object(request)) { status = 400; *code = "INVALID_TRANSFER_REQUEST"; goto done; }
+    if (st_owner_snapshot_load_on_db(db, current_actor.tenant_id, group, id, &before) != 0) goto done;
+    status = st_owner_transfer_prepare(current_actor.tenant_id, 1, group, id, &before, request, &preview, &requested_target, code);
+    if (status != 200) goto done;
+    status = 500; *code = "INTERNAL_SERVER_ERROR";
+    int found = owner_transfer_target(db, current_actor.tenant_id, requested_target, builtin, &target);
+    if (found != 0) { if (found > 0) { status = 400; *code = "INVALID_TARGET_OWNER"; } goto done; }
+    if (before.credentials.len > 1 || before.clients.len > SIZE_MAX / sizeof(*staged.client_ids)) goto done;
+    long long credential_id = before.credentials.len == 0 ? 0 : before.credentials.items[0].id;
+    staged.client_count = before.clients.len;
+    if (staged.client_count != 0) {
+        staged.client_ids = malloc(staged.client_count * sizeof(*staged.client_ids));
+        if (staged.client_ids == NULL) goto done;
+        for (size_t i = 0; i < staged.client_count; ++i) staged.client_ids[i] = before.clients.items[i].id;
+        qsort(staged.client_ids, staged.client_count, sizeof(*staged.client_ids), owner_transfer_compare_id);
+    }
+    strcpy(staged.tenant_id, current_actor.tenant_id); strcpy(staged.target_username, target.username);
+    const st_owner_rows *lists[] = {&before.clients, &before.credentials, &before.peers};
+    for (size_t n = 0; n < 3; ++n) for (size_t i = 0; i < lists[n]->len; ++i)
+        if (lists[n]->items[i].owner_username == NULL || strcmp(lists[n]->items[i].owner_username, target.username) != 0) staged.changed = 1;
+    long long audit_before = 0;
+    if (staged.changed) {
+        if (owner_transfer_scalar(db, "SELECT COUNT(*) FROM client_owner_transfer_audit", &audit_before) != 0
+            || owner_transfer_capture(db, &before) != 0
+            || owner_transfer_update_rows(db, &before.clients,
+                "UPDATE client_account SET owner_username=?1,updated_at=CURRENT_TIMESTAMP WHERE rowid=?2 AND tenant_id=?3 AND owner_username IS ?4", current_actor.tenant_id, target.username) != 0
+            || owner_transfer_update_rows(db, &before.credentials,
+                "UPDATE specus_client_credential SET owner_username=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND tenant_id=?3 AND owner_username IS ?4", current_actor.tenant_id, target.username) != 0
+            || owner_transfer_update_rows(db, &before.peers,
+                "UPDATE peer_mesh_device SET owner_username=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND tenant_id=?3 AND owner_username IS ?4", current_actor.tenant_id, target.username) != 0
+            || owner_transfer_close_lost(db, current_actor.tenant_id, &staged) != 0) goto done;
+    }
+    if (st_owner_transfer_encode_result(current_actor.tenant_id, current_actor.username, group, id, target.username,
+        credential_id, &before, preview, staged.client_ids, staged.client_count, staged.changed,
+        staged.closed, staged.closed_count, &staged.json, &audit) != 0) goto done;
+    if (staged.changed) {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(db, "INSERT INTO client_owner_transfer_audit(tenant_id,actor_username,scope,resource_id,credential_id,target_username,payload_json,occurred_at_ms) VALUES(?,?,?,?,?,?,?,?)", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_text(stmt, 1, current_actor.tenant_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, current_actor.username, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, group ? "credential-group" : "single", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(stmt, 4, id);
+            if (credential_id == 0) sqlite3_bind_null(stmt, 5); else sqlite3_bind_int64(stmt, 5, credential_id);
+            sqlite3_bind_text(stmt, 6, target.username, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 7, audit, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 8, now_ms);
+            rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
+        }
+        sqlite3_finalize(stmt); if (rc != 0) goto done;
+        staged.audit_id = sqlite3_last_insert_rowid(db);
+        long long audit_after = 0;
+        if (staged.audit_id <= 0 || owner_transfer_scalar(db, "SELECT COUNT(*) FROM client_owner_transfer_audit", &audit_after) != 0
+            || audit_after != audit_before + 1 || owner_transfer_validate_preserved(db) != 0) goto done;
+        rc = sqlite3_prepare_v2(db, "SELECT 1 FROM client_owner_transfer_audit WHERE id=? AND tenant_id=? AND actor_username=? AND scope=? AND resource_id=? AND credential_id IS ? AND target_username=? AND payload_json=? AND occurred_at_ms=?", -1, &stmt, NULL) == SQLITE_OK ? 0 : -1;
+        if (rc == 0) {
+            sqlite3_bind_int64(stmt, 1, staged.audit_id); sqlite3_bind_text(stmt, 2, current_actor.tenant_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, current_actor.username, -1, SQLITE_TRANSIENT); sqlite3_bind_text(stmt, 4, group ? "credential-group" : "single", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(stmt, 5, id); if (credential_id == 0) sqlite3_bind_null(stmt, 6); else sqlite3_bind_int64(stmt, 6, credential_id);
+            sqlite3_bind_text(stmt, 7, target.username, -1, SQLITE_TRANSIENT); sqlite3_bind_text(stmt, 8, audit, -1, SQLITE_TRANSIENT); sqlite3_bind_int64(stmt, 9, now_ms);
+            rc = sqlite3_step(stmt) == SQLITE_ROW ? 0 : -1;
+        }
+        sqlite3_finalize(stmt); if (rc != 0) goto done;
+    }
+    /* Re-read after all DML, including audit triggers. Current target/account identity,
+     * complete group and final owners must still be valid before any output is published. */
+    if (load_management_actor(db, actor, builtin, &checked) != 0 || !management_actor_is_admin(checked.role)) goto done;
+    st_storage_management_actor target_descriptor = {target.username, target.tenant_id, target.account_key};
+    if (load_management_actor(db, &target_descriptor, builtin, &checked) != 0) goto done;
+    if (st_owner_snapshot_load_on_db(db, current_actor.tenant_id, group, id, &after) != 0) goto done;
+    char after_revision[65]; const char *after_code = NULL;
+    if (st_owner_transfer_preview(current_actor.tenant_id, 1, group, id, &after, &after_json, after_revision, &after_code) != 200
+        || after_revision[0] == '\0' || after.clients.len != before.clients.len
+        || after.credentials.len != before.credentials.len || after.peers.len != before.peers.len) goto done;
+    const st_owner_rows *final[] = {&after.clients, &after.credentials, &after.peers};
+    for (size_t n = 0; n < 3; ++n) for (size_t i = 0; i < final[n]->len; ++i)
+        if (final[n]->items[i].owner_username == NULL || strcmp(final[n]->items[i].owner_username, target.username) != 0) goto done;
+    if (exec_sql(db, "COMMIT") != 0) goto done;
+    transaction = 0; status = 200; *code = NULL;
+    if (out != NULL) { *out = staged; memset(&staged, 0, sizeof(staged)); }
+done:
+    if (transaction) (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db); st_owner_snapshot_free(&before); st_owner_snapshot_free(&after);
+    free(preview); free(requested_target); free(audit); free(after_json);
+    st_storage_owner_transfer_result_free(&staged);
+    return status;
 }

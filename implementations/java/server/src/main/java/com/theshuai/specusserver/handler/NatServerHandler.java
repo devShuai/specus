@@ -29,6 +29,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
@@ -37,9 +38,25 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Slf4j
 public class NatServerHandler extends NatCommonHandler {
     static final int RECENTLY_CLOSED_STREAM_LIMIT = 1024;
-    // Pinned by client control connection: listenPort -> bound TcpServer.
+    // Owned by this physical DATA namespace: listenPort -> pending/bound listener registration.
     // Concurrent because the channel pipeline reads from arbitrary event loops.
-    private final Map<Integer, TcpServer> remoteConnectionServerMap = new ConcurrentHashMap<>();
+    private final Map<Integer, Registration> remoteConnectionServerMap = new ConcurrentHashMap<>();
+    private final java.util.Set<Registration> ownedRegistrations = ConcurrentHashMap.newKeySet();
+    private final Object namespaceGate = new Object();
+    private volatile boolean retired;
+    private final CompletableFuture<Void> retirement = new CompletableFuture<>();
+    private final Map<Integer, Admission> admissions = new ConcurrentHashMap<>();
+    private static final class Registration {
+        TcpServer server;
+        boolean cancelled;
+        final CompletableFuture<Void> stopped = new CompletableFuture<>();
+    }
+    private static final class Admission {
+        final int streamId, port;
+        final Channel channel;
+        boolean released;
+        Admission(int streamId, int port, Channel channel) {this.streamId=streamId;this.port=port;this.channel=channel;}
+    }
 
     // Public-internet channels for THIS client's specusMappings, keyed by connection-local streamId.
     // Per-connection (not static) so DATA/DISCONNECTED routing is O(1) and a client can only
@@ -91,6 +108,7 @@ public class NatServerHandler extends NatCommonHandler {
             return;
         }
         if (!bindAuthenticatedIdentity(ctx.channel())) {
+            retire();
             DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
             ctx.close();
             return;
@@ -108,7 +126,7 @@ public class NatServerHandler extends NatCommonHandler {
             int streamId = natMessagePacket.getStreamId();
             if (httpStreams.containsKey(streamId)) {
                 processHttpData(natMessagePacket);
-            } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
+            } else if (webSocketSpecusHandler.ownsStream(streamId,ctx.channel())) {
                 processWsData(natMessagePacket);
             } else if (isAbandonedHttpStream(streamId)) {
                 // Response body of a stream this server already reset: dropped, no WINDOW_UPDATE.
@@ -121,7 +139,7 @@ public class NatServerHandler extends NatCommonHandler {
             int streamId = natMessagePacket.getStreamId();
             if (httpStreams.containsKey(streamId)) {
                 processHttpClosed(natMessagePacket);
-            } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
+            } else if (webSocketSpecusHandler.ownsStream(streamId,ctx.channel())) {
                 processWsClosed(natMessagePacket);
             } else if (isAbandonedHttpStream(streamId)) {
                 // The client's FIN or RST crossed the RST of an abandoned stream: nothing to answer.
@@ -155,13 +173,11 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     public boolean openHttpStream(HttpStreamExchange exchange, Map<String, Object> metadata) {
-        if (ctx == null || !ctx.channel().isActive()
-                || !bindAuthenticatedIdentity(ctx.channel())
-                || httpStreams.putIfAbsent(exchange.streamId(), exchange) != null) {
-            return false;
+        synchronized(namespaceGate) {
+            if (!isActiveData() || httpStreams.putIfAbsent(exchange.streamId(), exchange) != null) return false;
+            markStreamOpened(exchange.streamId());
+            StreamFlowController.get(ctx.channel()).open(exchange.streamId(), null);
         }
-        markStreamOpened(exchange.streamId());
-        StreamFlowController.get(ctx.channel()).open(exchange.streamId(), null);
         NatMessagePacket open = new NatMessagePacket();
         open.setNatMessageType(NatMessageType.OPEN);
         open.setStreamId(exchange.streamId());
@@ -179,8 +195,19 @@ public class NatServerHandler extends NatCommonHandler {
         return true;
     }
 
+    /** Only in-memory ownership registration is permitted in this callback, never browser I/O. */
+    public boolean openWebSocketStream(int streamId, Runnable registerOwnership) {
+        synchronized(namespaceGate) {
+            if(!isActiveData()) return false;
+            registerOwnership.run();
+            markStreamOpened(streamId);
+            StreamFlowController.get(ctx.channel()).open(streamId,null);
+            return true;
+        }
+    }
+
     public CompletableFuture<Void> sendHttpData(int streamId, byte[] data) {
-        if (ctx == null || !httpStreams.containsKey(streamId)) {
+        if (!isActiveData() || !httpStreams.containsKey(streamId)) {
             return CompletableFuture.failedFuture(new IllegalStateException("HTTP stream is not active"));
         }
         return StreamFlowController.get(ctx.channel()).sendAsync(streamId, data, null,
@@ -191,7 +218,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     public CompletableFuture<Void> finishHttpRequest(int streamId, List<String> trailers) {
-        if (ctx == null) {
+        if (!isActiveData() || !httpStreams.containsKey(streamId)) {
             return CompletableFuture.failedFuture(new IllegalStateException("control channel is not active"));
         }
         Map<String, Object> metadata = trailers == null || trailers.isEmpty()
@@ -348,7 +375,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     private void sendWindowUpdate(int streamId, int credit) {
-        if (ctx == null || credit <= 0) {
+        if (!isActiveData() || credit <= 0) {
             return;
         }
         NatMessagePacket update = new NatMessagePacket();
@@ -390,17 +417,17 @@ public class NatServerHandler extends NatCommonHandler {
         if (port == null) {
             return;
         }
-        TcpServer server = remoteConnectionServerMap.remove(port);
-        if (server != null) {
-            server.close();
+        Registration registration;
+        synchronized(namespaceGate) {registration=remoteConnectionServerMap.remove(port);}
+        if (registration != null) {
+            stopRegistration(registration);
             log.info("Stop server on port: {} [{}]", port, clientName);
         }
     }
 
     private boolean bindAuthenticatedIdentity(Channel channel) {
-        if (clientName != null) {
-            return true;
-        }
+        if (retired || !SessionUtil.isCurrentData(channel)) return false;
+        if (clientName != null) return true;
         Session session = SessionUtil.getSession(channel);
         if (session == null) {
             return false;
@@ -409,6 +436,14 @@ public class NatServerHandler extends NatCommonHandler {
         String boundTenantId = channel.attr(ServerAttributes.TENANT_ID).get();
         tenantId = boundTenantId == null || boundTenantId.isBlank() ? "default" : boundTenantId;
         return true;
+    }
+
+    public boolean isActiveData() {
+        return ctx != null && bindAuthenticatedIdentity(ctx.channel());
+    }
+
+    boolean ownsExternalChannel(int streamId, Channel channel) {
+        return isActiveData() && externalChannels.get(streamId) == channel;
     }
 
     private void processRegister(NatMessagePacket natMessagePacket) {
@@ -442,7 +477,18 @@ public class NatServerHandler extends NatCommonHandler {
         }
         bindAuthenticatedIdentity(ctx.channel());
 
-        if (remoteConnectionServerMap.containsKey(port)) {
+        Registration registration=new Registration();
+        boolean accepted;
+        synchronized(namespaceGate) {
+            accepted=isActiveData() && remoteConnectionServerMap.putIfAbsent(port,registration) == null;
+            if(accepted) {
+                ownedRegistrations.add(registration);
+                registration.stopped.whenComplete((ignored,failure) -> {
+                    if(failure == null) ownedRegistrations.remove(registration);
+                });
+            }
+        }
+        if (!accepted) {
             // Port already in use on this server. Reject instead of silently reporting success.
             result.put("success", false);
             result.put("reason", "port " + port + " already in use");
@@ -456,48 +502,50 @@ public class NatServerHandler extends NatCommonHandler {
             TcpServer remoteConnectionServer = remotePortServerManager.bind(port, new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel channel) {
-                    if (!tryAcquireExternalChannel(port)) {
-                        log.warn("Reject external connection on port {} [{}], activeClient={}, activeGlobal={}",
-                                port, clientName, activeClientExternalChannels.get(),
-                                remotePortServerManager.activeExternalConnections());
-                        channel.close();
-                        return;
+                    Admission admission=null;
+                    synchronized(namespaceGate) {
+                        if (isActiveData() && !registration.cancelled
+                                && remoteConnectionServerMap.get(port) == registration
+                                && tryAcquireExternalChannel(port)) {
+                            int streamId=SpecusStreamIds.next();
+                            admission=new Admission(streamId,port,channel);
+                            admissions.put(streamId,admission);
+                            externalChannels.put(streamId,channel);
+                            externalChannelPorts.put(streamId,port);
+                            externalChannelIds.put(streamId,channel.id().asLongText());
+                            markStreamOpened(streamId);
+                        }
                     }
-                    String channelId = channel.id().asLongText();
-                    int streamId = SpecusStreamIds.next();
+                    if(admission == null) {channel.close();return;}
+                    Admission ownedAdmission=admission;
+                    int streamId=admission.streamId;
+                    // Own the admission before installing handlers: inactive/init failure and
+                    // namespace retirement all release this same token exactly once.
+                    channel.closeFuture().addListener(future -> releaseAdmission(ownedAdmission));
                     try {
                         channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(),
                                 new RemoteSpecusHandler(thisHandler, streamId, port, clientName, trafficUsageService,
                                         trafficInspectionService));
-                        externalChannels.put(streamId, channel);
-                        markStreamOpened(streamId);
-                        externalChannelPorts.put(streamId, port);
-                        externalChannelIds.put(streamId, channelId);
                         syncExternalReadWithControl(channel);
-                        channel.closeFuture().addListener(future -> {
-                            markStreamClosed(streamId);
-                            if (externalChannels.remove(streamId) != null) {
-                                externalChannelPorts.remove(streamId);
-                                externalChannelIds.remove(streamId);
-                                releaseExternalChannel(port);
-                                updateControlAutoReadForExternalWritability();
-                            }
-                        });
                     } catch (RuntimeException e) {
-                        markStreamClosed(streamId);
-                        externalChannels.remove(streamId);
-                        externalChannelPorts.remove(streamId);
-                        externalChannelIds.remove(streamId);
-                        releaseExternalChannel(port);
+                        releaseAdmission(admission);channel.close();
                         throw e;
                     }
                 }
             });
 
-            remoteConnectionServerMap.put(port, remoteConnectionServer);
-            result.put("success", true);
+            synchronized(namespaceGate) {
+                registration.server=remoteConnectionServer;
+                accepted=isActiveData() && !registration.cancelled
+                        && remoteConnectionServerMap.get(port) == registration;
+            }
+            if (!accepted) stopRegistration(registration);
+            result.put("success", accepted);
+            if(!accepted) result.put("reason","DATA namespace retired while binding");
             log.info("register success, start server on port {} --> {}:{} [{}] ", port, specusAddress, specusPort, clientName);
         } catch (Exception e) {
+            synchronized(namespaceGate) {remoteConnectionServerMap.remove(port,registration);}
+            registration.stopped.complete(null); // bind() owns and closes its channel on failure.
             result.put("success", false);
             result.put("reason", e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
             log.error("REGISTER failed on port {} [{}]", port, clientName, e);
@@ -507,6 +555,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     private void writeRegisterResult(Map<String, Object> metaData) {
+        if(!isActiveData()) return;
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.REGISTER_RESULT);
         message.setMetaData(metaData);
@@ -516,23 +565,66 @@ public class NatServerHandler extends NatCommonHandler {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         log.info("{} inactive close", ctx.channel().id().asLongText());
-        for (Map.Entry<Integer, TcpServer> serverEntry : remoteConnectionServerMap.entrySet()) {
-            serverEntry.getValue().close();
-            log.info("Stop server on port: {}", serverEntry.getKey());
+        retire();
+    }
+
+    /** Terminal and idempotent. Admission counters are retired synchronously; listeners and
+     * in-flight REGISTER binds must actually stop before the successor can be published. Socket
+     * and browser callbacks never run under namespaceGate or the SessionUtil registry lock. */
+    public CompletableFuture<Void> retire() {
+        List<Registration> registrations;
+        List<Admission> connections;
+        List<HttpStreamExchange> exchanges;
+        synchronized(namespaceGate) {
+            if(retired) return retirement;
+            retired=true;
+            registrations=new ArrayList<>(ownedRegistrations);
+            registrations.forEach(registration -> registration.cancelled=true);
+            remoteConnectionServerMap.clear();
+            connections=new ArrayList<>(admissions.values());
+            connections.forEach(this::releaseAdmissionLocked);
+            exchanges=new ArrayList<>(httpStreams.values());httpStreams.clear();
         }
-        remoteConnectionServerMap.clear();
-        externalChannels.values().forEach(Channel::close);
-        httpStreams.values().forEach(exchange ->
-                exchange.onReset(9, Map.of("reason", "control channel closed"),
-                        HttpStreamExchange.ResetOrigin.CONNECTION));
-        httpStreams.clear();
-        StreamFlowController.get(ctx.channel()).closeAll();
-        externalChannelPorts.clear();
-        externalChannelIds.clear();
-        // 客户端控制连接断开：关闭所有挂起的浏览器 WS 会话，避免浏览器侧永久挂起
-        if (clientName != null) {
-            webSocketSpecusHandler.onControlChannelInactive(clientName);
+        registrations.forEach(this::stopRegistration);
+        CompletableFuture.allOf(registrations.stream().map(registration -> registration.stopped)
+                .toArray(CompletableFuture[]::new)).whenComplete((ignored,failure) -> {
+                    if(failure == null) retirement.complete(null);else retirement.completeExceptionally(failure);
+                });
+        connections.forEach(admission -> admission.channel.close());
+        if(ctx != null) {
+            Runnable cleanup=() -> {
+                exchanges.forEach(exchange -> exchange.onReset(9,Map.of("reason","DATA channel retired"),HttpStreamExchange.ResetOrigin.CONNECTION));
+                StreamFlowController.get(ctx.channel()).closeAll();
+                webSocketSpecusHandler.onDataChannelInactive(ctx.channel());
+            };
+            try {ctx.executor().execute(cleanup);}
+            catch(java.util.concurrent.RejectedExecutionException stopped) {cleanup.run();}
         }
+        return retirement;
+    }
+
+    private void stopRegistration(Registration registration) {
+        TcpServer server;
+        synchronized(namespaceGate) {registration.cancelled=true;server=registration.server;}
+        if(server != null) server.closeAsync().whenComplete((ignored,failure) -> {
+            if(failure == null) registration.stopped.complete(null);else registration.stopped.completeExceptionally(failure);
+        });
+    }
+
+    private void releaseAdmission(Admission admission) {
+        synchronized(namespaceGate) {releaseAdmissionLocked(admission);}
+        updateControlAutoReadForExternalWritability();
+    }
+
+    private void releaseAdmissionLocked(Admission admission) {
+        if(admission.released) return;
+        admission.released=true;
+        admissions.remove(admission.streamId,admission);
+        externalChannels.remove(admission.streamId,admission.channel);
+        externalChannelPorts.remove(admission.streamId);
+        externalChannelIds.remove(admission.streamId);
+        markStreamClosed(admission.streamId);
+        releaseExternalChannel(admission.port);
     }
 
     @Override
@@ -546,7 +638,7 @@ public class NatServerHandler extends NatCommonHandler {
 
     @Override
     public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
-        remoteConnectionServerMap.values().forEach(TcpServer::close);
+        retire();
         super.channelUnregistered(ctx);
     }
 
@@ -559,7 +651,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     public void updateControlAutoReadForExternalWritability() {
-        if (ctx != null) {
+        if (isActiveData()) {
             ChannelBackpressure.setAutoRead(ctx.channel(),
                     ctx.channel().isWritable() && ChannelBackpressure.allWritable(externalChannels.values()));
         }

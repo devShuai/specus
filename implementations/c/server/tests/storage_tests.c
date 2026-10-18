@@ -667,6 +667,94 @@ static int exec_script(const char *path, const char *sql)
     return rc;
 }
 
+static int test_client_peer_reference_deletion(void)
+{
+    for (int audited = 0; audited <= 1; ++audited) {
+        for (int rollback = 0; rollback <= 1; ++rollback) {
+            char path[256];
+            snprintf(path, sizeof(path), "/tmp/specus-c-peer-delete-%ld-%d-%d.db", (long)getpid(), audited, rollback);
+            unlink(path);
+            if (st_storage_init(path, 0) != 0 || exec_script(path,
+                "INSERT INTO client_account(id,tenant_id,owner_username,client_name) VALUES"
+                "(1001,'tenant-a','alice','deleted'),(1002,'tenant-a','alice','survivor');"
+                "INSERT INTO peer_mesh_device(tenant_id,client_id,client_name,enabled) VALUES"
+                "('tenant-a',1001,'deleted',1),('tenant-b',1001,'foreign',1);"
+                "INSERT INTO peer_mesh_acl(tenant_id,source_client_id,source_client_name,target_client_id,target_client_name) VALUES"
+                "('tenant-a',1001,'deleted',1002,'survivor'),('tenant-a',1002,'survivor',1001,'deleted'),"
+                "('tenant-b',1001,'foreign',1002,'other');"
+                "INSERT INTO peer_mesh_shared_service(id,tenant_id,client_id,client_name,service_id,name,transport,application,"
+                "target_host,target_port,published_port,enabled,visibility,allowed_client_ids) VALUES"
+                "(10,'tenant-a',1001,'deleted','service-10','own','tcp','tcp','127.0.0.1',80,18010,1,'ACL',''),"
+                "(11,'tenant-a',1002,'survivor','service-11','multi','tcp','tcp','127.0.0.1',80,18011,1,'ACL','1001,1003,1001'),"
+                "(12,'tenant-a',1002,'survivor','service-12','last','tcp','tcp','127.0.0.1',80,18012,1,'ACL','1001'),"
+                "(13,'tenant-a',1002,'survivor','service-13','all','tcp','tcp','127.0.0.1',80,18013,1,'ACL',''),"
+                "(14,'tenant-a',1002,'survivor','service-14','owner','tcp','tcp','127.0.0.1',80,18014,1,'OWNER','1001'),"
+                "(15,'tenant-b',1001,'foreign','service-15','foreign','tcp','tcp','127.0.0.1',80,18015,1,'ACL','1001');"
+                "INSERT INTO peer_mesh_egress_policy(id,tenant_id,owner_username,egress_client_id,egress_client_name,enabled,"
+                "allowed_consumer_client_ids) VALUES (20,'tenant-a','alice',1001,'deleted',1,''),"
+                "(21,'tenant-a','alice',1002,'survivor',1,'1001,1003'),(22,'tenant-a','alice',1004,'last',1,'1001'),"
+                "(23,'tenant-b','alice',1001,'foreign',1,'1001');"
+                "INSERT INTO peer_mesh_session(id,tenant_id,source_client_id,source_client_name,target_client_id,target_client_name,"
+                "status,closed_at,direct_bytes,relay_bytes) VALUES (40,'tenant-a',1001,'deleted',1002,'survivor','ACTIVE',NULL,7,9),"
+                "(41,'tenant-a',1001,'deleted',1002,'survivor','CLOSED','2026-01-01T00:00:00Z',7,9),"
+                "(42,'tenant-b',1001,'foreign',1002,'other','ACTIVE',NULL,7,9);"
+                "INSERT INTO management_workbench_item(tenant_id,username,list,kind,object_id,at_ms)"
+                " VALUES('tenant-a','alice','favorites','peer-service',10,1);") != 0) return 1;
+            if (rollback && exec_script(path, "CREATE TRIGGER refuse_delete BEFORE DELETE ON client_account"
+                " WHEN OLD.id = 1001 BEGIN SELECT RAISE(ABORT,'injected account delete failure'); END;") != 0) return 1;
+            st_storage_share_ids revoked = {0};
+            st_storage_peer_close *closed = NULL;
+            size_t closed_count = 0U;
+            int rc = audited ? st_storage_delete_client_audited_with_peers(path, 1001, "admin", 1791870000000LL,
+                                                                          &revoked, &closed, &closed_count)
+                             : st_storage_delete_client(path, 1001);
+            st_storage_share_ids_free(&revoked);
+            int snapshots_ok = !audited || (rollback ? closed == NULL && closed_count == 0U
+                : closed_count == 1U && closed[0].id == 40 && closed[0].source_client_id == 1001
+                    && closed[0].target_client_id == 1002 && strcmp(closed[0].tenant_id, "tenant-a") == 0);
+            free(closed);
+            if (!snapshots_ok) { fprintf(stderr, "uncommitted or incorrect peer snapshots returned\n"); unlink(path); return 1; }
+            if ((rc == 0) == rollback) {
+                fprintf(stderr, "peer deletion outcome mismatch audited=%d rollback=%d\n", audited, rollback);
+                unlink(path);
+                return 1;
+            }
+            static const struct { const char *sql; long long deleted, retained; } checks[] = {
+                {"SELECT COUNT(*) FROM client_account WHERE id=1001",0,1},
+                {"SELECT COUNT(*) FROM peer_mesh_device WHERE tenant_id='tenant-a' AND client_id=1001",0,1},
+                {"SELECT COUNT(*) FROM peer_mesh_acl WHERE tenant_id='tenant-a'",0,2},
+                {"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE tenant_id='tenant-a' AND client_id=1001",0,1},
+                {"SELECT COUNT(*) FROM peer_mesh_egress_policy WHERE tenant_id='tenant-a' AND egress_client_id=1001",0,1},
+                {"SELECT COUNT(*) FROM management_workbench_item WHERE object_id=10",0,1},
+                {"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE id=11 AND allowed_client_ids='1003'",1,0},
+                {"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE id=12 AND allowed_client_ids='' AND enabled=0",1,0},
+                {"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE id=13 AND allowed_client_ids='' AND enabled=1",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE id=14 AND allowed_client_ids='' AND enabled=1",1,0},
+                {"SELECT COUNT(*) FROM peer_mesh_egress_policy WHERE id=21 AND allowed_consumer_client_ids='1003'",1,0},
+                {"SELECT COUNT(*) FROM peer_mesh_egress_policy WHERE id=22 AND allowed_consumer_client_ids=''",1,0},
+                {"SELECT COUNT(*) FROM peer_mesh_device WHERE tenant_id='tenant-b' AND client_id=1001",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_acl WHERE tenant_id='tenant-b'",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_shared_service WHERE id=15 AND allowed_client_ids='1001' AND enabled=1",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_egress_policy WHERE id=23 AND allowed_consumer_client_ids='1001'",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_session WHERE id=40 AND status='CLOSED' AND closed_at IS NOT NULL",1,0},
+                {"SELECT COUNT(*) FROM peer_mesh_session WHERE id=40 AND direct_bytes=7 AND relay_bytes=9",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_session WHERE id=41 AND closed_at='2026-01-01T00:00:00Z'",1,1},
+                {"SELECT COUNT(*) FROM peer_mesh_session WHERE id=42 AND status='ACTIVE' AND closed_at IS NULL",1,1}
+            };
+            for (size_t i=0U; i<sizeof(checks)/sizeof(checks[0]); ++i) {
+                long long expected = rollback ? checks[i].retained : checks[i].deleted;
+                if (query_int(path, checks[i].sql) != expected) {
+                    fprintf(stderr, "peer deletion invariant %zu failed audited=%d rollback=%d: %s\n", i,audited,rollback,checks[i].sql);
+                    unlink(path);
+                    return 1;
+                }
+            }
+            unlink(path);
+        }
+    }
+    return 0;
+}
+
 /*
  * Java ClientAuthNonceServiceIntegrationTests on the stored form: each (api key, nonce) pair is
  * consumed once, under Java's id and with Java's text expiry; a row still answers at its exact
@@ -1324,6 +1412,7 @@ static int test_login_names_are_unique_per_tenant(void)
 
 int main(void)
 {
+    if (test_client_peer_reference_deletion() != 0) return 1;
     if (test_client_account_id_migration() != 0) {
         return 1;
     }
@@ -1744,6 +1833,32 @@ int main(void)
         || !capability_device.message_attachments_capable
         || capability_device.message_max_attachment_bytes != 16777216) {
         fprintf(stderr, "client message capability projection mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    /* Same reusable SID, different physical CONTROL: only the current channel may retire it. */
+    int channel_changed = -1;
+    if (st_storage_mark_client_session_online(path, session.id, "channel-replacement", "127.0.0.1:7011",
+                                              "2026-06-25T00:02:30Z") != 0
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "channel-1",
+                                                                  "old-cleanup", &channel_changed) != 0
+        || channel_changed != 0
+        || st_storage_get_client_session_for_login(path, session.id, session.token_hash, &login_session) != 0
+        || strcmp(login_session.status, "NETTY_ONLINE") != 0
+        || strcmp(login_session.channel_id, "channel-replacement") != 0
+        || strcmp(login_session.remote_address, "127.0.0.1:7011") != 0
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "", "invalid", NULL) != -1
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "channel-replacement",
+                                                                  "2026-06-25T00:02:40Z", &channel_changed) != 0
+        || channel_changed != 1
+        || st_storage_mark_client_session_disconnected_if_channel(path, session.id, "channel-replacement",
+                                                                  "must-not-overwrite", &channel_changed) != 0
+        || channel_changed != 0
+        || st_storage_get_client_session_for_login(path, session.id, session.token_hash, &login_session) != 0
+        || strcmp(login_session.disconnected_at, "2026-06-25T00:02:40Z") != 0
+        || st_storage_mark_client_session_online(path, session.id, "channel-1", "127.0.0.1:7010",
+                                                 "2026-06-25T00:02:50Z") != 0) {
+        fprintf(stderr, "conditional physical-channel disconnect mismatch\n");
         unlink(path);
         return 1;
     }

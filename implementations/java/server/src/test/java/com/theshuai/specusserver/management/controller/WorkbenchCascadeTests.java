@@ -14,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Workbench references follow their objects and accounts through the existing delete endpoints
  * (protocol/spec/service-workbench.md sections 3 and 5.4): deleting a route, mapping or Peer service
  * removes every identity's references to it; deleting a client removes the references to everything
- * it carries although Java keeps those rows; deleting an account removes that identity's rows, so
+ * it carries, including Peer services deleted with it; deleting an account removes that identity's rows, so
  * the same name recreated starts empty. Disabling an account deletes nothing.
  */
 class WorkbenchCascadeTests extends WorkbenchHttpTestSupport {
@@ -90,10 +90,9 @@ class WorkbenchCascadeTests extends WorkbenchHttpTestSupport {
         var orphan = send("PUT", BASE + "/favorites/http-route/11", root);
         assertThat(orphan.statusCode()).isEqualTo(404);
         assertThat(json(orphan).path("code").asText()).isEqualTo("WORKBENCH_TARGET_NOT_FOUND");
-        // Its Peer service row stays and the Peer service list still shows it to an administrator,
-        // so an administrator may add it, as on the other servers; its former owner may not.
-        assertThat(send("PUT", BASE + "/favorites/peer-service/13", root).statusCode()).isEqualTo(200);
-        assertThat(send("POST", BASE + "/recents/peer-service/13", root).statusCode()).isEqualTo(200);
+        // #237: Peer services now go with their publisher, including for administrators.
+        assertThat(send("PUT", BASE + "/favorites/peer-service/13", root).statusCode()).isEqualTo(404);
+        assertThat(send("POST", BASE + "/recents/peer-service/13", root).statusCode()).isEqualTo(404);
         assertThat(send("PUT", BASE + "/favorites/peer-service/13", alice).statusCode()).isEqualTo(404);
     }
 

@@ -134,7 +134,7 @@ func TestServiceReportWithdrawalKeepsRevisionTombstoneAndServerTTL(t *testing.T)
 	for _, message := range loginMessages {
 		if message.Type == TypeServiceCatalog && message.PublisherClientID == publisher.ID &&
 			message.PublisherSessionID != nil && *message.PublisherSessionID == sessionID &&
-			message.Revision != nil && *message.Revision == revision2 && len(message.Services) == 1 {
+			message.Revision != nil && *message.Revision == 1 && len(message.Services) == 1 {
 			foundCurrentCatalog = true
 			break
 		}
