@@ -333,7 +333,7 @@ func (db *DB) ensureCompatibleColumns() error {
 			return fmt.Errorf("backfill %s tenant_id: %w", table, err)
 		}
 	}
-	indexes := []struct{ name, table, columns string }{
+	indexes := []schemaIndex{
 		{"idx_specus_connection_tenant_id", "specus_connection_record", "tenant_id, id"},
 		{"idx_specus_connection_tenant_client_id", "specus_connection_record", "tenant_id, client_id, id"},
 		{"idx_specus_connection_tenant_success", "specus_connection_record", "tenant_id, success"},
@@ -360,10 +360,36 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"idx_tcp_frame_tenant_client_port_id", "specus_tcp_traffic_frame", "tenant_id, client_id, listen_port, id"},
 		{"idx_tcp_frame_tenant_channel_id", "specus_tcp_traffic_frame", "tenant_id, channel_id, id"},
 	}
-	for _, index := range indexes {
-		if err := db.ensureIndex(index.name, index.table, index.columns); err != nil {
-			return err
+	return db.ensureIndexes(indexes)
+}
+
+type schemaIndex struct{ name, table, columns string }
+
+func (db *DB) ensureIndexes(indexes []schemaIndex) error {
+	if db.dialect != DialectSQLite {
+		for _, index := range indexes {
+			if err := db.ensureIndex(index.name, index.table, index.columns); err != nil {
+				return err
+			}
 		}
+		return nil
+	}
+	// These indexes depend on the preceding column/backfill repairs. Commit the
+	// batch once, with SQLite's existing FULL durability, rather than synchronizing
+	// the filesystem after each CREATE. No helper inside this transaction may use
+	// db.sql: SQLite deliberately has a one-connection pool.
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sqlite compatibility indexes: %w", err)
+	}
+	defer tx.Rollback()
+	for _, index := range indexes {
+		if _, err := tx.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)", index.name, index.table, index.columns)); err != nil {
+			return fmt.Errorf("create index %s: %w", index.name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite compatibility indexes: %w", err)
 	}
 	return nil
 }

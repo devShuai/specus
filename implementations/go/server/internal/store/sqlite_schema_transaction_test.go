@@ -94,3 +94,64 @@ func BenchmarkOpenSQLiteBaseSchema(b *testing.B) {
 		}
 	}
 }
+
+func TestSQLiteCompatibilityIndexesRollBackAndRecover(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compatibility-indexes.db")
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Recreate a partially upgraded database: the final compatibility index
+	// cannot be created, but the earlier indexes could otherwise be committed.
+	if _, err := db.sql.Exec(`
+		CREATE TABLE preserved_operator_data (value TEXT NOT NULL);
+		INSERT INTO preserved_operator_data VALUES ('keep-existing-data');
+		DROP INDEX idx_specus_connection_tenant_id;
+		DROP INDEX idx_tcp_frame_tenant_channel_id;
+		ALTER TABLE specus_tcp_traffic_frame RENAME COLUMN channel_id TO legacy_channel_id;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ensureCompatibleColumns(); err == nil || !strings.Contains(err.Error(), "channel_id") {
+		t.Fatalf("expected final compatibility index failure, got %v", err)
+	}
+	var count int
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_specus_connection_tenant_id'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("failed compatibility index batch committed an earlier index")
+	}
+	if _, err := db.sql.Exec(`ALTER TABLE specus_tcp_traffic_frame RENAME COLUMN legacy_channel_id TO channel_id`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ensureCompatibleColumns(); err != nil {
+		t.Fatalf("retry after explicit schema repair: %v", err)
+	}
+	for index, want := range map[string]string{
+		"idx_specus_connection_tenant_id": "tenant_id,id",
+		"idx_tcp_frame_tenant_channel_id": "tenant_id,channel_id,id",
+	} {
+		table := "specus_connection_record"
+		if strings.Contains(index, "tcp_frame") {
+			table = "specus_tcp_traffic_frame"
+		}
+		unique, columns, err := db.indexDefinition(table, index)
+		if err != nil || unique || strings.Join(columns, ",") != want {
+			t.Fatalf("repaired index %s: unique=%v columns=%v err=%v", index, unique, columns, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen committed repair: %v", err)
+	}
+	defer reopened.Close()
+	var value string
+	if err := reopened.sql.QueryRow(`SELECT value FROM preserved_operator_data`).Scan(&value); err != nil || value != "keep-existing-data" {
+		t.Fatalf("existing data changed: %q / %v", value, err)
+	}
+}
