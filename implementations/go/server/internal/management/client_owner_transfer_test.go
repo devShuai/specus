@@ -454,7 +454,7 @@ func TestOwnerTransferPreviewHTTPLargeGroupAndLiveness(t *testing.T) {
 		data.Clients = append(data.Clients, store.OwnerTransferClient{ID: id, TenantID: "t1", ClientName: ownerText(fmt.Sprint("device-", n)), OwnerUsername: ownerText("alice"), Enabled: n%2 == 0})
 		data.Identities = append(data.Identities, store.OwnerTransferIdentity{ID: int64(10001 + n), TenantID: "t1", CredentialID: 501, ClientID: id})
 	}
-	seedOwnerSnapshot(t, h, &data, "unused")
+	seedLargeOwnerSnapshotFixture(t, h, data)
 	load := func() ownerTransferPreview {
 		t.Helper()
 		response, payload := h.do(http.MethodGet, "/api/admin/client-credentials/501/owner-transfer", h.fixtureToken("t1"), nil)
