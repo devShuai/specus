@@ -392,20 +392,22 @@ public class PeerServiceRuntimeTest {
 
     @Test
     public void inPlaceTransportEditWithdrawsTcpAndCreatesUdpBridge() throws Exception {
-        int[] ports = freePorts(2);
-        try (ServerSocket tcpTarget = listen(ports[1]); UdpEchoTarget udpTarget = new UdpEchoTarget()) {
+        try (DualProtocolLoopbackPort published = DualProtocolLoopbackPort.reserve();
+             ServerSocket tcpTarget = listen(0); UdpEchoTarget udpTarget = new UdpEchoTarget()) {
             runtime = newRuntime();
             runtime.setHasAuthorizedOnlinePeer(true);
             SpecusCore.PeerMeshConfig current = config(true, tcpTarget.getLocalPort(), true);
-            current.localServices.get(0).publishedPort = ports[0];
+            current.localServices.get(0).publishedPort = published.port();
             current.localServices.get(0).allowedPeerVirtualIps = List.of("127.0.0.1");
+            published.releaseTcp();
             runtime.applyConfig(current);
             current.localServices.get(0).transport = "udp";
             current.localServices.get(0).application = "udp";
             current.localServices.get(0).targetPort = udpTarget.port();
+            published.releaseUdp();
             runtime.applyConfig(current);
-            assertConnectRejected("in-place TCP to UDP", "127.0.0.1", ports[0]);
-            assertUdpRoundTrip(ports[0], "new-udp-generation");
+            assertConnectRejected("in-place TCP to UDP", "127.0.0.1", published.port());
+            assertUdpRoundTrip(published.port(), "new-udp-generation");
         }
     }
 
