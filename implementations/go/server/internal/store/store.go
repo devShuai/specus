@@ -281,23 +281,24 @@ func (db *DB) ensureCompatibleColumns() error {
 	if err := db.backfillClientDownloadLatestSlots(); err != nil {
 		return err
 	}
-	if err := db.ensureUniqueIndex("uq_client_download_target_version", "client_download_link",
-		"implementation, platform, arch, version"); err != nil {
-		return err
-	}
-	if err := db.ensureUniqueIndex("uq_client_download_latest_slot", "client_download_link", "latest_slot"); err != nil {
+	if err := db.ensureUniqueIndexes([]schemaIndex{
+		{"uq_client_download_target_version", "client_download_link", "implementation, platform, arch, version"},
+		{"uq_client_download_latest_slot", "client_download_link", "latest_slot"},
+	}); err != nil {
 		return err
 	}
 	// This index must be created after ensureColumn. Embedded schema statements run before the
 	// compatibility pass, so putting the index there would make an old table without the nullable
 	// room column fail before it can be upgraded.
-	if err := db.ensureIndex("idx_transfer_attachment_public_room", "transfer_attachment",
-		"scope, public_transfer_room_id, id"); err != nil {
-		return err
-	}
-	if err := db.ensureIndex("idx_transfer_attachment_public_room_status", "transfer_attachment",
-		"scope, public_transfer_room_id, status"); err != nil {
-		return err
+	if db.dialect != DialectSQLite {
+		if err := db.ensureIndex("idx_transfer_attachment_public_room", "transfer_attachment",
+			"scope, public_transfer_room_id, id"); err != nil {
+			return err
+		}
+		if err := db.ensureIndex("idx_transfer_attachment_public_room_status", "transfer_attachment",
+			"scope, public_transfer_room_id, status"); err != nil {
+			return err
+		}
 	}
 	if err := db.ensurePostgresClientMessageCapabilityTypes(); err != nil {
 		return err
@@ -322,8 +323,10 @@ func (db *DB) ensureCompatibleColumns() error {
 		WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default'`)); err != nil {
 		return fmt.Errorf("backfill specus_connection_stat tenant_id: %w", err)
 	}
-	if err := db.ensureIndex("idx_specus_connection_stat_tenant", "specus_connection_stat", "tenant_id"); err != nil {
-		return err
+	if db.dialect != DialectSQLite {
+		if err := db.ensureIndex("idx_specus_connection_stat_tenant", "specus_connection_stat", "tenant_id"); err != nil {
+			return err
+		}
 	}
 	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		statement := fmt.Sprintf(`UPDATE %s SET tenant_id = COALESCE(
@@ -360,10 +363,46 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"idx_tcp_frame_tenant_client_port_id", "specus_tcp_traffic_frame", "tenant_id, client_id, listen_port, id"},
 		{"idx_tcp_frame_tenant_channel_id", "specus_tcp_traffic_frame", "tenant_id, channel_id, id"},
 	}
+	if db.dialect == DialectSQLite {
+		// These non-unique indexes need repaired columns, but no cleanup depends
+		// on them. Include them in the existing durable compatibility batch.
+		indexes = append([]schemaIndex{
+			{"idx_transfer_attachment_public_room", "transfer_attachment", "scope, public_transfer_room_id, id"},
+			{"idx_transfer_attachment_public_room_status", "transfer_attachment", "scope, public_transfer_room_id, status"},
+			{"idx_specus_connection_stat_tenant", "specus_connection_stat", "tenant_id"},
+		}, indexes...)
+	}
 	return db.ensureIndexes(indexes)
 }
 
 type schemaIndex struct{ name, table, columns string }
+
+func (db *DB) ensureUniqueIndexes(indexes []schemaIndex) error {
+	if db.dialect != DialectSQLite {
+		for _, index := range indexes {
+			if err := db.ensureUniqueIndex(index.name, index.table, index.columns); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Catalog backfills must finish first. Both unique constraints then become
+	// durable together; a late failure must not leave a partially indexed catalog.
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sqlite compatibility unique indexes: %w", err)
+	}
+	defer tx.Rollback()
+	for _, index := range indexes {
+		if _, err := tx.Exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (%s)", index.name, index.table, index.columns)); err != nil {
+			return fmt.Errorf("create unique index %s: %w", index.name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite compatibility unique indexes: %w", err)
+	}
+	return nil
+}
 
 func (db *DB) ensureIndexes(indexes []schemaIndex) error {
 	if db.dialect != DialectSQLite {
