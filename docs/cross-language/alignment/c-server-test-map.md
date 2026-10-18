@@ -8,13 +8,13 @@
 
 旧记录曾列出基线后新增的 22 类；该清单已不完整。当前提交的完整范围盘点与未完成项见下一节，下文历史表的计数仍只含原基线 79 类。
 
-## 2026-10-18 范围盘点与后续核验清单
+## 2026-10-18 范围盘点与后续核验清单（状态更新至2026-10-19）
 
 本次范围锚定已合并的 main `b8d6e725686b7353db98082b6082a94f5b7c8afa`；注册修复分支另锚定 `37851ae8c020fdd5a52bd0232a4ef00861f01891`。不将尚未合并的归属转移分支新增测试混入 main 的完成率。
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；另有41类待逐方法对照。49=4类平台差异+4类连通性候选覆盖+41类待核验；41也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的 79 类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批完整阅读并说明了4类纯框架/平台差异；4个连通性检查类共20个注解方法，首批均为“部分”，之后依次补齐Vector类行为断言、Resource类7个、Rate类5个及NAT类7个参考方法的候选证据；随后补列控制写入、会话清理、离线通知与上线指标4类共8方法的行为证据及限定API差异，见对应新节。当前49=4类纯平台差异+8类候选覆盖（28个注解方法）+37类待核验；37也不包括旧79类的当前断言复核。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -41,8 +41,8 @@
 | `database/SqliteSqlExceptionTranslatorTests` | 4 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SqliteUniqueIndexMigratorTests` | 7 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `database/SqliteUniqueIndexStartupTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `handler/ManagedLoginLogoutPushTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `handler/ManagedLoginProductMetricsTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `handler/ManagedLoginLogoutPushTests` | 3 | 覆盖（行为及限定调用层差异；候选） | `session_reference_tests.c:pair_scenario` 的mode0/1/2，真实注册表在线状态、实际离线roster发送、数据关闭不下线及替换后最终关闭恰好一次；C的替换保护位于logout helper内部，不等同于Java handler从不调用mock，详见新节。 |
+| `handler/ManagedLoginProductMetricsTests` | 1 | 覆盖（行为及限定API差异；候选） | `session_reference_tests.c:metrics_scenario` 经真实用户/凭证/连接验证非默认tenant及owner、固定client_online、一次control回调、data无新增与真实落库；C直接调用通用原语而非Java clientOnline包装方法，详见新节。 |
 | `http/HttpRouteLifecycleVectorTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpShareHttpTests` | 8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `http/HttpShareVectorTests` | 11 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
@@ -69,8 +69,8 @@
 | `productmetrics/ProductMetricsSweepTests` | 1 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `productmetrics/ProductMetricsVectorTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `productmetrics/ProductMetricsWritePathTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `server/ControlWriteFailureTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `session/SessionUtilTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
+| `server/ControlWriteFailureTests` | 2 | 覆盖（行为及限定Future API差异；候选） | `control_write_reference_tests.c` 将真实半帧写入socketpair后注入失败，验证关断及后续零字节；另以实际send锁竞争及字节比对验证半帧期间不插队、释放后两整帧。C无调用者可取消的Future；不声称覆盖pthread_cancel。 |
+| `session/SessionUtilTests` | 2 | 覆盖（参考2方法；候选） | `session_reference_tests.c:pair_scenario` 的mode0/1：当前control关闭带走data；按旧客户端端口识别并暂停真实旧EOF，绑定并验证新control/data后释放旧清理，新连接保持存活与在线。 |
 
 ## 连通性检查的逐方法对照（本轮增量）
 
@@ -189,6 +189,37 @@ Rate批次结束时，四类连通性中Vector、Resource、Rate三类为候选�
 新增Linux测试库 `connectivity_clock_offset.c` 只在独立CMake/Make回归中加载，使测试进程及子服务端的REALTIME读数偏移，MONOTONIC不变，不改变宿主机时间。该回归重复运行原3个完整场景；正常18场景加3次偏差重放是21次执行，不是21个不同场景。三个元数据/超时RST/绑定会话能力的生产负对照已基于最终单调时钟源码重新执行，仍均为旧15场景程序退出0、新3场景程序退出1。最终输入的正常18场景、包限流时钟回归及原包下载程序也通过ASan/UBSan、无报告；此消毒器范围不包括偏差库重放或服务端全部路径。
 
 本批把NAT类7个参考方法列为候选覆盖，与Vector/Resource/Rate三类合计4类；尚未合并的候选不计入main完成率。精确新提交CI仍须按PR #290的提交、实际测试树及原始产物另行核验，本文的本地通过不替代它。41类待对照、旧79类当前断言复核及#35其他运行时/真实环境验收仍未完成；不合并main、不关闭#35、不发版或更新Homebrew。
+
+## 控制写入、会话清理、离线通知与上线指标（2026-10-19增量）
+
+参考源码锚定未合并C分支前驱 `b1d1590fac4ede8823e264d68dcb729d642e5ea1`，相关Java类与上方main盘点一致。本节完整阅读4类8个注解方法后，给出逐方法候选对照；没有改Java参考方法或C生产源码。本节新增2个写入单元场景及4个真实进程场景，部分场景同时对应两个Java类，不能计为8个独立新增C场景，更不能加入main完成率。下表另外引用的旧会话生命周期场景不计为本批新增。前面各阶段保留的“41类待核验”是当时记录；本节之后当前剩余为37类，旧79类当前断言仍未全部复核。
+
+`control_write_reference_tests.c` 将真实 `src/main.c` 包含进专用测试可执行程序，仅在该可执行程序替换 `send` 与锁入口。实际字节使用AF_UNIX/SOCK_STREAM socketpair，注入点不替代生产编码、`session_send_packet`、锁或关断逻辑。`session_reference_tests.c` 则启动独立的专用测试server，使用真实HTTP/JWT/SQLite、控制/data TCP连接、会话注册表、替换及清理线程；只有该server的main对象别名化recv、logout helper、指标原语，由 `session_reference_observer.c` 转发真实调用并记录有界事件。`session_reference_recv.h` 先声明libc再替换调用，避免强化内联绕开观察器；构建核验对象确实引用观察器符号。正常 `specus-server-c` 不包含观察器或新运行时开关。本节不是TLS、跨NAT或全部服务端路径的验收。
+
+本节roster计数精确指真实logout helper进入生产send回调的发送尝试次数；观察器继续调用真实回调，并非只记mock。它没有逐条单独断言send返回值，也未比对旁观端收到的roster正文，不代表客户端已经确认通知。参考Java方法检查的是logout调用及当时在线状态，本节相应核验这层行为和发送保护，不能扩张为可靠通知投递验收；旁观连接的heartbeat用于证明它仍实际存活。
+
+| Java 方法 | C证据及精确断言 | 限定差异 |
+| --- | --- | --- |
+| `ControlWriteFailureTests.aWriteCutShortClosesTheChannelAndNothingFollowsIt` | 写入测试先以真实sendto送出正长度半帧，再注入ECONNRESET；第一次调用失败且write_failed置位，对端收到逐字节相同前缀与EOF，随后第二消息和heartbeat均失败，实际send调用数不增长、线上无后续字节。 | Java的IOException/ChannelFuture由C返回值、write_failed和socket关断对应；不将合成errno称为实际网络故障复现。 |
+| `ControlWriteFailureTests.aFrameBeingWrittenCannotBeCutShortByItsCaller` | 第一线程真实写出半帧后由条件变量持有；记录第二线程确已进入相同send锁的竞争入口，trylock=EBUSY且两次调用均未返回；释放第一线程后join，线上严格为两个完整编码帧，之后heartbeat仍成功。 | Java额外断言flushed Future的cancel(true)=false；C同步私有API只返回int，没有调用者可取消的Future，此API断言不适用。不声称执行了pthread_cancel、异步线程取消或所有线程终止情形。 |
+| `SessionUtilTests.closingTheCurrentControlConnectionClosesItsDataConnection` | 进程mode0真实关闭当前control发送方向，等待control和data实际EOF；logout观察时真实在线查询已为false，持久会话为DISCONNECTED，真实旁观设备仍可heartbeat。 | C以生产注册表查询与真实连接对应Java的两个getChannel结果，不伪造会话或在线回调。 |
+| `SessionUtilTests.closingAReplacedControlConnectionLeavesTheNewDataConnection` | mode1按旧客户端socket本地端口核验真实旧EOF进入屏障；旧关闭记录尚未完成时重新绑定同一HTTP会话的新control/data并heartbeat，再释放旧EOF；等待旧控制记录写入REPLACED_BY_NEW_LOGIN，之后新两通道仍可heartbeat且会话NETTY_ONLINE。原有 `session_lifecycle_tests.c:test_same_session_relogin_replaces_old_pair` 另在正常server二进制上明确等待旧control、旧data和旧NAT流实际EOF，再验证新连接存活。 | 新屏障补足原场景“先等旧EOF、后绑新data”未强制的迟到清理时序；原有旧通道关闭证据不冒充新增。屏障只延迟真实recv结果返回，不伪造EOF或生产注册表内容；5秒单调期限为测试失效上限，不按固定睡眠推断清理完成。 |
+| `ManagedLoginLogoutPushTests.closingTheControlConnectionTellsThePeersOnceTheClientIsUnbound` | mode0真实logout helper恰好一次，调用时生产online=false；实际转发的roster恰好一次到真实在线旁观设备，校准“零发送”检查不是因为没有接收方。 | 观察器转发真正helper和send，未把mock发送计数冒充真实发送。 |
+| `ManagedLoginLogoutPushTests.closingAControlConnectionReplacedByANewerLoginLeavesTheClientOnline` | mode1释放旧清理后online=true、实际departure roster=0且新两连接仍可用；再真实关闭当前control，等待当前control/data EOF、DISCONNECTED及实际departure roster恰好一次。 | Java handler不调用pushOnLogout mock；C teardown会调用helper一次，由helper内部的真实online保护返回零发送。调用层粒度不同，本文只把“客户端不被误宣告离线及最终一次离线通知”记为对应行为，不谎称C替换清理零helper调用。 |
+| `ManagedLoginLogoutPushTests.closingTheDataConnectionLeavesTheClientOnline` | mode2等待data真实EOF；control和旁观设备仍可heartbeat、会话NETTY_ONLINE，目标logout helper和departure roster均为0。 | 不以持久状态单独替代控制连接实际存活检查。 |
+| `ManagedLoginProductMetricsTests.controlLoginReportsClientOnlineForTheOwner` | mode3启用统计后经管理HTTP真实创建普通owner、登录及创建凭证；先证实非默认tenant已有一条client_online_at为空的进度，control登录及heartbeat后恰好一次固定client_online、tenant与owner全匹配，data登录及双heartbeat后没有新增；实际owner字段落库，OS用户和默认tenant无进度。 | Java调用clientOnline(account)且handler从不直接调用通用milestone；C直接以已认证client记录的tenant/owner和固定CLIENT_ONLINE调用通用原语。仅此包装API不同，不豁免归属、步骤、次数及data零新增；本节没有核验整个ProductMetricsService。 |
+
+本节保留首轮失败：最初编译参数直接重命名recv，glibc强化内联仍调用原recv，旧EOF没有进入屏障；强制前缀头及对象符号检查修正的是夹具，不是生产缺陷。最初指标夹具用初始化管理员直接断言进度落库，前提不成立：共享规范及Java/C实现都只由account_created创建进度，client_online不会补建。现在在启用统计后走真实建号路径，并显式检查初始进度，不把它解释为“管理员一概不统计”。
+
+事件读取有明确截止屏障，不靠睡眠推断零事件：当前control的最终shutdown位于logout helper转发、观察事件追加及连接关闭记录之后，所以mode0/1在该control实际EOF后比较通知次数；mode2在data实际EOF后，以control/旁观连接heartbeat确认存活并要求全体logout回调为0。mode1的旧连接关闭记录同样位于旧helper和本连接的配对清理之后：记录出现时这些可能影响新连接的步骤已完成，剩余步骤只shutdown旧fd、注销该连接对象并释放内存，不等同于断言整个旧线程已退出。指标回调及落库在control线程进入后续heartbeat循环前完成，data线程也需独立heartbeat屏障。计数窗口截止于上述明确事件，之后夹具清理旁观连接的通知不计入，不声称无限期没有其他业务事件。
+
+隔离的生产源码故障注入分别移除写失败关断、移除写锁、取消旧连接displaced保护、漏调logout、记错owner、data也记上线、硬编码默认tenant，以及仅保留旧替换清理的helper调用、漏掉最终当前连接的离线发送。每个变体均须由对应新增断言检出；它们不进入提交，不证明正常实现存在这些缺陷，也没有声称所有变体的旧全量测试都通过。写锁变体由未观察到第二锁竞争入口而超时失败，不能说它已测得线上帧交错。补强后的首次负对照脚本曾过度要求“完全漏调logout”走到最终关闭断言，但它先在旧helper次数处失败，脚本自身退出1；该次记录保留，随后增加仅漏最终通知的独立变体，区分两种失败阶段。
+
+最终负对照结果已核验：写入2个隔离变体各退出1，由各自写失败关断/锁竞争断言检出，汇总脚本退出0；调整脚本并以最终加强的进程夹具重跑上述6个会话/指标变体，也全部在各自预期阶段退出1，汇总脚本退出0。正常实现的焦点与消毒器测试通过。这里的8是缺陷注入变体数，不是新增Java方法数、C正常场景数或生产缺陷数。
+
+最终本地输入核验通过：CMake Release（O3/NDEBUG、Werror）63/63、零失败零跳过；原61个测试序号保留，新增写入与会话测试为62/63。独立O2/Werror Make构建及完整 `make test` 通过，原10000键容量、正常及进程时钟偏差下的真实10秒探测门禁均保留。严格O3焦点的写入2场景与专用测试server进程4场景通过；O2 ASan/UBSan、开启泄漏检查的写入2场景及带观察器server/驱动进程4场景通过，无消毒器报告，不外推普通server所有路径。构建后核验CMake/Make专用main对象确实引用recv观察器，普通server均不含fixture符号；全部生产src经Git文本规范化比较与前驱一致。先前未含最终通知/非默认tenant补强的完整通过记录另行保留，不冒充最终输入结果。
+
+本批精确新提交CI仍待核验，不能沿用前驱 `b1d1590` 的21项CI作为本批结果。失败日志、负对照源码及二进制留在本地证据，不进入发布产物。本节仍是未合并候选；37类待逐项对照、旧79类当前断言复核以及#35其他运行时/真实环境验收尚未完成。不合并main、不关闭#35、不发版、不更新Homebrew。
 
 ## 历史表的读法与限制
 

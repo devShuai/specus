@@ -501,3 +501,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             $<TARGET_FILE:specus_c_nat_stream_tests> $<TARGET_FILE:specus-server-c>)
     set_tests_properties(nat_connectivity_clock_adjustment PROPERTIES TIMEOUT 60)
 endif()
+
+# Reference tests compile private main.c code without adding switches to the shipped server.
+add_executable(specus_c_control_write_reference_tests tests/control_write_reference_tests.c)
+target_link_libraries(specus_c_control_write_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_control_write_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME control_write_reference_tests COMMAND specus_c_control_write_reference_tests)
+set_tests_properties(control_write_reference_tests PROPERTIES TIMEOUT 30)
+
+# Only this object aliases the three observation points. The helper forwards real I/O, registry
+# and metrics calls; the ordinary specus-server-c target above never links this helper.
+add_library(specus_c_session_reference_main OBJECT src/main.c)
+target_link_libraries(specus_c_session_reference_main PRIVATE specus_c_core)
+target_compile_options(specus_c_session_reference_main PRIVATE -Wall -Wextra -Wpedantic
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/tests/session_reference_recv.h")
+target_compile_definitions(specus_c_session_reference_main PRIVATE
+    st_peer_mesh_push_on_logout=st_fixture_peer_logout
+    st_product_metrics_milestone=st_fixture_milestone)
+add_executable(specus_c_session_reference_server
+    $<TARGET_OBJECTS:specus_c_session_reference_main> tests/session_reference_observer.c)
+target_link_libraries(specus_c_session_reference_server PRIVATE specus_c_core)
+target_compile_options(specus_c_session_reference_server PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(specus_c_session_reference_tests tests/session_reference_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_session_reference_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_session_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME session_reference_tests
+    COMMAND specus_c_session_reference_tests $<TARGET_FILE:specus_c_session_reference_server>)
+set_tests_properties(session_reference_tests PROPERTIES TIMEOUT 120)

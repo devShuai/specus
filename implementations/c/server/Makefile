@@ -89,6 +89,11 @@ ALL_TESTS += $(CONNECTIVITY_RESOURCE_WIRE_TESTS)
 ALL_TESTS += $(CONNECTIVITY_RATE_HTTP_TESTS)
 TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
 ALL_TESTS += $(CLIENT_PACKAGE_CLOCK_TESTS)
+CONTROL_WRITE_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_control_write_reference_tests
+SESSION_REFERENCE_SERVER := $(BUILD_DIR)/specus_c_session_reference_server
+SESSION_REFERENCE_TESTS := $(BUILD_DIR)/specus_c_session_reference_tests
+TESTS += $(CONTROL_WRITE_REFERENCE_TESTS)
+ALL_TESTS += $(CONTROL_WRITE_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER) $(SESSION_REFERENCE_TESTS)
 
 # This adverse clock view uses Linux's process-local preload, never the host clock.
 ifeq ($(shell uname -s),Linux)
@@ -122,6 +127,18 @@ $(UNICODE_JAVA21_TESTS): $(CORE_OBJS) tests/unicode_java21_tests.c $(UNICODE_JAV
 
 $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONTROL_WRITE_REFERENCE_TESTS): $(CORE_OBJS) src/main.c tests/control_write_reference_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/control_write_reference_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/session_reference_main.o: src/main.c tests/session_reference_recv.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -include tests/session_reference_recv.h -Dst_peer_mesh_push_on_logout=st_fixture_peer_logout -Dst_product_metrics_milestone=st_fixture_milestone -c $< -o $@
+
+$(SESSION_REFERENCE_SERVER): $(CORE_OBJS) $(BUILD_DIR)/session_reference_main.o tests/session_reference_observer.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/session_reference_observer.c $(BUILD_DIR)/session_reference_main.o $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(SESSION_REFERENCE_TESTS): $(CORE_OBJS) tests/session_reference_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/session_reference_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/admin_http_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -283,6 +300,7 @@ $(MANAGEMENT_ACCOUNTS_TESTS): $(CORE_OBJS) tests/management_accounts_tests.c | $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_accounts_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 test: all
+	$(SESSION_REFERENCE_TESTS) $(SESSION_REFERENCE_SERVER)
 	$(CONNECTIVITY_RATE_HTTP_TESTS)
 	$(CONNECTIVITY_RESOURCE_WIRE_TESTS) $(SERVER)
 	$(UNICODE_JAVA21_TESTS) "$(abspath $(UNICODE_JAVA21_VECTORS))"
