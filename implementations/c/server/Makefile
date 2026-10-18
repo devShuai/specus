@@ -59,6 +59,7 @@ MANAGEMENT_LISTS_TESTS := $(BUILD_DIR)/specus_c_management_lists_tests
 MANAGEMENT_CRUD_TESTS := $(BUILD_DIR)/specus_c_management_crud_tests
 MAILBOX_VECTOR_FILE := ../../../protocol/test-vectors/registration-mailbox-forms-v1.json
 EMAIL_MASK_VECTOR_FILE := ../../../protocol/test-vectors/registration-email-mask-v1.json
+EMAIL_NUL_VECTOR_FILE := ../../../protocol/test-vectors/registration-email-nul-v1.json
 PEER_MESH_API_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_api_tests
 MANAGEMENT_OVERVIEW_TESTS := $(BUILD_DIR)/specus_c_management_overview_tests
 HTTP_WEBSOCKET_ROUTING_TESTS := $(BUILD_DIR)/specus_c_http_websocket_routing_tests
@@ -199,8 +200,8 @@ $(CLIENT_MESSAGES_TESTS): $(CORE_OBJS) tests/client_messages_tests.c tests/clien
 $(MANAGEMENT_LISTS_TESTS): $(CORE_OBJS) tests/management_lists_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_lists_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
-$(MANAGEMENT_CRUD_TESTS): $(CORE_OBJS) tests/management_crud_tests.c tests/server_harness.c tests/server_harness.h $(MAILBOX_VECTOR_FILE) $(EMAIL_MASK_VECTOR_FILE) | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_MAILBOX_VECTOR_FILE='"$(abspath $(MAILBOX_VECTOR_FILE))"' -DST_EMAIL_MASK_VECTOR_FILE='"$(abspath $(EMAIL_MASK_VECTOR_FILE))"' tests/management_crud_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+$(MANAGEMENT_CRUD_TESTS): $(CORE_OBJS) tests/management_crud_tests.c tests/server_harness.c tests/server_harness.h $(MAILBOX_VECTOR_FILE) $(EMAIL_MASK_VECTOR_FILE) $(EMAIL_NUL_VECTOR_FILE) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DST_MAILBOX_VECTOR_FILE='"$(abspath $(MAILBOX_VECTOR_FILE))"' -DST_EMAIL_MASK_VECTOR_FILE='"$(abspath $(EMAIL_MASK_VECTOR_FILE))"' -DST_EMAIL_NUL_VECTOR_FILE='"$(abspath $(EMAIL_NUL_VECTOR_FILE))"' tests/management_crud_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(PEER_MESH_API_TESTS): $(CORE_OBJS) tests/peer_mesh_api_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_mesh_api_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@

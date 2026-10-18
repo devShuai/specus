@@ -237,6 +237,9 @@ func (s *registrationService) adminUsername() string {
 }
 
 func normalizeRegistrationEmail(value string) (string, error) {
+	if strings.ContainsRune(value, '\x00') {
+		return "", validation("邮箱格式无效")
+	}
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	if normalized == "" {
 		return "", validation("邮箱不能为空")

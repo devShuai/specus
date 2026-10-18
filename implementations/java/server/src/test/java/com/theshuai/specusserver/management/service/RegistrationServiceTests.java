@@ -48,7 +48,8 @@ class RegistrationServiceTests {
         var service = new RegistrationService(challenges, mock(ManagementUserEmailRepository.class),
                 mock(ManagementUserRepository.class), users, sender, properties, new AuthProperties(), tokens, turnstile);
         var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
-                new AuthController(tokens, users, service, turnstile, null, null, null)).build();
+                new AuthController(tokens, users, service, turnstile, null, null, null))
+                .setControllerAdvice(new com.theshuai.specusserver.management.controller.GlobalExceptionHandler()).build();
         Path root = Path.of("").toAbsolutePath();
         String relative = "protocol/test-vectors/registration-email-mask-v1.json";
         while (root != null && !Files.isRegularFile(root.resolve(relative))) root = root.getParent();
@@ -76,6 +77,50 @@ class RegistrationServiceTests {
                     org.mockito.ArgumentMatchers.anyLong());
         }
         assertEquals(names.size(), tested);
+        int rejected = 0;
+        var nulFixture = mapper.readTree(Files.readString(root.resolve(
+                "protocol/test-vectors/registration-email-nul-v1.json")));
+        for (var item : nulFixture.path("cases")) {
+            if (item.path("accepted").asBoolean()) continue;
+            String username = "nul-wire-" + rejected++;
+            int previousChallengeCalls = org.mockito.Mockito.mockingDetails(challenges).getInvocations().size();
+            var response = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                            .post("/auth/register").contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                            .content(mapper.writeValueAsBytes(java.util.Map.of("username", username,
+                                    "email", item.path("email").asText(), "password", "password", "turnstileToken", "test-token"))))
+                    .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest())
+                    .andReturn().getResponse();
+            assertEquals("邮箱格式无效", mapper.readTree(response.getContentAsByteArray()).path("error").asText());
+            assertEquals(previousChallengeCalls, org.mockito.Mockito.mockingDetails(challenges).getInvocations().size());
+            org.mockito.Mockito.verify(sender, org.mockito.Mockito.never()).sendVerificationCode(
+                    org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.eq(username),
+                    org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyLong());
+        }
+        assertEquals(12, rejected);
+    }
+
+    @Test
+    void sharedEmailNulPolicyRejectsRawInputBeforeTrim() throws Exception {
+        Path root = Path.of("").toAbsolutePath();
+        String relative = "protocol/test-vectors/registration-email-nul-v1.json";
+        while (root != null && !Files.isRegularFile(root.resolve(relative))) root = root.getParent();
+        if (root == null) throw new IllegalStateException("Shared email NUL vector missing");
+        var fixture = new ObjectMapper().readTree(Files.readString(root.resolve(relative)));
+        assertEquals(1, fixture.path("version").asInt());
+        assertEquals(14, fixture.path("cases").size());
+        RegistrationService service = new RegistrationService(null, null, null, null,
+                null, null, null, null, null);
+        for (var item : fixture.path("cases")) {
+            String email = item.path("email").asText();
+            if (item.path("accepted").asBoolean()) {
+                assertEquals(item.path("normalized").asText(),
+                        ReflectionTestUtils.invokeMethod(service, "normalizeEmail", email));
+            } else {
+                var error = assertThrows(IllegalArgumentException.class,
+                        () -> ReflectionTestUtils.invokeMethod(service, "normalizeEmail", email));
+                assertEquals("邮箱格式无效", error.getMessage(), item.path("name").asText());
+            }
+        }
     }
 
     @Test

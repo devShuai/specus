@@ -206,6 +206,9 @@ public class RegistrationService {
     }
 
     private String normalizeEmail(String rawEmail) {
+        if (rawEmail != null && rawEmail.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("邮箱格式无效");
+        }
         if (!StringUtils.hasText(rawEmail)) {
             throw new IllegalArgumentException("邮箱不能为空");
         }

@@ -179,22 +179,39 @@ static int test_registration_mailbox_vectors(const char *path, int mask_only)
     int version = 0;
     if (failed || !st_json_is_valid_object(json) || st_json_get_int(json, "version", &version) != 0
         || version != 1 || st_json_get_raw_array(json, "cases", &cases, &count) != 0
-        || count != (mask_only ? 24U : 36U)) return 1;
+        || count != (mask_only == 2 ? 14U : mask_only ? 24U : 36U)) return 1;
     mailbox box = {{0}, {0}, {0}};
     st_registration_set_handlers(fake_turnstile, fake_email, &box);
     for (size_t i = 0U; i < count; ++i) {
         char *name = st_json_get_string(cases[i], "name");
         char *email = st_json_get_string(cases[i], "email");
-        char *normalized = mask_only && email != NULL ? strdup(email) : st_json_get_string(cases[i], "normalized");
+        char *normalized = mask_only == 1 && email != NULL ? strdup(email) : st_json_get_string(cases[i], "normalized");
         char *masked = st_json_get_string(cases[i], "masked");
-        int accepted = mask_only;
+        int accepted = mask_only == 1;
         int valid = name != NULL && email != NULL
-            && (mask_only || st_json_get_bool(cases[i], "accepted", &accepted) == 0);
+            && (mask_only == 1 || st_json_get_bool(cases[i], "accepted", &accepted) == 0);
         char username[80];
-        snprintf(username, sizeof(username), "mailbox-%s-%zu", mask_only ? "mask" : "form", i);
+        snprintf(username, sizeof(username), "mailbox-%s-%zu", mask_only == 2 ? "nul" : mask_only ? "mask" : "form", i);
         int result = !valid || (accepted && (normalized == NULL || masked == NULL));
-        if (!result) result = register_with(username, email, "pw", "ok", accepted ? 202 : 400,
-                                            accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
+        if (!result && mask_only == 2) {
+            /* Keep escaped NUL and its suffix in the HTTP request, not in a C string
+             * which would lose bytes when st_json_escape reads it. */
+            char *raw_email = st_json_get_top_level_raw(cases[i], "email");
+            char body[4096];
+            memset(&box, 0, sizeof(box));
+            if (raw_email == NULL) result = 1;
+            else {
+                snprintf(body, sizeof(body), "{\"username\":\"%s\",\"email\":%s,\"password\":\"pw\",\"turnstileToken\":\"ok\"}", username, raw_email);
+                result = expect("POST", "/auth/register", body, NULL, accepted ? 202 : 400,
+                                accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
+            }
+            free(raw_email);
+            if (!accepted) {
+                st_storage_registration_challenge pending;
+                result = box.email[0] != '\0' || st_storage_find_registration_challenge(db_path, username, "", &pending) == 0 || result;
+            }
+        } else if (!result) result = register_with(username, email, "pw", "ok", accepted ? 202 : 400,
+                                                   accepted ? "\"registrationId\"" : "\"error\":\"邮箱格式无效\"") != 0;
         if (!result && accepted) {
             char actual_masked[1024];
             last_member("emailMasked", actual_masked, sizeof(actual_masked));
@@ -213,7 +230,7 @@ static int test_registration_mailbox_vectors(const char *path, int mask_only)
             result = st_storage_delete_registration_challenge(db_path, registration_id) != 0 || result;
         }
         printf("%s shared registration %s %s\n", result ? "FAIL" : "ok  ",
-               mask_only ? "Unicode mask HTTP/UTF8" : "mailbox form", name == NULL ? "missing-name" : name);
+               mask_only == 2 ? "NUL raw HTTP/no-mail/no-challenge" : mask_only ? "Unicode mask HTTP/UTF8" : "mailbox form", name == NULL ? "missing-name" : name);
         failed = result || failed;
         free(name); free(email); free(normalized); free(masked);
     }
@@ -831,6 +848,7 @@ int main(void)
         failed = test_registration() != 0;
         failed = test_registration_mailbox_vectors(ST_MAILBOX_VECTOR_FILE, 0) != 0 || failed;
         failed = test_registration_mailbox_vectors(ST_EMAIL_MASK_VECTOR_FILE, 1) != 0 || failed;
+        failed = test_registration_mailbox_vectors(ST_EMAIL_NUL_VECTOR_FILE, 2) != 0 || failed;
         failed = test_registration_email_storage() != 0 || failed;
         failed = test_me() != 0 || failed;
         failed = test_credentials() != 0 || failed;

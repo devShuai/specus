@@ -299,6 +299,10 @@ public sealed class RegistrationService
 
     private static string NormalizeEmail(string? value)
     {
+        if (value is not null && value.Contains('\0'))
+        {
+            throw new ArgumentException("邮箱格式无效");
+        }
         var email = (value ?? string.Empty).Trim().ToLowerInvariant();
         if (email.Length == 0)
         {

@@ -196,7 +196,8 @@ target_link_libraries(specus_c_management_crud_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_management_crud_tests PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(specus_c_management_crud_tests PRIVATE
     ST_MAILBOX_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-mailbox-forms-v1.json"
-    ST_EMAIL_MASK_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-email-mask-v1.json")
+    ST_EMAIL_MASK_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-email-mask-v1.json"
+    ST_EMAIL_NUL_VECTOR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/registration-email-nul-v1.json")
 add_test(NAME management_crud_tests COMMAND specus_c_management_crud_tests)
 
 # The Peer Mesh / Egress management endpoints, Spring-converted parameters, mapping create, times.

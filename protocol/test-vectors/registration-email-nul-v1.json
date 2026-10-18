@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "scope": "Human-adopted registration email rule: reject U+0000 anywhere in the raw input before trim, including leading/trailing NUL and quoted local parts. Other acceptance and normalization rules are unchanged. Rejections must send no email and persist no challenge.",
+  "cases": [
+    {"name":"ordinary", "email":"Alice@Example.test", "accepted":true, "normalized":"alice@example.test", "masked":"al***@example.test"},
+    {"name":"ordinary-unicode", "email":"用@example.test", "accepted":true, "normalized":"用@example.test", "masked":"用***@example.test"},
+    {"name":"only", "email":"\u0000", "accepted":false},
+    {"name":"leading", "email":"\u0000alice@example.test", "accepted":false},
+    {"name":"trailing", "email":"alice@example.test\u0000", "accepted":false},
+    {"name":"trim-both", "email":"\u0000 alice@example.test \u0000", "accepted":false},
+    {"name":"after-valid-prefix", "email":"alice@example.test\u0000.suffix", "accepted":false},
+    {"name":"local", "email":"ali\u0000ce@example.test", "accepted":false},
+    {"name":"quoted-local", "email":"\"ali\u0000ce\"@example.test", "accepted":false},
+    {"name":"before-at", "email":"alice\u0000@example.test", "accepted":false},
+    {"name":"after-at", "email":"alice@\u0000example.test", "accepted":false},
+    {"name":"domain", "email":"alice@exam\u0000ple.test", "accepted":false},
+    {"name":"before-domain-dot", "email":"alice@example\u0000.test", "accepted":false},
+    {"name":"unicode-local", "email":"用\u0000户@example.test", "accepted":false}
+  ]
+}

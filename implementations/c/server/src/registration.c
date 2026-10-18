@@ -548,7 +548,8 @@ int st_registration_request(const char *database_path,
         return -1;
     }
     char *username = st_json_get_string(json_body, "username");
-    char *email = st_json_get_string(json_body, "email");
+    size_t email_len = 0U;
+    char *email = st_json_get_string_len(json_body, "email", &email_len);
     char *password = st_json_get_string(json_body, "password");
     char *turnstile = st_json_get_string(json_body, "turnstileToken");
     /* Java AuthController.register: the challenge first, then requestRegistration's checks in order. */
@@ -569,7 +570,10 @@ int st_registration_request(const char *database_path,
                                           "password is too long");
     }
     if (refusal == NULL) {
-        refusal = registration_normalize_email(email);
+        /* The raw address must not contain NUL, including characters trim would remove.
+         * Validate the decoder's complete byte sequence, not a silently truncated prefix. */
+        refusal = email != NULL && memchr(email, '\0', email_len) != NULL
+            ? "邮箱格式无效" : registration_normalize_email(email);
     }
     if (refusal != NULL) {
         registration_error(error, error_len, refusal);

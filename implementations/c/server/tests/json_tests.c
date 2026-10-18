@@ -79,6 +79,27 @@ int main(void)
         return 1;
     }
     free(decoded);
+    size_t member_len = 99U;
+    char *member = st_json_get_string_len("{\"email\":\"a\\u0000b\"}", "email", &member_len);
+    if (member == NULL || member_len != 3U || memcmp(member, "a\0b", 3U) != 0) {
+        fprintf(stderr, "json member length must include escaped NUL and suffix\n");
+        free(member);
+        return 1;
+    }
+    free(member);
+    member = st_json_get_string_len("{\"email\":\"\\ud83d\\ude00\\u0000x\"}", "email", &member_len);
+    if (member == NULL || member_len != 6U || memcmp(member, "\xf0\x9f\x98\x80\0x", 6U) != 0) {
+        fprintf(stderr, "json member length counts decoded UTF-8 bytes\n");
+        free(member);
+        return 1;
+    }
+    free(member);
+    member = st_json_get_string_len("{\"email\":123}", "email", &member_len);
+    if (member != NULL || member_len != 0U) {
+        fprintf(stderr, "json failed member decode must report zero length\n");
+        free(member);
+        return 1;
+    }
     decoded = st_json_decode_string("\"a\\u0000b\"", &decoded_len);
     if (decoded == NULL || decoded_len != 3U || memcmp(decoded, "a\0b", 3U) != 0) {
         fprintf(stderr, "json string decode must report the length past an escaped NUL\n");

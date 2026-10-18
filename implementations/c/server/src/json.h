@@ -7,6 +7,9 @@ char *st_json_escape(const char *value);
 int st_json_is_valid(const char *json);
 int st_json_is_valid_object(const char *json);
 char *st_json_get_string(const char *json, const char *key);
+/* Same lookup as st_json_get_string; reports decoded bytes including embedded NULs.
+ * Callers must use the length before applying C-string validation. Zero on failure. */
+char *st_json_get_string_len(const char *json, const char *key, size_t *out_len);
 char *st_json_get_top_level_string(const char *json, const char *key);
 char *st_json_get_top_level_raw(const char *json, const char *key);
 /*
