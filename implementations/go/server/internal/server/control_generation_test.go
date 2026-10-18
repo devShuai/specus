@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"math"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -94,6 +95,12 @@ func (f *generationFixture) login(login clientAuthLoginForTestResponse, role str
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	packet, err := readProtocolPacket(reader)
 	if err != nil {
+		// Capture the live login worker before test cleanup releases its database,
+		// lifecycle lease or socket waits. Only failure pays for the stack snapshot;
+		// do not relax the deadline or infer that every timeout is storage latency.
+		stack := make([]byte, 2<<20)
+		n := runtime.Stack(stack, true)
+		f.t.Logf("%s login failure goroutines (truncated=%v):\n%s", role, n == len(stack), stack[:n])
 		f.t.Fatalf("%s login read: %v", role, err)
 	}
 	answer, ok := packet.(protocol.LoginResponse)
