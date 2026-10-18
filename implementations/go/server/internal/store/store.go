@@ -135,11 +135,31 @@ func (db *DB) migrate() error {
 	if err != nil {
 		return fmt.Errorf("read schema %s: %w", name, err)
 	}
+	execSchema := db.sql.Exec
+	var schemaTx *sql.Tx
+	if db.dialect == DialectSQLite {
+		// One durable commit for the embedded DDL, rather than a filesystem sync
+		// per CREATE. Keep FULL synchronous/journal settings and roll back the
+		// entire base-schema batch if any statement fails.
+		schemaTx, err = db.sql.Begin()
+		if err != nil {
+			return fmt.Errorf("begin sqlite base schema: %w", err)
+		}
+		defer schemaTx.Rollback()
+		execSchema = schemaTx.Exec
+	}
 	for _, stmt := range splitStatements(string(data)) {
-		if _, err := db.sql.Exec(stmt); err != nil {
+		if _, err := execSchema(stmt); err != nil {
 			return fmt.Errorf("apply schema statement: %w\n%s", err, stmt)
 		}
 	}
+	if schemaTx != nil {
+		if err := schemaTx.Commit(); err != nil {
+			return fmt.Errorf("commit sqlite base schema: %w", err)
+		}
+	}
+	// Compatibility helpers may own transactions and use the single SQLite
+	// connection, so the base-schema transaction must finish before they run.
 	if err := db.ensureCompatibleColumns(); err != nil {
 		return err
 	}
