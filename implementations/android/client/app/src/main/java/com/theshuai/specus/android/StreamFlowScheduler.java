@@ -271,8 +271,8 @@ final class StreamFlowScheduler implements Closeable {
                     closeCompletedStream(streamId, state, pending);
                 }
             } catch (Throwable error) {
-                pending.completion.completeExceptionally(error);
                 closeFailedStream(streamId, state, error);
+                pending.completion.completeExceptionally(error);
             }
         }
     }
