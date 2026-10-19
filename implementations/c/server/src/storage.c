@@ -1728,6 +1728,7 @@ int st_storage_init(const char *path, int seed_demo_client)
     if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment", "id", "upload_expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment", "id", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "transfer_attachment_download_grant", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "specus_http_media_capture", "id", "expires_at", NULL);
     if (fresh && rc == 0) {
         rc = exec_sql(db, "COMMIT");
     }

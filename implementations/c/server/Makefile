@@ -154,6 +154,8 @@ TESTS += $(PAIRING_EXPIRY_TESTS)
 TRANSFER_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_transfer_expiry_tests
 ALL_TESTS += $(TRANSFER_EXPIRY_TESTS)
 TESTS += $(TRANSFER_EXPIRY_TESTS)
+MEDIA_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_media_expiry_tests
+ALL_TESTS += $(MEDIA_EXPIRY_TESTS)
 
 all: $(SERVER) $(ALL_TESTS)
 
@@ -171,7 +173,7 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/unicode_java21.o: src/unicode_java21.h src/unicode_java21_data.h
 $(BUILD_DIR)/instant.o: src/instant.h
-$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/public_room.o: src/instant.h src/instant_storage.h
+$(BUILD_DIR)/instant_storage.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/media_capture.o: src/instant.h src/instant_storage.h
 
 $(BUILD_DIR)/connectivity_check.o: src/connectivity_check.h
 
@@ -362,6 +364,9 @@ $(PAIRING_EXPIRY_TESTS): $(CORE_OBJS) tests/pairing_expiry_tests.c tests/instant
 $(TRANSFER_EXPIRY_TESTS): $(CORE_OBJS) tests/transfer_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/transfer_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
 
+$(MEDIA_EXPIRY_TESTS): $(CORE_OBJS) tests/media_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/media_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
 $(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@
 
@@ -438,6 +443,7 @@ test: all
 	bash scripts/elasticsearch_traffic_test.sh $(ELASTICSEARCH_TRAFFIC_TESTS)
 	bash scripts/elasticsearch_traffic_test.sh $(TRAFFIC_DETAIL_API_TESTS) $(SERVER)
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
+	bash scripts/media_capture_test.sh $(MEDIA_EXPIRY_TESTS) expiry
 	$(SESSION_LIFECYCLE_TESTS) $(SERVER)
 	$(SECURITY_RULES_TESTS) $(SERVER)
 	$(HTTP_ROUTE_LIFECYCLE_TESTS) $(SERVER)

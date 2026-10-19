@@ -670,3 +670,11 @@ target_compile_options(specus_c_transfer_expiry_tests PRIVATE -Wall -Wextra -Wpe
 target_link_options(specus_c_transfer_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
 add_test(NAME transfer_expiry_tests COMMAND specus_c_transfer_expiry_tests)
 set_tests_properties(transfer_expiry_tests PROPERTIES TIMEOUT 90)
+
+add_executable(specus_c_media_expiry_tests tests/media_expiry_tests.c)
+target_link_libraries(specus_c_media_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_media_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_media_expiry_tests PRIVATE -Wl,--wrap=time -Wl,--wrap=clock_gettime)
+add_test(NAME media_expiry_tests COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/media_capture_test.sh
+    $<TARGET_FILE:specus_c_media_expiry_tests> expiry)
+set_tests_properties(media_expiry_tests PROPERTIES TIMEOUT 90)

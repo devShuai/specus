@@ -2,6 +2,8 @@
 set -euo pipefail
 
 test_binary="${1:?media capture test binary is required}"
+test_kind="${2:-full}"
+case "$test_kind" in full|expiry) ;; *) echo "unknown media test kind: $test_kind" >&2; exit 2 ;; esac
 tmp_dir="$(mktemp -d)"
 server_pid=""
 cleanup() {
@@ -156,5 +158,7 @@ SPECUS_MEDIA_CAPTURE_TEST_RESOLVE_ADDRESS="127.0.0.1" \
 SPECUS_MEDIA_CAPTURE_TEST_STATE_DIR="$tmp_dir" \
   "$test_binary"
 
-find "$tmp_dir" -name 'upload-*-part-1' -size 5242880c | grep -q .
-find "$tmp_dir" -name 'upload-*-part-2' -size 3c | grep -q .
+if [[ "$test_kind" == full ]]; then
+  find "$tmp_dir" -name 'upload-*-part-1' -size 5242880c | grep -q .
+  find "$tmp_dir" -name 'upload-*-part-2' -size 3c | grep -q .
+fi
