@@ -1756,6 +1756,165 @@ static int check_tcp_queue_overflow(test_server *server, client_pair *pair)
     return expect_data_connection_served(server, pair);
 }
 
+/* Peers flooding the stalled data connection, and how much each window lets them send. */
+#define BACKPRESSURE_PEERS 4U
+/* Well under the peers' combined send windows (4 x 16 MiB): only a stall of the reads gets below it. */
+#define BACKPRESSURE_BOUND (24U * 1024U * 1024U)
+
+/* The byte at offset of what public peer `peer` sends: each stream's content tells its order. */
+static uint8_t backpressure_byte(size_t peer, uint64_t offset)
+{
+    return (uint8_t)(offset * 7U + peer * 31U + offset / 251U);
+}
+
+/*
+ * Writes as much of each peer's pattern as its socket takes until none of them has taken a byte
+ * for stall_ms, adding what each took to sent[]. 0 when they stalled, -1 when they took bound
+ * bytes without stalling.
+ */
+static int flood_until_stalled(const int *fds, uint64_t *sent, uint64_t bound, int stall_ms)
+{
+    uint8_t chunk[DATA_CHUNK];
+    long long quiet_since = monotonic_ms();
+    for (;;) {
+        int progressed = 0;
+        uint64_t total = 0U;
+        for (size_t p = 0U; p < BACKPRESSURE_PEERS; ++p) {
+            for (size_t i = 0U; i < sizeof(chunk); ++i) {
+                chunk[i] = backpressure_byte(p, sent[p] + i);
+            }
+            ssize_t wrote = send(fds[p], chunk, sizeof(chunk), MSG_DONTWAIT);
+            if (wrote > 0) {
+                sent[p] += (uint64_t)wrote;
+                progressed = 1;
+            } else if (wrote < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                fprintf(stderr, "public peer %zu: send failed errno=%d\n", p, errno);
+                return -1;
+            }
+            total += sent[p];
+        }
+        if (total >= bound) {
+            return -1;
+        }
+        if (progressed) {
+            quiet_since = monotonic_ms();
+        } else if (monotonic_ms() - quiet_since >= stall_ms) {
+            return 0;
+        } else {
+            sleep_ms(20);
+        }
+    }
+}
+
+/*
+ * Reads the data connection until every stream has carried what its peer sent, checking each
+ * stream's bytes against its peer's pattern; no stream may be reset or ended meanwhile.
+ */
+static int relay_all(int data_fd, const uint32_t *stream_ids, const uint64_t *sent, uint64_t *received)
+{
+    long long deadline = monotonic_ms() + 60000;
+    for (;;) {
+        int done = 1;
+        for (size_t p = 0U; p < BACKPRESSURE_PEERS; ++p) {
+            done = done && received[p] == sent[p];
+        }
+        if (done) {
+            return 0;
+        }
+        st_nat_message message;
+        if (next_nat_frame(data_fd, deadline, &message) != 1) {
+            fprintf(stderr, "the data connection went silent before relaying everything\n");
+            return -1;
+        }
+        size_t peer = BACKPRESSURE_PEERS;
+        for (size_t p = 0U; p < BACKPRESSURE_PEERS; ++p) {
+            if (stream_ids[p] == message.stream_id) {
+                peer = p;
+            }
+        }
+        int ok = 1;
+        if (peer < BACKPRESSURE_PEERS && message.type == ST_NAT_DATA) {
+            ok = received[peer] + message.data_len <= sent[peer];
+            for (size_t i = 0U; ok && i < message.data_len; ++i) {
+                ok = message.data[i] == backpressure_byte(peer, received[peer] + i);
+            }
+            received[peer] += message.data_len;
+        } else if (peer < BACKPRESSURE_PEERS && message.type != ST_NAT_WINDOW_UPDATE) {
+            fprintf(stderr, "stream %u got NAT message %d before its data was relayed\n", message.stream_id,
+                    message.type);
+            ok = 0;
+        }
+        st_nat_message_free(&message);
+        if (!ok) {
+            fprintf(stderr, "stream of peer %zu relayed bytes out of order or beyond what was sent\n", peer);
+            return -1;
+        }
+    }
+}
+
+/*
+ * Java's write-buffer watermarks (NatServerHandler.channelWritabilityChanged): while the client's
+ * data connection cannot take more, the server stops reading every public socket of the client,
+ * and resumes once the client reads again. Here the streams' send windows are opened to the full
+ * 16 MiB, so the window is not what stops them: the peers' sockets must stall well short of their
+ * combined windows while the client does not read, every byte they got out must then reach the
+ * client in order once it reads, and they must be able to send again afterwards. The C server
+ * relays with blocking writes, so a data connection that cannot take more holds its relay
+ * threads, and with them the reads of their public sockets.
+ */
+static int check_tcp_backpressure(test_server *server, client_pair *pair)
+{
+    int fds[BACKPRESSURE_PEERS];
+    uint32_t stream_ids[BACKPRESSURE_PEERS];
+    uint64_t sent[BACKPRESSURE_PEERS] = {0};
+    uint64_t received[BACKPRESSURE_PEERS] = {0};
+    for (size_t p = 0U; p < BACKPRESSURE_PEERS; ++p) {
+        fds[p] = -1;
+    }
+    int failed = 0;
+    for (size_t p = 0U; !failed && p < BACKPRESSURE_PEERS; ++p) {
+        failed = open_public_stream_id(pair->data, pair->public_port, &fds[p], &stream_ids[p]) != 0
+            || send_nat(pair->data, ST_NAT_WINDOW_UPDATE, 0U, stream_ids[p], MAX_WINDOW - INITIAL_WINDOW,
+                        NULL, NULL, 0U) != 0;
+        if (failed) fprintf(stderr, "public peer %zu: OPEN or credit failed\n", p);
+    }
+    /* The client stops reading: the server must stop reading the peers. */
+    if (!failed && flood_until_stalled(fds, sent, BACKPRESSURE_BOUND, 2000) != 0) {
+        fprintf(stderr, "public peers sent %llu bytes without stalling, beyond the %u-byte bound\n",
+                (unsigned long long)(sent[0] + sent[1] + sent[2] + sent[3]), BACKPRESSURE_BOUND);
+        failed = 1;
+    }
+    if (!failed) {
+        printf("     stalled after %llu bytes from %u peers (windows allow %u)\n",
+               (unsigned long long)(sent[0] + sent[1] + sent[2] + sent[3]), BACKPRESSURE_PEERS,
+               BACKPRESSURE_PEERS * MAX_WINDOW);
+    }
+    /* The client reads again: everything the peers got out arrives, in order. */
+    failed = failed || relay_all(pair->data, stream_ids, sent, received) != 0;
+    /* And the peers can send again: another megabyte from the first peer goes through. */
+    if (!failed) {
+        uint64_t before = sent[0];
+        while (!failed && sent[0] - before < INITIAL_WINDOW) {
+            uint8_t chunk[DATA_CHUNK];
+            for (size_t i = 0U; i < sizeof(chunk); ++i) {
+                chunk[i] = backpressure_byte(0U, sent[0] + i);
+            }
+            failed = send_all(fds[0], chunk, sizeof(chunk)) != 0;
+            sent[0] += sizeof(chunk);
+        }
+        failed = failed || relay_all(pair->data, stream_ids, sent, received) != 0;
+        if (failed) fprintf(stderr, "the first peer could not send again after the client read\n");
+    }
+    for (size_t p = 0U; p < BACKPRESSURE_PEERS; ++p) {
+        if (fds[p] >= 0) {
+            (void)send_nat(pair->data, ST_NAT_RST, 0U, stream_ids[p], 0U, NULL, NULL, 0U);
+            close_fd(&fds[p]);
+        }
+    }
+    CHECK(!failed, "the public peers must stall while the data connection is not read, then all go through");
+    return expect_data_connection_served(server, pair);
+}
+
 /*
  * A data connection holds at most 1024 pending HTTP streams; the next request is refused with
  * 502 "HTTP 流创建失败" (Java HttpSpecusController) instead of a response timeout, and the pending
@@ -2264,6 +2423,8 @@ int main(int argc, char **argv)
     failures += run_scenario("HTTP detail keeps a binary body and shows it as a data: URL",
                              run_current_check, long_idle_with_capture);
     failures += run_check("4 MiB client-to-public queue overflow resets only that stream", check_tcp_queue_overflow);
+    failures += run_check("TCP reads stall while the data connection is not read, then resume",
+                          check_tcp_backpressure);
     failures += run_scenario("413 for request bodies over 16 MiB", test_request_body_limit, long_idle);
     failures += run_scenario("413 and route gate refusals are recorded like Java's", test_refusals_recorded,
                              long_idle_with_capture);
