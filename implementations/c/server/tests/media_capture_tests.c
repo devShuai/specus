@@ -917,10 +917,12 @@ static int test_retention_cleanup(void)
         return 1;
     }
     time_t now = time(NULL);
-    char captured_at[64], expires_at[64], raised_expiry[64], extended_floor[64];
+    char captured_at[64], expires_at[64], raised_expiry[64], raised_wire_expiry[64], extended_floor[64];
     iso_time(now - 2 * 86400, captured_at);
     iso_time(now - 86400, expires_at);
-    iso_time(now - 2 * 86400 + 7 * 86400, raised_expiry);
+    iso_time(now - 2 * 86400 + 7 * 86400, raised_wire_expiry);
+    /* The persisted expiry uses fixed seven-digit precision, including whole-second inputs. */
+    snprintf(raised_expiry, sizeof(raised_expiry), "%.19s.0000000Z", raised_wire_expiry);
     iso_time(now + 4 * 86400, extended_floor);
     char old_captured_at[64], old_expires_at[64];
     iso_time(now - 8 * 86400, old_captured_at);
@@ -932,12 +934,22 @@ static int test_retention_cleanup(void)
         fprintf(stderr, "media retention cleanup failed\n");
         return 1;
     }
-    capture_snapshot after;
+    capture_snapshot after = {0};
     if (count_rows("SELECT COUNT(*) FROM specus_http_media_capture WHERE id=?", NULL, kept.id) != 1
         || capture_of("/live.webm", 0, &after) != 0 || after.id != kept.id
         || strcmp(after.expires_at, raised_expiry) != 0 || strcmp(after.expires_at, extended_floor) <= 0
         || s3_log_lines("deleted.log", kept.object_key) != 0) {
-        fprintf(stderr, "raised media retention did not extend the capture\n");
+        fprintf(stderr, "raised media retention did not extend the capture: actual=%s expected=%s\n",
+                after.expires_at, raised_expiry);
+        return 1;
+    }
+    char view[4096];
+    if (capture_view(kept.id, view, sizeof(view)) != 0) return 1;
+    char *wire_expiry = st_json_get_top_level_string(view, "expiresAt");
+    int wire_ok = wire_expiry != NULL && strcmp(wire_expiry, raised_wire_expiry) == 0;
+    free(wire_expiry);
+    if (!wire_ok) {
+        fprintf(stderr, "raised media retention did not expose the public Instant expiry: %s\n", view);
         return 1;
     }
     if (count_rows("SELECT COUNT(*) FROM specus_http_media_capture WHERE id=?", NULL, expired.id) != 0
