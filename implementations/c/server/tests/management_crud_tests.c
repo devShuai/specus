@@ -545,7 +545,8 @@ static int test_mappings(void)
         || strcmp(last_body, "[]") != 0
         || expect("GET", "/api/admin/specus-mappings?clientId=-3", NULL, admin_token, 200, NULL) != 0
         || strcmp(last_body, "[]") != 0
-        || expect("GET", "/api/admin/specus-mappings?clientId=abc", NULL, admin_token, 400, "\"error\":\"Bad Request\"") != 0
+        || expect("GET", "/api/admin/specus-mappings?clientId=abc", NULL, admin_token, 400,
+                  "{\"error\":\"For input string: \\\"abc\\\"\"}") != 0
         || expect("GET", "/api/admin/specus-mappings?clientId=", NULL, admin_token, 200, "\"listenPort\":21002") != 0
         || strstr(last_body, "\"listenPort\":21001") == NULL || strstr(last_body, "\"listenPort\":21003") != NULL;
     snprintf(path, sizeof(path), "/api/admin/specus-mappings?clientId=%%20%lld%%20", client_a);
@@ -649,16 +650,42 @@ static int test_path_variables(void)
         {"PUT", "/api/admin/diagrams/", "", "{\"title\":\"t\",\"content\":\"{}\"}"},
         {"DELETE", "/api/admin/diagrams/", "", NULL},
     };
-    /* Segments Spring's NumberUtils.parseNumber refuses for a long. */
-    static const char *const refused[] = {
-        "abc", "1.5", "1a", "%zz", "1%00", "9223372036854775808", "-9223372036854775809", "0x", "+0x1", "--1",
+    /*
+     * Segments Spring cannot bind to a long, and the answer Java gives (probed on the Java server):
+     * the NumberFormatException's message, or Spring's generic 400 where the request firewall or
+     * Tomcat refuses the path first.
+     */
+    static const struct {
+        const char *segment;
+        const char *answer;
+    } refused[] = {
+        {"abc", "{\"error\":\"For input string: \\\"abc\\\"\"}"},
+        {"1.5", "{\"error\":\"For input string: \\\"1.5\\\"\"}"},
+        {"%20abc%20", "{\"error\":\"For input string: \\\"abc\\\"\"}"},
+        {"%20", "{\"error\":\"For input string: \\\"\\\"\"}"},
+        {"--1", "{\"error\":\"For input string: \\\"--1\\\"\"}"},
+        {"+0x1", "{\"error\":\"For input string: \\\"+0x1\\\"\"}"},
+        {"9223372036854775808", "{\"error\":\"For input string: \\\"9223372036854775808\\\"\"}"},
+        {"-9223372036854775809", "{\"error\":\"For input string: \\\"-9223372036854775809\\\"\"}"},
+        {"%E4%B8%AD", "{\"error\":\"For input string: \\\"中\\\"\"}"},
+        {"0x", "{\"error\":\"For input string: \\\"\\\" under radix 16\"}"},
+        {"-0x", "{\"error\":\"For input string: \\\"-\\\" under radix 16\"}"},
+        {"-0xZZ", "{\"error\":\"For input string: \\\"-ZZ\\\" under radix 16\"}"},
+        {"%23ZZ", "{\"error\":\"For input string: \\\"ZZ\\\" under radix 16\"}"},
+        {"0x8000000000000000", "{\"error\":\"For input string: \\\"8000000000000000\\\" under radix 16\"}"},
+        {"0x-5", "{\"error\":\"Sign character in wrong position\"}"},
+        {"0;v=1", "{\"error\":\"Bad Request\"}"},
+        {"1%2E", "{\"error\":\"Bad Request\"}"},
+        {"1%252", "{\"error\":\"Bad Request\"}"},
+        {"1%00", "{\"error\":\"Bad Request\"}"},
     };
     /* Segments that bind to a long no row has, and that long. */
     static const struct {
         const char *segment;
         const char *value;
     } unknown[] = {
-        {"0", "0"}, {"-1", "-1"}, {"-0x5", "-5"}, {"%2D7", "-7"}, {"0;v=1", "0"}, {"%200%20", "0"}, {"%230", "0"},
+        {"0", "0"}, {"-1", "-1"}, {"-0x5", "-5"}, {"%2D7", "-7"}, {"%200%20", "0"}, {"%230", "0"}, {"%09-3", "-3"},
+        {"0X3ADE68B1", "987654321"}, {"%EF%BC%90", "0"},
         {"9223372036854775807", "9223372036854775807"}, {"-9223372036854775808", "-9223372036854775808"},
     };
     int failed = 0;
@@ -666,9 +693,11 @@ static int test_path_variables(void)
     char reference[512];
     for (size_t e = 0; e < sizeof(endpoints) / sizeof(endpoints[0]) && !failed; ++e) {
         for (size_t r = 0; r < sizeof(refused) / sizeof(refused[0]) && !failed; ++r) {
-            snprintf(path, sizeof(path), "%s%s%s", endpoints[e].prefix, refused[r], endpoints[e].suffix);
-            failed = expect(endpoints[e].method, path, endpoints[e].body, admin_token, 400,
-                            "{\"error\":\"Bad Request\"}") != 0;
+            snprintf(path, sizeof(path), "%s%s%s", endpoints[e].prefix, refused[r].segment, endpoints[e].suffix);
+            failed = expect(endpoints[e].method, path, endpoints[e].body, admin_token, 400, NULL) != 0
+                || strcmp(last_body, refused[r].answer) != 0;
+            if (failed) fprintf(stderr, "FAIL %s %s: expected %s, got %s\n", endpoints[e].method, path,
+                                refused[r].answer, last_body == NULL ? "" : last_body);
         }
         snprintf(path, sizeof(path), "%s987654321%s", endpoints[e].prefix, endpoints[e].suffix);
         int reference_status = call(endpoints[e].method, path, endpoints[e].body, admin_token);
@@ -703,18 +732,79 @@ static int test_path_variables(void)
     failed = failed || expect("GET", plain, NULL, admin_token, 200, NULL) != 0;
     char *known = failed ? NULL : strdup(last_body);
     failed = failed || known == NULL;
+    /* The fullwidth digits of the id (U+FF10..U+FF19), which Java's Character.digit reads too. */
+    char fullwidth[96] = "/api/admin/clients/";
+    char digits[24];
+    snprintf(digits, sizeof(digits), "%lld", client_a);
+    for (const char *d = digits; *d != '\0'; ++d) {
+        size_t used = strlen(fullwidth);
+        snprintf(fullwidth + used, sizeof(fullwidth) - used, "%%EF%%BC%%%X", 0x90 + (*d - '0'));
+    }
     const char *const forms[] = {"/api/admin/clients/%%20%lld%%20", "/api/admin/clients/0x%llx",
-                                 "/api/admin/clients/%lld;jsessionid=abc", "/api/admin/clients/+%lld"};
-    for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]) && !failed; ++f) {
-        snprintf(path, sizeof(path), forms[f], client_a);
+                                 "/api/admin/clients/%%09+%lld"};
+    for (size_t f = 0; f <= sizeof(forms) / sizeof(forms[0]) && !failed; ++f) {
+        if (f < sizeof(forms) / sizeof(forms[0])) {
+            snprintf(path, sizeof(path), forms[f], client_a);
+        } else {
+            snprintf(path, sizeof(path), "%s", fullwidth);
+        }
         failed = expect("GET", path, NULL, admin_token, 200, NULL) != 0 || strcmp(last_body, known) != 0;
         if (failed) fprintf(stderr, "FAIL GET %s: expected the body of %s\n", path, plain);
     }
     free(known);
+    /* Spring Security's firewall refuses a path with ";" before any binding. */
+    snprintf(path, sizeof(path), "/api/admin/clients/%lld;jsessionid=abc", client_a);
+    failed = failed || expect("GET", path, NULL, admin_token, 400, "{\"error\":\"Bad Request\"}") != 0;
     /* No segment, or a path Java does not map past it, is no match: 404 as in Spring. */
     failed = failed || expect("GET", "/api/admin/clients/", NULL, admin_token, 404, NULL) != 0
         || expect("GET", "/api/admin/clients/1/unknown", NULL, admin_token, 404, NULL) != 0;
     printf("%s path variables bind as Spring's long\n", failed ? "FAIL" : "ok  ");
+    return failed;
+}
+
+/* ---- typed request parameters ------------------------------------------------------------- */
+
+/*
+ * A request parameter that does not convert answers what Java's GlobalExceptionHandler makes of
+ * the conversion's cause (probed on the Java server): the NumberFormatException's message for a
+ * Long or int, CustomBooleanEditor's for a boolean. A blank value is absent for a wrapper (Long
+ * clientId, Boolean success) and fails for a primitive (int page, boolean flush); an empty one is
+ * absent for both. Parameters are resolved in their declared order.
+ */
+static int test_query_parameters(void)
+{
+    static const struct {
+        const char *path;
+        const char *answer; /* NULL: 200 */
+    } cases[] = {
+        {"/api/admin/specus-mappings?clientId=%20%20", NULL},
+        {"/api/admin/specus-mappings?clientId=%E4%B8%AD", "{\"error\":\"For input string: \\\"中\\\"\"}"},
+        {"/api/admin/specus-mappings?clientId=%22a%5C", "{\"error\":\"For input string: \\\"\\\"a\\\\\\\"\"}"},
+        {"/api/admin/connections?page=%20", "{\"error\":\"For input string: \\\"\\\"\"}"},
+        {"/api/admin/connections?page=", NULL},
+        {"/api/admin/connections?page=1.0", "{\"error\":\"For input string: \\\"1.0\\\"\"}"},
+        {"/api/admin/connections?page=2147483648", "{\"error\":\"For input string: \\\"2147483648\\\"\"}"},
+        {"/api/admin/connections?page=0x80000000", "{\"error\":\"For input string: \\\"80000000\\\" under radix 16\"}"},
+        {"/api/admin/connections?success=%20", NULL},
+        {"/api/admin/connections?page=x&success=y", "{\"error\":\"Invalid boolean value [y]\"}"},
+        {"/api/admin/traffic?flush=%20maybe%20", "{\"error\":\"Invalid boolean value [ maybe ]\"}"},
+        {"/api/admin/traffic?flush=MAYBE", "{\"error\":\"Invalid boolean value [MAYBE]\"}"},
+        {"/api/admin/traffic?flush=%20", "{\"error\":\"Invalid boolean value [ ]\"}"},
+        {"/api/admin/traffic?flush=", NULL},
+        {"/api/admin/traffic?flush=YES", NULL},
+        {"/api/admin/traffic?limit=99999999999", "{\"error\":\"For input string: \\\"99999999999\\\"\"}"},
+        {"/api/admin/peer-mesh/sessions?page=%20&limit=%20", "{\"error\":\"For input string: \\\"\\\"\"}"},
+        {"/api/admin/peer-mesh/sessions?page=%20", NULL},
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]) && !failed; ++i) {
+        failed = expect("GET", cases[i].path, NULL, admin_token, cases[i].answer == NULL ? 200 : 400, NULL) != 0
+            || (cases[i].answer != NULL && strcmp(last_body, cases[i].answer) != 0);
+        if (failed) fprintf(stderr, "FAIL GET %s: expected %s, got %d %s\n", cases[i].path,
+                            cases[i].answer == NULL ? "200" : cases[i].answer, last_status,
+                            last_body == NULL ? "" : last_body);
+    }
+    printf("%s request parameters convert as Spring's editors\n", failed ? "FAIL" : "ok  ");
     return failed;
 }
 
@@ -737,6 +827,16 @@ static int test_user_mutation_binding(void)
         "{\"username\":{\"name\":\"bind-u\"},\"password\":\"bind-secret\"}",
         "{\"username\":\"bind-u\",\"password\":[\"bind-secret\"]}",
         "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":{}}",
+        /* ManagementRole binds its constant names exactly, or their ordinals 0 and 1. */
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":\"admin\"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":\"User\"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":\"\"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":\"  \"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":\"bogus\"}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":5}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":-1}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":1.0}",
+        "{\"username\":\"bind-u\",\"password\":\"bind-secret\",\"role\":true}",
         "[]",
         "\"bind-u\"",
     };
@@ -759,6 +859,17 @@ static int test_user_mutation_binding(void)
                   admin_token, 201, "\"enabled\":false") != 0
         || expect("POST", "/api/admin/users", "{\"username\":\"bind-w\",\"password\":\"bind-secret\",\"enabled\":null}",
                   admin_token, 201, "\"enabled\":true") != 0
+        /* The role spellings Jackson binds: the name trimmed, the ordinal as a number or digit string. */
+        || expect("POST", "/api/admin/users", "{\"username\":\"role-a\",\"password\":\"bind-secret\",\"role\":\" ADMIN\\t\"}",
+                  admin_token, 201, "\"role\":\"ADMIN\"") != 0
+        || expect("POST", "/api/admin/users", "{\"username\":\"role-b\",\"password\":\"bind-secret\",\"role\":0}",
+                  admin_token, 201, "\"role\":\"ADMIN\"") != 0
+        || expect("POST", "/api/admin/users", "{\"username\":\"role-c\",\"password\":\"bind-secret\",\"role\":\"1\"}",
+                  admin_token, 201, "\"role\":\"USER\"") != 0
+        || expect("POST", "/api/admin/users", "{\"username\":\"role-d\",\"password\":\"bind-secret\",\"role\":null}",
+                  admin_token, 201, "\"role\":\"USER\"") != 0
+        || expect("PUT", "/api/admin/users/role-d", "{\"role\":\"ADMIN\"}", admin_token, 200, "\"role\":\"ADMIN\"") != 0
+        || expect("PUT", "/api/admin/users/role-d", "{\"role\":null}", admin_token, 200, "\"role\":\"ADMIN\"") != 0
         /* A number given for a String member is its text. */
         || expect("POST", "/api/admin/users", "{\"username\":20261019,\"password\":\"bind-secret\"}", admin_token,
                   201, "\"username\":\"20261019\"") != 0;
@@ -791,7 +902,7 @@ static int test_name_availability(void)
         || expect("GET", "/api/admin/clients/name-availability?clientName=%20", NULL, admin_token, 400,
                   "\"error\":\"clientName cannot be blank\"") != 0
         || expect("GET", "/api/admin/clients/name-availability?clientName=x&excludeClientId=abc", NULL, admin_token,
-                  400, "\"error\":\"Bad Request\"") != 0
+                  400, "{\"error\":\"For input string: \\\"abc\\\"\"}") != 0
         || expect("GET", "/api/admin/clients/name-availability?clientName=x&excludeClientId=0", NULL, admin_token,
                   400, "\"error\":\"client not found: 0\"") != 0
         || expect("GET", path, NULL, admin_token, 400, missing) != 0
@@ -844,10 +955,12 @@ static int test_traffic_usage(void)
         || strstr(last_body, "\"uploadBytes\":202") != NULL
         || expect("GET", "/api/admin/traffic?clientId=0", NULL, admin_token, 200, NULL) != 0
         || strcmp(last_body, "[]") != 0
-        || expect("GET", "/api/admin/traffic?clientId=abc", NULL, admin_token, 400, "\"error\":\"Bad Request\"") != 0
-        || expect("GET", "/api/admin/traffic?limit=1.5", NULL, admin_token, 400, "\"error\":\"Bad Request\"") != 0
+        || expect("GET", "/api/admin/traffic?clientId=abc", NULL, admin_token, 400,
+                  "{\"error\":\"For input string: \\\"abc\\\"\"}") != 0
+        || expect("GET", "/api/admin/traffic?limit=1.5", NULL, admin_token, 400,
+                  "{\"error\":\"For input string: \\\"1.5\\\"\"}") != 0
         || expect("GET", "/api/admin/traffic/resources?limit=x", NULL, admin_token, 400,
-                  "\"error\":\"Bad Request\"") != 0;
+                  "{\"error\":\"For input string: \\\"x\\\"\"}") != 0;
     /* A clientId the caller cannot see is empty: another tenant's, a deleted client's, another owner's. */
     long long hidden[] = {client_c, gone.id};
     for (size_t i = 0; !failed && i < sizeof(hidden) / sizeof(hidden[0]); ++i) {
@@ -1025,6 +1138,7 @@ int main(void)
         failed = test_peer_import_targets() != 0 || failed;
         failed = test_path_variables() != 0 || failed;
         failed = test_user_mutation_binding() != 0 || failed;
+        failed = test_query_parameters() != 0 || failed;
         failed = test_database_initialize() != 0 || failed;
     }
     free(last_body);
