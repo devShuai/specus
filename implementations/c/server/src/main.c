@@ -1032,20 +1032,21 @@ static int current_connection_timestamp(char out[64])
     return st_instant_now(stored) == 0 ? st_instant_public(stored, out, 64U) : -1;
 }
 
-static void record_login_failure_event(const specus_session *session,
-                                       const char *client_name,
-                                       const char *remote_address,
-                                       const char *reason)
+static int record_login_failure(const specus_session *session,
+                                const char *client_name,
+                                const char *remote_address,
+                                const char *reason,
+                                st_storage_connection *connection)
 {
     const server_config *config = &session->config;
     const st_storage_client *account = &session->login_account;
     const char *tenant = account->id > 0 ? account->tenant_id : config->tenant_id;
     if (config->database_path[0] == '\0') {
-        return;
+        return 0;
     }
     char timestamp[64];
     if (current_connection_timestamp(timestamp) != 0) {
-        return;
+        return 0;
     }
     const char *effective_name = account->id > 0 ? account->client_name
         : (client_name != NULL && *client_name != '\0' ? client_name : config->client_name);
@@ -1063,10 +1064,9 @@ static void record_login_failure_event(const specus_session *session,
                                                                timestamp,
                                                                timestamp,
                                                                &record_id) != 0) {
-        return;
+        return 0;
     }
-    st_storage_connection connection;
-    fill_connection_event(&connection,
+    fill_connection_event(connection,
                           config,
                           record_id,
                           effective_name,
@@ -1076,9 +1076,9 @@ static void record_login_failure_event(const specus_session *session,
                           "LOGIN_FAILURE",
                           timestamp,
                           timestamp);
-    connection.client_id = client_id;
-    snprintf(connection.tenant_id, sizeof(connection.tenant_id), "%s", tenant);
-    st_admin_broadcast_connection_event(tenant, "created", &connection);
+    connection->client_id = client_id;
+    snprintf(connection->tenant_id, sizeof(connection->tenant_id), "%s", tenant);
+    return 1;
 }
 
 /*
@@ -1098,7 +1098,7 @@ static void record_client_online_milestone(const specus_session *session)
     }
 }
 
-static void record_login_success_event(specus_session *session)
+static void record_login_success(specus_session *session)
 {
     if (session->config.database_path[0] == '\0') {
         return;
@@ -1123,10 +1123,15 @@ static void record_login_success_event(specus_session *session)
         return;
     }
     session->connection_record_id = record_id;
+}
+
+static void broadcast_login_success_event(const specus_session *session)
+{
+    if (session->connection_record_id <= 0 || session->connected_at[0] == '\0') return;
     st_storage_connection connection;
     fill_connection_event(&connection,
                           &session->config,
-                          record_id,
+                          session->connection_record_id,
                           session->config.client_name,
                           session->remote,
                           1,
@@ -5237,6 +5242,8 @@ static void *client_thread(void *arg)
             const char *reason = NULL;
             displaced_sessions displaced = {.count = 0U};
             int control_login = !session->is_data_connection;
+            st_storage_connection failure_event;
+            int failure_recorded = 0;
             st_buffer nat_control = {0};
             size_t nat_control_tcp_routes = 0U;
             size_t nat_control_http_routes = 0U;
@@ -5265,6 +5272,11 @@ static void *client_thread(void *arg)
                 }
             }
             if (control_login) {
+                /* The next control admission must see this attempt even while its response is
+                 * blocked. Publish its management event later, outside the admission lock. */
+                if (logged_in) record_login_success(session);
+                else failure_recorded = record_login_failure(session, request.client_name, session->remote,
+                                                             reason == NULL ? "登录失败" : reason, &failure_event);
                 pthread_mutex_unlock(&control_admission_lock);
             }
             if (logged_in) {
@@ -5285,6 +5297,10 @@ static void *client_thread(void *arg)
                 st_buffer_free(&nat_control);
             }
             pthread_mutex_unlock(&session->send_lock);
+            if (logged_in && control_login) broadcast_login_success_event(session);
+            else if (failure_recorded) {
+                st_admin_broadcast_connection_event(failure_event.tenant_id, "created", &failure_event);
+            }
             release_displaced_sessions(&displaced);
             if (response_rc != 0) {
                 st_login_request_free(&request);
@@ -5295,10 +5311,6 @@ static void *client_thread(void *arg)
                        request.client_name == NULL ? "" : request.client_name,
                        session->remote,
                        reason == NULL ? "" : reason);
-                if (!session->is_data_connection) {
-                    record_login_failure_event(session, request.client_name, session->remote,
-                                               reason == NULL ? "登录失败" : reason);
-                }
                 st_login_request_free(&request);
                 break;
             }
@@ -5306,7 +5318,6 @@ static void *client_thread(void *arg)
                    session->is_data_connection ? "data" : "control",
                    session->config.client_name, session->remote);
             if (!session->is_data_connection) {
-                record_login_success_event(session);
                 record_client_online_milestone(session);
                 if (nat_control_rc != 0) {
                     /*
