@@ -19,6 +19,8 @@ endif
 BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/client_address.o $(BUILD_DIR)/client_auth_nonce.o $(BUILD_DIR)/client_package.o $(BUILD_DIR)/connectivity_check.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/decompression_limits.o $(BUILD_DIR)/elasticsearch_traffic.o $(BUILD_DIR)/github_release.o $(BUILD_DIR)/http_client.o $(BUILD_DIR)/json.o $(BUILD_DIR)/login_rate_limiter.o $(BUILD_DIR)/media_capture.o $(BUILD_DIR)/object_storage.o $(BUILD_DIR)/oidc.o $(BUILD_DIR)/password_hash.o $(BUILD_DIR)/peer_egress.o $(BUILD_DIR)/peer_mesh.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/public_coordination.o $(BUILD_DIR)/public_discovery.o $(BUILD_DIR)/public_room.o $(BUILD_DIR)/registration.o $(BUILD_DIR)/security.o $(BUILD_DIR)/security_baseline.o $(BUILD_DIR)/storage.o $(BUILD_DIR)/stun_turn.o $(BUILD_DIR)/tls_transport.o $(BUILD_DIR)/traffic_capture.o $(BUILD_DIR)/turn_auth.o $(BUILD_DIR)/stream_tombstones.o $(BUILD_DIR)/workbench.o $(BUILD_DIR)/http_share.o $(BUILD_DIR)/product_metrics.o $(BUILD_DIR)/upstream_browser_headers.o
 SERVER := $(BUILD_DIR)/specus-server-c
+CONNECTIVITY_LIFETIME_TESTS := $(BUILD_DIR)/specus_c_connectivity_lifetime_tests
+CONNECTIVITY_SETTER_TESTS := $(BUILD_DIR)/specus_c_connectivity_setter_tests
 CORE_OBJS += $(BUILD_DIR)/url_decode.o
 URL_DECODE_TESTS := $(BUILD_DIR)/specus_c_url_decode_tests
 ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
@@ -62,6 +64,7 @@ MANAGEMENT_CRUD_TESTS := $(BUILD_DIR)/specus_c_management_crud_tests
 PEER_MESH_API_TESTS := $(BUILD_DIR)/specus_c_peer_mesh_api_tests
 MANAGEMENT_OVERVIEW_TESTS := $(BUILD_DIR)/specus_c_management_overview_tests
 HTTP_WEBSOCKET_ROUTING_TESTS := $(BUILD_DIR)/specus_c_http_websocket_routing_tests
+SERVER_HARNESS_TESTS := $(BUILD_DIR)/specus_c_server_harness_tests
 STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 SESSION_ORDER_TESTS := $(BUILD_DIR)/specus_c_session_order_tests
 SESSION_SCOPE_TESTS := $(BUILD_DIR)/specus_c_session_scope_tests
@@ -80,6 +83,9 @@ TESTS += $(SESSION_ORDER_TESTS) $(SESSION_SCOPE_TESTS)
 ALL_TESTS += $(SESSION_ORDER_TESTS) $(SESSION_SCOPE_TESTS)
 TESTS += $(URL_DECODE_TESTS)
 ALL_TESTS += $(URL_DECODE_TESTS)
+TESTS += $(CONNECTIVITY_LIFETIME_TESTS) $(CONNECTIVITY_SETTER_TESTS)
+ALL_TESTS += $(CONNECTIVITY_LIFETIME_TESTS) $(CONNECTIVITY_SETTER_TESTS)
+ALL_TESTS += $(SERVER_HARNESS_TESTS)
 
 .PHONY: all test release clean
 
@@ -96,6 +102,12 @@ $(SERVER): $(CORE_OBJS) src/main.c | $(BUILD_DIR)
 
 $(ADMIN_TESTS): $(CORE_OBJS) tests/admin_http_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/admin_http_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
+$(CONNECTIVITY_LIFETIME_TESTS): $(CORE_OBJS) tests/connectivity_lifetime_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_lifetime_tests.c $(CORE_OBJS) -Wl,--wrap=free -Wl,--wrap=st_connectivity_checker_new -Wl,--wrap=st_connectivity_handle $(LDFLAGS) -o $@
+
+$(CONNECTIVITY_SETTER_TESTS): $(CORE_OBJS) tests/connectivity_setter_tests.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connectivity_setter_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
 $(URL_DECODE_TESTS): $(CORE_OBJS) tests/url_decode_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/url_decode_tests.c $(CORE_OBJS) $(LDFLAGS) -o $@
@@ -217,6 +229,9 @@ $(PEER_MESH_API_TESTS): $(CORE_OBJS) tests/peer_mesh_api_tests.c tests/server_ha
 $(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/management_overview_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@
+
 $(HTTP_WEBSOCKET_ROUTING_TESTS): $(CORE_OBJS) tests/http_websocket_routing_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/http_websocket_routing_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -276,6 +291,7 @@ test: all
 	$(PEER_MESH_API_TESTS)
 	$(MANAGEMENT_OVERVIEW_TESTS) $(SERVER)
 	$(HTTP_WEBSOCKET_ROUTING_TESTS) $(SERVER)
+	$(SERVER_HARNESS_TESTS) $(SERVER)
 	$(PEER_MESH_E2E_TESTS) $(SERVER)
 
 release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG

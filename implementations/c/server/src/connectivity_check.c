@@ -4,6 +4,7 @@
 
 #include <openssl/rand.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -62,6 +63,7 @@ typedef struct {
 } key_table;
 
 struct st_connectivity_checker {
+    atomic_uint references;
     st_connectivity_device device;
     pthread_mutex_t lock;
     long long running[ST_CONNECTIVITY_MAX_CONCURRENT];
@@ -189,6 +191,7 @@ st_connectivity_checker *st_connectivity_checker_new(const st_connectivity_devic
     if (checker == NULL) {
         return NULL;
     }
+    atomic_init(&checker->references, 1U);
     checker->device = *device;
     if (checker->device.now_ms == NULL) {
         checker->device.now_ms = system_now_ms;
@@ -197,9 +200,19 @@ st_connectivity_checker *st_connectivity_checker_new(const st_connectivity_devic
     return checker;
 }
 
+void st_connectivity_checker_retain(st_connectivity_checker *checker)
+{
+    if (checker != NULL) {
+        atomic_fetch_add_explicit(&checker->references, 1U, memory_order_relaxed);
+    }
+}
+
 void st_connectivity_checker_free(st_connectivity_checker *checker)
 {
     if (checker == NULL) {
+        return;
+    }
+    if (atomic_fetch_sub_explicit(&checker->references, 1U, memory_order_acq_rel) != 1U) {
         return;
     }
     pthread_mutex_destroy(&checker->lock);

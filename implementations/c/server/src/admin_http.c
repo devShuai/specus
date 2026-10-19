@@ -374,18 +374,18 @@ void st_admin_set_connectivity_device(const st_connectivity_device *device)
 {
     st_connectivity_checker *checker = device == NULL ? NULL : st_connectivity_checker_new(device);
     pthread_mutex_lock(&admin_connectivity_lock);
-    /*
-     * A replaced checker is deliberately not freed: a check may still run on it. The server sets
-     * its device once at startup; only tests replace it.
-     */
+    st_connectivity_checker *previous = admin_connectivity_checker;
     admin_connectivity_checker = checker;
     pthread_mutex_unlock(&admin_connectivity_lock);
+    /* In-flight requests own references; retire only the publication's ownership here. */
+    st_connectivity_checker_free(previous);
 }
 
 static st_connectivity_checker *admin_current_connectivity_checker(void)
 {
     pthread_mutex_lock(&admin_connectivity_lock);
     st_connectivity_checker *checker = admin_connectivity_checker;
+    st_connectivity_checker_retain(checker);
     pthread_mutex_unlock(&admin_connectivity_lock);
     return checker;
 }
@@ -6811,8 +6811,9 @@ static const char *admin_peer_service_apply(const char *database_path,
         char normalized[256];
         refusal = st_peer_mesh_local_host_refusal(mutation->target_host, normalized);
         if (refusal == NULL) {
-            if (strlen(normalized) >= sizeof(row->target_host)) refusal = "targetHost must be a unicast IP or localhost";
-            else snprintf(row->target_host, sizeof(row->target_host), "%s", normalized);
+            size_t normalized_len = strlen(normalized);
+            if (normalized_len >= sizeof(row->target_host)) refusal = "targetHost must be a unicast IP or localhost";
+            else memcpy(row->target_host, normalized, normalized_len + 1U);
         }
     }
     static const char *const port_names[2] = {"targetPort", "publishedPort"};
@@ -9693,7 +9694,9 @@ static int handle_http_route_connectivity_check(const st_admin_context *context,
         .body_len = body == NULL ? 0U : body_len,
     };
     st_connectivity_response response;
-    if (st_connectivity_handle(checker, &request, admin_connectivity_load_route, (void *)context, &response) != 0) {
+    int handled = st_connectivity_handle(checker, &request, admin_connectivity_load_route, (void *)context, &response);
+    st_connectivity_checker_free(checker);
+    if (handled != 0) {
         st_connectivity_response_free(&response);
         return write_connectivity_response(out, out_len, 503, 1, "{\"code\":\"CHECK_UNAVAILABLE\"}");
     }
