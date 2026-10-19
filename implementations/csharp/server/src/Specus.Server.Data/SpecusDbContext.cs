@@ -263,6 +263,7 @@ public sealed class SpecusDbContext : DbContext
             b.Property(x => x.ClientEgressVersion).HasColumnName("client_egress_version").IsRequired();
             b.Property(x => x.ClientEgressDomainTargets).HasColumnName("client_egress_domain_targets").IsRequired();
             b.Property(x => x.ClientEgressIpv6Targets).HasColumnName("client_egress_ipv6_targets").HasDefaultValue(false).IsRequired();
+            b.Property(x => x.ClientEgressIpv6Packets).HasColumnName("client_egress_ipv6_packets").HasDefaultValue(false).IsRequired();
             b.Property(x => x.HttpLoginAt).HasColumnName("http_login_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.NettyConnectedAt).HasColumnName("netty_connected_at").HasMaxLength(40)

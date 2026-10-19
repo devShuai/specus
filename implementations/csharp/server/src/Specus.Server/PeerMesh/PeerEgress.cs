@@ -169,6 +169,7 @@ public sealed partial class PeerMeshService
             Projection(nameof(ClientSession.ClientEgressVersion), nameof(AnnouncementSession.Version)),
             Projection(nameof(ClientSession.ClientEgressDomainTargets), nameof(AnnouncementSession.DomainTargets)),
             Projection(nameof(ClientSession.ClientEgressIpv6Targets), nameof(AnnouncementSession.Ipv6Targets)),
+            Projection(nameof(ClientSession.ClientEgressIpv6Packets), nameof(AnnouncementSession.Ipv6Packets)),
             Projection(nameof(ClientSession.NettyConnectedAt), nameof(AnnouncementSession.ConnectedAt)),
             Projection(nameof(ClientSession.HttpLoginAt), nameof(AnnouncementSession.HttpLoginAt)),
         };
@@ -199,7 +200,7 @@ public sealed partial class PeerMeshService
             }
         }
         return newest is null || newest.Version < 1 ? EgressAnnouncement.None
-            : new EgressAnnouncement(newest.Version, newest.DomainTargets, newest.Ipv6Targets);
+            : new EgressAnnouncement(newest.Version, newest.DomainTargets, newest.Ipv6Targets, newest.Ipv6Packets);
     }
 
     private sealed class AnnouncementSession
@@ -211,14 +212,15 @@ public sealed partial class PeerMeshService
         public int Version { get; set; }
         public bool DomainTargets { get; set; }
         public bool Ipv6Targets { get; set; }
+        public bool Ipv6Packets { get; set; }
         public string? ConnectedAt { get; set; }
         public string? HttpLoginAt { get; set; }
     }
 
     /// <summary>What an egress's online session announced, as the catalogue passes it on.</summary>
-    private sealed record EgressAnnouncement(int Version, bool DomainTargets, bool Ipv6Targets)
+    private sealed record EgressAnnouncement(int Version, bool DomainTargets, bool Ipv6Targets, bool Ipv6Packets)
     {
-        public static EgressAnnouncement None { get; } = new(0, false, false);
+        public static EgressAnnouncement None { get; } = new(0, false, false, false);
     }
 
     /// <summary>Cap on one egress-report envelope; the report carries counters only.</summary>
@@ -771,6 +773,7 @@ public sealed partial class PeerMeshService
                 Protocols = EgressProtocols(DecodeEgressDestinationRules(policy.DestinationRules)),
                 DomainTargetCapable = announced.DomainTargets,
                 Ipv6TargetCapable = announced.Ipv6Targets,
+                Ipv6PacketCapable = announced.Ipv6Packets,
                 EgressVersion = announced.Version,
             });
         }

@@ -373,6 +373,12 @@ namespace Specus.Server.Data.MySql.Migrations
                         .HasColumnType("tinyint(1)")
                         .HasColumnName("client_egress_domain_targets");
 
+                    b.Property<bool>("ClientEgressIpv6Packets")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("tinyint(1)")
+                        .HasDefaultValue(false)
+                        .HasColumnName("client_egress_ipv6_packets");
+
                     b.Property<bool>("ClientEgressIpv6Targets")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("tinyint(1)")

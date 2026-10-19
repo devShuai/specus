@@ -155,6 +155,45 @@ public sealed class ClientAuthOptionsTests
         Assert.Equal(expected, value is bool capable && capable);
     }
 
+    public static IEnumerable<object[]> Ipv6PacketLoginVectorCases()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            var path = Path.Combine(directory.FullName, "protocol", "test-vectors", "peer-egress-ipv6-packet-announcement-v1.json");
+            if (!File.Exists(path)) continue;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            var cases = document.RootElement.GetProperty("login");
+            Assert.Equal(8, cases.GetArrayLength());
+            foreach (var example in cases.EnumerateArray())
+                yield return [example.GetProperty("name").GetString()!, example.GetRawText()];
+            yield break;
+        }
+        throw new InvalidOperationException("Shared IPv6 packet announcement vector not found");
+    }
+
+    /// <summary>
+    /// The login keeps ipv6PacketCapable by the same rule as ipv6TargetCapable, and neither
+    /// declaration is read from the other.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Ipv6PacketLoginVectorCases))]
+    public async Task ClientAuthLoginStoresAnnouncedIpv6PacketSupport(string caseName, string caseJson)
+    {
+        using var document = JsonDocument.Parse(caseJson);
+        var example = document.RootElement;
+        var capabilities = example.GetProperty("capabilities");
+        await using var server = await TestServerFixture.StartAsync();
+        using var client = server.CreateClient();
+        var stored = await LoginWithEgressCapabilitiesAsync(server, client, "machine-egress-ipv6-packet",
+            capabilities.ValueKind == JsonValueKind.Object ? capabilities : null);
+        Assert.True(example.GetProperty("stored").GetBoolean() == stored.ClientEgressIpv6Packets,
+            $"{caseName}: wrong IPv6 packet declaration");
+        var targets = example.GetProperty("normalizedVersion").GetInt32() >= 1
+            && capabilities.ValueKind == JsonValueKind.Object
+            && capabilities.TryGetProperty("ipv6TargetCapable", out var flag) && flag.ValueKind == JsonValueKind.True;
+        Assert.True(targets == stored.ClientEgressIpv6Targets, $"{caseName}: wrong IPv6 target declaration");
+    }
+
     /// <summary>
     /// The connectivity check trusts RST metadata.failure only from a session that announced
     /// clientHttpRouteCapabilities.version >= 1, so the login keeps that version with the session.
