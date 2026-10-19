@@ -10,6 +10,7 @@ Reads the shipped files fresh (no shared code with the generator) and asserts:
   * the Windows route fixtures still carry their sampled cases, and each parser behaviour
     they pin is needed by at least one of them
 """
+import importlib.util
 import json
 import re
 import struct
@@ -299,6 +300,12 @@ for section in ("validation", "poolConfig", "egressCapability", "nameBindAtEgres
 _takeover_cases = json.loads((VECTORS / "peer-egress-dns-takeover-v1.json").read_text(encoding="utf-8"))
 used.update(case["code"] for case in _takeover_cases["upstreams"] if case["code"])
 used.add("EGRESS_DNS_TAKEOVER_FAILED")
+
+# The consumer's IPv6 data plane has its own vector (peer-egress-ipv6-v1.json).
+ipv6_plane = json.loads((VECTORS / "peer-egress-ipv6-v1.json").read_text(encoding="utf-8"))
+used.update(case["code"] for case in ipv6_plane["ruleValidation"]["cases"] if case["code"])
+used.update(case["code"] for case in ipv6_plane["frames"]["reject"])
+used.update(case["egressCode"] for case in ipv6_plane["frames"]["accept"] if "egressCode" in case)
 
 undocumented = used - table_codes
 uncovered = table_codes - used
@@ -969,6 +976,138 @@ for case in failure["unreachableOnDatagram"]["cases"]:
     check(body[8:] == quoted, f"failure datagram {case['name']}: the quoted datagram is not its header plus eight bytes")
 check(any(len(bytes.fromhex(c["packetHex"])) > 20 + 16 for c in failure["unreachableOnDatagram"]["cases"]),
       "failure: no datagram case with payload beyond the quoted eight bytes")
+
+# ---- IPv6 data plane vector ---------------------------------------------
+_ipv6_spec = importlib.util.spec_from_file_location(
+    "generate_peer_egress_ipv6_vectors", Path(__file__).with_name("generate_peer_egress_ipv6_vectors.py"))
+_ipv6_module = importlib.util.module_from_spec(_ipv6_spec)
+_ipv6_spec.loader.exec_module(_ipv6_module)
+if ipv6_plane != _ipv6_module.build():
+    failures.append("peer-egress-ipv6-v1.json differs from what its generator produces; regenerate it")
+# Checked from the bytes up with ipaddress, sharing nothing with the generator: the derived address
+# is the mesh IPv4 in the low 32 bits of the prefix, every packet is a well-formed IPv6 packet whose
+# upper-layer checksum verifies over the RFC 8200 pseudo-header, the frame refusals follow the
+# parse order the spec gives, and the failure packets sit where RFC 793 and RFC 4443 put them.
+mesh6 = ipaddress.IPv6Network(ipv6_plane["meshAddress"]["prefix"])
+check(mesh6.prefixlen == 96 and mesh6.network_address.is_private, "ipv6: the mesh prefix must be a ULA /96")
+for case in ipv6_plane["meshAddress"]["derive"]:
+    want = ipaddress.IPv6Address(int(mesh6.network_address) | int(ipaddress.IPv4Address(case["meshIpv4"])))
+    check(case["ipv6"] == want.compressed and "." not in case["ipv6"],
+          f"ipv6 derive {case['meshIpv4']}: {case['ipv6']} is not {want.compressed}")
+for case in ipv6_plane["meshAddress"]["underive"]:
+    address = ipaddress.IPv6Address(case["ipv6"])
+    want = str(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)) if address in mesh6 else None
+    check(case["meshIpv4"] == want, f"ipv6 underive {case['ipv6']}: expected {want}")
+
+
+def ipv6_upper_verifies(packet):
+    pseudo = packet[8:40] + struct.pack("!IxxxB", len(packet) - 40, packet[6])
+    return verifies(pseudo + packet[40:])
+
+
+def ipv6_well_formed(packet):
+    return (len(packet) >= 40 and packet[0] >> 4 == 6
+            and struct.unpack("!H", packet[4:6])[0] + 40 == len(packet))
+
+
+for case in ipv6_plane["ruleValidation"]["cases"]:
+    network = ipaddress.IPv6Network(case["rule"]["match"])
+    if network.overlaps(mesh6):
+        want = "EGRESS_RULE_MESH_OVERLAP"
+    elif case["egressOnline"] and not case["egressIpv6PacketCapable"]:
+        want = "EGRESS_RULE_EGRESS_NO_IPV6"
+    else:
+        want = None
+    check(case["code"] == want, f"ipv6 rule {case['name']}: expected {want}")
+
+for case in ipv6_plane["frames"]["accept"]:
+    raw = bytes.fromhex(case["frameHex"])
+    check(raw[:8] == b"SPEG1\x01\x00\x00", f"ipv6 frame {case['name']}: not an SPEG1 type=1 header")
+    packet = raw[8:]
+    check(ipv6_well_formed(packet), f"ipv6 frame {case['name']}: not a well-formed IPv6 packet")
+    check(str(ipaddress.IPv6Address(packet[8:24])) == case["innerSourceIp"]
+          and str(ipaddress.IPv6Address(packet[24:40])) == case["innerDestinationIp"],
+          f"ipv6 frame {case['name']}: declared addresses do not match the packet")
+    check(packet[6] == case["innerNextHeader"], f"ipv6 frame {case['name']}: next header mismatch")
+    if packet[6] in (6, 17):
+        check(ipv6_upper_verifies(packet), f"ipv6 frame {case['name']}: transport checksum does not verify")
+        check(struct.unpack("!HH", packet[40:44]) == (case["innerSourcePort"], case["innerDestinationPort"]),
+              f"ipv6 frame {case['name']}: ports do not match")
+        check("egressCode" not in case, f"ipv6 frame {case['name']}: TCP and UDP are carried")
+    else:
+        check(case.get("egressCode") == "EGRESS_PROTOCOL_DENIED",
+              f"ipv6 frame {case['name']}: anything but TCP and UDP is refused as a protocol")
+for case in ipv6_plane["frames"]["reject"]:
+    body = bytes.fromhex(case["frameHex"])[8:]
+    if len(body) >= 20 and body[0] >> 4 not in (4, 6):
+        want = "EGRESS_IPV6_UNSUPPORTED"
+    elif len(body) < 40 or 40 + struct.unpack("!H", body[4:6])[0] > len(body):
+        want = "EGRESS_FRAME_TRUNCATED"
+    else:
+        want = "EGRESS_FRAME_TRAILING_BYTES"
+    check(case["code"] == want, f"ipv6 frame {case['name']}: expected {want}")
+
+consumer6 = ipaddress.IPv6Address(int(mesh6.network_address)
+                                  | int(ipaddress.IPv4Address(ipv6_plane["consumerOutbound"]["consumerMeshIpv4"])))
+for case in ipv6_plane["consumerOutbound"]["cases"]:
+    packet = bytes.fromhex(case["packetHex"])
+    source, destination = ipaddress.IPv6Address(packet[8:24]), ipaddress.IPv6Address(packet[24:40])
+    if source.is_link_local or destination.is_multicast:
+        want = "drop-silently"
+    elif source != consumer6:
+        want = "ipv6-source-not-mesh"
+    elif destination in mesh6:
+        want = "ipv6-mesh-unsupported"
+    elif case["effectiveMtu"] < 1280:
+        want = "ipv6-path-mtu"
+    else:
+        want = "forward"
+    check(case["expect"] == want, f"ipv6 outbound {case['name']}: expected {want}")
+for case in ipv6_plane["returnPath"]["cases"]:
+    packet = bytes.fromhex(case["packetHex"])
+    source, destination = ipaddress.IPv6Address(packet[8:24]), ipaddress.IPv6Address(packet[24:40])
+    if destination != consumer6:
+        want = "not-for-consumer"
+    elif source in mesh6:
+        want = "return-mesh-source"
+    elif not case["liveFlow"]:
+        want = "return-no-flow"
+    else:
+        want = "deliver"
+    check(case["expect"] == want, f"ipv6 return {case['name']}: expected {want}")
+
+for case in ipv6_plane["failure"]["resetOnPacket"]["cases"]:
+    incoming, reset = bytes.fromhex(case["packetHex"]), bytes.fromhex(case["expect"]["packetHex"])
+    check(ipv6_well_formed(reset) and reset[6] == 6 and reset[7] == 64 and ipv6_upper_verifies(reset),
+          f"ipv6 failure {case['name']}: the reset is not a checksummed IPv6/TCP packet with hop limit 64")
+    check(reset[8:24] == incoming[24:40] and reset[24:40] == incoming[8:24]
+          and reset[40:42] == incoming[42:44] and reset[42:44] == incoming[40:42],
+          f"ipv6 failure {case['name']}: the reset is not addressed back to the sender")
+    seq, ack, offset, flags, window = struct.unpack("!IIBBH", reset[44:56])
+    in_seq, in_ack, in_offset, in_flags = struct.unpack("!IIBB", incoming[44:54])
+    if in_flags & 0x10:
+        check(flags == 0x04 and seq == in_ack, f"ipv6 failure {case['name']}: must be reset at the acknowledgement")
+    else:
+        length = len(incoming) - 40 - (in_offset >> 4) * 4 + bool(in_flags & 0x02) + bool(in_flags & 0x01)
+        check(flags == 0x14 and ack == (in_seq + length) & 0xFFFFFFFF,
+              f"ipv6 failure {case['name']}: must be RST|ACK covering the segment")
+    check(window == 0 and len(reset) == 60, f"ipv6 failure {case['name']}: a reset carries a window, options or data")
+for case in ipv6_plane["failure"]["unreachableOnDatagram"]["cases"]:
+    datagram, error = bytes.fromhex(case["packetHex"]), bytes.fromhex(case["expect"]["packetHex"])
+    check(ipv6_well_formed(error) and error[6] == 58 and error[7] == 64 and ipv6_upper_verifies(error),
+          f"ipv6 failure {case['name']}: not a checksummed ICMPv6 packet with hop limit 64")
+    check(error[8:24] == datagram[24:40] and error[24:40] == datagram[8:24],
+          f"ipv6 failure {case['name']}: the error is not addressed back to the sender")
+    check(error[40:42] == b"\x01\x03" and error[44:48] == bytes(4),
+          f"ipv6 failure {case['name']}: not destination unreachable, address unreachable")
+    check(len(error) <= 1280 and error[48:] == datagram[:len(error) - 48]
+          and (len(error) == 1280 or len(error) - 48 == len(datagram)),
+          f"ipv6 failure {case['name']}: the quote is not as much of the datagram as fits in 1280 bytes")
+check(any(len(bytes.fromhex(c["packetHex"])) > 1280 for c in ipv6_plane["failure"]["unreachableOnDatagram"]["cases"]),
+      "ipv6 failure: no datagram case long enough to be cut at the minimum MTU")
+print(f"ipv6 derive={len(ipv6_plane['meshAddress']['derive'])} rules={len(ipv6_plane['ruleValidation']['cases'])}"
+      f" frames accept={len(ipv6_plane['frames']['accept'])} reject={len(ipv6_plane['frames']['reject'])}"
+      f" outbound={len(ipv6_plane['consumerOutbound']['cases'])} return={len(ipv6_plane['returnPath']['cases'])}")
 
 # ---- routes vector ------------------------------------------------------
 # The planner's contract with the bypass list, stated a second time here so the generator's own

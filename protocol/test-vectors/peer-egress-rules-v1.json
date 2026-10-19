@@ -810,7 +810,7 @@
     "notes": [
       "地址族分开匹配：IPv4 目的只看 IPv4 规则，IPv6 目的只看 IPv6 规则；族内最长前缀优先，等长先配置者胜。两族规则从不竞争，也不与域名规则竞争（fake-IP 池是 IPv4）。",
       "规则与目的地址都按数值比较，写法（大小写、前导零、:: 的位置）不影响结果。",
-      "IPv6 规则不与 Peer Mesh 网段或 fake-IP 池比较重叠：两者都是 IPv4。",
+      "IPv6 规则不与 fake-IP 池比较重叠（池是 IPv4）；与设备推出地址前缀（IPv6 的 mesh 网段）的重叠见 peer-egress-ipv6-v1.json 的 ruleValidation。",
       "校验失败与停用的规则同样不参与匹配。"
     ],
     "ipv6DataPlane": true,
