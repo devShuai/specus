@@ -50,4 +50,9 @@ public final class PeerEgressProtocol {
     public static boolean declaresIpv6Targets(int version, boolean declared) {
         return normalizeVersion(version) >= 1 && declared;
     }
+
+    /** IPv6 packets in SPEG1, independently of the egress's own IPv6 sockets. */
+    public static boolean declaresIpv6Packets(int version, boolean declared) {
+        return normalizeVersion(version) >= 1 && declared;
+    }
 }

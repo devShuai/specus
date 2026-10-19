@@ -25,6 +25,7 @@ public class PeerEgressCatalogEntry {
     private List<String> protocols = List.of();
     private boolean domainTargetCapable;
     private boolean ipv6TargetCapable;
+    private boolean ipv6PacketCapable;
     /**
      * The {@code clientEgressCapabilities.version} the egress's current online session announced;
      * {@code 0} when it is offline or announced none. A primitive so the server always writes it,

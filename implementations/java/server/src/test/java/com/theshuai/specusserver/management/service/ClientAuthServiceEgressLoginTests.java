@@ -189,6 +189,40 @@ class ClientAuthServiceEgressLoginTests {
                 Arguments.of("null", false));
     }
 
+    @ParameterizedTest(name = "IPv6 packet announcement {index}: {0}")
+    @MethodSource("ipv6PacketAnnouncements")
+    void ipv6PacketSupportIsKeptWithTheLogin(String capabilities, boolean expected) {
+        ClientSession stored = loginWith(capabilities);
+        // Read through JSON like the IPv6 target case, so the assertion holds for an old session
+        // model that lacks this property and therefore observes the legacy false value.
+        boolean actual = JsonUtil.readString(JsonUtil.objectToString(stored))
+                .path("clientEgressIpv6Packets").asBoolean(false);
+        assertThat(actual).as(capabilities).isEqualTo(expected);
+    }
+
+    private static Stream<Arguments> ipv6PacketAnnouncements() {
+        return Stream.of(
+                Arguments.of("{\"version\":1,\"egressCapable\":true,\"ipv6PacketCapable\":true}", true),
+                Arguments.of("{\"version\":1,\"egressCapable\":true}", false),
+                Arguments.of("{\"version\":1,\"ipv6PacketCapable\":false}", false),
+                Arguments.of("{\"version\":0,\"ipv6PacketCapable\":true}", false),
+                Arguments.of("{\"version\":-1,\"ipv6PacketCapable\":true}", false),
+                Arguments.of("{\"version\":2,\"egressCapable\":true,\"ipv6PacketCapable\":true}", true),
+                Arguments.of("null", false),
+                // The two flags are independent: a target claim is not a packet claim.
+                Arguments.of("{\"version\":1,\"egressCapable\":true,\"ipv6TargetCapable\":true}", false));
+    }
+
+    @Test
+    void ipv6PacketAndTargetSupportAreStoredIndependently() {
+        ClientSession packetsOnly = loginWith("{\"version\":1,\"egressCapable\":true,\"ipv6PacketCapable\":true}");
+        assertThat(packetsOnly.isClientEgressIpv6Packets()).isTrue();
+        assertThat(packetsOnly.isClientEgressIpv6Targets()).isFalse();
+        ClientSession targetsOnly = loginWith("{\"version\":1,\"egressCapable\":true,\"ipv6TargetCapable\":true}");
+        assertThat(targetsOnly.isClientEgressIpv6Packets()).isFalse();
+        assertThat(targetsOnly.isClientEgressIpv6Targets()).isTrue();
+    }
+
     private ClientSession loginWith(String egressCapabilitiesJson) {
         return loginWithEnvironment("\"clientEgressCapabilities\": " + egressCapabilitiesJson);
     }

@@ -58,6 +58,7 @@ public class PeerServiceDiscoverySchemaMigrator {
         // false so sessions from before the column existed never claim a capability.
         ensureColumn("specus_client_session", "client_egress_domain_targets", dialect.boolNotNullFalse());
         ensureColumn("specus_client_session", "client_egress_ipv6_targets", dialect.boolNotNullFalse());
+        ensureColumn("specus_client_session", "client_egress_ipv6_packets", dialect.boolNotNullFalse());
         ensureColumn("peer_mesh_shared_service", "allowed_client_ids", dialect.varchar(512));
         ensureColumn("peer_mesh_service_sharing", "mdns_import_enabled", dialect.boolNotNullFalse());
         // Domain rules of an egress policy, default empty so a policy saved before them grants no

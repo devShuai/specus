@@ -115,6 +115,11 @@ public class ClientSession {
     @Column(name = "client_egress_ipv6_targets", nullable = false)
     private boolean clientEgressIpv6Targets;
 
+    /** IPv6 packets carried in SPEG1 to the egress, not the egress's own IPv6 sockets. */
+    @ColumnDefault("false")
+    @Column(name = "client_egress_ipv6_packets", nullable = false)
+    private boolean clientEgressIpv6Packets;
+
     @Column(name = "http_login_at", nullable = false, length = 40)
     private String httpLoginAt;
 
