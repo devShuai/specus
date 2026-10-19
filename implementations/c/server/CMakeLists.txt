@@ -649,3 +649,10 @@ foreach(test_name IN ITEMS instant instant_migration connection_time_reference a
     add_test(NAME ${test_name}_tests COMMAND specus_c_${test_name}_tests)
     set_tests_properties(${test_name}_tests PROPERTIES TIMEOUT 60)
 endforeach()
+
+add_executable(specus_c_peer_session_expiry_tests tests/peer_session_expiry_tests.c)
+target_link_libraries(specus_c_peer_session_expiry_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_peer_session_expiry_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(specus_c_peer_session_expiry_tests PRIVATE -Wl,--wrap=clock_gettime)
+add_test(NAME peer_session_expiry_tests COMMAND specus_c_peer_session_expiry_tests)
+set_tests_properties(peer_session_expiry_tests PROPERTIES TIMEOUT 60)

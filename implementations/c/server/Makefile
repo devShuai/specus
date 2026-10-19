@@ -145,6 +145,9 @@ TESTS += $(WEBSOCKET_TICKET_API_TESTS)
 REGISTRATION_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_registration_expiry_tests
 ALL_TESTS += $(REGISTRATION_EXPIRY_TESTS)
 TESTS += $(REGISTRATION_EXPIRY_TESTS)
+PEER_SESSION_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_peer_session_expiry_tests
+ALL_TESTS += $(PEER_SESSION_EXPIRY_TESTS)
+TESTS += $(PEER_SESSION_EXPIRY_TESTS)
 
 all: $(SERVER) $(ALL_TESTS)
 
@@ -343,6 +346,9 @@ $(MANAGEMENT_OVERVIEW_TESTS): $(CORE_OBJS) tests/management_overview_tests.c tes
 
 $(REGISTRATION_EXPIRY_TESTS): $(CORE_OBJS) tests/registration_expiry_tests.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/registration_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=time -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
+
+$(PEER_SESSION_EXPIRY_TESTS): $(CORE_OBJS) tests/peer_session_expiry_tests.c tests/instant_reference_cases.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/peer_session_expiry_tests.c $(CORE_OBJS) -Wl,--wrap=clock_gettime $(LDFLAGS) -o $@
 
 $(SERVER_HARNESS_TESTS): $(CORE_OBJS) tests/server_harness_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/server_harness_tests.c tests/server_harness.c $(CORE_OBJS) -Wl,--wrap=bind $(LDFLAGS) -o $@
