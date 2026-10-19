@@ -49,6 +49,7 @@ add_library(specus_c_core
     src/traffic_capture.c
     src/turn_auth.c
     src/upstream_browser_headers.c
+    src/url_decode.c
     src/workbench.c
 )
 target_include_directories(specus_c_core PUBLIC src PRIVATE ${HIREDIS_INCLUDE_DIR} ${UTF8PROC_INCLUDE_DIR})
@@ -77,6 +78,10 @@ target_link_libraries(specus-server-c PRIVATE specus_c_core)
 target_compile_options(specus-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(specus_c_url_decode_tests tests/url_decode_tests.c)
+target_link_libraries(specus_c_url_decode_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_url_decode_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME url_decode_tests COMMAND specus_c_url_decode_tests)
 add_executable(specus_c_admin_http_tests tests/admin_http_tests.c)
 target_link_libraries(specus_c_admin_http_tests PRIVATE specus_c_core)
 target_compile_options(specus_c_admin_http_tests PRIVATE -Wall -Wextra -Wpedantic)
