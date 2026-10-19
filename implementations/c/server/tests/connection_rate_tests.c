@@ -3,9 +3,26 @@
 #include "instant.h"
 #include "storage.h"
 #include <signal.h>
+#include <fcntl.h>
 #include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+static char gate_dir[] = "/tmp/specus-rate-admission-XXXXXX";
+
+static int gate(const char *point, int release)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/control-%s%s", gate_dir, point, release ? "-release" : "");
+    if (release) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        return fd < 0 ? -1 : close(fd);
+    }
+    long long end = monotonic_ms() + IO_TIMEOUT_MS;
+    while (access(path, F_OK) != 0 && monotonic_ms() < end) sleep_ms(10);
+    return access(path, F_OK);
+}
 
 static int execute(const char *path, const char *sql)
 {
@@ -151,6 +168,31 @@ static int tenant_refusal(test_server *server)
     return 0;
 }
 
+static int concurrent_admission(test_server *server)
+{
+    runtime_session runtime;
+    CHECK(setup(server, &runtime, 1) == 0, "setup");
+    int first = connect_local(server->control_port);
+    CHECK(first >= 0 && send_login_request(first, &runtime, "control") == 0, "first login");
+    CHECK(gate("loaded", 0) == 0 && gate("loaded", 1) == 0 && gate("published", 0) == 0,
+        "first control was not held before its response");
+    long long pending_count = rows(server, runtime.client_id);
+    if (pending_count != 1) {
+        (void)gate("published", 1);
+        close_fd(&first);
+        CHECK(0, "published control is absent from rate count while response is held: %lld", pending_count);
+    }
+    int result = refused(server, &runtime, "control", "连接频率超过限制");
+    CHECK(gate("published", 1) == 0, "release first response");
+    CHECK(result == 0, "second concurrent admission bypassed the limit");
+    int command = 0, success = 0; char reason[256];
+    CHECK(read_login_response(first, IO_TIMEOUT_MS, &command, &success, reason, sizeof(reason)) == 1
+        && success && expect_channel_alive(first) == 0, "first control lost its admission: %s", reason);
+    CHECK(rows(server, runtime.client_id) == 2, "accepted/refused attempts were not both recorded");
+    close_fd(&first);
+    return 0;
+}
+
 static int disabled(test_server *server)
 {
     runtime_session runtime;
@@ -195,5 +237,16 @@ int main(int argc, char **argv)
     if (mode < 0 || mode == 2) failed += run_on_fresh_server("control rate storage errors refuse admission", unavailable, NULL);
     if (mode < 0 || mode == 3) failed += run_on_fresh_server("control at its rate limit is refused before activation", at_limit, NULL);
     if (mode < 0 || mode == 4) failed += run_on_fresh_server("control refusal retains authenticated tenant and current name", tenant_refusal, NULL);
+    if (mode < 0 || mode == 5) {
+        if (mkdtemp(gate_dir) == NULL) return 2;
+        char env[320]; snprintf(env, sizeof(env), "SPECUS_LOGIN_TEST_GATE_DIR=%s", gate_dir);
+        const char *extra[] = {env, NULL};
+        failed += run_on_fresh_server("concurrent admission counts a control before its response", concurrent_admission, extra);
+        const char *files[] = {"control-loaded", "control-loaded-release", "control-published", "control-published-release"};
+        for (size_t i = 0; i < 4; ++i) {
+            char path[320]; snprintf(path, sizeof(path), "%s/%s", gate_dir, files[i]); unlink(path);
+        }
+        rmdir(gate_dir);
+    }
     return failed ? 1 : 0;
 }
