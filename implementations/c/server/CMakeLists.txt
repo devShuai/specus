@@ -410,6 +410,12 @@ add_test(NAME session_lifecycle_tests
     COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
 
+add_executable(specus_c_connection_rate_tests tests/connection_rate_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connection_rate_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connection_rate_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connection_rate_tests COMMAND specus_c_connection_rate_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connection_rate_tests PROPERTIES TIMEOUT 60)
+
 # Java SecurityRulesTests on a real server process: public transfer grants and callbacks, the public
 # HTTP entry against foreign tokens and portal headers, the portal policy and the cloud diagram API.
 add_executable(specus_c_security_rules_tests tests/security_rules_tests.c tests/server_harness.c)
@@ -549,6 +555,12 @@ target_link_libraries(specus_c_control_write_reference_tests PRIVATE specus_c_co
 target_compile_options(specus_c_control_write_reference_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME control_write_reference_tests COMMAND specus_c_control_write_reference_tests)
 set_tests_properties(control_write_reference_tests PROPERTIES TIMEOUT 30)
+
+add_executable(specus_c_socket_lifetime_tests tests/socket_lifetime_tests.c)
+target_link_libraries(specus_c_socket_lifetime_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_socket_lifetime_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME socket_lifetime_tests COMMAND specus_c_socket_lifetime_tests)
+set_tests_properties(socket_lifetime_tests PROPERTIES TIMEOUT 60)
 
 # Only this object aliases the three observation points. The helper forwards real I/O, registry
 # and metrics calls; the ordinary specus-server-c target above never links this helper.
