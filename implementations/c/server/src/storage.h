@@ -1002,6 +1002,9 @@ int st_storage_mark_connection_disconnected(const char *path,
                                             long long id,
                                             const char *disconnect_reason,
                                             const char *disconnected_at);
+/* Counts both accepted and refused control attempts at or after an inclusive UTC cutoff. */
+int st_storage_count_recent_connections(const char *path, const char *tenant_id, long long client_id,
+                                        const char *cutoff, long long *count);
 /*
  * Ends every connection record that is still open, keeping a reason already stamped on it. Used at
  * the graceful shutdown drain (SERVER_SHUTDOWN) for channels that did not finish in time.

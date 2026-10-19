@@ -63,6 +63,7 @@ PROTOCOL_TESTS := $(BUILD_DIR)/specus_c_protocol_fixture_tests
 SECURITY_TESTS := $(BUILD_DIR)/specus_c_security_tests
 SECURITY_BASELINE_TESTS := $(BUILD_DIR)/specus_c_security_baseline_tests
 SESSION_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_session_lifecycle_tests
+CONNECTION_RATE_TESTS := $(BUILD_DIR)/specus_c_connection_rate_tests
 SECURITY_RULES_TESTS := $(BUILD_DIR)/specus_c_security_rules_tests
 HTTP_ROUTE_LIFECYCLE_TESTS := $(BUILD_DIR)/specus_c_http_route_lifecycle_tests
 CLIENT_ROUTE_SCALE_TESTS := $(BUILD_DIR)/specus_c_client_route_scale_tests
@@ -156,6 +157,7 @@ ALL_TESTS += $(TRANSFER_EXPIRY_TESTS)
 TESTS += $(TRANSFER_EXPIRY_TESTS)
 MEDIA_EXPIRY_TESTS := $(BUILD_DIR)/specus_c_media_expiry_tests
 ALL_TESTS += $(MEDIA_EXPIRY_TESTS)
+ALL_TESTS += $(CONNECTION_RATE_TESTS)
 
 all: $(SERVER) $(ALL_TESTS)
 
@@ -310,6 +312,9 @@ $(SECURITY_BASELINE_TESTS): $(CORE_OBJS) tests/security_baseline_tests.c | $(BUI
 $(SESSION_LIFECYCLE_TESTS): $(CORE_OBJS) tests/session_lifecycle_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/session_lifecycle_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
+$(CONNECTION_RATE_TESTS): $(CORE_OBJS) tests/connection_rate_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/connection_rate_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
+
 $(SECURITY_RULES_TESTS): $(CORE_OBJS) tests/security_rules_tests.c tests/server_harness.c tests/server_harness.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/security_rules_tests.c tests/server_harness.c $(CORE_OBJS) $(LDFLAGS) -o $@
 
@@ -445,6 +450,7 @@ test: all
 	bash scripts/media_capture_test.sh $(MEDIA_CAPTURE_TESTS)
 	bash scripts/media_capture_test.sh $(MEDIA_EXPIRY_TESTS) expiry
 	$(SESSION_LIFECYCLE_TESTS) $(SERVER)
+	$(CONNECTION_RATE_TESTS) $(SERVER)
 	$(SECURITY_RULES_TESTS) $(SERVER)
 	$(HTTP_ROUTE_LIFECYCLE_TESTS) $(SERVER)
 	$(CLIENT_ROUTE_SCALE_TESTS) $(SERVER)

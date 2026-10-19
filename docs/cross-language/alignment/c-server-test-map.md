@@ -8,6 +8,14 @@
 
 旧记录曾列出基线后新增的 22 类；该清单已不完整。当前提交的完整范围盘点与未完成项见下一节，下文历史表的计数仍只含原基线 79 类。
 
+## 2026-10-19 控制连接频率限制与记录归属
+
+C 原先只保存每分钟连接限制，控制登录未执行它。现对照 Java `ClientAuthService.hasExceededRateLimit/authenticateNetty`，按已认证账号的租户与 client id 计算最近 60 秒内的全部连接记录，截止点包含相等值；达到正数限制时在关闭旧会话或激活新会话之前拒绝，非正数关闭限制，计数存储失败拒绝登录。数据连接保持豁免。`ManagedLoginRequestHandler` 不为数据连接创建成功或失败记录，C 也按同一规则处理；控制拒绝记录取已认证账号当前名称和租户，不能因请求中的旧名或伪造名称丢失计数归属。连接/断开运行时写入保留小数精度，公开事件使用 Instant 格式。
+
+`connection_time_reference_tests` 在四种整秒/小数、规范/旧值启动迁移组合下补齐七点截止的 inclusive count=4，以及已断开记录、失败记录、同 id 异租户、同租户异 id、无效 cutoff 和缺表错误。`connection_rate_tests` 经真实 HTTP 登录与控制/数据 socket 验证五个场景：过旧和外域记录不计入、失败记录使次数达限、拒绝不替换现有控制连接、数据连接可继续且不建记录、非正数关闭限制、存储故障不激活、跨租户拒绝仍记录实际账号。连接时间落在实际请求前后之间；拒绝用服务端 EOF 确认落库路径结束后再检查，不以任意短暂等待判断“没有记录”。
+
+相关四个 CMake 套件（含完整会话生命周期和 session reference）通过，旧 `6769694` 生产二进制分别在失败数据记录、存储故障放行和已达次数仍放行三项负对照失败。最终冻结提交的全量构建、Make、消毒器和 CI 另行验证；上述行为证据补齐排序类剩余方法，不代表 HA/跨实例原子限额或 #35 全量验收完成。
+
 ## 2026-10-19 到期增量的综合测试格式修正
 
 `518f07d` 的冻结全量验证为 CMake 85/88、ASan/UBSan 16/18，Make 也在 Peer 断言失败；失败日志保留。三个综合测试仍把时间当作整秒：`object_storage_e2e` 和 `peer_mesh_tests` 拒绝合法小数秒公开值，`media_capture_tests` 则把数据库固定七位小数的到期值与整秒字符串直接比较。对照当前 Java `Instant.toString()` 与 `SortableInstant.format()` 后，仅修正测试表达，生产精度和授权边界不回退。
@@ -28,12 +36,12 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 | `peerSessionExpirySweep` | `peer_session_expiry_tests`：到期瞬间关闭、已关闭记录不重复处理，七个生产入口及精确集合；查询实现不同，不声称返回 Java Repository 的分页对象。 |
 | `pairingCodeRedeem` | `pairing_expiry_tests`：恰好到期拒绝、未来三个码可消费，实际 HTTP 与数据库状态；含读后跨越到期边界。 |
 | `registrationChallengePurge` | `auth_expiry_reference_tests`：严格清理及剩余键集合；`registration_expiry_tests` 另经实际验证与账号写入检查到期拒绝。 |
-| `connectionRateLimitFilterAndStartupClose` | **部分**：`connection_time_reference_tests` 验证上下界、日期输入、公开视图、启动严格截止与退出收尾；该 Java 方法的 `countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual` 及其实际连接限流路径仍欠 C 证据。不能用列表总数替代连接限流计数。 |
+| `connectionRateLimitFilterAndStartupClose` | `connection_time_reference_tests` 验证上下界、日期输入、公开视图、启动严格截止与退出收尾，以及四组 inclusive count=4 和租户/client 隔离；`connection_rate_tests` 补实际控制限流、失败计数、数据豁免与存储错误。 |
 | `mediaCaptureRetentionSweepAndReuse` | `media_expiry_tests`：严格早于当前时刻清理、严格未来才复用、七个公开时间的倒序视图，实际采集/S3/HTTP 路径。 |
 | `TransferExpiryOrderingTests.storageUsageAroundAWholeSecondNow` / `storageUsageAroundAFractionalNow` | `transfer_expiry_tests`：PENDING 用上传有效期、UPLOADED 用保留期，七点加权用量和跨租户/账号隔离，经实际能力快照；补齐规范/旧格式两组。 |
 | `expiryScanAndDownloadGrantsAroundAFractionalNow` | 同上：按时间顺序清理且核对对象删除、严格未来 grant 消费、单次记账与过期清理后的剩余授权集合。 |
 
-因此迁移器一类与附件到期三方法列为候选覆盖；排序类仍为部分，不能把整类七方法计为完成。旧 79 类当前断言、其他新增类、背压/HA 和真实跨 NAT 条件仍待继续完成。
+迁移器一类与附件到期三方法列为候选覆盖；排序类七方法在控制连接限流增量后也列为候选覆盖。旧 79 类当前断言、其他新增类、背压/HA 和真实跨 NAT 条件仍待继续完成。
 
 ## 2026-10-19 附件与下载授权到期增量
 
@@ -80,7 +88,7 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 
 以 JDK 21 的 `JavacTask.parse` 解析上述提交的全部 `src/test/java` 源文件（不解析依赖、不执行测试）：main 有 136 个 Java 源文件，其中 128 个类包含 591 个测试注解方法（565 个 `@Test`、14 个 `@ParameterizedTest`、12 个 `@TestFactory`）。另外 8 个源文件是无上述测试注解的辅助源码。注册分支同样为 128 类，仅 `RegistrationServiceTests` 由 2 个增加到 8 个，总注解方法为 597 个。这里是静态方法声明数，**不是运行次数、参数化/动态用例数、通过数或 C 覆盖数**。
 
-旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。当前49=5类限定平台差异+19类候选覆盖（52个注解方法）+1类部分（7个注解方法，不能计为全部通过）+24类待核验；24也不包括部分排序类的连接限流缺口及旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，52不是52个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
+旧表的79类仍保留历史证据；本轮未重新核验它们当前增加或变更后的全部断言，因此不能把历史“覆盖73类”直接当作当前类的完整覆盖。当前main另有下列49类不在旧表中：前批说明4类框架/平台差异；连通性4类20方法、控制写入/会话/离线通知/指标4类8方法、HTTP流重置1类2方法、路由生命周期/失败关闭/NAT推送3类5方法、显式空快照/NAT大小与管理变更3类5方法先后补证；本节新增SQLite二进制列/真实约束2类8方法的候选对照，并逐方法说明Spring/JDBC异常转换1类4方法的平台差异，见相应新节。当前49=5类限定平台差异+20类候选覆盖（59个注解方法）+24类待核验；24不包括旧79类的当前断言复核。候选类内仍有明确列出的框架API差异，59不是59个独立C运行场景。表中增量是待合并C分支的候选对照状态，不是main完成率；最终提交CI须另行核验。待核验不等于C没有相应能力，同名功能也不等于覆盖已成立。
 
 新增“无（平台差异）”只限定到说明的框架断言。不得将其扩展为存储完整性、唯一约束、并发/回滚或 HTTP 契约的豁免；尤其不能把所有 SQLite/MySQL/MariaDB 测试一律排除。关闭 #35 前仍须为当前全部参考断言补齐 C 证据或逐项的书面差异说明，并完成该 issue 的其他运行时及真实环境验收。
 
@@ -128,7 +136,7 @@ Peer 信令断言接受公开格式的 0/3/6/9 位小数，并用正反例继续
 | `management/service/NatControlSizeLimitHttpTests` | 1 | 覆盖（共享14步；候选） | `nat_sizing_reference_tests.c:sizing_management_steps` 在真实服务端逐步回放原14个HTTP操作，命中精确1MiB边界，6次400解析error并比较两配置表全部行/类型/字段/时间戳；接受的ID与字段另读回，每步实际生成的启用配置均符合预留上限。设置及填充差异见下。 |
 | `management/service/NatControlSizingVectorTests` | 2 | 覆盖（参考2方法；候选；名称仅限编码层） | 同一新程序以生产JSON构造和管理入口共用计算核验5个精确J/body/fits值及varint边界；6类参考名称经真实JSON/compact编码并解码回原值、实际body不超过预留。未据此验收C公共改名、存储或登录对长名称的接受范围。 |
 | `management/service/RegistrationServiceTests` | 2／8 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
-| `management/service/SortableTimestampOrderingTests` | 7 | 部分 | 六个域的到期方法及连接过滤/收尾已有逐方法证据，实际连接限流计数仍欠缺，见上方复核表。 |
+| `management/service/SortableTimestampOrderingTests` | 7 | 候选覆盖 | 七方法的实际存储/HTTP/清理证据见上方逐方法复核表；控制频率增量补齐 inclusive count、租户/client 隔离及真实控制/数据连接路径。最终全量与 CI 另验。 |
 | `management/service/TransferExpiryOrderingTests` | 3 | 候选覆盖 | `transfer_expiry_tests` 实际额度、清理、授权消费路径的四组时间/存储边界及状态集合；最终整合 CI 另记。 |
 | `management/service/WorkbenchItemWriterTests` | 3 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
 | `productmetrics/ProductMetricsModelTests` | 2 | 待逐项核验 | 尚未建立本次源码下的逐方法 C 证据，不能由类名、向量文件名或同名功能推断覆盖。 |
