@@ -8,9 +8,12 @@ import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.specusclient.bean.HttpSpecusConfig;
 import com.theshuai.specusclient.bean.SpecusBean;
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.ConnectTimeoutException;
@@ -23,6 +26,7 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandshakeTimeoutException;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.resolver.AddressResolver;
 import io.netty.resolver.AddressResolverGroup;
 import io.netty.resolver.InetNameResolver;
@@ -59,6 +63,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import javax.net.ssl.KeyManagerFactory;
 
@@ -210,23 +215,117 @@ class HttpRouteFailureTests {
 
     @Test
     void anUntrustedCertificateIsTlsFailed() throws Exception {
-        SslContext serverTls = untrustedTls;
-        Channel server = new ServerBootstrap()
-                .group(serverGroup)
-                .channel(NioServerSocketChannel.class)
-                .childHandler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel channel) {
-                        channel.pipeline().addLast(serverTls.newHandler(channel.alloc()));
-                    }
-                })
-                .bind(InetAddress.getLoopbackAddress(), 0).sync().channel();
+        TlsTrace trace = new TlsTrace();
+        Channel server = tlsTarget(trace, true);
         try {
             int port = ((InetSocketAddress) server.localAddress()).getPort();
             NatMessagePacket reset = resetFor(List.of(route("https://127.0.0.1:" + port)), null);
-            assertFailure(HttpRouteFailure.TLS_FAILED, reset);
+            trace.mark("RST " + reset.getMetaData());
+            assertFailure(HttpRouteFailure.TLS_FAILED, reset, trace.toString());
+            trace.assertPreparedBeforeListening();
         } finally {
             server.close().syncUninterruptibly();
+            System.out.println("untrusted TLS target: " + trace);
+        }
+    }
+
+    @Test
+    void tlsFixturePreparationFinishesBeforeTheProductionDialDeadlineStarts() throws Exception {
+        assertEquals(5_000, HttpUpstreamDial.DEFAULT.connectTimeoutMillis());
+        TlsTrace trace = new TlsTrace();
+        // A deterministic slow fixture setup, not a slower network deadline. With preparation
+        // left in initChannel this exact target reports connect-timeout instead of tls-failed.
+        Channel server = tlsTarget(trace, true, () -> sleepQuietly(
+                Duration.ofMillis(HttpUpstreamDial.DEFAULT.connectTimeoutMillis() + 250)));
+        try {
+            int port = ((InetSocketAddress) server.localAddress()).getPort();
+            NatMessagePacket reset = resetFor(List.of(route("https://127.0.0.1:" + port)), null);
+            trace.mark("RST " + reset.getMetaData());
+            assertFailure(HttpRouteFailure.TLS_FAILED, reset, trace.toString());
+            trace.assertPreparedBeforeListening();
+        } finally {
+            server.close().syncUninterruptibly();
+            System.out.println("slow preparation TLS target: " + trace);
+        }
+    }
+
+    @Test
+    void anUntrustedTargetThatDoesNotReadTheHandshakeStillUsesTheDefaultDialDeadline() throws Exception {
+        assertEquals(5_000, HttpUpstreamDial.DEFAULT.connectTimeoutMillis());
+        TlsTrace trace = new TlsTrace();
+        Channel server = tlsTarget(trace, false);
+        try {
+            int port = ((InetSocketAddress) server.localAddress()).getPort();
+            NatMessagePacket reset = resetFor(List.of(route("https://127.0.0.1:" + port)), null);
+            trace.mark("RST " + reset.getMetaData());
+            assertFailure(HttpRouteFailure.CONNECT_TIMEOUT, reset, trace.toString());
+            assertTrue(trace.accepted, "the real TCP connection reached the TLS fixture: " + trace);
+            assertEquals(0, trace.reads.get(), "the certificate was not examined: " + trace);
+            assertEquals("upstream connect timed out after 5000 ms", reset.getMetaData().get("reason"));
+        } finally {
+            server.close().syncUninterruptibly();
+            System.out.println("unread TLS target: " + trace);
+        }
+    }
+
+    /** Each fixture accepts one connection and completes engine setup before exposing a listener. */
+    private static Channel tlsTarget(TlsTrace trace, boolean autoRead) throws Exception {
+        return tlsTarget(trace, autoRead, () -> { });
+    }
+
+    private static Channel tlsTarget(TlsTrace trace, boolean autoRead, Runnable prepare) throws Exception {
+        trace.mark("preparing server TLS handler before binding");
+        prepare.run();
+        SslHandler tls = untrustedTls.newHandler(ByteBufAllocator.DEFAULT);
+        trace.enginePrepared = System.nanoTime();
+        trace.mark("server TLS handler prepared");
+        tls.handshakeFuture().addListener(result -> trace.mark(result.isSuccess()
+                ? "server handshake succeeded" : "server handshake ended: " + result.cause()));
+        Channel server = new ServerBootstrap()
+                .group(serverGroup)
+                .channel(NioServerSocketChannel.class)
+                .childOption(ChannelOption.AUTO_READ, autoRead)
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel channel) {
+                        trace.accepted = true;
+                        trace.mark("TCP accepted; installing prepared server TLS handler");
+                        channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                            @Override
+                            public void channelRead(ChannelHandlerContext ctx, Object message) throws Exception {
+                                trace.reads.incrementAndGet();
+                                trace.mark("TLS bytes received");
+                                super.channelRead(ctx, message);
+                            }
+                        }, tls);
+                    }
+                })
+                .bind(InetAddress.getLoopbackAddress(), 0).sync().channel();
+        trace.listenerBound = System.nanoTime();
+        trace.mark("listener bound; production dial not started yet");
+        return server;
+    }
+
+    private static final class TlsTrace {
+        private final long started = System.nanoTime();
+        private final Queue<String> stages = new ConcurrentLinkedQueue<>();
+        private final AtomicInteger reads = new AtomicInteger();
+        private volatile boolean accepted;
+        private long enginePrepared;
+        private long listenerBound;
+
+        void mark(String event) {
+            stages.add(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) + "ms " + event);
+        }
+
+        void assertPreparedBeforeListening() {
+            assertTrue(enginePrepared != 0 && enginePrepared <= listenerBound,
+                    "fixture engine must be ready before the listener and timed production dial: " + this);
+        }
+
+        @Override
+        public String toString() {
+            return "java=" + System.getProperty("java.runtime.version") + ", stages=" + stages;
         }
     }
 
@@ -354,11 +453,15 @@ class HttpRouteFailureTests {
     }
 
     private static void assertFailure(HttpRouteFailure expected, NatMessagePacket reset) {
+        assertFailure(expected, reset, "");
+    }
+
+    private static void assertFailure(HttpRouteFailure expected, NatMessagePacket reset, String diagnostic) {
         assertEquals(8, reset.getValue(), "the RST value is unchanged");
         Object reason = reset.getMetaData().get("reason");
         assertTrue(reason instanceof String text && !text.isBlank(), "the reason is still carried");
         assertEquals(expected.wireName(), reset.getMetaData().get(HttpRouteFailure.METADATA_KEY),
-                "metadata " + reset.getMetaData());
+                "metadata " + reset.getMetaData() + " " + diagnostic);
     }
 
     private static void assertNoFailure(NatMessagePacket reset) {
