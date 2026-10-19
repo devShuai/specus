@@ -479,6 +479,12 @@ add_test(NAME session_lifecycle_tests
     COMMAND specus_c_session_lifecycle_tests $<TARGET_FILE:specus-server-c>)
 set_tests_properties(session_lifecycle_tests PROPERTIES TIMEOUT 120)
 
+add_executable(specus_c_connection_rate_tests tests/connection_rate_tests.c tests/server_harness.c)
+target_link_libraries(specus_c_connection_rate_tests PRIVATE specus_c_core)
+target_compile_options(specus_c_connection_rate_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME connection_rate_tests COMMAND specus_c_connection_rate_tests $<TARGET_FILE:specus-server-c>)
+set_tests_properties(connection_rate_tests PROPERTIES TIMEOUT 60)
+
 # Java SecurityRulesTests on a real server process: public transfer grants and callbacks, the public
 # HTTP entry against foreign tokens and portal headers, the portal policy and the cloud diagram API.
 add_executable(specus_c_security_rules_tests tests/security_rules_tests.c tests/server_harness.c)
