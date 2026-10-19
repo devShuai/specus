@@ -12,6 +12,30 @@ int main(void)
 {
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    CHECK(st_instant_register_sqlite(db) == 0);
+    /* Exercise SQLite bindings, including values that SQLite normally coerces silently. */
+    sqlite3_stmt *functions = NULL;
+    const char *function_sql =
+        "SELECT specus_instant(?1),specus_instant_add_seconds(?1,1),"
+        "specus_instant_add_seconds(?1,-1),specus_instant(NULL),specus_instant(123),"
+        "specus_instant(x'32303236'),specus_instant(?1||char(0)||'suffix'),"
+        "specus_instant_add_seconds(?1,'1'),specus_instant_add_seconds(?1,1.5),"
+        "specus_instant_add_seconds(?1,NULL),"
+        "specus_instant_add_seconds('9999-12-31T23:59:59.9999999Z',1),"
+        "specus_instant_add_seconds('0000-01-01T00:00:00Z',-1),"
+        "specus_instant_add_seconds(?1,9223372036854775807)";
+    CHECK(sqlite3_prepare_v2(db, function_sql, -1, &functions, NULL) == SQLITE_OK
+        && sqlite3_bind_text(functions, 1, "2026-09-15T14:00:00.5000001+02:00", -1, SQLITE_STATIC) == SQLITE_OK
+        && sqlite3_step(functions) == SQLITE_ROW);
+    const char *expected_functions[] = {"2026-09-15T12:00:00.5000001Z",
+        "2026-09-15T12:00:01.5000001Z", "2026-09-15T11:59:59.5000001Z"};
+    for (int i = 0; i < 13; ++i) {
+        if (i < 3) CHECK(sqlite3_column_type(functions, i) == SQLITE_TEXT
+            && strcmp((const char *)sqlite3_column_text(functions, i), expected_functions[i]) == 0);
+        else CHECK(sqlite3_column_type(functions, i) == SQLITE_NULL);
+    }
+    CHECK(sqlite3_step(functions) == SQLITE_DONE); sqlite3_finalize(functions);
+    puts("instant SQLite functions:100ns offset arithmetic,typed bindings,NULL/NUL/overflow rejection passed");
     CHECK(sqlite3_exec(db, "CREATE TABLE records(id INTEGER PRIMARY KEY,at TEXT);CREATE TABLE tickets(token TEXT PRIMARY KEY,at TEXT)", NULL, NULL, NULL) == SQLITE_OK);
     const int row_count = 2 * (int)ST_INSTANT_MIGRATION_BATCH + 7;
     for (int mode = 0; mode < 2; ++mode) {

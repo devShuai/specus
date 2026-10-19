@@ -19,6 +19,41 @@ static int identifier(const char *value)
 
 typedef struct { sqlite3_value *key; sqlite3_value *value; } instant_row;
 
+static const char *instant_sqlite_text(sqlite3_value *value)
+{
+    if (sqlite3_value_type(value) != SQLITE_TEXT) return NULL;
+    const char *text = (const char *)sqlite3_value_text(value);
+    return text != NULL && strlen(text) == (size_t)sqlite3_value_bytes(value) ? text : NULL;
+}
+
+static void instant_sqlite_normalize(sqlite3_context *context, int count, sqlite3_value **args)
+{
+    (void)count;
+    char result[ST_INSTANT_CAPACITY];
+    if (st_instant_normalize(instant_sqlite_text(args[0]), result) != 0) sqlite3_result_null(context);
+    else sqlite3_result_text(context, result, -1, SQLITE_TRANSIENT);
+}
+
+static void instant_sqlite_add_seconds(sqlite3_context *context, int count, sqlite3_value **args)
+{
+    (void)count;
+    char result[ST_INSTANT_CAPACITY];
+    if (sqlite3_value_type(args[1]) != SQLITE_INTEGER
+        || st_instant_add_seconds(instant_sqlite_text(args[0]), sqlite3_value_int64(args[1]), result) != 0)
+        sqlite3_result_null(context);
+    else sqlite3_result_text(context, result, -1, SQLITE_TRANSIENT);
+}
+
+int st_instant_register_sqlite(sqlite3 *db)
+{
+    if (db == NULL) return -1;
+    int flags = SQLITE_UTF8 | SQLITE_DETERMINISTIC;
+    return sqlite3_create_function_v2(db, "specus_instant", 1, flags, NULL,
+               instant_sqlite_normalize, NULL, NULL, NULL) == SQLITE_OK
+        && sqlite3_create_function_v2(db, "specus_instant_add_seconds", 2, flags, NULL,
+               instant_sqlite_add_seconds, NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+}
+
 int st_instant_migrate_column(sqlite3 *db, const char *table, const char *key, const char *column,
                               long long *rewritten)
 {

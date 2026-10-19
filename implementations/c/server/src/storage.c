@@ -1724,6 +1724,7 @@ int st_storage_init(const char *path, int seed_demo_client)
     if (rc == 0) rc = st_instant_migrate_column(db, "specus_management_registration_challenge", "registration_id", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "specus_websocket_ticket", "token_hash", "expires_at", NULL);
     if (rc == 0) rc = st_instant_migrate_column(db, "peer_mesh_session", "id", "expires_at", NULL);
+    if (rc == 0) rc = st_instant_migrate_column(db, "public_transfer_room_pairing_code", "id", "expires_at", NULL);
     if (fresh && rc == 0) {
         rc = exec_sql(db, "COMMIT");
     }
