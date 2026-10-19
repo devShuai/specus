@@ -101,10 +101,24 @@ static int expect(const char *method, const char *path, const char *body, const 
     return -1;
 }
 
-/* Spring's own 400, for a body or parameter that does not bind. */
+/* Spring's own 400, for a body that does not bind or a required parameter that is missing. */
 static int expect_spring_400(const char *method, const char *path, const char *body, const char *token)
 {
     return expect(method, path, body, token, 400, "{\"error\":\"Bad Request\"}");
+}
+
+/*
+ * A path variable or request parameter that does not convert: Java's GlobalExceptionHandler answers
+ * with the message of the conversion's cause, a NumberFormatException for a number (probed on the
+ * Java server), CustomBooleanEditor's IllegalArgumentException for a boolean.
+ */
+static int expect_unconverted(const char *method, const char *path, const char *body, const char *token,
+                              const char *value, int boolean)
+{
+    char answer[256];
+    snprintf(answer, sizeof(answer), boolean ? "{\"error\":\"Invalid boolean value [%s]\"}"
+                                             : "{\"error\":\"For input string: \\\"%s\\\"\"}", value);
+    return expect(method, path, body, token, 400, answer);
 }
 
 static int exec_sql(const char *sql)
@@ -202,7 +216,7 @@ static int test_devices(void)
         || expect("PUT", "/api/admin/peer-mesh/devices/0", "{}", admin_token, 400,
                   "{\"error\":\"peer device not found: 0\"}") != 0
         /* Spring: the path variable, the required body and the Boolean must bind. */
-        || expect_spring_400("PUT", "/api/admin/peer-mesh/devices/abc", "{}", admin_token) != 0
+        || expect_unconverted("PUT", "/api/admin/peer-mesh/devices/abc", "{}", admin_token, "abc", 0) != 0
         || expect_spring_400("PUT", path, NULL, admin_token) != 0
         || expect_spring_400("PUT", path, "{\"enabled\":\"maybe\"}", admin_token) != 0
         || expect_spring_400("PUT", path, "[true]", admin_token) != 0
@@ -283,7 +297,7 @@ static int test_acls(void)
     failed = failed || expect("DELETE", path, NULL, admin_token, 400, needle) != 0
         || expect("DELETE", "/api/admin/peer-mesh/acls/-5", NULL, admin_token, 400,
                   "{\"error\":\"peer ACL not found: -5\"}") != 0
-        || expect_spring_400("DELETE", "/api/admin/peer-mesh/acls/five", NULL, admin_token) != 0;
+        || expect_unconverted("DELETE", "/api/admin/peer-mesh/acls/five", NULL, admin_token, "five", 0) != 0;
     printf("%s ACLs as Java createAcl, deleteAcl and refreshAuthorization\n", failed ? "FAIL" : "ok  ");
     return failed;
 }
@@ -297,9 +311,9 @@ static int test_acls(void)
 static int test_sessions(void)
 {
     int failed = insert_open_session(7003, client_a, "pm-a", client_b, "pm-b") != 0
-        || expect_spring_400("GET", "/api/admin/peer-mesh/sessions?limit=abc", NULL, admin_token) != 0
-        || expect_spring_400("GET", "/api/admin/peer-mesh/sessions?openOnly=perhaps", NULL, admin_token) != 0
-        || expect_spring_400("GET", "/api/admin/peer-mesh/sessions?page=1.5", NULL, admin_token) != 0
+        || expect_unconverted("GET", "/api/admin/peer-mesh/sessions?limit=abc", NULL, admin_token, "abc", 0) != 0
+        || expect_unconverted("GET", "/api/admin/peer-mesh/sessions?openOnly=perhaps", NULL, admin_token, "perhaps", 1) != 0
+        || expect_unconverted("GET", "/api/admin/peer-mesh/sessions?page=1.5", NULL, admin_token, "1.5", 0) != 0
         || expect("GET", "/api/admin/peer-mesh/sessions?page=0&openOnly=yes", NULL, admin_token, 200,
                   "\"totalPages\":") != 0
         || strstr(last_body, "\"id\":7003") == NULL || strstr(last_body, "\"id\":7002") != NULL
@@ -316,7 +330,7 @@ static int test_sessions(void)
     sent_count = 0U;
     failed = failed || expect("DELETE", "/api/admin/peer-mesh/sessions/999999", NULL, admin_token, 400,
                               "{\"error\":\"peer session not found: 999999\"}") != 0
-        || expect_spring_400("DELETE", "/api/admin/peer-mesh/sessions/x1", NULL, admin_token) != 0
+        || expect_unconverted("DELETE", "/api/admin/peer-mesh/sessions/x1", NULL, admin_token, "x1", 0) != 0
         || expect("DELETE", "/api/admin/peer-mesh/sessions/7003", NULL, admin_token, 200, "\"status\":\"CLOSED\"") != 0
         || !last_has_instant("closedAt")
         || sent_matching("pm-a", "\"sessionId\":7003") != 1U || sent_matching("pm-b", "\"sessionId\":7003") != 1U;
@@ -381,7 +395,7 @@ static int test_egress(void)
     failed = failed || expect("DELETE", path, NULL, admin_token, 200, NULL) != 0
         || (last_body != NULL && *last_body != '\0')
         || expect("DELETE", path, NULL, admin_token, 404, needle) != 0
-        || expect_spring_400("DELETE", "/api/admin/peer-mesh/egress/policies/p1", NULL, admin_token) != 0;
+        || expect_unconverted("DELETE", "/api/admin/peer-mesh/egress/policies/p1", NULL, admin_token, "p1", 0) != 0;
     printf("%s egress switch and policies as Java PeerEgressService\n", failed ? "FAIL" : "ok  ");
     return failed;
 }
@@ -468,7 +482,7 @@ static int test_services(void)
                   "{\"error\":\"udp application requires udp transport\"}") != 0
         || expect("PUT", "/api/admin/peer-mesh/services/999999", "{}", admin_token, 400,
                   "{\"error\":\"service not found: 999999\"}") != 0
-        || expect_spring_400("PUT", "/api/admin/peer-mesh/services/import", "{}", admin_token) != 0
+        || expect_unconverted("PUT", "/api/admin/peer-mesh/services/import", "{}", admin_token, "import", 0) != 0
         || expect("DELETE", path, NULL, admin_token, 200, NULL) != 0 || (last_body != NULL && *last_body != '\0');
     snprintf(needle, sizeof(needle), "{\"error\":\"service not found: %lld\"}", id);
     failed = failed || expect("DELETE", path, NULL, admin_token, 400, needle) != 0;
@@ -538,26 +552,34 @@ static int test_mapping_create(void)
     return failed;
 }
 
-/* Request parameters Spring converts before the controller: a value that does not convert is 400. */
+/*
+ * Request parameters Spring converts before the controller: a value that does not convert is 400
+ * with the conversion's message, a missing required one Spring's own 400.
+ */
 static int test_parameters(void)
 {
-    static const char *const refused[] = {
-        "/api/admin/connections?page=abc",
-        "/api/admin/connections?success=maybe",
-        "/api/admin/connections?clientId=1x",
-        "/api/admin/connection-stats?limit=1.5",
-        "/api/admin/traffic?flush=sometimes",
-        "/api/admin/traffic/resources?clientId=one",
-        "/api/admin/traffic/http-exchanges?size=ten",
-        "/api/admin/traffic/tcp-frames?listenPort=x",
-        "/api/admin/traffic/tcp-streams",
-        "/api/admin/traffic/tcp-streams?channelId=c&limit=all",
-        "/api/admin/traffic/media-captures?page=first",
-        "/api/admin/http-routes?clientId=abc",
+    static const struct {
+        const char *path;
+        const char *value; /* NULL: a required parameter is missing */
+        int boolean;
+    } refused[] = {
+        {"/api/admin/connections?page=abc", "abc", 0},
+        {"/api/admin/connections?success=maybe", "maybe", 1},
+        {"/api/admin/connections?clientId=1x", "1x", 0},
+        {"/api/admin/connection-stats?limit=1.5", "1.5", 0},
+        {"/api/admin/traffic?flush=sometimes", "sometimes", 1},
+        {"/api/admin/traffic/resources?clientId=one", "one", 0},
+        {"/api/admin/traffic/http-exchanges?size=ten", "ten", 0},
+        {"/api/admin/traffic/tcp-frames?listenPort=x", "x", 0},
+        {"/api/admin/traffic/tcp-streams", NULL, 0},
+        {"/api/admin/traffic/tcp-streams?channelId=c&limit=all", "all", 0},
+        {"/api/admin/traffic/media-captures?page=first", "first", 0},
+        {"/api/admin/http-routes?clientId=abc", "abc", 0},
     };
     int failed = 0;
     for (size_t i = 0U; !failed && i < sizeof(refused) / sizeof(refused[0]); ++i) {
-        failed = expect_spring_400("GET", refused[i], NULL, admin_token) != 0;
+        failed = refused[i].value == NULL ? expect_spring_400("GET", refused[i].path, NULL, admin_token) != 0
+            : expect_unconverted("GET", refused[i].path, NULL, admin_token, refused[i].value, refused[i].boolean) != 0;
     }
     /* Spring's boolean words, hexadecimal and whitespace in numbers, and empty values. */
     failed = failed || expect("GET", "/api/admin/connections?success=yes&page=%200x0&size=", NULL, admin_token, 200,

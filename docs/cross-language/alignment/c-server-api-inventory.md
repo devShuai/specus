@@ -11,7 +11,7 @@
 - **没有**：C 没有对应实现。
 - **未逐项对照**：C 有对应路由，鉴权与主要形状已核对，但请求校验、状态码等细节没有逐项对照 Java，也没有对照测试；列为待办（第 9 节），不算作一致。
 - **本分支**：本分支修正过的行，提交见第 10 节。
-- Spring 在进入 controller 之前拒绝的请求（必填参数缺失、参数转不成 `Long`/`int`、必需的请求体缺失或不是对象）回 400，Spring Boot 的错误体以 `"error":"Bad Request"` 表示状态；C 回同样的 400 与 `{"error":"Bad Request"}`，不带 `timestamp`、`path` 等字段。`fix/c-server-parity-crud` 按此处理了它对照的端点；`fix/c-server-parity-peer-api` 补齐其余：带类型的查询参数（`Long`/`Integer`/`boolean`）在分发前按 Spring 的规则转换（空白去掉、可带 `0x`/`#` 的十六进制；布尔认 true/false/on/off/yes/no/1/0），转不了或必需参数缺失即 400；Peer Mesh、映射新增、客户端新增与修改、HTTP 路由新增与修改、凭据的 `enabled` 与客户端下载链接的请求体按 Jackson 绑定（缺请求体或不是对象 400；数字字符串可转 `Long`/`Integer`，带小数的数截断，`"TRUE"`、整数可转 `Boolean`，`"1"`、`"yes"` 不行，对象或数组不能转 `String`）；Peer Mesh 的路径变量转不了 400，0 与负数照样交给服务回它的「找不到」。
+- Spring 在进入 controller 之前拒绝的请求回 400，分两种（以 Java 服务端实测为准，见第 9 节第 9 项）。**请求体**缺失、不是对象或成员类型不符（`HttpMessageNotReadableException`）与**必填参数缺失**，Spring Boot 的错误体以 `"error":"Bad Request"` 表示状态，C 回同样的 400 与 `{"error":"Bad Request"}`，不带 `timestamp`、`path` 等字段；Spring Security 的请求防火墙拒绝的路径（含 `;`、编码的 `%`、`.`、`/`、`\`、NUL）同样。**路径变量与查询参数转换失败**（`MethodArgumentTypeMismatchException`）则由 Java 的 `GlobalExceptionHandler` 按其原因回 `{"error":"<原因的消息>"}`：数字是 `NumberFormatException` 的 `For input string: "<去掉空白后的值>"`（十六进制另带 ` under radix 16`，`0x-5` 是 `Sign character in wrong position`），布尔是 `Invalid boolean value [<原值>]`。转换规则：包装类型（`Long`、`Integer`、`Boolean`）的空白值等于没给，基本类型（`long`、`int`、`boolean`，路径变量都是）的空白值转换失败、空串取默认值；数字去掉全部 Java 空白，`-` 之后的 `0x`/`0X`/`#` 按 `Long.decode` 读十六进制，其余按 `Long.valueOf`，任何文字的十进制数字都算（`Character.digit`）；布尔先 `trim`，认 true/false/on/off/yes/no/1/0（不分大小写）；参数按 Java 方法里声明的顺序转换，第一个失败的作答。请求体按 Jackson 绑定：Peer Mesh、映射新增、客户端新增与修改、HTTP 路由新增与修改、凭据的 `enabled`、客户端下载链接与管理用户（缺请求体或不是对象 400；数字字符串可转 `Long`/`Integer`，带小数的数截断，`"TRUE"`、`"True"`、整数可转 `Boolean`，`"1"`、`"yes"`、`"tRUE"` 不行，对象或数组不能转 `String`；枚举只认常量名（去掉首尾空白）或序号）。`fix/c-server-parity-crud`、`fix/c-server-parity-peer-api` 建立了这套绑定，当时把转换失败也答成 `{"error":"Bad Request"}`，由 `fix/c-server-path-variable-binding` 按实测改正。
 - 鉴权：「公开」= `SecurityConfig` 中 `permitAll`；「Bearer」= 需要管理端本地 HS256 token（C 每次请求按 SQLite 重新读取用户）；「Bearer（任意）」= `/api/public/transfer/attachments/**`，任何已认证主体；「ticket」= WebSocket 一次性 ticket。
 
 ## 汇总
@@ -20,8 +20,8 @@ Java server 共 **141** 个端点：136 个 HTTP 映射（`/http/**` 与 `/http-
 
 | 状态 | 数量 | 说明 |
 | --- | ---: | --- |
-| 一致 | 127 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`） |
-| 有差异 | 14 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址） |
+| 一致 | 129 | 其中 10 个是本分支修正后才一致，2 个是 #191 修正后才一致，2 个是 `fix/c-server-parity-edges` 修正后才一致，12 个是 `fix/c-server-parity-crud` 逐项对照（多数先修正）后才一致，24 个是 `fix/c-server-parity-peer-api` 逐项对照（多数先修正）后才一致（Peer Mesh / Egress 22 个，映射新增，HTTP 明细详情的 `br`） |
+| 有差异 | 12 | 见各节“说明”，可修的列入第 9 节；`fix/c-server-parity-crud` 对照的 14 个里有 2 个（`/auth/register`、`database/initialize`）；`fix/c-server-parity-peer-api` 对照的 27 个里有 5 个（服务新增与更新的名称字节上限、服务审计存库、`stun-config` 与 `ice-config` 不发布没有服务在听的备用地址） |
 | 没有 | 0 | 每个 Java 端点在 C 都有对应路由 |
 | 未逐项对照 | 0 | 最后 27 个（Peer Mesh / Egress）已由 `fix/c-server-parity-peer-api` 逐项对照 |
 
@@ -45,12 +45,12 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | POST | `/auth/refresh` | Bearer | 续期本地 token；IdP token 400 | 一致 | `AuthControllerRefreshTests` 覆盖 |
 | GET | `/oidc-config` | 公开 | OIDC、注册、Turnstile 配置 | 一致 | `OidcControllerTests` 覆盖 |
 | POST | `/oidc/token` | 公开 | code → 本地 token | 一致 | `OidcControllerTests`、`SecurityConfigOidcTests` 覆盖（ctest `oidc_tests`） |
-| POST | `/api/client/auth/login` | 公开（HMAC 签名） | 客户端 HTTP 登录，返回会话 token 与配置 | 有差异 | 已消费的 nonce 存进程内存，多实例不共享（`ClientAuthNonceServiceIntegrationTests` 部分）。`fix/c-server-parity-rest` 改为存库，合入后复核 |
+| POST | `/api/client/auth/login` | 公开（HMAC 签名） | 客户端 HTTP 登录，返回会话 token 与配置 | 一致 | 原先已消费的 nonce 存进程内存；`fix/c-server-parity-rest` 起配置数据库时存进与 Java 同名同列的 `specus_client_auth_nonce` 表，重启后仍拒绝重放（test-map `ClientAuthNonceServiceTests`、`ClientAuthNonceServiceIntegrationTests` 均为覆盖：`client_auth_nonce_tests`、`session_lifecycle_tests` 真实进程重启） |
 | GET | `/api/admin/me` | Bearer | 当前管理用户 | 一致 | `fix/c-server-parity-crud` 对照 `ManagementUserService.currentUser`（`management_crud_tests`）：内置管理员以配置的用户名、调用者的租户、`ADMIN`、创建与更新时间为当前时刻；数据库用户取其账号行（含 `createdAt`/`updatedAt`）。原先两个时间戳都是空串 |
-| GET | `/api/admin/users` | Bearer | 本租户用户列表 | 有差异 | **本分支**去掉 128 行上限（ctest `management_lists_tests`）。差异同 test-map `ManagementUserServiceTests`：username 是全局主键，不同租户同名用户不存在 |
-| POST | `/api/admin/users` | Bearer（admin） | 创建用户 | 有差异 | 其他租户已有同名用户时 C 回 409，Java 允许（同上） |
-| PUT | `/api/admin/users/{username}` | Bearer（admin） | 改角色、启用、口令 | 有差异 | 其他租户的用户 C 回 404，Java 回 400（`ManagementUserServiceIntegrationTests` 部分） |
-| DELETE | `/api/admin/users/{username}` | Bearer（admin） | 删除用户 | 有差异 | 同上 |
+| GET | `/api/admin/users` | Bearer | 本租户用户列表 | 一致 | **本分支**去掉 128 行上限（ctest `management_lists_tests`）。原记的差异（username 是全局主键、不同租户不能同名）已由 #183 的按租户登录名消除；列表内容与内置管理员的位置由中央向量 `management-accounts-v1.json` 的 `userLists` 校验（ctest `management_accounts_tests`） |
+| POST | `/api/admin/users` | Bearer（admin） | 创建用户 | 有差异 | 其他租户已有同名用户照常创建（#183，原记的差异已消除）。剩余：本租户同名、与内置管理员同名时 C 回 409 `username already exists`，Java 回 400 `用户名不可用`、`内置 admin 用户不能重复创建`（`management-accounts.md` 第 7 节把本租户冲突的状态码明文留作各端现状：Java、Go、.NET 400，C 409）；用户名、口令为空 C 回 `username and password are required`，Java 分别是 `username cannot be blank`、`password cannot be blank`；用户名超过 80 字节 C 也回这句（Java 按 80 个 UTF-16 单元回 `username is too long`），口令 C 不查 Java 的 120 字符上限。请求体按 Jackson 绑定见第 9 节第 9 项 |
+| PUT | `/api/admin/users/{username}` | Bearer（admin） | 改角色、启用、口令 | 有差异 | 其他租户的用户与不存在的用户答复相同（规范第 7 节），C 是 404 `user not found`，Java 400 `用户不存在: <名>`（.NET 同 Java，Go 回 404）；内置管理员 C 409 `built-in admin cannot be updated`，Java 400 `内置 admin 用户只能通过配置文件修改`。各端未统一，待规范定下后再改 |
+| DELETE | `/api/admin/users/{username}` | Bearer（admin） | 删除用户 | 有差异 | 同上一行（内置管理员 Java 为 `内置 admin 用户不能删除`）；仍拥有客户端或凭据时的 409 由中央向量 `accountDeletion` 校验，各端一致 |
 
 ## 2. 客户端账号、凭据与 TCP 映射
 
@@ -255,7 +255,8 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 5. ~~**未逐项对照的 14 个管理端点**~~（已完成，`fix/c-server-parity-crud`）：注册两条、`/api/admin/me`、凭据 CRUD 四条、映射列表与改删三条、`database/initialize`、客户端名称可用性、流量统计两条，逐项对照了 Java 的 controller、service、DTO、校验与 `GlobalExceptionHandler` 的映射，差异见第 1、2、4 节各行。12 个改为一致；`/auth/register` 剩 C 登录名 80 字节的存储上限与少数邮箱写法，`database/initialize` 剩第 8 节的两项。ctest `management_crud_tests`（新增，经进程内管理监听器的真实 HTTP 与真实 token），`admin_http_tests` 的租户范围与初始化断言随之改为 Java 的 400 与调用者租户。对照中发现但不在本项内、未改的：映射新增的 upsert 与公网端口唯一范围（第 2 节该行）；客户端、路由、ACL 等其余视图的时间戳仍是 SQLite 的 `YYYY-MM-DD HH:MM:SS`（本项只改了凭据、映射与流量统计三类视图）。这两项已由第 8 项修正。
 6. ~~边缘差异~~（已完成，`fix/c-server-parity-edges`）：连接记录普通用户只看 `clientId` 属于自己客户端的记录（`management_lists_tests`）；`listenPort` 给出即过滤、`clientId` ≤ 0 为空页，ES 与 SQLite 相同（`elasticsearch_traffic_tests`、`traffic_detail_api_tests`）；裁剪时 `total_data_set_size_in_bytes` 只要存在就用（`elasticsearch_traffic_tests`）；`/ws/connections` 与 `/ws/client-messages` 共用一个读帧循环，文本按 Tomcat 默认的 8192 个字符限长（1009）并校验 UTF-8（1007）；命令成员为数字或布尔值时按 Jackson 读作字面文本，数字 `messageId` 原样回显（`client_messages_tests`）。都不是平台差异。
 7. ~~**Peer 服务导入的目标去重范围**~~（已完成，`fix/c-server-parity-crud`）：Java `importCandidates` 与 `importMdns` 只拿本客户端已有服务的 `host:port` 去重，C 原先拿整个租户的服务，别的客户端已发布同一目标时 C 会跳过而 Java 会导入；现在两条导入路径都只看本客户端的服务。ctest `management_crud_tests`：另一客户端已发布同一目标时照常导入，第二次导入因本客户端已有而跳过。
-8. ~~**最后 27 个 Peer Mesh / Egress 端点与 `fix/c-server-parity-crud` 的遗留**~~（已完成，`fix/c-server-parity-peer-api`）：逐个对照了 `PeerMeshResource`、`PeerEgressResource`、`PublicPeerMeshResource` 与其服务（`PeerMeshService`、`PeerSignalService`、`PeerServiceDiscoveryService`、`PeerServiceDiscovery`、`PeerEgressService`）、DTO、`GlobalExceptionHandler` 与 Spring 的绑定，第 7 节逐行写出；22 个一致，5 个有差异（服务名称的字节上限、审计存库、两个公共 STUN 配置不列无服务的备用地址，后两项见第 8 节）。遗留三项：映射新增改为 Java 的纯插入与全局公网端口、客户端找不到 400；其余视图的时间改为 ISO-8601；其余端点带类型的查询参数与上述请求体按 Spring 转换（读法第 6 条）。`br` 按第 8 节的方案接入。ctest `peer_mesh_api_tests`（新增，经进程内管理监听器的真实 HTTP 与真实 token，另捕获管理端发给客户端的 `close`），`admin_http_tests`、`management_crud_tests`、`management_lists_tests`、`workbench_tests` 随之改为 Java 的状态码与文案，`decompression_limits_tests`、`traffic_capture_tests` 补 `br`（有 libbrotlidec 时才解码，本机 WSL 没有，以 CI 为准）。对照中发现、未改的：其余 Java 路径变量（客户端、凭据、映射、路由等）仍按 C 原来的方式只认正整数，非数字或 0 落到通用 404，Java 为 400；管理用户新增与修改的请求体沿用 #183/#199 账号向量的检查，`enabled` 的类型不符仍被忽略。
+8. ~~**最后 27 个 Peer Mesh / Egress 端点与 `fix/c-server-parity-crud` 的遗留**~~（已完成，`fix/c-server-parity-peer-api`）：逐个对照了 `PeerMeshResource`、`PeerEgressResource`、`PublicPeerMeshResource` 与其服务（`PeerMeshService`、`PeerSignalService`、`PeerServiceDiscoveryService`、`PeerServiceDiscovery`、`PeerEgressService`）、DTO、`GlobalExceptionHandler` 与 Spring 的绑定，第 7 节逐行写出；22 个一致，5 个有差异（服务名称的字节上限、审计存库、两个公共 STUN 配置不列无服务的备用地址，后两项见第 8 节）。遗留三项：映射新增改为 Java 的纯插入与全局公网端口、客户端找不到 400；其余视图的时间改为 ISO-8601；其余端点带类型的查询参数与上述请求体按 Spring 转换（读法第 6 条）。`br` 按第 8 节的方案接入。ctest `peer_mesh_api_tests`（新增，经进程内管理监听器的真实 HTTP 与真实 token，另捕获管理端发给客户端的 `close`），`admin_http_tests`、`management_crud_tests`、`management_lists_tests`、`workbench_tests` 随之改为 Java 的状态码与文案，`decompression_limits_tests`、`traffic_capture_tests` 补 `br`（有 libbrotlidec 时才解码，本机 WSL 没有，以 CI 为准）。对照中发现、当时未改的两项（其余路径变量、管理用户请求体的 `enabled`）已由第 9 项修正。
+9. ~~**路径变量、查询参数与管理用户请求体的绑定**~~（已完成，`fix/c-server-path-variable-binding`）：先在 Java 服务端用真实 HTTP 逐项实测（`ManagementAccountsHttpTests` 同样的 Spring 上下文），再按结果改 C。客户端（详情、改、删、`force-refresh-port-mapping`、`nat-control`、`specus-mappings`、`http-routes`）、凭据、下载链接（改、删、`latest`）、映射、HTTP 路由、HTTP 明细与 TCP 帧详情、流程图的路径变量原先只认正十进制，非数字、0、负数都落到通用 404 `{"error":"not found"}`；现与 Peer Mesh 共用一个绑定，0、负数、十六进制、带空白、百分号编码、全角数字照样交给原处理函数，回答与不存在的 id 相同（文案带上绑定后的 id）。只在 Java 映射的方法上绑定，其余方法与没有段的路径仍落到原来的回落。转换失败（路径变量、查询参数，含原有的 Peer Mesh 路径变量与读法第 6 条的全部查询参数）原先答 `{"error":"Bad Request"}`，实测 Java 答原因的消息，已改为读法第 6 条所述；查询参数表按 Java 的声明顺序与包装/基本类型重写（如 `tcp-frames` 的 `listenPort`、`size`、`limit` 是包装类型，`page` 是基本类型）；含 `;` 等的路径按防火墙回通用 400。`POST /api/admin/users` 与 `PUT /api/admin/users/{username}` 的请求体按 Jackson 绑定 `UserMutation`，在管理员检查之前（Spring 先绑定、服务再查调用方）：缺请求体或不是对象、`enabled` 不是 Boolean、`username`/`password` 是对象或数组、`role` 不是 `ADMIN`/`USER`（去掉首尾空白）或序号 0/1，都回 400 `{"error":"Bad Request"}`，非管理员也一样。原先 `enabled` 类型不符被忽略（`"yes"` 建出启用的用户），`role` 不分大小写、未知值当 `USER`。ctest `management_crud_tests`：21 个端点各 19 种转不了或被拒的段回 Java 的答复、11 种可绑定的段与不存在的 id 回答相同，已有客户端用四种写法读到同一行；18 个查询参数用例；用户请求体 18 种拒绝写法在新增与修改上回 400、未建出用户、修改未生效，非管理员同样 400，绑定通过后才 403，`role` 的接受写法。三组都先在原实现上失败。`peer_mesh_api_tests` 的路径变量与查询参数断言随之改为 Java 的消息。未做：Java 把同名查询参数的多个值用逗号连起来再转换（`clientId=a&clientId=1` 答 `"a,1"`），C 只取第一个；整条路径上的防火墙规则（如任何位置的 `//`）C 只在路径变量所在的段里检查。
 
 ## 10. 本分支提交
 
@@ -299,3 +300,13 @@ C 独有、Java 没有的端点：`GET /health`（`{"status":"ok"}`）、`GET /a
 | `test(c-server): the Peer Mesh and Egress endpoints against Java` | ctest `peer_mesh_api_tests`（新增）；`admin_http_tests` 等随之调整；构建文件登记新测试并可选检测 libbrotlidec |
 | `feat(c-server): decode Content-Encoding br when the build has libbrotlidec` | `decompression_limits`、明细预览与详情、媒体清单；两个工作流加 `libbrotli-dev`；`br` 测试 |
 | `docs(alignment): the last 27 C inventory endpoints compared with Java` | 本文与 test-map |
+
+`fix/c-server-path-variable-binding`（第 9 节第 9 项）的提交：
+
+| 提交 | 内容 |
+| --- | --- |
+| `fix(c-server): bind the remaining path variables and the user body as Spring and Jackson do` | 共用的路径变量绑定；`UserMutation` 请求体 |
+| `test(c-server): path variables and the management user body against Java` | ctest `management_crud_tests` 两组 |
+| `fix(c-server): answer unconverted parameters with Java's message, bind role as Jackson` | 转换失败的消息、包装与基本类型、声明顺序、防火墙字符；`role` 的枚举绑定 |
+| `test(c-server): conversion messages, parameter kinds and role binding probed on Java` | `management_crud_tests` 三组、`peer_mesh_api_tests` |
+| `docs(alignment): C inventory item 9 done` | 本文 |

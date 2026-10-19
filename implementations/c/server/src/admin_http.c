@@ -29,6 +29,7 @@
 #include "tls_transport.h"
 #include "traffic_capture.h"
 #include "turn_auth.h"
+#include "unicode_java21.h"
 #include "upstream_browser_headers.h"
 #include "url_decode.h"
 #include "workbench.h"
@@ -54,6 +55,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <utf8proc.h>
 #include <zlib.h>
 
 #define ST_ADMIN_MAX_CONNECTIONS_PAGE 500U
@@ -671,42 +673,6 @@ static int admin_path_equals(const char *path, const char *expected)
     return len == strlen(expected) && memcmp(path, expected, len) == 0;
 }
 
-static int admin_parse_path_id(const char *path, const char *prefix, long long *id)
-{
-    size_t prefix_len = strlen(prefix);
-    if (strncmp(path, prefix, prefix_len) != 0) {
-        return -1;
-    }
-    const char *cursor = path + prefix_len;
-    char *end = NULL;
-    long long parsed = strtoll(cursor, &end, 10);
-    if (end == cursor || parsed <= 0 || (*end != '\0' && *end != '?')) {
-        return -1;
-    }
-    *id = parsed;
-    return 0;
-}
-
-static int admin_parse_nested_path_id(const char *path, const char *prefix, const char *suffix, long long *id)
-{
-    size_t prefix_len = strlen(prefix);
-    if (strncmp(path, prefix, prefix_len) != 0) {
-        return -1;
-    }
-    const char *cursor = path + prefix_len;
-    char *end = NULL;
-    long long parsed = strtoll(cursor, &end, 10);
-    if (end == cursor || parsed <= 0 || strncmp(end, suffix, strlen(suffix)) != 0) {
-        return -1;
-    }
-    const char *tail = end + strlen(suffix);
-    if (*tail != '\0' && *tail != '?') {
-        return -1;
-    }
-    *id = parsed;
-    return 0;
-}
-
 static int admin_query_i64(const char *path, const char *key, long long *out)
 {
     const char *query = strchr(path, '?');
@@ -790,60 +756,123 @@ static char *admin_query_string(const char *path, const char *key)
 }
 
 /*
- * A Long or Integer value as Spring binds a request parameter or a path variable
- * (NumberUtils.parseNumber): whitespace anywhere is dropped, an empty value is absent, a decimal or,
- * after an optional '-', a "0x", "0X" or "#" hexadecimal number in range is the value, and anything
- * else fails the request with 400. raw is changed in place. 0 when empty, 1 with *out set, -1 when
- * the value does not convert.
+ * Why the last request parameter or path variable did not convert: the message of Spring's
+ * NumberFormatException or IllegalArgumentException, which Java's GlobalExceptionHandler answers
+ * as {"error": message}; NULL when Spring answers with its generic 400 instead (a value that is not
+ * UTF-8, or a path the request firewall refuses). write_spring_conversion_refusal writes it.
  */
-static int admin_spring_number(char *raw, long long minimum, long long maximum, long long *out)
+static _Thread_local char *admin_conversion_message;
+
+static void admin_conversion_failed(const char *format, ...)
 {
-    size_t w = 0U;
-    for (size_t r = 0U; raw[r] != '\0'; ++r) {
-        if (!isspace((unsigned char)raw[r])) {
-            raw[w++] = raw[r];
+    free(admin_conversion_message);
+    admin_conversion_message = NULL;
+    if (format == NULL) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    int length = vsnprintf(NULL, 0U, format, copy);
+    va_end(copy);
+    if (length >= 0) {
+        admin_conversion_message = (char *)malloc((size_t)length + 1U);
+        if (admin_conversion_message != NULL) {
+            (void)vsnprintf(admin_conversion_message, (size_t)length + 1U, format, args);
         }
     }
-    raw[w] = '\0';
-    if (w == 0U) {
+    va_end(args);
+}
+
+/*
+ * The Java digits of text in radix as a long in [minimum, maximum], negated when negative: what
+ * Long.parseLong and Integer.parseInt accept, digits of any script included (Character.digit). 0
+ * when they do not make one.
+ */
+static int admin_java_digits(const char *text, int radix, int negative, long long minimum, long long maximum,
+                             long long *out)
+{
+    unsigned long long limit = negative ? (unsigned long long)(-(minimum + 1)) + 1ULL : (unsigned long long)maximum;
+    unsigned long long magnitude = 0ULL;
+    size_t length = strlen(text);
+    size_t offset = 0U;
+    if (length == 0U) {
         return 0;
     }
-    const char *digits = raw;
-    int negative = 0;
-    int base = 10;
-    if (*digits == '-' || *digits == '+') {
-        negative = *digits == '-';
-        ++digits;
+    while (offset < length) {
+        utf8proc_int32_t point = 0;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)text + offset,
+                                                  (utf8proc_ssize_t)(length - offset), &point);
+        int digit = width <= 0 ? -1 : st_unicode_java21_digit(point, radix);
+        if (digit < 0 || magnitude > (limit - (unsigned long long)digit) / (unsigned long long)radix) {
+            return 0;
+        }
+        magnitude = magnitude * (unsigned long long)radix + (unsigned long long)digit;
+        offset += (size_t)width;
     }
-    if (raw[0] != '+' && (strncmp(digits, "0x", 2U) == 0 || strncmp(digits, "0X", 2U) == 0)) {
-        digits += 2;
-        base = 16;
-    } else if (raw[0] != '+' && *digits == '#') {
-        digits += 1;
-        base = 16;
+    *out = !negative ? (long long)magnitude
+        : (magnitude == (unsigned long long)LLONG_MAX + 1ULL ? LLONG_MIN : -(long long)magnitude);
+    return 1;
+}
+
+/*
+ * A long or int (a Long or Integer when wrapper) as Spring binds a request parameter or path variable:
+ * CustomNumberEditor, then NumberUtils.parseNumber. An empty value is absent (Spring takes the
+ * default value instead); a blank one is absent too for a wrapper, and fails for a primitive.
+ * Otherwise every Java whitespace character is dropped, and after an optional '-', "0x", "0X" or "#"
+ * starts a Long.decode or Integer.decode, anything else a Long.valueOf or Integer.valueOf. 0 when
+ * absent, 1 with *out set, -1 when it does not convert, with admin_conversion_message set.
+ */
+static int admin_spring_number(const char *raw, int wrapper, long long minimum, long long maximum, long long *out)
+{
+    size_t raw_len = strlen(raw);
+    int has_text = st_unicode_java21_has_text(raw, raw_len);
+    if (has_text < 0) {
+        admin_conversion_failed(NULL);
+        return -1;
     }
-    unsigned long long magnitude = 0ULL;
-    int ok = *digits != '\0';
-    for (const char *cursor = digits; ok && *cursor != '\0'; ++cursor) {
-        int digit = isdigit((unsigned char)*cursor) ? *cursor - '0'
-            : (base == 16 && isxdigit((unsigned char)*cursor) ? tolower((unsigned char)*cursor) - 'a' + 10 : -1);
-        if (digit < 0 || magnitude > (ULLONG_MAX - (unsigned long long)digit) / (unsigned long long)base) {
-            ok = 0;
-        } else {
-            magnitude = magnitude * (unsigned long long)base + (unsigned long long)digit;
+    if (raw_len == 0U || (has_text == 0 && wrapper)) {
+        return 0;
+    }
+    char *text = (char *)malloc(raw_len + 1U);
+    if (text == NULL) {
+        admin_conversion_failed(NULL);
+        return -1;
+    }
+    size_t w = 0U;
+    for (size_t offset = 0U; offset < raw_len;) {
+        utf8proc_int32_t point = 0;
+        utf8proc_ssize_t width = utf8proc_iterate((const utf8proc_uint8_t *)raw + offset,
+                                                  (utf8proc_ssize_t)(raw_len - offset), &point);
+        if (!st_unicode_java21_whitespace(point)) {
+            memcpy(text + w, raw + offset, (size_t)width);
+            w += (size_t)width;
+        }
+        offset += (size_t)width;
+    }
+    text[w] = '\0';
+    int negative = text[0] == '-';
+    const char *rest = text + (negative ? 1 : 0);
+    int rc = 1;
+    if (strncmp(rest, "0x", 2U) == 0 || strncmp(rest, "0X", 2U) == 0 || rest[0] == '#') {
+        rest += rest[0] == '#' ? 1 : 2;
+        if (rest[0] == '-' || rest[0] == '+') {
+            admin_conversion_failed("Sign character in wrong position");
+            rc = -1;
+        } else if (!admin_java_digits(rest, 16, negative, minimum, maximum, out)) {
+            admin_conversion_failed("For input string: \"%s%s\" under radix 16", negative ? "-" : "", rest);
+            rc = -1;
+        }
+    } else {
+        int sign = text[0] == '-' || text[0] == '+';
+        if (!admin_java_digits(text + (sign ? 1 : 0), 10, negative, minimum, maximum, out)) {
+            admin_conversion_failed("For input string: \"%s\"", text);
+            rc = -1;
         }
     }
-    if (!ok || magnitude > (unsigned long long)LLONG_MAX + (negative ? 1ULL : 0ULL)) {
-        return -1;
-    }
-    long long value = negative ? (magnitude == (unsigned long long)LLONG_MAX + 1ULL ? LLONG_MIN
-                                                                                 : -(long long)magnitude)
-                               : (long long)magnitude;
-    if (value < minimum || value > maximum) {
-        return -1;
-    }
-    *out = value;
-    return 1;
+    free(text);
+    return rc;
 }
 
 /* A Long or Integer request parameter (admin_spring_number): 0 when absent, 1 with *out, -1 otherwise. */
@@ -854,7 +883,7 @@ static int admin_query_number_param(const char *path, const char *key, long long
     if (raw == NULL) {
         return 0;
     }
-    int rc = admin_spring_number(raw, minimum, maximum, out);
+    int rc = admin_spring_number(raw, 1, minimum, maximum, out);
     free(raw);
     return rc;
 }
@@ -871,34 +900,51 @@ static int admin_query_int_any(const char *path, const char *key, int *out)
 }
 
 /*
- * A Boolean request parameter as Spring converts it (StringToBooleanConverter): trimmed, true, on,
- * yes or 1 and false, off, no or 0 in any case; an empty value is absent. 0 when absent, 1 with
- * *out set, -1 when the value does not convert (Spring answers 400).
+ * A boolean (a Boolean when wrapper) request parameter as Spring's CustomBooleanEditor binds it:
+ * trimmed of the characters String.trim drops, true, on, yes or 1 and false, off, no or 0 in any
+ * case. An empty value is absent (Spring takes the default value instead); a blank one is absent too
+ * for a wrapper. 0 when absent, 1 with *out set, -1 when it does not convert, with
+ * admin_conversion_message set.
  */
-static int admin_query_boolean_param(const char *path, const char *key, int *out)
+static int admin_query_boolean_value(const char *path, const char *key, int wrapper, int *out)
 {
     static const char *const truths[] = {"true", "on", "yes", "1"};
     static const char *const falsehoods[] = {"false", "off", "no", "0"};
     char *raw = admin_query_string(path, key);
-    if (raw == NULL) {
+    if (raw == NULL || *raw == '\0') {
+        free(raw);
         return 0;
     }
-    char *value = raw;
-    while (isspace((unsigned char)*value)) ++value;
+    if (st_unicode_java21_has_text(raw, strlen(raw)) < 0) {
+        free(raw);
+        admin_conversion_failed(NULL);
+        return -1;
+    }
+    const char *value = raw;
+    while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
     size_t len = strlen(value);
-    while (len > 0U && isspace((unsigned char)value[len - 1U])) value[--len] = '\0';
-    int rc = len == 0U ? 0 : -1;
+    while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+    int rc = len == 0U && wrapper ? 0 : -1;
     for (size_t i = 0U; rc == -1 && i < sizeof(truths) / sizeof(truths[0]); ++i) {
-        if (strcasecmp(value, truths[i]) == 0) {
+        if (strlen(truths[i]) == len && strncasecmp(value, truths[i], len) == 0) {
             *out = 1;
             rc = 1;
-        } else if (strcasecmp(value, falsehoods[i]) == 0) {
+        } else if (strlen(falsehoods[i]) == len && strncasecmp(value, falsehoods[i], len) == 0) {
             *out = 0;
             rc = 1;
         }
     }
+    if (rc == -1) {
+        admin_conversion_failed("Invalid boolean value [%s]", raw);
+    }
     free(raw);
     return rc;
+}
+
+/* admin_query_boolean_value for a Boolean. */
+static int admin_query_boolean_param(const char *path, const char *key, int *out)
+{
+    return admin_query_boolean_value(path, key, 1, out);
 }
 
 /* A boolean request parameter that converts; -1 when it is absent, empty or does not convert. */
@@ -916,6 +962,31 @@ static int admin_query_bool(const char *path, const char *key, int *out)
 static int write_spring_bad_request(char *out, size_t out_len)
 {
     return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"Bad Request\"}");
+}
+
+/*
+ * The answer to a request parameter or path variable that did not convert: 400 with the message
+ * admin_conversion_message holds, which Java's GlobalExceptionHandler answers with (it handles the
+ * MethodArgumentTypeMismatchException by its cause), or Spring's generic 400 when there is none.
+ */
+static int write_spring_conversion_refusal(char *out, size_t out_len)
+{
+    char *escaped = admin_conversion_message == NULL ? NULL : st_json_escape(admin_conversion_message);
+    free(admin_conversion_message);
+    admin_conversion_message = NULL;
+    if (escaped == NULL) {
+        return write_spring_bad_request(out, out_len);
+    }
+    size_t body_len = strlen(escaped) + sizeof("{\"error\":\"\"}");
+    char *body = (char *)malloc(body_len);
+    int response_len = body == NULL ? write_spring_bad_request(out, out_len) : 0;
+    if (body != NULL) {
+        snprintf(body, body_len, "{\"error\":\"%s\"}", escaped);
+        response_len = write_response(out, out_len, 400, "Bad Request", body);
+        free(body);
+    }
+    free(escaped);
+    return response_len;
 }
 
 /*
@@ -1171,29 +1242,72 @@ static int admin_body_is_object(const char *body)
     return body != NULL && st_json_is_valid_object(body);
 }
 
-/*
- * A @PathVariable long: 1 with *id when path is prefix followed by one non-empty segment that
- * converts (any sign, 0 included, as Spring binds it before the service looks it up), -2 when that
- * segment does not convert (Spring answers 400), 0 when path does not have that shape.
- */
-static int admin_path_long(const char *path, const char *prefix, long long *id)
+static int admin_hex_digit(char c)
 {
+    return isdigit((unsigned char)c) ? c - '0'
+        : (isxdigit((unsigned char)c) ? tolower((unsigned char)c) - 'a' + 10 : -1);
+}
+
+/*
+ * A @PathVariable long: 1 with *id when path is prefix, one non-empty segment and then exactly
+ * suffix (before any query), and the segment converts (any sign, 0 included, as Spring binds it
+ * before the service looks it up); -2 when it does not, with admin_conversion_message set as
+ * admin_spring_number sets it for a primitive, or cleared where Spring Security's request firewall
+ * or Tomcat refuses the path first (";", or an encoded "%", ".", "/", "\\" or NUL); 0 when path does
+ * not have that shape. The segment is percent-decoded first, as Spring decodes path variables.
+ */
+static int admin_path_long_suffix(const char *path, const char *prefix, const char *suffix, long long *id)
+{
+    static const char *const refused[] = {"%25", "%2E", "%2e", "%2F", "%2f", "%5C", "%5c", "%00"};
     size_t prefix_len = strlen(prefix);
     if (strncmp(path, prefix, prefix_len) != 0) {
         return 0;
     }
     const char *segment = path + prefix_len;
-    size_t segment_len = strcspn(segment, "?");
-    if (segment_len == 0U || memchr(segment, '/', segment_len) != NULL) {
+    size_t segment_len = strcspn(segment, "/?");
+    size_t suffix_len = strlen(suffix);
+    if (segment_len == 0U || strncmp(segment + segment_len, suffix, suffix_len) != 0) {
         return 0;
     }
-    char text[64];
-    if (segment_len >= sizeof(text)) {
+    char tail = segment[segment_len + suffix_len];
+    if (tail != '\0' && tail != '?') {
+        return 0;
+    }
+    char *text = (char *)malloc(segment_len + 1U);
+    int refuse = text == NULL || memchr(segment, ';', segment_len) != NULL;
+    for (size_t i = 0U; !refuse && i < sizeof(refused) / sizeof(refused[0]); ++i) {
+        for (const char *at = segment; !refuse && (at = strstr(at, refused[i])) != NULL && at < segment + segment_len;
+             ++at) {
+            refuse = 1;
+        }
+    }
+    if (refuse) {
+        free(text);
+        admin_conversion_failed(NULL);
         return -2;
     }
-    memcpy(text, segment, segment_len);
-    text[segment_len] = '\0';
-    return admin_spring_number(text, LLONG_MIN, LLONG_MAX, id) == 1 ? 1 : -2;
+    size_t w = 0U;
+    for (size_t r = 0U; r < segment_len; ++r) {
+        int high = 0;
+        int low = 0;
+        if (segment[r] == '%' && r + 2U < segment_len
+            && (high = admin_hex_digit(segment[r + 1U])) >= 0 && (low = admin_hex_digit(segment[r + 2U])) >= 0) {
+            text[w++] = (char)(high * 16 + low);
+            r += 2U;
+        } else {
+            text[w++] = segment[r];
+        }
+    }
+    text[w] = '\0';
+    int rc = admin_spring_number(text, 0, LLONG_MIN, LLONG_MAX, id) == 1 ? 1 : -2;
+    free(text);
+    return rc;
+}
+
+/* admin_path_long_suffix for a path that ends with the variable. */
+static int admin_path_long(const char *path, const char *prefix, long long *id)
+{
+    return admin_path_long_suffix(path, prefix, "", id);
 }
 
 /* admin_jackson_long for an Integer member. */
@@ -11982,28 +12096,95 @@ static int normalize_username_in_place(char *username)
     return 0;
 }
 
+/*
+ * The member key bound to Java's ManagementRole as Jackson binds an enum: a string that, trimmed, is
+ * the constant's name, or the constant's ordinal (ADMIN 0, USER 1) as a number or a string of
+ * digits. 0 when absent or null, 1 with *role set, -2 otherwise (the name in another case, an empty
+ * string, any other number or type).
+ */
+static int admin_jackson_role(const char *body, const char *key, const char **role)
+{
+    static const char *const constants[] = {"ADMIN", "USER"};
+    char *raw = admin_json_member_raw(body, key);
+    if (raw == NULL || strcmp(raw, "null") == 0) {
+        free(raw);
+        return 0;
+    }
+    char *text = raw[0] == '"' ? st_json_decode_string(raw, NULL) : NULL;
+    const char *value = raw[0] == '"' ? text : raw;
+    int rc = -2;
+    if (value != NULL) {
+        while (*value != '\0' && (unsigned char)*value <= ' ') ++value;
+        size_t len = strlen(value);
+        while (len > 0U && (unsigned char)value[len - 1U] <= ' ') --len;
+        for (size_t i = 0U; rc == -2 && i < sizeof(constants) / sizeof(constants[0]); ++i) {
+            if (raw[0] == '"' && len == strlen(constants[i]) && strncmp(value, constants[i], len) == 0) {
+                *role = constants[i];
+                rc = 1;
+            }
+        }
+        if (rc == -2 && len == 1U && (value[0] == '0' || value[0] == '1')) {
+            *role = constants[value[0] - '0'];
+            rc = 1;
+        }
+    }
+    free(text);
+    free(raw);
+    return rc;
+}
+
+/*
+ * Spring's binding of the required UserMutation body (String username and password, ManagementRole
+ * role, Boolean enabled), which comes before the service checks the caller: 0 when it binds, else
+ * Spring's 400 written to out.
+ */
+static int admin_user_mutation_refusal(const char *body, char *out, size_t out_len)
+{
+    if (!admin_body_is_object(body)) {
+        return write_spring_bad_request(out, out_len);
+    }
+    const char *role = NULL;
+    if (admin_jackson_role(body, "role", &role) == -2) {
+        return write_spring_bad_request(out, out_len);
+    }
+    static const char *const strings[] = {"username", "password"};
+    for (size_t i = 0U; i < sizeof(strings) / sizeof(strings[0]); ++i) {
+        char *value = NULL;
+        int bound = admin_jackson_string(body, strings[i], &value);
+        free(value);
+        if (bound == -2) {
+            return write_spring_bad_request(out, out_len);
+        }
+    }
+    int enabled = 0;
+    return admin_jackson_boolean(body, "enabled", &enabled) == -2 ? write_spring_bad_request(out, out_len) : 0;
+}
+
 static int handle_management_user_create(const st_admin_context *context, const char *body, char *out, size_t out_len)
 {
+    int bind_refusal = admin_user_mutation_refusal(body, out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
+    }
     if (!context->admin) {
         return write_admin_forbidden(out, out_len);
-    }
-    if (body == NULL) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"request body is required\"}");
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
     if (init_response != 0) {
         return init_response;
     }
-    char *username = st_json_get_string(body, "username");
-    char *password = st_json_get_string(body, "password");
-    char *role = st_json_get_string(body, "role");
+    char *username = NULL;
+    char *password = NULL;
+    (void)admin_jackson_string(body, "username", &username);
+    (void)admin_jackson_string(body, "password", &password);
+    const char *role = NULL;
+    (void)admin_jackson_role(body, "role", &role);
     int enabled = 1;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
     if (normalize_username_in_place(username) != 0 || password == NULL || *admin_trim(password) == '\0') {
         free(username);
         free(password);
-        free(role);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username and password are required\"}");
     }
     /* Login names are unique per tenant: a same-named user of another tenant is no conflict, and the
@@ -12014,14 +12195,12 @@ static int handle_management_user_create(const st_admin_context *context, const 
                                                     &existing_user) == 0) {
         free(username);
         free(password);
-        free(role);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"username already exists\"}");
     }
     char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     if (st_password_hash(admin_trim(password), hash) != 0) {
         free(username);
         free(password);
-        free(role);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"password cannot be blank\"}");
     }
     st_storage_management_user user;
@@ -12029,12 +12208,11 @@ static int handle_management_user_create(const st_admin_context *context, const 
                                                username,
                                                context->tenant_id,
                                                hash,
-                                               normalize_management_role(role),
+                                               role == NULL ? "USER" : role,
                                                enabled,
                                                &user);
     free(username);
     free(password);
-    free(role);
     if (rc != 0) {
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"user create failed\"}");
     }
@@ -12100,11 +12278,12 @@ static int handle_management_user_update(const st_admin_context *context,
                                          char *out,
                                          size_t out_len)
 {
+    int bind_refusal = admin_user_mutation_refusal(body, out, out_len);
+    if (bind_refusal != 0) {
+        return bind_refusal;
+    }
     if (!context->admin) {
         return write_admin_forbidden(out, out_len);
-    }
-    if (body == NULL) {
-        return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"request body is required\"}");
     }
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -12126,18 +12305,19 @@ static int handle_management_user_update(const st_admin_context *context,
         free(username);
         return response_len;
     }
-    char *password = st_json_get_string(body, "password");
-    char *role = st_json_get_string(body, "role");
+    char *password = NULL;
+    (void)admin_jackson_string(body, "password", &password);
+    const char *role = NULL;
+    (void)admin_jackson_role(body, "role", &role);
     int enabled = existing.enabled;
-    (void)st_json_get_bool(body, "enabled", &enabled);
+    (void)admin_jackson_boolean(body, "enabled", &enabled);
     char hash[ST_PASSWORD_HASH_MAX_LEN + 1U];
     const char *hash_ptr = NULL;
     if (password != NULL && *admin_trim(password) != '\0') {
         if (st_password_hash(admin_trim(password), hash) != 0) {
             free(username);
             free(password);
-            free(role);
-            return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"password cannot be blank\"}");
+                return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"password cannot be blank\"}");
         }
         hash_ptr = hash;
     }
@@ -12150,7 +12330,7 @@ static int handle_management_user_update(const st_admin_context *context,
                                                        context->tenant_id,
                                                        username,
                                                        hash_ptr,
-                                                       role == NULL ? NULL : normalize_management_role(role),
+                                                       role == NULL ? NULL : role == NULL ? "USER" : role,
                                                        enabled,
                                                        context->username,
                                                        st_http_share_now_ms(),
@@ -12158,7 +12338,6 @@ static int handle_management_user_update(const st_admin_context *context,
                                                        &revoked);
     free(username);
     free(password);
-    free(role);
     admin_share_cut_revoked(&revoked);
     st_storage_share_ids_free(&revoked);
     if (rc != 0) {
@@ -12757,57 +12936,72 @@ static int handle_product_metrics_request(const st_admin_context *context,
  * parameter that is missing, is Spring's 400 whatever the handler would make of it. Names are
  * comma-separated; a NULL list has none.
  */
+/*
+ * The typed request parameters of an endpoint, in the order its Java method declares them (Spring
+ * resolves them in that order, and the first that fails answers): "L:clientId,i:page" with L, I, B
+ * a Long, Integer or Boolean, l, i, b a long, int or boolean (one with a default value), and S a
+ * required String.
+ */
 typedef struct {
     const char *method;
     const char *path;
-    const char *longs;
-    const char *ints;
-    const char *booleans;
-    const char *required;
+    const char *parameters;
 } admin_spring_parameters;
 
 static const admin_spring_parameters admin_spring_parameter_table[] = {
-    {"GET", "/api/admin/clients/name-availability", "excludeClientId", NULL, NULL, "clientName"},
-    {"GET", "/api/admin/specus-mappings", "clientId", NULL, NULL, NULL},
-    {"GET", "/api/admin/http-routes", "clientId", NULL, NULL, NULL},
-    {"GET", "/api/admin/connections", "clientId", "page,size", "success", NULL},
-    {"GET", "/api/admin/connection-stats", NULL, "limit", NULL, NULL},
-    {"GET", "/api/admin/traffic", "clientId", "limit", "flush", NULL},
-    {"GET", "/api/admin/traffic/resources", "clientId", "limit", "flush", NULL},
-    {"GET", "/api/admin/traffic/http-exchanges", "clientId", "page,size", "flush", NULL},
-    {"GET", "/api/admin/traffic/tcp-frames", "clientId", "listenPort,page,size,limit", "flush", NULL},
-    {"GET", "/api/admin/traffic/tcp-streams", NULL, "limit,page,size", "flush", "channelId"},
-    {"GET", "/api/admin/traffic/media-captures", "clientId", "page,size", NULL, NULL},
-    {"GET", "/api/admin/peer-mesh/sessions", NULL, "limit,page,size", "openOnly", NULL},
-    {"GET", "/api/public/client-version-check", NULL, NULL, NULL, "implementation,platform,arch,current"},
+    {"GET", "/api/admin/clients/name-availability", "S:clientName,L:excludeClientId"},
+    {"GET", "/api/admin/specus-mappings", "L:clientId"},
+    {"GET", "/api/admin/http-routes", "L:clientId"},
+    {"GET", "/api/admin/connections", "L:clientId,B:success,i:page,i:size"},
+    {"GET", "/api/admin/connection-stats", "i:limit"},
+    {"GET", "/api/admin/traffic", "L:clientId,i:limit,b:flush"},
+    {"GET", "/api/admin/traffic/resources", "L:clientId,i:limit,b:flush"},
+    {"GET", "/api/admin/traffic/http-exchanges", "L:clientId,i:page,i:size,b:flush"},
+    {"GET", "/api/admin/traffic/tcp-frames", "L:clientId,I:listenPort,i:page,I:size,I:limit,b:flush"},
+    {"GET", "/api/admin/traffic/tcp-streams", "S:channelId,i:limit,I:page,I:size,b:flush"},
+    {"GET", "/api/admin/traffic/media-captures", "L:clientId,i:page,i:size"},
+    {"GET", "/api/admin/peer-mesh/sessions", "i:limit,I:page,I:size,b:openOnly"},
+    {"GET", "/api/public/client-version-check", "S:implementation,S:platform,S:arch,S:current"},
 };
 
-/* 1 when one of the named parameters does not convert (or, for required ones, is missing). */
-static int admin_spring_names_fail(const char *path, const char *names, char kind)
+/*
+ * 1 when one of the parameters does not convert, with admin_conversion_message set, or a required
+ * one is missing, with it cleared (Spring's generic 400).
+ */
+static int admin_spring_parameters_list_fail(const char *path, const char *parameters)
 {
-    while (names != NULL && *names != '\0') {
+    while (parameters != NULL && *parameters != '\0') {
+        char kind = parameters[0];
+        const char *name_start = parameters + 2;
         char name[32];
-        size_t len = strcspn(names, ",");
-        snprintf(name, sizeof(name), "%.*s", (int)len, names);
-        names += len + (names[len] == ',' ? 1U : 0U);
+        size_t len = strcspn(name_start, ",");
+        snprintf(name, sizeof(name), "%.*s", (int)len, name_start);
+        parameters = name_start + len + (name_start[len] == ',' ? 1U : 0U);
         long long number = 0;
         int flag = 0;
+        int wrapper = isupper((unsigned char)kind) && kind != 'S';
+        char *raw = NULL;
         char *value = NULL;
         int failed = 0;
-        switch (kind) {
+        switch (tolower((unsigned char)kind)) {
         case 'l':
-            failed = admin_query_number_param(path, name, LLONG_MIN, LLONG_MAX, &number) < 0;
-            break;
         case 'i':
-            failed = admin_query_number_param(path, name, INT_MIN, INT_MAX, &number) < 0;
+            raw = admin_query_string(path, name);
+            failed = raw != NULL
+                && admin_spring_number(raw, wrapper, tolower((unsigned char)kind) == 'l' ? LLONG_MIN : INT_MIN,
+                                       tolower((unsigned char)kind) == 'l' ? LLONG_MAX : INT_MAX, &number) < 0;
+            free(raw);
             break;
         case 'b':
-            failed = admin_query_boolean_param(path, name, &flag) < 0;
+            failed = admin_query_boolean_value(path, name, wrapper, &flag) < 0;
             break;
         default:
             value = admin_query_string(path, name);
             failed = value == NULL;
             free(value);
+            if (failed) {
+                admin_conversion_failed(NULL);
+            }
             break;
         }
         if (failed) {
@@ -12823,17 +13017,14 @@ static int admin_spring_parameters_fail(const char *method, const char *path)
     for (size_t i = 0U; i < count; ++i) {
         const admin_spring_parameters *entry = &admin_spring_parameter_table[i];
         if (strcmp(method, entry->method) == 0 && admin_path_equals(path, entry->path)) {
-            return admin_spring_names_fail(path, entry->required, 'r')
-                || admin_spring_names_fail(path, entry->longs, 'l')
-                || admin_spring_names_fail(path, entry->ints, 'i')
-                || admin_spring_names_fail(path, entry->booleans, 'b');
+            return admin_spring_parameters_list_fail(path, entry->parameters);
         }
     }
     /* POST /api/admin/traffic/media-captures/{id}/playback-ticket?backfillMissing= */
     if (strcmp(method, "POST") == 0
         && strncmp(path, "/api/admin/traffic/media-captures/", strlen("/api/admin/traffic/media-captures/")) == 0
         && strstr(path, "/playback-ticket") != NULL) {
-        return admin_spring_names_fail(path, "backfillMissing", 'b');
+        return admin_spring_parameters_list_fail(path, "b:backfillMissing");
     }
     return 0;
 }
@@ -12917,7 +13108,7 @@ static int st_admin_build_response_internal(const char *method,
         }
     }
     if (admin_spring_parameters_fail(method, path)) {
-        return write_spring_bad_request(out, out_len);
+        return write_spring_conversion_refusal(out, out_len);
     }
     if (product_metrics_path) {
         return handle_product_metrics_request(&context, method, path, body, body_len, out, out_len);
@@ -13040,18 +13231,25 @@ static int st_admin_build_response_internal(const char *method,
         return handle_client_package_upload(&context, content_type, (const uint8_t *)body,
                                             body_len, out, out_len);
     }
+    /*
+     * Path variables bind as a long whatever its sign, as Spring does, and a segment that is not
+     * one is Spring's 400 (admin_path_long_suffix); the handlers then answer for ids they do not
+     * have. Only the methods Java maps reach that binding: another method falls through.
+     */
     long long path_id = 0;
+    int path_bound = 0;
     if (strcmp(method, "POST") == 0
-        && admin_parse_nested_path_id(path, "/api/admin/client-downloads/", "/latest", &path_id) == 0) {
-        return handle_client_download_mark_latest(&context, path_id, out, out_len);
+        && (path_bound = admin_path_long_suffix(path, "/api/admin/client-downloads/", "/latest", &path_id)) != 0) {
+        return path_bound == 1 ? handle_client_download_mark_latest(&context, path_id, out, out_len)
+                               : write_spring_conversion_refusal(out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/client-downloads/", &path_id) == 0) {
-        if (strcmp(method, "PUT") == 0) {
-            return handle_client_download_update(&context, path_id, body, out, out_len);
+    if ((strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (path_bound = admin_path_long(path, "/api/admin/client-downloads/", &path_id)) != 0) {
+        if (path_bound != 1) {
+            return write_spring_conversion_refusal(out, out_len);
         }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_client_download_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0 ? handle_client_download_update(&context, path_id, body, out, out_len)
+                                          : handle_client_download_delete(&context, path_id, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/client-credentials")) {
         return build_credentials_response(&context, out, out_len);
@@ -13059,13 +13257,13 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/client-credentials")) {
         return handle_credential_create(&context, body, out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/client-credentials/", &path_id) == 0) {
-        if (strcmp(method, "PUT") == 0) {
-            return handle_credential_update(&context, path_id, body, out, out_len);
+    if ((strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (path_bound = admin_path_long(path, "/api/admin/client-credentials/", &path_id)) != 0) {
+        if (path_bound != 1) {
+            return write_spring_conversion_refusal(out, out_len);
         }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_credential_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0 ? handle_credential_update(&context, path_id, body, out, out_len)
+                                          : handle_credential_delete(&context, path_id, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/clients")) {
         return build_clients_response(&context, out, out_len);
@@ -13078,39 +13276,38 @@ static int st_admin_build_response_internal(const char *method,
         return handle_client_create(&context, body, out, out_len);
     }
     if (strcmp(method, "POST") == 0
-        && admin_parse_nested_path_id(path, "/api/admin/clients/",
-                                      "/force-refresh-port-mapping", &path_id) == 0) {
-        return handle_nat_control_push(&context, path_id, out, out_len);
+        && ((path_bound = admin_path_long_suffix(path, "/api/admin/clients/",
+                                                 "/force-refresh-port-mapping", &path_id)) != 0
+            || (path_bound = admin_path_long_suffix(path, "/api/admin/clients/", "/nat-control", &path_id)) != 0)) {
+        return path_bound == 1 ? handle_nat_control_push(&context, path_id, out, out_len)
+                               : write_spring_conversion_refusal(out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/clients/", &path_id) == 0) {
+    if ((strcmp(method, "GET") == 0 || strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (path_bound = admin_path_long(path, "/api/admin/clients/", &path_id)) != 0) {
+        if (path_bound != 1) {
+            return write_spring_conversion_refusal(out, out_len);
+        }
         if (strcmp(method, "GET") == 0) {
             return build_client_detail_response(&context, path_id, out, out_len);
         }
-        if (strcmp(method, "PUT") == 0) {
-            return handle_client_update(&context, path_id, body, out, out_len);
-        }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_client_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0 ? handle_client_update(&context, path_id, body, out, out_len)
+                                          : handle_client_delete(&context, path_id, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/specus-mappings")) {
         return build_specusMappings_response(&context, path, out, out_len);
     }
     if (strcmp(method, "POST") == 0
-        && admin_parse_nested_path_id(path, "/api/admin/clients/", "/specus-mappings", &path_id) == 0) {
-        return handle_specus_create(&context, path_id, body, out, out_len);
+        && (path_bound = admin_path_long_suffix(path, "/api/admin/clients/", "/specus-mappings", &path_id)) != 0) {
+        return path_bound == 1 ? handle_specus_create(&context, path_id, body, out, out_len)
+                               : write_spring_conversion_refusal(out, out_len);
     }
-    if (strcmp(method, "POST") == 0
-        && admin_parse_nested_path_id(path, "/api/admin/clients/", "/nat-control", &path_id) == 0) {
-        return handle_nat_control_push(&context, path_id, out, out_len);
-    }
-    if (admin_parse_path_id(path, "/api/admin/specus-mappings/", &path_id) == 0) {
-        if (strcmp(method, "PUT") == 0) {
-            return handle_specus_update(&context, path_id, body, out, out_len);
+    if ((strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (path_bound = admin_path_long(path, "/api/admin/specus-mappings/", &path_id)) != 0) {
+        if (path_bound != 1) {
+            return write_spring_conversion_refusal(out, out_len);
         }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_specus_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0 ? handle_specus_update(&context, path_id, body, out, out_len)
+                                          : handle_specus_delete(&context, path_id, out, out_len);
     }
     int share_response = handle_http_share_management(&context, method, path, body, body_len, out, out_len);
     if (share_response != 0) {
@@ -13120,21 +13317,22 @@ static int st_admin_build_response_internal(const char *method,
         return build_http_routes_response(&context, path, out, out_len);
     }
     if (strcmp(method, "POST") == 0
-        && admin_parse_nested_path_id(path, "/api/admin/clients/", "/http-routes", &path_id) == 0) {
-        return handle_http_route_create(&context, path_id, body, out, out_len);
+        && (path_bound = admin_path_long_suffix(path, "/api/admin/clients/", "/http-routes", &path_id)) != 0) {
+        return path_bound == 1 ? handle_http_route_create(&context, path_id, body, out, out_len)
+                               : write_spring_conversion_refusal(out, out_len);
     }
     char connectivity_route_id[32];
     if (strcmp(method, "POST") == 0
         && admin_connectivity_check_path(path, connectivity_route_id, sizeof(connectivity_route_id))) {
         return handle_http_route_connectivity_check(&context, connectivity_route_id, body, body_len, out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/http-routes/", &path_id) == 0) {
-        if (strcmp(method, "PUT") == 0) {
-            return handle_http_route_update(&context, path_id, body, out, out_len);
+    if ((strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (path_bound = admin_path_long(path, "/api/admin/http-routes/", &path_id)) != 0) {
+        if (path_bound != 1) {
+            return write_spring_conversion_refusal(out, out_len);
         }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_http_route_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0 ? handle_http_route_update(&context, path_id, body, out, out_len)
+                                          : handle_http_route_delete(&context, path_id, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/connections")) {
         return build_connections_response(&context, path, out, out_len);
@@ -13152,8 +13350,9 @@ static int st_admin_build_response_internal(const char *method,
         return build_http_exchanges_response(&context, path, out, out_len);
     }
     if (strcmp(method, "GET") == 0
-        && admin_parse_path_id(path, "/api/admin/traffic/http-exchanges/", &path_id) == 0) {
-        return build_http_exchange_detail_response(&context, path_id, out, out_len);
+        && (path_bound = admin_path_long(path, "/api/admin/traffic/http-exchanges/", &path_id)) != 0) {
+        return path_bound == 1 ? build_http_exchange_detail_response(&context, path_id, out, out_len)
+                               : write_spring_conversion_refusal(out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/traffic/tcp-frames")) {
         return build_tcp_frames_response(&context, path, out, out_len);
@@ -13166,8 +13365,9 @@ static int st_admin_build_response_internal(const char *method,
         return build_traffic_inspection_status_response(out, out_len);
     }
     if (strcmp(method, "GET") == 0
-        && admin_parse_path_id(path, "/api/admin/traffic/tcp-frames/", &path_id) == 0) {
-        return build_tcp_frame_detail_response(&context, path_id, out, out_len);
+        && (path_bound = admin_path_long(path, "/api/admin/traffic/tcp-frames/", &path_id)) != 0) {
+        return path_bound == 1 ? build_tcp_frame_detail_response(&context, path_id, out, out_len)
+                               : write_spring_conversion_refusal(out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/status")) {
         char status_body[32];
@@ -13225,15 +13425,12 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/egress/policies")) {
         return handle_peer_mesh_egress_policy_mutation(&context, body, out, out_len);
     }
-    /*
-     * The Peer Mesh path variables bind as a long whatever its sign, as Spring does, and a segment
-     * that is not one is Spring's 400; the services then answer for ids they do not have.
-     */
+    /* The Peer Mesh path variables bind as the ones above. */
     int peer_path = 0;
     if (strcmp(method, "DELETE") == 0
         && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/egress/policies/", &path_id)) != 0) {
         return peer_path == 1 ? handle_peer_mesh_egress_policy_delete(&context, path_id, out, out_len)
-                              : write_spring_bad_request(out, out_len);
+                              : write_spring_conversion_refusal(out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/peer-mesh/service-audit")) {
         return build_peer_mesh_service_audit_response(&context, out, out_len);
@@ -13244,17 +13441,17 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "DELETE") == 0
         && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/sessions/", &path_id)) != 0) {
         return peer_path == 1 ? handle_peer_mesh_session_close(&context, path_id, out, out_len)
-                              : write_spring_bad_request(out, out_len);
+                              : write_spring_conversion_refusal(out, out_len);
     }
     if (strcmp(method, "PUT") == 0
         && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/devices/", &path_id)) != 0) {
         return peer_path == 1 ? handle_peer_mesh_device_update(&context, path_id, body, out, out_len)
-                              : write_spring_bad_request(out, out_len);
+                              : write_spring_conversion_refusal(out, out_len);
     }
     if (strcmp(method, "DELETE") == 0
         && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/acls/", &path_id)) != 0) {
         return peer_path == 1 ? handle_peer_mesh_acl_delete(&context, path_id, out, out_len)
-                              : write_spring_bad_request(out, out_len);
+                              : write_spring_conversion_refusal(out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/diagrams")) {
         return build_user_diagrams_response(&context, out, out_len);
@@ -13262,21 +13459,21 @@ static int st_admin_build_response_internal(const char *method,
     if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/diagrams")) {
         return handle_user_diagram_create(&context, body, out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/diagrams/", &path_id) == 0) {
+    if ((strcmp(method, "GET") == 0 || strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
+        && (path_bound = admin_path_long(path, "/api/admin/diagrams/", &path_id)) != 0) {
+        if (path_bound != 1) {
+            return write_spring_conversion_refusal(out, out_len);
+        }
         if (strcmp(method, "GET") == 0) {
             return build_user_diagram_detail_response(&context, path_id, out, out_len);
         }
-        if (strcmp(method, "PUT") == 0) {
-            return handle_user_diagram_update(&context, path_id, body, out, out_len);
-        }
-        if (strcmp(method, "DELETE") == 0) {
-            return handle_user_diagram_delete(&context, path_id, out, out_len);
-        }
+        return strcmp(method, "PUT") == 0 ? handle_user_diagram_update(&context, path_id, body, out, out_len)
+                                          : handle_user_diagram_delete(&context, path_id, out, out_len);
     }
     if ((strcmp(method, "PUT") == 0 || strcmp(method, "DELETE") == 0)
         && (peer_path = admin_path_long(path, "/api/admin/peer-mesh/services/", &path_id)) != 0) {
         if (peer_path != 1) {
-            return write_spring_bad_request(out, out_len);
+            return write_spring_conversion_refusal(out, out_len);
         }
         return strcmp(method, "PUT") == 0
             ? handle_peer_mesh_service_mutation(&context, 0, path_id, body, out, out_len)

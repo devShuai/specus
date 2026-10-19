@@ -40,6 +40,29 @@ int st_unicode_java21_domain_char(int32_t point)
     return point>=0 && (flags_for((uint32_t)point)&DOMAIN)!=0U;
 }
 
+int st_unicode_java21_whitespace(int32_t point)
+{
+    return point>=0 && (flags_for((uint32_t)point)&WHITE)!=0U;
+}
+
+int st_unicode_java21_digit(int32_t point,int radix)
+{
+    int value=-1;
+    if(point<0||point>0xFFFF)return -1;
+    if(point>='0'&&point<='9')value=point-'0';
+    else if(point>='A'&&point<='Z')value=point-'A'+10;
+    else if(point>='a'&&point<='z')value=point-'a'+10;
+    else if(point>=0xFF21&&point<=0xFF3A)value=point-0xFF21+10;
+    else if(point>=0xFF41&&point<=0xFF5A)value=point-0xFF41+10;
+    else if(utf8proc_category(point)==UTF8PROC_CATEGORY_ND) {
+        /* Decimal digits come in runs of ten from zero; none of the BMP's runs touch. */
+        int32_t start=point;
+        while(point-start<9&&utf8proc_category(start-1)==UTF8PROC_CATEGORY_ND)start--;
+        value=point-start;
+    }
+    return value<radix?value:-1;
+}
+
 int st_unicode_java21_has_text(const char *text,size_t length)
 {
     if(text==NULL)return length==0U?0:-1;
