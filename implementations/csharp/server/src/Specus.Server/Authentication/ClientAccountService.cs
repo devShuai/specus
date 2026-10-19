@@ -484,6 +484,8 @@ public sealed class ClientAccountService
             ClientEgressDomainTargets = PeerEgressProtocol.NormalizeVersion(
                     environment.ClientEgressCapabilities.Version) >= 1
                 && environment.ClientEgressCapabilities.DomainTargetCapable,
+            ClientEgressIpv6Targets = PeerEgressProtocol.DeclaresIpv6Targets(
+                environment.ClientEgressCapabilities.Version, environment.ClientEgressCapabilities.Ipv6TargetCapable),
             HttpLoginAt = DateTimeOffset.UtcNow,
             ExpiresAt = session.ExpiresAt,
         };

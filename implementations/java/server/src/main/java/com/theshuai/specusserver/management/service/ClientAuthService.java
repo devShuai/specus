@@ -490,6 +490,8 @@ public class ClientAuthService {
         // A domain-target claim means nothing from a client that does not take part in egress at
         // all, so it is only kept alongside a version the server will push egress messages for.
         session.setClientEgressDomainTargets(egressVersion >= 1 && egress.isDomainTargetCapable());
+        session.setClientEgressIpv6Targets(PeerEgressProtocol.declaresIpv6Targets(
+                egressVersion, egress.isIpv6TargetCapable()));
     }
 
     private List<ClientAuthLoginResponse.SpecusEndpoint> loadTcpMappings(ClientAccount account) {

@@ -632,6 +632,7 @@ func (a *App) managementHandler() http.Handler {
 	})
 
 	fileServer := http.FileServerFS(web.StaticFS())
+	registerPublicPageEntries(mux, fileServer)
 	mux.Handle("/", staticResourceCacheHeaders(fileServer))
 
 	// The share entry sees the raw path before the mux would clean dot segments and redirect: its

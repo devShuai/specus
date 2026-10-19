@@ -5695,8 +5695,43 @@ static int test_public_stun_config_endpoints(void)
     return failed;
 }
 
+static int test_public_page_entry_paths(void)
+{
+    const char *entries[] = {"/nat-detect", "/transfer", "/diagram", "/diagram-embed", "/download"};
+    const char *suffixes[] = {"", "/", "?roomId=fixture&view=file", "/?roomId=fixture&view=file"};
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        for (size_t j = 0; j < sizeof(suffixes) / sizeof(suffixes[0]); ++j) {
+            char request[128];
+            char resolved[256];
+            const char *type = NULL;
+            snprintf(request, sizeof(request), "%s%s", entries[i], suffixes[j]);
+            if (st_admin_resolve_static_path("fixture-static", request, resolved, sizeof(resolved), &type) != 0
+                || strcmp(resolved, "fixture-static/index.html") != 0
+                || type == NULL || strcmp(type, "text/html; charset=utf-8") != 0) {
+                fprintf(stderr, "public page entry did not resolve to actual index: %s\n", request);
+                return 1;
+            }
+        }
+    }
+    const char *missing[] = {"/transfer/unknown", "/transfer.js", "/transfer-other", "/assets/missing.js",
+                             "/api/public/missing", "/http/client/route/", "/http-share/opaque/"};
+    for (size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); ++i) {
+        char resolved[256];
+        const char *type = NULL;
+        if (st_admin_resolve_static_path("fixture-static", missing[i], resolved, sizeof(resolved), &type) == 0
+            && strcmp(resolved, "fixture-static/index.html") == 0) {
+            fprintf(stderr, "unknown/application path became a portal fallback: %s\n", missing[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void)
 {
+    if (test_public_page_entry_paths() != 0) {
+        return 1;
+    }
     /* The in-process admin server can still be writing to a socket the test has closed. */
     (void)signal(SIGPIPE, SIG_IGN);
     /* The suite deliberately exercises demo credentials and seeding; production disables both. */
@@ -6157,7 +6192,7 @@ int main(void)
              "\"attachments\":true,\"mediaPreview\":true,"
              "\"maxAttachmentBytes\":16777216},"
              "\"clientEgressCapabilities\":{\"version\":1,\"egressCapable\":true,"
-             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":false},"
+             "\"consumerCapable\":true,\"domainTargetCapable\":true,\"ipv6TargetCapable\":true},"
              "\"clientPeerServiceCapabilities\":{\"version\":2,"
              "\"applications\":[\"http\",\"tcp\",\"http\"]}}}",
              timestamp,
@@ -6226,6 +6261,23 @@ int main(void)
         || !negotiated_session.client_egress_domain_targets) {
         fprintf(stderr, "client egress capability negotiation mismatch\n");
         return 1;
+    }
+    {
+        sqlite3 *ipv6_db = NULL;
+        sqlite3_stmt *ipv6_statement = NULL;
+        int ipv6_stored = sqlite3_open(auth_db_path, &ipv6_db) == SQLITE_OK
+            && sqlite3_prepare_v2(ipv6_db,
+                "SELECT client_egress_ipv6_targets FROM specus_client_session WHERE id = ?",
+                -1, &ipv6_statement, NULL) == SQLITE_OK
+            && sqlite3_bind_int64(ipv6_statement, 1, runtime_client_session_id) == SQLITE_OK
+            && sqlite3_step(ipv6_statement) == SQLITE_ROW
+            && sqlite3_column_int(ipv6_statement, 0) == 1;
+        sqlite3_finalize(ipv6_statement);
+        sqlite3_close(ipv6_db);
+        if (!ipv6_stored) {
+            fprintf(stderr, "HTTP login lost the declared IPv6 target socket capability\n");
+            return 1;
+        }
     }
     if (st_storage_mark_client_session_online(auth_db_path,
                                               runtime_client_session_id,

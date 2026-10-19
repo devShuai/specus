@@ -30,6 +30,7 @@
 #include "traffic_capture.h"
 #include "turn_auth.h"
 #include "upstream_browser_headers.h"
+#include "url_decode.h"
 #include "workbench.h"
 
 #include <arpa/inet.h>
@@ -3078,6 +3079,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     /* Stored with the session so the egress-catalog can tell consumers which egress resolves names. */
     int client_egress_domain_targets = st_egress_declares_domain_targets(egress_caps_raw,
                                                                          client_egress_version);
+    int client_egress_ipv6_targets = st_egress_declares_ipv6_targets(egress_caps_raw, client_egress_version);
     /*
      * From version 1 the client classifies an HTTP stream RST in metadata.failure; the
      * connectivity check trusts that only from such a session (service-connectivity-check.md 6).
@@ -3342,6 +3344,7 @@ static int build_database_client_auth_login_response(const char *database_path,
     session.peer_service_discovery_version = peer_service_discovery_version;
     session.client_egress_version = client_egress_version;
     session.client_egress_domain_targets = client_egress_domain_targets;
+    session.client_egress_ipv6_targets = client_egress_ipv6_targets;
     session.client_http_route_version = client_http_route_version;
     snprintf(session.peer_service_applications, sizeof(session.peer_service_applications),
              "%s", peer_service_applications);
@@ -13559,6 +13562,20 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
     return st_admin_build_response_with_body(method, path, NULL, out, out_len);
 }
 
+static int admin_is_public_page_entry(const char *request_path)
+{
+    const char *entries[] = {"/nat-detect", "/transfer", "/diagram", "/diagram-embed", "/download"};
+    size_t path_len = strcspn(request_path, "?");
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        size_t entry_len = strlen(entries[i]);
+        if ((path_len == entry_len || (path_len == entry_len + 1 && request_path[entry_len] == '/'))
+            && strncmp(request_path, entries[i], entry_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int st_admin_resolve_static_path(const char *static_root,
                                  const char *request_path,
                                  char *file_path,
@@ -13570,7 +13587,8 @@ int st_admin_resolve_static_path(const char *static_root,
         || strstr(request_path, "..") != NULL) {
         return -1;
     }
-    const char *relative = request_path[1] == '\0' ? "index.html" : request_path + 1;
+    const char *relative = request_path[1] == '\0' || admin_is_public_page_entry(request_path)
+        ? "index.html" : request_path + 1;
     const char *query = strchr(relative, '?');
     size_t relative_len = query == NULL ? strlen(relative) : (size_t)(query - relative);
     if (relative_len == 0) {
@@ -13626,25 +13644,7 @@ static int hex_nibble(char value)
 
 static char *admin_url_decode(const char *value, size_t len)
 {
-    char *out = (char *)malloc(len + 1U);
-    if (out == NULL) {
-        return NULL;
-    }
-    size_t w = 0;
-    for (size_t i = 0; i < len; ++i) {
-        if (value[i] == '%' && i + 2U < len) {
-            int high = hex_nibble(value[i + 1U]);
-            int low = hex_nibble(value[i + 2U]);
-            if (high >= 0 && low >= 0) {
-                out[w++] = (char)((high << 4) | low);
-                i += 2U;
-                continue;
-            }
-        }
-        out[w++] = value[i] == '+' ? ' ' : value[i];
-    }
-    out[w] = '\0';
-    return out;
+    return st_url_decode(value, len, NULL);
 }
 
 static int admin_snapshot_base64_value(unsigned char value)
@@ -17318,7 +17318,7 @@ static int handle_connection_websocket_request(int fd, const char *method, const
     int single_ticket_query = 0;
     if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
         single_ticket_query = 1;
-        ticket = admin_query_string(path, "ticket");
+        ticket = st_url_decode_string(query + 8U, strlen(query + 8U));
     }
     char remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, remote_address);
@@ -17437,7 +17437,7 @@ static int handle_client_messages_websocket_request(int fd,
     int single_ticket_query = 0;
     if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
         single_ticket_query = 1;
-        ticket = admin_query_string(path, "ticket");
+        ticket = st_url_decode_string(query + 8U, strlen(query + 8U));
     }
     char remote_address[ST_CLIENT_ADDRESS_MAX_LEN];
     admin_request_client_address(fd, request, remote_address);

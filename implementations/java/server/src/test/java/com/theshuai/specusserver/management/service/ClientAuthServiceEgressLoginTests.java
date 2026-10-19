@@ -22,11 +22,15 @@ import com.theshuai.specusserver.security.TlsProperties;
 import com.theshuai.specusserver.session.ClientHttpRouteCapabilities;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -161,6 +165,28 @@ class ClientAuthServiceEgressLoginTests {
             assertThat(httpRouteCapabilities.versionOf(session.getId())).as(older).isZero();
         }
         assertThat(httpRouteCapabilities.versionOf(capable.getId())).isEqualTo(1);
+    }
+
+    @ParameterizedTest(name = "IPv6 target announcement {index}: {0}")
+    @MethodSource("ipv6TargetAnnouncements")
+    void ipv6TargetSocketSupportIsKeptWithTheLogin(String capabilities, boolean expected) {
+        ClientSession stored = loginWith(capabilities);
+        // An old session model lacks this property and therefore observes the
+        // legacy false value. The same assertion can run before adding the field.
+        boolean actual = JsonUtil.readString(JsonUtil.objectToString(stored))
+                .path("clientEgressIpv6Targets").asBoolean(false);
+        assertThat(actual).as(capabilities).isEqualTo(expected);
+    }
+
+    private static Stream<Arguments> ipv6TargetAnnouncements() {
+        return Stream.of(
+                Arguments.of("{\"version\":1,\"egressCapable\":true,\"ipv6TargetCapable\":true}", true),
+                Arguments.of("{\"version\":1,\"egressCapable\":true}", false),
+                Arguments.of("{\"version\":1,\"ipv6TargetCapable\":false}", false),
+                Arguments.of("{\"version\":0,\"ipv6TargetCapable\":true}", false),
+                Arguments.of("{\"version\":-1,\"ipv6TargetCapable\":true}", false),
+                Arguments.of("{\"version\":2,\"egressCapable\":true,\"ipv6TargetCapable\":true}", true),
+                Arguments.of("null", false));
     }
 
     private ClientSession loginWith(String egressCapabilitiesJson) {

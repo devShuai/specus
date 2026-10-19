@@ -255,6 +255,7 @@ app.UseWebSockets();
 // static asset so ASP.NET Core can still apply generated ETag/compression/fingerprint metadata.
 app.MapGet("/", () => Results.LocalRedirect("/index.html"));
 app.MapStaticAssets();
+app.MapPublicPageEntries();
 
 app.MapAdminApi();
 app.MapWorkbenchApi();

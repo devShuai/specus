@@ -3,6 +3,10 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
+using Specus.Server.Data.Conversion;
 using Specus.Protocol.PeerEgress;
 using Specus.Server.Authentication;
 using Specus.Protocol.Packets;
@@ -149,22 +153,72 @@ public sealed partial class PeerMeshService
     /// fields always describe the same session.
     /// </remarks>
     private async Task<EgressAnnouncement> EgressAnnouncementAsync(ClientAccount egress,
-        CancellationToken cancellationToken) =>
-        await _db.ClientSessions.AsNoTracking()
-            .Where(row => row.TenantId == egress.TenantId
-                && row.ClientId == egress.Id
-                && row.Status == "NETTY_ONLINE")
-            .OrderByDescending(row => row.NettyConnectedAt ?? row.HttpLoginAt)
-            .ThenByDescending(row => row.Id)
-            .Select(row => new EgressAnnouncement(row.ClientEgressVersion, row.ClientEgressDomainTargets))
-            .FirstOrDefaultAsync(cancellationToken)
-            .ConfigureAwait(false)
-        ?? EgressAnnouncement.None;
+        CancellationToken cancellationToken)
+    {
+        var model = _db.Model.FindEntityType(typeof(ClientSession))!;
+        var table = StoreObjectIdentifier.Table(model.GetTableName()!, model.GetSchema());
+        var sql = _db.GetService<ISqlGenerationHelper>();
+        string Column(string name) => sql.DelimitIdentifier(model.FindProperty(name)!.GetColumnName(table)!);
+        string Projection(string property, string alias) => $"{Column(property)} AS {sql.DelimitIdentifier(alias)}";
+        var projections = new[]
+        {
+            Projection(nameof(ClientSession.Id), nameof(AnnouncementSession.SessionId)),
+            Projection(nameof(ClientSession.TenantId), nameof(AnnouncementSession.TenantId)),
+            Projection(nameof(ClientSession.ClientId), nameof(AnnouncementSession.ClientId)),
+            Projection(nameof(ClientSession.Status), nameof(AnnouncementSession.Status)),
+            Projection(nameof(ClientSession.ClientEgressVersion), nameof(AnnouncementSession.Version)),
+            Projection(nameof(ClientSession.ClientEgressDomainTargets), nameof(AnnouncementSession.DomainTargets)),
+            Projection(nameof(ClientSession.ClientEgressIpv6Targets), nameof(AnnouncementSession.Ipv6Targets)),
+            Projection(nameof(ClientSession.NettyConnectedAt), nameof(AnnouncementSession.ConnectedAt)),
+            Projection(nameof(ClientSession.HttpLoginAt), nameof(AnnouncementSession.HttpLoginAt)),
+        };
+        // Identifiers come only from the trusted EF model; values stay parameterized.
+        // Read timestamp TEXT directly: the current DateTimeOffset converter would
+        // round Java's nanoseconds, and SQL string ordering mixes historical formats.
+        var statement = $"SELECT {string.Join(", ", projections)} FROM {sql.DelimitIdentifier(table.Name, table.Schema)} "
+            + $"WHERE {Column(nameof(ClientSession.TenantId))} = {{0}} AND {Column(nameof(ClientSession.ClientId))} = {{1}} "
+            + $"AND {Column(nameof(ClientSession.Status))} = 'NETTY_ONLINE'";
+        var online = await _db.Database.SqlQueryRaw<AnnouncementSession>(statement, egress.TenantId, egress.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        AnnouncementSession? newest = null;
+        ClientSessionInstant newestAt = default;
+        foreach (var session in online)
+        {
+            // Provider collations may ignore case/trailing spaces. A foreign row
+            // must neither supply capabilities nor poison timestamp ordering.
+            if (session.ClientId != egress.Id
+                || !string.Equals(session.TenantId, egress.TenantId, StringComparison.Ordinal)
+                || !string.Equals(session.Status, "NETTY_ONLINE", StringComparison.Ordinal)) continue;
+            var timestamp = string.IsNullOrEmpty(session.ConnectedAt) ? session.HttpLoginAt : session.ConnectedAt;
+            if (!ClientSessionInstant.TryParse(timestamp, out var at)) return EgressAnnouncement.None;
+            if (newest is null || at.CompareTo(newestAt) > 0
+                || (at.CompareTo(newestAt) == 0 && session.SessionId > newest.SessionId))
+            {
+                newest = session;
+                newestAt = at;
+            }
+        }
+        return newest is null || newest.Version < 1 ? EgressAnnouncement.None
+            : new EgressAnnouncement(newest.Version, newest.DomainTargets, newest.Ipv6Targets);
+    }
+
+    private sealed class AnnouncementSession
+    {
+        public long SessionId { get; set; }
+        public string TenantId { get; set; } = "";
+        public long ClientId { get; set; }
+        public string Status { get; set; } = "";
+        public int Version { get; set; }
+        public bool DomainTargets { get; set; }
+        public bool Ipv6Targets { get; set; }
+        public string? ConnectedAt { get; set; }
+        public string? HttpLoginAt { get; set; }
+    }
 
     /// <summary>What an egress's online session announced, as the catalogue passes it on.</summary>
-    private sealed record EgressAnnouncement(int Version, bool DomainTargets)
+    private sealed record EgressAnnouncement(int Version, bool DomainTargets, bool Ipv6Targets)
     {
-        public static EgressAnnouncement None { get; } = new(0, false);
+        public static EgressAnnouncement None { get; } = new(0, false, false);
     }
 
     /// <summary>Cap on one egress-report envelope; the report carries counters only.</summary>
@@ -716,8 +770,7 @@ public sealed partial class PeerMeshService
                 Scope = policy.Scope,
                 Protocols = EgressProtocols(DecodeEgressDestinationRules(policy.DestinationRules)),
                 DomainTargetCapable = announced.DomainTargets,
-                // No client announces IPv6 targets yet, so there is nothing to carry.
-                Ipv6TargetCapable = false,
+                Ipv6TargetCapable = announced.Ipv6Targets,
                 EgressVersion = announced.Version,
             });
         }

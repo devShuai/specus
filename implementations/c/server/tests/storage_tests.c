@@ -186,7 +186,8 @@ static int test_client_session_domain_targets_migration(void)
     st_storage_client_session legacy;
     if (st_storage_get_client_session_for_login(path, 1, "legacy-token", &legacy) != 0
         || legacy.client_egress_version != 1
-        || legacy.client_egress_domain_targets != 0) {
+        || legacy.client_egress_domain_targets != 0
+        || legacy.client_egress_ipv6_targets != 0) {
         fprintf(stderr, "client session migrated domain targets default mismatch\n");
         unlink(path);
         return 1;
@@ -198,10 +199,12 @@ static int test_client_session_domain_targets_migration(void)
     snprintf(fresh.status, sizeof(fresh.status), "%s", "HTTP_AUTHENTICATED");
     snprintf(fresh.http_login_at, sizeof(fresh.http_login_at), "%s", "2026-06-25T00:00:00Z");
     fresh.client_egress_domain_targets = 1;
+    fresh.client_egress_ipv6_targets = 1;
     if (st_storage_create_client_session(path, &fresh, &fresh) != 0
         || fresh.id == legacy.id
         || fresh.client_egress_version != 1
-        || !fresh.client_egress_domain_targets) {
+        || !fresh.client_egress_domain_targets
+        || !fresh.client_egress_ipv6_targets) {
         fprintf(stderr, "client session domain targets after migration mismatch\n");
         unlink(path);
         return 1;
@@ -1674,6 +1677,7 @@ int main(void)
     session.message_max_attachment_bytes = 16777216;
     session.client_egress_version = 1;
     session.client_egress_domain_targets = 1;
+    session.client_egress_ipv6_targets = 1;
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", "2026-06-25T00:00:00Z");
     snprintf(session.expires_at, sizeof(session.expires_at), "%s", "2026-06-25T08:00:00Z");
     if (st_storage_create_client_session(path, &session, &session) != 0
@@ -1686,7 +1690,8 @@ int main(void)
         || !session.message_media_preview_capable
         || session.message_max_attachment_bytes != 16777216
         || session.client_egress_version != 1
-        || !session.client_egress_domain_targets) {
+        || !session.client_egress_domain_targets
+        || !session.client_egress_ipv6_targets) {
         fprintf(stderr, "client session create mismatch\n");
         unlink(path);
         return 1;
@@ -1709,6 +1714,7 @@ int main(void)
         || login_session.message_max_attachment_bytes != 16777216
         || login_session.client_egress_version != 1
         || !login_session.client_egress_domain_targets
+        || !login_session.client_egress_ipv6_targets
         || st_storage_count_online_sessions_by_machine(path,
                                                        credential.id,
                                                        "machine-1",
@@ -1740,6 +1746,7 @@ int main(void)
         || capability_client.message_max_attachment_bytes != 16777216
         || capability_client.client_egress_version != 1
         || !capability_client.client_egress_domain_targets
+        || !capability_client.client_egress_ipv6_targets
         || st_storage_ensure_peer_mesh_device(path, &capability_client, &capability_device) != 0
         || !capability_device.message_attachments_capable
         || capability_device.message_max_attachment_bytes != 16777216) {
@@ -1758,6 +1765,7 @@ int main(void)
         || capability_client.message_max_attachment_bytes != 0
         || capability_client.client_egress_version != 0
         || capability_client.client_egress_domain_targets
+        || capability_client.client_egress_ipv6_targets
         || st_storage_ensure_peer_mesh_device(path, &capability_client, &capability_device) != 0
         || capability_device.message_attachments_capable
         || capability_device.message_max_attachment_bytes != 0) {

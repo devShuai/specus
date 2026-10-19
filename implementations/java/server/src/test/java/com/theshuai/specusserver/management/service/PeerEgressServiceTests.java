@@ -21,6 +21,9 @@ import com.theshuai.specusserver.management.repository.PeerMeshEgressActivityRep
 import com.theshuai.specusserver.management.repository.PeerMeshEgressSwitchRepository;
 import com.theshuai.specusserver.management.repository.PeerMeshEgressPolicyRepository;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -28,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -313,12 +317,67 @@ class PeerEgressServiceTests {
         wire.forEach(entry -> assertThat(entry.has("egressVersion")).as(entry.toString()).isTrue());
     }
 
+    @ParameterizedTest(name = "IPv6 target catalog {0}")
+    @MethodSource("ipv6TargetCatalogCases")
+    void theCatalogReflectsTheNewestOnlineIPv6TargetAnnouncement(
+            String name, String status, int version, boolean declared, boolean olderTrue, boolean expected) {
+        tenantEgressOn();
+        when(peerMeshService.isEnabled()).thenReturn(true);
+        when(peerMeshService.canPeer(any(), any())).thenReturn(true);
+        when(clientAccountRepository.findByTenantIdOrderByIdDesc(TENANT)).thenReturn(List.of(consumer, egress));
+        when(clientAccountRepository.findByIdAndTenantId(egress.getId(), TENANT)).thenReturn(Optional.of(egress));
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setEnabled(true);
+        when(deviceRepository.findByTenantIdAndClientId(TENANT, egress.getId())).thenReturn(Optional.of(device));
+        when(policyRepository.findByTenantIdAndEnabledTrueOrderByEgressClientNameAsc(TENANT))
+                .thenReturn(List.of(policy(List.of(consumer.getId()))));
+
+        List<ClientSession> online = new ArrayList<>();
+        if (olderTrue) online.add(ipv6AnnouncementSession(91, "NETTY_ONLINE", 1, true, "2026-10-18T00:00:00Z"));
+        if (ClientAuthService.STATUS_NETTY_ONLINE.equals(status)) {
+            online.add(ipv6AnnouncementSession(92, status, version, declared, "2026-10-18T00:01:00Z"));
+        }
+        when(clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
+                TENANT, List.of(egress.getId()), ClientAuthService.STATUS_NETTY_ONLINE)).thenReturn(online);
+        PeerControlMessage catalog = service.buildEgressCatalog(consumer, environment(1));
+        assertThat(catalog.getEgresses()).hasSize(1);
+        assertThat(catalog.getEgresses().getFirst().isIpv6TargetCapable()).as(name).isEqualTo(expected);
+    }
+
+    private ClientSession ipv6AnnouncementSession(long id, String status, int version, boolean declared, String at) {
+        ClientSession session = JsonUtil.stringToObject(
+                "{\"clientEgressIpv6Targets\":" + declared + "}", ClientSession.class);
+        assertThat(session).isNotNull();
+        session.setId(id);
+        session.setTenantId(TENANT);
+        session.setClientId(egress.getId());
+        session.setStatus(status);
+        session.setClientEgressVersion(version);
+        session.setNettyConnectedAt(at);
+        session.setHttpLoginAt(at);
+        return session;
+    }
+
+    private static Stream<Arguments> ipv6TargetCatalogCases() {
+        return Stream.of(
+                Arguments.of("announced", "NETTY_ONLINE", 1, true, false, true),
+                Arguments.of("false", "NETTY_ONLINE", 1, false, false, false),
+                Arguments.of("disconnected", "DISCONNECTED", 1, true, false, false),
+                Arguments.of("HTTP only", "HTTP_AUTHENTICATED", 1, true, false, false),
+                Arguments.of("zero version", "NETTY_ONLINE", 0, true, false, false),
+                Arguments.of("new false must not borrow old true", "NETTY_ONLINE", 1, false, true, false),
+                Arguments.of("new old client clears capability", "NETTY_ONLINE", 0, false, true, false));
+    }
+
     private void onlineSession(ClientAccount account, boolean domainTargets) {
         onlineSession(account, 1, domainTargets);
     }
 
     private void onlineSession(ClientAccount account, int egressVersion, boolean domainTargets) {
         ClientSession session = new ClientSession();
+        session.setId(10000L + account.getId());
+        session.setHttpLoginAt("2026-10-18T00:00:00Z");
+        session.setNettyConnectedAt("2026-10-18T00:00:00Z");
         session.setTenantId(TENANT);
         session.setClientId(account.getId());
         session.setStatus(ClientAuthService.STATUS_NETTY_ONLINE);

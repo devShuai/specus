@@ -376,6 +376,12 @@ namespace Specus.Server.Data.Postgres.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("client_egress_domain_targets");
 
+                    b.Property<bool>("ClientEgressIpv6Targets")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false)
+                        .HasColumnName("client_egress_ipv6_targets");
+
                     b.Property<int>("ClientEgressVersion")
                         .HasColumnType("integer")
                         .HasColumnName("client_egress_version");
