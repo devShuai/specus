@@ -14,5 +14,10 @@ int st_unicode_java21_has_text(const char *text, size_t length);
 /* InternetAddress uses Character.isLetterOrDigit(char), so supplementary scalars
  * are not DNS-domain characters; bracketed literals have their own grammar. */
 int st_unicode_java21_domain_char(int32_t point);
+/* Character.isWhitespace(int). */
+int st_unicode_java21_whitespace(int32_t point);
+/* Character.digit(char, radix) for a UTF-16 unit: a decimal digit of any script, or an ASCII or
+ * fullwidth Latin letter, whose value is below radix; -1 otherwise, and for any point past the BMP. */
+int st_unicode_java21_digit(int32_t point, int radix);
 
 #endif
